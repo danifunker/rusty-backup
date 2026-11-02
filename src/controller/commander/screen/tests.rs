@@ -1,0 +1,396 @@
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use super::*;
+use crate::controller::commander::pane::source::tests::mbr_fat16;
+use crate::controller::keys::{Key, Mods};
+
+type A = CommanderAction;
+type P = CommanderPaneAction;
+
+/// Ticks until neither pane nor the screen has a job running.
+fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
+    let start = Instant::now();
+    let mut fx = ctl.tick();
+    loop {
+        let checksumming = ctl.checksums.as_ref().is_some_and(|c| c.job.is_some());
+        let busy = ctl.left.is_busy() || ctl.right.is_busy();
+        if !busy && ctl.copy.is_none() && !checksumming {
+            return fx;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "a job never finished"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        fx.extend(ctl.tick());
+    }
+}
+
+fn open_image(ctl: &mut CommanderController, side: Side, dir: &Path) {
+    ctl.apply(A::Pane(side, P::OpenImage(mbr_fat16(dir))));
+    settle(ctl);
+    assert!(ctl.pane(side).listing.is_loaded(), "{}", ctl.status());
+}
+
+fn open_host(ctl: &mut CommanderController, side: Side, dir: &Path) {
+    ctl.apply(A::Pane(side, P::OpenHostFolder(dir.to_path_buf())));
+    settle(ctl);
+    assert!(ctl.pane(side).listing.is_host(), "{}", ctl.status());
+}
+
+fn files(ctl: &CommanderController, side: Side) -> Vec<String> {
+    let entries = ctl.pane(side).listing.entries().iter();
+    entries
+        .filter(|e| e.is_file())
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+fn select(ctl: &mut CommanderController, side: Side, name: &str) {
+    ctl.apply(A::Pane(
+        side,
+        P::Click {
+            name: name.into(),
+            ctrl: false,
+            shift: false,
+        },
+    ));
+}
+
+fn key(code: Key) -> CommanderAction {
+    A::Key(code, Mods::default())
+}
+
+fn sit_with(names: &[&str]) -> Vec<u8> {
+    use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+    let file = |name: &str| {
+        StuffItInputNode::File(StuffItInput {
+            name: name.into(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"hello".to_vec(),
+            resource_fork: Vec::new(),
+        })
+    };
+    let tree: Vec<_> = names.iter().map(|n| file(n)).collect();
+    build_archive_tree(&tree, WriteMethod::Store).unwrap()
+}
+
+#[test]
+fn a_host_to_image_copy_stages_adds_on_the_image_pane() {
+    let img = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("NEW.TXT"), b"new").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    open_image(&mut ctl, Side::Right, img.path());
+    select(&mut ctl, Side::Left, "NEW.TXT");
+    assert!(ctl.can_copy(Side::Left));
+    ctl.apply(A::Copy(Side::Left));
+    assert!(
+        ctl.status()
+            .starts_with("Staged copy of 1 item(s) into the R pane"),
+        "{}",
+        ctl.status()
+    );
+    assert_eq!(ctl.pane(Side::Right).queue.len(), 1);
+    let rows = ctl.right.display_rows();
+    let row = rows.iter().find(|r| r.name == "NEW.TXT").unwrap();
+    assert_eq!(row.kind, crate::controller::commander::RowKind::PendingAdd);
+}
+
+#[test]
+fn an_image_to_host_conflict_is_reviewed_then_replaced_or_skipped() {
+    let img = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    let existing = host.path().join(&name);
+    std::fs::write(&existing, b"old").unwrap();
+    open_host(&mut ctl, Side::Right, host.path());
+
+    // Skip keeps the host file.
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Copy(Side::Left));
+    assert_eq!(
+        ctl.host_conflict(),
+        Some(&[name.clone()][..]),
+        "{}",
+        ctl.status()
+    );
+    assert!(ctl.modal_open());
+    ctl.apply(A::HostConflict(OnConflict::Skip));
+    settle(&mut ctl);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"old");
+    assert!(ctl.status().contains("skipped 1"), "{}", ctl.status());
+
+    // Cancel writes nothing; Replace overwrites with the image's bytes.
+    ctl.apply(A::Copy(Side::Left));
+    ctl.apply(A::HostConflictCancel);
+    assert!(ctl.host_conflict().is_none());
+    assert_eq!(ctl.status(), "Copy cancelled; nothing was written.");
+    ctl.apply(A::Copy(Side::Left));
+    ctl.apply(A::HostConflict(OnConflict::Replace));
+    assert!(ctl.copy_job().is_some());
+    settle(&mut ctl);
+    assert_ne!(
+        std::fs::read(&existing).unwrap(),
+        b"old",
+        "{}",
+        ctl.status()
+    );
+    assert!(
+        ctl.status().starts_with("Copied 1 file(s)"),
+        "{}",
+        ctl.status()
+    );
+    assert!(ctl.log().iter().any(|l| l.contains("Copied 1 file(s)")));
+}
+
+#[test]
+fn an_image_to_image_copy_legalises_names_and_undo_unstages_it() {
+    let img = tempfile::tempdir().unwrap();
+    let arc = tempfile::tempdir().unwrap();
+    let sit = arc.path().join("names.sit");
+    std::fs::write(&sit, sit_with(&["a*b?.txt", "ok.txt"])).unwrap();
+    let mut ctl = CommanderController::headless();
+    ctl.apply(A::Pane(Side::Left, P::OpenImage(sit)));
+    settle(&mut ctl);
+    assert!(ctl.pane(Side::Left).is_archive(), "{}", ctl.status());
+    open_image(&mut ctl, Side::Right, img.path());
+    let before = ctl.pane(Side::Right).queue.len();
+    for name in ["a*b?.txt", "ok.txt"] {
+        ctl.apply(A::Pane(
+            Side::Left,
+            P::Click {
+                name: name.into(),
+                ctrl: true,
+                shift: false,
+            },
+        ));
+    }
+    ctl.apply(A::Copy(Side::Left));
+    assert_eq!(
+        ctl.copy_job().map(|(t, _)| t),
+        Some("Copying to other pane")
+    );
+    settle(&mut ctl);
+    let notice = ctl.rename_notice().expect("a rename notice");
+    assert_eq!(notice.dest, Side::Right);
+    assert_eq!(
+        notice.outcome.renamed.len(),
+        1,
+        "{:?}",
+        notice.outcome.renamed
+    );
+    assert_eq!(notice.outcome.renamed[0].from, "a*b?.txt");
+    assert_eq!(ctl.pane(Side::Right).queue.len(), before + 2);
+    // A key does nothing while the notice waits.
+    ctl.apply(key(Key::Tab));
+    assert_eq!(ctl.active(), Side::Left);
+    ctl.apply(A::RenameNoticeUndo);
+    assert!(ctl.rename_notice().is_none());
+    assert_eq!(ctl.pane(Side::Right).queue.len(), before);
+    assert_eq!(ctl.status(), "Copy removed from the staged edits.");
+}
+
+#[test]
+fn export_asks_for_a_folder_and_the_answer_runs_the_export_job() {
+    let img = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    let fx = ctl.apply(A::Export {
+        from: Side::Left,
+        format: None,
+    });
+    match fx.as_slice() {
+        [Effect::PickFolder(spec)] => assert_eq!(spec.purpose, purpose::EXPORT),
+        other => panic!("expected a folder picker, got {other:?}"),
+    }
+    ctl.apply(A::Picked {
+        purpose: purpose::EXPORT,
+        path: Some(out.path().to_path_buf()),
+    });
+    assert!(ctl.copy_job().is_some(), "{}", ctl.status());
+    settle(&mut ctl);
+    assert!(out.path().join(&name).is_file(), "{}", ctl.status());
+
+    // A single-file format asks for a file to save, named after the selection.
+    let fx = ctl.apply(A::Export {
+        from: Side::Left,
+        format: Some(ExportFormat::Zip),
+    });
+    match fx.as_slice() {
+        [Effect::PickFile(spec)] => assert!(spec.save && spec.file_name.ends_with(".zip")),
+        other => panic!("expected a save picker, got {other:?}"),
+    }
+    ctl.apply(A::Picked {
+        purpose: purpose::EXPORT,
+        path: None,
+    });
+    assert_eq!(ctl.status(), "Export cancelled.");
+}
+
+#[test]
+fn checksums_run_as_a_job_and_copy_to_the_clipboard() {
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("abc.txt"), b"abc").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    select(&mut ctl, Side::Left, "abc.txt");
+    ctl.apply(A::Checksums(Side::Left));
+    assert!(ctl.checksums().is_some(), "{}", ctl.status());
+    settle(&mut ctl);
+    let c = ctl.checksums().unwrap();
+    assert!(c.running().is_none() && c.error.is_none());
+    let values = c.rows[0].values.clone().unwrap();
+    assert_eq!(values[0], "352441c2");
+    let fx = ctl.apply(A::CopyChecksum {
+        file: 0,
+        algo: HashAlgo::Md5,
+    });
+    assert_eq!(
+        fx,
+        [Effect::CopyToClipboard(
+            "900150983cd24fb0d6963f7d28e17f72".into()
+        )]
+    );
+    match ctl.apply(A::CopyChecksums).as_slice() {
+        [Effect::CopyToClipboard(text)] => {
+            assert!(
+                text.starts_with("abc.txt") && text.contains("352441c2"),
+                "{text}"
+            )
+        }
+        other => panic!("expected the clipboard, got {other:?}"),
+    }
+    ctl.apply(key(Key::Escape));
+    assert!(ctl.checksums().is_none(), "Esc closes the window first");
+}
+
+#[test]
+fn close_asks_while_edits_are_staged() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    assert_eq!(ctl.apply(A::RequestClose), [Effect::CloseScreen]);
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Delete);
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
+    let fx = ctl.apply(A::RequestClose);
+    match fx.as_slice() {
+        [Effect::Confirm(spec)] => assert_eq!(spec.purpose, purpose::CLOSE_UNSAVED),
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    let no = ctl.apply(A::Confirmed {
+        purpose: purpose::CLOSE_UNSAVED,
+        yes: false,
+    });
+    assert!(no.is_empty());
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
+    let yes = ctl.apply(A::Confirmed {
+        purpose: purpose::CLOSE_UNSAVED,
+        yes: true,
+    });
+    assert_eq!(yes, [Effect::CloseScreen]);
+    assert!(ctl.pane(Side::Left).queue.is_empty());
+}
+
+#[test]
+fn keys_copy_switch_panes_and_delete_on_the_active_pane() {
+    let img = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("KEY.TXT"), b"k").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    open_image(&mut ctl, Side::Right, img.path());
+    assert!(ctl.binds(Key::F(6), Mods::default()));
+    select(&mut ctl, Side::Left, "KEY.TXT");
+    ctl.apply(key(Key::F(6)));
+    assert_eq!(ctl.pane(Side::Right).queue.len(), 1, "{}", ctl.status());
+
+    ctl.apply(key(Key::Tab));
+    assert_eq!(ctl.active(), Side::Right);
+    let victim = files(&ctl, Side::Right)[0].clone();
+    select(&mut ctl, Side::Right, &victim);
+    ctl.apply(key(Key::F(8)));
+    assert_eq!(ctl.pane(Side::Right).queue.len(), 2, "{}", ctl.status());
+    assert!(
+        ctl.status().starts_with("[R] toggled delete"),
+        "{}",
+        ctl.status()
+    );
+
+    // F1 toggles the help; its rows come from the key map.
+    ctl.apply(key(Key::F(1)));
+    assert!(ctl.help_shown());
+    assert!(ctl
+        .key_help()
+        .iter()
+        .any(|(l, k)| *l == Command::Copy.label() && k == "F6"));
+}
+
+#[test]
+fn file_info_opens_from_a_double_click_and_stages_metadata_on_its_pane() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    let node = ctl
+        .left
+        .rows()
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap()
+        .node_id
+        .clone();
+    ctl.apply(A::Pane(Side::Left, P::Activate(node)));
+    let d = ctl.detail().expect("File Info opened");
+    assert!(d.editable && d.entry.name == name && d.preview.is_some());
+    let entry = d.entry.clone();
+    ctl.apply(A::StageMetadata(Box::new(MetadataEdit::Dates {
+        entry,
+        create: 1,
+        modify: 2,
+        backup: 3,
+    })));
+    let result = ctl.detail().and_then(|d| d.result.clone());
+    assert_eq!(
+        result.as_deref(),
+        Some(&*format!("Staged date change on '{name}'"))
+    );
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
+}
+
+#[test]
+fn a_pane_prompt_answer_returns_to_the_pane_that_asked() {
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("DOOMED.TXT"), b"x").unwrap();
+    let mut ctl = CommanderController::headless();
+    ctl.apply(A::Focus(Side::Left));
+    open_host(&mut ctl, Side::Right, host.path());
+    select(&mut ctl, Side::Right, "DOOMED.TXT");
+    let fx = ctl.apply(A::Pane(Side::Right, P::Delete));
+    let purpose = match fx.as_slice() {
+        [Effect::Confirm(spec)] => spec.purpose,
+        other => panic!("expected a confirmation, got {other:?}"),
+    };
+    assert_eq!(ctl.asker(purpose), Some(Side::Right));
+    ctl.apply(A::Confirmed { purpose, yes: true });
+    settle(&mut ctl);
+    assert!(!host.path().join("DOOMED.TXT").exists(), "{}", ctl.status());
+    assert!(
+        ctl.log().iter().any(|l| l.contains("[R] deleted 1")),
+        "{:?}",
+        ctl.log()
+    );
+}

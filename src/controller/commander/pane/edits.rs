@@ -204,6 +204,15 @@ fn msg(text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Message(text.into())]
 }
 
+/// Up to `max` bytes of a host file, for the File Info preview.
+fn read_host_file_capped(path: &str, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(max as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
 impl CommanderPaneController {
     // --- read accessors ---------------------------------------------------
 
@@ -343,7 +352,84 @@ impl CommanderPaneController {
         std::mem::take(&mut self.ed.log)
     }
 
-    // --- entry points for the two-pane copy (slice 6) ------------------------
+    // --- what the two-pane controller reads and stages ------------------------
+
+    /// True when a row is selected, in the listing or inside an expanded wrapper.
+    pub fn has_selection(&self) -> bool {
+        self.tree_active() || !self.listing.selection().is_empty()
+    }
+
+    /// The selected entries: the wrapper-tree selection when there is one, else the listing's.
+    pub fn selected_entries(&self) -> Vec<FileEntry> {
+        if let Some((_, entries)) = self.tree_selection() {
+            return entries;
+        }
+        let selected = self.listing.selected_entries().into_iter();
+        selected.cloned().collect()
+    }
+
+    /// The current folder's entry, where a copy into this pane lands.
+    pub fn cwd_entry(&self) -> Option<FileEntry> {
+        self.listing.cwd().cloned()
+    }
+
+    /// True when the selection's source is a host folder (a wrapper selection is not).
+    pub fn is_host_pane(&self) -> bool {
+        !self.tree_active() && self.listing.is_host()
+    }
+
+    /// The filesystem the selection reads from: the active wrapper mount, else the listing's.
+    fn selection_fs(&mut self) -> Option<&mut (dyn disk_core::filesystem::Filesystem + 'static)> {
+        if let Some((mount, _)) = self.tree_selection() {
+            return self.wrapper_tree.mount_fs(&mount);
+        }
+        self.listing.fs_mut()
+    }
+
+    /// The selection's filesystem type for File Info (a wrapper's own type inside one).
+    pub fn detail_fs_type(&mut self) -> String {
+        if let Some((mount, _)) = self.tree_selection() {
+            if let Some(fs) = self.wrapper_tree.mount_fs(&mount) {
+                return fs.fs_type().to_string();
+            }
+        }
+        self.volume().fs_type.clone()
+    }
+
+    /// The named entry and up to `max` bytes of its data (`None` for a folder or a failed read).
+    pub fn detail_payload(
+        &mut self,
+        name: &str,
+        max: usize,
+    ) -> Option<(FileEntry, Option<Vec<u8>>)> {
+        let entry = match self.tree_selection() {
+            Some((_, entries)) => entries.into_iter().find(|e| e.name == name)?,
+            None => self.entry_named(name)?,
+        };
+        if !entry.is_file() {
+            return Some((entry, None));
+        }
+        let data = if self.is_host_pane() {
+            read_host_file_capped(&entry.path, max)
+        } else {
+            self.selection_fs()
+                .and_then(|fs| fs.read_file(&entry, max).ok())
+        };
+        Some((entry, data))
+    }
+
+    /// The entry's extended attributes; empty where the filesystem has none or cannot read them.
+    pub fn detail_xattrs(&mut self, entry: &FileEntry) -> Vec<disk_core::xattr::Xattr> {
+        self.selection_fs()
+            .filter(|fs| fs.supports_xattrs())
+            .and_then(|fs| fs.list_xattrs(entry).ok())
+            .unwrap_or_default()
+    }
+
+    /// What a job reading this pane's source holds, so an apply cannot write under it.
+    pub fn source_resources(&self) -> Vec<Resource> {
+        self.apply_resources()
+    }
 
     /// Push a copy batch onto the queue, renaming names this volume cannot hold.
     pub fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {

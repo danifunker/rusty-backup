@@ -47,6 +47,8 @@ pub enum Effect {
     Message(String),
     OpenUrl(String),
     CopyToClipboard(String),
+    /// Leave the screen that asked (Commander's Close); the shell drops its controller.
+    CloseScreen,
 }
 
 /// A file or folder picker; `purpose` says which `Action` the answer belongs to.
@@ -57,6 +59,8 @@ pub struct PickSpec {
     /// `(name, extensions)` pairs; empty means any file.
     pub filters: Vec<(String, Vec<String>)>,
     pub save: bool,
+    /// The name a save dialog suggests; empty for none.
+    pub file_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,6 +25,8 @@ pub(crate) enum Reply {
         purpose: &'static str,
         text: Option<String>,
     },
+    /// The controller asked to leave its screen.
+    CloseScreen,
 }
 
 /// A text prompt on screen: its spec, the field's text, and whether the user has typed yet.
@@ -75,6 +77,7 @@ impl EffectHost {
                 }
                 Effect::CopyToClipboard(text) => ctx.copy_text(text),
                 Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                Effect::CloseScreen => replies.push(Reply::CloseScreen),
             }
         }
         replies
@@ -83,6 +86,12 @@ impl EffectHost {
     /// True while a confirmation or text prompt waits for an answer.
     pub(crate) fn modal_open(&self) -> bool {
         self.confirm.is_some() || self.text.is_some()
+    }
+
+    /// The `purpose` of the confirmation or prompt on screen.
+    pub(crate) fn pending_purpose(&self) -> Option<&'static str> {
+        let confirm = self.confirm.as_ref().map(|c| c.purpose);
+        confirm.or_else(|| self.text.as_ref().map(|t| t.spec.purpose))
     }
 
     /// Draw the pending confirmation or prompt; `whose` tells two hosts' windows apart.
@@ -189,6 +198,9 @@ fn titled(title: &str, whose: &str) -> String {
 /// Run a picker dialog for `spec`; blocks the UI thread until the user answers.
 fn pick(spec: &PickSpec, folder: bool) -> Option<PathBuf> {
     let mut dialog = super::file_dialog().set_title(spec.title.as_str());
+    if !spec.file_name.is_empty() {
+        dialog = dialog.set_file_name(spec.file_name.as_str());
+    }
     for (name, exts) in &spec.filters {
         dialog = dialog.add_filter(name.as_str(), exts);
     }

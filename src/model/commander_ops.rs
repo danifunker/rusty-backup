@@ -1225,26 +1225,6 @@ fn resolve_host_conflict(
     }
 }
 
-/// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
-/// filesystem synchronously — the small/local fallback that mirrors the
-/// synchronous copy path. `dest` is a folder or an archive file per `format`.
-pub fn export_now(
-    fs: &mut dyn Filesystem,
-    entries: &[FileEntry],
-    dest: &Path,
-    format: crate::fs::export_selection::ExportFormat,
-    fork_mode: ResourceForkMode,
-) -> Result<crate::fs::export_selection::ExportSummary> {
-    use crate::fs::export_selection::{export_to_file, export_to_folder};
-    let noprog = |_: &str, _: usize, _: u64| {};
-    let never = || false;
-    if format.is_single_file() {
-        export_to_file(fs, entries, dest, format, &noprog, &never)
-    } else {
-        export_to_folder(fs, entries, dest, format, fork_mode, &noprog, &never)
-    }
-}
-
 /// True if the GUI has flipped `cancel_requested`. Checked at every file
 /// boundary; when set, the worker returns early with a cancellation error.
 fn is_cancelled(status: &Arc<Mutex<HostCopyStatus>>) -> bool {

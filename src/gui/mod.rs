@@ -188,6 +188,7 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
                     spec.purpose
                 )
             }
+            Effect::CloseScreen => log::error!("CloseScreen has no screen to close here"),
         }
     }
 }

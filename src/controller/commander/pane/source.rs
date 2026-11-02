@@ -467,18 +467,21 @@ impl CommanderPaneController {
                 title: "Open disk image".into(),
                 filters: image_filters(),
                 save: false,
+                file_name: String::new(),
             })],
             A::PickHostFolder => vec![Effect::PickFolder(PickSpec {
                 purpose: purpose::OPEN_HOST_FOLDER,
                 title: "Open local folder".into(),
                 filters: Vec::new(),
                 save: false,
+                file_name: String::new(),
             })],
             A::PickBackupFolder => vec![Effect::PickFolder(PickSpec {
                 purpose: purpose::OPEN_BACKUP_FOLDER,
                 title: "Open backup folder".into(),
                 filters: Vec::new(),
                 save: false,
+                file_name: String::new(),
             })],
             A::Picked {
                 purpose,
@@ -1055,7 +1058,7 @@ fn finish_open(session: BrowseSession, mut st: BrowseOpenStatus) -> anyhow::Resu
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(in crate::controller::commander) mod tests {
     use super::*;
     use crate::controller::Controller;
     use std::time::{Duration, Instant};

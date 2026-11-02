@@ -13,7 +13,7 @@ use crate::controller::{Controller, Effect};
 
 mod edits;
 mod remote;
-mod source;
+pub(in crate::controller::commander) mod source;
 
 pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
@@ -128,13 +128,6 @@ pub enum CommanderPaneAction {
     Disconnect,
 }
 
-/// Work the view still does for the pane until later slices turn it into jobs and effects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaneRequest {
-    /// Show File Info for this entry name (resolved against the active selection).
-    ShowInfo(String),
-}
-
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
 pub struct CommanderPaneController {
     pub listing: DirListing,
@@ -157,7 +150,8 @@ pub struct CommanderPaneController {
     /// Bumped whenever expanded wrappers are dropped, so a view can discard a stale open.
     wrapper_epoch: u64,
     error: Option<String>,
-    requests: Vec<PaneRequest>,
+    /// File Info asked for by name (double-click, F3); the two-pane controller opens it.
+    info_request: Option<String>,
     /// Effects raised inside navigation helpers, returned at the end of `apply` / `tick`.
     out: Vec<Effect>,
     /// What is open and how: path, partitions, session, open job, pending switch.
@@ -284,7 +278,7 @@ impl CommanderPaneController {
             cursor_at: 0,
             wrapper_epoch: 0,
             error: None,
-            requests: Vec::new(),
+            info_request: None,
             out: Vec::new(),
             src: source::SourceState::new(services),
             ed: edits::EditState::new(),
@@ -324,8 +318,8 @@ impl CommanderPaneController {
         self.error.take()
     }
 
-    pub fn take_requests(&mut self) -> Vec<PaneRequest> {
-        std::mem::take(&mut self.requests)
+    pub(in crate::controller::commander) fn take_info_request(&mut self) -> Option<String> {
+        self.info_request.take()
     }
 
     /// Changes whenever expanded wrappers are dropped, so an in-flight open can tell it is stale.
@@ -498,7 +492,7 @@ impl CommanderPaneController {
         } else {
             self.context_select(&row.name);
         }
-        self.requests.push(PaneRequest::ShowInfo(row.name));
+        self.info_request = Some(row.name);
     }
 
     /// Double-click: `..` goes up, a folder opens, a wrapper toggles, a file shows its info.
@@ -520,7 +514,7 @@ impl CommanderPaneController {
             self.out.extend(fx);
         } else {
             self.context_select(&row.name);
-            self.requests.push(PaneRequest::ShowInfo(row.name));
+            self.info_request = Some(row.name);
         }
     }
 
@@ -803,7 +797,7 @@ mod tests {
         assert_eq!(vm.listing.cwd_path(), root);
         vm.apply(CommanderPaneAction::CursorEnd);
         vm.apply(CommanderPaneAction::ActivateCursor);
-        assert_eq!(vm.take_requests(), [PaneRequest::ShowInfo("f.txt".into())]);
+        assert_eq!(vm.take_info_request().as_deref(), Some("f.txt"));
         assert_eq!(names_selected(&vm), ["f.txt"]);
     }
 

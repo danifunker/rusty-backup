@@ -1,43 +1,20 @@
-//! One Commander pane: a source bar (open image / folder + partition picker +
-//! Apply/Discard), a path line, and a flat single-directory listing grid with
-//! sortable columns, multi-selection, `..` / double-click navigation, and a
-//! per-pane staged-edit queue (delete + copy-in, shown in the virtual overlay).
+//! One Commander pane drawn from its controller: a source bar (open image / folder + partition
+//! picker + Apply / Discard), a path line, and the listing grid with sortable columns, selection,
+//! `..` / double-click navigation and the staged-edit overlay.
 //!
-//! What the pane shows and how it opens (host folder, disk image, backup folder,
-//! Mac archive, optical disc, as jobs) lives in [`CommanderPaneController`]; this
-//! file draws it, maps input to its actions, and answers its pickers and
-//! confirmations and text prompts through an [`EffectHost`]. Staging, Apply, the
-//! review and report, host writes, wrapper expansion and the remote connection are
-//! controller state this file draws.
-//!
-//! Image panes stage edits (Apply writes through); host panes take immediate
-//! writes and never stage; backup panes are read-only (browse + copy-out only).
-//! The cross-pane copy itself lives in [`super::CommanderMode`] (it spans both
-//! panes).
-
-use std::path::PathBuf;
-use std::sync::Arc;
+//! Everything it shows comes from [`CommanderController::pane`]; every click becomes a
+//! [`CommanderAction`] collected into the frame's list, which [`super::CommanderMode`] runs once
+//! drawing is done. The only state here is the view's own: the review's radio choice, the
+//! password field's text and the listing height last sent for Page Up / Page Down.
 
 use eframe::egui;
 
 use disk_core::display::format_size;
-use disk_core::entry::FileEntry;
-use disk_core::filesystem::Filesystem;
-use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::model::commander_ops;
-use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
-use rusty_backup::model::job::{JobRegistry, Snapshot};
-
-use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    CommanderPaneAction, CommanderPaneController, OnConflict, PaneRequest, PaneServices,
-    SortColumn, StageOutcome, MAX_CONSECUTIVE_FAILURES,
+    CommanderAction, CommanderController, CommanderPaneAction, CommanderPaneController,
+    ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
-use rusty_backup::controller::Controller;
-
-use super::super::effects::{EffectHost, Reply};
-use super::Side;
 
 const ROW_H: f32 = 20.0;
 /// Per-depth indent for tree rows, and the width reserved for the `+`/`-`
@@ -72,196 +49,49 @@ fn read_only_badge_color(v: &egui::Visuals) -> egui::Color32 {
     super::super::theme::warning(v)
 }
 
-/// What a pane reports back to [`super::CommanderMode`] after a frame.
-#[derive(Default)]
-pub(crate) struct PaneResponse {
-    /// A status line for the overlay's bottom bar, if anything happened.
-    pub status: Option<String>,
-    /// The user asked (via the row menu) to copy this pane's selection to the
-    /// other pane; `CommanderMode` performs the cross-pane copy.
-    pub copy_to_other: bool,
-    /// The user asked (via the row menu) to export this pane's selection to the
-    /// host using the middle-column "Export as" format; `CommanderMode` runs the
-    /// threaded write.
-    pub export_to_host: bool,
-    /// The user picked a specific format from the row menu's "Export" submenu,
-    /// overriding the dropdown for this one export.
-    pub export_as: Option<ExportFormat>,
-    /// The user asked (via the row menu) to calculate checksums for this pane's
-    /// selection; `CommanderMode` opens the threaded checksum window.
-    pub checksums: bool,
-    /// The user double-clicked a file or chose "File Info..."; carries the
-    /// entry name. `CommanderMode` opens the floating File Info window over it.
-    pub detail: Option<String>,
-    /// The user interacted with (clicked in) this pane this frame, so it becomes
-    /// the "active" pane the middle-column Delete acts on.
-    pub focused: bool,
-    /// Data-changing operations that completed on this pane this frame (a staged
-    /// queue applied, or an immediate host delete / rename / new folder), in the
-    /// order they happened. `CommanderMode` timestamps each and appends it to the
-    /// rolling session log.
-    pub log_events: Vec<String>,
-}
+type A = CommanderAction;
+type P = CommanderPaneAction;
 
-/// Per-frame outcome of the listing grid (which row action, if any, fired).
-#[derive(Default)]
-struct RowActions {
-    status: Option<String>,
-    /// Copy the selection to the other pane.
-    copy: bool,
-    /// Export the selection to the host using the dropdown's "Export as" format.
-    export: bool,
-    /// Export the selection in a format picked from the "Export" submenu.
-    export_as: Option<ExportFormat>,
-    /// Calculate checksums for the selection.
-    checksums: bool,
-    /// Open the File Info window for this entry (by name).
-    detail: Option<String>,
-    /// A row in this pane was clicked/navigated this frame (focus signal).
-    focused: bool,
-}
-
-pub(crate) struct CommanderPane {
-    /// Source, listing, staged edits and wrapper tree, shared with every shell.
-    ctl: CommanderPaneController,
-    /// Pickers and confirmations the controller asks for, answered back to it.
-    effects: EffectHost,
-    /// Status lines from the controller's messages, shown at the end of the frame.
-    statuses: Vec<String>,
+pub(crate) struct PaneView {
     side: Side,
     /// The review window's conflict choice until the user presses Apply.
     review_choice: OnConflict,
     /// The user's in-progress password / passphrase entry for the unlock prompt.
     password_input: String,
-    /// Data-changing operations completed this frame, drained into the
-    /// `PaneResponse` at the end of `show()` for the session log.
-    log_events: Vec<String>,
-    /// Keyboard actions for this pane, run at the start of the next row render.
-    key_actions: Vec<CommanderPaneAction>,
-    /// This is the active pane, so it draws the keyboard cursor.
-    has_focus: bool,
-    /// Rows that fit in the listing, for Page Up / Page Down.
+    /// Rows that fit in the listing, as last sent to the controller.
     page_rows: i32,
 }
 
-impl CommanderPane {
-    /// The rows to draw, from the controller.
-    fn display_rows(&mut self) -> Vec<DisplayRow> {
-        self.ctl.display_rows()
-    }
-
-    pub(crate) fn new(side: Side, jobs: JobRegistry) -> Self {
-        let services = PaneServices {
-            jobs,
-            notify: Arc::new(super::super::ui_logger::EguiWake),
-            recent: Box::new(CommanderRecent(UserConfig)),
-        };
+impl PaneView {
+    pub(crate) fn new(side: Side) -> Self {
         Self {
             side,
-            ctl: CommanderPaneController::with_services(services),
-            effects: EffectHost::default(),
-            statuses: Vec::new(),
             review_choice: OnConflict::Skip,
             password_input: String::new(),
-            log_events: Vec::new(),
-            key_actions: Vec::new(),
-            has_focus: false,
-            page_rows: 1,
+            page_rows: 0,
         }
     }
 
-    /// Run a source action and its effects, answering pickers straight back to the controller.
-    fn act(&mut self, ctx: &egui::Context, action: CommanderPaneAction) {
-        let fx = self.ctl.apply(action);
-        self.run_effects(ctx, fx);
+    fn pane_action(&self, out: &mut Vec<CommanderAction>, action: CommanderPaneAction) {
+        out.push(A::Pane(self.side, action));
     }
 
-    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<rusty_backup::controller::Effect>) {
-        let mut messages = Vec::new();
-        let replies = self.effects.run(ctx, fx, &mut messages);
-        let side = self.side.label();
-        self.statuses
-            .extend(messages.into_iter().map(|m| format!("[{side}] {m}")));
-        self.handle_requests();
-        for reply in replies {
-            self.answer(ctx, reply);
-        }
-    }
-
-    fn answer(&mut self, ctx: &egui::Context, reply: Reply) {
-        let action = match reply {
-            Reply::Picked { purpose, path } => CommanderPaneAction::Picked { purpose, path },
-            Reply::Confirmed { purpose, yes } => CommanderPaneAction::Confirmed { purpose, yes },
-            Reply::Answered { purpose, text } => CommanderPaneAction::Answered { purpose, text },
-        };
-        self.act(ctx, action);
-    }
-
-    /// Requests the controller leaves to the view (File Info).
-    fn handle_requests(&mut self) {
-        let rest = self.ctl.take_requests();
-        if !rest.is_empty() {
-            let mut out = RowActions::default();
-            self.handle_row_requests(rest, &mut out);
-            if let Some(s) = out.status {
-                self.statuses.push(s);
-            }
-        }
-    }
-
-    /// True when the active selection is inside an expanded wrapper. In that
-    /// state the pane's copy source is the mounted wrapper filesystem rather
-    /// than the base listing — `selected_entries` / `fs_mut` / `is_host_pane` /
-    /// `session` all switch to the wrapper context so the existing copy
-    /// dispatch pulls files straight out.
-    fn tree_active(&self) -> bool {
-        self.ctl.tree_active()
-    }
-
-    fn tree_selection(&self) -> Option<(String, Vec<FileEntry>)> {
-        self.ctl.tree_selection()
-    }
-
-    /// Drop this pane's in-memory recent-files mirror (the Settings dialog
-    /// cleared the persisted lists).
-    pub(crate) fn clear_recent_files(&mut self) {
-        self.ctl.apply(CommanderPaneAction::RecentCleared);
-    }
-
-    /// Number of staged (unapplied) edits on this pane.
-    pub(crate) fn staged_count(&self) -> usize {
-        self.ctl.queue.len()
-    }
-
-    /// Discard all staged edits (used by the overlay's Close guard).
-    pub(crate) fn discard_edits(&mut self) {
-        self.ctl.queue.clear();
-    }
-
-    /// Render the pane. Returns status + any cross-pane request for the overlay.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, active: bool) -> PaneResponse {
-        self.has_focus = active;
-        let fx = self.ctl.tick();
-        self.run_effects(ui.ctx(), fx);
-        let mut status = None;
-        let mut cancel_open = false;
-        let mut copy_to_other = false;
-        let mut export_to_host = false;
-        let mut export_as: Option<ExportFormat> = None;
-        let mut checksums = false;
-        let mut detail = None;
-        let mut focused = false;
-
-        if let Some(s) = self.source_bar(ui) {
-            status = Some(s);
-        }
-        if let Some(s) = self.path_line(ui) {
-            status = Some(s);
-        }
+    /// Draw the pane; `active` draws the keyboard cursor and `scroll` brings it into view.
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        active: bool,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let pane = ctl.pane(self.side);
+        self.source_bar(ui, pane, out);
+        self.path_line(ui, pane, out);
         ui.separator();
 
         // A wrapper expanding as a job: a spinner and its phase above the still-visible listing.
-        if let Some((name, snap)) = self.ctl.wrapper_opening() {
+        if let Some((name, snap)) = pane.wrapper_opening() {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
@@ -273,8 +103,7 @@ impl CommanderPane {
             });
             ui.ctx().request_repaint();
         }
-
-        if self.ctl.checking().is_some() {
+        if pane.checking().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -283,383 +112,100 @@ impl CommanderPane {
             });
             ui.ctx().request_repaint();
         }
-        if let Some(snap) = self.ctl.host_writing() {
+        if let Some(snap) = pane.host_writing() {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 super::super::progress::show_job(ui, &snap);
             });
         }
-        if self.ctl.applying().is_some() {
+        if pane.applying().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label("Applying staged edits...");
             });
-        } else if let Some(snap) = self.ctl.opening() {
+        } else if let Some(snap) = pane.opening() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 if super::super::progress::show_job(ui, &snap) {
-                    cancel_open = true;
+                    self.pane_action(out, P::CancelOpen);
                 }
             });
-        } else if self.ctl.is_opening() {
+        } else if pane.is_opening() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label("Opening...");
             });
-        } else if self.ctl.needs_password() {
-            // Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
-            let is_apfs = self.ctl.volume().fs_type == "APFS";
-            let mut submit = false;
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                if is_apfs {
-                    ui.label("This APFS volume is encrypted with FileVault.");
-                    ui.add_space(4.0);
-                    ui.label("Enter the volume password or personal recovery key.");
-                } else {
-                    ui.label("This source is password-protected.");
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.password_input)
-                            .password(true)
-                            .desired_width(220.0),
-                    );
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Unlock").clicked() || enter {
-                        submit = true;
-                    }
-                });
-            });
-            if submit {
-                let secret = std::mem::take(&mut self.password_input);
-                self.act(ui.ctx(), CommanderPaneAction::SubmitPassword(secret));
-            }
-        } else if let Some(err) = self.ctl.source_error().map(str::to_string) {
+        } else if pane.needs_password() {
+            self.unlock_prompt(ui, pane, out);
+        } else if let Some(err) = pane.source_error() {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
-        } else if self.ctl.listing.is_loaded() {
-            self.render_header(ui);
-            let actions = self.render_rows(ui);
-            if actions.status.is_some() {
-                status = actions.status;
-            }
-            copy_to_other = actions.copy;
-            export_to_host = actions.export;
-            export_as = actions.export_as;
-            checksums = actions.checksums;
-            detail = actions.detail;
-            focused = actions.focused;
+        } else if pane.listing.is_loaded() {
+            self.render_header(ui, pane, out);
+            self.render_rows(ui, ctl, active, scroll, out);
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
             });
         }
 
-        if cancel_open {
-            self.act(ui.ctx(), CommanderPaneAction::CancelOpen);
-        }
-        let side = self.side.label();
-        if let Some(reply) = self.effects.show(ui.ctx(), side) {
-            self.answer(ui.ctx(), reply);
-        }
-        self.render_edits_popup(ui.ctx());
-        self.render_apply_review(ui.ctx());
-        if let Some(s) = self.render_apply_report(ui.ctx()) {
-            status = Some(s);
-        }
-
-        self.key_actions.clear();
-        if let Some(s) = self.take_status() {
-            status = Some(s);
-        }
-        for line in self.ctl.take_log() {
-            self.log_events.push(format!("[{side}] {line}"));
-        }
-        PaneResponse {
-            status,
-            copy_to_other,
-            export_to_host,
-            export_as,
-            checksums,
-            detail,
-            focused,
-            log_events: std::mem::take(&mut self.log_events),
-        }
+        self.render_edits_popup(ui.ctx(), pane, out);
+        self.render_apply_review(ui.ctx(), pane, out);
+        self.render_apply_report(ui.ctx(), pane, out);
     }
 
-    /// True when this pane is browsing a remote daemon's *host* filesystem (the
-    /// file browser), where a file can be opened as an image.
-    pub(crate) fn is_remote_host(&self) -> bool {
-        self.ctl.is_remote_host()
-    }
-
-    /// The daemon address (`host:port`) this pane is connected to, if remote.
-    /// Used to open a fresh connection for an upload worker.
-    pub(crate) fn remote_addr(&self) -> Option<String> {
-        self.ctl.remote_addr()
-    }
-
-    // --- accessors used by CommanderMode for cross-pane copy ---------------
-
-    /// True when this pane can receive a copy: something is open, nothing runs, and it is writable.
-    pub(crate) fn can_receive(&self) -> bool {
-        self.ctl.can_receive()
-    }
-
-    /// Read-only media (archive, optical disc, backup), for the header's "Read-only" badge.
-    pub(crate) fn is_read_only(&self) -> bool {
-        self.ctl.is_read_only()
-    }
-
-    /// Why a copy into this pane is refused, for the copy button's hover.
-    pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
-        self.ctl.readonly_reason()
-    }
-
-    /// True when this pane lists a host-OS folder rather than a disk image.
-    /// When a wrapper selection is active the effective source is the mounted
-    /// wrapper filesystem (not the host), so report `false`.
-    pub(crate) fn is_host_pane(&self) -> bool {
-        !self.tree_active() && self.ctl.listing.is_host()
-    }
-
-    /// True when this pane lists a (read-only) backup folder's contents — native
-    /// rusty-backup or Clonezilla. Backups can be browsed and copied *out of*,
-    /// but not edited: writing to a raw backup's partition file would silently
-    /// desync its `metadata.json` checksum, zstd backups have no in-place
-    /// editable session, and Clonezilla images are read-through a block cache.
-    pub(crate) fn is_backup_pane(&self) -> bool {
-        self.ctl.is_backup()
-    }
-
-    /// True when this pane's source is a read-only Mac archive
-    /// (`ArchiveFilesystem`). Like a backup pane, it can be browsed and copied
-    /// out of, but not edited or copied into.
-    pub(crate) fn is_archive_pane(&self) -> bool {
-        self.ctl.is_archive()
-    }
-
-    /// How a copy or checksum worker reopens this pane's selection source.
-    pub(crate) fn copy_stage_source(&self) -> Option<commander_ops::StageSource> {
-        self.ctl.copy_stage_source()
-    }
-
-    /// The local apply job, for the progress modal.
-    pub(crate) fn apply_job(&self) -> Option<Snapshot> {
-        self.ctl.applying()
-    }
-
-    /// Re-read the current directory listing (after an immediate host write).
-    pub(crate) fn reload_listing(&mut self) {
-        self.ctl.apply(CommanderPaneAction::Reload);
-        self.ctl.take_error();
-    }
-
-    /// Delete the selection (the middle-column Delete): staged on an image, confirmed then immediate on a host.
-    pub(crate) fn delete_selection(&mut self, ctx: &egui::Context) -> String {
-        self.act(ctx, CommanderPaneAction::Delete);
-        self.take_status().unwrap_or_default()
-    }
-
-    /// Queues a keyboard action for this pane; it runs when the listing next renders.
-    pub(crate) fn key_action(&mut self, action: CommanderPaneAction) {
-        self.key_actions.push(action);
-    }
-
-    /// Rows that fit in the listing, the step for Page Up / Page Down.
-    pub(crate) fn page_rows(&self) -> i32 {
-        self.page_rows
-    }
-
-    /// True while one of this pane's dialogs waits for an answer, so shortcuts stand down.
-    pub(crate) fn modal_open(&self) -> bool {
-        self.effects.modal_open()
-            || self.ctl.apply_review().is_some()
-            || self.ctl.apply_report().is_some()
-    }
-
-    /// The Apply button and F10.
-    pub(crate) fn apply_now(&mut self, ctx: &egui::Context) -> String {
-        if !self.ctl.can_apply() {
-            return String::new();
-        }
-        self.act(ctx, CommanderPaneAction::Apply);
-        self.take_status().unwrap_or_default()
-    }
-
-    /// A pane action from the keyboard or a button whose effects must run now (prompts, confirms).
-    pub(crate) fn command(&mut self, ctx: &egui::Context, action: CommanderPaneAction) -> String {
-        self.act(ctx, action);
-        self.take_status().unwrap_or_default()
-    }
-
-    /// True when at least one row is selected (base listing or a wrapper).
-    pub(crate) fn has_selection(&self) -> bool {
-        self.tree_active() || !self.ctl.listing.selection().is_empty()
-    }
-
-    /// The selected entries (owned clones) — from the active wrapper mount when
-    /// a tree selection is live, otherwise the base current directory.
-    pub(crate) fn selected_entries(&self) -> Vec<FileEntry> {
-        if let Some((_, entries)) = self.tree_selection() {
-            return entries;
-        }
-        self.ctl
-            .listing
-            .selected_entries()
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-
-    /// The current directory entry (copy destination parent).
-    pub(crate) fn cwd_entry(&self) -> Option<FileEntry> {
-        self.ctl.listing.cwd().cloned()
-    }
-
-    /// Mutable access to the open filesystem (to extract files for a copy).
-    /// Returns the active wrapper mount when a tree selection is live.
-    pub(crate) fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
-        if let Some((mount, _)) = self.tree_selection() {
-            return self.ctl.wrapper_tree.mount_fs(&mount);
-        }
-        self.ctl.listing.fs_mut()
-    }
-
-    /// Mutable access to this pane's staged-edit queue (so the File Info window
-    /// can stage metadata edits onto it).
-    pub(crate) fn queue_mut(&mut self) -> &mut EditQueue {
-        &mut self.ctl.queue
-    }
-
-    /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
-    /// for a host pane or before a source is opened.
-    pub(crate) fn fs_type(&self) -> &str {
-        &self.ctl.volume().fs_type
-    }
-
-    /// Look up an entry by name in the current directory and read up to `max`
-    /// bytes of its data for the File Info preview. Returns the entry plus its
-    /// bytes (`None` for a directory or on read error). Drives `open_detail`.
-    pub(crate) fn detail_payload(
+    /// Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
+    fn unlock_prompt(
         &mut self,
-        name: &str,
-        max: usize,
-    ) -> Option<(FileEntry, Option<Vec<u8>>)> {
-        // A wrapper-tree row (a file inside an expanded .sit / .toast / disk-image
-        // wrapper): resolve against the active tree selection — a right-click
-        // selects the row first — and read through the mounted wrapper fs.
-        if self.tree_active() {
-            let (_, entries) = self.tree_selection()?;
-            let entry = entries.into_iter().find(|e| e.name == name)?;
-            if !entry.is_file() {
-                return Some((entry, None));
+        ui: &mut egui::Ui,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let is_apfs = pane.volume().fs_type == "APFS";
+        let mut submit = false;
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            if is_apfs {
+                ui.label("This APFS volume is encrypted with FileVault.");
+                ui.add_space(4.0);
+                ui.label("Enter the volume password or personal recovery key.");
+            } else {
+                ui.label("This source is password-protected.");
             }
-            let data = self.fs_mut().and_then(|fs| fs.read_file(&entry, max).ok());
-            return Some((entry, data));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Unlock").clicked() || enter {
+                    submit = true;
+                }
+            });
+        });
+        if submit {
+            let secret = std::mem::take(&mut self.password_input);
+            self.pane_action(out, P::SubmitPassword(secret));
         }
-        let entry = self
-            .ctl
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.name == name)
-            .cloned()?;
-        if !entry.is_file() {
-            return Some((entry, None));
-        }
-        let data = if self.ctl.listing.is_host() {
-            read_host_file_capped(&entry.path, max)
-        } else {
-            self.ctl
-                .listing
-                .fs_mut()
-                .and_then(|fs| fs.read_file(&entry, max).ok())
-        };
-        Some((entry, data))
-    }
-
-    /// True when an expanded-wrapper row is the active selection. Its contents
-    /// are read-only (copy out, don't edit), so File Info shows no editors.
-    pub(crate) fn wrapper_selection_active(&self) -> bool {
-        self.tree_active()
-    }
-
-    /// The filesystem type to show in File Info: the mounted wrapper's type
-    /// when a tree selection is active (e.g. "HFS" for a file inside a `.toast`
-    /// opened through a `.sit`), else the base pane's type.
-    /// The on-disk extended attributes of `entry`, for the File Info window.
-    /// Empty on a filesystem without xattr support (or when unreadable) — this
-    /// is display metadata, never a hard failure.
-    pub(crate) fn detail_xattrs(&mut self, entry: &FileEntry) -> Vec<disk_core::xattr::Xattr> {
-        self.fs_mut()
-            .filter(|fs| fs.supports_xattrs())
-            .and_then(|fs| fs.list_xattrs(entry).ok())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn detail_fs_type(&mut self) -> String {
-        if let Some((mount, _)) = self.tree_selection() {
-            if let Some(fs) = self.ctl.wrapper_tree.mount_fs(&mount) {
-                return fs.fs_type().to_string();
-            }
-        }
-        self.fs_type().to_string()
-    }
-
-    /// True when this pane is browsing a remote daemon (host FS or an image on
-    /// it). Cross-pane callers use this to gate in-place edits that the remote
-    /// write path doesn't carry yet (delete / rename over the wire).
-    pub(crate) fn is_remote(&self) -> bool {
-        self.ctl.is_remote()
-    }
-
-    /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
-    /// A directory opens as a host folder, a file as an image; staged edits defer
-    /// the switch behind the discard-confirmation, mirroring the source picker.
-    pub(crate) fn open_dropped(&mut self, ctx: &egui::Context, path: PathBuf) -> String {
-        self.act(ctx, CommanderPaneAction::OpenPath(path));
-        if self.effects.modal_open() {
-            return format!(
-                "[{}] discard staged edits to open a new source.",
-                self.side.label()
-            );
-        }
-        self.take_status().unwrap_or_default()
-    }
-
-    /// The newest controller message, dropping older ones from the same frame.
-    fn take_status(&mut self) -> Option<String> {
-        let last = self.statuses.pop();
-        self.statuses.clear();
-        last
-    }
-
-    /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
-    pub(crate) fn stage_edits(&mut self, edits: Vec<StagedEdit>) -> StageOutcome {
-        self.ctl.stage_edits(edits)
-    }
-
-    /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
-    pub(crate) fn unstage_since(&mut self, queue_start: usize) -> bool {
-        self.ctl.unstage_since(queue_start)
     }
 
     // --- source bar --------------------------------------------------------
 
-    fn source_bar(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        use CommanderPaneAction as A;
-        let mut status = None;
+    fn source_bar(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
         let mut source_action = None;
-        let mut apply = false;
 
         // Row 1: source selection + pane lifecycle (Close / Apply / Discard).
         // Wrapped so the picker + lifecycle buttons flow onto a second line on a
@@ -668,11 +214,11 @@ impl CommanderPane {
             // Shared source picker (R1): the same ComboBox widget the Inspect
             // tab uses, here offering an image file or a host folder. Image
             // opens are not materialized (BrowseSession peels the container).
-            let is_backup = self.ctl.is_backup();
-            let source = self.ctl.source_path().map(|p| p.to_path_buf());
-            let current_label = if let Some(label) = self.ctl.remote_label() {
+            let is_backup = pane.is_backup();
+            let source = pane.source_path().map(|p| p.to_path_buf());
+            let current_label = if let Some(label) = pane.remote_label() {
                 label
-            } else if self.ctl.listing.is_host() {
+            } else if pane.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
                 match &source {
@@ -684,7 +230,7 @@ impl CommanderPane {
                 }
             } else if let Some(p) = &source {
                 let base = p.file_name().unwrap_or_default().to_string_lossy();
-                if self.ctl.is_archive() {
+                if pane.is_archive() {
                     format!("Archive: {base}")
                 } else {
                     format!("Image: {base}")
@@ -712,13 +258,13 @@ impl CommanderPane {
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
-                image_active: source.is_some() && !self.ctl.listing.is_host() && !is_backup,
-                host_active: self.ctl.listing.is_host(),
+                image_active: source.is_some() && !pane.listing.is_host() && !is_backup,
+                host_active: pane.listing.is_host(),
                 backup_active: is_backup,
                 devices: &[],
                 // Merged recent list (newest 3 per mode) shown as a group inside
                 // this same dropdown — no extra combo crowding the source bar.
-                recent: self.ctl.recent(),
+                recent: pane.recent(),
             };
             let id = format!("commander_source_{}", self.side.idx());
             if let Some(ev) =
@@ -727,60 +273,60 @@ impl CommanderPane {
                 use super::super::source_picker::SourceEvent;
                 match ev {
                     // A recent pick opens like a drag-and-drop: a folder as a host folder, a file as an image.
-                    SourceEvent::Recent(path) => source_action = Some(A::OpenPath(path)),
-                    SourceEvent::Image { path, .. } => source_action = Some(A::OpenImage(path)),
-                    SourceEvent::HostFolder(dir) => source_action = Some(A::OpenHostFolder(dir)),
+                    SourceEvent::Recent(path) => source_action = Some(P::OpenPath(path)),
+                    SourceEvent::Image { path, .. } => source_action = Some(P::OpenImage(path)),
+                    SourceEvent::HostFolder(dir) => source_action = Some(P::OpenHostFolder(dir)),
                     SourceEvent::BackupFolder(dir) => {
-                        source_action = Some(A::OpenBackupFolder(dir))
+                        source_action = Some(P::OpenBackupFolder(dir))
                     }
-                    SourceEvent::PickImage => source_action = Some(A::PickImage),
-                    SourceEvent::PickHostFolder => source_action = Some(A::PickHostFolder),
-                    SourceEvent::PickBackupFolder => source_action = Some(A::PickBackupFolder),
+                    SourceEvent::PickImage => source_action = Some(P::PickImage),
+                    SourceEvent::PickHostFolder => source_action = Some(P::PickHostFolder),
+                    SourceEvent::PickBackupFolder => source_action = Some(P::PickBackupFolder),
                     SourceEvent::Device(_) => {}
-                    SourceEvent::Remote => source_action = Some(A::Connect),
+                    SourceEvent::Remote => source_action = Some(P::Connect),
                 }
             }
 
             // When inside a remote image, "Close Image" steps back to the host
             // browser (the folder it was opened from) — distinct from "Close",
             // which unloads the whole connection.
-            if self.ctl.is_remote_image() {
+            if pane.is_remote_image() {
                 let btn = egui::Button::new(
                     egui::RichText::new("Close Image").color(close_image_color(ui.visuals())),
                 );
                 if ui
-                    .add_enabled(self.ctl.queue.is_empty(), btn)
+                    .add_enabled(pane.queue.is_empty(), btn)
                     .on_hover_text("Back to browsing the remote host filesystem")
                     .clicked()
                 {
-                    source_action = Some(A::CloseRemoteImage);
+                    source_action = Some(P::CloseRemoteImage);
                 }
             }
 
             // Close (unload) this pane — guarded by unsaved staged edits.
-            if (source.is_some() || self.ctl.listing.is_loaded())
+            if (source.is_some() || pane.listing.is_loaded())
                 && ui
                     .button("Close")
                     .on_hover_text("Unload this pane / disconnect")
                     .clicked()
             {
-                source_action = Some(A::CloseSource);
+                source_action = Some(P::CloseSource);
             }
 
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups / archives are
             // read-only).
-            if self.ctl.stages_edits() {
-                let n = self.ctl.queue.len();
-                let busy = self.ctl.is_busy();
+            if pane.stages_edits() {
+                let n = pane.queue.len();
+                let busy = pane.is_busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
-                        apply = true;
+                        source_action = Some(P::Apply);
                     }
                 });
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button("Discard").clicked() {
-                        source_action = Some(A::Discard);
+                        source_action = Some(P::Discard);
                     }
                 });
                 if n > 0
@@ -789,7 +335,7 @@ impl CommanderPane {
                         .on_hover_text("Review the pending staged edits")
                         .clicked()
                 {
-                    source_action = Some(A::ShowEdits(!self.ctl.edits_shown()));
+                    source_action = Some(P::ShowEdits(!pane.edits_shown()));
                 }
             }
         });
@@ -797,20 +343,20 @@ impl CommanderPane {
         // Row 2: partition switcher + New Folder + volume readout. Wrapped so on
         // a narrow pane the volume readout flows onto a second line instead of
         // overlapping the New Folder button.
-        if self.ctl.listing.is_loaded() {
+        if pane.listing.is_loaded() {
             ui.horizontal_wrapped(|ui| {
                 // Filesystem / partition dropdown (image panes only; host
                 // folders have none). An optical disc lists its filesystems
                 // (ISO 9660 + any hybrid Mac side); every other image lists its
                 // partition-table entries.
-                if !self.ctl.listing.is_host() {
-                    let labels = self.ctl.partition_labels();
-                    let empty_text = if self.ctl.is_optical() {
+                if !pane.listing.is_host() {
+                    let labels = pane.partition_labels();
+                    let empty_text = if pane.is_optical() {
                         "(no filesystems)"
                     } else {
                         "(no partitions)"
                     };
-                    let selected = self.ctl.selected_partition();
+                    let selected = pane.selected_partition();
                     let current = selected
                         .and_then(|i| labels.get(i).cloned())
                         .unwrap_or_else(|| empty_text.to_string());
@@ -826,7 +372,7 @@ impl CommanderPane {
                         });
                     if chosen != selected {
                         if let Some(i) = chosen {
-                            source_action = Some(A::SelectPartition(i));
+                            source_action = Some(P::SelectPartition(i));
                         }
                     }
                 }
@@ -834,23 +380,23 @@ impl CommanderPane {
                 // New Folder: stages a CreateDirectory on an image pane;
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
-                if self.ctl.can_new_folder()
+                if pane.can_new_folder()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
                         .clicked()
                 {
-                    source_action = Some(A::RequestNewFolder);
+                    source_action = Some(P::RequestNewFolder);
                 }
 
                 // Volume label + free space. Rendered inline (not right-aligned)
                 // so on a narrow pane it wraps to a second line rather than
                 // overflowing left into the New Folder button.
                 ui.separator();
-                if self.ctl.listing.is_host() {
+                if pane.listing.is_host() {
                     ui.strong("local folder");
                 } else {
-                    let vol = self.ctl.volume().clone();
+                    let vol = pane.volume();
                     let label = if vol.label.is_empty() {
                         vol.fs_type.clone()
                     } else {
@@ -863,7 +409,7 @@ impl CommanderPane {
                     // Read-only media (archive / backup / remote host): flag it so
                     // the greyed copy-into button reads as "by design", and edits
                     // aren't attempted.
-                    if self.is_read_only() {
+                    if pane.is_read_only() {
                         ui.separator();
                         ui.colored_label(read_only_badge_color(ui.visuals()), "Read-only")
                             .on_hover_text(
@@ -875,23 +421,23 @@ impl CommanderPane {
             });
         }
         if let Some(action) = source_action {
-            self.act(ui.ctx(), action);
+            self.pane_action(out, action);
         }
-        if apply {
-            status = Some(self.apply_now(ui.ctx()));
-        }
-        status
     }
 
     /// The "Pending edits" list: every staged edit in plain words, in apply order, each removable.
-    fn render_edits_popup(&mut self, ctx: &egui::Context) {
-        if !self.ctl.edits_shown() {
+    fn render_edits_popup(
+        &self,
+        ctx: &egui::Context,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        if !pane.edits_shown() {
             return;
         }
         let mut open = true;
-        let mut unstage = None;
-        let busy = self.ctl.is_busy();
-        let lines = self.ctl.edit_lines();
+        let busy = pane.is_busy();
+        let lines = pane.edit_lines();
         egui::Window::new(format!("Pending edits ({})", self.side.label()))
             .open(&mut open)
             .resizable(true)
@@ -911,36 +457,37 @@ impl CommanderPane {
                                     .on_hover_text("Remove this edit from the queue")
                                     .clicked()
                                 {
-                                    unstage = Some(i);
+                                    self.pane_action(out, P::Unstage(i));
                                 }
                                 ui.label(format!("{}. {line}", i + 1));
                             });
                         }
                     });
             });
-        if let Some(i) = unstage {
-            self.act(ctx, CommanderPaneAction::Unstage(i));
-        }
         if !open {
-            self.act(ctx, CommanderPaneAction::ShowEdits(false));
+            self.pane_action(out, P::ShowEdits(false));
         }
     }
 
     /// The partition tag and the cwd as crumbs; clicking a crumb navigates there.
-    fn path_line(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let mut go: Option<String> = None;
+    fn path_line(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let prefix = if self.ctl.listing.is_host() {
+            let prefix = if pane.listing.is_host() {
                 "host ".to_string()
             } else {
-                match self.ctl.selected_partition() {
+                match pane.selected_partition() {
                     Some(i) => format!("@{} ", i + 1),
                     None => "- ".to_string(),
                 }
             };
             ui.monospace(prefix);
-            let crumbs = self.ctl.path_crumbs();
+            let crumbs = pane.path_crumbs();
             if crumbs.is_empty() {
                 ui.monospace("/");
             }
@@ -950,7 +497,7 @@ impl CommanderPane {
                 match target {
                     Some(t) if i < last => {
                         if ui.link(text).clicked() {
-                            go = Some(t);
+                            self.pane_action(out, P::NavigateTo(t));
                         }
                     }
                     _ => {
@@ -959,16 +506,17 @@ impl CommanderPane {
                 }
             }
         });
-        let mut out = RowActions::default();
-        let ctx = ui.ctx().clone();
-        self.dispatch(&ctx, CommanderPaneAction::NavigateTo(go?), &mut out);
-        out.status
     }
 
     // --- apply: the review and report are views over controller state ------
 
-    fn render_apply_review(&mut self, ctx: &egui::Context) {
-        let Some(p) = self.ctl.apply_review() else {
+    fn render_apply_review(
+        &mut self,
+        ctx: &egui::Context,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let Some(p) = pane.apply_review() else {
             self.review_choice = OnConflict::Skip;
             return;
         };
@@ -1035,19 +583,26 @@ impl CommanderPane {
                     }
                 });
             });
-        let action = match go {
-            Some(true) => CommanderPaneAction::ApplyReviewed(self.review_choice),
-            Some(false) => CommanderPaneAction::DismissReview,
-            None => return,
-        };
-        self.act(ctx, action);
+        match go {
+            Some(true) => self.pane_action(out, P::ApplyReviewed(self.review_choice)),
+            Some(false) => self.pane_action(out, P::DismissReview),
+            None => {}
+        }
     }
 
-    fn render_apply_report(&mut self, ctx: &egui::Context) -> Option<String> {
-        let report = self.ctl.apply_report()?;
+    fn render_apply_report(
+        &self,
+        ctx: &egui::Context,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let Some(report) = pane.apply_report() else {
+            return;
+        };
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
-        let still = self.ctl.queue.len();
-        let mut action = None;
+        let still = pane.queue.len();
+        let mut then = None;
+        let mut dismiss = false;
         egui::Window::new(format!("Apply report ({})", self.side.label()))
             .collapsible(false)
             .resizable(true)
@@ -1090,7 +645,8 @@ impl CommanderPane {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if still > 0 && ui.button("Retry").clicked() {
-                        action = Some(0);
+                        dismiss = true;
+                        then = Some(P::Apply);
                     }
                     if still > 0
                         && ui
@@ -1098,25 +654,30 @@ impl CommanderPane {
                             .on_hover_text("Drop the edits that did not apply")
                             .clicked()
                     {
-                        action = Some(1);
+                        dismiss = true;
+                        then = Some(P::Discard);
                     }
                     if ui.button("Close").clicked() {
-                        action = Some(2);
+                        dismiss = true;
                     }
                 });
             });
-        let action = action?;
-        self.act(ctx, CommanderPaneAction::DismissReport);
-        match action {
-            0 => Some(self.apply_now(ctx)),
-            1 => Some(self.command(ctx, CommanderPaneAction::Discard)),
-            _ => None,
+        if dismiss {
+            self.pane_action(out, P::DismissReport);
+        }
+        if let Some(action) = then {
+            self.pane_action(out, action);
         }
     }
 
     // --- listing grid ------------------------------------------------------
 
-    fn render_header(&mut self, ui: &mut egui::Ui) {
+    fn render_header(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &CommanderPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), ROW_H),
             egui::Sense::click(),
@@ -1125,8 +686,8 @@ impl CommanderPane {
         let mid = rect.center().y;
         let font = egui::FontId::proportional(13.0);
         let color = ui.visuals().strong_text_color();
-        let active = self.ctl.listing.sort_column();
-        let desc = self.ctl.listing.is_descending();
+        let active = pane.listing.sort_column();
+        let desc = pane.listing.is_descending();
         let caret = |col: SortColumn| -> &'static str {
             if col != active {
                 ""
@@ -1191,49 +752,44 @@ impl CommanderPane {
                 } else {
                     SortColumn::Type
                 };
-                self.ctl.apply(CommanderPaneAction::SortBy(clicked));
+                self.pane_action(out, P::SortBy(clicked));
             }
         }
     }
 
-    fn render_rows(&mut self, ui: &mut egui::Ui) -> RowActions {
-        let mut out = RowActions::default();
-        let ctx = ui.ctx().clone();
-        let keyed = !self.key_actions.is_empty();
-        for action in std::mem::take(&mut self.key_actions) {
-            self.dispatch(&ctx, action, &mut out);
+    fn render_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        active: bool,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let side = self.side;
+        let pane = ctl.pane(side);
+        let rows = pane.rows();
+        let cursor = if active { pane.cursor_index() } else { None };
+        let page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
+        if page_rows != self.page_rows {
+            self.page_rows = page_rows;
+            out.push(A::SetPageRows(side, page_rows));
         }
-        let rows = self.display_rows();
-        let cursor = if self.has_focus {
-            self.ctl.cursor_index()
-        } else {
-            None
-        };
-        self.page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
-        let busy = self.ctl.applying().is_some();
+        let busy = pane.applying().is_some();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
-        let host_pane = self.ctl.listing.is_host();
+        let host_pane = pane.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
         // delete or rename (both would mutate the backup).
-        let read_only = self.ctl.is_backup();
+        let read_only = pane.is_backup();
         // On a remote *host* pane, a file can be opened as a disk image.
-        let remote_host = self.is_remote_host();
+        let remote_host = pane.is_remote_host();
 
         // Row clicks this frame, run through the controller in order once drawing is done.
         let mut acts: Vec<CommanderPaneAction> = Vec::new();
-        let mut m_delete = false;
-        let mut m_copy = false;
-        let mut m_export = false;
-        let mut m_export_as: Option<ExportFormat> = None;
-        let mut m_checksums = false;
-        let mut m_rename: Option<String> = None;
-        let mut m_cancel_rename: Option<String> = None;
-        let mut m_info: Option<String> = None;
-        let mut m_open_image: Option<String> = None;
+        let mut after: Vec<CommanderAction> = Vec::new();
 
         egui::ScrollArea::vertical()
-            .id_salt(("commander_rows", self.side.idx()))
+            .id_salt(("commander_rows", side.idx()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mods = ui.input(|i| i.modifiers);
@@ -1245,9 +801,9 @@ impl CommanderPane {
                     let selected = if row.is_parent() {
                         false
                     } else if row.is_tree {
-                        self.ctl.tree_selected.contains(&row.node_id)
+                        pane.tree_selected.contains(&row.node_id)
                     } else {
-                        self.ctl.listing.is_selected(&row.name)
+                        pane.listing.is_selected(&row.name)
                     };
                     if selected {
                         ui.painter().rect_filled(
@@ -1269,7 +825,7 @@ impl CommanderPane {
                             egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color),
                             egui::StrokeKind::Inside,
                         );
-                        if keyed {
+                        if scroll {
                             ui.scroll_to_rect(rect, None);
                         }
                     }
@@ -1287,21 +843,21 @@ impl CommanderPane {
                     };
                     if resp.double_clicked() {
                         acts.push(if hit_toggle(&resp) {
-                            CommanderPaneAction::ToggleWrapper(row.node_id.clone())
+                            P::ToggleWrapper(row.node_id.clone())
                         } else {
-                            CommanderPaneAction::Activate(row.node_id.clone())
+                            P::Activate(row.node_id.clone())
                         });
                     } else if resp.clicked() {
                         if hit_toggle(&resp) {
-                            acts.push(CommanderPaneAction::ToggleWrapper(row.node_id.clone()));
+                            acts.push(P::ToggleWrapper(row.node_id.clone()));
                         } else if row.is_tree {
-                            acts.push(CommanderPaneAction::TreeClick {
+                            acts.push(P::TreeClick {
                                 node_id: row.node_id.clone(),
                                 ctrl: mods.command,
                                 shift: mods.shift,
                             });
                         } else if !row.is_parent() {
-                            acts.push(CommanderPaneAction::Click {
+                            acts.push(P::Click {
                                 name: row.name.clone(),
                                 ctrl: mods.command,
                                 shift: mods.shift,
@@ -1312,107 +868,13 @@ impl CommanderPane {
                     // Right-click a data row for its actions.
                     if !row.is_parent() && !busy {
                         let menu = resp.context_menu(|ui| {
-                            // On a remote host pane, offer to open a file as an
-                            // image (browse inside it).
-                            if remote_host
-                                && !row.is_dir
-                                && !row.is_tree
-                                && ui.button("Open Image").clicked()
-                            {
-                                m_open_image = Some(row.name.clone());
-                                ui.close();
-                            }
-                            // Copy applies to real / pending-delete rows, not a
-                            // not-yet-applied staged add.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Copy to other pane").clicked()
-                            {
-                                m_copy = true;
-                                ui.close();
-                            }
-                            // Export the selection to the host. "Export to hard
-                            // drive..." uses the middle-column "Export as" format;
-                            // the "Export" submenu picks a format inline. Needs
-                            // real data, so a not-yet-applied staged add is out.
-                            if !matches!(row.kind, RowKind::PendingAdd) {
-                                if ui.button("Export to hard drive...").clicked() {
-                                    m_export = true;
-                                    ui.close();
-                                }
-                                ui.menu_button("Export as", |ui| {
-                                    for fmt in ExportFormat::ALL {
-                                        if ui.button(fmt.label()).clicked() {
-                                            m_export_as = Some(fmt);
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                            }
-                            // Checksums need real data, so a not-yet-applied
-                            // staged add is excluded (same as Copy / Export).
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Calculate checksums...").clicked()
-                            {
-                                m_checksums = true;
-                                ui.close();
-                            }
-                            // File Info / Details: metadata + preview. Available
-                            // for base-listing rows AND wrapper-tree rows (files
-                            // inside a .sit / .toast / disk-image wrapper), which
-                            // resolve through the mounted wrapper filesystem.
-                            // Needs real data, so a not-yet-applied add is excluded.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("File Info / Details...").clicked()
-                            {
-                                m_info = Some(row.name.clone());
-                                ui.close();
-                            }
-                            // Edit actions are base-listing only — a wrapper's
-                            // contents are read-only (copy out, don't mutate).
-                            if !row.is_tree {
-                                // Rename a single entry in place. A row with a
-                                // rename already staged offers to cancel it
-                                // instead. Suppressed on a read-only backup pane.
-                                if !read_only {
-                                    if matches!(row.kind, RowKind::PendingRename)
-                                        && ui.button("Cancel rename").clicked()
-                                    {
-                                        m_cancel_rename = Some(row.name.clone());
-                                        ui.close();
-                                    } else if matches!(row.kind, RowKind::Normal)
-                                        && ui.button("Rename...").clicked()
-                                    {
-                                        m_rename = Some(row.name.clone());
-                                        ui.close();
-                                    }
-                                }
-                                // Delete (immediate on host, staged on image).
-                                // Suppressed on a read-only backup pane.
-                                if read_only {
-                                    // browse / copy-out only
-                                } else if host_pane {
-                                    if ui.button("Delete (immediate)").clicked() {
-                                        m_delete = true;
-                                        ui.close();
-                                    }
-                                } else {
-                                    let label = match row.kind {
-                                        RowKind::PendingDelete => "Undelete",
-                                        RowKind::PendingAdd => "Remove from staging",
-                                        _ => "Delete",
-                                    };
-                                    if ui.button(label).clicked() {
-                                        m_delete = true;
-                                        ui.close();
-                                    }
-                                }
-                            }
+                            row_menu(ui, row, side, remote_host, host_pane, read_only, &mut after)
                         });
                         if menu.is_some() {
                             acts.push(if row.is_tree {
-                                CommanderPaneAction::TreeContextSelect(row.node_id.clone())
+                                P::TreeContextSelect(row.node_id.clone())
                             } else {
-                                CommanderPaneAction::ContextSelect(row.name.clone())
+                                P::ContextSelect(row.name.clone())
                             });
                         }
                     }
@@ -1423,68 +885,91 @@ impl CommanderPane {
                 if remaining.y > 4.0 {
                     let (_r, bgr) = ui.allocate_exact_size(remaining, egui::Sense::click());
                     if bgr.clicked() {
-                        acts.push(CommanderPaneAction::ClearSelection);
+                        acts.push(P::ClearSelection);
                     }
                 }
             });
 
-        // Any row interaction marks this pane "active" for the middle Delete.
-        out.focused = !acts.is_empty();
-        if m_delete {
-            acts.push(CommanderPaneAction::Delete);
+        // Any row interaction makes this the active pane, before what the clicks asked for.
+        if !acts.is_empty() {
+            out.push(A::Focus(side));
         }
-        if let Some(name) = m_rename {
-            acts.push(CommanderPaneAction::RequestRename(name));
-        }
-        if let Some(name) = m_cancel_rename {
-            acts.push(CommanderPaneAction::CancelRename(name));
-        }
-        if let Some(name) = m_open_image {
-            acts.push(CommanderPaneAction::OpenRemoteImage(name));
-        }
-        for action in acts {
-            self.dispatch(&ctx, action, &mut out);
-        }
-        let status = out.status.take();
-        RowActions {
-            status,
-            copy: m_copy,
-            export: m_export,
-            export_as: m_export_as,
-            checksums: m_checksums,
-            detail: m_info.or(out.detail),
-            focused: out.focused,
-        }
-    }
-
-    /// Runs a pane action, turning its error and requests into this frame's row actions.
-    fn dispatch(&mut self, ctx: &egui::Context, action: CommanderPaneAction, out: &mut RowActions) {
-        let fx = self.ctl.apply(action);
-        if let Some(e) = self.ctl.take_error() {
-            out.status = Some(format!("[{}] {e}", self.side.label()));
-        }
-        let reqs = self.ctl.take_requests();
-        self.handle_row_requests(reqs, out);
-        self.run_effects(ctx, fx);
-    }
-
-    fn handle_row_requests(&mut self, reqs: Vec<PaneRequest>, out: &mut RowActions) {
-        for req in reqs {
-            match req {
-                PaneRequest::ShowInfo(name) => out.detail = Some(name),
-            }
-        }
+        out.extend(acts.into_iter().map(|a| A::Pane(side, a)));
+        out.extend(after);
     }
 }
 
-/// Read up to `max` bytes from a host file for the File Info preview.
-/// Returns `None` on any I/O error (the window then shows metadata only).
-fn read_host_file_capped(path: &str, max: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    file.take(max as u64).read_to_end(&mut buf).ok()?;
-    Some(buf)
+/// A data row's right-click menu; its choices land in `out` after the row's own select.
+fn row_menu(
+    ui: &mut egui::Ui,
+    row: &DisplayRow,
+    side: Side,
+    remote_host: bool,
+    host_pane: bool,
+    read_only: bool,
+    out: &mut Vec<CommanderAction>,
+) {
+    // A not-yet-applied staged add has no data to copy, export, hash or describe.
+    let real = !matches!(row.kind, RowKind::PendingAdd);
+    // On a remote host pane, a file opens as an image (browse inside it).
+    if remote_host && !row.is_dir && !row.is_tree && ui.button("Open Image").clicked() {
+        out.push(A::Pane(side, P::OpenRemoteImage(row.name.clone())));
+        ui.close();
+    }
+    if real && ui.button("Copy to other pane").clicked() {
+        out.push(A::Copy(side));
+        ui.close();
+    }
+    if real {
+        if ui.button("Export to hard drive...").clicked() {
+            out.push(A::Export {
+                from: side,
+                format: None,
+            });
+            ui.close();
+        }
+        ui.menu_button("Export as", |ui| {
+            for fmt in ExportFormat::ALL {
+                if ui.button(fmt.label()).clicked() {
+                    out.push(A::Export {
+                        from: side,
+                        format: Some(fmt),
+                    });
+                    ui.close();
+                }
+            }
+        });
+    }
+    if real && ui.button("Calculate checksums...").clicked() {
+        out.push(A::Checksums(side));
+        ui.close();
+    }
+    // File Info works for wrapper-tree rows too, read through the mounted wrapper.
+    if real && ui.button("File Info / Details...").clicked() {
+        out.push(A::OpenDetail(side, row.name.clone()));
+        ui.close();
+    }
+    // A wrapper's contents are read-only (copy out, don't edit), and so is a backup.
+    if row.is_tree || read_only {
+        return;
+    }
+    if matches!(row.kind, RowKind::PendingRename) && ui.button("Cancel rename").clicked() {
+        out.push(A::Pane(side, P::CancelRename(row.name.clone())));
+        ui.close();
+    } else if matches!(row.kind, RowKind::Normal) && ui.button("Rename...").clicked() {
+        out.push(A::Pane(side, P::RequestRename(row.name.clone())));
+        ui.close();
+    }
+    let label = match row.kind {
+        _ if host_pane => "Delete (immediate)",
+        RowKind::PendingDelete => "Undelete",
+        RowKind::PendingAdd => "Remove from staging",
+        _ => "Delete",
+    };
+    if ui.button(label).clicked() {
+        out.push(A::Pane(side, P::Delete));
+        ui.close();
+    }
 }
 
 // --- column geometry + painting (adapted from the layout mock) -------------

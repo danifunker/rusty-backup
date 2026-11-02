@@ -57,6 +57,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::Message(_) => "Message",
         Effect::OpenUrl(_) => "OpenUrl",
         Effect::CopyToClipboard(_) => "CopyToClipboard",
+        Effect::CloseScreen => "CloseScreen",
     }
 }
 
