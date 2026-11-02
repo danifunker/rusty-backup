@@ -74,6 +74,28 @@ pub fn forward_cancel(
     })
 }
 
+/// Run a status-polled runner inside a job: `body` runs on a scoped thread while `mirror` copies
+/// `status` into `ctx` every 50 ms (and forwards `ctx`'s cancel into the status).
+pub fn run_mirrored<S: Send, R: Send>(
+    ctx: &super::job::JobCtx,
+    status: &Arc<Mutex<S>>,
+    mirror: impl Fn(&mut S, &super::job::JobCtx),
+    body: impl FnOnce() -> R + Send,
+) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(body);
+        while !handle.is_finished() {
+            mirror(&mut lock_status(status), ctx);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        mirror(&mut lock_status(status), ctx);
+        match handle.join() {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
 /// `impl WorkerStatus` for a status whose end is `finished = true` plus an `error` message.
 #[macro_export]
 macro_rules! finished_with_error {

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::model::commander_descend::{self, DescendKind};
+use crate::model::commander_descend::{self, DescendKind, ReopenRecipe};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 
@@ -59,11 +59,8 @@ const SEP: char = '\u{1}';
 struct Mount {
     fs: Box<dyn Filesystem>,
     _temp: Option<tempfile::TempDir>,
-    /// How to reopen this mount's filesystem fresh on a worker thread (copy /
-    /// checksum off the UI thread). `None` for archive mounts — they're read
-    /// from an in-memory buffer with no path to reopen, so they stay
-    /// synchronous.
-    reopen: Option<commander_descend::ReopenRecipe>,
+    /// How a copy or checksum job reopens this mount's filesystem fresh, off the UI thread.
+    reopen: Option<ReopenRecipe>,
 }
 
 /// A wrapper mount built off the UI thread (all fields `Send`), ready to install
@@ -198,11 +195,8 @@ impl WrapperTree {
         self.mounts.get_mut(mount_key).map(|m| m.fs.as_mut())
     }
 
-    /// A recipe to reopen a mount's filesystem fresh on a worker thread, so a
-    /// long copy / checksum runs off the UI thread without touching the live
-    /// mount. `None` for archive mounts (read from an in-memory buffer — no path
-    /// to reopen), which stay on the synchronous path.
-    pub fn mount_reopen(&self, mount_key: &str) -> Option<commander_descend::ReopenRecipe> {
+    /// A recipe to reopen a mount's filesystem fresh in a job, never touching the live mount.
+    pub fn mount_reopen(&self, mount_key: &str) -> Option<ReopenRecipe> {
         self.mounts.get(mount_key).and_then(|m| m.reopen.clone())
     }
 
@@ -330,21 +324,43 @@ fn open_mount(
         DescendKind::Archive => {
             // In-memory bytes open directly; a file opens by path so a large ZIP / tar is indexed.
             let label = Some(file_name.to_string());
-            let (fs, temp) = match source {
-                WrapperSource::Bytes(b) => (
-                    commander_descend::open_archive_bytes(b, file_name, label)?,
-                    None,
-                ),
-                WrapperSource::Path(p) => (commander_descend::open_archive(&p, label)?, None),
+            let by_path = |path: &PathBuf, label: Option<String>| ReopenRecipe::Archive {
+                path: path.clone(),
+                label,
+            };
+            let (fs, temp, reopen) = match source {
+                WrapperSource::Bytes(b) => {
+                    let bytes = std::sync::Arc::new(b);
+                    let reopen = ReopenRecipe::ArchiveBytes {
+                        bytes: bytes.clone(),
+                        file_name: file_name.to_string(),
+                        label: label.clone(),
+                    };
+                    let fs = commander_descend::open_archive_bytes(
+                        bytes.as_ref().clone(),
+                        file_name,
+                        label,
+                    )?;
+                    (fs, None, reopen)
+                }
+                WrapperSource::Path(p) => {
+                    let reopen = by_path(&p, label.clone());
+                    (commander_descend::open_archive(&p, label)?, None, reopen)
+                }
                 WrapperSource::TempFile(dir, p) => {
-                    (commander_descend::open_archive(&p, label)?, Some(dir))
+                    let reopen = by_path(&p, label.clone());
+                    (
+                        commander_descend::open_archive(&p, label)?,
+                        Some(dir),
+                        reopen,
+                    )
                 }
             };
             Ok((
                 Mount {
                     fs,
                     _temp: temp,
-                    reopen: None,
+                    reopen: Some(reopen),
                 },
                 None,
             ))
@@ -489,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_mount_has_no_reopen_recipe() {
+    fn archive_mount_reopens_from_its_bytes() {
         let mut tree = WrapperTree::new();
         tree.expand_wrapper(
             "/a.sit",
@@ -498,9 +514,11 @@ mod tests {
             WrapperSource::Bytes(archive_bytes()),
         )
         .unwrap();
-        // Archive mounts read from an in-memory buffer with no path, so there is
-        // no reopen recipe — those copies stay on the synchronous path.
-        assert!(tree.mount_reopen("/a.sit").is_none());
+        // An archive read from memory reopens from a shared copy of its bytes.
+        let recipe = tree.mount_reopen("/a.sit").expect("archive mounts reopen");
+        let mut fs = recipe.open().unwrap();
+        let root = fs.root().unwrap();
+        assert!(!fs.list_directory(&root).unwrap().is_empty());
     }
 
     /// Expanding a multi-partition disk image in the inline tree shows one

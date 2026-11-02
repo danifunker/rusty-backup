@@ -937,6 +937,76 @@ impl HostCopyJob {
     }
 }
 
+/// What a finished [`host_copy_in_job`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostCopyDone {
+    pub copied: usize,
+    /// Host paths passed over (special files, or existing ones under `OnConflict::Skip`).
+    pub skipped: Vec<String>,
+}
+
+/// Run a [`HostCopyJob`] as a job body, reporting through `ctx`.
+pub fn host_copy_in_job(job: HostCopyJob, ctx: &crate::model::job::JobCtx) -> Result<HostCopyDone> {
+    let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+    let last = std::cell::RefCell::new(String::new());
+    let mirror = |s: &mut HostCopyStatus, ctx: &crate::model::job::JobCtx| {
+        if ctx.is_cancelled() {
+            s.cancel_requested = true;
+        }
+        mirror_progress(ctx, &last, &s.current_file, s.bytes_done, s.bytes_total);
+    };
+    let copied =
+        crate::model::worker::run_mirrored(ctx, &status, mirror, || run_host_copy(job, &status))?;
+    let skipped = std::mem::take(&mut crate::model::worker::lock_status(&status).skipped);
+    Ok(HostCopyDone { copied, skipped })
+}
+
+/// Off-thread [`stage_copy`] as a job body: reopens `source` and extracts into `temp_dir`.
+pub fn stage_copy_in_job(
+    source: StageSource,
+    entries: Vec<FileEntry>,
+    dest_parent: FileEntry,
+    temp_dir: PathBuf,
+    keep_dates: bool,
+    ctx: &crate::model::job::JobCtx,
+) -> Result<Vec<StagedEdit>> {
+    let status = Arc::new(Mutex::new(StageCopyStatus::default()));
+    let last = std::cell::RefCell::new(String::new());
+    let mirror = |s: &mut StageCopyStatus, ctx: &crate::model::job::JobCtx| {
+        if ctx.is_cancelled() {
+            s.cancel_requested = true;
+        }
+        mirror_progress(ctx, &last, &s.current_file, s.bytes_done, s.bytes_total);
+    };
+    crate::model::worker::run_mirrored(ctx, &status, mirror, || {
+        run_stage_copy(
+            source,
+            &entries,
+            &dest_parent,
+            &temp_dir,
+            keep_dates,
+            &status,
+        )
+    })
+}
+
+/// Phase and byte progress from a copy status; the phase is only set when the file changes.
+pub(crate) fn mirror_progress(
+    ctx: &crate::model::job::JobCtx,
+    last: &std::cell::RefCell<String>,
+    current: &str,
+    done: u64,
+    total: u64,
+) {
+    if !current.is_empty() && *last.borrow() != current {
+        *last.borrow_mut() = current.to_string();
+        ctx.set_phase(format!("Copying {current}"));
+    }
+    if total > 0 {
+        ctx.set_bytes(done, total);
+    }
+}
+
 /// Run a [`HostCopyJob`] on a worker thread (host writes are immediate, not
 /// staged). The returned status flips `finished` when done, with live
 /// byte/file counters the Commander progress modal reads each frame.

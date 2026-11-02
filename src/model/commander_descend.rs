@@ -470,6 +470,12 @@ pub enum ReopenRecipe {
         path: PathBuf,
         label: Option<String>,
     },
+    /// Reopen an archive held in memory (an archive expanded from inside another source).
+    ArchiveBytes {
+        bytes: std::sync::Arc<Vec<u8>>,
+        file_name: String,
+        label: Option<String>,
+    },
     /// Reopen a disk-image container's first browsable volume by path.
     DiskImage { path: PathBuf },
     /// Reopen a multi-partition disk image as a [`MultiVolumeFilesystem`]
@@ -501,6 +507,11 @@ impl ReopenRecipe {
     pub fn open(&self) -> Result<Box<dyn Filesystem>> {
         match self {
             ReopenRecipe::Archive { path, label } => open_archive(path, label.clone()),
+            ReopenRecipe::ArchiveBytes {
+                bytes,
+                file_name,
+                label,
+            } => open_archive_bytes(bytes.as_ref().clone(), file_name, label.clone()),
             ReopenRecipe::DiskImage { path } => {
                 let parts = browsable_partitions(path)?;
                 let (_, first) = parts.first().ok_or_else(|| {

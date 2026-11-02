@@ -197,6 +197,35 @@ pub fn spawn(job: ChecksumJob) -> Arc<Mutex<ChecksumStatus>> {
     status
 }
 
+/// Run a [`ChecksumJob`] as a job body; `total_bytes` (the selected files' sizes) drives the bar.
+pub fn checksum_in_job(
+    job: ChecksumJob,
+    total_bytes: u64,
+    ctx: &crate::model::job::JobCtx,
+) -> anyhow::Result<Vec<FileChecksum>> {
+    ctx.set_can_cancel(false);
+    let status = Arc::new(Mutex::new(ChecksumStatus::default()));
+    let mirror = |s: &mut ChecksumStatus, ctx: &crate::model::job::JobCtx| {
+        if !s.current_file.is_empty() {
+            let n = (s.done_files + 1).min(s.total_files);
+            ctx.set_phase(format!(
+                "Hashing {} ({n}/{})",
+                s.current_file, s.total_files
+            ));
+        }
+        let done = s.results.iter().map(|r| r.size).sum::<u64>() + s.current_bytes;
+        if total_bytes > 0 {
+            ctx.set_bytes(done.min(total_bytes), total_bytes);
+        }
+    };
+    crate::model::worker::run_mirrored(ctx, &status, mirror, || run(job, &status));
+    let mut st = crate::model::worker::lock_status(&status);
+    if let Some(e) = st.error.take() {
+        anyhow::bail!(e);
+    }
+    Ok(std::mem::take(&mut st.results))
+}
+
 fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
     match job {
         ChecksumJob::Image { source, entries } => {

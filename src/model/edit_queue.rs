@@ -418,6 +418,46 @@ pub struct QueueScan {
     pub missing_folders: Vec<String>,
 }
 
+/// A metadata change from a File Info editor, staged with [`EditQueue::stage_metadata`].
+#[derive(Debug, Clone)]
+pub enum MetadataEdit {
+    TypeCreator {
+        entry: FileEntry,
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
+    },
+    ProdosType {
+        entry: FileEntry,
+        type_byte: u8,
+        aux_type: u16,
+    },
+    /// Mac epoch seconds.
+    Dates {
+        entry: FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
+    },
+    Permissions {
+        entry: FileEntry,
+        mode: u32,
+    },
+    Owner {
+        entry: FileEntry,
+        uid: u32,
+        gid: u32,
+    },
+    SetXattr {
+        entry: FileEntry,
+        name: String,
+        value: Vec<u8>,
+    },
+    RemoveXattr {
+        entry: FileEntry,
+        name: String,
+    },
+}
+
 /// Staged-edit queue with the predicates and mutations the GUI needs while the
 /// user is staging changes. The queue is "dumb" — applying edits is still done
 /// via [`apply_edit`]; this type only owns the list and answers questions
@@ -953,6 +993,62 @@ impl EditQueue {
             }
         }
         false
+    }
+
+    /// Stage a File Info change (on a pending copy when the entry is one); returns what it did.
+    pub fn stage_metadata(&mut self, edit: MetadataEdit) -> String {
+        match edit {
+            MetadataEdit::TypeCreator {
+                entry,
+                type_code: t,
+                creator_code: c,
+            } => {
+                let (ts, cs) = (String::from_utf8_lossy(&t), String::from_utf8_lossy(&c));
+                if self.set_pending_hfs_override(&entry.path, t, c) {
+                    format!("Updated pending '{}' to {ts}/{cs}", entry.name)
+                } else {
+                    self.replace_set_type_creator(&entry, t, c);
+                    format!("Staged type/creator {ts}/{cs} on '{}'", entry.name)
+                }
+            }
+            MetadataEdit::ProdosType {
+                entry,
+                type_byte: t,
+                aux_type: a,
+            } => {
+                if self.set_pending_prodos_override(&entry.path, t, a) {
+                    format!("Updated pending '{}' to ${t:02X}/${a:04X}", entry.name)
+                } else {
+                    self.replace_set_prodos_type(&entry, t, a);
+                    format!("Staged type ${t:02X}/${a:04X} on '{}'", entry.name)
+                }
+            }
+            MetadataEdit::Dates {
+                entry,
+                create,
+                modify,
+                backup,
+            } => {
+                self.replace_set_dates(&entry, create, modify, backup);
+                format!("Staged date change on '{}'", entry.name)
+            }
+            MetadataEdit::Permissions { entry, mode } => {
+                self.replace_set_permissions(&entry, mode);
+                format!("Staged permissions {mode:o} on '{}'", entry.name)
+            }
+            MetadataEdit::Owner { entry, uid, gid } => {
+                self.replace_set_owner(&entry, uid, gid);
+                format!("Staged owner {uid}:{gid} on '{}'", entry.name)
+            }
+            MetadataEdit::SetXattr { entry, name, value } => {
+                self.replace_set_xattr(&entry, &name, value);
+                format!("Staged xattr {name} on '{}'", entry.name)
+            }
+            MetadataEdit::RemoveXattr { entry, name } => {
+                self.replace_remove_xattr(&entry, &name);
+                format!("Staged xattr removal {name} on '{}'", entry.name)
+            }
+        }
     }
 
     /// Push a `SetProdosType` edit, replacing any prior one targeting the
