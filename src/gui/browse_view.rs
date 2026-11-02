@@ -7,15 +7,14 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arc_mac::detect::detect_mac_archive;
-use arc_mac::extract as mac_extract;
 use disk_core::entry::{EntryType, FileEntry};
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    ArchiveRead, ArchiveUse, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow,
-    EditQueue, ExportFormat, ExtractOptions, JobRegistry, ListingStyle, MacArchiveKind,
-    PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot,
+    ArchiveUse, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue,
+    ExportFormat, ExtractOptions, ForkFormat, ImportChoice, JobRegistry, ListingStyle,
+    MacArchiveKind, PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot,
+    TarChoice,
 };
 use rusty_backup::controller::Controller as _;
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
@@ -151,8 +150,6 @@ pub struct BrowseView {
     repair_seen: bool,
     /// The screen's export of the marked rows is running; its status line is the result.
     exporting: bool,
-    /// A running tar import (its preflight, or the import itself).
-    tar_job: Option<rusty_backup::model::job::Job<TarStep>>,
     /// Backing up a CHD and opening its edit session, before edit mode starts.
     chd_open_job: Option<
         rusty_backup::model::job::Job<(
@@ -193,11 +190,6 @@ pub struct BrowseView {
     /// fully close the browse view rather than just leaving edit mode. Set by
     /// the in-view Close intercept when staged edits force the dialog first.
     pending_close: bool,
-    /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
-    /// `show_staging_errors` drives a modal dialog listing each failure.
-    staging_errors: Vec<(PathBuf, String)>,
-    /// Whether the staging-errors modal dialog is open.
-    show_staging_errors: bool,
     /// Live CHD edit-mode state. Present while editing a CHD via
     /// [`chd_edit::ChdEditSession`] (diff-against-parent for compressed,
     /// in-place for uncompressed). The `Arc<Mutex<ChdEditSession>>` itself
@@ -207,12 +199,6 @@ pub struct BrowseView {
     /// Background flatten progress (compressed CHD apply): merges the diff
     /// into a fresh compressed CHD that overwrites the parent.
     chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
-    /// A tar import awaiting the user's confirmation (preflight found
-    /// content this filesystem can't represent).
-    pending_tar_import: Option<PendingTarImport>,
-    /// A tar archive dropped/added as a host file, awaiting the user's
-    /// choice: import its contents, or add the archive as a plain file.
-    pending_tar_add: Option<PathBuf>,
     /// When the CHD being edited is the body of a single-file-chd backup,
     /// this carries the backup folder path so that on flatten-success we
     /// can refresh `metadata.json` (per-partition checksums + container
@@ -221,73 +207,6 @@ pub struct BrowseView {
 
     /// User's password input text for the password prompt.
     password_input: String,
-
-    /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
-    /// `.sea.hqx`) that the user picked via Add File... — each waits on a
-    /// user choice in the Workflow A modal (Convert / Expand / Add as-is).
-    /// Drained by [`render_archive_import_dialog`] one item at a time.
-    pending_archive_imports: Vec<PendingArchiveImport>,
-    /// Holds extracted archive payloads on the host so the staged
-    /// `AddFile` paths still resolve at Apply time. Created lazily on the
-    /// first Convert/Expand action; dropped on Discard / browse close.
-    archive_import_tempdir: Option<tempfile::TempDir>,
-    /// Workflow C state — the user clicked "Save as Mac archive..." on a
-    /// file inside the disk image that sniffed as a Mac archive, and the
-    /// modal is open asking what to do with it.
-    pending_archive_extract: Option<PendingArchiveExtract>,
-    /// Workflow E state — a floating "Archive viewer" window the user
-    /// opened with "Browse archive..." on a Mac archive file inside the
-    /// disk image. Read-only: shows entries + a per-entry checkbox + the
-    /// fork-format dropdown + Extract All / Extract Selected, mirroring
-    /// the standalone Archives tab shape.
-    mac_archive_window: Option<MacArchiveWindow>,
-}
-
-/// Workflow C state: the selected entry on the disk image is a Mac
-/// archive and the user clicked "Save as Mac archive...". The raw
-/// bytes are kept around so "Save as-is" doesn't need to re-read; the
-/// parsed archive + ready-for-extract bytes drive the "Decode and
-/// save" path. `fork_format` is the user-editable container choice for
-/// the decode path (BinHex / MacBinary / AppleDouble / Raw).
-struct PendingArchiveExtract {
-    entry_name: String,
-    kind: MacArchiveKind,
-    raw_bytes: Vec<u8>,
-    extract_bytes: Vec<u8>,
-    archive: arc_mac::stuffit::StuffItArchive,
-    fork_format: mac_extract::ForkFormat,
-}
-
-/// Workflow E state — the floating "Archive viewer" window opened on a
-/// Mac archive that lives inside the disk image. Read-only browse +
-/// extract; mirrors the standalone Archives tab shape so the UX is
-/// consistent. Per-entry `selected` checkboxes drive "Extract
-/// Selected".
-struct MacArchiveWindow {
-    entry_name: String,
-    kind: MacArchiveKind,
-    bytes: Vec<u8>,
-    archive: arc_mac::stuffit::StuffItArchive,
-    selected: Vec<bool>,
-    fork_format: mac_extract::ForkFormat,
-}
-
-/// One Mac archive the user picked via Add File..., awaiting their
-/// Convert/Expand/Add-as-is choice in the import modal (Workflow A).
-/// The archive's bytes are read up-front so the modal can show the
-/// correct three-option set (which depends on whether the file is
-/// HQX-wrapping-a-SIT vs a plain SIT, etc.).
-#[derive(Clone)]
-struct PendingArchiveImport {
-    /// The original host path the user picked.
-    host_path: PathBuf,
-    /// Where on the disk image to land the result.
-    parent: FileEntry,
-    /// Sniffed archive kind — drives modal copy + which buttons appear.
-    kind: MacArchiveKind,
-    /// Raw bytes of the picked file, kept around so the action handler
-    /// doesn't have to re-read after the user clicks.
-    raw: Vec<u8>,
 }
 
 /// State carried for the duration of a CHD edit-mode session.
@@ -309,15 +228,6 @@ struct ChdFlattenProgress {
     finished: bool,
     error: Option<String>,
     cancel_requested: bool,
-}
-
-/// A tar import awaiting user confirmation because the preflight found
-/// content the target filesystem can't represent (dropped symlinks, invalid
-/// names, …). Cleared when the user confirms or cancels the modal.
-#[derive(Clone)]
-struct PendingTarImport {
-    archive_path: std::path::PathBuf,
-    preflight: fs_tar::tar_import::TarImportPreflight,
 }
 
 /// How to encode ProDOS file type/aux when extracting files to a host
@@ -396,7 +306,6 @@ impl Default for BrowseView {
             show_fsck_debug: false,
             repair_seen: false,
             exporting: false,
-            tar_job: None,
             chd_open_job: None,
             apply_follow: None,
             tree_text: None,
@@ -408,20 +317,12 @@ impl Default for BrowseView {
             show_unsaved_dialog: false,
             text_editor: None,
             pending_close: false,
-            staging_errors: Vec::new(),
-            show_staging_errors: false,
             chd_edit: None,
             chd_flatten_progress: None,
             squashfs_budget_dialog: None,
             squashfs_measure_job: None,
-            pending_tar_import: None,
-            pending_tar_add: None,
             single_file_chd_backup_folder: None,
             password_input: String::new(),
-            pending_archive_imports: Vec::new(),
-            archive_import_tempdir: None,
-            pending_archive_extract: None,
-            mac_archive_window: None,
         }
     }
 }
@@ -468,8 +369,8 @@ impl BrowseView {
             Some("Export")
         } else if self.apply_follow.is_some() {
             Some("Apply edits")
-        } else if self.tar_job.is_some() {
-            Some("Tar import")
+        } else if self.ctl.pane(Side::Left).archive_working().is_some() {
+            Some("Archive")
         } else if self.ctl.pane(Side::Left).tool_working().is_some() {
             Some("Volume tool")
         } else {
@@ -699,10 +600,6 @@ impl BrowseView {
         self.tree_show_ids = false;
         self.show_unsaved_dialog = false;
         self.pending_close = false;
-        self.pending_archive_imports.clear();
-        self.archive_import_tempdir = None;
-        self.pending_archive_extract = None;
-        self.mac_archive_window = None;
         self.password_input.clear();
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
@@ -714,8 +611,6 @@ impl BrowseView {
         // CHD is left untouched; user's `.chd_backup` is preserved.
         self.discard_chd_edit_session();
         self.chd_flatten_progress = None;
-        self.pending_tar_import = None;
-        self.pending_tar_add = None;
         self.single_file_chd_backup_folder = None;
         // Dialogs and editors that name a file on the volume being closed;
         // left open, their Save/Overwrite acted on the next volume.
@@ -790,12 +685,11 @@ impl BrowseView {
                     super::progress::show_job(ui, &snap);
                 });
         }
-        if let Some((entry, purpose, read)) = self.ctl.host_pane().take_archive() {
-            self.apply_archive_read(entry, purpose, read);
+        if let Some(said) = self.ctl.host_pane().take_archive_notice() {
+            self.edit_result = Some(said);
         }
         self.render_apply_job(ui);
-        self.poll_tar_job();
-        if let Some(snap) = self.tar_job.as_ref().map(|j| j.snapshot()) {
+        if let Some(snap) = self.ctl.pane(Side::Left).archive_working() {
             egui::Window::new(snap.label.clone())
                 .collapsible(false)
                 .resizable(false)
@@ -1031,8 +925,6 @@ impl BrowseView {
                             self.edit_mode = false;
                             self.edit_result = None;
                             self.ctl.host_pane().queue.clear();
-                            self.pending_archive_imports.clear();
-                            self.archive_import_tempdir = None;
                         }
                     }
                 }
@@ -2700,204 +2592,6 @@ impl BrowseView {
         }
     }
 
-    /// Pick a host `.tar.gz` / `.tar.zst` / `.tar` and preflight it against
-    /// the current volume. If the import would lose content (dropped
-    /// symlinks, names this FS can't store), stash it for a confirmation
-    /// modal; otherwise import straight away. Imports into the directory the
-    /// user is currently editing.
-    fn start_tar_import_dialog(&mut self) {
-        let path = match rfd::FileDialog::new()
-            .set_title("Import a tar archive into this volume")
-            .add_filter("tar archive", &["gz", "tgz", "tar", "zst"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-        self.begin_tar_import_from_path(&path);
-    }
-
-    /// Preflight `path` against the current volume and either import it
-    /// straight away (lossless) or stash it for the confirmation modal
-    /// (`render_tar_import_dialog`) when content would be skipped/dropped.
-    /// Shared by the "Import Archive..." button and the add/drop auto-route.
-    fn begin_tar_import_from_path(&mut self, path: &std::path::Path) {
-        self.spawn_tar_job(path.to_path_buf(), true);
-    }
-
-    /// Import `archive` into the current directory after its preflight was confirmed.
-    fn run_tar_import(&mut self, archive: &std::path::Path) {
-        self.spawn_tar_job(archive.to_path_buf(), false);
-    }
-
-    /// Preflight (when `check`) and import a tar as a job; a preflight with warnings stops for the dialog.
-    /// Existing names are skipped, macOS `._*` sidecars dropped; it writes at once, not staged.
-    fn spawn_tar_job(&mut self, archive: PathBuf, check: bool) {
-        if self.tar_job.is_some() {
-            return;
-        }
-        let session = self.session.clone();
-        let dest = self.current_parent_entry();
-        self.tar_job = Some(rusty_backup::model::job::Job::spawn(
-            "Importing the archive...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                Ok(tar_import_step(&session, &dest, archive, check, job))
-            },
-        ));
-    }
-
-    fn poll_tar_job(&mut self) {
-        use rusty_backup::model::job::Status;
-        let Some(job) = &self.tar_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        self.tar_job = None;
-        match (snap.status, out) {
-            (Status::Done, Some(TarStep::Confirm(archive_path, preflight))) => {
-                self.pending_tar_import = Some(PendingTarImport {
-                    archive_path,
-                    preflight,
-                });
-            }
-            (Status::Done, Some(TarStep::Finished(msg, wrote))) => {
-                self.edit_result = Some(msg);
-                if wrote {
-                    self.invalidate_all_caches();
-                    self.invalidate_cached_fs();
-                }
-            }
-            (Status::Failed(e), _) => self.edit_result = Some(format!("Import failed: {e}")),
-            _ => {}
-        }
-    }
-
-    /// Modal shown when a tar archive is added/dropped as a host file: import
-    /// its contents into the current folder, or add the archive as a plain
-    /// file. Mirrors the Mac-archive add flow.
-    fn render_tar_add_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(path) = self.pending_tar_add.clone() else {
-            return;
-        };
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("archive")
-            .to_string();
-        let mut open = true;
-        let mut decision: Option<u8> = None; // 0=import, 1=add-as-file, 2=cancel
-        egui::Window::new("Tar archive")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(460.0)
-            .show(ui.ctx(), |ui| {
-                ui.label(format!("\"{name}\" is a tar archive."));
-                ui.add_space(4.0);
-                ui.label(
-                    "Import its contents into the current folder, or add the \
-                     archive itself as a file?",
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Import contents").clicked() {
-                        decision = Some(0);
-                    }
-                    if ui.button("Add as file").clicked() {
-                        decision = Some(1);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(2);
-                    }
-                });
-            });
-        if !open {
-            decision = Some(2);
-        }
-        match decision {
-            Some(0) => {
-                self.pending_tar_add = None;
-                self.begin_tar_import_from_path(&path);
-            }
-            Some(1) => {
-                self.pending_tar_add = None;
-                let folder = Some(self.current_parent_entry().path);
-                self.stage_paths(vec![path.clone()], folder);
-            }
-            Some(_) => self.pending_tar_add = None, // cancel / window closed
-            None => {}
-        }
-    }
-
-    /// Modal shown when a tar import's preflight found content the target
-    /// filesystem can't represent. Continue runs the (lossy) import; Cancel
-    /// abandons it.
-    fn render_tar_import_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(pending) = self.pending_tar_import.clone() else {
-            return;
-        };
-        let mut open = true;
-        let mut decision: Option<bool> = None; // Some(true)=continue, Some(false)=cancel
-        egui::Window::new("Import archive - some content can't be kept")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(520.0)
-            .show(ui.ctx(), |ui| {
-                ui.colored_label(
-                    super::theme::warning(ui.visuals()),
-                    format!(
-                        "This [{}] volume can't store everything in the archive:",
-                        self.fs_type
-                    ),
-                );
-                ui.add_space(4.0);
-                for w in pending.preflight.warnings() {
-                    ui.label(format!("- {w}"));
-                }
-                if pending.preflight.appledouble > 0 {
-                    ui.label(format!(
-                        "- {} macOS ._ sidecar(s) will be skipped.",
-                        pending.preflight.appledouble
-                    ));
-                }
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
-                    pending.preflight.files, pending.preflight.dirs
-                ));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Continue").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        if !open {
-            decision = Some(false);
-        }
-        match decision {
-            Some(true) => {
-                self.pending_tar_import = None;
-                self.run_tar_import(&pending.archive_path);
-            }
-            Some(false) => {
-                self.pending_tar_import = None;
-                self.edit_result = Some("Archive import cancelled.".to_string());
-            }
-            None => {}
-        }
-    }
-
     /// Render the edit mode toolbar with action buttons and free space.
     fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -2915,14 +2609,14 @@ impl BrowseView {
             ui.add_space(8.0);
 
             if ui.button("Add File...").clicked() {
-                self.add_file_dialog();
+                self.add_file_dialog(&ui.ctx().clone());
             }
 
             // Import a host .tar.gz / .tar.zst / .tar into the current
             // directory. Runs a preflight first and prompts if the target
             // filesystem can't represent some of the archive's content.
             if ui.button("Import Archive...").clicked() {
-                self.start_tar_import_dialog();
+                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ImportTar);
             }
 
             // Alto BFS has a flat namespace — no subdirectories to create.
@@ -3100,180 +2794,19 @@ impl BrowseView {
     }
 
     /// Show the "Add File" file picker dialog and add files.
-    fn add_file_dialog(&mut self) {
+    fn add_file_dialog(&mut self, ctx: &egui::Context) {
         let files = rfd::FileDialog::new()
             .set_title("Select files to add")
             .pick_files();
 
         if let Some(paths) = files {
-            self.add_host_paths(&paths);
+            self.add_host_paths(ctx, &paths);
         }
     }
 
-    /// Stage host paths through the pane; a tar or (on HFS) a Mac archive asks how to import it first.
-    fn add_host_paths(&mut self, paths: &[PathBuf]) {
-        let parent = self.current_parent_entry();
-        let mut plain = Vec::new();
-        for path in paths {
-            if path.is_file() && fs_tar::tar_import::looks_like_tar_archive(path) {
-                self.pending_tar_add = Some(path.clone());
-            } else if !(path.is_file()
-                && self.is_hfs_type()
-                && self.queue_archive_import_if_applicable(path, &parent))
-            {
-                plain.push(path.clone());
-            }
-        }
-        self.stage_paths(plain, None);
-    }
-
-    /// Stage host files and folders into `folder` (the pane's target folder when `None`).
-    fn stage_paths(&mut self, paths: Vec<PathBuf>, folder: Option<String>) {
-        if paths.is_empty() {
-            return;
-        }
-        let act = BrowserPaneAction::AddHostPaths { paths, folder };
-        // A staging pane answers with status lines only; nothing here asks the user.
-        for fx in self.ctl.apply(CommanderAction::Pane(Side::Left, act)) {
-            log::debug!("staging: {fx:?}");
-        }
-        self.edit_result = Some(self.ctl.status().to_string());
-    }
-
-    /// Workflow A: sniff the picked host file for a Mac archive kind.
-    /// On a hit, push a [`PendingArchiveImport`] so
-    /// [`render_archive_import_dialog`] asks the user how to handle it
-    /// and return `true`. Returning `true` short-circuits the normal
-    /// staging path. Returning `false` means "not a Mac archive — keep
-    /// going with the as-binary staging path."
-    ///
-    /// Sniff failures (unreadable file, opaque bytes) return `false`
-    /// silently — the regular staging path handles its own errors.
-    fn queue_archive_import_if_applicable(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-    ) -> bool {
-        // Detection needs the whole file; past 64 MiB only a Mac-archive extension earns that read.
-        let size = std::fs::metadata(host_path).map(|m| m.len()).unwrap_or(0);
-        let named_archive = host_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| {
-                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(e))
-            });
-        if size > fs_tar::mem_archive::INLINE_MAX && !named_archive {
-            return false;
-        }
-        let raw = match std::fs::read(host_path) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
-        };
-        let kind = match detect_mac_archive(&raw) {
-            Some(k) => k,
-            None => return false,
-        };
-        self.pending_archive_imports.push(PendingArchiveImport {
-            host_path: host_path.to_path_buf(),
-            parent: parent.clone(),
-            kind,
-            raw,
-        });
-        true
-    }
-
-    /// Get-or-create the BrowseView's archive-import tempdir. Held until
-    /// Discard/Apply/close so the staged AddFile host_path references
-    /// stay valid.
-    fn ensure_archive_import_tempdir(&mut self) -> Result<&Path, String> {
-        if self.archive_import_tempdir.is_none() {
-            let dir = tempfile::Builder::new()
-                .prefix("rusty-archive-import-")
-                .tempdir()
-                .map_err(|e| format!("create tempdir: {e}"))?;
-            self.archive_import_tempdir = Some(dir);
-        }
-        Ok(self.archive_import_tempdir.as_ref().unwrap().path())
-    }
-
-    /// Workflow A "Convert" / "Expand" / "Convert and expand": decode the
-    /// pending archive's contents into an AppleDouble dump inside the
-    /// import tempdir, then re-stage its children as if the user had
-    /// picked them via the regular Add File flow (so resource forks are
-    /// detected via the `._<name>` sidecars).
-    fn apply_archive_import_extract(
-        &mut self,
-        pending: &PendingArchiveImport,
-    ) -> Result<(), String> {
-        // Decode the picked file. For HQX wrappers, peel them; for SIT/SEA
-        // standalone the bytes go straight to the parser.
-        let (bytes, archive) = mac_extract::open_bytes(pending.raw.clone())
-            .map_err(|e| format!("decode {}: {e}", pending.host_path.display()))?;
-
-        // A unique subdir per import so multiple Convert clicks don't
-        // collide on filename.
-        let root = self.ensure_archive_import_tempdir()?.to_path_buf();
-        let subdir = root.join(format!("import-{}", self.pending_archive_imports.len()));
-        std::fs::create_dir_all(&subdir).map_err(|e| format!("create subdir: {e}"))?;
-
-        // AppleDouble preserves data fork + resource fork + type/creator
-        // via a `._<name>` sidecar that the existing
-        // `resource_fork::detect_resource_fork` picks up at staging time.
-        mac_extract::extract_all(
-            &bytes,
-            &archive,
-            &subdir,
-            mac_extract::ForkFormat::AppleDouble,
-            |_, _, _| {},
-            |_| {},
-        )
-        .map_err(|e| format!("extract: {e}"))?;
-
-        // Now stage every direct child of the subdir under `parent`.
-        // (stage_host_file silently skips `._<name>` sidecars and the
-        // primary file's resource fork is detected via the sidecar.)
-        let children: Vec<PathBuf> = std::fs::read_dir(&subdir)
-            .map_err(|e| format!("read subdir: {e}"))?
-            .filter_map(|r| r.ok())
-            .map(|e| e.path())
-            .collect();
-        self.stage_paths(children, Some(pending.parent.path.clone()));
-        Ok(())
-    }
-
-    /// Workflow A "Convert only" (HQX-over-SIT / HQX-over-SEA): strip
-    /// the BinHex wrapper and stage the resulting .sit / .sea as a
-    /// single AddFile under the import tempdir.
-    fn apply_archive_import_convert_only(
-        &mut self,
-        pending: &PendingArchiveImport,
-    ) -> Result<(), String> {
-        let bh = fs_mac::binhex::parse_binhex(&pending.raw)
-            .map_err(|e| format!("decode BinHex: {e}"))?;
-        let root = self.ensure_archive_import_tempdir()?.to_path_buf();
-        let subdir = root.join(format!("import-{}", self.pending_archive_imports.len()));
-        std::fs::create_dir_all(&subdir).map_err(|e| format!("create subdir: {e}"))?;
-        let inner_name = if bh.name.is_empty() {
-            "archive.sit".to_string()
-        } else {
-            bh.name.replace(['/', '\\'], "_")
-        };
-        let inner_path = subdir.join(&inner_name);
-        std::fs::write(&inner_path, &bh.data_fork)
-            .map_err(|e| format!("write inner archive: {e}"))?;
-        self.stage_paths(vec![inner_path], Some(pending.parent.path.clone()));
-        Ok(())
-    }
-
-    /// Workflow A "Add as-is": skip the archive intercept and stage the
-    /// picked file unchanged through the regular add-host-file path.
-    /// Direct call (bypasses queue_archive_import_if_applicable).
-    fn apply_archive_import_as_is(&mut self, pending: &PendingArchiveImport) -> Result<(), String> {
-        let folder = Some(pending.parent.path.clone());
-        self.stage_paths(vec![pending.host_path.clone()], folder);
-        Ok(())
+    /// Stage host picks and drops through the pane; a tar or (on HFS) a Mac archive asks first.
+    fn add_host_paths(&mut self, ctx: &egui::Context, paths: &[PathBuf]) {
+        self.pane_act(ctx, BrowserPaneAction::AddPicked(paths.to_vec()));
     }
 
     /// Workflow E trigger: read the selected file's bytes off the disk
@@ -3294,33 +2827,6 @@ impl BrowseView {
         let path = entry.path.clone();
         let purpose = ArchiveUse::Extract;
         self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
-    }
-
-    /// Open the archive window or the extract modal for a decoded archive.
-    fn apply_archive_read(&mut self, entry: FileEntry, purpose: ArchiveUse, read: ArchiveRead) {
-        match purpose {
-            ArchiveUse::Browse => {
-                let selected = vec![true; read.archive.entries.len()];
-                self.mac_archive_window = Some(MacArchiveWindow {
-                    entry_name: entry.name.clone(),
-                    kind: read.kind,
-                    bytes: read.bytes,
-                    archive: read.archive,
-                    selected,
-                    fork_format: mac_extract::ForkFormat::BinHex,
-                });
-            }
-            ArchiveUse::Extract => {
-                self.pending_archive_extract = Some(PendingArchiveExtract {
-                    entry_name: entry.name.clone(),
-                    kind: read.kind,
-                    raw_bytes: read.raw,
-                    extract_bytes: read.bytes,
-                    archive: read.archive,
-                    fork_format: mac_extract::ForkFormat::BinHex,
-                });
-            }
-        }
     }
 
     /// Apply all staged edits to the filesystem in a single batch.
@@ -3379,8 +2885,6 @@ impl BrowseView {
             }
             None => {
                 self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
-                // The archive-import tempdir backed the AddFile host paths; the bytes are on the image now.
-                self.archive_import_tempdir = None;
             }
         }
         self.run_apply_follow_up(follow_up);
@@ -3609,8 +3113,6 @@ impl BrowseView {
                             yes: true,
                         };
                         self.ctl.apply(CommanderAction::Pane(Side::Left, yes));
-                        self.pending_archive_imports.clear();
-                        self.archive_import_tempdir = None;
                         self.show_unsaved_dialog = false;
                         // For CHD edit sessions, "Discard" must also drop
                         // the diff so prior Apply Edits aren't flattened
@@ -3638,52 +3140,47 @@ impl BrowseView {
             });
     }
 
-    /// Render the Workflow A "Mac archive picked" modal. Shows one
-    /// modal per pending import in queue order; each user click pops
-    /// the front and applies the chosen action. The modal copy varies
-    /// by sniffed archive kind:
-    ///   * BinHexSingleFile -> Convert / Add as-is / Cancel
-    ///   * Sit / Sit5 / Sea -> Expand / Add as-is / Cancel
-    ///   * BinHexOverSit / BinHexOverSea -> Convert and expand / Convert only / Add as-is / Cancel
+    /// The pane's Mac archive waiting for its import choice; the buttons depend on its kind.
     fn render_archive_import_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_archive_imports.is_empty() {
+        let Some((filename, kind)) = self.ctl.pane(Side::Left).pending_import() else {
             return;
-        }
-        // Snapshot the front item to render the modal body. The action
-        // handlers each remove the front entry; this clone keeps the
-        // borrow short and lets the click handlers mutate self.
-        let pending = self.pending_archive_imports[0].clone();
-        let filename = pending
-            .host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("(no name)")
-            .to_string();
-        let kind_label = pending.kind.label();
-
-        #[derive(Clone, Copy)]
-        enum ImportAction {
-            Extract,     // Convert (HQX) / Expand (SIT/SEA) / Convert+Expand (HQX-over)
-            ConvertOnly, // Only valid for BinHexOverSit / BinHexOverSea
-            AsIs,
-            Cancel,
-        }
-        let mut action: Option<ImportAction> = None;
-
-        let title = match pending.kind {
-            MacArchiveKind::BinHexSingleFile => "Convert HQX file?",
+        };
+        let kind_label = kind.label();
+        let mut choice: Option<ImportChoice> = None;
+        // A single BinHex converts; an archive expands; BinHex over an archive does either.
+        let (title, body, expand) = match kind {
+            MacArchiveKind::BinHexSingleFile => (
+                "Convert HQX file?",
+                format!("Would you like to convert {filename} to binary?"),
+                "Convert",
+            ),
+            MacArchiveKind::BinHexOverSit
+            | MacArchiveKind::BinHexOverSea
+            | MacArchiveKind::BinHexOverCompactPro => (
+                "Convert and/or expand?",
+                format!(
+                    "Would you like to convert {filename} to binary and/or expand the contents?"
+                ),
+                "Convert and expand",
+            ),
             MacArchiveKind::Sit
             | MacArchiveKind::Sit5
             | MacArchiveKind::Sea
             | MacArchiveKind::CompactPro
             | MacArchiveKind::Mar
             | MacArchiveKind::MacBinary
-            | MacArchiveKind::MacZip => "Expand archive?",
-            MacArchiveKind::BinHexOverSit
-            | MacArchiveKind::BinHexOverSea
-            | MacArchiveKind::BinHexOverCompactPro => "Convert and/or expand?",
+            | MacArchiveKind::MacZip => (
+                "Expand archive?",
+                format!("Would you like to expand the contents of {filename}?"),
+                "Expand",
+            ),
         };
-
+        let convert_only = match kind {
+            MacArchiveKind::BinHexOverSea => Some("Convert only (.sea lands here)"),
+            MacArchiveKind::BinHexOverCompactPro => Some("Convert only (inner archive lands here)"),
+            MacArchiveKind::BinHexOverSit => Some("Convert only (.sit lands here)"),
+            _ => None,
+        };
         egui::Window::new(title)
             .id(egui::Id::unique("archive_import_dialog"))
             .collapsible(false)
@@ -3692,102 +3189,22 @@ impl BrowseView {
             .show(ui.ctx(), |ui| {
                 ui.label(format!("{filename} is a {kind_label} archive."));
                 ui.add_space(4.0);
-                let body = match pending.kind {
-                    MacArchiveKind::BinHexSingleFile => {
-                        format!("Would you like to convert {filename} to binary?")
-                    }
-                    MacArchiveKind::Sit
-                    | MacArchiveKind::Sit5
-                    | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro
-                    | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary
-                    | MacArchiveKind::MacZip => {
-                        format!("Would you like to expand the contents of {filename}?")
-                    }
-                    MacArchiveKind::BinHexOverSit
-                    | MacArchiveKind::BinHexOverSea
-                    | MacArchiveKind::BinHexOverCompactPro => {
-                        format!(
-                            "Would you like to convert {filename} to binary and/or expand the contents?"
-                        )
-                    }
-                };
                 ui.label(body);
                 ui.add_space(8.0);
-                ui.horizontal(|ui| match pending.kind {
-                    MacArchiveKind::BinHexSingleFile => {
-                        if ui
-                            .button("Convert")
-                            .on_hover_text(
-                                "Decode the BinHex envelope and add the enclosed file \
-                                 to this directory.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the .hqx file unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(expand)
+                        .on_hover_text(
+                            "Decode the archive and add each enclosed file to this directory \
+                             (resource forks preserved on HFS/HFS+).",
+                        )
+                        .clicked()
+                    {
+                        choice = Some(ImportChoice::Expand);
                     }
-                    MacArchiveKind::Sit
-                    | MacArchiveKind::Sit5
-                    | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro
-                    | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary
-                    | MacArchiveKind::MacZip => {
+                    if let Some(label) = convert_only {
                         if ui
-                            .button("Expand")
-                            .on_hover_text(
-                                "Decompress the archive and add each enclosed file to this \
-                                 directory (resource forks preserved on HFS/HFS+).",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the archive file unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
-                    }
-                    MacArchiveKind::BinHexOverSit
-                    | MacArchiveKind::BinHexOverSea
-                    | MacArchiveKind::BinHexOverCompactPro => {
-                        if ui
-                            .button("Convert and expand")
-                            .on_hover_text(
-                                "Decode BinHex, decompress the inner archive, and add \
-                                 each enclosed file to this directory.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        let convert_only_label = match pending.kind {
-                            MacArchiveKind::BinHexOverSea => "Convert only (.sea lands here)",
-                            MacArchiveKind::BinHexOverCompactPro => {
-                                "Convert only (inner archive lands here)"
-                            }
-                            _ => "Convert only (.sit lands here)",
-                        };
-                        if ui
-                            .button(convert_only_label)
+                            .button(label)
                             .on_hover_text(
                                 "Strip the BinHex wrapper and add the inner archive file. \
                                  Useful when the target Mac has StuffIt Expander but no \
@@ -3795,291 +3212,240 @@ impl BrowseView {
                             )
                             .clicked()
                         {
-                            action = Some(ImportAction::ConvertOnly);
+                            choice = Some(ImportChoice::ConvertOnly);
                         }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the wrapped archive unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
+                    }
+                    if ui
+                        .button("Add as-is")
+                        .on_hover_text("Add the file unchanged.")
+                        .clicked()
+                    {
+                        choice = Some(ImportChoice::AsIs);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(ImportChoice::Cancel);
                     }
                 });
             });
-
-        let Some(action) = action else { return };
-        // Pop the queue front (matches the snapshot above).
-        let pending = self.pending_archive_imports.remove(0);
-        let outcome = match action {
-            ImportAction::Extract => self.apply_archive_import_extract(&pending),
-            ImportAction::ConvertOnly => self.apply_archive_import_convert_only(&pending),
-            ImportAction::AsIs => self.apply_archive_import_as_is(&pending),
-            ImportAction::Cancel => return,
-        };
-        match outcome {
-            Ok(()) => {
-                self.edit_result = Some(format!(
-                    "{} {filename}",
-                    match action {
-                        ImportAction::Extract => "Imported contents of",
-                        ImportAction::ConvertOnly => "Imported inner archive from",
-                        ImportAction::AsIs => "Imported (as-is)",
-                        ImportAction::Cancel => "Cancelled",
-                    }
-                ));
-            }
-            Err(e) => {
-                self.staging_errors
-                    .push((pending.host_path.clone(), e.clone()));
-                self.show_staging_errors = true;
-                self.edit_result = Some(format!("Failed to import {filename}: {e}"));
-            }
+        if let Some(c) = choice {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ChooseImport(c));
         }
     }
 
-    /// Render the Workflow E floating "Archive viewer" window. Mirrors
-    /// the standalone Archives tab shape: entry list with per-entry
-    /// checkboxes, fork-format dropdown, Extract All / Extract Selected
-    /// / Close buttons. Read-only — no edit operations inside the
-    /// archive (would need archive repacking, deferred follow-up).
-    fn render_archive_browse_window(&mut self, ui: &mut egui::Ui) {
-        if self.mac_archive_window.is_none() {
+    /// The pane's tar waiting for its choice: import its contents, or add it as a file.
+    fn render_tar_add_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.ctl.pane(Side::Left).pending_tar() else {
             return;
-        }
-        let mut close = false;
-        let mut extract_action: Option<bool> = None; // Some(true)=all, Some(false)=selected
-
-        // Snapshot read-only labels so the closure below doesn't have to
-        // re-borrow self.mac_archive_window through more than the
-        // mutable handle it already takes for checkboxes / format.
-        let (title, file_count, selected_file_count) = {
-            let w = self.mac_archive_window.as_ref().unwrap();
-            let fc = w.archive.entries.iter().filter(|e| !e.is_dir).count();
-            let sfc = w
-                .archive
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| !e.is_dir && w.selected.get(*i).copied().unwrap_or(true))
-                .count();
-            (
-                format!("Archive: {} ({})", w.entry_name, w.kind.label()),
-                fc,
-                sfc,
-            )
         };
+        let mut open = true;
+        let mut choice: Option<TarChoice> = None;
+        egui::Window::new("Tar archive")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("\"{name}\" is a tar archive."));
+                ui.add_space(4.0);
+                ui.label(
+                    "Import its contents into the current folder, or add the \
+                     archive itself as a file?",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Import contents").clicked() {
+                        choice = Some(TarChoice::Import);
+                    }
+                    if ui.button("Add as file").clicked() {
+                        choice = Some(TarChoice::AsFile);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(TarChoice::Cancel);
+                    }
+                });
+            });
+        if !open {
+            choice = Some(TarChoice::Cancel);
+        }
+        if let Some(c) = choice {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ChooseTar(c));
+        }
+    }
 
-        egui::Window::new(title)
+    /// The pane's tar preflight that found content this volume cannot keep: go on or cancel.
+    fn render_tar_import_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(pf) = self.ctl.pane(Side::Left).tar_preview().cloned() else {
+            return;
+        };
+        let mut open = true;
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Import archive - some content can't be kept")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ui.ctx(), |ui| {
+                ui.colored_label(
+                    super::theme::warning(ui.visuals()),
+                    format!(
+                        "This [{}] volume can't store everything in the archive:",
+                        self.fs_type
+                    ),
+                );
+                ui.add_space(4.0);
+                for w in &pf.warnings {
+                    ui.label(format!("- {w}"));
+                }
+                if pf.sidecars > 0 {
+                    ui.label(format!(
+                        "- {} macOS ._ sidecar(s) will be skipped.",
+                        pf.sidecars
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
+                    pf.files, pf.dirs
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if !open {
+            decision = Some(false);
+        }
+        if let Some(yes) = decision {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ConfirmTarImport(yes));
+        }
+    }
+
+    /// The pane's read-only archive viewer: entries with marks, the fork container, extract.
+    fn render_archive_browse_window(&mut self, ui: &mut egui::Ui) {
+        let Some(w) = self.ctl.pane(Side::Left).archive_viewer().cloned() else {
+            return;
+        };
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
+        let marked = w.marked_files();
+        egui::Window::new(format!("Archive: {} ({})", w.entry_name, w.kind.label()))
             .id(egui::Id::unique("mac_archive_window"))
             .collapsible(false)
             .resizable(true)
             .default_size([640.0, 480.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("{file_count} file(s) in archive (read-only view)."));
+                ui.label(format!(
+                    "{} file(s) in archive (read-only view).",
+                    w.file_count()
+                ));
                 ui.separator();
-
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let Some(w) = self.mac_archive_window.as_mut() else {
-                            return;
-                        };
                         egui::Grid::new("mac_archive_window_entries")
                             .striped(true)
                             .num_columns(5)
                             .spacing([12.0, 2.0])
                             .show(ui, |ui| {
-                                ui.strong("Extract");
-                                ui.strong("Name");
-                                ui.strong("Type/Creator");
-                                ui.strong("Size");
-                                ui.strong("Method");
+                                for h in ["Extract", "Name", "Type/Creator", "Size", "Method"] {
+                                    ui.strong(h);
+                                }
                                 ui.end_row();
-
-                                for i in 0..w.archive.entries.len() {
-                                    let e = &w.archive.entries[i];
+                                for (i, e) in w.rows.iter().enumerate() {
                                     if e.is_dir {
                                         ui.label("");
-                                        ui.label(format!("[ {} ]", e.display_path()));
-                                        ui.label("");
-                                        ui.label("");
-                                        ui.label("");
+                                        ui.label(format!("[ {} ]", e.path));
+                                        for _ in 0..3 {
+                                            ui.label("");
+                                        }
                                         ui.end_row();
                                         continue;
                                     }
-                                    let checked = w.selected.get(i).copied().unwrap_or(true);
-                                    let mut new_checked = checked;
-                                    ui.checkbox(&mut new_checked, "");
-                                    if new_checked != checked {
-                                        if let Some(slot) = w.selected.get_mut(i) {
-                                            *slot = new_checked;
-                                        }
+                                    let mut checked = w.marked[i];
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        acts.push(BrowserPaneAction::ArchiveMark(i));
                                     }
-                                    ui.label(e.display_path());
-                                    let tc = String::from_utf8_lossy(&e.type_code);
-                                    let cc = String::from_utf8_lossy(&e.creator_code);
-                                    ui.label(format!("{tc} / {cc}"));
-                                    let (size, method) = e
-                                        .data
-                                        .as_ref()
-                                        .filter(|f| f.uncompressed_len > 0)
-                                        .or(e.rsrc.as_ref())
-                                        .map(|f| (f.uncompressed_len, f.method_name()))
-                                        .unwrap_or((0, "None"));
-                                    ui.label(human_size_b(size as u64));
-                                    ui.label(method);
+                                    ui.label(&e.path);
+                                    ui.label(&e.type_creator);
+                                    ui.label(human_size_b(e.size));
+                                    ui.label(e.method);
                                     ui.end_row();
                                 }
                             });
                     });
-
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Extract as:");
-                    if let Some(w) = self.mac_archive_window.as_mut() {
-                        egui::ComboBox::from_id_salt("mac_archive_window_fork_format")
-                            .selected_text(w.fork_format.label())
-                            .show_ui(ui, |ui| {
-                                for f in mac_extract::ForkFormat::ALL {
-                                    ui.selectable_value(&mut w.fork_format, f, f.label());
-                                }
-                            });
+                    let mut format = w.format;
+                    egui::ComboBox::from_id_salt("mac_archive_window_fork_format")
+                        .selected_text(format.label())
+                        .show_ui(ui, |ui| {
+                            for f in ForkFormat::ALL {
+                                ui.selectable_value(&mut format, f, f.label());
+                            }
+                        });
+                    if format != w.format {
+                        let viewer = true;
+                        acts.push(BrowserPaneAction::ArchiveFormat { viewer, format });
                     }
-
                     if ui.button("Extract All...").clicked() {
-                        extract_action = Some(true);
+                        acts.push(BrowserPaneAction::ArchiveExtract { all: true });
                     }
+                    let label = format!("Extract Selected... ({marked})");
                     if ui
-                        .add_enabled(
-                            selected_file_count > 0,
-                            egui::Button::new(format!(
-                                "Extract Selected... ({selected_file_count})"
-                            )),
-                        )
+                        .add_enabled(marked > 0, egui::Button::new(label))
                         .clicked()
                     {
-                        extract_action = Some(false);
+                        acts.push(BrowserPaneAction::ArchiveExtract { all: false });
                     }
                     if ui.button("Close").clicked() {
-                        close = true;
+                        acts.push(BrowserPaneAction::CloseArchive);
                     }
                 });
             });
-
-        if let Some(extract_all) = extract_action {
-            self.run_archive_window_extract(extract_all);
-        }
-        if close {
-            self.mac_archive_window = None;
+        let ctx = ui.ctx().clone();
+        for a in acts {
+            self.pane_act(&ctx, a);
         }
     }
 
-    /// Drives the Workflow E extract action: picks an output folder and
-    /// runs the same extract pipeline the standalone Archives tab uses.
-    fn run_archive_window_extract(&mut self, all: bool) {
-        let dest = match super::file_dialog()
-            .set_title("Extract archive contents to folder")
-            .pick_folder()
-        {
-            Some(d) => d,
-            None => return,
-        };
-        let Some(w) = self.mac_archive_window.as_ref() else {
-            return;
-        };
-        let bytes = w.bytes.clone();
-        let archive = w.archive.clone();
-        let selected = w.selected.clone();
-        let format = w.fork_format;
-        let result = if all {
-            mac_extract::extract_all(&bytes, &archive, &dest, format, |_, _, _| {}, |_| {})
-        } else {
-            mac_extract::extract_filtered(
-                &bytes,
-                &archive,
-                &dest,
-                format,
-                |i| selected.get(i).copied().unwrap_or(true),
-                |_, _, _| {},
-                |_| {},
-            )
-        };
-        match result {
-            Ok(stats) => {
-                self.edit_result = Some(format!(
-                    "Extracted {} file(s) to {} as {}{}",
-                    stats.files,
-                    dest.display(),
-                    format.label(),
-                    if stats.skipped > 0 {
-                        format!(" ({} skipped)", stats.skipped)
-                    } else {
-                        String::new()
-                    },
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Extract failed: {e}"));
-            }
-        }
-    }
-
-    /// Render the Workflow C "Save Mac archive" modal: the selected
-    /// file inside the disk image sniffed as a Mac archive; the user
-    /// can either dump the raw bytes (Save as-is) or decode into a
-    /// folder using a fork-preserving container (Decode and save).
+    /// The pane's save dialog for a Mac archive on the volume: as stored, or decoded.
     fn render_archive_extract_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_archive_extract.is_none() {
+        let Some(p) = self.ctl.pane(Side::Left).archive_save().cloned() else {
             return;
-        }
-
-        #[derive(Clone, Copy)]
-        enum CAction {
-            SaveAsIs,
-            Decode,
-            Cancel,
-        }
-        let mut action: Option<CAction> = None;
-
-        // Snapshot fields for rendering; the mutable handle is reborrowed
-        // below for the fork-format dropdown.
-        let (entry_name, kind_label) = {
-            let p = self.pending_archive_extract.as_ref().unwrap();
-            (p.entry_name.clone(), p.kind.label())
         };
-
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
         egui::Window::new("Save Mac archive")
             .id(egui::Id::unique("archive_extract_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("{entry_name} is a {kind_label} archive."));
+                ui.label(format!("{} is a {} archive.", p.entry_name, p.kind.label()));
                 ui.add_space(4.0);
                 ui.label("How would you like to save it?");
                 ui.add_space(8.0);
-
-                // Fork-format dropdown for the Decode path (no effect
-                // when the user picks Save as-is).
                 ui.horizontal(|ui| {
                     ui.label("Decoded fork container:");
-                    if let Some(p) = self.pending_archive_extract.as_mut() {
-                        egui::ComboBox::from_id_salt("archive_extract_fork_format")
-                            .selected_text(p.fork_format.label())
-                            .show_ui(ui, |ui| {
-                                for f in mac_extract::ForkFormat::ALL {
-                                    ui.selectable_value(&mut p.fork_format, f, f.label());
-                                }
-                            });
+                    let mut format = p.format;
+                    egui::ComboBox::from_id_salt("archive_extract_fork_format")
+                        .selected_text(format.label())
+                        .show_ui(ui, |ui| {
+                            for f in ForkFormat::ALL {
+                                ui.selectable_value(&mut format, f, f.label());
+                            }
+                        });
+                    if format != p.format {
+                        let viewer = false;
+                        acts.push(BrowserPaneAction::ArchiveFormat { viewer, format });
                     }
                 });
-
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -4090,80 +3456,23 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        action = Some(CAction::SaveAsIs);
+                        acts.push(BrowserPaneAction::SaveArchive { raw: true });
                     }
                     if ui
                         .button("Decode and save contents to a folder...")
                         .on_hover_text("Decompress on the host into the chosen fork container.")
                         .clicked()
                     {
-                        action = Some(CAction::Decode);
+                        acts.push(BrowserPaneAction::SaveArchive { raw: false });
                     }
                     if ui.button("Cancel").clicked() {
-                        action = Some(CAction::Cancel);
+                        acts.push(BrowserPaneAction::CancelSaveArchive);
                     }
                 });
             });
-
-        let Some(action) = action else { return };
-        // Take the pending state; subsequent actions own it.
-        let pending = self.pending_archive_extract.take().unwrap();
-        match action {
-            CAction::SaveAsIs => {
-                let default = pending.entry_name.clone();
-                if let Some(dest) = super::file_dialog()
-                    .set_title("Save archive as-is")
-                    .set_file_name(&default)
-                    .save_file()
-                {
-                    match std::fs::write(&dest, &pending.raw_bytes) {
-                        Ok(()) => {
-                            self.edit_result = Some(format!(
-                                "Wrote {} ({})",
-                                dest.display(),
-                                disk_core::display::format_size(pending.raw_bytes.len() as u64),
-                            ));
-                        }
-                        Err(e) => {
-                            self.edit_result = Some(format!("Write failed: {e}"));
-                        }
-                    }
-                }
-            }
-            CAction::Decode => {
-                if let Some(dest_dir) = super::file_dialog()
-                    .set_title("Save decoded contents to folder")
-                    .pick_folder()
-                {
-                    let result = mac_extract::extract_all(
-                        &pending.extract_bytes,
-                        &pending.archive,
-                        &dest_dir,
-                        pending.fork_format,
-                        |_, _, _| {},
-                        |_| {},
-                    );
-                    match result {
-                        Ok(stats) => {
-                            self.edit_result = Some(format!(
-                                "Extracted {} files to {} as {}{}",
-                                stats.files,
-                                dest_dir.display(),
-                                pending.fork_format.label(),
-                                if stats.skipped > 0 {
-                                    format!(" ({} skipped)", stats.skipped)
-                                } else {
-                                    String::new()
-                                },
-                            ));
-                        }
-                        Err(e) => {
-                            self.edit_result = Some(format!("Extract failed: {e}"));
-                        }
-                    }
-                }
-            }
-            CAction::Cancel => {}
+        let ctx = ui.ctx().clone();
+        for a in acts {
+            self.pane_act(&ctx, a);
         }
     }
 
@@ -4173,8 +3482,6 @@ impl BrowseView {
         self.free_space_job = None;
         self.edit_result = None;
         self.ctl.host_pane().queue.clear();
-        self.pending_archive_imports.clear();
-        self.archive_import_tempdir = None;
 
         if self.chd_edit.is_some() {
             self.start_chd_flatten();
@@ -4185,11 +3492,7 @@ impl BrowseView {
 
     /// The items that could not be staged: the pane's host staging, then an archive import's failure.
     fn render_staging_errors_dialog(&mut self, ui: &mut egui::Ui) {
-        let mut rows: Vec<(String, String)> = self.ctl.pane(Side::Left).staging_errors().to_vec();
-        if self.show_staging_errors {
-            let own = self.staging_errors.iter();
-            rows.extend(own.map(|(p, why)| (p.display().to_string(), why.clone())));
-        }
+        let rows: Vec<(String, String)> = self.ctl.pane(Side::Left).staging_errors().to_vec();
         if rows.is_empty() {
             return;
         }
@@ -4242,8 +3545,6 @@ impl BrowseView {
                 });
             });
         if !open || dismiss {
-            self.show_staging_errors = false;
-            self.staging_errors.clear();
             let act = BrowserPaneAction::DismissStagingErrors;
             self.ctl.apply(CommanderAction::Pane(Side::Left, act));
         }
@@ -4572,7 +3873,7 @@ impl BrowseView {
         });
 
         if !dropped.is_empty() {
-            self.add_host_paths(&dropped);
+            self.add_host_paths(&ui.ctx().clone(), &dropped);
         }
     }
 
@@ -4648,105 +3949,4 @@ enum ApplyFollowUp {
     RecompressArchive,
     /// Close the view or leave edit mode (the unsaved-changes dialog).
     LeaveEditing,
-}
-
-/// What a tar-import job ended with.
-enum TarStep {
-    /// The preflight found content that would be skipped or dropped; ask before importing.
-    Confirm(PathBuf, fs_tar::tar_import::TarImportPreflight),
-    /// The status-line message, and whether anything was written.
-    Finished(String, bool),
-}
-
-/// The tar import, off the UI thread: preflight on a throwaway editable open, then import, sync and commit.
-fn tar_import_step(
-    session: &BrowseSession,
-    dest: &FileEntry,
-    archive: PathBuf,
-    check: bool,
-    job: &rusty_backup::model::job::JobCtx,
-) -> TarStep {
-    let opts = fs_tar::tar_import::TarImportOptions {
-        conflict: fs_tar::tar_import::ImportConflict::Skip,
-        ..Default::default()
-    };
-    if check {
-        job.set_phase("Checking the archive...");
-        let preflight = {
-            let (efs, _commit) = match session.open_editable() {
-                Ok(pair) => pair,
-                Err(e) => {
-                    return TarStep::Finished(format!("Error opening filesystem: {e}"), false)
-                }
-            };
-            match fs_tar::tar_import::preflight_tar_from_path(&*efs, &archive, &opts) {
-                Ok(pf) => pf,
-                Err(e) => {
-                    return TarStep::Finished(format!("Could not read archive: {e:#}"), false)
-                }
-            }
-        };
-        if preflight.has_warnings() {
-            return TarStep::Confirm(archive, preflight);
-        }
-    }
-    job.set_phase("Importing...");
-    let (mut efs, commit) = match session.open_editable() {
-        Ok(pair) => pair,
-        Err(e) => return TarStep::Finished(format!("Error opening filesystem: {e}"), false),
-    };
-    let report = |st: &fs_tar::tar_import::TarImportStats| {
-        job.set_phase(format!(
-            "Importing... {} file(s), {} folder(s)",
-            st.files, st.dirs_created
-        ));
-    };
-    let stats =
-        match fs_tar::tar_import::import_tar_from_path(&mut *efs, dest, &archive, &opts, &report) {
-            Ok(s) => s,
-            Err(e) => return TarStep::Finished(format!("Import failed: {e:#}"), false),
-        };
-    if let Err(e) = efs.sync_metadata() {
-        return TarStep::Finished(format!("Error saving to disk: {e}"), false);
-    }
-    drop(efs);
-    if let Err(e) = commit.commit() {
-        return TarStep::Finished(format!("Error writing container: {e}"), false);
-    }
-    let mut msg = format!(
-        "Imported {} files, {} dirs, {} symlinks into /{}",
-        stats.files,
-        stats.dirs_created,
-        stats.symlinks,
-        if dest.path == "/" {
-            String::new()
-        } else {
-            dest.name.clone()
-        }
-    );
-    if stats.symlinks_skipped > 0 {
-        msg.push_str(&format!("; {} symlink(s) skipped", stats.symlinks_skipped));
-    }
-    if stats.appledouble_skipped > 0 {
-        msg.push_str(&format!(
-            "; {} ._ sidecar(s) skipped",
-            stats.appledouble_skipped
-        ));
-    }
-    if stats.appledouble_paired > 0 {
-        msg.push_str(&format!(
-            "; {} ._ sidecar(s) joined to their file",
-            stats.appledouble_paired
-        ));
-    }
-    if stats.invalid_names_skipped > 0 {
-        msg.push_str(&format!(
-            "; {} bad-name entr(ies) skipped",
-            stats.invalid_names_skipped
-        ));
-    }
-    if stats.skipped_existing > 0 {
-        msg.push_str(&format!("; {} already existed", stats.skipped_existing));
-    }
-    TarStep::Finished(msg, true)
 }

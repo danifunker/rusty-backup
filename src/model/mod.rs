@@ -4,6 +4,7 @@
 //! this tree. See §5 / §10 of `docs/codecleanup.md`.
 
 pub mod archive_edit;
+pub mod archive_import;
 pub mod backup_loader;
 #[cfg(feature = "remote")]
 pub mod backup_remote;

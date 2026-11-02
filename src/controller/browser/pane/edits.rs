@@ -320,6 +320,7 @@ impl BrowserPaneController {
             || !matches!(self.ed.apply, ApplyPhase::Idle | ApplyPhase::Review(_))
             || self.ed.host_job.is_some()
             || self.tool_busy()
+            || self.archive_busy()
     }
 
     /// Add a line to the session log.

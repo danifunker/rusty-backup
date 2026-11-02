@@ -790,7 +790,11 @@ impl BrowserPaneController {
     }
 
     /// Stage host files and folders into the target folder; names the volume cannot hold are listed.
-    fn add_host_paths(&mut self, paths: &[PathBuf], folder: Option<&str>) -> Vec<Effect> {
+    pub(super) fn add_host_paths(
+        &mut self,
+        paths: &[PathBuf],
+        folder: Option<&str>,
+    ) -> Vec<Effect> {
         if let Err(fx) = self.writable_volume() {
             return fx;
         }
@@ -834,6 +838,10 @@ impl BrowserPaneController {
         let mut fx: Vec<Effect> = said.into_iter().map(Effect::Message).collect();
         fx.append(&mut self.out);
         fx
+    }
+
+    pub(super) fn push_staging_error(&mut self, what: String, why: String) {
+        self.tl.staging_errors.push((what, why));
     }
 
     /// A folder that exists only as a staged add.

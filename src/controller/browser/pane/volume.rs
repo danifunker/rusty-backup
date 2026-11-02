@@ -195,7 +195,6 @@ pub(super) struct VolumeState {
     sniff: Option<Job<ReadOut>>,
     /// The last sniff's verdict, by path.
     sniffed: Option<(String, Option<MacArchiveKind>)>,
-    archive: Option<(FileEntry, ArchiveUse, ArchiveRead)>,
 }
 
 impl BrowserPaneController {
@@ -230,11 +229,6 @@ impl BrowserPaneController {
         self.vol.sniff.is_some()
     }
 
-    /// A Mac archive read by `ReadArchive`, handed over once.
-    pub fn take_archive(&mut self) -> Option<(FileEntry, ArchiveUse, ArchiveRead)> {
-        self.vol.archive.take()
-    }
-
     /// Sniff the file at `path` for a Mac archive, unless known or already sniffing.
     pub(super) fn sniff_archive(&mut self, path: &str) -> Vec<Effect> {
         if self.archive_sniff(path).is_some() || self.vol.sniff.is_some() {
@@ -250,21 +244,6 @@ impl BrowserPaneController {
             Err(_) => self.vol.sniffed = Some((path.to_string(), None)),
         }
         Vec::new()
-    }
-
-    pub(super) fn found_archive(
-        &mut self,
-        entry: FileEntry,
-        purpose: ArchiveUse,
-        read: Result<ArchiveRead, String>,
-    ) -> Vec<Effect> {
-        match read {
-            Ok(read) => {
-                self.vol.archive = Some((entry, purpose, read));
-                Vec::new()
-            }
-            Err(e) => msg(e),
-        }
     }
 
     /// Spawn a reading tool on the shared reader.

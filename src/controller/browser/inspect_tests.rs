@@ -12,7 +12,7 @@ use crate::model::browse_session::BrowseSession;
 
 type A = BrowserPaneAction;
 
-fn session(img: &Path) -> BrowseSession {
+pub(super) fn session(img: &Path) -> BrowseSession {
     BrowseSession {
         source_path: Some(img.to_path_buf()),
         ..Default::default()
@@ -20,7 +20,7 @@ fn session(img: &Path) -> BrowseSession {
 }
 
 /// Ticks until no job runs (the side panel's delayed read included).
-fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
+pub(super) fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
     let start = Instant::now();
     let mut fx = ctl.tick();
     while ctl.is_working() {
@@ -34,7 +34,7 @@ fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
     fx
 }
 
-fn inspect(img: &Path) -> CommanderController {
+pub(super) fn inspect(img: &Path) -> CommanderController {
     let mut ctl = CommanderController::single(
         PaneServices::headless(),
         KeyMap::for_this_platform(),
@@ -53,7 +53,7 @@ fn row(ctl: &CommanderController, name: &str) -> DisplayRow {
     found.cloned().unwrap_or_else(|| panic!("no row {name}"))
 }
 
-fn pane(ctl: &mut CommanderController, a: BrowserPaneAction) -> Vec<Effect> {
+pub(super) fn pane(ctl: &mut CommanderController, a: BrowserPaneAction) -> Vec<Effect> {
     ctl.apply(CommanderAction::Pane(Side::Left, a))
 }
 
@@ -764,12 +764,10 @@ fn a_mac_archive_is_sniffed_and_read_on_the_shared_reader() {
         },
     );
     settle(&mut ctl);
-    let (entry, purpose, read) = ctl.host_pane().take_archive().expect("the archive");
-    assert_eq!(
-        (entry.name.as_str(), purpose),
-        ("ARC.SIT", ArchiveUse::Browse)
-    );
-    assert_eq!(read.archive.entries.len(), 1);
+    let viewer = ctl.pane(Side::Left).archive_viewer().expect("the viewer");
+    assert_eq!(viewer.entry_name, "ARC.SIT");
+    assert_eq!((viewer.file_count(), viewer.marked_files()), (1, 1));
+    assert_eq!(viewer.rows[0].path, "inner.txt");
     pane(
         &mut ctl,
         A::ReadArchive {
@@ -778,7 +776,7 @@ fn a_mac_archive_is_sniffed_and_read_on_the_shared_reader() {
         },
     );
     settle(&mut ctl);
-    assert!(ctl.host_pane().take_archive().is_none());
+    assert!(ctl.pane(Side::Left).archive_save().is_none());
     assert!(
         ctl.status().contains("not a recognized Mac archive"),
         "{}",

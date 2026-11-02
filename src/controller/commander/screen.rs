@@ -883,7 +883,7 @@ impl CommanderController {
     /// True while any job runs (an open, apply, copy, export, wrapper or checksum), so a view polls.
     pub fn is_working(&self) -> bool {
         let pane_busy = |p: &BrowserPaneController| {
-            let probing = p.volume_probing();
+            let probing = p.volume_probing() || p.archive_working().is_some();
             p.is_busy() || p.wrapper_opening().is_some() || p.is_listing_folders() || probing
         };
         let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());

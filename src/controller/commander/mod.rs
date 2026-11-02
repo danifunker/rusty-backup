@@ -11,11 +11,12 @@ pub mod screen;
 
 pub use crate::controller::browser::{pane, rows};
 pub use crate::controller::browser::{
-    purpose, validate_entry_name, ApplyPreflight, ApplyReport, ArchiveRead, ArchiveUse,
-    BrowserPaneAction, BrowserPaneController, CheckSummary, DetailPlacement, DisplayRow,
-    FailedEdit, JournalDetail, ListingStyle, MacArchiveKind, NoRecent, OnConflict, PaneProfile,
-    PaneServices, RecentStore, RepairSummary, RowKind, SortColumn, SourceKind, StageOutcome,
-    ToolReport, TreeText, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
+    purpose, validate_entry_name, ApplyPreflight, ApplyReport, ArchiveRead, ArchiveRow,
+    ArchiveSave, ArchiveUse, ArchiveViewer, BrowserPaneAction, BrowserPaneController, CheckSummary,
+    DetailPlacement, DisplayRow, FailedEdit, ForkFormat, ImportChoice, JournalDetail, ListingStyle,
+    MacArchiveKind, NoRecent, OnConflict, PaneProfile, PaneServices, RecentStore, RepairSummary,
+    RowKind, SortColumn, SourceKind, StageOutcome, TarChoice, TarPreview, ToolReport, TreeText,
+    VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 pub use screen::{
     export_choices, ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField,

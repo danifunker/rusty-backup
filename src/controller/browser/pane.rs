@@ -12,6 +12,7 @@ use super::profile::{ListingStyle, PaneProfile};
 use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
+mod archives;
 mod edits;
 mod expand;
 mod remote;
@@ -21,9 +22,11 @@ mod tree;
 mod volume;
 
 pub use crate::fs::replace::OnConflict;
+pub use crate::model::archive_import::{ArchiveRow, TarPreview};
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
 pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
+pub use archives::{ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice, TarChoice};
 pub use edits::{validate_entry_name, ApplyReport, CursorDetail, StageOutcome};
 pub use remote::validate_remote_addr;
 pub use source::{purpose, NoRecent, PaneServices, PrefsOnly, RecentStore, SourceKind, VolumeInfo};
@@ -198,6 +201,34 @@ pub enum BrowserPaneAction {
     },
     /// Close the list of host items that could not be staged.
     DismissStagingErrors,
+    /// Stage host picks and drops into the target folder; a tar (or, on a Mac volume, a Mac
+    /// archive) waits for `ChooseTar` / `ChooseImport` first.
+    AddPicked(Vec<PathBuf>),
+    /// Answer the Mac archive at the front of `pending_import`.
+    ChooseImport(ImportChoice),
+    /// Answer `pending_tar`.
+    ChooseTar(TarChoice),
+    /// Pick a tar and import its contents into the target folder (asking first when it is lossy).
+    ImportTar,
+    /// Go on with (or drop) the tar import whose preflight is in `tar_preview`.
+    ConfirmTarImport(bool),
+    /// Toggle entry `i` of the archive viewer.
+    ArchiveMark(usize),
+    /// The fork container the archive viewer (`viewer`) or the save dialog extracts into.
+    ArchiveFormat {
+        viewer: bool,
+        format: ForkFormat,
+    },
+    /// Pick a folder and extract the viewer's entries: all, or the marked ones.
+    ArchiveExtract {
+        all: bool,
+    },
+    CloseArchive,
+    /// Pick where the save dialog's archive goes: as stored (`raw`), or decoded into a folder.
+    SaveArchive {
+        raw: bool,
+    },
+    CancelSaveArchive,
     /// Open the metadata form for the cursor row.
     EditMetadata,
     SubmitMetadata(Box<MetadataFields>),
@@ -249,6 +280,8 @@ pub struct BrowserPaneController {
     dirs: expand::Folders,
     /// The tree listing, journal and boot-block tools.
     vol: volume::VolumeState,
+    /// The archive viewer, save dialog and archive imports.
+    arc: archives::ArchiveState,
 }
 
 impl Default for BrowserPaneController {
@@ -366,7 +399,8 @@ impl Controller for BrowserPaneController {
                 let handled = self
                     .apply_remote(other)
                     .or_else(|a| self.apply_edit(a))
-                    .or_else(|a| self.apply_tool(a));
+                    .or_else(|a| self.apply_tool(a))
+                    .or_else(|a| self.apply_archive(a));
                 fx = match handled {
                     Ok(fx) => fx,
                     Err(other) => self.apply_source(other),
@@ -382,6 +416,7 @@ impl Controller for BrowserPaneController {
         fx.extend(self.poll_edits());
         fx.extend(self.poll_tools());
         fx.extend(self.poll_volume());
+        fx.extend(self.poll_archives());
         self.poll_folders();
         self.sync_tree();
         self.rebuild_rows();
@@ -429,6 +464,7 @@ impl BrowserPaneController {
             style_key: None,
             dirs: expand::Folders::default(),
             vol: volume::VolumeState::default(),
+            arc: archives::ArchiveState::default(),
         }
     }
 
@@ -459,7 +495,13 @@ impl BrowserPaneController {
             A::Bless | A::BootBlocks => (p.tools.bless && !p.read_only, "bless"),
             A::ShowJournal => (p.tools.fsck, "the journal"),
             A::EditText | A::SaveText { .. } => (p.tools.text_edit && !p.read_only, "editing text"),
-            A::Import | A::AddHostPaths { .. } => (p.tools.import && !p.read_only, "import"),
+            A::Import
+            | A::AddHostPaths { .. }
+            | A::AddPicked(_)
+            | A::ChooseImport(_)
+            | A::ChooseTar(_)
+            | A::ImportTar
+            | A::ConfirmTarImport(_) => (p.tools.import && !p.read_only, "import"),
             A::EditMetadata | A::SubmitMetadata(_) => {
                 (p.tools.metadata && !p.read_only, "editing metadata")
             }
