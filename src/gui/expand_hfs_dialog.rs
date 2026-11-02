@@ -23,8 +23,6 @@ const HFV_MAX_MIB: u32 = (HFV_MAX_BYTES / (1024 * 1024)) as u32;
 
 use rusty_backup::controller::log::LogStore;
 
-pub use rusty_backup::model::hfs_expand_runner::summarize_source;
-
 pub struct ExpandHfsDialog {
     pub open: bool,
     source: ExpandSource,

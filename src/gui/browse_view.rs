@@ -2,19 +2,19 @@
 // info, reader, ctx, logging, etc. — multi-arg by design.
 #![allow(clippy::too_many_arguments)]
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveEditContext,
-    ArchiveUse, BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow,
-    EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _,
-    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
-    PaneProfile, PaneServices, PartcloneCache, ResourceForkMode, RowKind, Side, Snapshot,
-    TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
+    format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveUse,
+    BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue,
+    EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _, ForkFormat,
+    ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction, PaneProfile,
+    PaneServices, ResourceForkMode, RowKind, Side, Snapshot, TarChoice, TextShape, UnsavedChoice,
+    MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
 };
+use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
 use rusty_backup::controller::{Controller as _, Effect};
 
 use super::commander::pane::PaneView;
@@ -265,79 +265,26 @@ impl BrowseView {
         &self.ctl.pane(Side::Left).queue
     }
 
-    /// Open a partition of an image or device (`preopen_file`: an already elevated handle).
-    pub fn open(
-        &mut self,
-        source_path: PathBuf,
-        partition_offset: u64,
-        partition_type: u8,
-        partition_type_string: Option<String>,
-        preopen_file: Option<File>,
-    ) {
-        let session = BrowseSession {
-            source_path: Some(source_path),
-            partition_offset,
-            partition_type,
-            partition_type_string,
-            preopen_file: preopen_file.map(std::sync::Arc::new),
-            ..Default::default()
-        };
+    /// Open the partition the Inspect controller chose, with its edit flow and header extras.
+    pub fn open_request(&mut self, req: BrowseOpen) {
+        let BrowseOpen {
+            session,
+            edit,
+            label_prefix,
+            backup_folder,
+        } = req;
         self.open_with_session(session);
-        self.ctl.inspect_edit_in_place();
-    }
-
-    /// Open a Clonezilla partition through its partclone block cache.
-    pub fn open_partclone(&mut self, cache: PartcloneCache, partition_type: u8) {
-        self.open_with_session(BrowseSession::partclone(cache, partition_type));
-    }
-
-    /// Open a native zstd partition image as a stream until its seekable cache is ready.
-    pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
-        match BrowseSession::streaming(&path, ptype, ptype_str) {
-            Ok(session) => self.open_with_session(session),
-            Err(e) => {
-                self.close();
-                self.error = Some(e);
-                self.active = true;
-            }
+        match edit {
+            BrowseEdit::ReadOnly => {}
+            BrowseEdit::InPlace => self.ctl.inspect_edit_in_place(),
+            BrowseEdit::Archive(ctx) => self.ctl.inspect_edit_archive(ctx),
         }
-    }
-
-    /// A prefix for the header's volume label, such as the Amiga drive name ("DH0"); empty clears it.
-    pub fn set_label_prefix(&mut self, prefix: String) {
-        self.label_prefix = prefix;
-    }
-
-    /// The open source may be edited in place (raw or CHD backup partitions, remote images).
-    pub fn mark_edit_supported(&mut self) {
-        self.ctl.inspect_edit_in_place();
-    }
-
-    /// The open backup partition is edited by decompressing, editing, then recompressing it.
-    pub fn set_archive_edit_context(
-        &mut self,
-        archive_path: PathBuf,
-        compression_type: String,
-        original_size: u64,
-        compacted: bool,
-        metadata_path: PathBuf,
-        partition_index: usize,
-        checksum_type: String,
-    ) {
-        self.ctl.inspect_edit_archive(ArchiveEditContext {
-            archive_path,
-            compression_type,
-            original_size,
-            compacted,
-            metadata_path,
-            partition_index,
-            checksum_type,
-        });
-    }
-
-    /// The open CHD is the body of this single-file-chd backup; a save refreshes its metadata.
-    pub fn set_single_file_chd_backup_folder(&mut self, backup_folder: PathBuf) {
-        self.ctl.inspect_backup_folder(backup_folder);
+        if let Some(prefix) = label_prefix {
+            self.label_prefix = prefix;
+        }
+        if let Some(folder) = backup_folder {
+            self.ctl.inspect_backup_folder(folder);
+        }
     }
 
     /// The streamed backup's seekable cache is ready; the tree stays where it is.
