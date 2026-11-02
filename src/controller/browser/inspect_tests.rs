@@ -159,3 +159,39 @@ fn a_staged_folder_shows_its_staged_contents_beneath_it() {
         Some("/NEWDIR/INNER".into())
     );
 }
+
+#[test]
+fn the_side_panel_takes_edits_only_while_writable_and_covers_staged_adds() {
+    use crate::model::edit_queue::StagedEdit;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    ctl.host_pane().set_read_only(true);
+    pane(
+        &mut ctl,
+        A::Click {
+            name: "HELLO.TXT".into(),
+            ctrl: false,
+            shift: false,
+        },
+    );
+    settle(&mut ctl);
+    assert!(!ctl.side_detail(Side::Left).unwrap().editable);
+    ctl.host_pane().set_read_only(false);
+    settle(&mut ctl);
+    assert!(ctl.side_detail(Side::Left).unwrap().editable);
+    let root = ctl.pane(Side::Left).entry_at("/").unwrap();
+    ctl.host_pane().queue.push(StagedEdit::CreateDirectory {
+        parent: root,
+        name: "NEWDIR".into(),
+        qnx2_attrs: None,
+    });
+    ctl.tick();
+    let id = row(&ctl, "NEWDIR").node_id;
+    pane(&mut ctl, A::CursorTo(id));
+    settle(&mut ctl);
+    let d = ctl
+        .side_detail(Side::Left)
+        .expect("a staged add has details");
+    assert_eq!(d.entry.name, "NEWDIR");
+    assert!(d.preview.is_none() && !d.loading);
+}

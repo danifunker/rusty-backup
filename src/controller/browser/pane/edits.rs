@@ -437,8 +437,19 @@ impl BrowserPaneController {
     /// What File Info would show for the cursor row, without touching the selection.
     pub fn cursor_detail(&mut self) -> Option<CursorDetail> {
         let row = self.cursor_row()?;
-        if row.is_parent() || row.kind == super::RowKind::PendingAdd {
+        if row.is_parent() {
             return None;
+        }
+        // A staged add has nothing to read yet, but its type and dates can be set before Apply.
+        if row.kind == super::RowKind::PendingAdd {
+            return Some(CursorDetail {
+                entry: self.row_entry(&row)?,
+                node_id: row.node_id,
+                fs_type: self.volume().fs_type.clone(),
+                editable: !self.profile.read_only,
+                source: None,
+                at_root: false,
+            });
         }
         if row.is_tree {
             let tr = self.tree_index.get(&row.node_id)?.clone();
@@ -471,7 +482,7 @@ impl BrowserPaneController {
             at_root: !entry.path.trim_start_matches('/').contains('/'),
             entry,
             fs_type: self.volume().fs_type.clone(),
-            editable: !host && !self.is_backup() && !self.is_archive(),
+            editable: !self.profile.read_only && !host && !self.is_backup() && !self.is_archive(),
             source,
         })
     }

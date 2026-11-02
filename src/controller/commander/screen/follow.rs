@@ -181,10 +181,11 @@ impl CommanderController {
 
     fn retarget(&mut self, side: Side, now: Instant) {
         let target = self.pane_mut(side).cursor_detail();
-        // The entry's size and date are in the key, so a row rewritten by an apply is read again.
-        let key = target
-            .as_ref()
-            .map(|t| format!("{}\0{}\0{:?}", t.node_id, t.entry.size, t.entry.modified));
+        // Size, date and editability are in the key: a rewritten row is read again, a toggle redraws.
+        let key = target.as_ref().map(|t| {
+            let (size, modified) = (t.entry.size, &t.entry.modified);
+            format!("{}\0{size}\0{modified:?}\0{}", t.node_id, t.editable)
+        });
         if key == self.follow[side.idx()].key {
             return;
         }

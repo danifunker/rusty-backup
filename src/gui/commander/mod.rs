@@ -43,15 +43,25 @@ type A = CommanderAction;
 
 /// The File Info window's widget state for one entry; rebuilt when the controller's serial changes.
 #[derive(Default)]
-struct DetailEditors {
-    serial: u64,
-    content: Option<FileContent>,
+pub(crate) struct DetailEditors {
+    pub(crate) serial: u64,
+    pub(crate) content: Option<FileContent>,
     hfs: Option<HfsTypeEditorState>,
     prodos: Option<ProdosTypeEditorState>,
     dates: Option<HfsDatesEditorState>,
     perms: Option<ExtPermsEditorState>,
     owner: Option<OwnerEditorState>,
     xattr: Option<XattrEditorState>,
+}
+
+impl DetailEditors {
+    /// Empty widgets for the detail with this serial.
+    pub(crate) fn fresh(serial: u64) -> Self {
+        DetailEditors {
+            serial,
+            ..DetailEditors::default()
+        }
+    }
 }
 
 /// The editors read the pane's queue and hand their changes back for the controller to stage.
@@ -770,6 +780,19 @@ fn detail_body(
     staged: &mut Vec<MetadataEdit>,
     id: &str,
 ) {
+    detail_meta(ui, d, ed, queue, staged);
+    ui.separator();
+    detail_preview(ui, ed, id, 280.0);
+}
+
+/// File Info's metadata rows and editors, without the preview.
+pub(crate) fn detail_meta(
+    ui: &mut egui::Ui,
+    d: &FileDetail,
+    ed: &mut DetailEditors,
+    queue: &EditQueue,
+    staged: &mut Vec<MetadataEdit>,
+) {
     let fs = d.fs_type.as_str();
     let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
     let is_prodos = fs == "ProDOS";
@@ -849,12 +872,15 @@ fn detail_body(
         ui.add_space(4.0);
         ui.colored_label(super::theme::success(ui.visuals()), msg);
     }
-    ui.separator();
+}
+
+/// File Info's text or hex preview, at most `height` tall.
+pub(crate) fn detail_preview(ui: &mut egui::Ui, ed: &DetailEditors, id: &str, height: f32) {
     match &ed.content {
         Some(FileContent::Text(text)) => {
             egui::ScrollArea::vertical()
                 .id_salt((id, "preview"))
-                .max_height(280.0)
+                .max_height(height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
@@ -867,7 +893,7 @@ fn detail_body(
         Some(FileContent::Binary(data)) => {
             egui::ScrollArea::vertical()
                 .id_salt((id, "preview"))
-                .max_height(280.0)
+                .max_height(height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| file_detail::render_hex_view(ui, data));
         }

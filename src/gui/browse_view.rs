@@ -29,12 +29,10 @@ use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::rbformats::chd_edit;
 
 use super::commander::pane::PaneView;
+use super::commander::DetailEditors;
 use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
-use super::metadata_editor::{
-    self, ExtPermsEditorState, HfsTypeEditorState, OwnerEditorState, ProdosTypeEditorState,
-    XattrEditorState,
-};
+use super::metadata_editor;
 
 /// Smallest file offered "Open as Disk Image": below this nothing holds a partitioned volume.
 const MIN_NESTED_IMAGE_BYTES: u64 = 16 * 1024;
@@ -85,6 +83,8 @@ pub struct BrowseView {
     cursor_seen: Option<String>,
     /// The user moved the cursor since the volume (re)opened; until then it selects nothing.
     cursor_armed: bool,
+    /// A row to put the cursor back on once the reopened pane lists it (a saved text file).
+    cursor_back: Option<String>,
     /// The session changed or the volume was written: the pane reopens on the next frame.
     pane_stale: bool,
     /// The entry the content panel shows: the cursor row, or the root when its row is clicked.
@@ -94,8 +94,8 @@ pub struct BrowseView {
     chd_diff_dirty: bool,
     /// Chosen output format for the "Export selected" pulldown.
     export_format: rusty_backup::fs::export_selection::ExportFormat,
-    /// Cached content of the selected file.
-    content: Option<FileContent>,
+    /// The side panel's preview and editor widgets, rebuilt when its detail changes.
+    side_ed: DetailEditors,
     /// View mode for file content.
     #[allow(dead_code)]
     view_mode: ViewMode,
@@ -103,11 +103,6 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
-    /// Cached uid/gid -> name map from the image's own `/etc/passwd` +
-    /// `/etc/group`, built lazily the first time File Info shows an owner and
-    /// reused thereafter. `None` = not yet built; a built-but-empty map (a
-    /// non-Linux image) is still cached so we don't retry every frame.
-    id_names: Option<disk_core::id_names::IdNameMap>,
     /// Volume total / used bytes (cached at open) for the header free-space
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
@@ -245,23 +240,6 @@ pub struct BrowseView {
     /// fully close the browse view rather than just leaving edit mode. Set by
     /// the in-view Close intercept when staged edits force the dialog first.
     pending_close: bool,
-    /// Inline ProDOS type/aux editor state, keyed by entry path. Reset when
-    /// the selection changes.
-    prodos_type_editor: Option<ProdosTypeEditorState>,
-    /// Inline HFS type/creator editor state, keyed by entry path. The fields
-    /// are kept as 4-char-clamped strings so the user can type freely; on
-    /// "Set" we encode and stage. `None` means the editor is closed for that
-    /// entry; on first open we seed from current FInfo or the dictionary.
-    hfs_type_editor: Option<HfsTypeEditorState>,
-    /// Inline Unix permissions / owner / xattr editor state, keyed by entry
-    /// path. Reset when the selection changes.
-    ext_perms_editor: Option<ExtPermsEditorState>,
-    owner_editor: Option<OwnerEditorState>,
-    xattr_editor: Option<XattrEditorState>,
-    /// On-disk xattrs of the selected entry, cached by path (read once per
-    /// selection on an xattr-bearing filesystem). Rebuilt when the selection
-    /// changes; `None` = not yet read for this selection.
-    xattr_cache: Option<(String, Vec<disk_core::xattr::Xattr>)>,
     /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
     /// `show_staging_errors` drives a modal dialog listing each failure.
     staging_errors: Vec<(PathBuf, String)>,
@@ -477,15 +455,15 @@ impl Default for BrowseView {
             scroll_cursor: false,
             cursor_seen: None,
             cursor_armed: false,
+            cursor_back: None,
             pane_stale: false,
             selected_entry: None,
             chd_diff_dirty: false,
             export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
-            content: None,
+            side_ed: DetailEditors::default(),
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
-            id_names: None,
             volume_total: 0,
             volume_used: 0,
             carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
@@ -537,12 +515,6 @@ impl Default for BrowseView {
             conflict_review: None,
             text_editor: None,
             pending_close: false,
-            prodos_type_editor: None,
-            hfs_type_editor: None,
-            ext_perms_editor: None,
-            owner_editor: None,
-            xattr_editor: None,
-            xattr_cache: None,
             staging_errors: Vec::new(),
             show_staging_errors: false,
             pending_extraction: None,
@@ -859,9 +831,7 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
         self.selected_entry = None;
-        self.content = None;
-        self.id_names = None;
-        self.xattr_cache = None;
+        self.side_ed = DetailEditors::default();
         self.error = None;
         self.active = false;
         self.fs_type.clear();
@@ -1780,6 +1750,20 @@ impl BrowseView {
 
     /// Point the content panel at the cursor row once it moved (a click or a key).
     fn sync_selected(&mut self) {
+        if let Some(id) = self.cursor_back.clone() {
+            if self
+                .ctl
+                .pane(Side::Left)
+                .rows()
+                .iter()
+                .any(|r| r.node_id == id)
+            {
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::CursorTo(id));
+                self.ctl.apply(act);
+                self.cursor_back = None;
+                self.cursor_armed = true;
+            }
+        }
         let pane = self.ctl.pane(Side::Left);
         let Some(row) = pane.cursor_index().map(|i| pane.rows()[i].clone()) else {
             return;
@@ -1799,19 +1783,14 @@ impl BrowseView {
         };
         let Some(entry) = entry else {
             self.selected_entry = None;
-            self.content = None;
+            self.side_ed = DetailEditors::default();
             return;
         };
         if self.selected_entry.as_ref().map(|e| &e.path) == Some(&entry.path) {
             return;
         }
-        if entry.is_directory() || row.kind == RowKind::PendingAdd {
-            self.selected_entry = Some(entry);
-            self.content = None;
-            self.error = None;
-        } else {
-            self.select_file(&entry);
-        }
+        self.selected_entry = Some(entry);
+        self.error = None;
     }
 
     /// The listing in the pane's style: the combined tree as the browser always drew it, or Commander's.
@@ -1870,7 +1849,7 @@ impl BrowseView {
         ui.horizontal(|ui| {
             if ui.selectable_label(root_selected, "/").clicked() {
                 self.selected_entry = pane.entry_at("/").or_else(|| Some(FileEntry::root()));
-                self.content = None;
+                self.side_ed = DetailEditors::default();
                 self.error = None;
                 self.keys_active = true;
             }
@@ -2236,10 +2215,7 @@ impl BrowseView {
         let cached = self.cached_fs.take();
         let session = self.session.clone();
         let show_deleted = self.show_deleted;
-        let label = match &read {
-            FsRead::Archive(..) => ARCHIVE_READ_LABEL,
-            _ => "Reading",
-        };
+        let label = ARCHIVE_READ_LABEL;
         let job = rusty_backup::model::job::Job::spawn(
             label,
             Arc::new(super::ui_logger::EguiWake),
@@ -2262,12 +2238,6 @@ impl BrowseView {
                     },
                 };
                 let done = match read {
-                    FsRead::Preview(entry) => {
-                        let result = fs
-                            .read_file(&entry, MAX_PREVIEW_SIZE)
-                            .map_err(|e| e.to_string());
-                        FsReadDone::Preview(entry, result)
-                    }
                     FsRead::Archive(entry, purpose) => {
                         let result = read_mac_archive(&mut *fs, &entry, purpose);
                         FsReadDone::Archive(entry, purpose, result)
@@ -2312,60 +2282,7 @@ impl BrowseView {
             FsReadDone::Archive(entry, purpose, result) => {
                 self.apply_archive_read(entry, purpose, result);
             }
-            FsReadDone::Preview(entry, result) => {
-                // Only the file still selected gets its preview.
-                if self.selected_entry.as_ref().map(|s| &s.path) != Some(&entry.path) {
-                    return;
-                }
-                match result {
-                    Ok(mut data) => {
-                        if self.fs_type == "QNX 2"
-                            && rusty_backup::fs::qnx2::looks_like_rs_text(&data)
-                        {
-                            data = rusty_backup::fs::qnx2::rs_to_lf(&data);
-                        }
-                        self.content = Some(file_detail::detect_content_type(&entry, &data));
-                    }
-                    Err(e) => self.error = Some(format!("Failed to read file: {e}")),
-                }
-            }
         }
-    }
-
-    fn select_file(&mut self, entry: &FileEntry) {
-        self.selected_entry = Some(entry.clone());
-        self.content = None;
-        self.error = None;
-
-        // Symlinks: show the target path as text content
-        if entry.is_symlink() {
-            let target = entry
-                .symlink_target
-                .as_deref()
-                .unwrap_or("(unknown target)");
-            self.content = Some(FileContent::Text(format!("Symlink target: {target}")));
-            return;
-        }
-
-        // Special files: no content to preview
-        if entry.is_special() {
-            let stype = entry.special_type.as_deref().unwrap_or("special file");
-            self.content = Some(FileContent::Text(format!(
-                "{} -- no preview available",
-                stype
-            )));
-            return;
-        }
-
-        if entry.size > MAX_PREVIEW_SIZE as u64 {
-            // Don't auto-load large files
-            return;
-        }
-
-        // Only the newest preview matters: drop any still waiting.
-        self.read_queue.retain(|r| !matches!(r, FsRead::Preview(_)));
-        self.read_queue.push_back(FsRead::Preview(entry.clone()));
-        self.pump_reads();
     }
 
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
@@ -2398,408 +2315,310 @@ impl BrowseView {
             }
         }
 
-        // Lazily build the uid/gid -> name map the first time we're about to
-        // show an owner on a Unix filesystem (the selected entry carrying a uid
-        // is the signal). Cached even when empty so we don't reopen every frame.
-        if self.id_names.is_none()
-            && self
-                .selected_entry
-                .as_ref()
-                .map(|e| e.uid.is_some())
-                .unwrap_or(false)
-        {
-            let map = self
-                .session
-                .open()
-                .ok()
-                .map(|mut fs| disk_core::id_names::IdNameMap::from_filesystem(&mut *fs))
-                .unwrap_or_default();
-            self.id_names = Some(map);
-        }
-
-        match &self.selected_entry {
-            None => {
+        let entry = self.selected_entry.clone();
+        let shown = self.render_detail(ui, entry.as_ref());
+        // A row inside an expanded archive or image: details only, its actions act on this volume.
+        let Some(entry) = entry else {
+            if !shown {
                 ui.colored_label(
                     super::theme::muted(ui.visuals()),
                     "Select a file to view its contents.",
                 );
             }
-            Some(entry) => {
-                let entry = entry.clone();
-                // Read-only metadata rows (name header + size/modified/type/...).
-                // HFS/HFS+ and ProDOS suppress the inline Type/Creator labels —
-                // they render those in a dedicated editor row below.
-                let suppress_type_creator = self.is_hfs_type() || self.is_prodos_type();
-                file_detail::render_metadata_rows(
-                    ui,
-                    &entry,
-                    suppress_type_creator,
-                    self.id_names.as_ref(),
-                );
-
-                // HFS/HFS+ type/creator row — read-only labels normally, full
-                // editor (text fields + dictionary pulldown) when in edit mode.
-                if self.is_hfs_type() && entry.is_file() {
-                    metadata_editor::render_hfs_type_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.ctl.host_pane().queue,
-                        &mut self.hfs_type_editor,
-                        &mut self.edit_result,
+            return;
+        };
+        // ProDOS/GS-OS leaves $CB..$EE unassigned; vintage apps used them, so say it is not corruption.
+        if self.is_prodos_type() {
+            let tt = entry.prodos_file_type;
+            if let Some(tt) = tt {
+                if !fs_apple2::prodos_types::is_known_type(tt) {
+                    let aux = entry.aux_type.unwrap_or(0);
+                    ui.colored_label(
+                        super::theme::warning(ui.visuals()),
+                        format!(
+                            "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                            tt,
+                            fs_apple2::prodos_types::UNKNOWN_TYPE_NOTE,
+                            aux,
+                            tt,
+                            aux,
+                        ),
                     );
-                }
-
-                // ProDOS type/aux row — read-only normally, type pulldown + hex
-                // inputs when in edit mode.
-                if self.is_prodos_type() && entry.is_file() {
-                    metadata_editor::render_prodos_type_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.ctl.host_pane().queue,
-                        &mut self.prodos_type_editor,
-                        &mut self.edit_result,
-                    );
-                }
-
-                // ProDOS/GS-OS leaves $CB..$EE unassigned in the official
-                // type registry; vintage apps often picked bytes out of
-                // that range for their own data files. Surface a note so
-                // the user knows the file isn't corrupt — the type and
-                // aux round-trip via the CiderPress #TTAAAA suffix.
-                if self.is_prodos_type() {
-                    let tt = entry.prodos_file_type;
-                    if let Some(tt) = tt {
-                        if !fs_apple2::prodos_types::is_known_type(tt) {
-                            let aux = entry.aux_type.unwrap_or(0);
-                            ui.colored_label(
-                                super::theme::warning(ui.visuals()),
-                                format!(
-                                    "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
-                                    tt,
-                                    fs_apple2::prodos_types::UNKNOWN_TYPE_NOTE,
-                                    aux,
-                                    tt,
-                                    aux,
-                                ),
-                            );
-                        }
-                    }
-                }
-
-                // Unix permissions / owner / xattrs. Shown on any filesystem
-                // whose entries carry POSIX metadata (the entry having a `mode`
-                // is the signal). Read-only labels normally; octal / uid-gid /
-                // xattr editors when in edit mode.
-                if entry.mode.is_some() {
-                    metadata_editor::render_ext_permissions_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.ctl.host_pane().queue,
-                        &mut self.ext_perms_editor,
-                        &mut self.edit_result,
-                    );
-                    metadata_editor::render_owner_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        self.id_names.as_ref(),
-                        &mut self.ctl.host_pane().queue,
-                        &mut self.owner_editor,
-                        &mut self.edit_result,
-                    );
-
-                    // Extended attributes: read the on-disk set once per
-                    // selection on an xattr-bearing filesystem, then let the
-                    // section overlay any staged edits.
-                    let want_xattrs =
-                        self.xattr_cache.as_ref().map(|(p, _)| p) != Some(&entry.path);
-                    if want_xattrs {
-                        let read = self
-                            .session
-                            .open()
-                            .ok()
-                            .filter(|fs| fs.supports_xattrs())
-                            .and_then(|mut fs| fs.list_xattrs(&entry).ok())
-                            .unwrap_or_default();
-                        self.xattr_cache = Some((entry.path.clone(), read));
-                    }
-                    let xattrs = self
-                        .xattr_cache
-                        .as_ref()
-                        .map(|(_, x)| x.as_slice())
-                        .unwrap_or(&[]);
-                    metadata_editor::render_xattr_section(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        xattrs,
-                        &mut self.ctl.host_pane().queue,
-                        &mut self.xattr_editor,
-                        &mut self.edit_result,
-                    );
-                }
-
-                // Extract controls row
-                let extraction_running = self.extraction_progress.is_some();
-                let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
-
-                // The Mac-archive workflows only make sense on Mac-native
-                // volumes. Sniff the selection once per change so the
-                // "Save as / Browse archive" buttons appear strictly for
-                // files that are actually archives (preflight, not
-                // error-on-click). The bundling row needs only the
-                // filesystem gate — you can wrap any file/folder.
-                let is_mac_fs = self.is_mac_filesystem();
-                let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
-
-                if is_extractable && !extraction_running {
-                    ui.horizontal(|ui| {
-                        // Resource fork mode dropdown (HFS/HFS+ only)
-                        if self.is_hfs_type() {
-                            ui.label("Resource forks:");
-                            let current_label = self.resource_fork_mode.label();
-                            egui::ComboBox::from_id_salt("rsrc_mode")
-                                .selected_text(current_label)
-                                .show_ui(ui, |ui| {
-                                    for mode in &ResourceForkMode::ALL {
-                                        ui.selectable_value(
-                                            &mut self.resource_fork_mode,
-                                            *mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                        }
-
-                        if self.fs_type == "QNX 2" {
-                            ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
-                                "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
-                            );
-                            ui.add_space(8.0);
-                        }
-
-                        // ProDOS export mode dropdown (ProDOS only)
-                        if self.is_prodos_type() {
-                            ui.label("Export name:");
-                            let current_label = self.prodos_export_mode.label();
-                            egui::ComboBox::from_id_salt("prodos_export_mode")
-                                .selected_text(current_label)
-                                .show_ui(ui, |ui| {
-                                    for mode in &ProdosExportMode::ALL {
-                                        ui.selectable_value(
-                                            &mut self.prodos_export_mode,
-                                            *mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                        }
-
-                        let btn_label = if entry.is_directory() {
-                            "Extract Folder..."
-                        } else {
-                            "Extract File..."
-                        };
-                        if ui.button(btn_label).clicked() {
-                            self.start_extraction(&entry);
-                        }
-
-                        // Archive the selected folder/file to a tar.gz instead
-                        // of laying it out on the host — preserves case +
-                        // symlinks (handy for case-sensitive volumes).
-                        let tgz_label = if entry.is_directory() {
-                            "Export Folder to .tgz..."
-                        } else {
-                            "Export File to .tgz..."
-                        };
-                        if ui
-                            .add_enabled(
-                                self.tar_export_progress.is_none(),
-                                egui::Button::new(tgz_label),
-                            )
-                            .on_hover_text(
-                                "Save the selection as a single .tar.gz / .tar.zst / .tar \
-                                 (preserves exact case + symlinks; pick the extension in \
-                                 the save dialog)",
-                            )
-                            .clicked()
-                        {
-                            self.start_tar_export(&entry);
-                        }
-
-                        if entry.is_file()
-                            && entry.size >= MIN_NESTED_IMAGE_BYTES
-                            && ui
-                                .button("Open as Disk Image")
-                                .on_hover_text(
-                                    "Copy this file to a temporary folder and inspect it as \
-                                     its own disk image, e.g. a ShapeShifter hardfile or a \
-                                     floppy image stored on this volume.",
-                                )
-                                .clicked()
-                        {
-                            self.start_nested_open(&entry);
-                        }
-
-                        // Workflow C: the selection already sniffed as a
-                        // Mac archive (see show_archive_actions), so pop
-                        // the C modal (Save as-is vs Decode-and-save).
-                        if show_archive_actions
-                            && ui
-                                .button("Save as Mac archive...")
-                                .on_hover_text(
-                                    "This file is a Mac archive (BinHex / StuffIt / \
-                                     SEA): open a dialog to either save it raw or \
-                                     decode and save its contents in a fork-preserving \
-                                     container.",
-                                )
-                                .clicked()
-                        {
-                            self.open_archive_extract_modal(&entry);
-                        }
-
-                        // Workflow E: open a floating viewer that lets
-                        // the user browse the archive's entries and
-                        // extract any subset.
-                        if show_archive_actions
-                            && ui
-                                .button("Browse archive...")
-                                .on_hover_text(
-                                    "Open a viewer to browse this Mac archive's entries \
-                                     and extract any subset (per-entry selection, \
-                                     fork-preserving containers).",
-                                )
-                                .clicked()
-                        {
-                            self.open_archive_browse_window(&entry);
-                        }
-                    });
-
-                    // Workflow B: bundle the current selection as a Mac
-                    // archive on the host. BinHex is single-file only;
-                    // SIT / SIT.HQX accept any single entry (folders
-                    // walk recursively). Only offered on Mac volumes,
-                    // where forks / type / creator codes exist to bundle.
-                    if is_mac_fs {
-                        ui.horizontal(|ui| {
-                            ui.label("Export Mac archive:");
-                            let is_single_file = entry.is_file();
-                            if ui
-                                .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
-                                .on_hover_text(
-                                    "Encode the selected file's data fork, resource fork, \
-                                 and type/creator codes as printable ASCII (BinHex 4.0). \
-                                 The only flat format that survives a non-HFS roundtrip.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
-                            }
-                            if ui
-                                .button("StuffIt (.sit)")
-                                .on_hover_text(
-                                    "Multi-file compressed archive in classic StuffIt format. \
-                                 Preserves forks on HFS or inside a .hqx wrapper. \
-                                 Folders walk recursively.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
-                            }
-                            if ui
-                                .button("StuffIt-over-BinHex (.sit.hqx)")
-                                .on_hover_text(
-                                    "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
-                                 The classic \"emailed me a Mac app\" format.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(
-                                    &entry,
-                                    ArchiveExportFormat::SitHqx,
-                                );
-                            }
-                            if ui
-                                .button("MAR (.mar)")
-                                .on_hover_text(
-                                    "Hampa Hug's MAR format: a single file or folder tree with \
-                                 both forks, stored uncompressed. Folders walk recursively; \
-                                 multiple items are wrapped in a folder.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Mar);
-                            }
-                        });
-                    }
-                }
-
-                ui.separator();
-
-                if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
-                    ui.label(format!(
-                        "File too large to preview ({}).",
-                        disk_core::display::format_size(entry.size)
-                    ));
-                    return;
-                }
-
-                if entry.is_directory() {
-                    return;
-                }
-
-                // Remaining height for the scroll area after the header
-                let content_height = ui.available_height().min(panel_height);
-
-                // Deferred: `self.content` is borrowed for the match below, so
-                // the editor cannot be opened from inside it.
-                let mut open_editor_for: Option<(String, String)> = None;
-
-                match &self.content {
-                    None => {
-                        if entry.is_file() {
-                            ui.spinner();
-                            ui.label("Loading...");
-                        }
-                    }
-                    Some(FileContent::Text(text)) => {
-                        // Editing is offered only where it is safe: a text
-                        // preview means the content decoded cleanly.
-                        if ui.button("Edit as text...").clicked() {
-                            open_editor_for = Some((entry.path.clone(), entry.name.clone()));
-                        }
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_content")
-                            .max_height(content_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut text.as_str())
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                            });
-                    }
-                    Some(FileContent::Binary(data)) => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_content")
-                            .max_height(content_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                file_detail::render_hex_view(ui, data);
-                            });
-                    }
-                }
-                if let Some((path, name)) = open_editor_for.take() {
-                    self.open_text_editor(&path, &name);
                 }
             }
         }
+
+        // Extract controls row
+        let extraction_running = self.extraction_progress.is_some();
+        let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
+
+        // The Mac-archive workflows only make sense on Mac-native
+        // volumes. Sniff the selection once per change so the
+        // "Save as / Browse archive" buttons appear strictly for
+        // files that are actually archives (preflight, not
+        // error-on-click). The bundling row needs only the
+        // filesystem gate — you can wrap any file/folder.
+        let is_mac_fs = self.is_mac_filesystem();
+        let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
+
+        if is_extractable && !extraction_running {
+            ui.horizontal(|ui| {
+                // Resource fork mode dropdown (HFS/HFS+ only)
+                if self.is_hfs_type() {
+                    ui.label("Resource forks:");
+                    let current_label = self.resource_fork_mode.label();
+                    egui::ComboBox::from_id_salt("rsrc_mode")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for mode in &ResourceForkMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.resource_fork_mode,
+                                    *mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+
+                if self.fs_type == "QNX 2" {
+                    ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
+                        "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
+                    );
+                    ui.add_space(8.0);
+                }
+
+                // ProDOS export mode dropdown (ProDOS only)
+                if self.is_prodos_type() {
+                    ui.label("Export name:");
+                    let current_label = self.prodos_export_mode.label();
+                    egui::ComboBox::from_id_salt("prodos_export_mode")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for mode in &ProdosExportMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.prodos_export_mode,
+                                    *mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+
+                let btn_label = if entry.is_directory() {
+                    "Extract Folder..."
+                } else {
+                    "Extract File..."
+                };
+                if ui.button(btn_label).clicked() {
+                    self.start_extraction(&entry);
+                }
+
+                // Archive the selected folder/file to a tar.gz instead
+                // of laying it out on the host — preserves case +
+                // symlinks (handy for case-sensitive volumes).
+                let tgz_label = if entry.is_directory() {
+                    "Export Folder to .tgz..."
+                } else {
+                    "Export File to .tgz..."
+                };
+                if ui
+                    .add_enabled(
+                        self.tar_export_progress.is_none(),
+                        egui::Button::new(tgz_label),
+                    )
+                    .on_hover_text(
+                        "Save the selection as a single .tar.gz / .tar.zst / .tar \
+                         (preserves exact case + symlinks; pick the extension in \
+                         the save dialog)",
+                    )
+                    .clicked()
+                {
+                    self.start_tar_export(&entry);
+                }
+
+                if entry.is_file()
+                    && entry.size >= MIN_NESTED_IMAGE_BYTES
+                    && ui
+                        .button("Open as Disk Image")
+                        .on_hover_text(
+                            "Copy this file to a temporary folder and inspect it as \
+                             its own disk image, e.g. a ShapeShifter hardfile or a \
+                             floppy image stored on this volume.",
+                        )
+                        .clicked()
+                {
+                    self.start_nested_open(&entry);
+                }
+
+                // Workflow C: the selection already sniffed as a
+                // Mac archive (see show_archive_actions), so pop
+                // the C modal (Save as-is vs Decode-and-save).
+                if show_archive_actions
+                    && ui
+                        .button("Save as Mac archive...")
+                        .on_hover_text(
+                            "This file is a Mac archive (BinHex / StuffIt / \
+                             SEA): open a dialog to either save it raw or \
+                             decode and save its contents in a fork-preserving \
+                             container.",
+                        )
+                        .clicked()
+                {
+                    self.open_archive_extract_modal(&entry);
+                }
+
+                // Workflow E: open a floating viewer that lets
+                // the user browse the archive's entries and
+                // extract any subset.
+                if show_archive_actions
+                    && ui
+                        .button("Browse archive...")
+                        .on_hover_text(
+                            "Open a viewer to browse this Mac archive's entries \
+                             and extract any subset (per-entry selection, \
+                             fork-preserving containers).",
+                        )
+                        .clicked()
+                {
+                    self.open_archive_browse_window(&entry);
+                }
+            });
+
+            // Workflow B: bundle the current selection as a Mac
+            // archive on the host. BinHex is single-file only;
+            // SIT / SIT.HQX accept any single entry (folders
+            // walk recursively). Only offered on Mac volumes,
+            // where forks / type / creator codes exist to bundle.
+            if is_mac_fs {
+                ui.horizontal(|ui| {
+                    ui.label("Export Mac archive:");
+                    let is_single_file = entry.is_file();
+                    if ui
+                        .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
+                        .on_hover_text(
+                            "Encode the selected file's data fork, resource fork, \
+                         and type/creator codes as printable ASCII (BinHex 4.0). \
+                         The only flat format that survives a non-HFS roundtrip.",
+                        )
+                        .clicked()
+                    {
+                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
+                    }
+                    if ui
+                        .button("StuffIt (.sit)")
+                        .on_hover_text(
+                            "Multi-file compressed archive in classic StuffIt format. \
+                         Preserves forks on HFS or inside a .hqx wrapper. \
+                         Folders walk recursively.",
+                        )
+                        .clicked()
+                    {
+                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
+                    }
+                    if ui
+                        .button("StuffIt-over-BinHex (.sit.hqx)")
+                        .on_hover_text(
+                            "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
+                         The classic \"emailed me a Mac app\" format.",
+                        )
+                        .clicked()
+                    {
+                        self.export_selection_as_archive(&entry, ArchiveExportFormat::SitHqx);
+                    }
+                    if ui
+                        .button("MAR (.mar)")
+                        .on_hover_text(
+                            "Hampa Hug's MAR format: a single file or folder tree with \
+                         both forks, stored uncompressed. Folders walk recursively; \
+                         multiple items are wrapped in a folder.",
+                        )
+                        .clicked()
+                    {
+                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Mar);
+                    }
+                });
+            }
+        }
+
+        ui.separator();
+
+        if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
+            ui.label(format!(
+                "File too large to preview ({}).",
+                disk_core::display::format_size(entry.size)
+            ));
+            return;
+        }
+
+        if entry.is_directory() {
+            return;
+        }
+
+        let content_height = ui.available_height().min(panel_height);
+        if entry.is_symlink() {
+            let target = entry
+                .symlink_target
+                .as_deref()
+                .unwrap_or("(unknown target)");
+            ui.monospace(format!("Symlink target: {target}"));
+            return;
+        }
+        if entry.is_special() {
+            let stype = entry.special_type.as_deref().unwrap_or("special file");
+            ui.label(format!("{stype} -- no preview available"));
+            return;
+        }
+        // Editing is offered only where it is safe: a text preview means the content decoded cleanly.
+        if matches!(self.side_ed.content, Some(FileContent::Text(_)))
+            && ui.button("Edit as text...").clicked()
+        {
+            self.open_text_editor(&entry.path, &entry.name);
+        }
+        super::commander::detail_preview(ui, &self.side_ed, "browse", content_height);
+    }
+
+    /// The side panel's File Info for the cursor row: metadata, editors (Edit Mode) and the preview.
+    fn render_detail(&mut self, ui: &mut egui::Ui, entry: Option<&FileEntry>) -> bool {
+        let detail = self.ctl.side_detail(Side::Left);
+        // The root has no row; anything else must be the cursor row the detail follows.
+        let detail = match entry {
+            Some(e) if e.path == "/" => None,
+            Some(e) => detail.filter(|d| d.entry.path == e.path),
+            None => detail.filter(|_| self.cursor_armed),
+        };
+        let Some(d) = detail else {
+            if let Some(e) = entry {
+                file_detail::render_metadata_rows(ui, e, false, None);
+            }
+            return false;
+        };
+        let ed = &mut self.side_ed;
+        if ed.serial != d.serial {
+            *ed = DetailEditors::fresh(d.serial);
+        }
+        if ed.content.is_none() {
+            ed.content = d.preview.as_ref().map(|data| {
+                if d.fs_type == "QNX 2" && rusty_backup::fs::qnx2::looks_like_rs_text(data) {
+                    let text = rusty_backup::fs::qnx2::rs_to_lf(data);
+                    file_detail::detect_content_type(&d.entry, &text)
+                } else {
+                    file_detail::detect_content_type(&d.entry, data)
+                }
+            });
+        }
+        let mut staged = Vec::new();
+        let queue = &self.ctl.pane(Side::Left).queue;
+        super::commander::detail_meta(ui, d, ed, queue, &mut staged);
+        if entry.is_none() {
+            ui.separator();
+            super::commander::detail_preview(ui, ed, "browse_wrapped", ui.available_height());
+        }
+        for e in staged {
+            self.ctl.apply(CommanderAction::StageMetadata(Box::new(e)));
+        }
+        true
     }
 
     /// Start extracting the selected entry to a user-chosen folder.
@@ -3040,7 +2859,7 @@ impl BrowseView {
         // Close the browser while compressing to release the temp file.
         self.ctl = new_controller();
         self.selected_entry = None;
-        self.content = None;
+        self.side_ed = DetailEditors::default();
 
         self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
     }
@@ -3058,7 +2877,7 @@ impl BrowseView {
         // The source bytes changed: the pane reopens on the temp file.
         self.invalidate_cached_fs();
         self.selected_entry = None;
-        self.content = None;
+        self.side_ed = DetailEditors::default();
     }
 
     /// Poll archive edit background operations for completion.
@@ -3122,7 +2941,7 @@ impl BrowseView {
                 self.archive_temp_path = None;
                 self.invalidate_cached_fs();
                 self.selected_entry = None;
-                self.content = None;
+                self.side_ed = DetailEditors::default();
                 self.edit_result = Some("Changes saved successfully.".to_string());
             }
         }
@@ -3867,7 +3686,7 @@ impl BrowseView {
                             Some(format!("Unstaged '{}'", sel.name))
                         };
                         self.selected_entry = None;
-                        self.content = None;
+                        self.side_ed = DetailEditors::default();
                     } else {
                         // The selection's own parent: a selected directory is
                         // not its own parent.
@@ -4871,7 +4690,7 @@ impl BrowseView {
     /// and re-open against the freshly written disk bytes.
     fn invalidate_all_caches(&mut self) {
         self.selected_entry = None;
-        self.content = None;
+        self.side_ed = DetailEditors::default();
         // The pane's reopen drops marks too: after a write they may name renamed or deleted files.
         self.invalidate_cached_fs();
     }
@@ -4936,13 +4755,13 @@ impl BrowseView {
                 self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
                 // Drop the cached read so the preview shows what is now on
                 // disk rather than what was there when it was opened.
-                self.content = None;
+                self.side_ed = DetailEditors::default();
                 self.invalidate_all_caches();
                 self.invalidate_cached_fs();
                 // The invalidation dropped the selection; put the saved file
                 // back so the preview shows what was written, not "Loading...".
                 if let Some(entry) = saved {
-                    self.select_file(&entry);
+                    self.cursor_back = Some(entry.path);
                 }
                 // A save is a write like any applied edit: the CHD diff is
                 // dirty and an archive session must recompress or lose it.
@@ -7144,7 +6963,6 @@ fn tar_import_step(
 
 /// A read the browse view queues off the UI thread.
 enum FsRead {
-    Preview(FileEntry),
     /// Read a whole file and decode it as a Mac archive.
     Archive(FileEntry, ArchiveUse),
 }
@@ -7153,7 +6971,6 @@ impl FsRead {
     /// The same read, failed with `message` (when the filesystem would not open).
     fn failed(self, message: String) -> FsReadDone {
         match self {
-            FsRead::Preview(entry) => FsReadDone::Preview(entry, Err(message)),
             FsRead::Archive(entry, purpose) => FsReadDone::Archive(entry, purpose, Err(message)),
         }
     }
@@ -7161,7 +6978,6 @@ impl FsRead {
 
 /// What a queued read produced.
 enum FsReadDone {
-    Preview(FileEntry, Result<Vec<u8>, String>),
     Archive(FileEntry, ArchiveUse, Result<ArchiveRead, String>),
 }
 
