@@ -58,6 +58,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::OpenUrl(_) => "OpenUrl",
         Effect::CopyToClipboard(_) => "CopyToClipboard",
         Effect::CloseScreen => "CloseScreen",
+        Effect::Quit => "Quit",
     }
 }
 

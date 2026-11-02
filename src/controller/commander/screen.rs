@@ -73,6 +73,7 @@ impl Side {
 pub mod purpose {
     pub const EXPORT: &str = "commander.export";
     pub const CLOSE_UNSAVED: &str = "commander.close_unsaved";
+    pub const QUIT_UNSAVED: &str = "commander.quit_unsaved";
     pub const DETAIL_MODE: &str = "commander.detail_mode";
     pub const DETAIL_OWNER: &str = "commander.detail_owner";
     pub const DETAIL_XATTR: &str = "commander.detail_xattr";
@@ -160,6 +161,8 @@ pub enum CommanderAction {
     ShowPartitions(bool),
     /// Close the screen, asking first while either pane has staged edits.
     RequestClose,
+    /// Quit the application, asking first while either pane has staged edits.
+    RequestQuit,
     /// A key press, resolved through the key map.
     Key(Key, Mods),
     /// Rows the pane's listing shows, the step for Page Up / Page Down.
@@ -431,7 +434,8 @@ impl CommanderController {
                 }
                 Vec::new()
             }
-            A::RequestClose => self.request_close(),
+            A::RequestClose => self.request_close(false),
+            A::RequestQuit => self.request_close(true),
             A::Key(key, mods) => self.key(key, mods),
             A::SetPageRows(side, rows) => {
                 self.page_rows[side.idx()] = rows.max(1);
@@ -451,13 +455,15 @@ impl CommanderController {
                 let side = self.asker_take(purpose);
                 self.forward(side, CommanderPaneAction::Picked { purpose, path })
             }
-            A::Confirmed { purpose, yes } if purpose == purpose::CLOSE_UNSAVED => {
+            A::Confirmed { purpose, yes }
+                if purpose == purpose::CLOSE_UNSAVED || purpose == purpose::QUIT_UNSAVED =>
+            {
                 if !yes {
                     return Vec::new();
                 }
                 self.left.queue.clear();
                 self.right.queue.clear();
-                vec![Effect::CloseScreen]
+                vec![close_effect(purpose == purpose::QUIT_UNSAVED)]
             }
             A::Confirmed { purpose, yes } => {
                 let side = self.asker_take(purpose);
@@ -471,6 +477,14 @@ impl CommanderController {
                 self.forward(side, CommanderPaneAction::Answered { purpose, text })
             }
         }
+    }
+}
+
+fn close_effect(quit: bool) -> Effect {
+    if quit {
+        Effect::Quit
+    } else {
+        Effect::CloseScreen
     }
 }
 
@@ -638,6 +652,11 @@ impl CommanderController {
         self.partitions
     }
 
+    /// Either pane holds staged edits that a close or quit would discard.
+    pub fn has_staged_edits(&self) -> bool {
+        !self.left.queue.is_empty() || !self.right.queue.is_empty()
+    }
+
     /// True while any job runs (an open, apply, copy, export, wrapper or checksum), so a view polls.
     pub fn is_working(&self) -> bool {
         let pane_busy = |p: &CommanderPaneController| p.is_busy() || p.wrapper_opening().is_some();
@@ -733,7 +752,10 @@ impl CommanderController {
                 Effect::Confirm(s) => Some(s.purpose),
                 Effect::AskPassword(s) => Some(s.purpose),
                 Effect::AskText(s) => Some(s.purpose),
-                Effect::OpenUrl(_) | Effect::CopyToClipboard(_) | Effect::CloseScreen => None,
+                Effect::OpenUrl(_)
+                | Effect::CopyToClipboard(_)
+                | Effect::CloseScreen
+                | Effect::Quit => None,
             };
             if let Some(purpose) = asked {
                 self.askers.retain(|(p, _)| *p != purpose);
@@ -924,24 +946,29 @@ impl CommanderController {
         } else if self.show_log {
             self.show_log = false;
         } else {
-            return self.request_close();
+            return self.request_close(false);
         }
         Vec::new()
     }
 
-    fn request_close(&mut self) -> Vec<Effect> {
+    fn request_close(&mut self, quit: bool) -> Vec<Effect> {
         let n = self.left.queue.len() + self.right.queue.len();
         if n == 0 {
-            return vec![Effect::CloseScreen];
+            return vec![close_effect(quit)];
         }
+        let (purpose, label) = if quit {
+            (purpose::QUIT_UNSAVED, "Discard & Quit")
+        } else {
+            (purpose::CLOSE_UNSAVED, "Discard & Close")
+        };
         vec![Effect::Confirm(ConfirmSpec {
-            purpose: purpose::CLOSE_UNSAVED,
+            purpose,
             title: "Unsaved staged edits".into(),
             message: format!(
                 "{n} staged edit(s) across the panes have not been applied. \
                  Apply them per-pane first, or discard."
             ),
-            confirm_label: "Discard & Close".into(),
+            confirm_label: label.into(),
             destructive: true,
         })]
     }

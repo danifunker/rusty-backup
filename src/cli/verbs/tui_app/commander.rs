@@ -75,6 +75,8 @@ pub(super) struct CommanderView {
     scroll: usize,
     scroll_window: Option<Window>,
     closed: bool,
+    /// The controller passed a quit (no staged edits, or the user discarded them).
+    quit: bool,
     /// Held while jobs run, whose engine code may print to stderr.
     muted: Option<super::MutedStderr>,
 }
@@ -94,12 +96,26 @@ impl CommanderView {
             scroll: 0,
             scroll_window: None,
             closed: false,
+            quit: false,
             muted: None,
         }
     }
 
     pub(super) fn closed(&self) -> bool {
         self.closed
+    }
+
+    pub(super) fn quit(&self) -> bool {
+        self.quit
+    }
+
+    pub(super) fn has_staged_edits(&self) -> bool {
+        self.ctl.has_staged_edits()
+    }
+
+    /// Ask the controller to quit; it confirms first while edits are staged.
+    pub(super) fn request_quit(&mut self) {
+        self.send(A::RequestQuit);
     }
 
     pub(super) fn is_working(&self) -> bool {
@@ -130,6 +146,7 @@ impl CommanderView {
         for effect in fx {
             match effect {
                 Effect::CloseScreen => self.closed = true,
+                Effect::Quit => self.quit = true,
                 // The controller turns pane messages into its status line; a stray one goes there too.
                 Effect::Message(_) => {}
                 other => self.waiting.push_back(other),
@@ -188,7 +205,7 @@ impl CommanderView {
                     title: "Open in a browser".into(),
                     text: url,
                 }),
-                Effect::Message(_) | Effect::CloseScreen => None,
+                Effect::Message(_) | Effect::CloseScreen | Effect::Quit => None,
             };
         }
     }
@@ -1501,6 +1518,32 @@ mod tests {
             app.current() == TabId::Inspect,
             "back to the tab it came from"
         );
+    }
+
+    #[test]
+    fn q_with_staged_edits_asks_before_quitting() {
+        let (_h, _i, mut app) = host_and_image(&["KEEP.TXT"]);
+        cursor_to(&mut app, "KEEP.TXT");
+        app.on_key(key(KeyCode::F(6)));
+        // From another tab too: the quit comes back to Commander to ask.
+        app.on_key(key(KeyCode::Char('1')));
+        assert!(app.current() != TabId::Commander);
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit, "q must not drop staged edits");
+        assert!(app.current() == TabId::Commander);
+        assert!(matches!(view(&app).modal, Some(Modal::Confirm(_))));
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(!app.should_quit && staged(&app, Side::Right) == 1);
+        app.on_key(key(KeyCode::Char('q')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.should_quit, "yes quits");
+    }
+
+    #[test]
+    fn q_without_staged_edits_quits_at_once() {
+        let mut app = commander_app();
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
     }
 
     #[test]

@@ -306,6 +306,29 @@ fn close_asks_while_edits_are_staged() {
 }
 
 #[test]
+fn quit_asks_while_edits_are_staged() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    assert!(!ctl.has_staged_edits());
+    assert_eq!(ctl.apply(A::RequestQuit), [Effect::Quit]);
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Delete);
+    assert!(ctl.has_staged_edits());
+    match ctl.apply(A::RequestQuit).as_slice() {
+        [Effect::Confirm(spec)] => assert_eq!(spec.purpose, purpose::QUIT_UNSAVED),
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    let yes = ctl.apply(A::Confirmed {
+        purpose: purpose::QUIT_UNSAVED,
+        yes: true,
+    });
+    assert_eq!(yes, [Effect::Quit]);
+    assert!(!ctl.has_staged_edits());
+}
+
+#[test]
 fn keys_copy_switch_panes_and_delete_on_the_active_pane() {
     let img = tempfile::tempdir().unwrap();
     let host = tempfile::tempdir().unwrap();

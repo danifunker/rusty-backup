@@ -78,6 +78,7 @@ impl EffectHost {
                 Effect::CopyToClipboard(text) => ctx.copy_text(text),
                 Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
                 Effect::CloseScreen => replies.push(Reply::CloseScreen),
+                Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
         replies

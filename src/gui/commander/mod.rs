@@ -107,6 +107,17 @@ impl CommanderMode {
         self.dispatch(ctx, A::OpenDropped(path));
     }
 
+    /// The window is closing: `true` holds it while the controller asks about staged edits.
+    pub fn hold_quit(&mut self, ctx: &egui::Context) -> bool {
+        if !self.ctl.has_staged_edits() {
+            return false;
+        }
+        if !self.effects.modal_open() {
+            self.dispatch(ctx, A::RequestQuit);
+        }
+        true
+    }
+
     /// The Settings dialog cleared the persisted recent lists.
     pub(crate) fn clear_recent_files(&mut self) {
         self.ctl.apply(A::RecentCleared);

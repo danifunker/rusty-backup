@@ -189,6 +189,7 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
                 )
             }
             Effect::CloseScreen => log::error!("CloseScreen has no screen to close here"),
+            Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 }
@@ -691,6 +692,15 @@ impl eframe::App for RustyBackupApp {
             || self.bulk_convert_status.is_some()
         {
             ctx.request_repaint();
+        }
+
+        // Closing the window with staged Commander edits asks first; a yes closes it again.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(cmd) = self.commander.as_mut() {
+                if cmd.hold_quit(ctx) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
         }
 
         // One-shot: drain the file path handed in on the command line

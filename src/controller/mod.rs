@@ -49,6 +49,8 @@ pub enum Effect {
     CopyToClipboard(String),
     /// Leave the screen that asked (Commander's Close); the shell drops its controller.
     CloseScreen,
+    /// Quit the application; the controller's unsaved-edits guard has passed.
+    Quit,
 }
 
 /// A file or folder picker; `purpose` says which `Action` the answer belongs to.

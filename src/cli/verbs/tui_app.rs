@@ -2350,7 +2350,7 @@ impl App {
         match key.code {
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
             KeyCode::Char(':') => self.palette_input = Some(String::new()),
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => self.on_back(),
             // Left / Right (and Tab, and vim h/l) change tabs ("windows").
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.switch_tab(1),
@@ -3794,8 +3794,34 @@ impl App {
 
     /// Esc: unwind one level — cancel a running task, then close a drill-down,
     /// then quit.
+    /// Quit, unless Commander holds staged edits: then its controller asks first, on its tab.
+    fn request_quit(&mut self) {
+        if !self
+            .commander
+            .as_ref()
+            .is_some_and(|c| c.has_staged_edits())
+        {
+            self.should_quit = true;
+            return;
+        }
+        if let Some(idx) = TABS.iter().position(|t| t.0 == TabId::Commander) {
+            if self.active != idx {
+                self.active = idx;
+                self.scroll = 0;
+                self.on_tab_changed();
+            }
+        }
+        if let Some(c) = self.commander.as_mut() {
+            c.request_quit();
+        }
+    }
+
     /// Commander's Close: drop its controller and go back to the tab it was opened from.
     fn leave_commander_if_closed(&mut self) {
+        if self.commander.as_ref().is_some_and(|c| c.quit()) {
+            self.should_quit = true;
+            return;
+        }
         if !self.commander.as_ref().is_some_and(|c| c.closed()) {
             return;
         }
@@ -3820,7 +3846,7 @@ impl App {
             self.selection = 0;
             self.status = None;
         } else {
-            self.should_quit = true;
+            self.request_quit();
         }
     }
 
