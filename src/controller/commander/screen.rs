@@ -139,6 +139,12 @@ pub enum CommanderAction {
         from: Side,
         format: Option<ExportFormat>,
     },
+    /// Export the entry at `path` (`/`: the whole volume) instead of the selection.
+    ExportEntry {
+        from: Side,
+        path: String,
+        format: Option<ExportFormat>,
+    },
     Checksums(Side),
     /// Extract the entry at `path` (a folder with its contents) into `dest`, or a folder the user picks.
     Extract {
@@ -568,6 +574,7 @@ impl CommanderController {
                 fx.extend(self.forward(Side::Right, BrowserPaneAction::RecentCleared));
                 fx
             }
+            A::ExportEntry { from, path, format } => self.request_export_entry(from, &path, format),
             A::Extract {
                 from,
                 path,

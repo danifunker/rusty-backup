@@ -668,3 +668,48 @@ fn extract_picks_a_folder_reviews_existing_files_and_runs_as_the_copy_job() {
         ctl.status()
     );
 }
+
+#[test]
+fn one_entry_or_the_whole_volume_exports_and_tar_follows_the_picked_name() {
+    use crate::controller::commander::screen::purpose as screen_purpose;
+    use crate::controller::commander::ExportFormat;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let fx = ctl.apply(CommanderAction::ExportEntry {
+        from: Side::Left,
+        path: "/".into(),
+        format: Some(ExportFormat::TarGz),
+    });
+    let Some(Effect::PickFile(spec)) = fx.first() else {
+        panic!("{fx:?}");
+    };
+    assert_eq!(spec.file_name, "T.tar.gz", "named after the volume");
+    let tar = dir.path().join("vol.tar");
+    ctl.apply(CommanderAction::Picked {
+        purpose: screen_purpose::EXPORT,
+        path: Some(tar.clone()),
+    });
+    settle(&mut ctl);
+    let bytes = std::fs::read(&tar).unwrap();
+    assert_eq!(&bytes[257..262], b"ustar", "a plain tar, as the name says");
+    let names = String::from_utf8_lossy(&bytes).to_string();
+    assert!(
+        names.contains("HELLO.TXT") && names.contains("SUB/"),
+        "{}",
+        ctl.status()
+    );
+
+    ctl.apply(CommanderAction::ExportEntry {
+        from: Side::Left,
+        path: "/HELLO.TXT".into(),
+        format: Some(ExportFormat::StuffItHqx),
+    });
+    let hqx = dir.path().join("HELLO.sit.hqx");
+    ctl.apply(CommanderAction::Picked {
+        purpose: screen_purpose::EXPORT,
+        path: Some(hqx.clone()),
+    });
+    settle(&mut ctl);
+    let text = std::fs::read_to_string(&hqx).unwrap();
+    assert!(text.contains("BinHex"), "{}", &text[..text.len().min(80)]);
+}

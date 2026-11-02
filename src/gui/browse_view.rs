@@ -9,15 +9,14 @@ use std::sync::{Arc, Mutex};
 
 use arc_mac::detect::{detect_mac_archive, MacArchiveKind};
 use arc_mac::extract as mac_extract;
-use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::Filesystem;
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, ExtractOptions,
-    JobRegistry, ListingStyle, PaneProfile, PaneServices, ResourceForkMode, RowKind, Side,
-    Snapshot,
+    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, ExportFormat,
+    ExtractOptions, JobRegistry, ListingStyle, PaneProfile, PaneServices, ResourceForkMode,
+    RowKind, Side, Snapshot,
 };
 use rusty_backup::controller::Controller as _;
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
@@ -89,7 +88,7 @@ pub struct BrowseView {
     /// committed yet; closing on an empty queue deleted that diff silently.
     chd_diff_dirty: bool,
     /// Chosen output format for the "Export selected" pulldown.
-    export_format: rusty_backup::fs::export_selection::ExportFormat,
+    export_format: ExportFormat,
     /// The side panel's preview and editor widgets, rebuilt when its detail changes.
     side_ed: DetailEditors,
     /// View mode for file content.
@@ -224,8 +223,6 @@ pub struct BrowseView {
     /// Background flatten progress (compressed CHD apply): merges the diff
     /// into a fresh compressed CHD that overwrites the parent.
     chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
-    /// Background tar export progress ("Export to .tar.gz...").
-    tar_export_progress: Option<Arc<Mutex<TarExportProgress>>>,
     /// A tar import awaiting the user's confirmation (preflight found
     /// content this filesystem can't represent).
     pending_tar_import: Option<PendingTarImport>,
@@ -351,18 +348,6 @@ struct ChdFlattenProgress {
     cancel_requested: bool,
 }
 
-/// Background progress for "Export to .tar.gz..." — archiving the whole
-/// volume to a tar stream on a worker thread.
-struct TarExportProgress {
-    files: u64,
-    dirs: u64,
-    symlinks: u64,
-    bytes: u64,
-    finished: bool,
-    error: Option<String>,
-    out_path: std::path::PathBuf,
-}
-
 /// A tar import awaiting user confirmation because the preflight found
 /// content the target filesystem can't represent (dropped symlinks, invalid
 /// names, …). Cleared when the user confirms or cancels the modal.
@@ -415,7 +400,7 @@ impl Default for BrowseView {
             pane_stale: false,
             selected_entry: None,
             chd_diff_dirty: false,
-            export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
+            export_format: ExportFormat::MacArchive,
             side_ed: DetailEditors::default(),
             view_mode: ViewMode::Auto,
             error: None,
@@ -468,7 +453,6 @@ impl Default for BrowseView {
             chd_flatten_progress: None,
             squashfs_budget_dialog: None,
             squashfs_measure_job: None,
-            tar_export_progress: None,
             pending_tar_import: None,
             pending_tar_add: None,
             single_file_chd_backup_folder: None,
@@ -523,12 +507,8 @@ impl BrowseView {
             .is_some_and(|p| !lock_status(p).finished)
         {
             Some("CHD flatten")
-        } else if self
-            .tar_export_progress
-            .as_ref()
-            .is_some_and(|p| !lock_status(p).finished)
-        {
-            Some("Tar export")
+        } else if self.exporting && self.ctl.copy_job().is_some() {
+            Some("Export")
         } else if self.apply_follow.is_some() {
             Some("Apply edits")
         } else if self.tar_job.is_some() {
@@ -782,7 +762,6 @@ impl BrowseView {
         // CHD is left untouched; user's `.chd_backup` is preserved.
         self.discard_chd_edit_session();
         self.chd_flatten_progress = None;
-        self.tar_export_progress = None;
         self.pending_tar_import = None;
         self.pending_tar_add = None;
         self.single_file_chd_backup_folder = None;
@@ -1187,7 +1166,7 @@ impl BrowseView {
             // .tar). Preserves case-sensitive names + real symlinks (data
             // fork only) so a case-insensitive host won't clobber files that
             // differ only in case. Runs on a worker thread.
-            if !self.edit_mode && self.tar_export_progress.is_none() {
+            if !self.edit_mode && self.ctl.copy_job().is_none() {
                 let btn = ui.button("Export to .tar.gz...");
                 if btn.hovered() {
                     btn.clone().on_hover_text(
@@ -1196,7 +1175,7 @@ impl BrowseView {
                     );
                 }
                 if btn.clicked() {
-                    self.start_tar_export(&FileEntry::root());
+                    self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
                 }
             }
 
@@ -1300,7 +1279,6 @@ impl BrowseView {
         self.poll_squashfs_budget_dialog(ui);
 
         // Background tar-export progress (Export to .tar.gz...).
-        self.poll_tar_export(ui);
 
         // CHD flatten progress bar (compressed CHD edit-apply)
         self.poll_chd_flatten(ui);
@@ -1821,7 +1799,6 @@ impl BrowseView {
         if count == 0 {
             return;
         }
-        use rusty_backup::fs::export_selection::ExportFormat;
         let mut fmt = self.export_format;
         let mut do_export = false;
         let mut clear = false;
@@ -1854,11 +1831,7 @@ impl BrowseView {
     }
 
     /// Export the marked rows as one `format` output through the screen's export (picker, job).
-    fn export_marked(
-        &mut self,
-        ctx: &egui::Context,
-        format: rusty_backup::fs::export_selection::ExportFormat,
-    ) {
+    fn export_marked(&mut self, ctx: &egui::Context, format: ExportFormat) {
         if self.ctl.copy_job().is_some() {
             return;
         }
@@ -1870,6 +1843,23 @@ impl BrowseView {
         };
         self.exporting = true;
         self.dispatch(ctx, export);
+    }
+
+    /// Export one entry (the root: the whole volume) as `format` through the screen's export.
+    fn export_entry(&mut self, ctx: &egui::Context, entry: &FileEntry, format: ExportFormat) {
+        if self.ctl.copy_job().is_some() {
+            return;
+        }
+        self.ctl
+            .apply(CommanderAction::SetForkMode(self.resource_fork_mode));
+        let act = CommanderAction::ExportEntry {
+            from: Side::Left,
+            path: entry.path.clone(),
+            format: Some(format),
+        };
+        self.exporting = true;
+        let ctx = ctx.clone();
+        self.dispatch(&ctx, act);
     }
 
     /// The export's progress window, then its status line as the result.
@@ -2156,7 +2146,7 @@ impl BrowseView {
                 };
                 if ui
                     .add_enabled(
-                        self.tar_export_progress.is_none(),
+                        self.ctl.copy_job().is_none(),
                         egui::Button::new(tgz_label),
                     )
                     .on_hover_text(
@@ -2166,7 +2156,7 @@ impl BrowseView {
                     )
                     .clicked()
                 {
-                    self.start_tar_export(&entry);
+                    self.export_entry(ui.ctx(), &entry, ExportFormat::TarGz);
                 }
 
                 if entry.is_file()
@@ -2236,7 +2226,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::BinHex);
                     }
                     if ui
                         .button("StuffIt (.sit)")
@@ -2247,7 +2237,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffIt);
                     }
                     if ui
                         .button("StuffIt-over-BinHex (.sit.hqx)")
@@ -2257,7 +2247,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_selection_as_archive(&entry, ArchiveExportFormat::SitHqx);
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffItHqx);
                     }
                     if ui
                         .button("MAR (.mar)")
@@ -2268,7 +2258,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_selection_as_archive(&entry, ArchiveExportFormat::Mar);
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::MacArchive);
                     }
                 });
             }
@@ -2803,115 +2793,6 @@ impl BrowseView {
         self.edit_result = Some(result_msg);
     }
 
-    /// Spawn a background job that archives the whole volume to a
-    /// `.tar.gz` / `.tar.zst` / `.tar` chosen via a save dialog. Compression
-    /// is inferred from the chosen extension. Real symlinks and
-    /// case-sensitive names are preserved (data fork only). Progress is
-    /// polled by [`Self::poll_tar_export`].
-    /// Archive `target` (the whole volume when its path is `/`, otherwise the
-    /// selected folder or file) to a `.tar.gz` / `.tar.zst` / `.tar` chosen
-    /// via a save dialog. A subtree is rooted under its own basename in the
-    /// archive (like `tar`); a single file becomes a one-entry archive.
-    fn start_tar_export(&mut self, target: &FileEntry) {
-        let whole_volume = target.path == "/";
-        let default_name = if whole_volume {
-            let base = self
-                .session
-                .source_path
-                .as_ref()
-                .and_then(|p| p.file_stem())
-                .and_then(|s| s.to_str())
-                .unwrap_or("volume");
-            format!("{base}.tar.gz")
-        } else {
-            format!("{}.tar.gz", target.name)
-        };
-        let title = if target.is_directory() {
-            "Export folder to tar archive"
-        } else {
-            "Export file to tar archive"
-        };
-        let path = match super::file_dialog()
-            .set_title(title)
-            .set_file_name(&default_name)
-            .save_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-        // A subtree roots its entries under its own name; the whole volume
-        // and single files sit at the archive top level.
-        let archive_prefix = if target.is_directory() && !whole_volume {
-            target.name.clone()
-        } else {
-            String::new()
-        };
-        let target = target.clone();
-        let compression = fs_tar::tar_export::TarCompression::infer_from_path(&path);
-        let session = self.session.clone();
-        let progress = Arc::new(Mutex::new(TarExportProgress {
-            files: 0,
-            dirs: 0,
-            symlinks: 0,
-            bytes: 0,
-            finished: false,
-            error: None,
-            out_path: path.clone(),
-        }));
-        let progress_thread = Arc::clone(&progress);
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress),
-            "tar export",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: tar export");
-                let result = (|| -> anyhow::Result<()> {
-                    let mut fs = session
-                        .open()
-                        .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
-                    // Re-fetch the root fresh on the worker's own fs instance; a
-                    // subtree/file uses the selected entry directly (its on-disk
-                    // identity is stable across fs instances of the same image).
-                    let root = if whole_volume {
-                        fs.root()
-                            .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
-                    } else {
-                        target
-                    };
-                    let file = std::fs::File::create(&path)
-                        .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
-                    let out = std::io::BufWriter::new(file);
-                    let opts = fs_tar::tar_export::TarExportOptions::default();
-                    let cb = |s: &fs_tar::tar_export::TarExportStats| {
-                        if let Ok(mut p) = progress_thread.lock() {
-                            p.files = s.files;
-                            p.dirs = s.dirs;
-                            p.symlinks = s.symlinks;
-                            p.bytes = s.total_bytes;
-                        }
-                    };
-                    fs_tar::tar_export::export_tar(
-                        &mut *fs,
-                        &root,
-                        &archive_prefix,
-                        out,
-                        compression,
-                        &opts,
-                        &cb,
-                    )?;
-                    Ok(())
-                })();
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.finished = true;
-                    if let Err(e) = result {
-                        p.error = Some(format!("{e:#}"));
-                    }
-                }
-                Ok(())
-            },
-        );
-        self.tar_export_progress = Some(progress);
-    }
-
     /// Poll the background tar-export worker: show a spinner while running,
     /// and surface the result when it finishes.
     /// Enter Edit Mode on a raw image / device, probing the editable open
@@ -3018,43 +2899,6 @@ impl BrowseView {
             self.enter_direct_edit_mode();
         } else if closed {
             self.squashfs_budget_dialog = None;
-        }
-    }
-
-    fn poll_tar_export(&mut self, ui: &mut egui::Ui) {
-        let arc = match &self.tar_export_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-        let Ok(p) = arc.lock() else { return };
-        if !p.finished {
-            ui.ctx().request_repaint();
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!(
-                    "Exporting archive... {} files, {} dirs, {} symlinks",
-                    p.files, p.dirs, p.symlinks
-                ));
-            });
-            return;
-        }
-        let error = p.error.clone();
-        let (files, dirs, symlinks, bytes) = (p.files, p.dirs, p.symlinks, p.bytes);
-        let out = p.out_path.clone();
-        drop(p);
-        self.tar_export_progress = None;
-        match error {
-            Some(e) => self.error = Some(format!("Tar export failed: {e}")),
-            None => {
-                self.edit_result = Some(format!(
-                    "Wrote {} ({} files, {} dirs, {} symlinks, {})",
-                    out.display(),
-                    files,
-                    dirs,
-                    symlinks,
-                    disk_core::display::format_size(bytes),
-                ));
-            }
         }
     }
 
@@ -3397,7 +3241,7 @@ impl BrowseView {
             // or tar export is still reading the volume the apply would rewrite.
             if !self.ctl.pane(Side::Left).queue.is_empty() {
                 let label = format!("Apply Edits ({})", self.ctl.pane(Side::Left).queue.len());
-                let reading = self.extracting || self.tar_export_progress.is_some();
+                let reading = self.extracting || self.exporting;
                 if ui
                     .add_enabled(!reading, egui::Button::new(label))
                     .on_disabled_hover_text("Wait for the running extraction or export to finish")
@@ -3689,123 +3533,6 @@ impl BrowseView {
                     archive: read.archive,
                     fork_format: mac_extract::ForkFormat::BinHex,
                 });
-            }
-        }
-    }
-
-    /// Walk `entry` (and its children if a directory) on the open
-    /// filesystem, collecting every reachable file into a [`StuffItInputNode`]
-    /// tree. Symlinks and special files are skipped. Used by
-    /// [`export_selection_as_archive`] for Workflow B. Holds the
-    /// filesystem only for the duration of the walk.
-    fn collect_archive_inputs(
-        &mut self,
-        entry: &FileEntry,
-    ) -> Result<Vec<StuffItInputNode>, String> {
-        let mut fs = self
-            .take_or_open_fs()
-            .ok_or_else(|| "filesystem not open".to_string())?;
-        let result = walk_fs_to_input_nodes(&mut *fs, entry);
-        self.return_fs(fs);
-        result
-    }
-
-    /// Workflow B: bundle the selected entry as a Mac archive on the
-    /// host. Single-file selections can be wrapped as BinHex (which is
-    /// always single-file); file-or-folder selections can be SIT or
-    /// SIT-over-BinHex (a `.sit.hqx`). Foreground execution — typical
-    /// classic-Mac payloads are small (Hypercard stacks, dev tools).
-    fn export_selection_as_archive(&mut self, entry: &FileEntry, format: ArchiveExportFormat) {
-        let default_name = format!("{}{}", entry.name, format.extension());
-        let path = match super::file_dialog()
-            .set_title("Save Mac archive")
-            .set_file_name(&default_name)
-            .save_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-
-        let nodes = match self.collect_archive_inputs(entry) {
-            Ok(n) => n,
-            Err(e) => {
-                self.edit_result = Some(format!("Archive collect failed: {e}"));
-                return;
-            }
-        };
-        if nodes.is_empty() {
-            self.edit_result = Some("Nothing to archive (empty selection).".into());
-            return;
-        }
-
-        let bytes = match format {
-            ArchiveExportFormat::Sit => match build_archive_tree(&nodes, WriteMethod::Store) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("SIT build failed: {e}"));
-                    return;
-                }
-            },
-            ArchiveExportFormat::Mar => match arc_mac::mar::build_archive(&entry.name, &nodes) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("MAR build failed: {e}"));
-                    return;
-                }
-            },
-            ArchiveExportFormat::SitHqx => {
-                let sit = match build_archive_tree(&nodes, WriteMethod::Store) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.edit_result = Some(format!("SIT build failed: {e}"));
-                        return;
-                    }
-                };
-                let bh = fs_mac::binhex::BinHexFile {
-                    name: format!("{}.sit", entry.name),
-                    type_code: *b"SITD", // StuffIt Deluxe archive type
-                    creator_code: *b"SIT!",
-                    flags: 0,
-                    data_fork: sit,
-                    resource_fork: Vec::new(),
-                };
-                fs_mac::binhex::build_binhex(&bh).into_bytes()
-            }
-            ArchiveExportFormat::Hqx => {
-                // BinHex is fundamentally single-file. The button is gated
-                // on a single-file selection, so the input tree should be
-                // a one-element Vec<File>; defend against the alternative.
-                let file = match nodes.first() {
-                    Some(StuffItInputNode::File(f)) if nodes.len() == 1 => f.clone(),
-                    _ => {
-                        self.edit_result =
-                            Some("BinHex export requires a single file selection.".into());
-                        return;
-                    }
-                };
-                let bh = fs_mac::binhex::BinHexFile {
-                    name: file.name,
-                    type_code: file.type_code,
-                    creator_code: file.creator_code,
-                    flags: file.finder_flags,
-                    data_fork: file.data_fork,
-                    resource_fork: file.resource_fork,
-                };
-                fs_mac::binhex::build_binhex(&bh).into_bytes()
-            }
-        };
-
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                self.edit_result = Some(format!(
-                    "Wrote {} ({}, {})",
-                    path.display(),
-                    format.label(),
-                    disk_core::display::format_size(bytes.len() as u64),
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Write failed: {e}"));
             }
         }
     }
@@ -5078,29 +4805,6 @@ impl BrowseView {
         }
     }
 
-    /// Borrow the cached read-only filesystem, opening fresh if the cache is
-    /// empty. The caller MUST return the fs via [`return_fs`](Self::return_fs)
-    /// after use so subsequent calls can reuse it. Returning an `Option` (vs.
-    /// a `&mut`) keeps the borrow off `self` so callers can also mutate other
-    /// `BrowseView` fields in the same scope.
-    fn take_or_open_fs(&mut self) -> Option<Box<dyn Filesystem>> {
-        if let Some(fs) = self.cached_fs.take() {
-            return Some(fs);
-        }
-        match self.session.open() {
-            Ok(mut fs) => {
-                if self.show_deleted {
-                    fs.set_show_deleted(true);
-                }
-                Some(fs)
-            }
-            Err(e) => {
-                log::debug!("session.open() failed: {e}");
-                None
-            }
-        }
-    }
-
     /// Return a previously taken filesystem to the cache.
     fn return_fs(&mut self, fs: Box<dyn Filesystem>) {
         self.cached_fs = Some(fs);
@@ -5179,97 +4883,7 @@ fn human_size_b(bytes: u64) -> String {
     }
 }
 
-/// Workflow B: which on-host archive format to write when the user
-/// clicks one of the "Export Mac archive" buttons under the browse-view
-/// extract row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveExportFormat {
-    /// `.hqx` — BinHex 4.0. Single file only.
-    Hqx,
-    /// `.sit` — classic StuffIt. Any selection (file or folder).
-    Sit,
-    /// `.sit.hqx` — StuffIt-over-BinHex. Any selection.
-    SitHqx,
-    /// `.mar` — Hampa Hug's MAR (stored). A single file or folder selection
-    /// (multiple top-level items are wrapped in a folder).
-    Mar,
-}
-
-impl ArchiveExportFormat {
-    fn extension(self) -> &'static str {
-        match self {
-            ArchiveExportFormat::Hqx => ".hqx",
-            ArchiveExportFormat::Sit => ".sit",
-            ArchiveExportFormat::SitHqx => ".sit.hqx",
-            ArchiveExportFormat::Mar => ".mar",
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            ArchiveExportFormat::Hqx => "BinHex 4.0 (.hqx)",
-            ArchiveExportFormat::Sit => "StuffIt (.sit)",
-            ArchiveExportFormat::SitHqx => "StuffIt-over-BinHex (.sit.hqx)",
-            ArchiveExportFormat::Mar => "MAR (.mar)",
-        }
-    }
-}
-
-/// Recursive helper for [`BrowseView::collect_archive_inputs`]: walks
-/// `entry` on the open `fs` and produces zero or more
-/// [`StuffItInputNode`]s. Files become `File` nodes carrying both forks
-/// plus type/creator; directories become `Folder` nodes containing the
-/// recursive walk of their children. Symlinks and special files are
-/// dropped silently — there's no Mac-archive representation for them.
-fn walk_fs_to_input_nodes(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-) -> Result<Vec<StuffItInputNode>, String> {
-    if entry.is_directory() {
-        let children = fs.list_directory(entry).map_err(|e| e.to_string())?;
-        let mut inner: Vec<StuffItInputNode> = Vec::new();
-        for child in children {
-            inner.extend(walk_fs_to_input_nodes(fs, &child)?);
-        }
-        // A directory at the volume root (path "/") expands to its
-        // children directly — bundling the root would yield a strangely-
-        // named outer folder ("/" or ""), and the user almost always
-        // means "bundle these children" when they pick root.
-        if entry.path == "/" {
-            return Ok(inner);
-        }
-        Ok(vec![StuffItInputNode::Folder {
-            name: entry.name.clone(),
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            children: inner,
-        }])
-    } else if entry.is_file() {
-        let data = fs.read_file(entry, usize::MAX).map_err(|e| e.to_string())?;
-        let mut rsrc: Vec<u8> = Vec::new();
-        // Best-effort: missing resource fork support / empty fork =>
-        // zero bytes (the StuffIt writer drops it on the floor).
-        let _ = fs.write_resource_fork_to(entry, &mut rsrc);
-
-        let type_code = entry.type_code.unwrap_or([0; 4]);
-        let creator_code = entry.creator_code.unwrap_or([0; 4]);
-
-        Ok(vec![StuffItInputNode::File(StuffItInput {
-            name: entry.name.clone(),
-            type_code,
-            creator_code,
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            data_fork: data,
-            resource_fork: rsrc,
-        })])
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-rusty_backup::model::worker::finished_with_error!(ChdFlattenProgress, TarExportProgress);
+rusty_backup::model::worker::finished_with_error!(ChdFlattenProgress);
 
 /// What to do once a staged-edit Apply lands without an error.
 #[derive(Clone, Copy)]

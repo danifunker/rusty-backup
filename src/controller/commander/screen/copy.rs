@@ -344,13 +344,41 @@ impl CommanderController {
         from: Side,
         format: Option<ExportFormat>,
     ) -> Vec<Effect> {
+        let entries = without_nested(self.pane(from).selected_entries());
+        self.request_export_of(from, format, entries, None)
+    }
+
+    /// Export one entry (the root: the whole volume) instead of the selection.
+    pub(super) fn request_export_entry(
+        &mut self,
+        from: Side,
+        path: &str,
+        format: Option<ExportFormat>,
+    ) -> Vec<Effect> {
+        let pane = self.pane(from);
+        let stem = (path == "/").then(|| pane.volume().name().to_string());
+        let entries = match pane.entry_at(path) {
+            Some(_) if path == "/" => pane.folder_children("/").map(|c| c.to_vec()),
+            Some(e) => Some(vec![e]),
+            None => None,
+        };
+        let entries = entries.unwrap_or_default();
+        self.request_export_of(from, format, entries, stem)
+    }
+
+    fn request_export_of(
+        &mut self,
+        from: Side,
+        format: Option<ExportFormat>,
+        entries: Vec<FileEntry>,
+        stem: Option<String>,
+    ) -> Vec<Effect> {
         if self.copy.is_some() {
             self.status = "A copy is already in progress; wait for it to finish.".to_string();
             return Vec::new();
         }
         let format = format.unwrap_or(self.export_format);
         let src = self.pane(from);
-        let entries = without_nested(src.selected_entries());
         if entries.is_empty() {
             self.status = format!("Nothing selected in the {} pane to export.", from.label());
             return Vec::new();
@@ -371,7 +399,10 @@ impl CommanderController {
                 title: format!("Export as {}", format.label()),
                 filters: vec![(format.label().to_string(), vec![ext.to_string()])],
                 save: true,
-                file_name: export_archive_name(&entries, ext),
+                file_name: match stem {
+                    Some(stem) => format!("{stem}.{ext}"),
+                    None => export_archive_name(&entries, ext),
+                },
             }
         } else {
             PickSpec {
@@ -406,6 +437,7 @@ impl CommanderController {
         let Some(dest) = path else {
             return "Export cancelled.".to_string();
         };
+        let format = tar_format_for(format, &dest);
         let where_to = format!("export folder ({} pane)", from.label());
         if self.pane(from).is_host_pane() {
             let conflicts = commander_ops::host_copy_conflicts(&entries, &dest, None);
@@ -562,4 +594,26 @@ fn without_nested(entries: Vec<FileEntry>) -> Vec<FileEntry> {
         .collect();
     let nested = |e: &FileEntry| dirs.iter().any(|d| inside(&e.path, d));
     entries.into_iter().filter(|e| !nested(e)).collect()
+}
+
+/// A tar export takes its compression from the name picked (`.tar`, `.tar.gz` / `.tgz`, `.tar.zst`).
+fn tar_format_for(format: ExportFormat, dest: &std::path::Path) -> ExportFormat {
+    let tar = [
+        ExportFormat::Tar,
+        ExportFormat::TarGz,
+        ExportFormat::TarZstd,
+    ];
+    if !tar.contains(&format) {
+        return format;
+    }
+    let name = dest.to_string_lossy().to_ascii_lowercase();
+    if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+        ExportFormat::TarZstd
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        ExportFormat::TarGz
+    } else if name.ends_with(".tar") {
+        ExportFormat::Tar
+    } else {
+        format
+    }
 }

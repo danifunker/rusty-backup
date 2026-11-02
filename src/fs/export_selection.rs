@@ -57,11 +57,13 @@ pub enum ExportFormat {
     /// A single MacArchive `.mar`; forks + Finder type/creator native, same
     /// input tree as StuffIt.
     MacArchive,
+    /// A StuffIt archive wrapped in BinHex (`.sit.hqx`), safe for text-only transfers.
+    StuffItHqx,
 }
 
 impl ExportFormat {
     /// Every format, in menu order (folder outputs first, then archives).
-    pub const ALL: [ExportFormat; 10] = [
+    pub const ALL: [ExportFormat; 11] = [
         ExportFormat::LooseFiles,
         ExportFormat::GzipPerFile,
         ExportFormat::ZstdPerFile,
@@ -72,6 +74,7 @@ impl ExportFormat {
         ExportFormat::Zip,
         ExportFormat::StuffIt,
         ExportFormat::MacArchive,
+        ExportFormat::StuffItHqx,
     ];
 
     /// Short menu / dropdown label.
@@ -87,6 +90,7 @@ impl ExportFormat {
             ExportFormat::Zip => "Zip (.zip)",
             ExportFormat::StuffIt => "StuffIt (.sit)",
             ExportFormat::MacArchive => "Mac Archive (.mar)",
+            ExportFormat::StuffItHqx => "StuffIt in BinHex (.sit.hqx)",
         }
     }
 
@@ -101,6 +105,7 @@ impl ExportFormat {
                 | ExportFormat::Zip
                 | ExportFormat::StuffIt
                 | ExportFormat::MacArchive
+                | ExportFormat::StuffItHqx
         )
     }
 
@@ -113,6 +118,7 @@ impl ExportFormat {
             ExportFormat::Zip => Some("zip"),
             ExportFormat::StuffIt => Some("sit"),
             ExportFormat::MacArchive => Some("mar"),
+            ExportFormat::StuffItHqx => Some("sit.hqx"),
             _ => None,
         }
     }
@@ -316,7 +322,7 @@ pub fn export_to_file(
             export_tar_file(fs, entries, out_path, format, progress)
         }
         ExportFormat::Zip => export_zip_file(fs, entries, out_path, progress, cancelled),
-        ExportFormat::StuffIt | ExportFormat::MacArchive => {
+        ExportFormat::StuffIt | ExportFormat::MacArchive | ExportFormat::StuffItHqx => {
             export_mac_archive_file(fs, entries, out_path, format, progress, cancelled)
         }
         _ => anyhow::bail!("{:?} is not a single-file format", format),
@@ -482,6 +488,23 @@ fn export_mac_archive_file(
         arc_mac::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
     } else {
         build_archive_tree(&nodes, WriteMethod::Rle).context("building StuffIt archive")?
+    };
+    let bytes = if format == ExportFormat::StuffItHqx {
+        let name = out_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("archive.sit.hqx");
+        let bh = fs_mac::binhex::BinHexFile {
+            name: name.trim_end_matches(".hqx").to_string(),
+            type_code: *b"SITD",
+            creator_code: *b"SIT!",
+            flags: 0,
+            data_fork: bytes,
+            resource_fork: Vec::new(),
+        };
+        fs_mac::binhex::build_binhex(&bh).into_bytes()
+    } else {
+        bytes
     };
     std::fs::write(out_path, &bytes).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(summary)
