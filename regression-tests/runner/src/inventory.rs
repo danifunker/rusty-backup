@@ -124,7 +124,7 @@ pub fn sync(catalog: &Catalog, source: &Path, dest: &Path) -> String {
         // Found by moving the corpus off the share: three optical cases passed
         // against the NAS and failed against a local copy, because the share
         // still held siblings the sync had never fetched.
-        if Path::new(&row.relpath).parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+        if in_set_dir(&row.relpath) {
             match copy_dir(src.parent().unwrap(), dst.parent().unwrap()) {
                 Ok((n, b)) => {
                     if n == 0 {
@@ -171,6 +171,19 @@ pub fn sync(catalog: &Catalog, source: &Path, dest: &Path) -> String {
 ", f));
     }
     s
+}
+
+/// Whether a catalogued file sits in its own set directory; `../fixtures-large/` is a corpus root, not a set.
+fn in_set_dir(relpath: &str) -> bool {
+    let Some(parent) = Path::new(relpath).parent() else {
+        return false;
+    };
+    let sibling_root = usize::from(parent.starts_with(".."));
+    let mut rest = parent
+        .components()
+        .skip_while(|c| matches!(c, std::path::Component::ParentDir))
+        .skip(sibling_root);
+    rest.next().is_some()
 }
 
 /// Copy every file in `src` into `dst`, skipping same-size ones. Returns the
@@ -376,4 +389,17 @@ pub fn render(inv: &Inventory, verbose: bool) -> String {
     }
 
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_set_dir;
+
+    #[test]
+    fn large_root_is_not_a_set_but_dirs_inside_it_are() {
+        assert!(!in_set_dir("fmt.adf.amiga-dd.floppy.adf"));
+        assert!(!in_set_dir("../fixtures-large/optical.iso.hpux1111-tcoe.cd.iso"));
+        assert!(in_set_dir("optical.cdda.mixedmode.cd/disc.cue"));
+        assert!(in_set_dir("../fixtures-large/optical.clonecd.bookshelf.cd/disc.ccd"));
+    }
 }
