@@ -168,7 +168,6 @@ when convenient):
 | Site | Status type |
 |---|---|
 | `gui/inspect_tab.rs` (disk inspect, seekable cache, block-cache scan) | `InspectStatus`, `CacheStatus`, `BlockCacheScan` |
-| `gui/backup_tab.rs` (run_backup, VHD whole-disk export) | `BackupProgress`, `VhdExportStatus` |
 | `gui/restore_tab.rs` (full restore, single-partition, new-disk) | `RestoreProgress` |
 | `gui/resize_popup.rs` (in-place resize) | `ResizeStatus` |
 | `gui/browse_view.rs` (file extraction) | `ExtractionProgress` |

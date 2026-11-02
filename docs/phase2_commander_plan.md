@@ -628,6 +628,85 @@ Shells' engine references 654 -> 470 (`inspect_tab.rs` 181 -> 0, an unused re-ex
   export) or plain data the inspect controller could re-export (`PartitionInfo`, the editor).
 - Pickers are still blocking rfd calls on the UI thread (`EffectHost`), as in every egui view.
 
+## Slice 12: the Backup tab
+
+`src/gui/backup_tab.rs` (2,604 lines, 62 engine references) held the whole Backup flow in the
+view: the source dropdown and its change detection, the image decode, the scan and image preview,
+a raw `min_size_runner` thread per Calc min, the Compact Space rules, the single-file-CHD sizing,
+the VHD options window and its whole-disk export thread, the Remote Drive connect / load threads,
+and the backup worker. The TUI's Backup screen built its own `BackupConfig` and ran `run_backup`
+on its own thread.
+
+### Steps
+
+1. (20b74a23) Model and controller. `model::backup_plan` holds the rules: `MinSizes` (the walks'
+   in-place and defragmented minimums, fragmentation, the Compact toggle, its 5% auto-check and the
+   toggle-aware effective minimum), `BackupOptions` (the split rule: VHD and CHD are one file;
+   sector-by-sector turns resize off; a resize-to-minimum CHD needs minimums first), `sizing`
+   (MinPlus20 targets, the Compact opt-in set, the precomputed minimums), `partition_filter`,
+   `build_config`, `deferred_selected`, `remote_min_plan` and `is_device_path`.
+   `controller::backup::BackupController` (`mod.rs`, `source.rs`, `remote.rs`, `run.rs`) owns:
+   - Sources: `SelectDevice { slot, device }`, `OpenImage { path, rename }` (a wrapped image is
+     decoded in a job first), `PickImage` (an `Effect::PickFile` with the disk-image and Mac-archive
+     filters), the remote drive (`RemoteOpen`, `RemoteSetAddress`, `RemoteConnect`, `RemotePick`,
+     `RemoteClose`, `RemoteClear`), `CloseSource` (releases the escalated device) and
+     `reconcile_devices` (the old per-frame device-slot check). `HostRequest::RememberRecent` asks
+     the shell to put an opened image on the recent list.
+   - What was found as plain data: `rows()` (`PartitionRow` with `MinCell` and `CompactCell`),
+     `table_desc`, `load_error`, `vhd_rows()` (`VhdRow`), `remote_drives()`.
+   - Jobs: the decode, the scan / preview (`CancelScan`), Calc min (logging each phase), the remote
+     connect and load, the backup (`run_mirrored` over `run_backup` / `run_backup_from`, its log and
+     progress mirrored; `progress()` is the shared bar's `BackupBar`) and the whole-disk VHD export.
+   - Start's rules: `validate()` (source, an image that exists, destination, name, a selection),
+     the VHD window (scanning first when nothing was read), Calc min on the selected deferred
+     partitions before a resize-to-minimum CHD (`start_pending`, `CancelPendingStart`), and a Start
+     during the decode or scan that waits for it. The Custom CHD choice that travels with `Start` is
+     saved to config.json (`saved_chd_custom` restores it).
+   - `wait_idle` / `wait_finished` block for a headless shell or a test.
+2. (08f563dd) The egui tab renders and maps: it keeps only the CHD options control, the recent-list
+   mirror and whether it shows the shared progress bar.
+3. (this commit) `src/gui/backup_tab.rs` joins `ENFORCED`; the TUI's Backup screen drives a
+   headless `BackupController` (source, destination, name, format, checksum, Start, Cancel, the
+   result and the last log lines; `the_backup_screen_backs_up_a_disk_through_the_controller`); a ui
+   scenario (`tests/ui_scenarios/backup_open_validate_run.toml`, vm `backup`) opens an image, walks
+   Start's refusals, opens and closes the VHD window, runs a zstd backup and closes. The dead
+   `model::status::VhdExportStatus` is gone.
+
+Shells' engine references 470 -> 393 (`backup_tab.rs` 62 -> 0, `tui_app.rs` 96 -> 81).
+
+`rb-cli backup` keeps its own `BackupConfig`: its rules differ on purpose (`--split-size` passes
+through so the engine refuses a split CHD, the name is the source stem and a time stamp, `--defrag`
+is the FAT defragment, nothing is resized), so `build_config` would change what it writes.
+
+### Behaviour changes
+
+- GUI: picking a remote drive replaces the local source (the old tab dropped the remote pick on
+  the next frame when a device or image was still selected).
+- GUI: switching or closing the source cancels running Calc min walks (they ran on).
+- GUI: a remote backup gets the same split rule as a local one (a VHD is never split) and remembers
+  a Custom CHD choice too; the partition filter is sorted.
+- GUI: a failed image decode is logged in the log panel (it went to stderr only); a recent pick of a
+  wrapped image renames the backup once decoded (only an image ready at once was renamed).
+- GUI: a panic in the backup reads "Backup failed: <message>" (it read "backup worker panicked").
+- TUI: the backup name comes from the controller (size, label or stem, and the date, as the GUI
+  names it) and is replaced on every source pick (it was the bare stem, kept once typed); an empty
+  name is refused ("Enter a backup name.") instead of becoming "backup"; a missing output folder
+  reads "Choose a destination folder.".
+- TUI: an image source is previewed (partitions and minimums are read, and their count shows on the
+  form), wrapped images (`.hdz`, `.adz`, `.msa`, ...) are decoded first, and a Start during either
+  waits for it. The engine gets the minimums the preview found (the GUI always passed them).
+- TUI: the run shows the controller's last log lines, and after Esc cancels it shows the final
+  result instead of keeping "Cancel requested...".
+- CLI: none.
+
+### Left
+
+- The TUI Backup screen has no partition selection, Compact, resize, split, CHD codec choice, remote
+  drive or VHD window; each is an existing `BackupAction`.
+- `rb-cli backup` could take `validate()` and `BackupOptions` once its rules are reconciled with the
+  GUI's (the three differences above).
+- The pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.

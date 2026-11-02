@@ -52,6 +52,7 @@ impl SourceState {
         self.decode.is_none() && self.scan.is_none()
     }
 
+    #[cfg(feature = "remote")]
     pub fn drop_decode(&mut self) {
         self.decode = None;
     }

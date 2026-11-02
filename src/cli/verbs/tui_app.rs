@@ -1162,10 +1162,9 @@ impl NewWizard {
     }
 }
 
-/// The Backup screen: a guided source -> config -> run flow driving the shared
-/// `backup::run_backup` on a worker thread (the same runner the GUI and CLI
-/// use). Progress is polled from the runner's `BackupProgress` and mirrored into
-/// the shell's bottom progress bar.
+/// The Backup screen: a guided source -> config -> run flow over a headless
+/// `controller::backup::BackupController`, the controller behind the GUI's Backup tab.
+/// The run's progress is mirrored into the shell's bottom progress bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackupStep {
     Source,
@@ -1174,19 +1173,25 @@ enum BackupStep {
 }
 
 /// Output formats offered on the Backup config form (label -> compression).
-const BACKUP_FORMATS: &[(&str, crate::backup::CompressionType)] = &[
-    ("Zstd", crate::backup::CompressionType::Zstd),
-    ("CHD (single-file)", crate::backup::CompressionType::Chd),
-    ("VHD", crate::backup::CompressionType::Vhd),
-    ("gzip", crate::backup::CompressionType::Gzip),
-    ("LZ4", crate::backup::CompressionType::Lz4),
-    ("Raw (uncompressed)", crate::backup::CompressionType::None),
+const BACKUP_FORMATS: &[(&str, crate::controller::backup::CompressionType)] = &[
+    ("Zstd", crate::controller::backup::CompressionType::Zstd),
+    (
+        "CHD (single-file)",
+        crate::controller::backup::CompressionType::Chd,
+    ),
+    ("VHD", crate::controller::backup::CompressionType::Vhd),
+    ("gzip", crate::controller::backup::CompressionType::Gzip),
+    ("LZ4", crate::controller::backup::CompressionType::Lz4),
+    (
+        "Raw (uncompressed)",
+        crate::controller::backup::CompressionType::None,
+    ),
 ];
 
 /// Checksum choices on the Backup config form (label -> algorithm).
-const BACKUP_CHECKSUMS: &[(&str, crate::backup::ChecksumType)] = &[
-    ("SHA-256", crate::backup::ChecksumType::Sha256),
-    ("CRC32", crate::backup::ChecksumType::Crc32),
+const BACKUP_CHECKSUMS: &[(&str, crate::controller::backup::ChecksumType)] = &[
+    ("SHA-256", crate::controller::backup::ChecksumType::Sha256),
+    ("CRC32", crate::controller::backup::ChecksumType::Crc32),
 ];
 
 /// Config-form rows: 0 output dir, 1 name, 2 format, 3 checksum, 4 "Start".
@@ -1194,48 +1199,107 @@ const BACKUP_FIELDS: usize = 5;
 
 struct BackupState {
     step: BackupStep,
-    /// Source path (an image file, or a physical device path).
-    source: String,
-    from_device: bool,
+    ctl: crate::controller::backup::BackupController,
     /// Source image file picker, when open.
     picker: Option<FilePicker>,
     /// Physical-disk chooser sub-mode + its cursor.
     device_pick: bool,
     device_sel: usize,
-    /// Config form.
+    /// The typed output folder (`~` expands on Start).
     out_dir: String,
-    name: String,
     format_sel: usize,
     checksum_sel: usize,
     field: usize,
-    /// A running backup's shared progress, once started.
-    run: Option<Arc<Mutex<crate::backup::BackupProgress>>>,
-    /// Latest operation string from the runner (shown during Run).
+    /// Latest operation string from the run (shown during Run).
     op: String,
-    /// Terminal result (success or error) once finished.
-    result: Option<String>,
-    is_error: bool,
+    /// The controller's latest log lines, shown under the run.
+    log: Vec<String>,
+    /// Esc asked the running backup to stop.
+    cancel_note: bool,
 }
 
 impl Default for BackupState {
     fn default() -> Self {
+        use crate::controller::backup::{
+            BackupAction, BackupController, BackupServices, JobRegistry, NoNotify,
+        };
+        use crate::controller::Controller as _;
+        let mut ctl = BackupController::new(BackupServices {
+            jobs: JobRegistry::new(),
+            notify: Arc::new(NoNotify),
+        });
+        // The TUI keeps each partition's size and writes one archive per partition.
+        ctl.apply(BackupAction::SetResize(false));
+        ctl.apply(BackupAction::SetSplit(false));
         BackupState {
             step: BackupStep::Source,
-            source: String::new(),
-            from_device: false,
+            ctl,
             picker: None,
             device_pick: false,
             device_sel: 0,
             out_dir: String::new(),
-            name: String::new(),
             format_sel: 0,
             checksum_sel: 0,
             field: 0,
-            run: None,
             op: String::new(),
-            result: None,
-            is_error: false,
+            log: Vec::new(),
+            cancel_note: false,
         }
+    }
+}
+
+impl BackupState {
+    fn act(&mut self, action: crate::controller::backup::BackupAction) {
+        use crate::controller::Controller as _;
+        // The controller's pickers are the TUI's own file picker, opened by key.
+        let _ = self.ctl.apply(action);
+        self.after();
+    }
+
+    /// Carry out the controller's requests and keep its latest log lines.
+    fn after(&mut self) {
+        use crate::controller::backup::HostRequest;
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(path) => {
+                    crate::update::push_recent(
+                        crate::update::RecentMode::Backup,
+                        &path.to_string_lossy(),
+                    );
+                }
+            }
+        }
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, msg)| msg));
+        let n = self.log.len();
+        if n > 6 {
+            self.log.drain(..n - 6);
+        }
+    }
+
+    /// A backup runs or waits to start.
+    fn busy(&self) -> bool {
+        self.ctl.is_running() || self.ctl.start_pending() || self.ctl.vhd_open()
+    }
+
+    /// How the run ended (text, is an error); `None` while it runs.
+    fn result(&self) -> Option<(String, bool)> {
+        if self.busy() {
+            return self
+                .cancel_note
+                .then(|| ("Cancel requested...".to_string(), true));
+        }
+        match self.ctl.last_result()? {
+            Ok(()) => Some(("Backup complete.".to_string(), false)),
+            Err(e) => Some((e.clone(), true)),
+        }
+    }
+
+    fn source_text(&self) -> String {
+        self.ctl
+            .source_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -2206,9 +2270,13 @@ impl App {
             }
         }
         // Also signal a running backup / restore to stop.
-        if let Some(run) = self.backup.as_ref().and_then(|b| b.run.clone()) {
-            if let Ok(mut p) = run.lock() {
-                p.cancel_requested = true;
+        if let Some(b) = self.backup.as_mut() {
+            use crate::controller::backup::BackupAction;
+            if b.ctl.is_running() {
+                b.act(BackupAction::Cancel);
+                b.cancel_note = true;
+            } else if b.ctl.start_pending() {
+                b.act(BackupAction::CancelPendingStart);
             }
         }
         if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
@@ -2813,47 +2881,29 @@ impl App {
     /// Backup screen keys. Returns `true` when consumed; `false` lets a key fall
     /// through to the shell (Left/Right switch tabs, `q` quits from idle steps).
     fn handle_backup_key(&mut self, code: KeyCode) -> bool {
+        use crate::controller::backup::BackupAction;
         if self.backup.is_none() {
             self.backup = Some(BackupState::default());
         }
         // Source image file picker (modal).
-        if self
-            .backup
-            .as_ref()
-            .map(|b| b.picker.is_some())
-            .unwrap_or(false)
-        {
-            let is_dir = matches!(
-                self.backup.as_ref().unwrap().picker.as_ref().unwrap().kind,
-                PickKind::Dir
-            );
-            let res = self
-                .backup
-                .as_mut()
-                .unwrap()
-                .picker
-                .as_mut()
-                .unwrap()
-                .handle_key(code);
-            match res {
-                Some(PickResult::Cancel) => self.backup.as_mut().unwrap().picker = None,
-                Some(PickResult::Confirm(path)) => {
-                    if is_dir {
-                        // Output-folder browse.
-                        let b = self.backup.as_mut().unwrap();
-                        b.out_dir = path.to_string_lossy().into_owned();
+        if let Some(b) = self.backup.as_mut() {
+            if let Some(picker) = b.picker.as_mut() {
+                let is_dir = matches!(picker.kind, PickKind::Dir);
+                match picker.handle_key(code) {
+                    Some(PickResult::Cancel) => b.picker = None,
+                    Some(PickResult::Confirm(path)) => {
                         b.picker = None;
-                    } else {
-                        crate::update::push_recent(
-                            crate::update::RecentMode::Backup,
-                            &path.to_string_lossy(),
-                        );
-                        self.backup_set_source(path.to_string_lossy().into_owned(), false);
+                        if is_dir {
+                            b.out_dir = path.to_string_lossy().into_owned();
+                        } else {
+                            b.act(BackupAction::OpenImage { path, rename: true });
+                            self.backup_source_chosen();
+                        }
                     }
+                    None => {}
                 }
-                None => {}
+                return true;
             }
-            return true;
         }
 
         let step = self.backup.as_ref().unwrap().step;
@@ -2869,14 +2919,12 @@ impl App {
                 KeyCode::Esc => b.device_pick = false,
                 KeyCode::Enter => {
                     let sel = b.device_sel;
-                    let dev = self
-                        .disks
-                        .as_ref()
-                        .and_then(|d| d.get(sel))
-                        .map(|d| d.path.display().to_string());
-                    if let Some(path) = dev {
-                        self.backup.as_mut().unwrap().device_pick = false;
-                        self.backup_set_source(path, true);
+                    let dev = self.disks.as_ref().and_then(|d| d.get(sel)).cloned();
+                    if let Some(device) = dev {
+                        let b = self.backup.as_mut().unwrap();
+                        b.device_pick = false;
+                        b.act(BackupAction::SelectDevice { slot: sel, device });
+                        self.backup_source_chosen();
                     }
                 }
                 _ => {}
@@ -2932,6 +2980,8 @@ impl App {
                     } else {
                         b.format_sel = (b.format_sel + 1) % n;
                     }
+                    let format = BACKUP_FORMATS[b.format_sel].1;
+                    b.act(BackupAction::SetFormat(format));
                     true
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if b.field == 3 => {
@@ -2941,6 +2991,8 @@ impl App {
                     } else {
                         b.checksum_sel = (b.checksum_sel + 1) % n;
                     }
+                    let checksum = BACKUP_CHECKSUMS[b.checksum_sel].1;
+                    b.act(BackupAction::SetChecksum(checksum));
                     true
                 }
                 KeyCode::Tab if b.field == 0 => {
@@ -2957,16 +3009,25 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     match b.field {
-                        0 => b.out_dir.pop(),
-                        1 => b.name.pop(),
-                        _ => None,
-                    };
+                        0 => {
+                            b.out_dir.pop();
+                        }
+                        1 => {
+                            let mut name = b.ctl.name().to_string();
+                            name.pop();
+                            b.act(BackupAction::SetName(name));
+                        }
+                        _ => {}
+                    }
                     true
                 }
                 KeyCode::Char(c) if !c.is_control() && (b.field == 0 || b.field == 1) => {
-                    match b.field {
-                        0 => b.out_dir.push(c),
-                        _ => b.name.push(c),
+                    if b.field == 0 {
+                        b.out_dir.push(c);
+                    } else {
+                        let mut name = b.ctl.name().to_string();
+                        name.push(c);
+                        b.act(BackupAction::SetName(name));
                     }
                     true
                 }
@@ -2974,22 +3035,19 @@ impl App {
             },
             BackupStep::Run => match code {
                 KeyCode::Esc => {
-                    let running = b.result.is_none();
-                    if running {
+                    if b.result().is_none() {
                         // Request cancel; the bar clears via cancel_progress.
                         self.cancel_progress();
                         if let Some(b) = self.backup.as_mut() {
-                            b.result = Some("Cancel requested...".to_string());
-                            b.is_error = true;
+                            if !b.busy() && b.result().is_none() {
+                                b.step = BackupStep::Config;
+                            }
                         }
                     } else {
                         // Done: clear and return to the config form.
                         self.progress = None;
-                        if let Some(b) = self.backup.as_mut() {
-                            b.run = None;
-                            b.result = None;
-                            b.step = BackupStep::Config;
-                        }
+                        b.cancel_note = false;
+                        b.step = BackupStep::Config;
                     }
                     true
                 }
@@ -2998,115 +3056,40 @@ impl App {
         }
     }
 
-    /// Record a chosen backup source and advance to the config form, defaulting
-    /// the output folder (source's parent) and backup name (source stem + date).
-    fn backup_set_source(&mut self, source: String, from_device: bool) {
+    /// A source was picked: on to the config form, defaulting the output folder to the image's.
+    fn backup_source_chosen(&mut self) {
         let Some(b) = self.backup.as_mut() else {
             return;
         };
-        b.source = source.clone();
-        b.from_device = from_device;
-        b.picker = None;
-        // Default the name from the source's file stem (or device name).
-        let stem = std::path::Path::new(&source)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "backup".to_string());
-        if b.name.is_empty() {
-            b.name = stem;
-        }
-        // Default the output folder to the source's parent (for a file source).
-        if b.out_dir.is_empty() && !from_device {
-            if let Some(parent) = std::path::Path::new(&source).parent() {
-                b.out_dir = parent.display().to_string();
+        if b.out_dir.is_empty() {
+            if let Some(dir) = b.ctl.default_destination() {
+                b.out_dir = dir.display().to_string();
             }
         }
         b.step = BackupStep::Config;
         b.field = 0;
     }
 
-    /// Validate the config form and start `backup::run_backup` on a worker
-    /// thread, mirroring its `BackupProgress` into the shell's progress bar.
+    /// Hand the form to the controller and press its Start; it validates and runs the backup.
     fn start_backup(&mut self) {
-        let Some(b) = self.backup.as_ref() else {
+        use crate::controller::backup::BackupAction;
+        let Some(b) = self.backup.as_mut() else {
             return;
         };
-        let source = expand_tilde(b.source.trim());
-        if source.as_os_str().is_empty() || (!b.from_device && !source.exists()) {
-            let b = self.backup.as_mut().unwrap();
-            b.result = Some("Source not found.".to_string());
-            b.is_error = true;
-            b.step = BackupStep::Run;
-            return;
-        }
         let out_dir = expand_tilde(b.out_dir.trim());
-        if out_dir.as_os_str().is_empty() {
-            let b = self.backup.as_mut().unwrap();
-            b.result = Some("Enter an output folder.".to_string());
-            b.is_error = true;
-            b.step = BackupStep::Run;
-            return;
-        }
-        let name = if b.name.trim().is_empty() {
-            "backup".to_string()
-        } else {
-            b.name.trim().to_string()
-        };
-        let compression = BACKUP_FORMATS[b.format_sel.min(BACKUP_FORMATS.len() - 1)].1;
-        let checksum = BACKUP_CHECKSUMS[b.checksum_sel.min(BACKUP_CHECKSUMS.len() - 1)].1;
-        let config = crate::backup::BackupConfig {
-            source_path: source,
-            destination_dir: out_dir,
-            backup_name: name,
-            compression,
-            checksum,
-            split_size_mib: None,
-            sector_by_sector: false,
-            partition_filter: None,
-            chd_options: None,
-            size_policy: None,
-            partition_target_sizes: None,
-            shrink_to_minimum: false,
-            precomputed_minimum_sizes: None,
-            defrag_partition_indices: None,
-            defrag_fat: false,
-            keep_swap: false,
-        };
-        let progress = Arc::new(Mutex::new(crate::backup::BackupProgress::new()));
-        let worker = Arc::clone(&progress);
-        crate::model::worker::spawn_guarded(Arc::clone(&progress), "backup", move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::backup::run_backup(config, Arc::clone(&worker))
-            }));
-            if let Ok(mut p) = worker.lock() {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        if p.error.is_none() {
-                            p.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    Err(_) => {
-                        if p.error.is_none() {
-                            p.error = Some("backup thread panicked".to_string());
-                        }
-                    }
-                }
-                p.finished = true; // always unstick the poll loop
-            }
-            Ok(())
-        });
-        let b = self.backup.as_mut().unwrap();
-        b.run = Some(progress);
-        b.result = None;
-        b.is_error = false;
+        let dest = (!out_dir.as_os_str().is_empty()).then_some(out_dir);
+        b.act(BackupAction::SetDestination(dest));
+        b.act(BackupAction::Start(None));
+        b.cancel_note = false;
         b.op = "Starting...".to_string();
         b.step = BackupStep::Run;
-        self.progress = Some(Progress {
-            shared: Arc::new(Mutex::new(ProgressShared::default())),
-            tracker: RateTracker::default(),
-            label: "Backing up".to_string(),
-        });
+        if b.busy() {
+            self.progress = Some(Progress {
+                shared: Arc::new(Mutex::new(ProgressShared::default())),
+                tracker: RateTracker::default(),
+                label: "Backing up".to_string(),
+            });
+        }
     }
 
     /// Restore screen keys. Returns `true` when consumed.
@@ -4362,39 +4345,30 @@ impl App {
     /// worker (the bar stays until the user presses Esc, showing 100%).
     fn tick(&mut self) {
         self.poll_task();
-        // Mirror a running backup's shared progress into the visual bar, and
-        // capture its terminal result once it finishes.
-        if let Some(run) = self.backup.as_ref().and_then(|b| b.run.clone()) {
-            let snap = run.lock().ok().map(|p| {
-                (
-                    p.current_bytes,
-                    p.total_bytes,
-                    p.finished,
-                    p.error.clone(),
-                    p.operation.clone(),
-                )
-            });
-            if let Some((cur, total, done, err, op)) = snap {
+        // Drive the Backup controller and mirror its run into the visual bar.
+        if let Some(b) = self.backup.as_mut() {
+            use crate::controller::backup::BackupAction;
+            use crate::controller::Controller as _;
+            let _ = b.ctl.tick();
+            // The TUI has no VHD window: one .vhd per partition, as before.
+            if b.ctl.vhd_open() {
+                b.act(BackupAction::VhdWholeDisk(false));
+                b.act(BackupAction::VhdStart);
+            }
+            b.after();
+            let bar = b.ctl.progress();
+            if let Some(bar) = &bar {
+                b.op = bar.operation.clone();
+            }
+            if b.step == BackupStep::Run {
+                let done = !b.busy();
                 if let Some(prog) = self.progress.as_ref() {
                     if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = cur;
-                        sh.total = total;
-                        sh.done = done;
-                    }
-                }
-                if let Some(b) = self.backup.as_mut() {
-                    b.op = op;
-                    if done && b.result.is_none() {
-                        match err {
-                            Some(e) => {
-                                b.result = Some(format!("Backup failed: {e}"));
-                                b.is_error = true;
-                            }
-                            None => {
-                                b.result = Some("Backup complete.".to_string());
-                                b.is_error = false;
-                            }
+                        if let Some(bar) = &bar {
+                            sh.current = bar.current_bytes;
+                            sh.total = bar.total_bytes;
                         }
+                        sh.done = done;
                     }
                 }
             }
@@ -5274,11 +5248,12 @@ impl App {
                     Span::styled("  d          ", self.palette.accent()),
                     dev_line,
                 ]));
-                if !b.source.is_empty() {
+                let source = b.source_text();
+                if !source.is_empty() {
                     lines.push(Line::raw(""));
                     lines.push(Line::from(vec![
                         Span::styled("Current source: ", self.palette.dim()),
-                        Span::raw(b.source.clone()),
+                        Span::raw(source),
                     ]));
                 }
                 lines.push(Line::raw(""));
@@ -5289,12 +5264,31 @@ impl App {
             BackupStep::Config => {
                 lines.push(Line::from(vec![
                     Span::styled("Source: ", self.palette.dim()),
-                    Span::raw(b.source.clone()),
+                    Span::raw(b.source_text()),
                     Span::styled(
-                        if b.from_device { "  [device]" } else { "" },
+                        if b.ctl.device_slot().is_some() {
+                            "  [device]"
+                        } else {
+                            ""
+                        },
                         self.palette.dim(),
                     ),
                 ]));
+                if let Some(snap) = b.ctl.decoding().or_else(|| b.ctl.scanning()) {
+                    let what = if snap.phase.is_empty() {
+                        snap.label
+                    } else {
+                        snap.phase
+                    };
+                    lines.push(Line::styled(format!("  {what}"), self.palette.dim()));
+                } else if let Some(table) = b.ctl.table_desc() {
+                    lines.push(Line::styled(
+                        format!("  {} partition(s) ({table})", b.ctl.partition_count()),
+                        self.palette.dim(),
+                    ));
+                } else if let Some(err) = b.ctl.load_error() {
+                    lines.push(Line::styled(format!("  {err}"), self.palette.warn()));
+                }
                 lines.push(Line::raw(""));
                 let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
                     let active = b.field == idx;
@@ -5321,7 +5315,7 @@ impl App {
                     b.out_dir.clone()
                 };
                 lines.push(row(0, "Output:", out_disp, true));
-                lines.push(row(1, "Name:", b.name.clone(), true));
+                lines.push(row(1, "Name:", b.ctl.name().to_string(), true));
                 lines.push(row(
                     2,
                     "Format:",
@@ -5357,14 +5351,14 @@ impl App {
             BackupStep::Run => {
                 lines.push(Line::from(vec![
                     Span::styled("Source: ", self.palette.dim()),
-                    Span::raw(b.source.clone()),
+                    Span::raw(b.source_text()),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("Output: ", self.palette.dim()),
                     Span::raw(format!(
                         "{}/{}  ({}, {})",
                         b.out_dir,
-                        b.name,
+                        b.ctl.name(),
                         BACKUP_FORMATS[b.format_sel].0,
                         BACKUP_CHECKSUMS[b.checksum_sel].0
                     )),
@@ -5376,9 +5370,12 @@ impl App {
                         Span::raw(b.op.clone()),
                     ]));
                 }
-                if let Some(r) = &b.result {
+                for msg in &b.log {
+                    lines.push(Line::styled(format!("  {msg}"), self.palette.dim()));
+                }
+                if let Some((r, is_error)) = b.result() {
                     lines.push(Line::raw(""));
-                    let style = if b.is_error {
+                    let style = if is_error {
                         self.palette.warn()
                     } else {
                         self.palette.accent()
@@ -7403,6 +7400,38 @@ mod tests {
             "the disk's hardware facts must come along so the header can show \
              them instead of needing a screen of their own"
         );
+    }
+
+    /// The Backup screen runs a backup through the controller and reports its end.
+    #[test]
+    fn the_backup_screen_backs_up_a_disk_through_the_controller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+
+        let mut app = App::new_on(BACKUP_TAB);
+        app.disks = Some(vec![fake_disk(&img, size)]);
+        assert!(app.handle_backup_key(KeyCode::Char('d')));
+        assert!(app.handle_backup_key(KeyCode::Enter));
+        let b = app.backup.as_mut().unwrap();
+        assert!(b.step == BackupStep::Config);
+        assert!(!b.ctl.name().is_empty());
+        b.out_dir = out.path().display().to_string();
+        b.field = 4;
+        assert!(app.handle_backup_key(KeyCode::Enter));
+        assert!(app.progress.is_some());
+        for _ in 0..6000 {
+            app.tick();
+            if app.backup.as_ref().unwrap().result().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let b = app.backup.as_ref().unwrap();
+        assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
+        let folder = out.path().join(b.ctl.name());
+        assert!(folder.join("metadata.json").exists());
     }
 
     /// The file picker must accept a raw device path.

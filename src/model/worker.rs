@@ -139,13 +139,6 @@ impl WorkerStatus for crate::restore::RestoreProgress {
     }
 }
 
-impl WorkerStatus for super::status::VhdExportStatus {
-    fn fail(&mut self, message: String) {
-        self.error = Some(message);
-        self.finished = true;
-    }
-}
-
 impl WorkerStatus for super::min_size_runner::MinSizeStatus {
     fn fail(&mut self, message: String) {
         self.error = Some(message);

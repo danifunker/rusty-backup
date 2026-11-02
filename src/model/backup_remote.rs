@@ -1,8 +1,8 @@
 //! Testable core for backing up a **remote source** (a physical drive or an
 //! image file on an `rb-cli serve` daemon) from the Backup tab.
 //!
-//! The GUI shell in `src/gui/backup_tab.rs` is a thin state machine over these
-//! two blocking transitions; keeping the network + parsing logic here lets it be
+//! `controller::backup` runs these two blocking transitions as jobs; keeping the
+//! network + parsing logic here lets it be
 //! exercised headlessly over a loopback `serve_on` (see the integration test),
 //! since GUI code can't run in the agent environment.
 

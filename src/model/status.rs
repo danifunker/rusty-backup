@@ -76,16 +76,6 @@ pub struct BlockCacheScan {
     pub cache: Arc<Mutex<PartcloneBlockCache>>,
 }
 
-/// Status of a VHD whole-disk export running on a background thread.
-pub struct VhdExportStatus {
-    pub finished: bool,
-    pub error: Option<String>,
-    pub current_bytes: u64,
-    pub total_bytes: u64,
-    pub cancel_requested: bool,
-    pub log_messages: Vec<String>,
-}
-
 /// Status of a background file/folder extraction from `BrowseView`.
 pub struct ExtractionProgress {
     pub current_bytes: u64,

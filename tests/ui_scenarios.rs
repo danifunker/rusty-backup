@@ -310,9 +310,133 @@ impl Target for InspectTarget {
     }
 }
 
+/// The Backup tab's controller. Actions: `OpenImage` (arg: a path, or `$blank_fat` for a fresh
+/// FAT image), `SetDestination` (a path, or `$out` for a temp folder), `SetName`, `SetFormat`
+/// (`zstd`, `vhd`, `chd`, `raw`), `SelectAll`, `SelectNone`, `Start`, `VhdClose`, `Close`.
+/// Probes: `source`, `partitions`, `selected`, `error` (why Start is refused, empty when it is
+/// not), `vhd_open`, `result` (`ok`, the failure, or empty), `output` (the backup folder holds a
+/// `metadata.json`), `log` (every line so far).
+struct BackupTarget {
+    ctl: rusty_backup::controller::backup::BackupController,
+    dir: tempfile::TempDir,
+    log: Vec<String>,
+}
+
+impl BackupTarget {
+    fn new() -> Self {
+        use rusty_backup::controller::backup::{
+            BackupController, BackupServices, JobRegistry, NoNotify,
+        };
+        BackupTarget {
+            ctl: BackupController::new(BackupServices {
+                jobs: JobRegistry::new(),
+                notify: std::sync::Arc::new(NoNotify),
+            }),
+            dir: tempfile::tempdir().expect("temp dir"),
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        fx
+    }
+}
+
+impl Target for BackupTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::backup::{BackupAction, CompressionType};
+        let a = match action {
+            "OpenImage" => {
+                let arg = arg_str(arg)?;
+                let path = if arg == "$blank_fat" {
+                    let p = self.dir.path().join("vol.img");
+                    let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T"))
+                        .map_err(|e| e.to_string())?;
+                    std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                    p
+                } else {
+                    PathBuf::from(arg)
+                };
+                BackupAction::OpenImage { path, rename: true }
+            }
+            "SetDestination" => {
+                let arg = arg_str(arg)?;
+                let path = if arg == "$out" {
+                    let p = self.dir.path().join("out");
+                    std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+                    p
+                } else {
+                    PathBuf::from(arg)
+                };
+                BackupAction::SetDestination(Some(path))
+            }
+            "SetName" => BackupAction::SetName(arg_str(arg)?.to_string()),
+            "SetFormat" => BackupAction::SetFormat(match arg_str(arg)? {
+                "zstd" => CompressionType::Zstd,
+                "vhd" => CompressionType::Vhd,
+                "chd" => CompressionType::Chd,
+                "raw" => CompressionType::None,
+                other => return Err(format!("unknown format {other:?}")),
+            }),
+            "SelectAll" => BackupAction::SelectAll,
+            "SelectNone" => BackupAction::SelectNone,
+            "Start" => BackupAction::Start(None),
+            "VhdClose" => BackupAction::VhdClose,
+            "Close" => BackupAction::CloseSource,
+            other => return Err(format!("BackupController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        Ok(self.note(fx))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "source" => Value::String(
+                if self.ctl.image_path().is_some() {
+                    "image"
+                } else if self.ctl.has_source() {
+                    "other"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ),
+            "partitions" => Value::Integer(self.ctl.partition_count() as i64),
+            "selected" => Value::Integer(self.ctl.selected_count() as i64),
+            "error" => Value::String(self.ctl.validate().err().unwrap_or_default()),
+            "vhd_open" => Value::Boolean(self.ctl.vhd_open()),
+            "result" => Value::String(match self.ctl.last_result() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "output" => Value::Boolean(
+                self.dir
+                    .path()
+                    .join("out")
+                    .join(self.ctl.name())
+                    .join("metadata.json")
+                    .exists(),
+            ),
+            "log" => Value::String(self.log.join("\n")),
+            other => return Err(format!("BackupController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.wait_finished();
+        let fx = self.ctl.tick();
+        self.note(fx)
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
+        "backup" => Ok(Box::new(BackupTarget::new())),
         "inspect" => Ok(Box::new(InspectTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
