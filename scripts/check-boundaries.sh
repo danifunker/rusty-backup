@@ -4,7 +4,7 @@
 # Enforced (exit 1):
 #   - src/controller has no toolkit code (egui, eframe, ratatui, crossterm, rfd, objc2, gtk, Win32 UI).
 #   - src/controller spawns no raw threads; slow work goes through model::job::Job.
-#   - shells (src/gui, the TUI, the optical browser) spawn no raw threads: use Job,
+#   - shells (src/gui, the TUI) spawn no raw threads: use Job,
 #     worker::spawn_guarded or worker::spawn_detached, which catch panics (Phase 1).
 #   - views in ENFORCED (the Commander views, Phase 2 slice 9) name neither the engine/model
 #     nor a split crate: they use what src/controller re-exports.
@@ -18,8 +18,8 @@ cd "$(dirname "$0")/.."
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app src/optical/browse_view.rs)
-ENFORCED=(src/gui/commander src/gui/browse_view.rs src/gui/inspect_tab.rs src/gui/backup_tab.rs src/gui/restore_tab.rs src/gui/physical_disk_export.rs src/gui/partition_editor_modal.rs src/gui/progress.rs src/gui/alto_resize_dialog.rs src/gui/squashfs_budget_dialog.rs src/gui/expand_hfs_dialog.rs src/gui/floppy_convert_dialog.rs src/gui/remote_browser.rs src/gui/resize_popup.rs src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
+SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app)
+ENFORCED=(src/gui/commander src/gui/browse_view.rs src/gui/inspect_tab.rs src/gui/backup_tab.rs src/gui/restore_tab.rs src/gui/physical_disk_export.rs src/gui/partition_editor_modal.rs src/gui/progress.rs src/gui/alto_resize_dialog.rs src/gui/squashfs_budget_dialog.rs src/gui/expand_hfs_dialog.rs src/gui/floppy_convert_dialog.rs src/gui/remote_browser.rs src/gui/resize_popup.rs src/gui/optical_tab.rs src/gui/optical_browse_view.rs src/gui/optical_audio.rs src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'

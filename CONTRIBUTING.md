@@ -254,7 +254,8 @@ never copy it sideways.
   `src/gui/partition_editor_modal.rs`, `src/gui/progress.rs`,
   `src/gui/alto_resize_dialog.rs`, `src/gui/squashfs_budget_dialog.rs`,
   `src/gui/expand_hfs_dialog.rs`, `src/gui/floppy_convert_dialog.rs`,
-  `src/gui/remote_browser.rs`, `src/gui/resize_popup.rs`,
+  `src/gui/remote_browser.rs`, `src/gui/resize_popup.rs`, `src/gui/optical_tab.rs`,
+  `src/gui/optical_browse_view.rs`, `src/gui/optical_audio.rs`,
   `src/cli/verbs/tui_app/commander.rs` and `src/cli/verbs/tui_app/explorer.rs`.
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
   error.

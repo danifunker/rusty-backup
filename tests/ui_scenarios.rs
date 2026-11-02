@@ -25,8 +25,19 @@ use rusty_backup::model::job::{Job, JobCtx, Status};
 struct Scenario {
     name: String,
     vm: String,
+    /// Cargo features the view-model needs; a build without one skips the scenario.
+    #[serde(default)]
+    requires: Vec<String>,
     #[serde(default)]
     step: Vec<Step>,
+}
+
+/// Whether this build has a feature a scenario `requires`.
+fn has_feature(name: &str) -> bool {
+    match name {
+        "optical" => cfg!(all(feature = "optical", feature = "native-zstd")),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -943,10 +954,12 @@ impl Target for ExpandHfsTarget {
                 ExpandHfsAction::Open(src)
             }
             "SetFlatHfv" => ExpandHfsAction::SetFlatHfv(
-                arg.and_then(Value::as_bool).ok_or("SetFlatHfv needs a bool")?,
+                arg.and_then(Value::as_bool)
+                    .ok_or("SetFlatHfv needs a bool")?,
             ),
             "SetSizeMib" => ExpandHfsAction::SetSizeMib(
-                arg.and_then(Value::as_integer).ok_or("SetSizeMib needs an int")? as u32,
+                arg.and_then(Value::as_integer)
+                    .ok_or("SetSizeMib needs an int")? as u32,
             ),
             "PickOutput" => ExpandHfsAction::PickOutput,
             "Pick" => ExpandHfsAction::Picked {
@@ -1060,7 +1073,9 @@ impl Target for FloppyConvertTarget {
                 None => String::new(),
             }),
             "out_bytes" => Value::Integer(
-                std::fs::metadata(self.out()).map(|m| m.len() as i64).unwrap_or(0),
+                std::fs::metadata(self.out())
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0),
             ),
             other => return Err(format!("FloppyConvertController has no probe {other:?}")),
         })
@@ -1105,8 +1120,7 @@ impl ResizeTarget {
 
     fn open_sgi(&mut self) -> Result<rusty_backup::controller::resize::ResizePlan, String> {
         use rusty_backup::controller::inspect::{
-            InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
-            NoNotify,
+            InspectAction, InspectController, InspectServices, InspectSource, JobRegistry, NoNotify,
         };
         use rusty_backup::partition::sgi_hdd_builder::{build_sgi_efs_hdd, SgiHddOptions};
         let (img, _) = build_sgi_efs_hdd(&SgiHddOptions::new(64 << 20, "scenario"))
@@ -1117,7 +1131,10 @@ impl ResizeTarget {
             jobs: JobRegistry::new(),
             notify: std::sync::Arc::new(NoNotify),
         });
-        inspect.apply(InspectAction::Open(InspectSource::Image { path, temp: None }));
+        inspect.apply(InspectAction::Open(InspectSource::Image {
+            path,
+            temp: None,
+        }));
         while inspect.loading().is_some() {
             std::thread::sleep(std::time::Duration::from_millis(2));
             inspect.tick();
@@ -1200,6 +1217,178 @@ impl Target for ResizeTarget {
     }
 }
 
+/// `OpticalController` on an image file. Actions: `OpenImage` (arg `$hybrid`: the committed
+/// hybrid ISO 9660 + HFS+ disc), `SetOutputFormat` (`iso`, `bincue`, `chd`), `PickOutput`, `Pick`
+/// (the output, `out.<ext>`), `Start`, `BrowseContents`, `SelectFs` (a label substring),
+/// `Expand` / `Select` (a `/`-separated path from the root), `Extract`, `PickExtract`, `Tree`,
+/// `CloseDisc`. Probes: `format`, `can_start`, `result`, `bin_bytes`, `browsing`, `choices`,
+/// `error`, `content`, `extract_result`, `extracted`, `tree`, `source`.
+#[cfg(all(feature = "optical", feature = "native-zstd"))]
+struct OpticalTarget {
+    ctl: rusty_backup::controller::optical::OpticalController,
+    dir: tempfile::TempDir,
+}
+
+#[cfg(all(feature = "optical", feature = "native-zstd"))]
+impl OpticalTarget {
+    fn new() -> Self {
+        OpticalTarget {
+            ctl: rusty_backup::controller::optical::OpticalController::new(std::sync::Arc::new(
+                rusty_backup::controller::optical::NoNotify,
+            )),
+            dir: tempfile::tempdir().expect("temp dir"),
+        }
+    }
+
+    fn out(&self) -> PathBuf {
+        self.dir
+            .path()
+            .join(format!("out.{}", self.ctl.output_format().extension()))
+    }
+
+    fn extract_dir(&self) -> PathBuf {
+        self.dir.path().join("extract")
+    }
+
+    /// The entry at `path` (`/`-separated names from the root), from the folders listed so far.
+    fn entry(
+        &self,
+        path: &str,
+    ) -> Result<rusty_backup::controller::optical::browse::FileEntry, String> {
+        let b = self.ctl.browse();
+        let mut cur = b.root().ok_or("no root")?.clone();
+        for name in path.split('/').filter(|n| !n.is_empty()) {
+            let kids = b
+                .children(cur.path.as_str())
+                .ok_or_else(|| format!("{} is not listed", cur.path))?;
+            cur = kids
+                .iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| format!("no {name} in {}", cur.path))?
+                .clone();
+        }
+        Ok(cur)
+    }
+}
+
+#[cfg(all(feature = "optical", feature = "native-zstd"))]
+impl Target for OpticalTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::optical::browse::purpose as bpurpose;
+        use rusty_backup::controller::optical::{
+            purpose, DiscBrowseAction, OpticalAction, OutputFormat,
+        };
+        let browse = OpticalAction::Browse;
+        let a = match action {
+            "OpenImage" => OpticalAction::OpenImage(match arg_str(arg)? {
+                "$hybrid" => {
+                    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+                    let packed =
+                        std::fs::read(root.join("tests/fixtures/optical/hybrid_rsrc.iso.zst"))
+                            .map_err(|e| e.to_string())?;
+                    let iso = zstd::stream::decode_all(std::io::Cursor::new(packed))
+                        .map_err(|e| e.to_string())?;
+                    let p = self.dir.path().join("disc.iso");
+                    std::fs::write(&p, iso).map_err(|e| e.to_string())?;
+                    p
+                }
+                other => PathBuf::from(other),
+            }),
+            "SetOutputFormat" => OpticalAction::SetOutputFormat(match arg_str(arg)? {
+                "iso" => OutputFormat::Iso,
+                "bincue" => OutputFormat::BinCue,
+                "chd" => OutputFormat::Chd,
+                other => return Err(format!("no output format {other:?}")),
+            }),
+            "PickOutput" => OpticalAction::PickOutput,
+            "Pick" => OpticalAction::Picked {
+                purpose: purpose::OUTPUT,
+                path: Some(self.out()),
+            },
+            "Start" => OpticalAction::Start(None),
+            "BrowseContents" => OpticalAction::BrowseContents,
+            "SelectFs" => {
+                let want = arg_str(arg)?;
+                let idx = self
+                    .ctl
+                    .browse()
+                    .fs_choices()
+                    .iter()
+                    .position(|l| l.contains(want))
+                    .ok_or_else(|| format!("no filesystem choice like {want:?}"))?;
+                browse(DiscBrowseAction::SelectFs(idx))
+            }
+            "Expand" => browse(DiscBrowseAction::Expand(self.entry(arg_str(arg)?)?)),
+            "Select" => browse(DiscBrowseAction::Select(self.entry(arg_str(arg)?)?)),
+            "Extract" => browse(DiscBrowseAction::Extract),
+            "PickExtract" => {
+                let dir = self.extract_dir();
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                OpticalAction::Picked {
+                    purpose: bpurpose::EXTRACT_TO,
+                    path: Some(dir),
+                }
+            }
+            "Tree" => browse(DiscBrowseAction::Tree),
+            "CloseDisc" => OpticalAction::CloseDisc,
+            other => return Err(format!("OpticalController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        use rusty_backup::controller::optical::browse::FileContent;
+        let b = self.ctl.browse();
+        Ok(match name {
+            "format" => Value::String(self.ctl.disc().map(|d| d.format).unwrap_or_default()),
+            "source" => Value::String(
+                self.ctl
+                    .image()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            "can_start" => Value::Boolean(self.ctl.can_start()),
+            "result" => Value::String(match self.ctl.last_result() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => format!("error: {e}"),
+                None => String::new(),
+            }),
+            "bin_bytes" => Value::Integer(
+                std::fs::metadata(self.out().with_extension("bin"))
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0),
+            ),
+            "browsing" => Value::Boolean(b.is_active()),
+            "choices" => Value::Integer(b.fs_choices().len() as i64),
+            "error" => Value::String(b.error().unwrap_or("").to_string()),
+            "content" => Value::String(match b.content() {
+                Some(FileContent::Text(t)) => t.clone(),
+                Some(FileContent::Binary(d)) => format!("{} bytes", d.len()),
+                None => String::new(),
+            }),
+            "extract_result" => Value::String(b.result().unwrap_or("").to_string()),
+            "extracted" => Value::String({
+                let mut names: Vec<String> = std::fs::read_dir(self.extract_dir())
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                names.join(",")
+            }),
+            "tree" => Value::String(b.tree_text().unwrap_or("").to_string()),
+            other => return Err(format!("OpticalController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.tick()
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
@@ -1211,6 +1400,8 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
         "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
         "resize" => Ok(Box::new(ResizeTarget::new())),
+        #[cfg(all(feature = "optical", feature = "native-zstd"))]
+        "optical" => Ok(Box::new(OpticalTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,
@@ -1222,6 +1413,9 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
 fn run(path: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let sc: Scenario = toml::from_str(&text).map_err(|e| e.to_string())?;
+    if !sc.requires.iter().all(|f| has_feature(f.as_str())) {
+        return Ok(());
+    }
     let mut target = target_for(&sc.vm)?;
     for (i, step) in sc.step.iter().enumerate() {
         let at = |msg: String| format!("{} step {}: {msg}", sc.name, i + 1);
