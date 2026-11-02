@@ -140,7 +140,7 @@ Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the thre
   - **SFS** (`crates/fs-amiga/src/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
 - **Bitmap convention**: All three filesystems use **set bit = free** (opposite of most other FS we deal with). Easy bug source.
 - **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
-- **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.
+- **`.adz` / `.hdz`**: browsing, Inspect and Commander open them as containers (`model::source_reader::open_read` peels the gzip, and edits re-gzip in place), while Backup / Restore decode them to a flat tempfile through `model::image_prep::prepare_disk_image_path`, whose `TempDir` the caller keeps alive.
 
 Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives in the `fs-amiga` crate (`crates/fs-amiga/src/{affs,pfs3,sfs}.rs`; `src/fs/` keeps re-export shims) and follows the existing patterns there.
 
