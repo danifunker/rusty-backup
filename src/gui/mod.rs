@@ -17,6 +17,7 @@ mod journal_view;
 mod metadata_editor;
 #[cfg(feature = "audio")]
 mod optical_audio;
+mod optical_browse_view;
 mod optical_tab;
 mod partition_bar;
 mod partition_editor_modal;
@@ -29,7 +30,7 @@ mod settings_dialog;
 mod size_mode_row;
 mod source_picker;
 mod squashfs_budget_dialog;
-// The palette lives in the lib so `optical::browse_view` can reach it too;
+// The palette lives in the lib (the old optical widget used it there);
 // re-exported here so `super::theme::` resolves throughout the GUI.
 pub(crate) use rusty_backup::theme;
 pub mod ui_logger;
@@ -390,14 +391,9 @@ impl Default for RustyBackupApp {
 
         let backup_tab = BackupTab::default();
 
+        // The scan runs in a job; "Found N optical drive(s)" is logged when it ends.
         let mut optical_tab = OpticalTab::default();
-        optical_tab.refresh_drives();
-        if optical_tab.drive_count() > 0 {
-            log.info(format!(
-                "Found {} optical drive(s)",
-                optical_tab.drive_count()
-            ));
-        }
+        optical_tab.find_drives();
 
         // Start update check in background
         let update_info = Arc::new(Mutex::new(None));

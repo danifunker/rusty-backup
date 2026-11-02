@@ -1,397 +1,120 @@
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+//! The Optical tab: a shell over `controller::optical`.
+//!
+//! Draws the source (drive or image file), the disc info, the output form and Start / Cancel,
+//! maps them to [`OpticalAction`]s, answers pickers through an [`EffectHost`] and mirrors the
+//! run into the shared progress bar. Widget state only: the CHD options control, the remote
+//! address being typed, and the recent-files mirror.
 
-use opticaldiscs::detect::DiscImageInfo;
-use opticaldiscs::formats::DiscFormat;
-
-use rusty_backup::backup::LogLevel as BackupLogLevel;
-use rusty_backup::model::optical_devices::{list_rip_devices, RipDevice};
-use rusty_backup::optical::browse_view::OpticalDiscBrowseView;
-use rusty_backup::optical::convert::ConvertProgress;
-use rusty_backup::optical::rip::{OpticalTarget, RipConfig, RipFormat, RipProgress};
-use rusty_backup::rbformats::chd_options::{
-    codec_label, parse_codec_string, ChdOptions, ChdProfile,
+use rusty_backup::controller::log::LogStore;
+use rusty_backup::controller::optical::{
+    ChdChoice, ChdProfile, HostRequest, OpticalAction, OpticalController, OutputFormat, SourceMode,
+    Task,
 };
-use rusty_backup::remote::RemoteConnection;
-use rusty_backup::update::UpdateConfig;
+use rusty_backup::controller::{Controller, Effect};
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
-
+use super::effects::{EffectHost, Reply};
 use super::progress::ProgressState;
-use rusty_backup::controller::log::LogStore;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SourceMode {
-    PhysicalDrive,
-    ImageFile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Action {
-    Rip,
-    Convert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum OutputFormat {
-    Iso,
-    BinCue,
-    Chd,
-}
-
-/// Background state for the "Add remote daemon" connect — runs off the UI
-/// thread so an unreachable host can't freeze egui.
-#[derive(Default)]
-struct ConnectStatus {
-    done: bool,
-    result: Option<std::result::Result<Arc<Mutex<RemoteConnection>>, String>>,
-}
-
-/// State for the Optical disc tab.
 pub struct OpticalTab {
-    source_mode: SourceMode,
-    /// Unified drive list: local drives + every connected daemon's drives.
-    rip_devices: Vec<RipDevice>,
-    /// A drive re-scan, which asks every attached daemon over the network; `true` logs the count.
-    drives_job: Option<(rusty_backup::model::job::Job<Vec<RipDevice>>, bool)>,
-    selected_drive_idx: Option<usize>,
-    /// Connected remote daemons, re-queried when the drive list refreshes.
-    remote_daemons: Vec<Arc<Mutex<RemoteConnection>>>,
-    /// "Add remote daemon" dialog state.
-    add_remote_open: bool,
-    add_remote_addr: String,
-    add_remote_error: Option<String>,
-    add_remote_status: Option<Arc<Mutex<ConnectStatus>>>,
-    /// MRU of daemon addresses (newest first), mirrored to `config.json` — the
-    /// "Add remote daemon" dialog's quick-pick list.
-    recent_daemons: Vec<String>,
-    /// MRU of opened disc-image paths (newest first), mirrored to `config.json`
-    /// — the image-file "Recent:" quick-pick row.
+    ctl: OpticalController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
+    /// MRU of opened disc-image paths (config.json), for the "Recent:" quick-pick row.
     recent_files: Vec<String>,
-    image_file_path: Option<PathBuf>,
-    disc_info: Option<DiscImageInfo>,
-    /// Detecting the disc's format and filesystem; `true` reopens the browse view once it lands.
-    detect_job: Option<(
-        rusty_backup::model::job::Job<Result<DiscImageInfo, String>>,
-        bool,
-    )>,
-    disc_info_error: Option<String>,
-    action: Action,
-    output_format: OutputFormat,
-    output_path: Option<PathBuf>,
-    eject_after: bool,
-    rip_running: bool,
-    rip_progress: Option<Arc<Mutex<RipProgress>>>,
-    convert_running: bool,
-    convert_progress: Option<Arc<Mutex<ConvertProgress>>>,
-    browse_view: OpticalDiscBrowseView,
     chd_cd_control: ChdOptionsControl,
-    /// Track source changes for auto-detection
-    prev_drive_idx: Option<usize>,
-    prev_image_path: Option<PathBuf>,
-    /// CHD info popup text. `Some` while the popup is open.
-    chd_info_text: Option<String>,
-    /// In-app CD-DA player (Optical tab only). Loaded when the selected source
-    /// is a local CHD / BIN-CUE image with audio tracks.
-    #[cfg(feature = "audio")]
-    audio: super::optical_audio::OpticalAudioPlayer,
+    /// The "Add remote daemon" address field.
+    add_remote_addr: String,
+    /// This tab drives the shared progress bar.
+    showing_bar: bool,
 }
 
 impl Default for OpticalTab {
     fn default() -> Self {
+        let mut chd = ChdOptionsControl::new(ChdProfile::Cd);
+        chd.custom = OpticalController::saved_chd_custom(chd.custom.clone());
         Self {
-            source_mode: SourceMode::ImageFile,
-            rip_devices: Vec::new(),
-            drives_job: None,
-            selected_drive_idx: None,
-            remote_daemons: Vec::new(),
-            add_remote_open: false,
-            add_remote_addr: String::new(),
-            add_remote_error: None,
-            add_remote_status: None,
-            recent_daemons: UpdateConfig::load().recent_daemon_addrs,
+            ctl: OpticalController::new(std::sync::Arc::new(super::ui_logger::EguiWake)),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
             recent_files: super::load_recent(rusty_backup::update::RecentMode::Optical),
-            image_file_path: None,
-            disc_info: None,
-            detect_job: None,
-            disc_info_error: None,
-            action: Action::Rip,
-            output_format: OutputFormat::Iso,
-            output_path: None,
-            eject_after: false,
-            rip_running: false,
-            rip_progress: None,
-            convert_running: false,
-            convert_progress: None,
-            browse_view: OpticalDiscBrowseView::default(),
-            chd_cd_control: {
-                let mut ctl = ChdOptionsControl::new(ChdProfile::Cd);
-                // Restore last-used CD codec/hunk choice. CD codecs ("cdlz"
-                // etc.) are distinct from HD codecs, so the persisted value
-                // only round-trips safely for the matching profile.
-                let cfg = UpdateConfig::load();
-                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
-                    if let Ok(codecs) = parse_codec_string(spec) {
-                        if codecs
-                            .iter()
-                            .all(|c| codec_label(*c).starts_with("cd") || *c == 0)
-                        {
-                            ctl.custom.codecs = codecs;
-                        }
-                    }
-                }
-                if let Some(hs) = cfg.last_chd_hunk_size {
-                    if hs % 2448 == 0 {
-                        ctl.custom.hunk_size = hs;
-                    }
-                }
-                ctl
-            },
-            prev_drive_idx: None,
-            prev_image_path: None,
-            chd_info_text: None,
-            #[cfg(feature = "audio")]
-            audio: super::optical_audio::OpticalAudioPlayer::default(),
+            chd_cd_control: chd,
+            add_remote_addr: String::new(),
+            showing_bar: false,
         }
     }
 }
 
 impl OpticalTab {
-    fn persist_chd_options(&self, opts: &ChdOptions) {
-        let mut cfg = UpdateConfig::load();
-        cfg.last_chd_codecs = Some(
-            opts.codecs
-                .iter()
-                .map(|c| codec_label(*c))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        cfg.last_chd_hunk_size = Some(opts.hunk_size);
-        let _ = cfg.save();
+    fn act(&mut self, action: OpticalAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
     }
 
-    /// Enumerate drives now; start-up only, when no daemon is attached yet.
-    pub fn refresh_drives(&mut self) {
-        self.rip_devices = list_rip_devices(&self.remote_daemons);
+    /// Scan the drives at start-up; the count reaches the log when the scan ends.
+    pub fn find_drives(&mut self) {
+        self.act(OpticalAction::FindDrives);
     }
 
-    /// Re-scan drives off the UI thread; attached daemons answer over the network.
-    fn refresh_drives_async(&mut self, log_count: bool) {
-        if self.drives_job.is_some() {
-            return;
-        }
-        let remotes = self.remote_daemons.clone();
-        let job = rusty_backup::model::job::Job::spawn(
-            "Looking for optical drives...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                Ok(list_rip_devices(&remotes))
-            },
-        );
-        self.drives_job = Some((job, log_count));
-    }
-
-    fn poll_drives_job(&mut self, log: &mut LogStore) {
-        let Some((job, _)) = &self.drives_job else {
-            return;
-        };
-        if job.is_running() {
-            return;
-        }
-        let found = job.take_result();
-        let Some((_, log_count)) = self.drives_job.take() else {
-            return;
-        };
-        if let Some(devices) = found {
-            self.rip_devices = devices;
-            if log_count {
-                log.info(format!(
-                    "Refreshed: {} optical drive(s) found",
-                    self.rip_devices.len()
-                ));
-            }
-        }
-    }
-
-    pub fn drive_count(&self) -> usize {
-        self.rip_devices.len()
-    }
-
-    /// True while a disc's contents are being browsed. The drag-and-drop router
-    /// checks this so dropping a file mid-browse doesn't clobber the open disc.
+    /// True while a disc's contents are browsed, so a drop does not replace the open disc.
     pub fn is_browsing(&self) -> bool {
-        self.browse_view.is_active()
+        self.ctl.browse().is_active()
     }
 
-    /// Open `path` as the image-file source (used by the drag-and-drop router
-    /// when the Optical tab is active). Sets the source mode to Image file and
-    /// points at the dropped path; `show()` auto-detects the disc on the next
-    /// frame via the `image_file_path != prev_image_path` check.
-    pub fn open_image(&mut self, path: PathBuf) {
-        self.source_mode = SourceMode::ImageFile;
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Optical, &path);
-        self.image_file_path = Some(path);
+    /// Open `path` as the image-file source (a drop, or Inspect's hand-off).
+    pub fn open_image(&mut self, path: std::path::PathBuf) {
+        self.act(OpticalAction::OpenImage(path));
     }
 
-    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
-    /// the persisted lists; the mirror otherwise only reloads at construction).
+    /// Drop the recent-files mirror after Settings cleared the persisted list.
     pub(crate) fn clear_recent_files(&mut self) {
         self.recent_files.clear();
     }
 
-    /// Poll the background "Add remote daemon" connect; on success add the
-    /// daemon and refresh the unified drive list.
-    fn poll_add_remote(&mut self, log: &mut LogStore) {
-        let Some(status) = &self.add_remote_status else {
-            return;
-        };
-        let finished = status.lock().map(|s| s.done).unwrap_or(false);
-        if !finished {
-            return;
-        }
-        let result = self
-            .add_remote_status
-            .take()
-            .and_then(|s| s.lock().ok().and_then(|mut s| s.result.take()));
-        match result {
-            Some(Ok(conn)) => {
-                let label = conn
-                    .lock()
-                    .map(|c| c.addr().to_string())
-                    .unwrap_or_default();
-                self.remember_daemon_addr(&label);
-                self.remote_daemons.push(conn);
-                self.refresh_drives_async(false);
-                self.add_remote_open = false;
-                self.add_remote_addr.clear();
-                self.add_remote_error = None;
-                log.info(format!("Connected to remote daemon {label}"));
+    pub fn is_running(&self) -> bool {
+        self.ctl.is_running()
+    }
+
+    /// Drain the jobs while another tab is showing, so a run keeps reporting.
+    pub fn poll_background(&mut self, log: &mut LogStore, progress: &mut ProgressState) {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        self.mirror(log, progress);
+    }
+
+    fn mirror(&mut self, log: &mut LogStore, progress: &mut ProgressState) {
+        super::progress::drain_log_lines(self.ctl.take_log(), log);
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(path) => {
+                    self.recent_files =
+                        super::push_recent(rusty_backup::update::RecentMode::Optical, &path);
+                }
             }
-            Some(Err(e)) => {
-                self.add_remote_error = Some(e);
+        }
+        match self.ctl.progress() {
+            Some(bar) => {
+                progress.active = true;
+                progress.operation = bar.operation;
+                progress.current_bytes = bar.current_bytes;
+                progress.total_bytes = bar.total_bytes;
+                progress.full_size_bytes = 0;
+                progress.record_sample();
+                self.showing_bar = true;
+            }
+            None if self.showing_bar => {
+                progress.active = false;
+                self.showing_bar = false;
             }
             None => {}
         }
     }
 
-    /// Record a successfully-connected daemon address in the MRU list (in-memory
-    /// + persisted to `config.json`), newest first.
-    fn remember_daemon_addr(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if addr.is_empty() {
-            return;
-        }
-        self.recent_daemons.retain(|a| a != addr);
-        self.recent_daemons.insert(0, addr.to_string());
-        self.recent_daemons.truncate(8);
-        let mut cfg = UpdateConfig::load();
-        cfg.remember_daemon(addr);
-        let _ = cfg.save();
-    }
-
-    /// Spawn the connect for the address in the dialog on a worker thread.
-    fn start_add_remote(&mut self) {
-        let addr = self.add_remote_addr.trim().to_string();
-        if addr.is_empty() {
-            self.add_remote_error = Some("Enter a host:port".to_string());
-            return;
-        }
-        self.add_remote_error = None;
-        let status = Arc::new(Mutex::new(ConnectStatus::default()));
-        self.add_remote_status = Some(Arc::clone(&status));
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&status),
-            "remote connect",
-            move || {
-                let result = RemoteConnection::connect_shared(&addr).map_err(|e| format!("{e:#}"));
-                if let Ok(mut s) = status.lock() {
-                    s.result = Some(result);
-                    s.done = true;
-                }
-                Ok(())
-            },
-        );
-    }
-
-    /// The "Add remote daemon" modal: a host:port field that connects on a
-    /// worker thread (see [`Self::start_add_remote`] / [`Self::poll_add_remote`]).
-    fn show_add_remote_dialog(&mut self, ctx: &egui::Context) {
-        if !self.add_remote_open {
-            return;
-        }
-        let connecting = self.add_remote_status.is_some();
-        let mut open = self.add_remote_open;
-        egui::Window::new("Add remote daemon")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Daemon address (host:port):");
-                let resp = ui.add_enabled(
-                    !connecting,
-                    egui::TextEdit::singleline(&mut self.add_remote_addr)
-                        .hint_text("mister.local:7341"),
-                );
-                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!connecting, egui::Button::new("Connect"))
-                        .clicked()
-                        || (submit && !connecting)
-                    {
-                        self.start_add_remote();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.add_remote_open = false;
-                        self.add_remote_status = None;
-                        self.add_remote_error = None;
-                    }
-                });
-                if connecting {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Connecting...");
-                    });
-                }
-                if let Some(err) = &self.add_remote_error {
-                    ui.colored_label(super::theme::danger(ui.visuals()), err);
-                }
-
-                if !self.recent_daemons.is_empty() {
-                    ui.separator();
-                    ui.label("Recent:");
-                    // Clone to avoid borrowing `self` while the click handler
-                    // calls `&mut self` methods.
-                    let recents = self.recent_daemons.clone();
-                    for addr in recents {
-                        if ui
-                            .add_enabled(!connecting, egui::Button::new(&addr).small())
-                            .clicked()
-                        {
-                            self.add_remote_addr = addr.clone();
-                            self.start_add_remote();
-                        }
-                    }
-                }
-            });
-        // Honor the window's [x] close button.
-        if !open {
-            self.add_remote_open = false;
-        }
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.rip_running || self.convert_running
-    }
-
-    /// Drain the workers while another tab is showing, so a job keeps
-    /// reporting and its completion is not missed after a tab switch.
-    pub fn poll_background(&mut self, log: &mut LogStore, progress: &mut ProgressState) {
-        self.poll_progress(log, progress);
-        self.poll_add_remote(log);
-        self.poll_drives_job(log);
-        self.poll_detect_job(log);
+    fn chd_choice(&self) -> Option<ChdChoice> {
+        (self.ctl.output_format() == OutputFormat::Chd).then(|| ChdChoice {
+            options: self.chd_cd_control.effective(ChdProfile::Cd),
+            custom: self.chd_cd_control.mode == ChdOptionsMode::Custom,
+        })
     }
 
     pub fn show(
@@ -401,10 +124,11 @@ impl OpticalTab {
         progress: &mut ProgressState,
         busy_elsewhere: Option<&'static str>,
     ) {
-        self.poll_progress(log, progress);
-        self.poll_add_remote(log);
-        self.poll_drives_job(log);
-        self.show_add_remote_dialog(ui.ctx());
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        self.mirror(log, progress);
+        let mut actions = Vec::new();
+        self.show_add_remote_dialog(ui.ctx(), &mut actions);
 
         ui.heading("Optical Disc");
         ui.add_space(8.0);
@@ -415,238 +139,57 @@ impl OpticalTab {
                 super::context::busy_elsewhere_notice(tab),
             );
         }
-        let controls_enabled =
-            !self.rip_running && !self.convert_running && busy_elsewhere.is_none();
+        let controls_enabled = !self.ctl.is_running() && busy_elsewhere.is_none();
 
-        // ── Source selection ─────────────────────────────────────────────────
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Source:");
-                // Physical-drive ripping opens the drive with write access for
-                // SCSI pass-through, which needs administrator rights on Windows.
-                // Keep the option visible (so users know it exists) but gray it
-                // out until they elevate via the top-bar "Show Physical Devices"
-                // button. Image-file convert stays available unelevated.
-                // A local drive needs elevation (SCSI pass-through); a remote
-                // drive is opened by the daemon, so adding one also unlocks the
-                // mode.
-                let phys_enabled =
-                    super::physical_devices_available() || !self.remote_daemons.is_empty();
-                ui.add_enabled_ui(phys_enabled, |ui| {
-                    ui.radio_value(
-                        &mut self.source_mode,
-                        SourceMode::PhysicalDrive,
-                        "Physical drive",
-                    )
-                    .on_disabled_hover_text(
-                        "Click \"Show Physical Devices\" (top bar) for a local drive, \
-                         or \"Add remote daemon...\" for a networked one.",
-                    );
-                });
-                ui.radio_value(&mut self.source_mode, SourceMode::ImageFile, "Image file");
-                if ui.button("Add remote daemon...").clicked() {
-                    self.add_remote_open = true;
-                    self.add_remote_error = None;
-                }
-            });
+        ui.add_enabled_ui(controls_enabled, |ui| self.source_rows(ui, &mut actions));
 
-            match self.source_mode {
-                SourceMode::PhysicalDrive => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(60.0);
-
-                        let current_label = self
-                            .selected_drive_idx
-                            .and_then(|idx| self.rip_devices.get(idx))
-                            .map(|d| d.picker_label())
-                            .unwrap_or_else(|| "Select a drive...".into());
-
-                        egui::ComboBox::from_id_salt("optical_drive")
-                            .selected_text(&current_label)
-                            .width(360.0)
-                            .show_ui(ui, |ui| {
-                                for (i, drive) in self.rip_devices.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_drive_idx,
-                                        Some(i),
-                                        drive.picker_label(),
-                                    );
-                                }
-                            });
-
-                        if self.drives_job.is_some() {
-                            ui.spinner();
-                        } else if ui.button("Refresh").clicked() {
-                            self.refresh_drives_async(true);
-                        }
-
-                        // Eject the selected local drive. Remote drives are the
-                        // daemon's to control, and a drive with no disc has no
-                        // device path to act on.
-                        let ejectable = self
-                            .selected_drive_idx
-                            .and_then(|idx| self.rip_devices.get(idx))
-                            .filter(|d| !d.is_remote() && !d.device_path.is_empty())
-                            .map(|d| d.device_path.clone());
-                        ui.add_enabled_ui(ejectable.is_some(), |ui| {
-                            if ui
-                                .button("Eject")
-                                .on_disabled_hover_text(
-                                    "Select a local drive with a disc in it to eject.",
-                                )
-                                .clicked()
-                            {
-                                if let Some(path) = ejectable {
-                                    match rusty_backup::optical::source::eject_disc(
-                                        std::path::Path::new(&path),
-                                    ) {
-                                        Ok(()) => {
-                                            log.info(format!("Ejected {path}"));
-                                            // The disc is gone: drop anything
-                                            // still pointing at it, then re-scan
-                                            // so the drive shows as empty.
-                                            self.close_disc();
-                                            self.refresh_drives_async(false);
-                                        }
-                                        Err(e) => log.warn(format!("Eject failed: {e:#}")),
-                                    }
-                                }
-                            }
-                        });
-                    });
-                }
-                SourceMode::ImageFile => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(60.0);
-
-                        let path_text = self
-                            .image_file_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "No file selected".into());
-                        ui.label(&path_text);
-
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = super::file_dialog()
-                                .add_filter(
-                                    "Disc Images",
-                                    rusty_backup::model::file_types::OPTICAL_EXTS,
-                                )
-                                .add_filter("All Files", &["*"])
-                                .pick_file()
-                            {
-                                self.open_image(path);
-                            }
-                        }
-                        if let Some(path) =
-                            super::recent_combo(ui, "optical_recent", &self.recent_files, 5)
-                        {
-                            self.open_image(path);
-                        }
-                    });
-                }
-            }
-        });
-
-        // ── Auto-detect disc info on source change ──────────────────────────
-        if controls_enabled {
-            let source_changed = match self.source_mode {
-                SourceMode::PhysicalDrive => self.selected_drive_idx != self.prev_drive_idx,
-                SourceMode::ImageFile => self.image_file_path != self.prev_image_path,
-            };
-
-            if source_changed {
-                let was_browsing = self.browse_view.is_active();
-                self.browse_view.close();
-                self.prev_drive_idx = self.selected_drive_idx;
-                self.prev_image_path = self.image_file_path.clone();
-                self.detect_disc_info(was_browsing);
-                // Load CD-DA tracks for the in-app player. Only local CHD /
-                // BIN-CUE image files are supported; other sources clear it.
-                #[cfg(feature = "audio")]
-                match self.get_browsable_path() {
-                    Some(path) => self.audio.set_disc(&path),
-                    None => self.audio.clear(),
-                }
-            }
-        }
-
-        self.poll_detect_job(log);
-
-        // ── Disc info display ───────────────────────────────────────────────
         ui.add_space(4.0);
-        if let Some((job, _)) = &self.detect_job {
-            super::progress::show_job(ui, &job.snapshot());
+        if let Some(snap) = self.ctl.detecting() {
+            super::progress::show_job(ui, &snap);
         }
         ui.horizontal(|ui| {
             ui.label("Disc Info:");
-            if let Some(info) = &self.disc_info {
-                ui.label(format!("Format: {}", info.format.display_name()));
-                ui.label(format!("FS: {}", info.filesystem.display_name()));
-                if let Some(ref label) = info.volume_label {
+            if let Some(info) = self.ctl.disc() {
+                ui.label(format!("Format: {}", info.format));
+                ui.label(format!("FS: {}", info.filesystem));
+                if let Some(label) = &info.volume {
                     ui.label(format!("Volume: {label}"));
                 }
-                // Physical media only: the drive's reported capacity, so the
-                // user can see what a full rip will cost before starting one.
-                if let Some(bytes) = info.media_size_bytes {
-                    ui.label(format!(
-                        "Size: {} ({} sectors)",
-                        rusty_backup::optical::browse_view::format_size(bytes),
-                        bytes / 2048
-                    ));
+                // Physical media only: the drive's capacity, so a full rip's cost shows first.
+                if let Some(size) = &info.size {
+                    ui.label(format!("Size: {size}"));
                 }
                 if let Some(g) = &info.game {
-                    ui.label(format!(
-                        "Game: {}",
-                        rusty_backup::optical::format_game_identity(g)
-                    ));
+                    ui.label(format!("Game: {g}"));
                 }
-            } else if let Some(err) = &self.disc_info_error {
+            } else if let Some(err) = self.ctl.disc_error() {
                 ui.colored_label(super::theme::danger(ui.visuals()), err);
             } else {
                 ui.colored_label(super::theme::muted(ui.visuals()), "No source selected");
             }
         });
 
-        // Browse Contents / Close buttons
-        if self.disc_info.is_some() {
+        if self.ctl.disc().is_some() {
             ui.horizontal(|ui| {
                 ui.add_space(60.0);
-                if !self.browse_view.is_active() && ui.button("Browse Contents").clicked() {
-                    if let Some(path) = self.get_browsable_path() {
-                        self.open_browse(&path);
-                    }
+                if !self.ctl.browse().is_active() && ui.button("Browse Contents").clicked() {
+                    actions.push(OpticalAction::BrowseContents);
                 }
                 if ui.button("Close Disc").clicked() {
-                    self.close_disc();
+                    actions.push(OpticalAction::CloseDisc);
                 }
-                if let Some(path) = self.image_file_path.clone() {
-                    if path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("chd"))
-                        .unwrap_or(false)
-                        && ui.button("CHD Info").clicked()
-                    {
-                        match rusty_backup::rbformats::chd::format_chd_info(&path) {
-                            Ok(text) => self.chd_info_text = Some(text),
-                            Err(e) => {
-                                log.error(format!("CHD Info failed: {}", e));
-                            }
-                        }
-                    }
+                if self.ctl.can_chd_info() && ui.button("CHD Info").clicked() {
+                    actions.push(OpticalAction::ChdInfo);
                 }
             });
         }
 
-        // In-app CD-DA player (no-op unless the disc has audio tracks).
         #[cfg(feature = "audio")]
-        self.audio.ui(ui);
+        super::optical_audio::show(ui, &self.ctl, &mut actions);
 
-        // CHD Info popup
-        if let Some(text) = self.chd_info_text.clone() {
+        if let Some(text) = self.ctl.chd_info() {
             let mut open = true;
-            let mut buf = text;
+            let mut buf = text.to_string();
             egui::Window::new("CHD Info")
                 .open(&mut open)
                 .resizable(true)
@@ -665,734 +208,273 @@ impl OpticalTab {
                         });
                 });
             if !open {
-                self.chd_info_text = None;
+                actions.push(OpticalAction::CloseChdInfo);
             }
         }
 
         ui.separator();
 
-        // ── Action selection ────────────────────────────────────────────────
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Action:");
-
-                let can_rip = self.source_mode == SourceMode::PhysicalDrive;
-                let can_convert = self.source_mode == SourceMode::ImageFile;
-
-                if can_rip {
-                    ui.radio_value(&mut self.action, Action::Rip, "Rip to disk");
-                }
-                if can_convert {
-                    ui.radio_value(&mut self.action, Action::Convert, "Convert format");
-                }
-
-                // Auto-select valid action when source mode changes
-                if !can_rip && self.action == Action::Rip {
-                    self.action = Action::Convert;
-                }
-                if !can_convert && self.action == Action::Convert {
-                    self.action = Action::Rip;
-                }
-            });
-
-            // ── Output format ───────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label("Output:");
-
-                let available_formats = match self.action {
-                    Action::Rip => vec![
-                        (OutputFormat::Iso, "ISO", true),
-                        (OutputFormat::BinCue, "BIN/CUE", true),
-                        (OutputFormat::Chd, "CHD", true),
-                    ],
-                    Action::Convert => {
-                        let source_format = self.disc_info.as_ref().map(|i| &i.format);
-                        vec![
-                            (
-                                OutputFormat::Iso,
-                                "ISO",
-                                source_format != Some(&DiscFormat::Iso),
-                            ),
-                            (
-                                OutputFormat::BinCue,
-                                "BIN/CUE",
-                                source_format != Some(&DiscFormat::BinCue),
-                            ),
-                            (
-                                OutputFormat::Chd,
-                                "CHD",
-                                source_format != Some(&DiscFormat::Chd),
-                            ),
-                        ]
-                    }
-                };
-
-                for (fmt, label, enabled) in &available_formats {
-                    let response = ui.add_enabled(
-                        *enabled,
-                        egui::RadioButton::new(self.output_format == *fmt, *label),
-                    );
-                    if response.clicked() {
-                        self.output_format = *fmt;
-                    }
-                }
-            });
-
-            // CHD codec / hunk-size knobs (only when CHD output is selected)
-            if self.output_format == OutputFormat::Chd {
-                super::chd_options_ui::show(
-                    ui,
-                    "optical_chd",
-                    ChdProfile::Cd,
-                    &mut self.chd_cd_control,
-                );
-            }
-
-            // ── Output path ─────────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.add_space(60.0);
-
-                let path_text = self
-                    .output_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No output path selected".into());
-                ui.label(&path_text);
-
-                if ui.button("Browse...").clicked() {
-                    let ext = match self.output_format {
-                        OutputFormat::Iso => "iso",
-                        OutputFormat::BinCue => "cue",
-                        OutputFormat::Chd => "chd",
-                    };
-                    if let Some(path) = super::file_dialog()
-                        .add_filter("Output", &[ext])
-                        .set_file_name(self.default_output_name())
-                        .save_file()
-                    {
-                        self.output_path = Some(path);
-                    }
-                }
-            });
-
-            // ── Eject checkbox (rip only) ───────────────────────────────────
-            if self.action == Action::Rip {
-                ui.horizontal(|ui| {
-                    ui.add_space(60.0);
-                    ui.checkbox(&mut self.eject_after, "Eject after ripping")
-                        .on_hover_text(
-                            "Ejects the source drive on its own machine - the \
-                             remote daemon's drive for a remote source.",
-                        );
-                });
-            }
-        });
+        ui.add_enabled_ui(controls_enabled, |ui| self.output_rows(ui, &mut actions));
 
         ui.add_space(8.0);
 
-        // ── Start / Cancel buttons ──────────────────────────────────────────
         ui.horizontal(|ui| {
-            if !self.is_running() {
-                let can_start = self.output_path.is_some() && self.has_valid_source();
-
-                let btn_label = match self.action {
-                    Action::Rip => "Start Rip",
-                    Action::Convert => "Start Convert",
+            if !self.ctl.is_running() {
+                let label = match self.ctl.task() {
+                    Task::Rip => "Start Rip",
+                    Task::Convert => "Start Convert",
                 };
-
                 if ui
-                    .add_enabled(can_start, egui::Button::new(btn_label))
+                    .add_enabled(self.ctl.can_start(), egui::Button::new(label))
                     .clicked()
                 {
-                    match self.action {
-                        Action::Rip => self.start_rip(log),
-                        Action::Convert => self.start_convert(log),
-                    }
+                    actions.push(OpticalAction::Start(self.chd_choice()));
                 }
             } else if ui.button("Cancel").clicked() {
-                if let Some(ref p) = self.rip_progress {
-                    if let Ok(mut progress) = p.lock() {
-                        progress.cancel_requested = true;
-                    }
-                }
-                if let Some(ref p) = self.convert_progress {
-                    if let Ok(mut progress) = p.lock() {
-                        progress.cancel_requested = true;
-                    }
-                }
-                log.warn("Cancellation requested...");
+                actions.push(OpticalAction::Cancel);
             }
         });
 
         ui.separator();
 
-        // ── Browse view ─────────────────────────────────────────────────────
-        self.browse_view.show(ui);
-    }
+        super::optical_browse_view::show(ui, self.ctl.browse(), &mut actions);
 
-    fn has_valid_source(&self) -> bool {
-        match self.source_mode {
-            SourceMode::PhysicalDrive => self
-                .selected_drive_idx
-                .and_then(|idx| self.rip_devices.get(idx))
-                .is_some(),
-            SourceMode::ImageFile => self.image_file_path.is_some(),
+        for a in actions {
+            self.act(a);
         }
+        self.run_effects(ui.ctx(), log);
+        self.mirror(log, progress);
     }
 
-    /// The path the browse view / disc-info detector opens. Only local sources
-    /// are browsable — a remote drive is rip-only here (browsing a remote disc
-    /// is the remote Inspect tab's job), so it yields `None`.
-    fn get_browsable_path(&self) -> Option<PathBuf> {
-        match self.source_mode {
-            SourceMode::ImageFile => self.image_file_path.clone(),
-            SourceMode::PhysicalDrive => self
-                .selected_drive_idx
-                .and_then(|idx| self.rip_devices.get(idx))
-                .filter(|d| !d.is_remote())
-                .map(|d| PathBuf::from(&d.device_path)),
-        }
-    }
-
-    /// Open the browse view against the current source, picking the
-    /// device-backed reader for a physical drive (see
-    /// [`OpticalDiscBrowseView::open_physical`]).
-    fn open_browse(&mut self, path: &Path) {
-        if self.source_mode == SourceMode::PhysicalDrive {
-            self.browse_view.open_physical(path);
-        } else {
-            self.browse_view.open(path);
-        }
-    }
-
-    fn close_disc(&mut self) {
-        self.browse_view.close();
-        self.disc_info = None;
-        self.disc_info_error = None;
-        self.image_file_path = None;
-        self.selected_drive_idx = None;
-        self.prev_drive_idx = None;
-        self.prev_image_path = None;
-        #[cfg(feature = "audio")]
-        self.audio.clear();
-    }
-
-    /// Detect the disc as a job (reading a drive can take seconds); `reopen_browse` reopens the browse view after.
-    fn detect_disc_info(&mut self, reopen_browse: bool) {
-        self.disc_info = None;
-        self.disc_info_error = None;
-        self.detect_job = None;
-
-        let path = match self.get_browsable_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // A drive is not a file: `open_physical` reads the raw node as flat cooked sectors,
-        // since the buffered /dev/diskN node is EBUSY on macOS while the disc is mounted.
-        let physical = matches!(self.source_mode, SourceMode::PhysicalDrive);
-        let job = rusty_backup::model::job::Job::spawn(
-            "Detecting the disc...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                let probe = if physical {
-                    DiscImageInfo::open_physical(&path)
-                } else {
-                    DiscImageInfo::open(&path)
-                };
-                Ok(probe.map_err(|e| e.to_string()))
-            },
-        );
-        self.detect_job = Some((job, reopen_browse));
-    }
-
-    fn poll_detect_job(&mut self, log: &mut LogStore) {
-        use rusty_backup::model::job::Status;
-        let Some((job, _)) = &self.detect_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        let Some((_, reopen_browse)) = self.detect_job.take() else {
-            return;
-        };
-        let probe = match (snap.status, out) {
-            (Status::Done, Some(probe)) => probe,
-            (Status::Failed(e), _) => Err(e),
-            _ => return,
-        };
-        match probe {
-            Ok(info) => {
-                log.info(format!(
-                    "Detected disc: {} / {} {}",
-                    info.format.display_name(),
-                    info.filesystem.display_name(),
-                    info.volume_label.as_deref().unwrap_or(""),
-                ));
-                if let Some(g) = &info.game {
-                    log.info(format!(
-                        "Game disc: {}",
-                        rusty_backup::optical::format_game_identity(g)
-                    ));
+    fn source_rows(&mut self, ui: &mut egui::Ui, actions: &mut Vec<OpticalAction>) {
+        ui.horizontal(|ui| {
+            ui.label("Source:");
+            // A local drive needs elevation (SCSI pass-through); a remote drive is the daemon's to open.
+            let phys_enabled = super::physical_devices_available() || self.ctl.has_remote_daemons();
+            let mode = self.ctl.source_mode();
+            ui.add_enabled_ui(phys_enabled, |ui| {
+                if ui
+                    .radio(mode == SourceMode::PhysicalDrive, "Physical drive")
+                    .on_disabled_hover_text(
+                        "Click \"Show Physical Devices\" (top bar) for a local drive, \
+                         or \"Add remote daemon...\" for a networked one.",
+                    )
+                    .clicked()
+                {
+                    actions.push(OpticalAction::SetSourceMode(SourceMode::PhysicalDrive));
                 }
-                self.disc_info = Some(info);
-                if reopen_browse {
-                    if let Some(path) = self.get_browsable_path() {
-                        self.open_browse(&path);
-                    }
-                }
+            });
+            if ui
+                .radio(mode == SourceMode::ImageFile, "Image file")
+                .clicked()
+            {
+                actions.push(OpticalAction::SetSourceMode(SourceMode::ImageFile));
             }
-            Err(e) => {
-                let msg = format!("Failed to detect disc info: {e}");
-                log.warn(&msg);
-                self.disc_info_error = Some(msg);
+            if ui.button("Add remote daemon...").clicked() {
+                actions.push(OpticalAction::OpenAddRemote);
             }
-        }
-    }
-
-    fn default_output_name(&self) -> String {
-        let stem = if let Some(ref path) = self.image_file_path {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("disc")
-                .to_string()
-        } else if let Some(ref label) = self.disc_info.as_ref().and_then(|i| i.volume_label.clone())
-        {
-            label.clone()
-        } else {
-            "disc".to_string()
-        };
-
-        let ext = match self.output_format {
-            OutputFormat::Iso => "iso",
-            OutputFormat::BinCue => "cue",
-            OutputFormat::Chd => "chd",
-        };
-
-        format!("{stem}.{ext}")
-    }
-
-    fn start_rip(&mut self, log: &mut LogStore) {
-        // Resolve the target up front (owned) so the &mut self calls below don't
-        // conflict with a borrow of `rip_devices`.
-        let target = match self
-            .selected_drive_idx
-            .and_then(|idx| self.rip_devices.get(idx))
-        {
-            Some(d) => d.to_target(),
-            None => {
-                log.error("No drive selected");
-                return;
-            }
-        };
-
-        let output_path = match &self.output_path {
-            Some(p) => p.clone(),
-            None => {
-                log.error("No output path selected");
-                return;
-            }
-        };
-
-        // CHD rip: rip to temp BIN/CUE, then convert to CHD
-        if self.output_format == OutputFormat::Chd {
-            self.start_rip_to_chd(target, output_path, log);
-            return;
-        }
-
-        let format = match self.output_format {
-            OutputFormat::Iso => RipFormat::Iso,
-            OutputFormat::BinCue => RipFormat::BinCue,
-            OutputFormat::Chd => unreachable!(),
-        };
-
-        let config = RipConfig {
-            device: target,
-            output_path,
-            format,
-            eject_after: self.eject_after,
-        };
-
-        log.info(format!(
-            "Starting rip: {} -> {}",
-            config.device.display(),
-            config.output_path.display()
-        ));
-
-        let progress_arc = Arc::new(Mutex::new(RipProgress::new()));
-        self.rip_progress = Some(Arc::clone(&progress_arc));
-        self.rip_running = true;
-
-        rusty_backup::model::worker::spawn_guarded(Arc::clone(&progress_arc), "rip", move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip");
-            if let Err(e) = rusty_backup::optical::run_rip(config, Arc::clone(&progress_arc)) {
-                if let Ok(mut p) = progress_arc.lock() {
-                    p.error = Some(format!("{e:#}"));
-                    p.finished = true;
-                }
-            }
-            Ok(())
         });
-    }
 
-    /// Rip to CHD: rip to temporary BIN/CUE, convert to CHD, clean up temps.
-    fn start_rip_to_chd(&mut self, target: OpticalTarget, chd_path: PathBuf, log: &mut LogStore) {
-        let eject_after = self.eject_after;
-        if self.chd_cd_control.mode == ChdOptionsMode::Custom {
-            self.persist_chd_options(&self.chd_cd_control.custom);
-        }
-        let chd_options = self.chd_cd_control.effective(ChdProfile::Cd);
-
-        log.info(format!(
-            "Starting rip to CHD: {} -> {}",
-            target.display(),
-            chd_path.display()
-        ));
-
-        let progress_arc = Arc::new(Mutex::new(ConvertProgress::new()));
-        self.convert_progress = Some(Arc::clone(&progress_arc));
-        self.convert_running = true;
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "rip to CHD",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip to CHD");
-                let result =
-                    rip_to_chd_worker(target, &chd_path, eject_after, chd_options, &progress_arc);
-                if let Err(e) = result {
-                    if let Ok(mut p) = progress_arc.lock() {
-                        if !p.finished {
-                            p.error = Some(format!("{e:#}"));
-                            p.finished = true;
+        match self.ctl.source_mode() {
+            SourceMode::PhysicalDrive => {
+                ui.horizontal(|ui| {
+                    ui.add_space(60.0);
+                    let labels = self.ctl.drive_labels();
+                    let selected = self.ctl.selected_drive();
+                    let current = selected
+                        .and_then(|i| labels.get(i).cloned())
+                        .unwrap_or_else(|| "Select a drive...".into());
+                    egui::ComboBox::from_id_salt("optical_drive")
+                        .selected_text(&current)
+                        .width(360.0)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in labels.iter().enumerate() {
+                                if ui.selectable_label(selected == Some(i), label).clicked() {
+                                    actions.push(OpticalAction::SelectDrive(Some(i)));
+                                }
+                            }
+                        });
+                    if self.ctl.scanning_drives() {
+                        ui.spinner();
+                    } else if ui.button("Refresh").clicked() {
+                        actions.push(OpticalAction::RefreshDrives);
+                    }
+                    // Remote drives are the daemon's to eject; an empty drive has no device path.
+                    ui.add_enabled_ui(self.ctl.can_eject(), |ui| {
+                        if ui
+                            .button("Eject")
+                            .on_disabled_hover_text(
+                                "Select a local drive with a disc in it to eject.",
+                            )
+                            .clicked()
+                        {
+                            actions.push(OpticalAction::Eject);
                         }
-                    }
-                }
-                Ok(())
-            },
-        );
-    }
-
-    fn start_convert(&mut self, log: &mut LogStore) {
-        let input_path = match &self.image_file_path {
-            Some(p) => p.clone(),
-            None => {
-                log.error("No input file selected");
-                return;
+                    });
+                });
             }
-        };
-
-        let output_path = match &self.output_path {
-            Some(p) => p.clone(),
-            None => {
-                log.error("No output path selected");
-                return;
-            }
-        };
-
-        let source_format = self.disc_info.as_ref().map(|i| i.format);
-
-        log.info(format!(
-            "Starting conversion: {} -> {}",
-            input_path.display(),
-            output_path.display()
-        ));
-
-        let progress_arc = Arc::new(Mutex::new(ConvertProgress::new()));
-        self.convert_progress = Some(Arc::clone(&progress_arc));
-        self.convert_running = true;
-
-        let output_format = self.output_format;
-        let chd_options = if output_format == OutputFormat::Chd {
-            if self.chd_cd_control.mode == ChdOptionsMode::Custom {
-                self.persist_chd_options(&self.chd_cd_control.custom);
-            }
-            Some(self.chd_cd_control.effective(ChdProfile::Cd))
-        } else {
-            None
-        };
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "convert",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical convert");
-                let result = run_conversion(
-                    &input_path,
-                    &output_path,
-                    source_format,
-                    output_format,
-                    chd_options,
-                    Arc::clone(&progress_arc),
-                );
-
-                if let Err(e) = result {
-                    if let Ok(mut p) = progress_arc.lock() {
-                        if !p.finished {
-                            p.error = Some(format!("{e:#}"));
-                            p.finished = true;
-                        }
+            SourceMode::ImageFile => {
+                ui.horizontal(|ui| {
+                    ui.add_space(60.0);
+                    let path_text = self
+                        .ctl
+                        .image()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "No file selected".into());
+                    ui.label(&path_text);
+                    if ui.button("Browse...").clicked() {
+                        actions.push(OpticalAction::PickImage);
                     }
-                }
-                Ok(())
-            },
-        );
-    }
-
-    fn poll_progress(&mut self, log: &mut LogStore, progress_state: &mut ProgressState) {
-        // Poll rip progress
-        if let Some(progress_arc) = self.rip_progress.clone() {
-            let mut finished = false;
-            if let Ok(mut p) = progress_arc.lock() {
-                while let Some(msg) = p.log_messages.pop_front() {
-                    match msg.level {
-                        BackupLogLevel::Info => log.info(msg.message),
-                        BackupLogLevel::Warning => log.warn(msg.message),
-                        BackupLogLevel::Error => log.error(msg.message),
+                    if let Some(path) =
+                        super::recent_combo(ui, "optical_recent", &self.recent_files, 5)
+                    {
+                        actions.push(OpticalAction::OpenImage(path));
                     }
-                }
-
-                progress_state.active = !p.finished;
-                progress_state.operation = p.operation.clone();
-                progress_state.current_bytes = p.current_bytes;
-                progress_state.total_bytes = p.total_bytes;
-                progress_state.record_sample();
-
-                if p.finished {
-                    if let Some(err) = &p.error {
-                        log.error(format!("Rip failed: {err}"));
-                    } else {
-                        log.info("Rip completed successfully");
-                    }
-                    finished = true;
-                }
-            }
-            if finished {
-                self.rip_running = false;
-                self.rip_progress = None;
-            }
-        }
-
-        // Poll convert progress
-        if let Some(progress_arc) = self.convert_progress.clone() {
-            let mut finished = false;
-            if let Ok(mut p) = progress_arc.lock() {
-                while let Some(msg) = p.log_messages.pop_front() {
-                    match msg.level {
-                        BackupLogLevel::Info => log.info(msg.message),
-                        BackupLogLevel::Warning => log.warn(msg.message),
-                        BackupLogLevel::Error => log.error(msg.message),
-                    }
-                }
-
-                progress_state.active = !p.finished;
-                progress_state.operation = p.operation.clone();
-                progress_state.current_bytes = p.current_bytes;
-                progress_state.total_bytes = p.total_bytes;
-                progress_state.record_sample();
-
-                if p.finished {
-                    if let Some(err) = &p.error {
-                        log.error(format!("Conversion failed: {err}"));
-                    } else {
-                        log.info("Conversion completed successfully");
-                    }
-                    finished = true;
-                }
-            }
-            if finished {
-                self.convert_running = false;
-                self.convert_progress = None;
+                });
             }
         }
     }
-}
 
-/// Dispatch to the correct conversion function based on source and output formats.
-fn run_conversion(
-    input_path: &std::path::Path,
-    output_path: &std::path::Path,
-    source_format: Option<DiscFormat>,
-    output_format: OutputFormat,
-    chd_options: Option<ChdOptions>,
-    progress: Arc<Mutex<ConvertProgress>>,
-) -> anyhow::Result<()> {
-    use rusty_backup::optical::convert;
+    fn output_rows(&mut self, ui: &mut egui::Ui, actions: &mut Vec<OpticalAction>) {
+        ui.horizontal(|ui| {
+            ui.label("Action:");
+            match self.ctl.task() {
+                Task::Rip => {
+                    let _ = ui.radio(true, "Rip to disk");
+                }
+                Task::Convert => {
+                    let _ = ui.radio(true, "Convert format");
+                }
+            }
+        });
 
-    match (source_format, output_format) {
-        (Some(DiscFormat::Iso), OutputFormat::BinCue) => {
-            let bin_path = output_path.with_extension("bin");
-            convert::iso_to_bincue(input_path, &bin_path, output_path, progress)
-        }
-        (Some(DiscFormat::BinCue), OutputFormat::Iso) => {
-            // input_path might be .cue or .bin — resolve to .cue
-            let cue_path = if input_path
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("bin"))
-                .unwrap_or(false)
-            {
-                input_path.with_extension("cue")
-            } else {
-                input_path.to_path_buf()
-            };
-            convert::bincue_to_iso(&cue_path, output_path, progress)
-        }
-        (Some(DiscFormat::Iso), OutputFormat::Chd)
-        | (Some(DiscFormat::BinCue), OutputFormat::Chd) => {
-            let cue_input = if source_format == Some(DiscFormat::BinCue)
-                && input_path
-                    .extension()
-                    .map(|e| e.eq_ignore_ascii_case("bin"))
-                    .unwrap_or(false)
-            {
-                input_path.with_extension("cue")
-            } else {
-                input_path.to_path_buf()
-            };
-            convert::to_chd(&cue_input, output_path, chd_options, progress)
-        }
-        (Some(DiscFormat::Chd), OutputFormat::BinCue) => {
-            convert::chd_to_bincue(input_path, output_path, progress)
-        }
-        (Some(DiscFormat::Chd), OutputFormat::Iso) => {
-            convert::chd_to_iso(input_path, output_path, progress)
-        }
-        _ => {
-            anyhow::bail!(
-                "Unsupported conversion: {:?} -> {:?}",
-                source_format,
-                output_format
+        ui.horizontal(|ui| {
+            ui.label("Output:");
+            let current = self.ctl.output_format();
+            for (fmt, enabled) in self.ctl.format_choices() {
+                let response =
+                    ui.add_enabled(enabled, egui::RadioButton::new(current == fmt, fmt.label()));
+                if response.clicked() {
+                    actions.push(OpticalAction::SetOutputFormat(fmt));
+                }
+            }
+        });
+
+        if self.ctl.output_format() == OutputFormat::Chd {
+            super::chd_options_ui::show(
+                ui,
+                "optical_chd",
+                ChdProfile::Cd,
+                &mut self.chd_cd_control,
             );
         }
-    }
-}
 
-/// The GUI's Cancel flag as a probe the model's relay can poll.
-fn cancel_probe(progress: &Arc<Mutex<ConvertProgress>>) -> impl Fn() -> bool + Send + 'static {
-    let from = Arc::clone(progress);
-    move || from.lock().map(|p| p.cancel_requested).unwrap_or(false)
-}
-
-/// Background worker: rip disc (local or remote) to temp BIN/CUE, convert to
-/// CHD locally, clean up. The encode always runs here on the desktop.
-fn rip_to_chd_worker(
-    target: OpticalTarget,
-    chd_path: &std::path::Path,
-    eject_after: bool,
-    chd_options: ChdOptions,
-    progress: &Arc<Mutex<ConvertProgress>>,
-) -> anyhow::Result<()> {
-    use rusty_backup::backup::LogLevel;
-    use rusty_backup::optical::{convert, rip};
-
-    // Step 1: Rip to temporary BIN/CUE next to the output CHD
-    let parent = chd_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let temp_cue = parent.join(".rusty-backup-rip-temp.cue");
-    let temp_bin = parent.join(".rusty-backup-rip-temp.bin");
-
-    let rip_config = RipConfig {
-        device: target,
-        output_path: temp_cue.clone(),
-        format: RipFormat::BinCue,
-        eject_after,
-    };
-
-    if let Ok(mut p) = progress.lock() {
-        p.operation = "Ripping to temporary BIN/CUE...".into();
-    }
-
-    // Use a separate RipProgress and drain its messages into our ConvertProgress.
-    // The GUI's Cancel lands on `progress`, so forward it to the rip's own flag.
-    let rip_progress = Arc::new(Mutex::new(rip::RipProgress::new()));
-    let rip_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let forwarder = rusty_backup::model::worker::forward_cancel(
-        cancel_probe(progress),
-        Arc::clone(&rip_done),
-        {
-            let to = Arc::clone(&rip_progress);
-            move || {
-                if let Ok(mut r) = to.lock() {
-                    r.cancel_requested = true;
-                }
+        ui.horizontal(|ui| {
+            ui.add_space(60.0);
+            let path_text = self
+                .ctl
+                .output()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No output path selected".into());
+            ui.label(&path_text);
+            if ui.button("Browse...").clicked() {
+                actions.push(OpticalAction::PickOutput);
             }
-        },
-    );
-    let rip_result = rip::run_rip(rip_config, Arc::clone(&rip_progress));
-    rip_done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = forwarder.join();
-    rip_result?;
-
-    // Drain rip log messages
-    if let Ok(mut rp) = rip_progress.lock() {
-        while let Some(msg) = rp.log_messages.pop_front() {
-            if let Ok(mut p) = progress.lock() {
-                p.log_messages.push_back(msg);
-            }
-        }
-    }
-
-    // Step 2: Convert temp BIN/CUE to CHD
-    if let Ok(mut p) = progress.lock() {
-        p.log_messages.push_back(rusty_backup::backup::LogMessage {
-            level: LogLevel::Info,
-            message: "Rip complete, converting to CHD...".into(),
         });
-    }
 
-    let convert_progress = Arc::new(Mutex::new(ConvertProgress::new()));
-    let convert_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let forwarder = rusty_backup::model::worker::forward_cancel(
-        cancel_probe(progress),
-        Arc::clone(&convert_done),
-        {
-            let to = Arc::clone(&convert_progress);
-            move || {
-                if let Ok(mut c) = to.lock() {
-                    c.cancel_requested = true;
+        if self.ctl.task() == Task::Rip {
+            ui.horizontal(|ui| {
+                ui.add_space(60.0);
+                let mut eject = self.ctl.eject_after();
+                if ui
+                    .checkbox(&mut eject, "Eject after ripping")
+                    .on_hover_text(
+                        "Ejects the source drive on its own machine - the \
+                         remote daemon's drive for a remote source.",
+                    )
+                    .changed()
+                {
+                    actions.push(OpticalAction::SetEjectAfter(eject));
                 }
-            }
-        },
-    );
-    let convert_result = convert::to_chd(
-        &temp_cue,
-        chd_path,
-        Some(chd_options),
-        Arc::clone(&convert_progress),
-    );
-    convert_done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = forwarder.join();
-
-    // Drain convert log messages
-    if let Ok(mut cp) = convert_progress.lock() {
-        while let Some(msg) = cp.log_messages.pop_front() {
-            if let Ok(mut p) = progress.lock() {
-                p.log_messages.push_back(msg);
-            }
+            });
         }
     }
 
-    // Clean up temp files regardless of result
-    let _ = std::fs::remove_file(&temp_cue);
-    let _ = std::fs::remove_file(&temp_bin);
-
-    convert_result?;
-
-    if let Ok(mut p) = progress.lock() {
-        p.finished = true;
+    /// The "Add remote daemon" window: an address field, Connect / Cancel and the recent addresses.
+    fn show_add_remote_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<OpticalAction>) {
+        if !self.ctl.add_remote_open() {
+            self.add_remote_addr.clear();
+            return;
+        }
+        let connecting = self.ctl.remote_connecting().is_some();
+        let mut open = true;
+        egui::Window::new("Add remote daemon")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Daemon address (host:port):");
+                let resp = ui.add_enabled(
+                    !connecting,
+                    egui::TextEdit::singleline(&mut self.add_remote_addr)
+                        .hint_text("mister.local:7341"),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!connecting, egui::Button::new("Connect"))
+                        .clicked()
+                        || (submit && !connecting)
+                    {
+                        actions.push(OpticalAction::ConnectRemote(self.add_remote_addr.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        actions.push(OpticalAction::CloseAddRemote);
+                    }
+                });
+                if connecting {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Connecting...");
+                    });
+                }
+                if let Some(err) = self.ctl.add_remote_error() {
+                    ui.colored_label(super::theme::danger(ui.visuals()), err);
+                }
+                if !self.ctl.recent_daemons().is_empty() {
+                    ui.separator();
+                    ui.label("Recent:");
+                    for addr in self.ctl.recent_daemons() {
+                        if ui
+                            .add_enabled(!connecting, egui::Button::new(addr.as_str()).small())
+                            .clicked()
+                        {
+                            self.add_remote_addr = addr.clone();
+                            actions.push(OpticalAction::ConnectRemote(addr.clone()));
+                        }
+                    }
+                }
+            });
+        if !open {
+            actions.push(OpticalAction::CloseAddRemote);
+        }
     }
 
-    Ok(())
-}
-
-impl rusty_backup::model::worker::WorkerStatus for ConnectStatus {
-    fn fail(&mut self, message: String) {
-        self.result = Some(Err(message));
-        self.done = true;
+    fn run_effects(&mut self, ctx: &egui::Context, log: &mut LogStore) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ctx, fx, &mut messages);
+        replies.extend(self.effects.show(ctx, "Optical"));
+        for msg in messages {
+            log.info(msg);
+        }
+        for reply in replies {
+            match reply {
+                Reply::Picked { purpose, path } => {
+                    self.act(OpticalAction::Picked { purpose, path })
+                }
+                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
+            }
+        }
     }
 }
