@@ -20,7 +20,7 @@ use rusty_backup::rbformats::containers::{
     convert_floppy_container, floppy_kind_from_extension, ContainerKind,
 };
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 /// Backing status shared between the GUI thread and the worker.
 #[derive(Default)]

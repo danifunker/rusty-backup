@@ -13,7 +13,7 @@
 
 use rusty_backup::device::DiskDevice;
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 /// Bundle of references the App threads through every tab call.
 pub struct TabContext<'a> {

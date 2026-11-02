@@ -1,12 +1,12 @@
 //! egui's side of the app log: the [`Notify`] that wakes egui, and start-up wiring.
 //!
-//! The `log` sink and the log store live in `rusty_backup::vm::log`; this module
+//! The `log` sink and the log store live in `rusty_backup::controller::log`; this module
 //! only connects them to egui. See that module for why the wake is thread-gated.
 
 use std::sync::{Arc, OnceLock};
 
+use rusty_backup::controller::log::capture;
 use rusty_backup::model::job::Notify;
-use rusty_backup::vm::log::capture;
 
 /// The egui context, registered once the window exists.
 static REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();

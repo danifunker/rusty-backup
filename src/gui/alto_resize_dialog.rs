@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use fs_xerox::alto::bfs::Bfs;
 use fs_xerox::alto::{open_pack, pdi, write, FsFamily, Geometry};
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {

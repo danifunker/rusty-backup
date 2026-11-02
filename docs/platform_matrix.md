@@ -51,4 +51,4 @@ for wasm32) is a CI target too; the check script knows it.
 | AppKit, GTK4, Win32 | `frontends/{appkit,gtk4,win32}/` (not yet) | Phases 3-5 |
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 
-Every shell renders `src/vm` view-models only (`scripts/check-boundaries.sh`).
+Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`).

@@ -36,4 +36,4 @@ pub use disk_core::rust173 as rust173_compat;
 // `gui` / `tui-update`, so a plain-`tui` (e.g. vintage) build links no network.
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 pub mod update;
-pub mod vm;
+pub mod controller;

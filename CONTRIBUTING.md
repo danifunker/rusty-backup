@@ -73,7 +73,7 @@ it. `CLAUDE.md` points every agent here before it writes code.
 │             future native shells (AppKit / GTK4 / Win32, written in Rust)  │
 │             renders state, maps input to Actions, fulfils Effects          │
 ├───────────────────────────────────────────────────────────────────────────┤
-│ CONTROLLER  src/vm/  (one controller per task, screen or dialog)           │
+│ CONTROLLER  src/controller/  (one controller per task, screen or dialog)           │
 │             state machines, Actions in / Effects out, validation rules,    │
 │             key bindings, widget ids, job orchestration                    │
 ├───────────────────────────────────────────────────────────────────────────┤
@@ -98,7 +98,7 @@ toolkit.
 | Layer | Owns | Must not |
 |---|---|---|
 | **Model** | The truth: on-disk formats, filesystems, partition tables, containers, persistence (config, recent files), and domain operations (open, list, stage, apply, back up, restore). Pure functions and runners that report progress through callbacks or `model::job`. | Touch any UI toolkit, hold UI state (selection, cursor, which dialog is open), format text for display beyond plain data, or know a controller exists. |
-| **Controller** (`src/vm/`) | Everything the user is *doing*: what is open, selected, staged, running and failing; which dialog or prompt is up; what an input means (the key map); validation rules; the `Action` enum it accepts and the `Effect` enum it emits; stable widget ids; starting, polling and cancelling jobs. | Import a toolkit (egui, ratatui/crossterm, rfd, objc2, gtk, Win32 UI), spawn raw threads, draw, block on I/O on the caller's thread, or assume a particular view. |
+| **Controller** (`src/controller/`) | Everything the user is *doing*: what is open, selected, staged, running and failing; which dialog or prompt is up; what an input means (the key map); validation rules; the `Action` enum it accepts and the `Effect` enum it emits; stable widget ids; starting, polling and cancelling jobs. | Import a toolkit (egui, ratatui/crossterm, rfd, objc2, gtk, Win32 UI), spawn raw threads, draw, block on I/O on the caller's thread, or assume a particular view. |
 | **View** | Presentation only: layout, colours, fonts, scrolling, focus, animation. Turns raw input into controller `Action`s (through the controller's key map), draws from the controller's read accessors, and fulfils `Effect`s (file pickers, prompts, confirmations, clipboard). | Contain domain logic or business rules, import `model`/engine/crate types directly (the controller re-exports the plain data it hands out), spawn threads, decide what a key does, or keep state the controller should own. |
 
 **The litmus test** for any piece of logic: *could a second view need it?* If
@@ -112,8 +112,8 @@ never copy it sideways.
 |---|---|
 | A format, filesystem, partition-table or container rule | a `crates/*` crate (or `src/fs`, `src/partition`, ... until it moves) |
 | A domain operation with progress (open, list, stage, apply, back up) | `src/model/` runner or function, run as a `model::job` |
-| "What happens when the user does X" (state, sequencing, enablement, validation) | the task's controller in `src/vm/` |
-| A key binding or shortcut | the controller key map (`src/vm/keys.rs`), never a view |
+| "What happens when the user does X" (state, sequencing, enablement, validation) | the task's controller in `src/controller/` |
+| A key binding or shortcut | the controller key map (`src/controller/keys.rs`), never a view |
 | Layout, widget state, scroll position, colours | the view |
 
 ### Rust and the front end
@@ -132,7 +132,7 @@ never copy it sideways.
 
 ### Controllers: the contract
 
-- A controller implements `vm::ViewModel`: `apply(Action) -> Vec<Effect>` for
+- A controller implements `controller::Controller`: `apply(Action) -> Vec<Effect>` for
   user intents and `tick() -> Vec<Effect>` to drain finished jobs. Views read
   state through plain accessors.
 - **`Action` and `Effect` enums are exhaustive.** Views `match` them with no `_`
@@ -165,7 +165,7 @@ never copy it sideways.
 
 ### Key bindings
 
-- Every shortcut is **data**: one table in `src/vm/keys.rs` of
+- Every shortcut is **data**: one table in `src/controller/keys.rs` of
   (key, modifiers) -> action, per controller. Views translate their native key
   events into the table's key type and look the action up; no view hard-codes
   what a key does.
@@ -225,7 +225,7 @@ never copy it sideways.
 ### Regression
 
 - **Every change** runs the tests for what it touched: unit tests in the same
-  file, controller tests (`#[cfg(test)]` in `src/vm`, and the scenarios in
+  file, controller tests (`#[cfg(test)]` in `src/controller`, and the scenarios in
   `tests/ui_scenarios/`), the matching `rb-regress run --filter` cases, and, when
   it changes how a filesystem is written, the emulator scenario where the real
   operating system judges it (`regression-tests/emulator/`).
@@ -241,7 +241,7 @@ never copy it sideways.
 ### Enforcement
 
 - `scripts/check-boundaries.sh` (CI job `boundaries`) fails on toolkit code or
-  raw threads in `src/vm` and on raw threads in views, and counts views'
+  raw threads in `src/controller` and on raw threads in views, and counts views'
   direct references to the model and engine. That count only goes down; a path
   that reaches zero is switched to enforcing.
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile

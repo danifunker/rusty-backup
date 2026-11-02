@@ -1,15 +1,15 @@
 use egui::RichText;
-use rusty_backup::vm::app::AppVm;
-use rusty_backup::vm::log::LogLevel;
-use rusty_backup::vm::ViewModel;
+use rusty_backup::controller::app::AppController;
+use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::Controller;
 
 // The rate/ETA estimator lives in the (non-GUI) model layer so the CLI shares
 // it; re-exported here for the tabs that refer to `progress::RateTracker`.
 pub use rusty_backup::model::rate_tracker::RateTracker;
 
 /// Draw the log panel at the bottom of the window from the app view-model.
-pub fn show_log(ui: &mut egui::Ui, app: &mut AppVm) {
-    use rusty_backup::vm::app::AppAction;
+pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
+    use rusty_backup::controller::app::AppAction;
     let mut actions = Vec::new();
     ui.horizontal(|ui| {
         ui.label(RichText::new("Log").strong());

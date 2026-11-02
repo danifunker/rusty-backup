@@ -1,28 +1,29 @@
-//! View-models: one per screen or dialog, rendered by every shell (`docs/native_frontends_plan.md` §4.2).
+//! Controllers: one per task, screen or dialog, shared by every view (CONTRIBUTING.md § Architecture policy (MVC)).
 //!
-//! A shell (egui today; the TUI and native shells later) owns a view-model,
+//! A view (egui, the TUI, the CLI, and native shells later) owns a controller,
 //! sends it user intents as `Action`s, draws from its read accessors, and
-//! carries out the [`Effect`]s it returns (file pickers, confirmations, the
-//! clipboard), replying with another `Action` where the effect has an answer.
-//! Slow work goes through [`crate::model::job`], so a shell can only show a
+//! carries out the [`Effect`]s it returns (file pickers, prompts, confirmations,
+//! the clipboard), replying with another `Action` where the effect has an answer.
+//! Slow work goes through [`crate::model::job`], so a view can only show a
 //! wait state through a job snapshot.
 //!
 //! Rules:
 //! - Nothing toolkit-specific here: no egui, ratatui, rfd, AppKit, GTK or Win32.
 //!   `scripts/check-boundaries.sh` enforces it.
-//! - `Action` and [`Effect`] enums are exhaustive and shells `match` them with no
-//!   `_` arm, so a new variant fails to compile in every shell that ignores it.
+//! - `Action` and [`Effect`] enums are exhaustive and views `match` them with no
+//!   `_` arm, so a new variant fails to compile in every view that ignores it.
 //! - Every actionable element has a stable widget id (the `ids` modules), which
-//!   each shell sets as its accessibility identifier for UI tests.
+//!   each view sets as its accessibility identifier for UI tests.
+//! - Shortcuts are data in [`keys`], never hard-coded in a view.
 //! - Rust 1.73 and mrustc compile this, like the engine.
-//! - Tier A tests replay `tests/ui_scenarios/*.toml` against view-models (`tests/ui_scenarios.rs`).
+//! - Tier A tests replay `tests/ui_scenarios/*.toml` against controllers (`tests/ui_scenarios.rs`).
 
 pub mod app;
 pub mod commander;
 pub mod log;
 
-/// The shape every view-model shares.
-pub trait ViewModel {
+/// The shape every controller shares.
+pub trait Controller {
     /// User intents, such as `OpenSource(path)`, `StartBackup` or `Cancel`.
     type Action;
 

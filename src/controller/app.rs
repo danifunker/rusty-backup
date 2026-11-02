@@ -1,4 +1,4 @@
-//! `AppVm`: app-wide state every screen shares (`docs/native_frontends_plan.md` §4.2).
+//! `AppController`: app-wide state every screen shares (`docs/native_frontends_plan.md` §4.2).
 //!
 //! Holds the log, the job registry, the shell's wake handle, and (in builds
 //! with the `update` module) the recent-files history persisted in
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::log::{capture, LogStore};
-use super::{Effect, ViewModel};
+use super::{Controller, Effect};
 use crate::model::job::{JobRegistry, NoNotify, Notify};
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -25,7 +25,7 @@ pub enum AppAction {
     SetLogAutoScroll(bool),
 }
 
-pub struct AppVm {
+pub struct AppController {
     pub log: LogStore,
     log_auto_scroll: bool,
     jobs: JobRegistry,
@@ -34,10 +34,10 @@ pub struct AppVm {
     config: Box<dyn ConfigStore>,
 }
 
-impl AppVm {
+impl AppController {
     /// An app view-model waking the shell through `notify` and persisting to the user's config.json.
     pub fn new(notify: Arc<dyn Notify>) -> Self {
-        AppVm {
+        AppController {
             log: LogStore::default(),
             log_auto_scroll: true,
             jobs: JobRegistry::new(),
@@ -49,7 +49,7 @@ impl AppVm {
 
     /// For tests: no wake, and config kept in memory.
     pub fn headless() -> Self {
-        AppVm {
+        AppController {
             log: LogStore::default(),
             log_auto_scroll: true,
             jobs: JobRegistry::new(),
@@ -73,7 +73,7 @@ impl AppVm {
     }
 }
 
-impl ViewModel for AppVm {
+impl Controller for AppController {
     type Action = AppAction;
 
     fn apply(&mut self, action: AppAction) -> Vec<Effect> {
@@ -101,10 +101,10 @@ pub use recent::{ConfigStore, MemoryConfig, UserConfig};
 
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 mod recent {
-    use super::AppVm;
+    use super::AppController;
     use crate::update::{RecentMode, UpdateConfig};
 
-    /// Where `AppVm` loads and saves config.json; swapped for memory in tests.
+    /// Where `AppController` loads and saves config.json; swapped for memory in tests.
     pub trait ConfigStore: Send {
         fn load(&self) -> UpdateConfig;
         fn save(&mut self, config: &UpdateConfig);
@@ -139,7 +139,7 @@ mod recent {
         }
     }
 
-    impl AppVm {
+    impl AppController {
         /// The recent-files list for `mode`, newest first.
         pub fn recent(&self, mode: RecentMode) -> Vec<String> {
             self.config.load().recent_files.list(mode).to_vec()
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn copy_log_asks_the_shell_to_copy_every_line() {
-        let mut app = AppVm::headless();
+        let mut app = AppController::headless();
         app.log.info("one");
         app.log.warn("two");
         let effects = app.apply(AppAction::CopyLog);
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn clear_log_and_auto_scroll() {
-        let mut app = AppVm::headless();
+        let mut app = AppController::headless();
         app.log.info("one");
         assert!(app.apply(AppAction::ClearLog).is_empty());
         assert!(app.log.entries().is_empty());
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn recent_files_are_newest_first_and_per_mode() {
         use crate::update::RecentMode;
-        let mut app = AppVm::headless();
+        let mut app = AppController::headless();
         app.remember(RecentMode::Inspect, "/a.img");
         app.remember(RecentMode::Inspect, "/b.img");
         let list = app.remember(RecentMode::Inspect, "/a.img");

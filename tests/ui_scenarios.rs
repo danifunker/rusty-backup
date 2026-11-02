@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use toml::Value;
 
+use rusty_backup::controller::app::{AppAction, AppController};
+use rusty_backup::controller::{Controller, Effect};
 use rusty_backup::model::job::{Job, JobCtx, Status};
-use rusty_backup::vm::app::{AppAction, AppVm};
-use rusty_backup::vm::{Effect, ViewModel};
 
 #[derive(Debug, Deserialize)]
 struct Scenario {
@@ -64,10 +64,10 @@ fn arg_str(arg: Option<&Value>) -> Result<&str, String> {
         .ok_or_else(|| "this action needs a string `arg`".to_string())
 }
 
-/// `AppVm`. Actions: `CopyLog`, `ClearLog`, `SetLogAutoScroll` (bool arg), and the
+/// `AppController`. Actions: `CopyLog`, `ClearLog`, `SetLogAutoScroll` (bool arg), and the
 /// test-only `LogInfo` / `LogWarn` / `LogError` (string arg). Probes: `log_lines`,
 /// `log_text`, `log_auto_scroll`, `jobs_running`.
-impl Target for AppVm {
+impl Target for AppController {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
         let a = match action {
             "CopyLog" => AppAction::CopyLog,
@@ -88,7 +88,7 @@ impl Target for AppVm {
                 self.log.error(arg_str(arg)?);
                 return Ok(Vec::new());
             }
-            other => return Err(format!("AppVm has no action {other:?}")),
+            other => return Err(format!("AppController has no action {other:?}")),
         };
         Ok(self.apply(a))
     }
@@ -99,7 +99,7 @@ impl Target for AppVm {
             "log_text" => Value::String(self.log.to_text()),
             "log_auto_scroll" => Value::Boolean(self.log_auto_scroll()),
             "jobs_running" => Value::Integer(self.jobs().running().len() as i64),
-            other => return Err(format!("AppVm has no probe {other:?}")),
+            other => return Err(format!("AppController has no probe {other:?}")),
         })
     }
 
@@ -114,12 +114,12 @@ impl Target for AppVm {
 /// A test-only view-model over one job, for the job lifecycle scenarios.
 /// Actions: `Start` (arg: `ok`, `error`, `panic` or `wait_for_cancel`), `Cancel`.
 /// Probes: `status` (`idle`, `running`, `done`, `failed`, `cancelled`), `error`, `result`.
-struct JobProbeVm {
-    app: AppVm,
+struct JobProbeController {
+    app: AppController,
     job: Option<Job<String>>,
 }
 
-impl Target for JobProbeVm {
+impl Target for JobProbeController {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
         match action {
             "Start" => {
@@ -149,7 +149,7 @@ impl Target for JobProbeVm {
                 self.job.as_ref().ok_or("no job to cancel")?.cancel();
                 Ok(Vec::new())
             }
-            other => Err(format!("JobProbeVm has no action {other:?}")),
+            other => Err(format!("JobProbeController has no action {other:?}")),
         }
     }
 
@@ -176,7 +176,7 @@ impl Target for JobProbeVm {
                     .and_then(|j| j.take_result())
                     .unwrap_or_default(),
             ),
-            other => return Err(format!("JobProbeVm has no probe {other:?}")),
+            other => return Err(format!("JobProbeController has no probe {other:?}")),
         })
     }
 
@@ -190,9 +190,9 @@ impl Target for JobProbeVm {
 
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
-        "app" => Ok(Box::new(AppVm::headless())),
-        "job_probe" => Ok(Box::new(JobProbeVm {
-            app: AppVm::headless(),
+        "app" => Ok(Box::new(AppController::headless())),
+        "job_probe" => Ok(Box::new(JobProbeController {
+            app: AppController::headless(),
             job: None,
         })),
         other => Err(format!("unknown vm {other:?}")),

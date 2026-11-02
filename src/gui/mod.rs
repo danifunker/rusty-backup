@@ -41,10 +41,10 @@ use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
 use progress::ProgressState;
 use restore_tab::RestoreTab;
+use rusty_backup::controller::app::AppController;
+use rusty_backup::controller::log::LogStore;
+use rusty_backup::controller::{Controller, Effect};
 use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
-use rusty_backup::vm::app::AppVm;
-use rusty_backup::vm::log::LogStore;
-use rusty_backup::vm::{Effect, ViewModel};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
@@ -337,7 +337,7 @@ pub struct RustyBackupApp {
     optical_tab: OpticalTab,
     archives_tab: ArchivesTab,
     /// App-wide view-model: the log, the job registry and recent files.
-    app: AppVm,
+    app: AppController,
     /// A Refresh Devices scan in flight.
     devices_job: Option<rusty_backup::model::job::Job<Vec<DiskDevice>>>,
     progress: ProgressState,
@@ -438,7 +438,7 @@ impl Default for RustyBackupApp {
             archives_tab: ArchivesTab::default(),
             devices_job: None,
             app: {
-                let mut app = AppVm::new(Arc::new(ui_logger::EguiWake));
+                let mut app = AppController::new(Arc::new(ui_logger::EguiWake));
                 app.log = log;
                 app
             },

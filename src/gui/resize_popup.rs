@@ -9,7 +9,7 @@ use rusty_backup::model::status::ResizeStatus;
 use rusty_backup::partition::resize::{apply_resize, compute_resize_plan, detect_vhd};
 use rusty_backup::partition::{PartitionInfo, PartitionTable};
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 /// Per-partition entry in the resize grid.
 struct ResizeEntry {

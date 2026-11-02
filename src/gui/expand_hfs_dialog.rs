@@ -21,7 +21,7 @@ use rusty_backup::model::status::ExpandStatus;
 /// HFV's 2047 MB ceiling expressed in whole MiB, for slider clamping.
 const HFV_MAX_MIB: u32 = (HFV_MAX_BYTES / (1024 * 1024)) as u32;
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 pub use rusty_backup::model::hfs_expand_runner::summarize_source;
 

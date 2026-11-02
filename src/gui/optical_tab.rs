@@ -18,7 +18,7 @@ use rusty_backup::update::UpdateConfig;
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
 
 use super::progress::ProgressState;
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SourceMode {

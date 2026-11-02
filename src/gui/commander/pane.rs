@@ -51,10 +51,10 @@ use rusty_backup::model::wrapper_tree::{tree_range, TreeRow};
 use rusty_backup::partition::PartitionInfo;
 use rusty_backup::update::RecentMode;
 
-use rusty_backup::vm::commander::rows::{
+use rusty_backup::controller::commander::rows::{
     is_mac_archive_path, partition_label, remote_parent_dir, DisplayRow, RowKind,
 };
-use rusty_backup::vm::commander::CommanderPaneVm;
+use rusty_backup::controller::commander::CommanderPaneController;
 
 use super::Side;
 
@@ -168,7 +168,7 @@ struct RowActions {
 
 pub(crate) struct CommanderPane {
     /// Listing, staged edits and wrapper tree, shared with every shell.
-    vm: CommanderPaneVm,
+    ctl: CommanderPaneController,
     side: Side,
     /// Loaded source path (image / container). `None` until the user opens one.
     source: Option<PathBuf>,
@@ -348,7 +348,7 @@ impl CommanderPane {
     /// The rows to draw, from the view-model; a remote-host pane never expands wrappers.
     fn display_rows(&mut self) -> Vec<DisplayRow> {
         let remote_host = self.is_remote_host();
-        self.vm.display_rows(remote_host)
+        self.ctl.display_rows(remote_host)
     }
 
     pub(crate) fn new(side: Side) -> Self {
@@ -358,7 +358,7 @@ impl CommanderPane {
             partitions: Vec::new(),
             resolved_backup: None,
             selected_part: None,
-            vm: CommanderPaneVm::new(),
+            ctl: CommanderPaneController::new(),
             session: None,
             pending_open: None,
             pending_apply: None,
@@ -401,19 +401,19 @@ impl CommanderPane {
     /// `session` all switch to the wrapper context so the existing copy
     /// dispatch pulls files straight out.
     fn tree_active(&self) -> bool {
-        !self.vm.tree_selected.is_empty()
+        !self.ctl.tree_selected.is_empty()
     }
 
     /// The mount key and selected entries for the active tree selection, all
     /// sharing the first selected row's mount (a selection can't span mounts).
     fn tree_selection(&self) -> Option<(String, Vec<FileEntry>)> {
-        let first = self.vm.tree_selected.first()?;
-        let mount = self.vm.tree_index.get(first)?.mount.clone();
+        let first = self.ctl.tree_selected.first()?;
+        let mount = self.ctl.tree_index.get(first)?.mount.clone();
         let entries = self
-            .vm
+            .ctl
             .tree_selected
             .iter()
-            .filter_map(|id| self.vm.tree_index.get(id))
+            .filter_map(|id| self.ctl.tree_index.get(id))
             .filter(|r| r.mount == mount)
             .map(|r| r.entry.clone())
             .collect();
@@ -422,7 +422,7 @@ impl CommanderPane {
 
     /// Clear the tree selection (e.g. when the base listing is clicked).
     fn clear_tree_selection(&mut self) {
-        self.vm.tree_selected.clear();
+        self.ctl.tree_selected.clear();
     }
 
     /// Drop this pane's in-memory recent-files mirror (the Settings dialog
@@ -444,22 +444,22 @@ impl CommanderPane {
         expanded: bool,
     ) -> Option<String> {
         if expanded {
-            self.vm.wrapper_tree.collapse(node_id);
+            self.ctl.wrapper_tree.collapse(node_id);
             // Drop any selection that was inside the collapsed subtree.
-            self.vm.tree_selected.retain(|id| !id.starts_with(node_id));
+            self.ctl.tree_selected.retain(|id| !id.starts_with(node_id));
             return None;
         }
         if is_tree {
             if is_wrapper {
                 // Nested wrapper: read its bytes out of the enclosing mount.
-                let row = self.vm.tree_index.get(node_id)?.clone();
+                let row = self.ctl.tree_index.get(node_id)?.clone();
                 let kind = classify_entry(&row.entry)?;
-                let source = match self.vm.wrapper_tree.read_wrapper_source(&row) {
+                let source = match self.ctl.wrapper_tree.read_wrapper_source(&row) {
                     Ok(s) => s,
                     Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
                 };
                 if let Err(e) = self
-                    .vm
+                    .ctl
                     .wrapper_tree
                     .expand_wrapper(node_id, name, kind, source)
                 {
@@ -467,7 +467,7 @@ impl CommanderPane {
                 }
             } else {
                 // Plain folder inside a mount — just reveal its children.
-                self.vm.wrapper_tree.expand_folder(node_id);
+                self.ctl.wrapper_tree.expand_folder(node_id);
             }
         } else {
             // Base wrapper: open it off the UI thread with a spinner —
@@ -480,7 +480,7 @@ impl CommanderPane {
                 ));
             }
             let entry = self
-                .vm
+                .ctl
                 .listing
                 .entries()
                 .iter()
@@ -492,7 +492,7 @@ impl CommanderPane {
             // whose sibling data file sits next to it. A wrapper inside an image
             // pane is extracted on the worker from a fresh reopen of the base
             // source; a non-reopenable base (rare) extracts synchronously here.
-            let plan = if self.vm.listing.is_host() {
+            let plan = if self.ctl.listing.is_host() {
                 WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
             } else if let Some(base) = self.base_stage_source() {
                 WrapperOpenPlan::Extract(Box::new(WrapperExtract {
@@ -500,7 +500,7 @@ impl CommanderPane {
                     entry: entry.clone(),
                 }))
             } else {
-                let Some(fs) = self.vm.listing.fs_mut() else {
+                let Some(fs) = self.ctl.listing.fs_mut() else {
                     return self.wrapper_open_failed(name, "source is not open".into());
                 };
                 let mut buf = Vec::new();
@@ -517,7 +517,7 @@ impl CommanderPane {
             return Some(format!("[{}] opening {name}...", self.side.label()));
         }
         let side = self.side.label();
-        self.vm
+        self.ctl
             .wrapper_tree
             .note(node_id)
             .map(|n| format!("[{side}] {name}: {n}"))
@@ -593,12 +593,12 @@ impl CommanderPane {
 
     /// Number of staged (unapplied) edits on this pane.
     pub(crate) fn staged_count(&self) -> usize {
-        self.vm.queue.len()
+        self.ctl.queue.len()
     }
 
     /// Discard all staged edits (used by the overlay's Close guard).
     pub(crate) fn discard_edits(&mut self) {
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
     }
 
     /// Render the pane. Returns status + any cross-pane request for the overlay.
@@ -606,11 +606,11 @@ impl CommanderPane {
         // Wrapper expansion is scoped to the current directory: any change of
         // base cwd (navigate / source / partition switch / close) collapses
         // every expanded wrapper and drops its mounts + tree selection.
-        let cwd_now = self.vm.listing.cwd_path().to_string();
-        if cwd_now != self.vm.last_cwd {
-            self.vm.last_cwd = cwd_now;
-            self.vm.wrapper_tree.clear();
-            self.vm.tree_selected.clear();
+        let cwd_now = self.ctl.listing.cwd_path().to_string();
+        if cwd_now != self.ctl.last_cwd {
+            self.ctl.last_cwd = cwd_now;
+            self.ctl.wrapper_tree.clear();
+            self.ctl.tree_selected.clear();
             // Abandon any wrapper open still in flight — its target row is gone.
             self.pending_wrapper = None;
         }
@@ -794,7 +794,7 @@ impl CommanderPane {
         } else if let Some(err) = &self.error {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
-        } else if self.vm.listing.is_loaded() {
+        } else if self.ctl.listing.is_loaded() {
             self.render_header(ui);
             let actions = self.render_rows(ui);
             if actions.status.is_some() {
@@ -811,14 +811,14 @@ impl CommanderPane {
             // "Close Image" returns there.
             if let Some(name) = actions.open_image {
                 let path = self
-                    .vm
+                    .ctl
                     .listing
                     .entries()
                     .iter()
                     .find(|e| e.name == name)
                     .map(|e| e.path.clone());
                 if let Some(path) = path {
-                    let opened_from = self.vm.listing.cwd_path().to_string();
+                    let opened_from = self.ctl.listing.cwd_path().to_string();
                     status = Some(self.spawn_open_image(path, None, opened_from));
                 }
             }
@@ -901,7 +901,7 @@ impl CommanderPane {
     /// Immediately remove `names` from the host folder, then re-list.
     fn delete_host_entries(&mut self, names: &[String]) -> String {
         let targets: Vec<FileEntry> = self
-            .vm
+            .ctl
             .listing
             .entries()
             .iter()
@@ -993,7 +993,7 @@ impl CommanderPane {
             // Validate against the filesystem's name rules (image panes only;
             // host names are validated by the OS at rename time).
             if let Some(Err(e)) = self
-                .vm
+                .ctl
                 .listing
                 .fs_mut()
                 .map(|fs| fs.validate_name(&new_name))
@@ -1013,7 +1013,7 @@ impl CommanderPane {
     /// (host pane), then refresh.
     fn perform_rename(&mut self, entry: FileEntry, new_name: String) -> String {
         let side = self.side.label();
-        if self.vm.listing.is_host() {
+        if self.ctl.listing.is_host() {
             let old_path = PathBuf::from(&entry.path);
             let new_path = old_path.with_file_name(&new_name);
             if new_path.exists() {
@@ -1029,12 +1029,12 @@ impl CommanderPane {
                 Err(e) => format!("[{side}] rename failed: {e}"),
             }
         } else {
-            let Some(cwd) = self.vm.listing.cwd().cloned() else {
+            let Some(cwd) = self.ctl.listing.cwd().cloned() else {
                 return format!("[{side}] no directory to rename in.");
             };
             // Replace any prior staged rename of the same entry.
-            self.vm.queue.remove_pending_rename(&entry.path);
-            self.vm.queue.push(StagedEdit::Rename {
+            self.ctl.queue.remove_pending_rename(&entry.path);
+            self.ctl.queue.push(StagedEdit::Rename {
                 parent: cwd,
                 entry,
                 new_name: new_name.clone(),
@@ -1093,17 +1093,17 @@ impl CommanderPane {
                 .trim()
                 .to_string();
             // Name validity (image panes; host names are validated by the OS).
-            if let Some(Err(e)) = self.vm.listing.fs_mut().map(|fs| fs.validate_name(&name)) {
+            if let Some(Err(e)) = self.ctl.listing.fs_mut().map(|fs| fs.validate_name(&name)) {
                 if let Some(d) = self.new_folder_dialog.as_mut() {
                     d.error = Some(format!("{e}"));
                 }
                 return None;
             }
             // Reject a name already present (on disk or staged here).
-            let cwd_path = self.vm.listing.cwd_path().to_string();
-            let dup = self.vm.listing.entries().iter().any(|e| e.name == name)
+            let cwd_path = self.ctl.listing.cwd_path().to_string();
+            let dup = self.ctl.listing.entries().iter().any(|e| e.name == name)
                 || self
-                    .vm
+                    .ctl
                     .queue
                     .pending_adds_for(&cwd_path)
                     .iter()
@@ -1124,8 +1124,8 @@ impl CommanderPane {
     /// staged `CreateDirectory` on an image pane.
     fn perform_new_folder(&mut self, name: String) -> String {
         let side = self.side.label();
-        if self.vm.listing.is_host() {
-            let dir = PathBuf::from(self.vm.listing.cwd_path()).join(&name);
+        if self.ctl.listing.is_host() {
+            let dir = PathBuf::from(self.ctl.listing.cwd_path()).join(&name);
             match std::fs::create_dir(&dir) {
                 Ok(()) => {
                     self.reload_listing();
@@ -1136,10 +1136,10 @@ impl CommanderPane {
                 Err(e) => format!("[{side}] create folder failed: {e}"),
             }
         } else {
-            let Some(cwd) = self.vm.listing.cwd().cloned() else {
+            let Some(cwd) = self.ctl.listing.cwd().cloned() else {
                 return format!("[{side}] no directory open.");
             };
-            self.vm.queue.push(StagedEdit::CreateDirectory {
+            self.ctl.queue.push(StagedEdit::CreateDirectory {
                 parent: cwd,
                 name: name.clone(),
                 qnx2_attrs: None,
@@ -1329,7 +1329,7 @@ impl CommanderPane {
         self.reset_optical();
         self.selected_part = None;
         self.session = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         self.error = None;
     }
 
@@ -1369,7 +1369,7 @@ impl CommanderPane {
                     addr: addr.clone(),
                     mode: mode.clone(),
                 });
-                self.vm
+                self.ctl
                     .listing
                     .load_root(target.fs, target.root, target.entries, false);
                 match mode {
@@ -1438,7 +1438,7 @@ impl CommanderPane {
     fn render_switch_guard(&mut self, ctx: &egui::Context) -> Option<String> {
         // Short-circuit when nothing is pending.
         self.pending_switch.as_ref()?;
-        let n = self.vm.queue.len();
+        let n = self.ctl.queue.len();
         let mut confirm = false;
         let mut cancel = false;
         egui::Window::new(format!("Discard staged edits? ({})", self.side.label()))
@@ -1484,7 +1484,7 @@ impl CommanderPane {
     /// an image destination takes a staged copy.) A read-only backup pane can
     /// never receive a copy.
     pub(crate) fn can_receive(&self) -> bool {
-        self.vm.listing.is_loaded()
+        self.ctl.listing.is_loaded()
             && self.pending_apply.is_none()
             && self.pending_preflight.is_none()
             && self.pending_open.is_none()
@@ -1505,8 +1505,8 @@ impl CommanderPane {
     /// image — both writable, subject to the daemon's read-only policy) are not
     /// read-only.
     pub(crate) fn is_read_only(&self) -> bool {
-        self.vm.listing.is_loaded()
-            && !self.vm.listing.is_host()
+        self.ctl.listing.is_loaded()
+            && !self.ctl.listing.is_host()
             && (self.archive_source || self.optical_source || self.resolved_backup.is_some())
     }
 
@@ -1526,7 +1526,7 @@ impl CommanderPane {
     /// When a wrapper selection is active the effective source is the mounted
     /// wrapper filesystem (not the host), so report `false`.
     pub(crate) fn is_host_pane(&self) -> bool {
-        !self.tree_active() && self.vm.listing.is_host()
+        !self.tree_active() && self.ctl.listing.is_host()
     }
 
     /// True when this pane lists a (read-only) backup folder's contents — native
@@ -1595,7 +1595,7 @@ impl CommanderPane {
         // active; reopen it from its recipe (None for archive mounts -> sync).
         if let Some((mount_key, _)) = self.tree_selection() {
             return self
-                .vm
+                .ctl
                 .wrapper_tree
                 .mount_reopen(&mount_key)
                 .map(commander_ops::StageSource::Reopen);
@@ -1656,7 +1656,7 @@ impl CommanderPane {
 
     /// Re-read the current directory listing (after an immediate host write).
     pub(crate) fn reload_listing(&mut self) {
-        let _ = self.vm.listing.reload();
+        let _ = self.ctl.listing.reload();
     }
 
     /// Delete this pane's current selection — the middle-column Delete acting on
@@ -1684,11 +1684,11 @@ impl CommanderPane {
                 self.side.label()
             );
         }
-        let names: Vec<String> = self.vm.listing.selection().to_vec();
+        let names: Vec<String> = self.ctl.listing.selection().to_vec();
         if names.is_empty() {
             return format!("[{}] nothing selected to delete.", self.side.label());
         }
-        if self.vm.listing.is_host() {
+        if self.ctl.listing.is_host() {
             self.pending_host_delete = Some(names);
             format!("[{}] confirm host delete...", self.side.label())
         } else {
@@ -1700,7 +1700,7 @@ impl CommanderPane {
 
     /// True when at least one row is selected (base listing or a wrapper).
     pub(crate) fn has_selection(&self) -> bool {
-        self.tree_active() || !self.vm.listing.selection().is_empty()
+        self.tree_active() || !self.ctl.listing.selection().is_empty()
     }
 
     /// The selected entries (owned clones) — from the active wrapper mount when
@@ -1709,7 +1709,7 @@ impl CommanderPane {
         if let Some((_, entries)) = self.tree_selection() {
             return entries;
         }
-        self.vm
+        self.ctl
             .listing
             .selected_entries()
             .into_iter()
@@ -1719,22 +1719,22 @@ impl CommanderPane {
 
     /// The current directory entry (copy destination parent).
     pub(crate) fn cwd_entry(&self) -> Option<FileEntry> {
-        self.vm.listing.cwd().cloned()
+        self.ctl.listing.cwd().cloned()
     }
 
     /// Mutable access to the open filesystem (to extract files for a copy).
     /// Returns the active wrapper mount when a tree selection is live.
     pub(crate) fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
         if let Some((mount, _)) = self.tree_selection() {
-            return self.vm.wrapper_tree.mount_fs(&mount);
+            return self.ctl.wrapper_tree.mount_fs(&mount);
         }
-        self.vm.listing.fs_mut()
+        self.ctl.listing.fs_mut()
     }
 
     /// Mutable access to this pane's staged-edit queue (so the File Info window
     /// can stage metadata edits onto it).
     pub(crate) fn queue_mut(&mut self) -> &mut EditQueue {
-        &mut self.vm.queue
+        &mut self.ctl.queue
     }
 
     /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
@@ -1764,7 +1764,7 @@ impl CommanderPane {
             return Some((entry, data));
         }
         let entry = self
-            .vm
+            .ctl
             .listing
             .entries()
             .iter()
@@ -1773,10 +1773,10 @@ impl CommanderPane {
         if !entry.is_file() {
             return Some((entry, None));
         }
-        let data = if self.vm.listing.is_host() {
+        let data = if self.ctl.listing.is_host() {
             read_host_file_capped(&entry.path, max)
         } else {
-            self.vm
+            self.ctl
                 .listing
                 .fs_mut()
                 .and_then(|fs| fs.read_file(&entry, max).ok())
@@ -1805,7 +1805,7 @@ impl CommanderPane {
 
     pub(crate) fn detail_fs_type(&mut self) -> String {
         if let Some((mount, _)) = self.tree_selection() {
-            if let Some(fs) = self.vm.wrapper_tree.mount_fs(&mount) {
+            if let Some(fs) = self.ctl.wrapper_tree.mount_fs(&mount) {
                 return fs.fs_type().to_string();
             }
         }
@@ -1824,7 +1824,7 @@ impl CommanderPane {
     /// the switch behind the discard-confirmation, mirroring the source picker.
     pub(crate) fn open_dropped(&mut self, path: PathBuf) -> String {
         let is_dir = path.is_dir();
-        if !self.vm.queue.is_empty() {
+        if !self.ctl.queue.is_empty() {
             self.pending_switch = Some(if is_dir {
                 PendingSwitch::HostRoot(path)
             } else {
@@ -1844,16 +1844,16 @@ impl CommanderPane {
 
     /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
     pub(crate) fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
-        let queue_start = self.vm.queue.len();
-        let cwd_path = self.vm.listing.cwd_path().to_string();
+        let queue_start = self.ctl.queue.len();
+        let cwd_path = self.ctl.listing.cwd_path().to_string();
         let cwd_names: Vec<String> = self
-            .vm
+            .ctl
             .listing
             .entries()
             .iter()
             .map(|e| e.name.clone())
             .collect();
-        let queue = &self.vm.queue;
+        let queue = &self.ctl.queue;
         let mut existing = |path: &str| {
             let mut names: Vec<String> = queue
                 .pending_adds_for(path)
@@ -1866,7 +1866,7 @@ impl CommanderPane {
             names
         };
         // A remote image has no local fs here; the daemon reports bad names at apply.
-        let (report, fs_type) = match self.vm.listing.fs_mut() {
+        let (report, fs_type) = match self.ctl.listing.fs_mut() {
             Some(fs) => {
                 let fold = fs.case_insensitive_lookup();
                 let fs_type = fs.fs_type().to_string();
@@ -1880,7 +1880,7 @@ impl CommanderPane {
         };
         let staged = edits.len();
         for e in edits {
-            self.vm.queue.push(e);
+            self.ctl.queue.push(e);
         }
         StageOutcome {
             staged,
@@ -1897,7 +1897,7 @@ impl CommanderPane {
         if self.pending_apply.is_some() || self.pending_preflight.is_some() {
             return false;
         }
-        self.vm.queue.truncate(queue_start);
+        self.ctl.queue.truncate(queue_start);
         true
     }
 
@@ -1931,7 +1931,7 @@ impl CommanderPane {
                         format!("Remote {}: {base}{part}", r.addr)
                     }
                 }
-            } else if self.vm.listing.is_host() {
+            } else if self.ctl.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
                 match &self.source {
@@ -1970,8 +1970,8 @@ impl CommanderPane {
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
-                image_active: self.source.is_some() && !self.vm.listing.is_host() && !is_backup,
-                host_active: self.vm.listing.is_host(),
+                image_active: self.source.is_some() && !self.ctl.listing.is_host() && !is_backup,
+                host_active: self.ctl.listing.is_host(),
                 backup_active: is_backup,
                 devices: &[],
                 // Merged recent list (newest 3 per mode) shown as a group inside
@@ -1991,21 +1991,21 @@ impl CommanderPane {
                         status = Some(self.open_dropped(path));
                     }
                     SourceEvent::Image { path, .. } => {
-                        if self.vm.queue.is_empty() {
+                        if self.ctl.queue.is_empty() {
                             status = Some(self.load_source(path));
                         } else {
                             self.pending_switch = Some(PendingSwitch::Source(path));
                         }
                     }
                     SourceEvent::HostFolder(dir) => {
-                        if self.vm.queue.is_empty() {
+                        if self.ctl.queue.is_empty() {
                             status = Some(self.load_host(dir));
                         } else {
                             self.pending_switch = Some(PendingSwitch::HostRoot(dir));
                         }
                     }
                     SourceEvent::BackupFolder(folder) => {
-                        if self.vm.queue.is_empty() {
+                        if self.ctl.queue.is_empty() {
                             status = Some(self.load_backup_source(folder));
                         } else {
                             self.pending_switch = Some(PendingSwitch::Backup(folder));
@@ -2017,7 +2017,7 @@ impl CommanderPane {
                     // (connecting replaces the listing), so we hint instead of
                     // silently doing nothing.
                     SourceEvent::Remote => {
-                        if self.vm.queue.is_empty() {
+                        if self.ctl.queue.is_empty() {
                             self.connect_dialog = Some(ConnectDialog {
                                 host: self
                                     .remote
@@ -2050,7 +2050,7 @@ impl CommanderPane {
                     egui::RichText::new("Close Image").color(close_image_color(ui.visuals())),
                 );
                 if ui
-                    .add_enabled(self.vm.queue.is_empty(), btn)
+                    .add_enabled(self.ctl.queue.is_empty(), btn)
                     .on_hover_text("Back to browsing the remote host filesystem")
                     .clicked()
                 {
@@ -2061,13 +2061,13 @@ impl CommanderPane {
             }
 
             // Close (unload) this pane — guarded by unsaved staged edits.
-            if (self.source.is_some() || self.vm.listing.is_loaded())
+            if (self.source.is_some() || self.ctl.listing.is_loaded())
                 && ui
                     .button("Close")
                     .on_hover_text("Unload this pane / disconnect")
                     .clicked()
             {
-                if self.vm.queue.is_empty() {
+                if self.ctl.queue.is_empty() {
                     status = Some(self.close_source());
                 } else {
                     self.pending_switch = Some(PendingSwitch::Close);
@@ -2077,9 +2077,9 @@ impl CommanderPane {
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups / archives are
             // read-only).
-            if !self.vm.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source
+            if !self.ctl.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source
             {
-                let n = self.vm.queue.len();
+                let n = self.ctl.queue.len();
                 let busy = self.pending_apply.is_some()
                     || self.pending_preflight.is_some()
                     || self.pending_open.is_some()
@@ -2091,7 +2091,7 @@ impl CommanderPane {
                 });
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button("Discard").clicked() {
-                        self.vm.queue.clear();
+                        self.ctl.queue.clear();
                         status = Some(format!("[{}] discarded staged edits.", self.side.label()));
                     }
                 });
@@ -2109,13 +2109,13 @@ impl CommanderPane {
         // Row 2: partition switcher + New Folder + volume readout. Wrapped so on
         // a narrow pane the volume readout flows onto a second line instead of
         // overlapping the New Folder button.
-        if self.vm.listing.is_loaded() {
+        if self.ctl.listing.is_loaded() {
             ui.horizontal_wrapped(|ui| {
                 // Filesystem / partition dropdown (image panes only; host
                 // folders have none). An optical disc lists its filesystems
                 // (ISO 9660 + any hybrid Mac side); every other image lists its
                 // partition-table entries.
-                if !self.vm.listing.is_host() {
+                if !self.ctl.listing.is_host() {
                     // (label per index, empty-state text) for the active list.
                     let labels: Vec<String> = if self.optical_source {
                         self.optical_choices
@@ -2155,7 +2155,7 @@ impl CommanderPane {
                             if self.optical_source {
                                 // Optical panes are read-only — no queue to guard.
                                 status = Some(self.open_optical_choice(i));
-                            } else if self.vm.queue.is_empty() {
+                            } else if self.ctl.queue.is_empty() {
                                 status = Some(self.open_partition(i));
                             } else {
                                 self.pending_switch = Some(PendingSwitch::Partition(i));
@@ -2188,7 +2188,7 @@ impl CommanderPane {
                 // so on a narrow pane it wraps to a second line rather than
                 // overflowing left into the New Folder button.
                 ui.separator();
-                if self.vm.listing.is_host() {
+                if self.ctl.listing.is_host() {
                     ui.strong("local folder");
                 } else {
                     let label = if self.volume_label.is_empty() {
@@ -2234,9 +2234,9 @@ impl CommanderPane {
         self.reset_optical();
         self.cache_store.clear();
         self.selected_part = None;
-        self.vm.listing = DirListing::new();
+        self.ctl.listing = DirListing::new();
         self.session = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         self.pending_open = None;
         self.pending_apply = None;
         self.pending_scan = None;
@@ -2265,12 +2265,12 @@ impl CommanderPane {
             return;
         }
         // Auto-close once the queue empties (Apply / Discard).
-        if self.vm.queue.is_empty() {
+        if self.ctl.queue.is_empty() {
             self.show_edits_popup = false;
             return;
         }
         let mut open = true;
-        let lines = self.vm.queue.describe();
+        let lines = self.ctl.queue.describe();
         egui::Window::new(format!("Pending edits ({})", self.side.label()))
             .open(&mut open)
             .resizable(true)
@@ -2294,7 +2294,7 @@ impl CommanderPane {
 
     fn path_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let prefix = if self.vm.listing.is_host() {
+            let prefix = if self.ctl.listing.is_host() {
                 "host".to_string()
             } else {
                 match self.selected_part {
@@ -2303,7 +2303,7 @@ impl CommanderPane {
                 }
             };
             ui.monospace(prefix);
-            let path = self.vm.listing.cwd_path();
+            let path = self.ctl.listing.cwd_path();
             ui.monospace(if path.is_empty() { "/" } else { path });
         });
     }
@@ -2333,7 +2333,7 @@ impl CommanderPane {
         // refresh this pane's merged view.
         super::super::push_recent(RecentMode::Commander, &path);
         self.recent = super::super::load_recent_merged();
-        self.vm.listing = DirListing::new();
+        self.ctl.listing = DirListing::new();
         self.resolved_backup = None;
         self.archive_source = false;
         self.optical_source = false;
@@ -2398,7 +2398,7 @@ impl CommanderPane {
         self.reset_optical();
         self.selected_part = None;
         self.session = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
         let mut fs = match open_archive(&path, label) {
             Ok(fs) => fs,
@@ -2425,7 +2425,7 @@ impl CommanderPane {
         self.fs_type = fs.fs_type().to_string();
         self.archive_source = true;
         let n = entries.len();
-        self.vm.listing.load_root(fs, root, entries, false);
+        self.ctl.listing.load_root(fs, root, entries, false);
         format!(
             "[{}] opened archive {} ({n} item(s)).",
             self.side.label(),
@@ -2445,7 +2445,7 @@ impl CommanderPane {
         self.optical_source = true;
         self.optical_choices = choices;
         self.session = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         // Auto-open the first filesystem (the primary — usually ISO 9660).
         self.open_optical_choice(0)
     }
@@ -2461,8 +2461,8 @@ impl CommanderPane {
         };
         self.selected_part = Some(idx);
         self.error = None;
-        self.vm.listing = DirListing::new();
-        self.vm.queue.clear();
+        self.ctl.listing = DirListing::new();
+        self.ctl.queue.clear();
         let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
 
         let opened = match choice.hybrid_index {
@@ -2496,7 +2496,7 @@ impl CommanderPane {
         self.total_size = 0;
         self.used_size = 0;
         let n = entries.len();
-        self.vm.listing.load_root(fs, root, entries, false);
+        self.ctl.listing.load_root(fs, root, entries, false);
         format!(
             "[{}] opened {} ({n} item(s)).",
             self.side.label(),
@@ -2510,7 +2510,7 @@ impl CommanderPane {
     /// `open_partition` routes through the resolver to build the right session.
     fn load_backup_source(&mut self, folder: PathBuf) -> String {
         self.source = Some(folder.clone());
-        self.vm.listing = DirListing::new();
+        self.ctl.listing = DirListing::new();
         self.resolved_backup = None;
         self.archive_source = false;
         self.reset_optical();
@@ -2519,7 +2519,7 @@ impl CommanderPane {
         self.session = None;
         self.pending_open = None;
         self.pending_apply = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         self.error = None;
         self.selected_part = None;
         self.volume_label.clear();
@@ -2561,20 +2561,20 @@ impl CommanderPane {
         self.session = None;
         self.pending_open = None;
         self.pending_apply = None;
-        self.vm.queue.clear();
+        self.ctl.queue.clear();
         self.error = None;
         self.volume_label.clear();
         self.fs_type.clear();
 
-        match self.vm.listing.load_host_root(dir.clone()) {
+        match self.ctl.listing.load_host_root(dir.clone()) {
             Ok(()) => format!(
                 "[{}] opened host folder {} ({} item(s)).",
                 self.side.label(),
                 dir.display(),
-                self.vm.listing.entries().len()
+                self.ctl.listing.entries().len()
             ),
             Err(e) => {
-                self.vm.listing = DirListing::new();
+                self.ctl.listing = DirListing::new();
                 self.error = Some(format!("Could not read folder: {e}"));
                 format!(
                     "[{}] failed to open folder {}",
@@ -2597,8 +2597,8 @@ impl CommanderPane {
         };
         self.selected_part = Some(idx);
         self.error = None;
-        self.vm.listing = DirListing::new();
-        self.vm.queue.clear();
+        self.ctl.listing = DirListing::new();
+        self.ctl.queue.clear();
         self.pending_scan = None;
 
         // Non-filesystem partitions (APM driver / partition-map entries, EFI,
@@ -2720,7 +2720,10 @@ impl CommanderPane {
         let result = pw.status.lock().ok().and_then(|mut g| g.result.take());
         match result {
             Some(Ok(prepared)) => {
-                let note = self.vm.wrapper_tree.install_prepared(&pw.node_id, prepared);
+                let note = self
+                    .ctl
+                    .wrapper_tree
+                    .install_prepared(&pw.node_id, prepared);
                 let side = self.side.label();
                 Some(match note {
                     Some(n) => format!("[{side}] {}: {n}", pw.name),
@@ -2767,7 +2770,7 @@ impl CommanderPane {
             // A failed post-apply reopen must not lose what is still staged.
             if let Some((edits, _)) = self.reopen_restore.take() {
                 for e in edits {
-                    self.vm.queue.push(e);
+                    self.ctl.queue.push(e);
                 }
             }
             self.error = Some(err);
@@ -2785,12 +2788,12 @@ impl CommanderPane {
 
         match (fs, root) {
             (Some(fs), Some(root)) => {
-                self.vm.listing.load_root(fs, root, entries, false);
+                self.ctl.listing.load_root(fs, root, entries, false);
                 if let Some((edits, cwd)) = self.reopen_restore.take() {
                     for e in edits {
-                        self.vm.queue.push(e);
+                        self.ctl.queue.push(e);
                     }
-                    let _ = self.vm.listing.navigate_to(&cwd);
+                    let _ = self.ctl.listing.navigate_to(&cwd);
                 }
                 Some(format!(
                     "[{}] opened {} ({} item(s)).",
@@ -2800,7 +2803,7 @@ impl CommanderPane {
                     } else {
                         self.volume_label.clone()
                     },
-                    self.vm.listing.entries().len()
+                    self.ctl.listing.entries().len()
                 ))
             }
             _ => {
@@ -2814,7 +2817,7 @@ impl CommanderPane {
 
     /// Check the staged queue against this pane's volume, then apply (see `poll_preflight`).
     fn apply(&mut self) -> String {
-        if self.vm.queue.is_empty() {
+        if self.ctl.queue.is_empty() {
             return String::new();
         }
         // A remote image pane has no local BrowseSession — apply over the wire.
@@ -2824,8 +2827,8 @@ impl CommanderPane {
         let Some(session) = self.session.clone() else {
             return format!("[{}] no source to apply to.", self.side.label());
         };
-        let n = self.vm.queue.len();
-        let edits: Vec<StagedEdit> = self.vm.queue.iter().cloned().collect();
+        let n = self.ctl.queue.len();
+        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
         self.pending_preflight = Some(commander_ops::spawn_apply_preflight(session, edits));
         self.apply_report = None;
         format!("[{}] checking {n} staged edit(s)...", self.side.label())
@@ -2836,8 +2839,8 @@ impl CommanderPane {
         let Some(session) = self.session.clone() else {
             return format!("[{}] no source to apply to.", self.side.label());
         };
-        let n = self.vm.queue.len();
-        let edits: Vec<StagedEdit> = self.vm.queue.iter().cloned().collect();
+        let n = self.ctl.queue.len();
+        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
         self.pending_apply = Some(commander_ops::spawn_apply(session, edits, true));
         self.error = None;
         format!("[{}] applying {n} edit(s)...", self.side.label())
@@ -2865,7 +2868,7 @@ impl CommanderPane {
             }
             Err(e) => {
                 self.apply_report = Some(ApplyReport {
-                    total: self.vm.queue.len(),
+                    total: self.ctl.queue.len(),
                     applied: 0,
                     failed: Vec::new(),
                     not_tried: 0,
@@ -2950,7 +2953,7 @@ impl CommanderPane {
             ));
         }
         if !review.preflight.scan.conflicts.is_empty() {
-            self.vm.queue.set_all_conflicts(review.on_conflict);
+            self.ctl.queue.set_all_conflicts(review.on_conflict);
         }
         Some(self.start_apply())
     }
@@ -2958,7 +2961,7 @@ impl CommanderPane {
     fn render_apply_report(&mut self, ctx: &egui::Context) -> Option<String> {
         let report = self.apply_report.as_ref()?;
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
-        let still = self.vm.queue.len();
+        let still = self.ctl.queue.len();
         let mut action = None;
         egui::Window::new(format!("Apply report ({})", self.side.label()))
             .collapsible(false)
@@ -3023,7 +3026,7 @@ impl CommanderPane {
         match action {
             0 => Some(self.apply()),
             1 => {
-                self.vm.queue.clear();
+                self.ctl.queue.clear();
                 Some(format!(
                     "[{}] discarded the remaining staged edits.",
                     self.side.label()
@@ -3047,7 +3050,7 @@ impl CommanderPane {
             }) => (addr.clone(), path.clone(), partition.clone()),
             _ => return format!("[{}] no remote image to apply to.", self.side.label()),
         };
-        if self.vm.queue.iter().any(|e| {
+        if self.ctl.queue.iter().any(|e| {
             !matches!(
                 e,
                 StagedEdit::AddFile { .. } | StagedEdit::CreateDirectory { .. }
@@ -3059,8 +3062,8 @@ impl CommanderPane {
                 self.side.label()
             );
         }
-        let n = self.vm.queue.len();
-        let edits: Vec<StagedEdit> = self.vm.queue.iter().cloned().collect();
+        let n = self.ctl.queue.len();
+        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
         self.pending_apply = Some(commander_ops::spawn_remote_apply(
             addr, path, partition, edits,
         ));
@@ -3088,8 +3091,8 @@ impl CommanderPane {
         if self.is_remote_image() {
             return Some(self.finish_remote_apply(fatal));
         }
-        let total = self.vm.queue.len();
-        self.vm.queue.remove_indices(&outcome.applied_indices);
+        let total = self.ctl.queue.len();
+        self.ctl.queue.remove_indices(&outcome.applied_indices);
         let applied = outcome.applied();
         for f in &outcome.failed {
             self.log_events
@@ -3110,7 +3113,7 @@ impl CommanderPane {
         } else {
             format!(
                 "[{side}] applied {applied} of {total} edit(s); {} still staged.",
-                self.vm.queue.len()
+                self.ctl.queue.len()
             )
         };
         self.reopen_after_apply();
@@ -3123,8 +3126,8 @@ impl CommanderPane {
         let Some(i) = self.selected_part else {
             return;
         };
-        let keep: Vec<StagedEdit> = self.vm.queue.drain().collect();
-        let cwd = self.vm.listing.cwd_path().to_string();
+        let keep: Vec<StagedEdit> = self.ctl.queue.drain().collect();
+        let cwd = self.ctl.listing.cwd_path().to_string();
         self.open_partition(i);
         self.reopen_restore = Some((keep, cwd));
     }
@@ -3133,7 +3136,7 @@ impl CommanderPane {
     fn finish_remote_apply(&mut self, fatal: Option<String>) -> String {
         if let Some(err) = fatal {
             self.apply_report = Some(ApplyReport {
-                total: self.vm.queue.len(),
+                total: self.ctl.queue.len(),
                 applied: 0,
                 failed: Vec::new(),
                 not_tried: 0,
@@ -3141,8 +3144,8 @@ impl CommanderPane {
             });
             return format!("[{}] apply failed.", self.side.label());
         }
-        let n = self.vm.queue.len();
-        self.vm.queue.clear();
+        let n = self.ctl.queue.len();
+        self.ctl.queue.clear();
         // The daemon's browse handle snapshotted the catalog before the write
         // session committed; a fresh handle shows the copied files.
         let reopen = match &self.remote {
@@ -3165,21 +3168,21 @@ impl CommanderPane {
     /// stage a delete on a normal entry, undelete a pending delete, or un-stage
     /// a pending copy / new folder.
     fn toggle_delete(&mut self, names: &[String]) {
-        let Some(cwd) = self.vm.listing.cwd().cloned() else {
+        let Some(cwd) = self.ctl.listing.cwd().cloned() else {
             return;
         };
-        let pending_adds = self.vm.queue.pending_adds_for(&cwd.path);
+        let pending_adds = self.ctl.queue.pending_adds_for(&cwd.path);
         for name in names {
             if let Some(add) = pending_adds.iter().find(|e| &e.name == name) {
                 if add.is_directory() {
-                    self.vm.queue.remove_pending_subtree(&add.path);
+                    self.ctl.queue.remove_pending_subtree(&add.path);
                 } else {
-                    self.vm.queue.remove_pending_add(&add.path);
+                    self.ctl.queue.remove_pending_add(&add.path);
                 }
                 continue;
             }
             let Some(entry) = self
-                .vm
+                .ctl
                 .listing
                 .entries()
                 .iter()
@@ -3188,19 +3191,19 @@ impl CommanderPane {
             else {
                 continue;
             };
-            if self.vm.queue.is_pending_delete(&entry.path) {
-                self.vm.queue.remove_pending_delete(&entry.path);
+            if self.ctl.queue.is_pending_delete(&entry.path) {
+                self.ctl.queue.remove_pending_delete(&entry.path);
             } else {
                 // Deleting supersedes a staged rename of the same entry (else
                 // apply would rename it, then fail to delete the old name).
-                self.vm.queue.remove_pending_rename(&entry.path);
+                self.ctl.queue.remove_pending_rename(&entry.path);
                 if entry.is_directory() {
-                    self.vm.queue.push(StagedEdit::DeleteRecursive {
+                    self.ctl.queue.push(StagedEdit::DeleteRecursive {
                         parent: cwd.clone(),
                         entry,
                     });
                 } else {
-                    self.vm.queue.push(StagedEdit::DeleteEntry {
+                    self.ctl.queue.push(StagedEdit::DeleteEntry {
                         parent: cwd.clone(),
                         entry,
                     });
@@ -3220,8 +3223,8 @@ impl CommanderPane {
         let mid = rect.center().y;
         let font = egui::FontId::proportional(13.0);
         let color = ui.visuals().strong_text_color();
-        let active = self.vm.listing.sort_column();
-        let desc = self.vm.listing.is_descending();
+        let active = self.ctl.listing.sort_column();
+        let desc = self.ctl.listing.is_descending();
         let caret = |col: SortColumn| -> &'static str {
             if col != active {
                 ""
@@ -3286,7 +3289,7 @@ impl CommanderPane {
                 } else {
                     SortColumn::Type
                 };
-                self.vm.listing.resort(clicked);
+                self.ctl.listing.resort(clicked);
             }
         }
     }
@@ -3296,7 +3299,7 @@ impl CommanderPane {
         let busy = self.pending_apply.is_some();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
-        let host_pane = self.vm.listing.is_host();
+        let host_pane = self.ctl.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
         // delete or rename (both would mutate the backup).
         let read_only = self.resolved_backup.is_some();
@@ -3338,9 +3341,9 @@ impl CommanderPane {
                     let selected = if row.is_parent() {
                         false
                     } else if row.is_tree {
-                        self.vm.tree_selected.contains(&row.node_id)
+                        self.ctl.tree_selected.contains(&row.node_id)
                     } else {
-                        self.vm.listing.is_selected(&row.name)
+                        self.ctl.listing.is_selected(&row.name)
                     };
                     if selected {
                         ui.painter().rect_filled(
@@ -3541,10 +3544,10 @@ impl CommanderPane {
 
         let mut status = None;
         if to_up {
-            self.vm.listing.up();
+            self.ctl.listing.up();
         }
         if let Some(name) = to_enter {
-            if let Err(e) = self.vm.listing.enter(&name) {
+            if let Err(e) = self.ctl.listing.enter(&name) {
                 // A synchronous read that hits an encrypted, still-locked volume
                 // (belt-and-suspenders for the "directly through open" paths —
                 // for APFS the root listing already fails at open, but any FS
@@ -3563,60 +3566,60 @@ impl CommanderPane {
             }
         }
         if bg_deselect {
-            self.vm.listing.clear_selection();
+            self.ctl.listing.clear_selection();
             self.clear_tree_selection();
         }
         if let Some((name, command, shift)) = click {
             // A base-listing click takes over the selection from any wrapper.
             self.clear_tree_selection();
             if shift {
-                self.vm.listing.shift_click(&name);
+                self.ctl.listing.shift_click(&name);
             } else if command {
-                self.vm.listing.ctrl_click(&name);
+                self.ctl.listing.ctrl_click(&name);
             } else {
-                self.vm.listing.click(&name);
+                self.ctl.listing.click(&name);
             }
         }
         // A click on a row inside an expanded wrapper takes over from the base
         // selection (the two selection contexts are mutually exclusive).
         if let Some((node_id, ctrl, shift)) = tree_click {
-            self.vm.listing.clear_selection();
+            self.ctl.listing.clear_selection();
             let anchor = self
-                .vm
+                .ctl
                 .tree_anchor
                 .clone()
-                .filter(|a| self.vm.tree_index.contains_key(a));
+                .filter(|a| self.ctl.tree_index.contains_key(a));
             if let (true, Some(anchor)) = (shift, anchor) {
                 let visible: Vec<TreeRow> = rows
                     .iter()
                     .filter(|r| r.is_tree)
-                    .filter_map(|r| self.vm.tree_index.get(&r.node_id).cloned())
+                    .filter_map(|r| self.ctl.tree_index.get(&r.node_id).cloned())
                     .collect();
-                self.vm.tree_selected = tree_range(&visible, &anchor, &node_id);
+                self.ctl.tree_selected = tree_range(&visible, &anchor, &node_id);
             } else if ctrl {
-                if let Some(pos) = self.vm.tree_selected.iter().position(|n| *n == node_id) {
-                    self.vm.tree_selected.remove(pos);
+                if let Some(pos) = self.ctl.tree_selected.iter().position(|n| *n == node_id) {
+                    self.ctl.tree_selected.remove(pos);
                 } else {
-                    self.vm.tree_selected.push(node_id.clone());
+                    self.ctl.tree_selected.push(node_id.clone());
                 }
-                self.vm.tree_anchor = Some(node_id);
+                self.ctl.tree_anchor = Some(node_id);
             } else {
-                self.vm.tree_selected = vec![node_id.clone()];
-                self.vm.tree_anchor = Some(node_id);
+                self.ctl.tree_selected = vec![node_id.clone()];
+                self.ctl.tree_anchor = Some(node_id);
             }
         }
         // A right-click on an unselected base row acts on just that row.
         if let Some(name) = &ctx_rclick {
-            if !self.vm.listing.is_selected(name) {
+            if !self.ctl.listing.is_selected(name) {
                 self.clear_tree_selection();
-                self.vm.listing.click(name);
+                self.ctl.listing.click(name);
             }
         }
         // A right-click on an unselected wrapper row acts on just that row.
         if let Some(node_id) = &tree_rclick {
-            if !self.vm.tree_selected.contains(node_id) {
-                self.vm.listing.clear_selection();
-                self.vm.tree_selected = vec![node_id.clone()];
+            if !self.ctl.tree_selected.contains(node_id) {
+                self.ctl.listing.clear_selection();
+                self.ctl.tree_selected = vec![node_id.clone()];
             }
         }
         // Expand / collapse a wrapper or inner folder.
@@ -3626,7 +3629,7 @@ impl CommanderPane {
             }
         }
         if m_delete {
-            let names: Vec<String> = self.vm.listing.selection().to_vec();
+            let names: Vec<String> = self.ctl.listing.selection().to_vec();
             self.toggle_delete(&names);
             status = Some(format!(
                 "[{}] toggled delete on {} item(s).",
@@ -3635,14 +3638,14 @@ impl CommanderPane {
             ));
         }
         if m_host_delete {
-            let names: Vec<String> = self.vm.listing.selection().to_vec();
+            let names: Vec<String> = self.ctl.listing.selection().to_vec();
             if !names.is_empty() {
                 self.pending_host_delete = Some(names);
             }
         }
         if let Some(name) = m_rename {
             if let Some(entry) = self
-                .vm
+                .ctl
                 .listing
                 .entries()
                 .iter()
@@ -3658,14 +3661,14 @@ impl CommanderPane {
         }
         if let Some(name) = m_cancel_rename {
             if let Some(path) = self
-                .vm
+                .ctl
                 .listing
                 .entries()
                 .iter()
                 .find(|e| e.name == name)
                 .map(|e| e.path.clone())
             {
-                self.vm.queue.remove_pending_rename(&path);
+                self.ctl.queue.remove_pending_rename(&path);
                 status = Some(format!("[{}] cancelled staged rename.", self.side.label()));
             }
         }

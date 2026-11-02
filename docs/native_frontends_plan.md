@@ -65,14 +65,14 @@ model         src/model/   runners, sessions, edit queue, status structs  (exist
    ^
 jobs          src/model/job.rs        one "wait" abstraction           (new, Phase 0)
    ^
-view-models   src/vm/                 one per screen/dialog + AppVm     (new, Phase 2)
+view-models   src/controller/                 one per screen/dialog + AppController     (new, Phase 2)
    ^
 shells        egui (src/gui)  TUI (src/cli/verbs/tui*)  appkit/  gtk4/  win32/  vintage/*
 ```
 
 **Rules:**
 - **The shell boundary is an import rule.** Shells may import only `rusty_backup::vm`, plus plain data types re-exported from it. A CI script fails the build if a shell crate references `rusty_backup::{fs,backup,restore,partition,rbformats,os,optical,remote,model}` directly. This is how "view-only" gets enforced.
-- **View-models live in `src/` and obey the engine floor.** They must compile on Rust 1.73 (through the `compat` / `rust173_compat` shims) and under mrustc, because the vintage shells use them. Nothing toolkit-specific goes in `src/vm`.
+- **View-models live in `src/` and obey the engine floor.** They must compile on Rust 1.73 (through the `compat` / `rust173_compat` shims) and under mrustc, because the vintage shells use them. Nothing toolkit-specific goes in `src/controller`.
 - **Each shell is its own package.** For example `frontends/appkit/`, `frontends/gtk4/`, `frontends/win32/` and `frontends-vintage/{appkit-10.7,win32-win7}/`. Each has its own lockfile, following the `rb-cli-vintage/` pattern (`[lib] path = "../../src/lib.rs"` or a path dependency). Modern shells can then use current crates without moving the engine's floor.
 
 ### 4.1 The job ("wait") abstraction
@@ -106,20 +106,20 @@ impl<R> Job<R> {
   Shells redraw from `snapshot()`, so no shell needs a per-frame timer. This replaces the repaint-every-frame loop (`gui/mod.rs:898`) and the global egui context in `ui_logger.rs:29`.
 - **Resource keys and a `JobRegistry`.** Each job declares what it touches (a device path, an image path, a backup folder). The registry replaces `busy_elsewhere`, covers every job (today Inspect and browse writers are missed), and lets a view-model say *why* a control is disabled.
 - **Elevation and dialogs never block the UI thread.** An elevation prompt is a job step. A file dialog, a confirmation or a password request is an *effect* (§4.2) that the shell fulfills before the job continues. Privileged handles travel inside the job, so a device is never reopened by path.
-- **Log lines** flow through the job context into an `AppVm` log store, replacing the GUI-owned `LogPanel`.
+- **Log lines** flow through the job context into an `AppController` log store, replacing the GUI-owned `LogPanel`.
 - **The TUI** gets a real "working" frame. A wake from a job triggers a redraw, which ends the "frozen until next key" behavior.
 
 ### 4.2 View-models
 
 There is one view-model per screen or dialog:
-- **Screens:** `InspectVm`, `BackupVm`, `RestoreVm`, `BrowseVm`, `CommanderPaneVm` + `CommanderVm`, `OpticalVm`, `ArchivesVm`, `BulkVm`, `SettingsVm`.
+- **Screens:** `InspectVm`, `BackupVm`, `RestoreVm`, `BrowseVm`, `CommanderPaneController` + `CommanderVm`, `OpticalVm`, `ArchivesVm`, `BulkVm`, `SettingsVm`.
 - **Dialogs:** `ResizeVm`, `HfsExpandVm`, `PartitionEditorVm`, `MetadataEditorVm`, and so on.
-- **`AppVm`** holds what is currently GUI-owned: devices, recent files, settings persistence, the log, the job registry, and cross-tab handoffs (open in Inspect, nested open, redirect to Optical).
+- **`AppController`** holds what is currently GUI-owned: devices, recent files, settings persistence, the log, the job registry, and cross-tab handoffs (open in Inspect, nested open, redirect to Optical).
 
 Each view-model has the same shape:
 
 ```rust
-pub trait ViewModel {
+pub trait Controller {
     type Action;                       // user intents: OpenSource(path), StartBackup, Cancel, ...
     fn apply(&mut self, a: Self::Action) -> Vec<Effect>;
     fn tick(&mut self) -> Vec<Effect>; // drains finished jobs, advances state machines
@@ -140,7 +140,7 @@ Each phase lands as small per-slice commits and pull requests. Exit criteria are
 ### Phase 0: Groundwork (toolkit-free)
 
 1. Add `src/model/job.rs`, the `Notify` trait and `JobRegistry`. Re-express `worker.rs` on top of them.
-2. Add `src/vm/` with the `ViewModel` / `Action` / `Effect` skeleton and `AppVm`, including the log, recent files and settings moved out of `gui/`.
+2. Add `src/controller/` with the `Controller` / `Action` / `Effect` skeleton and `AppController`, including the log, recent files and settings moved out of `gui/`.
 3. Write `docs/platform_matrix.md` (a machine-checkable version of §3) and the fan-out rule in CLAUDE.md (§7).
 4. Add the boundary checks (§4) as a script run in CI, starting in warn-only mode.
 5. Add the headless view-model test harness: a scenario runner that replays `Action`s and asserts on state (§6, Tier A).
@@ -149,9 +149,9 @@ Each phase lands as small per-slice commits and pull requests. Exit criteria are
 
 **Done (2026-11-01).** How each step landed, and where it differs from the sketch above:
 1. `src/model/job.rs`: `Job<R>`, `JobCtx`, `Notify` / `NoNotify`, `Resource`, `JobRegistry` (refuses a second job on a busy resource and names the holder). `snapshot()` returns an owned `Snapshot` without the result, and `take_result()` hands the result over once, instead of `JobState<&R>`, which can't outlive the lock. A body ends `Cancelled` by returning `job::Cancelled` (`ctx.check_cancel()?`) or by failing after a cancel. `worker::run_guarded` shares the guard (`job::catch`). Nothing runs on `Job` yet; that is Phase 1.
-2. `src/vm/`: `ViewModel`, the exhaustive `Effect` (`PickFile`, `PickFolder`, `Confirm`, `AskPassword`, `Message`, `OpenUrl`, `CopyToClipboard`; `ShowDialog` waits for the first dialog view-model) and `AppVm`. The log store and the global `log` sink moved out of `gui/` (`vm::log`); egui draws the log from `AppVm` and runs effects in `gui::run_effects`. Recent files go through `AppVm` behind a `ConfigStore`, but the tabs still call the old helpers until their view-models exist (Phase 2); settings move then too.
+2. `src/controller/`: `Controller`, the exhaustive `Effect` (`PickFile`, `PickFolder`, `Confirm`, `AskPassword`, `Message`, `OpenUrl`, `CopyToClipboard`; `ShowDialog` waits for the first dialog view-model) and `AppController`. The log store and the global `log` sink moved out of `gui/` (`controller::log`); egui draws the log from `AppController` and runs effects in `gui::run_effects`. Recent files go through `AppController` behind a `ConfigStore`, but the tabs still call the old helpers until their view-models exist (Phase 2); settings move then too.
 3. `docs/platform_matrix.md`, checked against `release.yml` by `scripts/check-platform-matrix.py`; CLAUDE.md § "Feature fan-out".
-4. `scripts/check-boundaries.sh`: `src/vm` enforced, shells reported (840 engine/model references and 27 `thread::spawn` at the start). CI job `boundaries`.
+4. `scripts/check-boundaries.sh`: `src/controller` enforced, shells reported (840 engine/model references and 27 `thread::spawn` at the start). CI job `boundaries`.
 5. `tests/ui_scenarios.rs` replays `tests/ui_scenarios/*.toml`. It is an integration test rather than `cargo test --lib vm`, because the library's unit tests don't build on 1.73; the 1.73 run is in CI's `test-crates-msrv` job through `rb-cli-vintage`.
 
 ### Phase 1: The wait audit, fixed in egui and the TUI first
@@ -172,22 +172,22 @@ Work through [long_operations_inventory.md](long_operations_inventory.md), worst
 
 **Done (2026-11-01), with these differences** (details: the progress table in [long_operations_inventory.md](long_operations_inventory.md)):
 - No `thread::spawn` remains in `src/gui`, the TUI or the optical browser; `scripts/check-boundaries.sh` enforces it. Already-async workers run under `worker::spawn_guarded` (or `spawn_detached`) rather than `Job`; they move onto `Job` with their screen's view-model in Phase 2. Work that used to block the UI runs as a `Job` (GUI) or a `TuiTask` (a `Job` whose result is a closure the TUI applies in `tick`).
-- **Left synchronous, agreed:** Commander's operations and remote navigation (its listing is shared with copy, tree and selection, so it needs `CommanderPaneVm` first), loading a saved partclone cache (its store is shared with Commander), Alto resize (synchronous by design), and the TUI Explorer's per-keystroke folder listing (quick once the volume is open).
+- **Left synchronous, agreed:** Commander's operations and remote navigation (its listing is shared with copy, tree and selection, so it needs `CommanderPaneController` first), loading a saved partclone cache (its store is shared with Commander), Alto resize (synchronous by design), and the TUI Explorer's per-keystroke folder listing (quick once the volume is open).
 - Panic coverage is tested once, generically: `Job`, `spawn_guarded` and the `finished_with_error!` statuses each have a test that a panic ends in a failure, rather than one test per job.
 - Every wait shows a bar (or a sweeping bar when the total is unknown), the step, amounts, speed and time left; `rb-cli --status` prints the same line periodically.
 
 ### Phase 2: Extract the view-models
 
 **Decisions (2026-11-01), binding with CONTRIBUTING.md § Architecture policy (MVC):**
-- The view-models in `src/vm/` are the **controllers**. The GUI, the TUI and the CLI all drive the same controller for a task; every interface is a view.
+- The view-models in `src/controller/` are the **controllers**. The GUI, the TUI and the CLI all drive the same controller for a task; every interface is a view.
 - **The TUI Commander stages edits** and applies them like the GUI, instead of writing immediately.
-- **One key map, defined as data** in `src/vm/keys.rs` and overridable by the user: F1 help, F2 rename, F3 or Primary+I info, F5 refresh, F6 copy, F8 or Delete (Mac: Delete/Backspace) delete, Primary+N new folder, Tab switch pane, Enter open, Space/Insert mark. `Primary` is Ctrl on Windows/Linux and Cmd on macOS.
+- **One key map, defined as data** in `src/controller/keys.rs` and overridable by the user: F1 help, F2 rename, F3 or Primary+I info, F5 refresh, F6 copy, F8 or Delete (Mac: Delete/Backspace) delete, Primary+N new folder, Tab switch pane, Enter open, Space/Insert mark. `Primary` is Ctrl on Windows/Linux and Cmd on macOS.
 - **No cross-volume move.** F6 is copy.
 - **Text prompts are effects** (`AskText`) that carry a controller-defined validator; the view runs it for inline feedback and the controller re-checks the answer.
 - **One browser pane, configured by profile:** the Commander panes, the Inspect browse view and the TUI explorer share one browser-pane controller with per-use capabilities, instead of three implementations.
 
 
-The pilot is **Commander**. Lift `CommanderPane` (`gui/commander/pane.rs:164`) and the orchestration in `commander/mod.rs` into `CommanderPaneVm` / `CommanderVm`. Rebuild both the egui and TUI Commander on top of them. **The proof is TUI parity:** unlock, preflight, async apply, partclone and wrappers arrive in the TUI with little or no new logic.
+The pilot is **Commander**. Lift `CommanderPane` (`gui/commander/pane.rs:164`) and the orchestration in `commander/mod.rs` into `CommanderPaneController` / `CommanderVm`. Rebuild both the egui and TUI Commander on top of them. **The proof is TUI parity:** unlock, preflight, async apply, partclone and wrappers arrive in the TUI with little or no new logic.
 
 Then go screen by screen, ordered by logic weight:
 1. Inspect (about 2.5k logic LOC)
@@ -283,7 +283,7 @@ The goal is that a future session, given "add feature X", reaches every front-en
 
 PPC (mrustc, built on the G5) and Solaris 9 (mrustc + gcc 4.9) cannot run Rust GUI bindings. When this is picked up:
 
-- Add a `staticlib` C ABI over `src/vm`: opaque view-model handles, `apply(action_json)`, `snapshot_json()`, a wake callback, and effect callbacks.
+- Add a `staticlib` C ABI over `src/controller`: opaque view-model handles, `apply(action_json)`, `snapshot_json()`, a wake callback, and effect callbacks.
   - JSON keeps the ABI tiny and mrustc-friendly.
   - The exhaustive-match guarantee is lost at the C boundary, so a generated action/effect list plus a CI check stands in for it.
 - Shells:
@@ -370,8 +370,8 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 |---|---|
 | Lifting about 14.5k LOC out of the GUI regresses behavior | One screen per slice, starting with Commander. Tier A scenarios are written *before* each extraction; Tier B on egui catches view regressions. |
 | The job API is wrong for some operation (streaming, nested jobs, multi-step wizards) | Phase 1 migrates all about 66 operations onto it in egui before any native shell depends on it |
-| View-models accidentally use post-1.73 APIs | The vintage CI job compiles and tests `src/vm` (and `cargo +1.73 check` locally, per CONTRIBUTING) |
-| mrustc cannot compile some view-model construct | Keep `src/vm` plain: no proc-macros, no const generics. Check with the PPC/Sol9 builds each phase. |
+| View-models accidentally use post-1.73 APIs | The vintage CI job compiles and tests `src/controller` (and `cargo +1.73 check` locally, per CONTRIBUTING) |
+| mrustc cannot compile some view-model construct | Keep `src/controller` plain: no proc-macros, no const generics. Check with the PPC/Sol9 builds each phase. |
 | N shells drift apart | Exhaustive matches, widget-ID scenarios shared across shells, and the platform matrix enforced by CI |
 | Accessibility-driven tests are flaky in CI | Tier B stays tiny and deterministic, using fixture images and no real devices. Tier C is periodic and non-blocking. |
 | Elevation regresses when moved off the UI thread | Jobs carry the privileged handle. The existing macOS hardware audit checklist is re-run after Phase 1. |

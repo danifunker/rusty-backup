@@ -9,7 +9,7 @@ use crate::model::wrapper_tree::{TreeRow, WrapperTree};
 use super::rows::{build_display_rows, DisplayRow};
 
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
-pub struct CommanderPaneVm {
+pub struct CommanderPaneController {
     pub listing: DirListing,
     /// Edits staged against this pane's volume until Apply.
     pub queue: EditQueue,
@@ -25,13 +25,13 @@ pub struct CommanderPaneVm {
     pub last_cwd: String,
 }
 
-impl Default for CommanderPaneVm {
+impl Default for CommanderPaneController {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CommanderPaneVm {
+impl CommanderPaneController {
     pub fn new() -> Self {
         Self {
             listing: DirListing::new(),
@@ -59,10 +59,10 @@ impl CommanderPaneVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::commander::RowKind;
     use crate::model::edit_queue::StagedEdit;
-    use crate::vm::commander::RowKind;
 
-    fn host_pane(files: &[&str], dirs: &[&str]) -> (tempfile::TempDir, CommanderPaneVm) {
+    fn host_pane(files: &[&str], dirs: &[&str]) -> (tempfile::TempDir, CommanderPaneController) {
         let dir = tempfile::tempdir().unwrap();
         for f in files {
             std::fs::write(dir.path().join(f), b"x").unwrap();
@@ -70,7 +70,7 @@ mod tests {
         for d in dirs {
             std::fs::create_dir(dir.path().join(d)).unwrap();
         }
-        let mut vm = CommanderPaneVm::new();
+        let mut vm = CommanderPaneController::new();
         vm.listing.load_host_root(dir.path().to_path_buf()).unwrap();
         (dir, vm)
     }

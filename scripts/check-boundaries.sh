@@ -2,8 +2,8 @@
 # Layer rules from docs/native_frontends_plan.md §4.
 #
 # Enforced (exit 1):
-#   - src/vm has no toolkit code (egui, eframe, ratatui, crossterm, rfd, objc2, gtk, Win32 UI).
-#   - src/vm spawns no raw threads; slow work goes through model::job::Job.
+#   - src/controller has no toolkit code (egui, eframe, ratatui, crossterm, rfd, objc2, gtk, Win32 UI).
+#   - src/controller spawns no raw threads; slow work goes through model::job::Job.
 #   - shells (src/gui, the TUI, the optical browser) spawn no raw threads: use Job,
 #     worker::spawn_guarded or worker::spawn_detached, which catch panics (Phase 1).
 # Reported only (warn mode until Phase 2 makes the shells pure view):
@@ -30,12 +30,12 @@ error() {
   fail=1
 }
 
-# --- enforced: src/vm stays toolkit-free and thread-free ---------------------
-if hits=$(grep -rnE "\b($TOOLKITS)::|extern crate ($TOOLKITS)\b" src/vm); then
-  error "src/vm uses toolkit code:"; echo "$hits"
+# --- enforced: src/controller stays toolkit-free and thread-free ---------------------
+if hits=$(grep -rnE "\b($TOOLKITS)::|extern crate ($TOOLKITS)\b" src/controller); then
+  error "src/controller uses toolkit code:"; echo "$hits"
 fi
-if hits=$(grep -rnE "thread::spawn|std::thread::Builder" src/vm); then
-  error "src/vm spawns threads; use model::job::Job:"; echo "$hits"
+if hits=$(grep -rnE "thread::spawn|std::thread::Builder" src/controller); then
+  error "src/controller spawns threads; use model::job::Job:"; echo "$hits"
 fi
 
 # --- reported: shells reaching past the view-models --------------------------
@@ -58,5 +58,5 @@ if [ "$VERBOSE" = 1 ]; then
   printf '%s\n' "$spawns" | cut -d: -f1 | sort | uniq -c | sort -rn
 fi
 
-[ "$fail" = 0 ] && echo "boundaries: src/vm is clean and shells spawn no raw threads"
+[ "$fail" = 0 ] && echo "boundaries: src/controller is clean and shells spawn no raw threads"
 exit "$fail"

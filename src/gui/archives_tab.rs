@@ -19,7 +19,7 @@ use arc_mac::detect::{detect_mountable_image, MountableImageKind};
 use arc_mac::extract::{self, ExtractStats, ForkFormat};
 use arc_mac::stuffit::{self, StuffItArchive};
 
-use rusty_backup::vm::log::LogStore;
+use rusty_backup::controller::log::LogStore;
 
 /// A successfully loaded archive: the decoded bytes plus parsed directory.
 struct Loaded {
