@@ -46,6 +46,31 @@ fn an_image_opens_into_one_superfloppy_row_with_a_volume_label() {
     assert!(log.iter().any(|l| l.starts_with("Inspecting ")), "{log:?}");
 }
 
+#[test]
+fn an_image_file_is_prepared_in_a_job_then_opened() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::controller::commander::blank_fat_image(dir.path());
+    // Inspect keeps a gzip-wrapped Amiga hard file as a container, so edits go back into it.
+    let hdz = dir.path().join("vol.hdz");
+    let mut gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(&hdz).unwrap(),
+        flate2::Compression::fast(),
+    );
+    gz.write_all(&std::fs::read(&img).unwrap()).unwrap();
+    gz.finish().unwrap();
+    let mut ctl = controller();
+    ctl.apply(InspectAction::Open(InspectSource::ImageFile(img.clone())));
+    assert!(ctl.is_preparing() && ctl.loading().is_some());
+    settle(&mut ctl);
+    assert_eq!(ctl.image_path(), Some(img.as_path()));
+    assert_eq!(ctl.partitions().len(), 1);
+    ctl.apply(InspectAction::Load(InspectSource::ImageFile(hdz.clone())));
+    settle(&mut ctl);
+    assert_eq!(ctl.image_path(), Some(hdz.as_path()));
+    assert_eq!(ctl.partitions().len(), 1);
+}
+
 fn opened_fat() -> (tempfile::TempDir, PathBuf, InspectController) {
     let dir = tempfile::tempdir().unwrap();
     let img = crate::controller::commander::blank_fat_image(dir.path());

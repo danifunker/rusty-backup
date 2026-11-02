@@ -1,0 +1,401 @@
+//! The app shell's rules: which tab is up, where a dropped file goes, which tab's job locks the
+//! others, the backup folder the Backup-aware tabs share, the device list and the
+//! physical-device elevation gate. The egui shell (`src/gui/mod.rs`) draws these.
+
+use std::path::{Path, PathBuf};
+
+use super::AppController;
+use crate::controller::job_outcome;
+use crate::model::job::{Job, Snapshot};
+
+pub use crate::device::DiskDevice;
+
+/// The top-level tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTab {
+    Backup,
+    Restore,
+    Inspect,
+    Optical,
+    Archives,
+}
+
+/// What the tabs a drop may go to are doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropTargets {
+    pub inspect_remote: bool,
+    pub inspect_loaded: bool,
+    pub optical_browsing: bool,
+}
+
+/// Where a dropped file goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropRoute {
+    /// Open it in Inspect and switch there.
+    Inspect(PathBuf),
+    Optical(PathBuf),
+    Archives(PathBuf),
+    Restore(PathBuf),
+    Backup(PathBuf),
+    /// The active tab keeps it (Inspect's open volume takes drops itself).
+    Ignore,
+}
+
+/// What a Backup-aware tab does with the backup folder the tabs share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareStep {
+    /// The tab opened a new backup: the other tab loads it too.
+    Publish(PathBuf),
+    /// The tab is empty: it loads the shared backup.
+    Adopt(PathBuf),
+    Nothing,
+}
+
+/// Whether the physical-device elevation gate applies, and its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationGate {
+    /// Not a gated platform (macOS escalates per operation): "Refresh Devices" applies.
+    NotApplicable,
+    /// Not elevated: show the elevation button.
+    NeedsElevation,
+    /// Elevated: devices are available, "Refresh Devices" applies.
+    Elevated,
+    /// A build without physical devices.
+    Disabled,
+}
+
+/// Why physical devices are unavailable in this build, for a hover text.
+pub const PHYSICAL_DEVICES_DISABLED: &str = crate::os::PHYSICAL_DEVICES_DISABLED;
+
+/// The current elevation gate; macOS is always `NotApplicable`.
+pub fn elevation_gate() -> ElevationGate {
+    if !crate::os::PHYSICAL_DEVICES_ENABLED {
+        return ElevationGate::Disabled;
+    }
+    if cfg!(any(windows, target_os = "linux")) {
+        if crate::os::is_elevated() {
+            ElevationGate::Elevated
+        } else {
+            ElevationGate::NeedsElevation
+        }
+    } else {
+        ElevationGate::NotApplicable
+    }
+}
+
+/// Whether physical-device controls are usable now (Windows needs elevation to list them).
+pub fn physical_devices_available() -> bool {
+    if !crate::os::PHYSICAL_DEVICES_ENABLED {
+        return false;
+    }
+    !cfg!(windows) || crate::os::is_elevated()
+}
+
+/// A device dropdown's hint when it lists nothing.
+pub fn no_devices_hint() -> &'static str {
+    if !crate::os::PHYSICAL_DEVICES_ENABLED {
+        return "Physical devices are not available in this build. Use disk image files.";
+    }
+    if cfg!(windows) && !crate::os::is_elevated() {
+        "Click \"Show Physical Devices\" (top bar) to access disks."
+    } else {
+        "No physical devices detected."
+    }
+}
+
+/// The top bar's elevation button label.
+pub fn elevation_button_label() -> &'static str {
+    if cfg!(windows) {
+        "Show Physical Devices"
+    } else {
+        "Unlock Physical Devices"
+    }
+}
+
+/// The elevation button's hover text.
+pub fn elevation_button_hover() -> &'static str {
+    if cfg!(windows) {
+        "Restart with administrator privileges to access physical disk devices \
+         (will prompt for elevation)."
+    } else {
+        "Restart with root privileges (pkexec) to read and write physical disk \
+         devices. Disk image files do not need this."
+    }
+}
+
+/// The note beside a physical-device picker while unprivileged, naming the remedy.
+pub fn unelevated_device_note() -> &'static str {
+    if cfg!(windows) {
+        "Note: physical devices need administrator privileges. Without it they may \
+         not be listed, and Edit Mode will fail. Click \"Show Physical Devices\" in \
+         the top bar. Disk image files are unaffected."
+    } else if cfg!(target_os = "linux") {
+        "Note: physical devices need root privileges to open, so Edit Mode and \
+         device backups will fail. Click \"Unlock Physical Devices\" in the top bar \
+         to restart as root. Disk image files are unaffected."
+    } else {
+        "Note: physical devices need root privileges (sudo). Without it they may \
+         not be listed, and Edit Mode will fail. Disk image files are unaffected."
+    }
+}
+
+/// Where file pickers start: the real user's home, even when running elevated through pkexec.
+pub fn picker_start_folder() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::os::linux::real_user_home()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The shell's part of [`AppController`]: the tab, the device list, the shared backup folder.
+#[derive(Default)]
+pub(super) struct ShellState {
+    tab: Option<AppTab>,
+    devices: Vec<DiskDevice>,
+    devices_job: Option<Job<Vec<DiskDevice>>>,
+    shared_backup: Option<PathBuf>,
+    elevation_prompt: bool,
+}
+
+impl AppController {
+    /// The tab on screen (Inspect at start).
+    pub fn active_tab(&self) -> AppTab {
+        self.shell.tab.unwrap_or(AppTab::Inspect)
+    }
+
+    pub fn select_tab(&mut self, tab: AppTab) {
+        self.shell.tab = Some(tab);
+    }
+
+    pub fn devices(&self) -> &[DiskDevice] {
+        self.shell.devices.as_slice()
+    }
+
+    /// The device list beside the log, for a shell that lends both to a tab at once.
+    pub fn devices_and_log(&mut self) -> (&[DiskDevice], &mut crate::controller::log::LogStore) {
+        (self.shell.devices.as_slice(), &mut self.log)
+    }
+
+    /// List the devices now, at start-up, and log what was found.
+    pub fn load_devices(&mut self) {
+        self.shell.devices = crate::device::enumerate_devices();
+        if !crate::os::PHYSICAL_DEVICES_ENABLED {
+            self.log.info(
+                "This build works on disk image files only; physical device access is disabled.",
+            );
+        } else if self.shell.devices.is_empty() {
+            self.log
+                .warn("No disk devices detected. You can still open image files.");
+        } else {
+            self.log
+                .info(format!("Found {} device(s)", self.shell.devices.len()));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Devices are listed unprivileged from /sys/block; only opening them needs root.
+            if crate::os::is_elevated() {
+                self.log.info("Running with administrator privileges");
+            } else if !self.shell.devices.is_empty() {
+                self.log.warn(
+                    "Running unprivileged: physical devices cannot be opened. Click \
+                     'Unlock Physical Devices' in the top bar to restart as root. \
+                     Disk image files are unaffected.",
+                );
+            }
+        }
+    }
+
+    /// "Refresh Devices": list them again in a job (querying each disk takes a moment).
+    pub(super) fn refresh_devices(&mut self) {
+        if self.shell.devices_job.is_some() {
+            return;
+        }
+        self.shell.devices_job = Some(Job::spawn("Looking for devices...", self.notify(), |_| {
+            Ok(crate::device::enumerate_devices())
+        }));
+    }
+
+    pub fn devices_refreshing(&self) -> Option<Snapshot> {
+        self.shell.devices_job.as_ref().map(Job::snapshot)
+    }
+
+    pub(super) fn poll_shell(&mut self) {
+        if let Some(done) = self.shell.devices_job.as_ref().and_then(job_outcome) {
+            self.shell.devices_job = None;
+            if let Ok(devices) = done {
+                self.shell.devices = devices;
+                self.log.info(format!(
+                    "Refreshed: {} device(s) found",
+                    self.shell.devices.len()
+                ));
+            }
+        }
+    }
+
+    /// The top bar's elevation button: Windows asks UAC now, Linux asks the user first.
+    pub(super) fn request_elevation(&mut self) {
+        #[cfg(windows)]
+        {
+            self.log.info("Requesting administrator privileges...");
+            if let Err(e) = crate::os::windows::request_elevation() {
+                self.log
+                    .error(format!("Elevation request failed or was cancelled: {e}"));
+            }
+        }
+        // The relaunch discards unsaved edits, so the shell's dialog says so first.
+        #[cfg(target_os = "linux")]
+        {
+            self.shell.elevation_prompt = true;
+        }
+    }
+
+    /// True once after the elevation button, when the shell must ask before relaunching.
+    pub fn take_elevation_prompt(&mut self) -> bool {
+        std::mem::take(&mut self.shell.elevation_prompt)
+    }
+
+    pub(super) fn confirm_elevation(&mut self, yes: bool) {
+        if !yes {
+            self.log.warn(
+                "Elevation cancelled. Physical devices stay unavailable; \
+                 image files are unaffected.",
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.log.info("Relaunching with elevated privileges...");
+            if let Err(e) = crate::os::linux::relaunch_with_elevation() {
+                self.log.error(format!("Failed to elevate: {}", e));
+            }
+        }
+    }
+
+    /// Where a file dropped on `active` goes.
+    pub fn route_drop(&mut self, path: PathBuf, targets: DropTargets) -> DropRoute {
+        match self.active_tab() {
+            AppTab::Inspect if targets.inspect_remote => {
+                self.log.warn(format!(
+                    "Ignored dropped file {}: a remote session is open; close it first",
+                    path.display()
+                ));
+                DropRoute::Ignore
+            }
+            // A loaded source keeps the drop: the open volume adds it in edit mode.
+            AppTab::Inspect if targets.inspect_loaded => DropRoute::Ignore,
+            AppTab::Inspect => DropRoute::Inspect(path),
+            // An open disc browse has no drag-to-add of its own; don't clobber it.
+            AppTab::Optical if targets.optical_browsing => DropRoute::Ignore,
+            AppTab::Optical => DropRoute::Optical(path),
+            AppTab::Archives => DropRoute::Archives(path),
+            AppTab::Restore => DropRoute::Restore(path),
+            AppTab::Backup => DropRoute::Backup(path),
+        }
+    }
+
+    /// The backup folder the Restore and Inspect tabs share.
+    pub fn shared_backup(&self) -> Option<&Path> {
+        self.shell.shared_backup.as_deref()
+    }
+
+    /// The top bar's Close Backup.
+    pub fn close_shared_backup(&mut self) {
+        self.shell.shared_backup = None;
+    }
+
+    /// Sync a tab with the shared folder: it opened a new backup, or (only when empty) adopts it.
+    pub fn share_backup(&mut self, loaded: Option<PathBuf>, tab_empty: bool) -> ShareStep {
+        if let Some(new) = loaded {
+            if self.shell.shared_backup.as_ref() != Some(&new) {
+                self.shell.shared_backup = Some(new.clone());
+                return ShareStep::Publish(new);
+            }
+            return ShareStep::Nothing;
+        }
+        match (&self.shell.shared_backup, tab_empty) {
+            (Some(folder), true) => ShareStep::Adopt(folder.clone()),
+            _ => ShareStep::Nothing,
+        }
+    }
+}
+
+/// Another tab (not `tab`) with a disk job in flight, so one job runs at a time.
+pub fn busy_elsewhere(
+    tab: AppTab,
+    running: &[(AppTab, Option<&'static str>)],
+    bulk_running: bool,
+) -> Option<&'static str> {
+    running
+        .iter()
+        .find(|(owner, name)| name.is_some() && *owner != tab)
+        .and_then(|(_, name)| *name)
+        .or(if bulk_running {
+            Some("Bulk Convert")
+        } else {
+            None
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drops_follow_the_active_tab() {
+        let mut app = AppController::headless();
+        let p = PathBuf::from("/x.img");
+        assert_eq!(
+            app.route_drop(p.clone(), DropTargets::default()),
+            DropRoute::Inspect(p.clone())
+        );
+        let loaded = DropTargets {
+            inspect_loaded: true,
+            ..DropTargets::default()
+        };
+        assert_eq!(app.route_drop(p.clone(), loaded), DropRoute::Ignore);
+        let remote = DropTargets {
+            inspect_remote: true,
+            ..DropTargets::default()
+        };
+        assert_eq!(app.route_drop(p.clone(), remote), DropRoute::Ignore);
+        assert!(app.log.to_text().contains("a remote session is open"));
+        app.select_tab(AppTab::Archives);
+        assert_eq!(
+            app.route_drop(p.clone(), loaded),
+            DropRoute::Archives(p.clone())
+        );
+    }
+
+    #[test]
+    fn the_shared_backup_is_published_then_adopted_only_by_an_empty_tab() {
+        let mut app = AppController::headless();
+        let f = PathBuf::from("/bk");
+        assert_eq!(
+            app.share_backup(Some(f.clone()), false),
+            ShareStep::Publish(f.clone())
+        );
+        assert_eq!(app.share_backup(Some(f.clone()), false), ShareStep::Nothing);
+        assert_eq!(app.share_backup(None, false), ShareStep::Nothing);
+        assert_eq!(app.share_backup(None, true), ShareStep::Adopt(f));
+        app.close_shared_backup();
+        assert_eq!(app.share_backup(None, true), ShareStep::Nothing);
+    }
+
+    #[test]
+    fn one_disk_job_at_a_time() {
+        let running = [(AppTab::Backup, Some("Backup")), (AppTab::Restore, None)];
+        assert_eq!(
+            busy_elsewhere(AppTab::Restore, &running, false),
+            Some("Backup")
+        );
+        assert_eq!(busy_elsewhere(AppTab::Backup, &running, false), None);
+        assert_eq!(
+            busy_elsewhere(AppTab::Backup, &running, true),
+            Some("Bulk Convert")
+        );
+    }
+}

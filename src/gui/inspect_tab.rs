@@ -129,6 +129,12 @@ impl InspectTab {
         }
     }
 
+    /// Open an image file dropped or named on the command line; a wrapper is decoded first.
+    pub fn open_file(&mut self, path: PathBuf) {
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Inspect, &path);
+        self.act(InspectAction::Load(InspectSource::ImageFile(path)));
+    }
+
     /// Open an image handed over by another tab, keeping `guard` (its temp folder) alive.
     pub fn load_image_with_tempdir(&mut self, path: PathBuf, guard: Option<tempfile::TempDir>) {
         self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Inspect, &path);
@@ -274,21 +280,10 @@ impl InspectTab {
                 slot: i,
                 identity: d.identity(),
             }),
-            SourceEvent::Image { path, tempdir } => Some(InspectSource::Image {
-                path,
-                temp: tempdir,
-            }),
-            // A recent pick is a raw path; materialize it like re-picking the file.
-            SourceEvent::Recent(path) => match super::prepare_disk_image_path(&path, false) {
-                Ok((materialized, guard)) => Some(InspectSource::Image {
-                    path: materialized,
-                    temp: guard,
-                }),
-                Err(e) => {
-                    log::error!("Failed to decompress {}: {}", path.display(), e);
-                    Some(InspectSource::Image { path, temp: None })
-                }
-            },
+            // A wrapper (`.adz`, ...) is decoded to a temporary file in the open's job.
+            SourceEvent::Image(path) | SourceEvent::Recent(path) => {
+                Some(InspectSource::ImageFile(path))
+            }
             SourceEvent::BackupFolder(folder) => Some(InspectSource::Backup { folder }),
             // Inspect offers no host folder, and runs its own dialogs.
             SourceEvent::HostFolder(_)
@@ -310,7 +305,6 @@ impl InspectTab {
                 show_host_folder: false,
                 show_backup_folder: true,
                 show_remote: true,
-                materialize_image: true,
                 include_mac_archives: true,
                 width: 400.0,
                 // A fixed 5-row Recent group keeps egui's cached popup size right.

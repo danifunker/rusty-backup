@@ -266,7 +266,6 @@ impl PaneView {
                 // "Connect to Remote..." lives in this dropdown now (no
                 // separate button).
                 show_remote: true,
-                materialize_image: false,
                 // Surface .sit/.hqx/... in the "Open File..." dialog; a Mac
                 // archive opens read-only in-pane (ArchiveFilesystem).
                 include_mac_archives: true,
@@ -294,7 +293,7 @@ impl PaneView {
                 match ev {
                     // A recent pick opens like a drag-and-drop: a folder as a host folder, a file as an image.
                     SourceEvent::Recent(path) => source_action = Some(P::OpenPath(path)),
-                    SourceEvent::Image { path, .. } => source_action = Some(P::OpenImage(path)),
+                    SourceEvent::Image(path) => source_action = Some(P::OpenImage(path)),
                     SourceEvent::HostFolder(dir) => source_action = Some(P::OpenHostFolder(dir)),
                     SourceEvent::BackupFolder(dir) => {
                         source_action = Some(P::OpenBackupFolder(dir))

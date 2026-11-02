@@ -441,14 +441,14 @@ impl Controller for ArchivesController {
     }
 }
 
+/// A classic StuffIt archive of TEXT files at `dir/a.sit`, for tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) fn sample_archive(dir: &std::path::Path, files: &[(&str, &[u8])]) -> PathBuf {
     use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
-
-    fn sit(dir: &std::path::Path) -> PathBuf {
-        let file = |name: &str, data: &[u8]| StuffItInput {
-            name: name.into(),
+    let inputs: Vec<StuffItInput> = files
+        .iter()
+        .map(|(name, data)| StuffItInput {
+            name: name.to_string(),
             type_code: *b"TEXT",
             creator_code: *b"ttxt",
             finder_flags: 0,
@@ -456,15 +456,23 @@ mod tests {
             mod_date: 0,
             data_fork: data.to_vec(),
             resource_fork: Vec::new(),
-        };
-        let bytes = build_archive(
-            &[file("one", b"first"), file("two", b"second")],
-            WriteMethod::Store,
-        )
-        .unwrap();
-        let path = dir.join("a.sit");
-        std::fs::write(&path, bytes).unwrap();
-        path
+        })
+        .collect();
+    let path = dir.join("a.sit");
+    std::fs::write(
+        &path,
+        build_archive(inputs.as_slice(), WriteMethod::Store).unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sit(dir: &std::path::Path) -> PathBuf {
+        sample_archive(dir, &[("one", b"first"), ("two", b"second")])
     }
 
     #[test]

@@ -88,6 +88,8 @@ pub enum InspectSource {
         path: PathBuf,
         temp: Option<tempfile::TempDir>,
     },
+    /// An image file as the user named it; a wrapper is decoded to a temporary file first, in a job.
+    ImageFile(PathBuf),
     /// A rusty-backup or Clonezilla backup folder.
     Backup { folder: PathBuf },
     /// An image on a daemon, read over the block tier.
@@ -349,6 +351,8 @@ pub struct InspectController {
     escalated: Option<PathBuf>,
     /// Bumped when the partition list's text changes width, so the shell re-measures.
     layout_generation: u64,
+    /// An `ImageFile` whose wrapper is being decoded before it opens.
+    prepare: Option<(PathBuf, Job<(PathBuf, Option<tempfile::TempDir>)>)>,
     open: open::OpenState,
     tools: tools::ToolState,
     export: export::ExportState,
@@ -367,6 +371,7 @@ impl InspectController {
             pending_gate: None,
             escalated: None,
             layout_generation: 0,
+            prepare: None,
             open: open::OpenState::default(),
             tools: tools::ToolState::default(),
             export: export::ExportState::default(),
@@ -848,7 +853,8 @@ impl InspectController {
 
     /// The running inspect or backup load, for the shell's spinner.
     pub fn loading(&self) -> Option<Snapshot> {
-        self.open.loading()
+        let preparing = self.prepare.as_ref().map(|(_, job)| job.snapshot());
+        preparing.or_else(|| self.open.loading())
     }
 
     /// The label of a running job other tabs must wait for, if any.
@@ -858,6 +864,10 @@ impl InspectController {
 
     /// Block until the open and its probes end; for a headless shell's worker, never a UI thread.
     pub fn wait_opened(&mut self) {
+        while self.prepare.is_some() {
+            self.poll_prepare();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         loop {
             self.poll_open();
             if self.open.loading().is_none() && !self.open.probing() {
@@ -906,17 +916,36 @@ impl InspectController {
     }
 
     fn load(&mut self, source: InspectSource) {
-        if let InspectSource::Image { path, .. } = &source {
+        if let InspectSource::Image { path, .. } | InspectSource::ImageFile(path) = &source {
             if Self::is_mac_archive(path.as_path()) {
                 self.requests.push(HostRequest::OpenArchive(path.clone()));
                 return;
             }
+        }
+        self.prepare = None;
+        if let InspectSource::ImageFile(path) = source {
+            // Floppy containers stay as they are, so edits persist back into the container.
+            let file = path.clone();
+            let job = Job::spawn(
+                "Preparing the image...",
+                Arc::clone(&self.services.notify),
+                move |job| {
+                    job.set_can_cancel(false);
+                    Ok(crate::model::image_prep::prepare_disk_image_path(
+                        file.as_path(),
+                        false,
+                    )?)
+                },
+            );
+            self.prepare = Some((path, job));
+            return;
         }
         self.requests.push(HostRequest::CloseBrowse);
         self.reset();
         let source = match source {
             InspectSource::Device { slot, identity } => Source::Device { slot, identity },
             InspectSource::Image { path, temp } => Source::Image { path, _temp: temp },
+            InspectSource::ImageFile(_) => return,
             InspectSource::Backup { folder } => Source::Backup { folder },
             #[cfg(feature = "remote")]
             InspectSource::Remote { conn } => Source::Remote { conn },
@@ -1077,6 +1106,7 @@ impl Controller for InspectController {
 
     fn tick(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
+        self.poll_prepare();
         self.poll_open();
         fx.extend(self.poll_tools());
         self.poll_export();
@@ -1086,6 +1116,35 @@ impl Controller for InspectController {
 }
 
 impl InspectController {
+    /// An `ImageFile` was decoded (or could not be): open what there is.
+    fn poll_prepare(&mut self) {
+        let Some(done) = self
+            .prepare
+            .as_ref()
+            .and_then(|(_, j)| crate::controller::job_outcome(j))
+        else {
+            return;
+        };
+        let (path, _) = self.prepare.take().expect("prepare job");
+        let source = match done {
+            Ok((path, temp)) => InspectSource::Image { path, temp },
+            Err(e) => {
+                self.warn(format!(
+                    "Failed to materialize {}: {} - opening raw bytes",
+                    path.display(),
+                    e
+                ));
+                InspectSource::Image { path, temp: None }
+            }
+        };
+        self.load(source);
+    }
+
+    /// An image file is being prepared to open.
+    pub fn is_preparing(&self) -> bool {
+        self.prepare.is_some()
+    }
+
     fn picked(&mut self, purpose: &'static str, path: Option<PathBuf>) -> Vec<Effect> {
         match purpose {
             purpose::BOOT_DONOR => self.boot_donor_picked(path),

@@ -1,0 +1,34 @@
+# The app shell: tabs, where a drop goes, and the backup folder the Restore and Inspect tabs share.
+name = "App shell: tabs, drops, shared backup"
+vm = "app"
+
+[[step]]
+expect = { active_tab = "Inspect" }
+
+[[step]]
+action = "Drop"
+arg = "/images/disk.img"
+expect = { log_text = "~route: Inspect(\"/images/disk.img\")" }
+
+[[step]]
+action = "SelectTab"
+arg = "archives"
+expect = { active_tab = "Archives" }
+
+[[step]]
+action = "Drop"
+arg = "/images/a.sit"
+expect = { log_text = "~route: Archives(\"/images/a.sit\")" }
+
+[[step]]
+action = "ShareBackup"
+arg = "/backups/bk"
+expect = { shared_backup = "/backups/bk", log_text = "~share: Publish(\"/backups/bk\")" }
+
+[[step]]
+action = "AdoptBackup"
+expect = { log_text = "~share: Adopt(\"/backups/bk\")" }
+
+[[step]]
+action = "CloseBackup"
+expect = { shared_backup = "" }

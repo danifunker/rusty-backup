@@ -1,10 +1,24 @@
 //! `AppController`: app-wide state every screen shares (`docs/native_frontends_plan.md` §4.2).
 //!
-//! Holds the log, the job registry, the shell's wake handle, and (in builds
-//! with the `update` module) the recent-files history persisted in
-//! config.json. Devices, settings and cross-tab handoffs move here in Phase 2.
+//! Holds the log, the job registry, the shell's wake handle, (in builds with the
+//! `update` module) the recent-files history persisted in config.json, and the app
+//! shell's rules in [`shell`]: the active tab, drops, the shared backup folder, the
+//! device list and elevation. The update banner's checks are in [`update`] (GUI builds).
 
 use std::sync::Arc;
+
+mod shell;
+#[cfg(feature = "gui")]
+mod update;
+
+pub use shell::{
+    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate,
+    no_devices_hint, physical_devices_available, picker_start_folder, unelevated_device_note,
+    AppTab, DiskDevice, DropRoute, DropTargets, ElevationGate, ShareStep,
+    PHYSICAL_DEVICES_DISABLED,
+};
+#[cfg(feature = "gui")]
+pub use update::{InstallState, UpdateInfo};
 
 use super::log::{capture, LogStore};
 use super::{Controller, Effect};
@@ -44,6 +58,20 @@ pub enum AppAction {
     CopyLog,
     ClearLog,
     SetLogAutoScroll(bool),
+    SelectTab(AppTab),
+    /// List the devices again, in a job.
+    RefreshDevices,
+    /// The top bar's elevation button.
+    RequestElevation,
+    /// The answer to the shell's "restart as root?" dialog (Linux).
+    ConfirmElevation(bool),
+    DismissUpdate,
+    /// Download and install the announced release (Windows).
+    InstallUpdate,
+    /// After a failed install, offer it again.
+    RetryUpdate,
+    /// Run the installed update (Windows; exits this process).
+    RestartApp,
 }
 
 pub struct AppController {
@@ -53,6 +81,9 @@ pub struct AppController {
     notify: Arc<dyn Notify>,
     #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
     config: Box<dyn ConfigStore>,
+    shell: shell::ShellState,
+    #[cfg(feature = "gui")]
+    update: update::UpdateState,
 }
 
 impl AppController {
@@ -65,6 +96,9 @@ impl AppController {
             notify,
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
             config: Box::new(UserConfig),
+            shell: shell::ShellState::default(),
+            #[cfg(feature = "gui")]
+            update: update::UpdateState::default(),
         }
     }
 
@@ -77,6 +111,9 @@ impl AppController {
             notify: Arc::new(NoNotify),
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
             config: Box::<MemoryConfig>::default(),
+            shell: shell::ShellState::default(),
+            #[cfg(feature = "gui")]
+            update: update::UpdateState::default(),
         }
     }
 
@@ -108,11 +145,51 @@ impl Controller for AppController {
                 self.log_auto_scroll = on;
                 Vec::new()
             }
+            AppAction::SelectTab(tab) => {
+                self.select_tab(tab);
+                Vec::new()
+            }
+            AppAction::RefreshDevices => {
+                self.refresh_devices();
+                Vec::new()
+            }
+            AppAction::RequestElevation => {
+                self.request_elevation();
+                Vec::new()
+            }
+            AppAction::ConfirmElevation(yes) => {
+                self.confirm_elevation(yes);
+                Vec::new()
+            }
+            AppAction::DismissUpdate => {
+                #[cfg(feature = "gui")]
+                self.dismiss_update();
+                Vec::new()
+            }
+            AppAction::InstallUpdate => {
+                #[cfg(feature = "gui")]
+                self.install_update();
+                Vec::new()
+            }
+            AppAction::RetryUpdate => {
+                #[cfg(feature = "gui")]
+                self.retry_update();
+                Vec::new()
+            }
+            AppAction::RestartApp => {
+                #[cfg(windows)]
+                crate::update::restart_app();
+                #[cfg(not(windows))]
+                Vec::new()
+            }
         }
     }
 
     fn tick(&mut self) -> Vec<Effect> {
         self.log.extend_from_capture(capture::drain());
+        self.poll_shell();
+        #[cfg(feature = "gui")]
+        self.poll_update();
         Vec::new()
     }
 }

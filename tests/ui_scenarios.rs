@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use toml::Value;
 
-use rusty_backup::controller::app::{AppAction, AppController};
+use rusty_backup::controller::app::{AppAction, AppController, AppTab, DropTargets};
 use rusty_backup::controller::{Controller, Effect};
 use rusty_backup::model::job::{Job, JobCtx, Status};
 
@@ -75,9 +75,11 @@ fn arg_str(arg: Option<&Value>) -> Result<&str, String> {
         .ok_or_else(|| "this action needs a string `arg`".to_string())
 }
 
-/// `AppController`. Actions: `CopyLog`, `ClearLog`, `SetLogAutoScroll` (bool arg), and the
-/// test-only `LogInfo` / `LogWarn` / `LogError` (string arg). Probes: `log_lines`,
-/// `log_text`, `log_auto_scroll`, `jobs_running`.
+/// `AppController`. Actions: `CopyLog`, `ClearLog`, `SetLogAutoScroll` (bool arg), `SelectTab`
+/// (`backup`, `restore`, `inspect`, `optical`, `archives`), `Drop` (a path, with no tab busy),
+/// `ShareBackup` (a folder a tab opened) / `AdoptBackup` (an empty tab asks), `CloseBackup`, and
+/// the test-only `LogInfo` / `LogWarn` / `LogError` (string arg). Probes: `log_lines`,
+/// `log_text`, `log_auto_scroll`, `jobs_running`, `active_tab`, `last_route`, `shared_backup`.
 impl Target for AppController {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
         let a = match action {
@@ -87,6 +89,30 @@ impl Target for AppController {
                 arg.and_then(Value::as_bool)
                     .ok_or("SetLogAutoScroll needs a bool `arg`")?,
             ),
+            "SelectTab" => AppAction::SelectTab(match arg_str(arg)? {
+                "backup" => AppTab::Backup,
+                "restore" => AppTab::Restore,
+                "inspect" => AppTab::Inspect,
+                "optical" => AppTab::Optical,
+                "archives" => AppTab::Archives,
+                other => return Err(format!("no tab {other:?}")),
+            }),
+            "Drop" => {
+                let route = self.route_drop(PathBuf::from(arg_str(arg)?), DropTargets::default());
+                self.log.info(format!("route: {route:?}"));
+                return Ok(Vec::new());
+            }
+            "ShareBackup" | "AdoptBackup" => {
+                let loaded =
+                    (action == "ShareBackup").then(|| PathBuf::from(arg_str(arg).unwrap_or("")));
+                let step = self.share_backup(loaded, action == "AdoptBackup");
+                self.log.info(format!("share: {step:?}"));
+                return Ok(Vec::new());
+            }
+            "CloseBackup" => {
+                self.close_shared_backup();
+                return Ok(Vec::new());
+            }
             "LogInfo" => {
                 self.log.info(arg_str(arg)?);
                 return Ok(Vec::new());
@@ -110,6 +136,12 @@ impl Target for AppController {
             "log_text" => Value::String(self.log.to_text()),
             "log_auto_scroll" => Value::Boolean(self.log_auto_scroll()),
             "jobs_running" => Value::Integer(self.jobs().running().len() as i64),
+            "active_tab" => Value::String(format!("{:?}", self.active_tab())),
+            "shared_backup" => Value::String(
+                self.shared_backup()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
             other => return Err(format!("AppController has no probe {other:?}")),
         })
     }
@@ -1329,6 +1361,59 @@ impl Target for ArchivesTarget {
     }
 }
 
+/// `SettingsController` over an in-memory config with two recent files. Actions: `Open`,
+/// `SetUpdateCheck` (bool), `SetRepoUrl`, `ClearRecent`, `Save`, `Close`. Probes: `open`,
+/// `update_check`, `repo_url`, `recent_count`, `status`, `cleared`.
+struct SettingsTarget(rusty_backup::controller::settings::SettingsController);
+
+impl SettingsTarget {
+    fn new() -> Self {
+        use rusty_backup::controller::app::{ConfigStore, MemoryConfig};
+        let mut store = MemoryConfig::default();
+        let mut cfg = store.load();
+        cfg.remember_file(rusty_backup::update::RecentMode::Inspect, "/a.img");
+        cfg.remember_file(rusty_backup::update::RecentMode::Archives, "/b.sit");
+        store.save(&cfg);
+        SettingsTarget(
+            rusty_backup::controller::settings::SettingsController::with_store(Box::new(store)),
+        )
+    }
+}
+
+impl Target for SettingsTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::settings::SettingsAction as A;
+        let a = match action {
+            "Open" => A::Open,
+            "SetUpdateCheck" => A::SetUpdateCheck(
+                arg.and_then(Value::as_bool)
+                    .ok_or("SetUpdateCheck needs a bool")?,
+            ),
+            "SetRepoUrl" => A::SetRepoUrl(arg_str(arg)?.to_string()),
+            "ClearRecent" => A::ClearRecent,
+            "Save" => A::Save,
+            "Close" => A::Close,
+            other => return Err(format!("SettingsController has no action {other:?}")),
+        };
+        Ok(self.0.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "open" => Value::Boolean(self.0.is_open()),
+            "update_check" => Value::Boolean(self.0.update_check()),
+            "repo_url" => Value::String(self.0.repo_url().to_string()),
+            "recent_count" => Value::Integer(self.0.recent_count() as i64),
+            "status" => Value::String(self.0.status().unwrap_or("").to_string()),
+            other => return Err(format!("SettingsController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.0.tick()
+    }
+}
+
 /// `ResizeController`, opened from Inspect's plan. Actions: `Open` (arg: `$sgi` writes a 64 MiB
 /// SGI volume header + EFS disk image and inspects it), `Custom` / `Original` (the EFS row's
 /// mode), `SetSize` (MiB as a string), `Preview`, `Apply`, `Close`. Probes: `open`, `rows`,
@@ -1643,6 +1728,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
         "bulk_convert" => Ok(Box::new(BulkConvertTarget::new())),
         "archives" => Ok(Box::new(ArchivesTarget::new())),
+        "settings" => Ok(Box::new(SettingsTarget::new())),
         "resize" => Ok(Box::new(ResizeTarget::new())),
         #[cfg(all(feature = "optical", feature = "native-zstd"))]
         "optical" => Ok(Box::new(OpticalTarget::new())),
