@@ -7456,10 +7456,11 @@ mod tests {
     #[test]
     fn the_optical_screen_starts_the_rip_through_the_controller() {
         let mut app = App::new_on(BACKUP_TAB);
-        let mut o = OpticalState::default();
-        o.step = OpticalStep::Config;
-        o.field = 3;
-        app.optical = Some(o);
+        app.optical = Some(OpticalState {
+            step: OpticalStep::Config,
+            field: 3,
+            ..OpticalState::default()
+        });
         app.start_optical_rip();
         let o = app.optical.as_ref().unwrap();
         assert_eq!(o.result.as_deref(), Some("Enter an output path."));

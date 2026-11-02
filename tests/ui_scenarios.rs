@@ -34,10 +34,7 @@ struct Scenario {
 
 /// Whether this build has a feature a scenario `requires`.
 fn has_feature(name: &str) -> bool {
-    match name {
-        "optical" => cfg!(all(feature = "optical", feature = "native-zstd")),
-        _ => false,
-    }
+    name == "optical" && cfg!(all(feature = "optical", feature = "native-zstd"))
 }
 
 #[derive(Debug, Deserialize)]

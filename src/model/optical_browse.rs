@@ -140,7 +140,7 @@ pub struct DiscChoice {
 impl DiscChoice {
     fn open(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
         open_choice(
-            &*self.info,
+            self.info.as_ref(),
             self.src.path.as_path(),
             self.src.physical,
             self.selected,
@@ -191,7 +191,7 @@ impl DiscChoice {
 
     /// The selected filesystem's type (the primary, or the chosen hybrid side).
     pub fn fs_type(&self) -> Option<FilesystemType> {
-        selected_fs_type(&*self.info, self.selected)
+        selected_fs_type(self.info.as_ref(), self.selected)
     }
 
     /// Extract `entry` (a file or a folder) into `dest`; the number of files written.
