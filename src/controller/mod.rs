@@ -32,6 +32,7 @@ pub mod log;
 pub mod partition_edit;
 #[cfg(feature = "remote")]
 pub mod remote_pick;
+pub mod resize;
 pub mod restore;
 
 /// A job's outcome once it ended: its result, or why it failed or was cancelled.

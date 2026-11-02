@@ -1,0 +1,38 @@
+# Resize Partitions on an image file: a bad size is refused at Preview, then the EFS partition of
+# a 64 MiB IRIX disk shrinks to 32 MiB and the image file is trimmed after it (34 MiB with the
+# volume header ahead of it).
+name = "Resize: shrink an EFS partition"
+vm = "resize"
+
+[[step]]
+action = "Open"
+arg = "$sgi"
+expect = { open = true, can_apply = false, file_mib = 64 }
+
+[[step]]
+action = "Custom"
+
+[[step]]
+action = "SetSize"
+arg = "lots"
+
+[[step]]
+action = "Preview"
+expect = { plan_error = "~Invalid size for partition", can_apply = false }
+
+[[step]]
+action = "SetSize"
+arg = "32"
+
+[[step]]
+action = "Preview"
+expect = { plan_error = "", preview = "~32.0 MiB Resize", can_apply = true }
+
+[[step]]
+action = "Apply"
+settle = true
+expect = { changed = true, log = "~Partition resize completed successfully", file_mib = 34 }
+
+[[step]]
+action = "Close"
+expect = { open = false }

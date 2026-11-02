@@ -1029,3 +1029,48 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    (a port outside 1..65535, spaces or a slash are refused; it accepted anything non-empty and
    failed at connect); a connect or reopen shows the shared job widget instead of a spinner;
    Disconnect is ignored while a connect is still running (its button was already disabled).
+7. `src/gui/resize_popup.rs` (22 -> 0): `controller::resize::ResizeController` starts from
+   Inspect's `ResizePlan` (`Open`) and owns the size grid (`ResizeRow`: `SetMode` stamps Original /
+   Minimum, `SetSizeText` edits a Custom row), the Current / After bars (`layout()`, as
+   `partition_edit::LayoutBar`s plus their shared scale), `Preview` (`PreviewRow`s or
+   `plan_error`), `AcceptDeviceRisk`, `Apply` and `Cancel`, and tells the host to re-read the table
+   when a write ends (`take_disk_changed`, which the tab turns into `InspectAction::DiskChanged`).
+   `model::partition_resize` holds the one size-field parser (`parsed_new_size`, `stamp_mib`, with
+   the popup's regression tests) and `run_resize`, the popup's worker body moved verbatim (open
+   read-write or the device handle, VHD detection, `apply_resize`, the shrunk-file trim). The
+   write is a job over it through `run_mirrored` (engine lines to the log panel as they come,
+   bytes to the bar). `tests/resize_suite` `the_resize_controller_writes_the_same_bytes_as_the_engine`
+   checks the controller's bytes against `compute_resize_plan` + `apply_resize` on an IRIX disk;
+   `tests/ui_scenarios/resize_shrink.toml` refuses a bad size, then shrinks an EFS partition and
+   checks the file was trimmed. `rb-cli resize` resizes one filesystem inside its partition (a
+   different operation) and is unchanged.
+   Behaviour: the write's progress is the shared job widget (step, percentage, rate, time left);
+   its Cancel still only logs "Resize cancellation requested..." because `apply_resize` has no stop
+   point (as before).
+
+Shells' engine references 238 -> 181 (`resize_popup.rs` 22, `remote_browser.rs` 12,
+`floppy_convert_dialog.rs` 8, `progress.rs` 7, `expand_hfs_dialog.rs` 4, `alto_resize_dialog.rs` 2,
+`squashfs_budget_dialog.rs` 2, each -> 0 and enforced).
+
+### Behaviour changes
+
+- GUI: listed with each step above. In short: the Alto summary and write, the floppy source sniff,
+  and the remote reopen run as jobs instead of on the UI thread; pickers are the shared
+  `EffectHost` ones (titled); the remote connect prompt validates the address as it is typed; the
+  floppy converter cannot be closed or re-sourced while it writes; the resize and remote waits use
+  the shared job widget.
+- TUI: none (it has none of these dialogs).
+- CLI: none. `rb-cli expand`, `rb-cli floppy convert` and `rb-cli resize` keep their own argument
+  handling and output; sharing the controllers' validation would change their messages.
+
+### Left
+
+- Resize's Cancel does nothing but log a line: `partition::resize::apply_resize` has no
+  cancellation point. Making it stop safely mid-move is an engine change for a later slice.
+- The TUI has none of these dialogs; each is now a controller a TUI screen can drive headless.
+- The remote picker could become the browser pane with a "pick image" profile instead of its own
+  small listing controller.
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+- Shells still reaching the engine: `tui_app.rs` (57), `optical_tab.rs` (33), `gui/mod.rs` (22),
+  `optical/browse_view.rs` (19), `archives_tab.rs` (12), `metadata_editor.rs` (11),
+  `bulk_convert_dialog.rs` (7), `file_detail.rs` (5), and a few one- to three-reference helpers.

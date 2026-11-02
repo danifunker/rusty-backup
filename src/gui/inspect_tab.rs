@@ -472,11 +472,9 @@ impl InspectTab {
         }
 
         let mut resize_finished = false;
-        if let Some(ref mut popup) = self.resize_popup {
-            let was_running = popup.is_running();
-            popup.poll_status(ctx.log);
-            resize_finished = was_running && !popup.is_running();
-            if !popup.show(ui, ctx.devices, ctx.log) {
+        if let Some(popup) = self.resize_popup.as_mut() {
+            resize_finished = popup.poll(ctx.log);
+            if !popup.show(ui, ctx.log) {
                 self.resize_popup = None;
             }
         }
@@ -661,21 +659,9 @@ impl InspectTab {
     }
 
     fn open_resize_popup(&mut self) {
-        let Some(plan) = self.ctl.resize_plan() else {
-            return;
-        };
-        self.resize_popup = Some(Box::new(super::resize_popup::ResizePopup::new(
-            plan.partitions.as_slice(),
-            plan.table,
-            &plan.min_sizes,
-            plan.alignment_sectors,
-            super::resize_popup::ContainerInfo {
-                size_bytes: plan.size_bytes,
-                is_device: plan.is_device,
-                can_grow: plan.can_grow,
-            },
-            plan.path,
-        )));
+        if let Some(plan) = self.ctl.resize_plan() {
+            self.resize_popup = Some(Box::new(super::resize_popup::ResizePopup::new(plan)));
+        }
     }
 
     /// Small windows for running tools (check, table write, Make Bootable, expand, defragment).

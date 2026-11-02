@@ -43,6 +43,7 @@ pub mod multi_volume_fs;
 #[cfg(feature = "optical")]
 pub mod optical_devices;
 pub mod partition_editor;
+pub mod partition_resize;
 pub mod physical_write_runner;
 pub mod provision_runner;
 pub mod rate_tracker;

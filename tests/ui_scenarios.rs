@@ -1072,6 +1072,134 @@ impl Target for FloppyConvertTarget {
     }
 }
 
+/// `ResizeController`, opened from Inspect's plan. Actions: `Open` (arg: `$sgi` writes a 64 MiB
+/// SGI volume header + EFS disk image and inspects it), `Custom` / `Original` (the EFS row's
+/// mode), `SetSize` (MiB as a string), `Preview`, `Apply`, `Close`. Probes: `open`, `rows`,
+/// `plan_error`, `preview`, `can_apply`, `changed` (a write ended), `log`, `file_mib`.
+struct ResizeTarget {
+    ctl: rusty_backup::controller::resize::ResizeController,
+    dir: tempfile::TempDir,
+    efs: usize,
+    changed: bool,
+    log: Vec<String>,
+}
+
+impl ResizeTarget {
+    fn new() -> Self {
+        ResizeTarget {
+            ctl: rusty_backup::controller::resize::ResizeController::new(std::sync::Arc::new(
+                rusty_backup::model::job::NoNotify,
+            )),
+            dir: tempfile::tempdir().expect("temp dir"),
+            efs: 0,
+            changed: false,
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self) {
+        self.changed |= self.ctl.take_disk_changed();
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+    }
+
+    fn open_sgi(&mut self) -> Result<rusty_backup::controller::resize::ResizePlan, String> {
+        use rusty_backup::controller::inspect::{
+            InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
+            NoNotify,
+        };
+        use rusty_backup::partition::sgi_hdd_builder::{build_sgi_efs_hdd, SgiHddOptions};
+        let (img, _) = build_sgi_efs_hdd(&SgiHddOptions::new(64 << 20, "scenario"))
+            .map_err(|e| e.to_string())?;
+        let path = self.dir.path().join("irix.img");
+        std::fs::write(&path, img).map_err(|e| e.to_string())?;
+        let mut inspect = InspectController::new(InspectServices {
+            jobs: JobRegistry::new(),
+            notify: std::sync::Arc::new(NoNotify),
+        });
+        inspect.apply(InspectAction::Open(InspectSource::Image { path, temp: None }));
+        while inspect.loading().is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            inspect.tick();
+        }
+        let plan = inspect.resize_plan().ok_or("no table to resize")?;
+        self.efs = plan
+            .partitions
+            .iter()
+            .find(|p| p.partition_type_byte == 0xA1)
+            .map(|p| p.index)
+            .ok_or("no EFS partition")?;
+        Ok(plan)
+    }
+}
+
+impl Target for ResizeTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::resize::{ResizeAction, SizeMode};
+        let index = self.efs;
+        let a = match action {
+            "Open" => {
+                if arg_str(arg)? != "$sgi" {
+                    return Err("Open takes $sgi".into());
+                }
+                ResizeAction::Open(self.open_sgi()?)
+            }
+            "Custom" => ResizeAction::SetMode {
+                index,
+                mode: SizeMode::Custom,
+            },
+            "Original" => ResizeAction::SetMode {
+                index,
+                mode: SizeMode::Original,
+            },
+            "SetSize" => ResizeAction::SetSizeText {
+                index,
+                text: arg_str(arg)?.to_string(),
+            },
+            "Preview" => ResizeAction::Preview,
+            "Apply" => ResizeAction::Apply,
+            "Close" => ResizeAction::Close,
+            other => return Err(format!("ResizeController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        self.note();
+        Ok(fx)
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "rows" => Value::Integer(self.ctl.rows().len() as i64),
+            "plan_error" => Value::String(self.ctl.plan_error().unwrap_or("").to_string()),
+            "preview" => Value::String(
+                self.ctl
+                    .preview()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|r| format!("{} {}", r.new_size, r.action))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            "can_apply" => Value::Boolean(self.ctl.can_apply()),
+            "changed" => Value::Boolean(self.changed),
+            "log" => Value::String(self.log.join("\n")),
+            "file_mib" => Value::Integer(
+                std::fs::metadata(self.dir.path().join("irix.img"))
+                    .map(|m| (m.len() >> 20) as i64)
+                    .unwrap_or(0),
+            ),
+            other => return Err(format!("ResizeController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        let fx = self.ctl.tick();
+        self.note();
+        fx
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
@@ -1082,6 +1210,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
         "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
+        "resize" => Ok(Box::new(ResizeTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

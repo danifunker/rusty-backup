@@ -10,8 +10,9 @@
 //! The egui Inspect tab (`src/gui/inspect_tab.rs`) is the shell: it maps the source picker,
 //! buttons and dialogs onto [`InspectAction`]s, fulfils the [`Effect`]s (pickers, confirmations),
 //! drains [`InspectController::take_log`] into the log panel and carries out each
-//! [`HostRequest`]. Dialogs with their own widgets (resize, Expand HFS, Alto resize, floppy
-//! convert, physical export, the partition-table editor) take their inputs from accessors here.
+//! [`HostRequest`]. Dialogs with their own controllers start from accessors here: resize
+//! (`controller::resize` from [`InspectController::resize_plan`]), Expand HFS
+//! (`controller::expand_hfs`), Alto resize, floppy convert, the remote picker, and the disk writer.
 //! See docs/phase2_commander_plan.md § "Slice 11".
 
 mod browse;

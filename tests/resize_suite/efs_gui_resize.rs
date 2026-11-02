@@ -282,3 +282,89 @@ fn gui_grows_the_image_itself_then_the_efs_partition() {
     );
     assert_healthy(&grown, grown_offset);
 }
+
+/// The Resize Partitions window's controller writes exactly what the planner + applier write:
+/// Inspect builds the plan from the image file, `controller::resize` previews and applies it.
+#[test]
+fn the_resize_controller_writes_the_same_bytes_as_the_engine() {
+    use rusty_backup::controller::inspect::{
+        InspectAction, InspectController, InspectServices, InspectSource, JobRegistry, NoNotify,
+    };
+    use rusty_backup::controller::resize::{ResizeAction, ResizeController, SizeMode};
+    use rusty_backup::controller::Controller;
+    use std::sync::Arc;
+
+    let img = build_seeded_disk();
+    let (offset, _) = efs_slice(&img);
+    let want = gui_resize(img.clone(), 100 * 1024 * 1024);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("irix.img");
+    std::fs::write(&path, &img).unwrap();
+    let mut inspect = InspectController::new(InspectServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(NoNotify),
+    });
+    inspect.apply(InspectAction::Open(InspectSource::Image {
+        path: path.clone(),
+        temp: None,
+    }));
+    while inspect.loading().is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        inspect.tick();
+    }
+    let plan = inspect.resize_plan().expect("a table to resize");
+    let align = plan.alignment_sectors;
+    let efs = plan
+        .partitions
+        .iter()
+        .find(|p| p.partition_type_byte == 0xA1)
+        .map(|p| p.index)
+        .unwrap();
+
+    let mut ctl = ResizeController::new(Arc::new(NoNotify));
+    ctl.apply(ResizeAction::Open(plan));
+    ctl.apply(ResizeAction::SetMode {
+        index: efs,
+        mode: SizeMode::Custom,
+    });
+    ctl.apply(ResizeAction::SetSizeText {
+        index: efs,
+        text: "100".into(),
+    });
+    assert!(!ctl.can_apply(), "Apply waits for a preview");
+    ctl.apply(ResizeAction::Preview);
+    assert!(ctl.plan_error().is_none(), "{:?}", ctl.plan_error());
+    assert_eq!(ctl.preview().map(|p| p.len()), Some(1));
+    ctl.apply(ResizeAction::Apply);
+    assert!(ctl.is_running());
+    ctl.wait_idle();
+    assert!(ctl.take_disk_changed());
+    let log: Vec<String> = ctl.take_log().into_iter().map(|(_, l)| l).collect();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("Partition resize completed")),
+        "{log:?}"
+    );
+    let got = std::fs::read(&path).unwrap();
+    // The window also trims a shrunk image file to its new last partition end, as it always did.
+    let table = PartitionTable::detect(&mut Cursor::new(&img)).unwrap();
+    let plans = compute_resize_plan(
+        &table.partitions(),
+        &[(efs, 100 * 1024 * 1024)],
+        align,
+        img.len() as u64,
+    )
+    .unwrap();
+    let end = plans
+        .iter()
+        .map(|p| p.new_start_lba * 512 + p.new_size_bytes)
+        .max()
+        .unwrap();
+    assert_eq!(got.len() as u64, end);
+    assert!(
+        got[..] == want[..got.len()],
+        "the controller wrote different bytes"
+    );
+    assert_healthy(&got, offset);
+}

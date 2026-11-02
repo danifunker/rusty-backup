@@ -1,10 +1,7 @@
 use egui::RichText;
-use rusty_backup::controller::app::{format_size, AppController, Snapshot};
+use rusty_backup::controller::app::{format_size, AppController, RateTracker, Snapshot};
 use rusty_backup::controller::log::{LogLevel, LogStore};
 use rusty_backup::controller::Controller;
-
-// The rate/ETA estimator is shared with the CLI; re-exported for the tabs that use it.
-pub use rusty_backup::controller::app::RateTracker;
 
 /// Draw the log panel at the bottom of the window from the app view-model.
 pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
