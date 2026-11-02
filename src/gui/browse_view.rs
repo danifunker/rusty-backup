@@ -13,19 +13,17 @@ use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, Write
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::Filesystem;
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
-use fs_mac::fork_export;
-use fs_mac::resource_fork::{self, ResourceForkMode};
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, JobRegistry,
-    ListingStyle, PaneProfile, PaneServices, RowKind, Side,
+    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, ExtractOptions,
+    JobRegistry, ListingStyle, PaneProfile, PaneServices, ResourceForkMode, RowKind, Side,
+    Snapshot,
 };
 use rusty_backup::controller::Controller as _;
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
 use rusty_backup::model::browse_session::BrowseSession;
 use rusty_backup::model::edit_queue::StagedEdit;
-use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::rbformats::chd_edit;
 
 use super::commander::pane::PaneView;
@@ -129,8 +127,8 @@ pub struct BrowseView {
     show_deleted: bool,
     /// Convert RS line separators in text files to LF on extract (QNX 2).
     rs_to_lf: bool,
-    /// Active extraction progress (shared with background thread).
-    extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
+    /// An extraction runs as the screen's copy job; its status line becomes the result.
+    extracting: bool,
     /// Message to show after extraction completes.
     extraction_result: Option<String>,
     /// Temp dir an "Open as Disk Image" extraction is writing into, until it finishes.
@@ -217,8 +215,6 @@ pub struct BrowseView {
     staging_errors: Vec<(PathBuf, String)>,
     /// Whether the staging-errors modal dialog is open.
     show_staging_errors: bool,
-    /// Extraction parameters awaiting overwrite confirmation.
-    pending_extraction: Option<PendingExtraction>,
     /// Live CHD edit-mode state. Present while editing a CHD via
     /// [`chd_edit::ChdEditSession`] (diff-against-parent for compressed,
     /// in-place for uncompressed). The `Arc<Mutex<ChdEditSession>>` itself
@@ -376,15 +372,6 @@ struct PendingTarImport {
     preflight: fs_tar::tar_import::TarImportPreflight,
 }
 
-/// Captured state from `start_extraction` so the extraction can resume after
-/// the user answers the overwrite confirmation dialog.
-struct PendingExtraction {
-    entry: FileEntry,
-    dest: PathBuf,
-    /// Path(s) at `dest` that already exist and would be replaced.
-    conflicts: Vec<PathBuf>,
-}
-
 /// How to encode ProDOS file type/aux when extracting files to a host
 /// directory. Only meaningful for ProDOS filesystems.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -444,7 +431,7 @@ impl Default for BrowseView {
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
             show_deleted: false,
             rs_to_lf: false,
-            extraction_progress: None,
+            extracting: false,
             extraction_result: None,
             nested_open: None,
             nested_ready: None,
@@ -477,7 +464,6 @@ impl Default for BrowseView {
             pending_close: false,
             staging_errors: Vec::new(),
             show_staging_errors: false,
-            pending_extraction: None,
             chd_edit: None,
             chd_flatten_progress: None,
             squashfs_budget_dialog: None,
@@ -523,11 +509,7 @@ impl BrowseView {
     /// The label of a running extract, archive edit, CHD flatten or tar export, if any.
     pub fn running_job(&self) -> Option<&'static str> {
         use rusty_backup::model::worker::lock_status;
-        if self
-            .extraction_progress
-            .as_ref()
-            .is_some_and(|p| !lock_status(p).finished)
-        {
+        if self.extracting && self.ctl.copy_job().is_some() {
             Some("Extract")
         } else if self
             .archive_edit_progress
@@ -767,7 +749,7 @@ impl BrowseView {
         self.volume_label.clear();
         self.label_prefix.clear();
         self.session = BrowseSession::new();
-        self.extraction_progress = None;
+        self.extracting = false;
         self.extraction_result = None;
         self.edit_mode = false;
         self.edit_supported = false;
@@ -807,7 +789,6 @@ impl BrowseView {
         // Dialogs and editors that name a file on the volume being closed;
         // left open, their Save/Overwrite acted on the next volume.
         self.text_editor = None;
-        self.pending_extraction = None;
         self.boot_blocks_present = None;
         self.pane_stale = false;
     }
@@ -1009,7 +990,7 @@ impl BrowseView {
             self.journal_view = Some(super::journal_view::JournalView::new(detail));
         }
         // Poll extraction progress
-        self.poll_extraction(ui);
+        self.poll_extraction();
 
         // Unlock prompt for an encrypted container (e.g. IMZ with ZipCrypto)
         // or an encrypted filesystem (APFS FileVault). The retry loop is shared:
@@ -1135,7 +1116,7 @@ impl BrowseView {
 
             // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
             if self.edit_supported && self.fs_type != "Pilot/Cedar" {
-                let busy = self.extraction_progress.is_some()
+                let busy = self.extracting
                     || self.archive_edit_progress.is_some()
                     || self.chd_flatten_progress.is_some();
                 ui.add_space(8.0);
@@ -1401,7 +1382,6 @@ impl BrowseView {
         self.render_staging_errors_dialog(ui);
 
         // Extraction overwrite-confirm dialog
-        self.render_extract_overwrite_dialog(ui);
 
         // Workflow A: Mac archive import modal (Convert / Expand / Add as-is).
         self.render_archive_import_dialog(ui);
@@ -1455,6 +1435,7 @@ impl BrowseView {
         let mut acts = Vec::new();
         type Cm = super::commander::CommanderMode;
         Cm::render_checksum_window(&self.ctl, &ctx, &mut acts);
+        Cm::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
         Cm::render_log_window(&self.ctl, &ctx, &mut acts);
         Cm::render_help(&self.ctl, &ctx, &mut acts);
         Cm::render_view_window(&self.ctl, &ctx, &mut acts);
@@ -1893,6 +1874,12 @@ impl BrowseView {
 
     /// The export's progress window, then its status line as the result.
     fn poll_export(&mut self, ui: &mut egui::Ui) {
+        if self.extracting {
+            if let Some((_, snap)) = self.ctl.copy_job() {
+                self.show_copy_job(ui, "Extracting", &snap);
+            }
+            return;
+        }
         if !self.exporting {
             return;
         }
@@ -1907,12 +1894,17 @@ impl BrowseView {
             }
             return;
         };
+        self.show_copy_job(ui, title, &snap);
+    }
+
+    /// The screen's copy job as a window with Cancel.
+    fn show_copy_job(&mut self, ui: &mut egui::Ui, title: &str, snap: &Snapshot) {
         let mut cancel = false;
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                cancel = super::progress::show_job(ui, &snap);
+                cancel = super::progress::show_job(ui, snap);
             });
         if cancel {
             self.ctl.apply(CommanderAction::CancelCopy);
@@ -2053,35 +2045,6 @@ impl BrowseView {
     }
 
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
-        // Extraction progress bar
-        if let Some(progress) = &self.extraction_progress {
-            if let Ok(p) = progress.lock() {
-                let fraction = if p.total_bytes > 0 {
-                    p.current_bytes as f32 / p.total_bytes as f32
-                } else if p.total_files > 0 {
-                    p.files_extracted as f32 / p.total_files as f32
-                } else {
-                    0.0
-                };
-                let text = format!(
-                    "Extracting {}/{} files: {}",
-                    p.files_extracted, p.total_files, p.current_file
-                );
-                ui.add(egui::ProgressBar::new(fraction).text(text));
-                if !p.finished {
-                    // Clone progress Arc to allow the mutable borrow for the button
-                    let progress_clone = Arc::clone(progress);
-                    drop(p);
-                    if ui.button("Cancel").clicked() {
-                        if let Ok(mut p) = progress_clone.lock() {
-                            p.cancel_requested = true;
-                        }
-                    }
-                    ui.separator();
-                }
-            }
-        }
-
         let entry = self.selected_entry.clone();
         let shown = self.render_detail(ui, entry.as_ref());
         // A row inside an expanded archive or image: details only, its actions act on this volume.
@@ -2116,7 +2079,7 @@ impl BrowseView {
         }
 
         // Extract controls row
-        let extraction_running = self.extraction_progress.is_some();
+        let extraction_running = self.extracting;
         let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
 
         // The Mac-archive workflows only make sense on Mac-native
@@ -2179,7 +2142,8 @@ impl BrowseView {
                     "Extract File..."
                 };
                 if ui.button(btn_label).clicked() {
-                    self.start_extraction(&entry);
+                    let ctx = ui.ctx().clone();
+                    self.start_extraction(&ctx, &entry, None);
                 }
 
                 // Archive the selected folder/file to a tar.gz instead
@@ -2216,7 +2180,8 @@ impl BrowseView {
                         )
                         .clicked()
                 {
-                    self.start_nested_open(&entry);
+                    let ctx = ui.ctx().clone();
+                    self.start_nested_open(&ctx, &entry);
                 }
 
                 // Workflow C: the selection already sniffed as a
@@ -2398,7 +2363,7 @@ impl BrowseView {
     }
 
     /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
-    fn start_nested_open(&mut self, entry: &FileEntry) {
+    fn start_nested_open(&mut self, ctx: &egui::Context, entry: &FileEntry) {
         if !self.ctl.pane(Side::Left).queue.is_empty() {
             self.extraction_result = Some(
                 "Apply or discard the staged edits first: opening a disk image replaces this view."
@@ -2429,128 +2394,33 @@ impl BrowseView {
         }
         let dest = temp.path().to_path_buf();
         self.nested_open = Some(temp);
-        let mode = std::mem::replace(&mut self.resource_fork_mode, ResourceForkMode::DataForkOnly);
-        self.launch_extraction(entry.clone(), dest);
-        self.resource_fork_mode = mode;
+        self.start_extraction(ctx, entry, Some(dest));
     }
 
-    fn start_extraction(&mut self, entry: &FileEntry) {
-        // Pick destination folder
-        let dest = match rfd::FileDialog::new()
-            .set_title("Extract to folder")
-            .pick_folder()
-        {
-            Some(d) => d,
-            None => return,
-        };
-
-        let conflicts = self.detect_extract_conflicts(entry, &dest);
-        if !conflicts.is_empty() {
-            self.pending_extraction = Some(PendingExtraction {
-                entry: entry.clone(),
-                dest,
-                conflicts,
-            });
+    /// Extract `entry` through the screen (a picker unless `dest` is given; existing files are reviewed).
+    fn start_extraction(&mut self, ctx: &egui::Context, entry: &FileEntry, dest: Option<PathBuf>) {
+        if self.ctl.copy_job().is_some() {
             return;
         }
-
-        self.launch_extraction(entry.clone(), dest);
-    }
-
-    /// Collect existing paths under `dest` that the extraction would overwrite.
-    /// Only top-level collisions are considered (the primary output plus any
-    /// sidecar file for HFS resource-fork modes).
-    fn detect_extract_conflicts(&self, entry: &FileEntry, dest: &std::path::Path) -> Vec<PathBuf> {
-        let base = resource_fork::sanitize_filename(&entry.name);
-        let safe_name = if self.is_prodos_type()
-            && entry.is_file()
-            && self.prodos_export_mode == ProdosExportMode::WithTypeSuffix
-        {
-            let tt = entry.prodos_file_type.unwrap_or(0x06);
-            let aux = entry.aux_type.unwrap_or(0);
-            format!(
-                "{}{}",
-                base,
-                fs_apple2::prodos_types::encode_cp_suffix(tt, aux)
-            )
-        } else {
-            base
+        // An image opened from inside the volume wants its bytes, not its forks.
+        let fork_mode = match dest {
+            Some(_) => ResourceForkMode::DataForkOnly,
+            None => self.resource_fork_mode,
         };
-
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        let has_rsrc = self.is_hfs_type()
-            && entry.is_file()
-            && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
-
-        if has_rsrc && self.resource_fork_mode == ResourceForkMode::MacBinary {
-            candidates.push(dest.join(format!("{safe_name}.bin")));
-        } else if entry.is_file() && self.resource_fork_mode == ResourceForkMode::BinHex {
-            // BinHex packs data + resource fork + Finder info into one .hqx,
-            // regardless of whether a resource fork is present.
-            candidates.push(dest.join(format!("{safe_name}.hqx")));
-        } else {
-            candidates.push(dest.join(&safe_name));
-            if has_rsrc {
-                match self.resource_fork_mode {
-                    ResourceForkMode::AppleDouble => {
-                        candidates.push(dest.join(format!("._{safe_name}")));
-                    }
-                    ResourceForkMode::SeparateRsrc => {
-                        candidates.push(dest.join(format!("{safe_name}.rsrc")));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        candidates.into_iter().filter(|p| p.exists()).collect()
-    }
-
-    /// Spawn the extraction thread. Separated from `start_extraction` so the
-    /// overwrite confirmation dialog can resume it after the user confirms.
-    fn launch_extraction(&mut self, entry: FileEntry, dest: PathBuf) {
-        let session = self.session.clone();
-        let resource_fork_mode = self.resource_fork_mode;
-        let is_prodos = self.is_prodos_type();
-        let prodos_export_mode = self.prodos_export_mode;
-        let rs_to_lf = self.rs_to_lf && self.fs_type == "QNX 2";
-
-        let progress = Arc::new(Mutex::new(ExtractionProgress {
-            current_bytes: 0,
-            total_bytes: 0,
-            current_file: String::new(),
-            files_extracted: 0,
-            files_skipped: 0,
-            total_files: 0,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-        }));
-
-        self.extraction_progress = Some(Arc::clone(&progress));
+        let options = ExtractOptions {
+            fork_mode,
+            prodos_suffix: self.prodos_export_mode == ProdosExportMode::WithTypeSuffix,
+            rs_to_lf: self.rs_to_lf,
+        };
+        let act = CommanderAction::Extract {
+            from: Side::Left,
+            path: entry.path.clone(),
+            options,
+            dest,
+        };
+        self.extracting = true;
         self.extraction_result = None;
-
-        rusty_backup::model::worker::spawn_guarded(Arc::clone(&progress), "extract", move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: extract files");
-            let result = run_extraction(
-                &session,
-                &entry,
-                &dest,
-                resource_fork_mode,
-                is_prodos,
-                prodos_export_mode,
-                rs_to_lf,
-                &progress,
-            );
-
-            if let Ok(mut p) = progress.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e}"));
-                }
-            }
-            Ok(())
-        });
+        self.dispatch(ctx, act);
     }
 
     /// Get the parent entry for the currently selected entry, or root if nothing selected.
@@ -3527,8 +3397,7 @@ impl BrowseView {
             // or tar export is still reading the volume the apply would rewrite.
             if !self.ctl.pane(Side::Left).queue.is_empty() {
                 let label = format!("Apply Edits ({})", self.ctl.pane(Side::Left).queue.len());
-                let reading =
-                    self.extraction_progress.is_some() || self.tar_export_progress.is_some();
+                let reading = self.extracting || self.tar_export_progress.is_some();
                 if ui
                     .add_enabled(!reading, egui::Button::new(label))
                     .on_disabled_hover_text("Wait for the running extraction or export to finish")
@@ -4787,81 +4656,6 @@ impl BrowseView {
         }
     }
 
-    /// Render the overwrite confirmation dialog for extraction.
-    fn render_extract_overwrite_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_extraction.is_none() {
-            return;
-        }
-        let (conflict_list, count) = {
-            let pe = self.pending_extraction.as_ref().unwrap();
-            let list: Vec<String> = pe
-                .conflicts
-                .iter()
-                .map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
-                        .to_string()
-                })
-                .collect();
-            (list, pe.conflicts.len())
-        };
-
-        let mut action: Option<bool> = None; // Some(true)=overwrite, Some(false)=cancel
-        egui::Window::new("Overwrite existing file?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ui.ctx(), |ui| {
-                if count == 1 {
-                    ui.label(format!(
-                        "'{}' already exists at the destination.",
-                        conflict_list[0]
-                    ));
-                } else {
-                    ui.label(format!("{count} items already exist at the destination:"));
-                    for name in &conflict_list {
-                        ui.label(format!("  - {name}"));
-                    }
-                }
-                ui.add_space(4.0);
-                ui.label("Overwriting will replace the existing items.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Overwrite").clicked() {
-                        action = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = Some(false);
-                    }
-                });
-            });
-
-        match action {
-            Some(true) => {
-                let pe = self.pending_extraction.take().unwrap();
-                for path in &pe.conflicts {
-                    let res = if path.is_dir() {
-                        std::fs::remove_dir_all(path)
-                    } else {
-                        std::fs::remove_file(path)
-                    };
-                    if let Err(e) = res {
-                        self.extraction_result =
-                            Some(format!("Could not remove '{}': {e}", path.display()));
-                        return;
-                    }
-                }
-                self.launch_extraction(pe.entry, pe.dest);
-            }
-            Some(false) => {
-                self.pending_extraction = None;
-            }
-            None => {}
-        }
-    }
-
-    /// Exit edit mode, clearing all staged state.
     fn exit_edit_mode(&mut self) {
         self.edit_mode = false;
         self.edit_free_space = None;
@@ -5334,249 +5128,35 @@ impl BrowseView {
     /// `None` when unknown — no file-backed source (e.g. a CHD edit session),
     /// or a read error. Only trustworthy in edit mode, where the backing file
     /// holds the raw, decompressed image bytes.
-    fn poll_extraction(&mut self, ui: &egui::Ui) {
-        let finished_msg = if let Some(progress) = &self.extraction_progress {
-            if let Ok(p) = progress.lock() {
-                if p.finished {
-                    Some(if let Some(ref err) = p.error {
-                        format!("Extraction failed: {err}")
-                    } else if p.files_skipped > 0 {
-                        format!(
-                            "Extraction complete: {} files extracted, {} skipped \
-                             (see log for details).",
-                            p.files_extracted, p.files_skipped
-                        )
-                    } else {
-                        format!(
-                            "Extraction complete: {} files extracted.",
-                            p.files_extracted
-                        )
-                    })
-                } else {
-                    ui.ctx().request_repaint();
-                    None
-                }
-            } else {
-                None
+    /// The extraction's progress window, then its status line (or the nested image) as the result.
+    fn poll_extraction(&mut self) {
+        if !self.extracting || self.ctl.copy_job().is_some() || self.effects.modal_open() {
+            return;
+        }
+        if self.ctl.host_conflict().is_some() {
+            return;
+        }
+        self.extracting = false;
+        let said = self.ctl.status().to_string();
+        let Some(temp) = self.nested_open.take() else {
+            if !said.is_empty() {
+                self.extraction_result = Some(said);
             }
-        } else {
-            None
+            return;
         };
-        if let Some(msg) = finished_msg {
-            self.extraction_progress = None;
-            if let Some(temp) = self.nested_open.take() {
-                let extracted = std::fs::read_dir(temp.path())
-                    .ok()
-                    .and_then(|mut d| d.find_map(|e| e.ok()))
-                    .map(|e| e.path());
-                match extracted {
-                    Some(path) if !msg.starts_with("Extraction failed") => {
-                        self.extraction_result =
-                            Some(format!("Opening {} as a disk image...", path.display()));
-                        self.nested_ready = Some((path, temp));
-                    }
-                    _ => {
-                        self.extraction_result =
-                            Some(msg.replacen("Extraction", "Open as disk image", 1));
-                    }
-                }
-                return;
+        let extracted = std::fs::read_dir(temp.path())
+            .ok()
+            .and_then(|mut d| d.find_map(|e| e.ok()))
+            .map(|e| e.path());
+        match extracted {
+            Some(path) => {
+                self.extraction_result =
+                    Some(format!("Opening {} as a disk image...", path.display()));
+                self.nested_ready = Some((path, temp));
             }
-            self.extraction_result = Some(msg);
+            None => self.extraction_result = Some(format!("Open as disk image: {said}")),
         }
     }
-}
-
-/// Run the extraction in a background thread.
-fn run_extraction(
-    session: &BrowseSession,
-    entry: &FileEntry,
-    dest: &std::path::Path,
-    resource_fork_mode: ResourceForkMode,
-    is_prodos: bool,
-    prodos_export_mode: ProdosExportMode,
-    rs_to_lf: bool,
-    progress: &Arc<Mutex<ExtractionProgress>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut counting_fs = session.open()?;
-
-    // Pre-count files and bytes for progress tracking
-    let (total_files, total_bytes) = count_entry(&mut *counting_fs, entry)?;
-    if let Ok(mut p) = progress.lock() {
-        p.total_files = total_files;
-        p.total_bytes = total_bytes;
-    }
-    drop(counting_fs);
-
-    // Open a fresh filesystem for extraction
-    let mut fs = session.open()?;
-
-    extract_entry(
-        &mut *fs,
-        entry,
-        dest,
-        resource_fork_mode,
-        is_prodos,
-        prodos_export_mode,
-        rs_to_lf,
-        progress,
-    )?;
-
-    Ok(())
-}
-
-/// Recursively count files and total bytes for progress tracking.
-fn count_entry(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
-    match entry.entry_type {
-        EntryType::File => {
-            let rsrc = entry.resource_fork_size.unwrap_or(0);
-            Ok((1, entry.size + rsrc))
-        }
-        EntryType::Symlink => Ok((1, 0)),
-        EntryType::Directory => {
-            let children = fs.list_directory(entry)?;
-            let mut total_files = 0u32;
-            let mut total_bytes = 0u64;
-            for child in &children {
-                let (f, b) = count_entry(fs, child)?;
-                total_files += f;
-                total_bytes += b;
-            }
-            Ok((total_files, total_bytes))
-        }
-        EntryType::Special => Ok((0, 0)),
-    }
-}
-
-/// True when the error is the sentinel raised on user cancellation. Such an
-/// error must abort the whole extraction rather than being skipped per-file.
-fn is_cancellation(e: &(dyn std::error::Error + Send + Sync)) -> bool {
-    e.to_string() == "Extraction cancelled"
-}
-
-/// Recursively extract an entry to the destination path.
-#[allow(clippy::too_many_arguments)]
-fn extract_entry(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-    dest: &std::path::Path,
-    resource_fork_mode: ResourceForkMode,
-    is_prodos: bool,
-    prodos_export_mode: ProdosExportMode,
-    rs_to_lf: bool,
-    progress: &Arc<Mutex<ExtractionProgress>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Check for cancellation
-    if let Ok(p) = progress.lock() {
-        if p.cancel_requested {
-            return Err("Extraction cancelled".into());
-        }
-    }
-
-    let base_name = resource_fork::sanitize_filename(&entry.name);
-    // For ProDOS files (not directories) in WithTypeSuffix mode, append the
-    // CiderPress `#TTAAAA` suffix so type and aux round-trip through host.
-    let safe_name =
-        if is_prodos && entry.is_file() && prodos_export_mode == ProdosExportMode::WithTypeSuffix {
-            let tt = entry.prodos_file_type.unwrap_or(0x06);
-            let aux = entry.aux_type.unwrap_or(0);
-            format!(
-                "{}{}",
-                base_name,
-                fs_apple2::prodos_types::encode_cp_suffix(tt, aux)
-            )
-        } else {
-            base_name
-        };
-
-    match entry.entry_type {
-        EntryType::File => {
-            // Update progress with current file name
-            if let Ok(mut p) = progress.lock() {
-                p.current_file = entry.path.clone();
-            }
-
-            if rs_to_lf && entry.size <= 16 << 20 {
-                let data = fs.read_file(entry, usize::MAX)?;
-                if rusty_backup::fs::qnx2::looks_like_rs_text(&data) {
-                    std::fs::write(
-                        dest.join(&safe_name),
-                        rusty_backup::fs::qnx2::rs_to_lf(&data),
-                    )?;
-                    if let Ok(mut p) = progress.lock() {
-                        p.current_bytes += data.len() as u64;
-                        p.files_extracted += 1;
-                    }
-                    return Ok(());
-                }
-            }
-            // All fork formats (MacBinary / BinHex / AppleDouble / Native /
-            // SeparateRsrc / DataForkOnly) go through the shared per-file
-            // exporter so the browse view and Commander produce identical output.
-            // `safe_name` carries any ProDOS `#TTAAAA` suffix computed above.
-            let written =
-                fork_export::export_file_with_fork(fs, entry, dest, &safe_name, resource_fork_mode)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("{e:#}").into()
-                    })?;
-            if let Ok(mut p) = progress.lock() {
-                p.current_bytes += written;
-                p.files_extracted += 1;
-            }
-        }
-        EntryType::Directory => {
-            let dir_path = dest.join(&safe_name);
-            std::fs::create_dir_all(&dir_path)?;
-
-            let children = fs.list_directory(entry)?;
-            for child in &children {
-                match extract_entry(
-                    fs,
-                    child,
-                    &dir_path,
-                    resource_fork_mode,
-                    is_prodos,
-                    prodos_export_mode,
-                    rs_to_lf,
-                    progress,
-                ) {
-                    Ok(()) => {}
-                    // Cancellation must stop the whole run; propagate it.
-                    Err(e) if is_cancellation(&*e) => return Err(e),
-                    // Any other per-entry failure (e.g. an NTFS metafile with
-                    // no $DATA attribute, an unreadable file, or a host I/O
-                    // error) is logged and counted as skipped so extraction
-                    // continues with the remaining entries.
-                    Err(e) => {
-                        log::warn!("Skipped {}: {e}", child.path);
-                        if let Ok(mut p) = progress.lock() {
-                            p.files_skipped += 1;
-                        }
-                    }
-                }
-            }
-        }
-        EntryType::Symlink => {
-            #[cfg(unix)]
-            {
-                let target = entry.symlink_target.as_deref().unwrap_or("");
-                let link_path = dest.join(&safe_name);
-                // Ignore errors for symlinks (target may not exist on host)
-                let _ = std::os::unix::fs::symlink(target, &link_path);
-            }
-            if let Ok(mut p) = progress.lock() {
-                p.files_extracted += 1;
-            }
-        }
-        EntryType::Special => {
-            // Skip special files (block devices, etc.)
-        }
-    }
-
-    Ok(())
 }
 
 /// Compact byte-count formatter for the Workflow E archive viewer

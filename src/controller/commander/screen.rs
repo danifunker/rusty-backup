@@ -38,12 +38,14 @@ pub use fs_squashfs::squashfs_edit::SizePlan;
 pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
+pub use crate::model::extract::ExtractOptions;
 pub use detail::DetailField;
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
 
 mod copy;
 mod detail;
+mod extract;
 mod follow;
 #[cfg(test)]
 mod tests;
@@ -81,6 +83,7 @@ impl Side {
 /// The `purpose` of the pickers and confirmations the screen itself asks for.
 pub mod purpose {
     pub const EXPORT: &str = "commander.export";
+    pub const EXTRACT: &str = "commander.extract";
     pub const CLOSE_UNSAVED: &str = "commander.close_unsaved";
     pub const QUIT_UNSAVED: &str = "commander.quit_unsaved";
     pub const DETAIL_MODE: &str = "commander.detail_mode";
@@ -137,6 +140,13 @@ pub enum CommanderAction {
         format: Option<ExportFormat>,
     },
     Checksums(Side),
+    /// Extract the entry at `path` (a folder with its contents) into `dest`, or a folder the user picks.
+    Extract {
+        from: Side,
+        path: String,
+        options: ExtractOptions,
+        dest: Option<PathBuf>,
+    },
     /// Every finished checksum, as text, to the clipboard.
     CopyChecksums,
     /// One value of the `file`th result to the clipboard.
@@ -372,6 +382,8 @@ pub struct CommanderController {
     conflict: Option<PendingConflict>,
     rename_notice: Option<RenameNotice>,
     export: Option<PendingExport>,
+    /// An extraction waiting for its destination picker.
+    extract: Option<extract::PendingExtract>,
     checksums: Option<Checksums>,
     detail: Option<FileDetail>,
     detail_serial: u64,
@@ -556,6 +568,16 @@ impl CommanderController {
                 fx.extend(self.forward(Side::Right, BrowserPaneAction::RecentCleared));
                 fx
             }
+            A::Extract {
+                from,
+                path,
+                options,
+                dest,
+            } => self.request_extract(from, &path, options, dest),
+            A::Picked { purpose, path } if purpose == purpose::EXTRACT => {
+                self.status = self.extract_picked(path);
+                Vec::new()
+            }
             A::Picked { purpose, path } if purpose == purpose::EXPORT => {
                 self.status = self.export_picked(path);
                 Vec::new()
@@ -653,6 +675,7 @@ impl CommanderController {
             conflict: None,
             rename_notice: None,
             export: None,
+            extract: None,
             checksums: None,
             detail: None,
             detail_serial: 0,

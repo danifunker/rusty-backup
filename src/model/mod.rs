@@ -24,6 +24,7 @@ pub mod disk_builder;
 pub mod edit_queue;
 pub mod entry_detail;
 pub mod export_runner;
+pub mod extract;
 pub mod file_types;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;

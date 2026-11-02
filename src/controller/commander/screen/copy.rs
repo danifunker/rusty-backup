@@ -212,7 +212,7 @@ impl CommanderController {
     // --- immediate host writes --------------------------------------------
 
     /// Run `job` now, or hold it for the conflict review when it would overwrite `conflicts`.
-    fn start_host_copy(
+    pub(super) fn start_host_copy(
         &mut self,
         job: HostCopyJob,
         dest: Option<Side>,

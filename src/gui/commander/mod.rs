@@ -175,7 +175,7 @@ impl CommanderMode {
         let mut acts: Vec<CommanderAction> = Vec::new();
 
         self.render_progress_modal(&ctx, &mut acts);
-        self.render_host_conflict_modal(&ctx, &mut acts);
+        Self::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
         self.render_rename_notice(&ctx, &mut acts);
 
         egui::Panel::top("commander_top").show(ui, |ui| {
@@ -423,8 +423,12 @@ impl CommanderMode {
             });
     }
 
-    fn render_host_conflict_modal(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
-        let Some(names) = self.ctl.host_conflict() else {
+    pub(crate) fn render_host_conflict_modal(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(names) = ctl.host_conflict() else {
             return;
         };
         egui::Window::new("Files already exist")

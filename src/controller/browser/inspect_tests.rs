@@ -622,3 +622,49 @@ fn boot_blocks_pick_a_donor_and_report_one_without_them() {
     assert!(ctl.status().contains("boot blocks:"), "{}", ctl.status());
     assert_eq!(ctl.pane(Side::Left).boot_blocks_present(), None, "not HFS");
 }
+
+#[test]
+fn extract_picks_a_folder_reviews_existing_files_and_runs_as_the_copy_job() {
+    use crate::controller::commander::screen::purpose as screen_purpose;
+    use crate::controller::commander::{ExtractOptions, OnConflict};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let extract = |path: &str, dest: Option<std::path::PathBuf>| CommanderAction::Extract {
+        from: Side::Left,
+        path: path.into(),
+        options: ExtractOptions::default(),
+        dest,
+    };
+    let fx = ctl.apply(extract("/SUB", None));
+    assert!(matches!(&fx[..], [Effect::PickFolder(p)] if p.purpose == screen_purpose::EXTRACT));
+    ctl.apply(CommanderAction::Picked {
+        purpose: screen_purpose::EXTRACT,
+        path: Some(out.clone()),
+    });
+    settle(&mut ctl);
+    assert!(out.join("SUB").join("DEEP").is_dir(), "{}", ctl.status());
+
+    // A file that already exists goes to the review: Skip keeps it, Replace writes it.
+    std::fs::write(out.join("HELLO.TXT"), b"old").unwrap();
+    ctl.apply(extract("/HELLO.TXT", Some(out.clone())));
+    assert_eq!(
+        ctl.host_conflict().map(|n| n.len()),
+        Some(1),
+        "{}",
+        ctl.status()
+    );
+    ctl.apply(CommanderAction::HostConflict(OnConflict::Skip));
+    settle(&mut ctl);
+    assert_eq!(std::fs::read(out.join("HELLO.TXT")).unwrap(), b"old");
+    ctl.apply(extract("/HELLO.TXT", Some(out.clone())));
+    ctl.apply(CommanderAction::HostConflict(OnConflict::Replace));
+    settle(&mut ctl);
+    assert_eq!(std::fs::read(out.join("HELLO.TXT")).unwrap(), b"hello\r\n");
+    assert!(
+        ctl.status().contains("Copied 1 file(s)"),
+        "{}",
+        ctl.status()
+    );
+}

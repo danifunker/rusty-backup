@@ -19,14 +19,15 @@ pub use crate::controller::browser::{
 };
 pub use screen::{
     export_choices, ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField,
-    ExportChoice, ExportFormat, FileDetail, HashAlgo, IdNameMap, MetadataEdit, RenameNotice,
-    ResourceForkMode, Side, SizePlan, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
+    ExportChoice, ExportFormat, ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit,
+    RenameNotice, ResourceForkMode, Side, SizePlan, ViewItemKind, ViewMenuItem, Xattr,
+    FOLLOW_DELAY,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::browse_session::BrowseSession;
 pub use crate::model::edit_queue::EditQueue;
-pub use crate::model::job::JobRegistry;
+pub use crate::model::job::{JobRegistry, Snapshot};
 pub use disk_core::display::format_size;
 pub use disk_core::entry::FileEntry;
 

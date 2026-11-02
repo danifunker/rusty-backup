@@ -920,6 +920,8 @@ pub enum HostCopyJob {
     /// `dest` is the folder or the archive file per `format.is_single_file()`.
     /// Boxed to keep the enum's variants close in size.
     ExportSelection(Box<ExportJob>),
+    /// Extract one entry (a folder with its contents) to a host folder.
+    Extract(Box<crate::model::extract::ExtractJob>),
 }
 
 /// Payload for [`HostCopyJob::ExportSelection`].
@@ -974,6 +976,7 @@ impl HostCopyJob {
         match &mut self {
             HostCopyJob::ImageToHost { on_conflict, .. }
             | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
+            HostCopyJob::Extract(job) => job.on_conflict = on,
             _ => {}
         }
         self
@@ -1147,6 +1150,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             upload_host_entries_to_remote_host(&entries, &mut conn, &dest_parent, status)
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
+        HostCopyJob::Extract(job) => crate::model::extract::run(*job, status),
     }
 }
 
