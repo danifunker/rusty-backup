@@ -31,6 +31,7 @@ pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod host_ops;
 pub mod image_prep;
+pub mod inspect_runner;
 pub mod job;
 pub mod mac_archive_read;
 pub mod min_size_runner;

@@ -77,3 +77,68 @@ pub fn scan_in_job(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// Re-encode a native zstd partition image as a seekable zstd cache at `cache_path`.
+/// Progress counts compressed input bytes, so it stays within the file's size.
+#[cfg(feature = "seekable-zstd")]
+pub fn build_seekable_zstd(
+    data_path: &std::path::Path,
+    cache_path: &std::path::Path,
+    job: &crate::model::job::JobCtx,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::{BufReader, BufWriter, Read};
+
+    struct Counting<R> {
+        inner: R,
+        count: u64,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.count += n as u64;
+            Ok(n)
+        }
+    }
+
+    let input = std::fs::File::open(data_path)
+        .with_context(|| format!("failed to open {}", data_path.display()))?;
+    let total = input.metadata().map(|m| m.len()).unwrap_or(0);
+    let counting = Counting {
+        inner: BufReader::new(input),
+        count: 0,
+    };
+    let mut decoder = zstd::Decoder::new(counting).context("failed to create zstd decoder")?;
+    let output = std::fs::File::create(cache_path)
+        .with_context(|| format!("failed to create cache file: {}", cache_path.display()))?;
+    let opts = zeekstd::EncodeOptions::new()
+        .frame_size_policy(zeekstd::FrameSizePolicy::Uncompressed(2 * 1024 * 1024));
+    let mut encoder = opts
+        .into_encoder(BufWriter::new(output))
+        .map_err(|e| anyhow::anyhow!("failed to create zeekstd encoder: {e}"))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        job.check_cancel()?;
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        encoder
+            .compress(&buf[..n])
+            .map_err(|e| anyhow::anyhow!("zeekstd compress error: {e}"))?;
+        job.set_bytes(decoder.get_ref().get_ref().count, total);
+    }
+    encoder
+        .finish()
+        .map_err(|e| anyhow::anyhow!("zeekstd finish error: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "seekable-zstd"))]
+pub fn build_seekable_zstd(
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: &crate::model::job::JobCtx,
+) -> anyhow::Result<()> {
+    anyhow::bail!("the seekable zstd cache is not built into this binary")
+}

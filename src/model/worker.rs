@@ -96,6 +96,21 @@ pub fn run_mirrored<S: Send, R: Send>(
     })
 }
 
+/// Wait inside a job for a runner that spawned its own worker: `step` sees the status every 50 ms
+/// (mirror progress, drain log lines, forward a cancel) and returns true once the runner finished.
+pub fn wait_spawned<S>(
+    ctx: &super::job::JobCtx,
+    status: &Arc<Mutex<S>>,
+    mut step: impl FnMut(&mut S, &super::job::JobCtx) -> bool,
+) {
+    loop {
+        if step(&mut lock_status(status), ctx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// `impl WorkerStatus` for a status whose end is `finished = true` plus an `error` message.
 #[macro_export]
 macro_rules! finished_with_error {

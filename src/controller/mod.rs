@@ -21,6 +21,7 @@
 pub mod app;
 pub mod browser;
 pub mod commander;
+pub mod inspect;
 pub mod keys;
 pub mod log;
 
