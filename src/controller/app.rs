@@ -8,12 +8,28 @@ use std::sync::Arc;
 
 use super::log::{capture, LogStore};
 use super::{Controller, Effect};
-use crate::model::job::{JobRegistry, NoNotify, Notify};
+use crate::model::job::{JobRegistry, NoNotify};
 
 // What the shared progress widgets draw, so views never name the model (CONTRIBUTING.md MVC).
+pub use crate::model::file_types::{archives_picker_exts, DISK_IMAGE_EXTS, MAC_ARCHIVE_EXTS};
+/// The wake a shell implements so jobs and log lines can repaint it.
+pub use crate::model::job::Notify;
 pub use crate::model::job::Snapshot;
 pub use crate::model::rate_tracker::RateTracker;
+pub use crate::model::size_mode::SizeMode;
 pub use disk_core::display::format_size;
+
+/// The CHD codec and profile choices the shared CHD options control offers.
+#[cfg(feature = "chd")]
+pub mod chd {
+    pub use crate::rbformats::chd_options::{
+        codec_label, codec_long_name, is_codec_supported, ChdOptions, ChdProfile,
+    };
+    pub use libchdman_rs::{
+        CHD_CODEC_CD_FLAC, CHD_CODEC_CD_LZMA, CHD_CODEC_CD_ZLIB, CHD_CODEC_CD_ZSTD, CHD_CODEC_FLAC,
+        CHD_CODEC_HUFF, CHD_CODEC_LZMA, CHD_CODEC_NONE, CHD_CODEC_ZLIB, CHD_CODEC_ZSTD,
+    };
+}
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
@@ -113,6 +129,11 @@ mod recent {
     pub trait ConfigStore: Send {
         fn load(&self) -> UpdateConfig;
         fn save(&mut self, config: &UpdateConfig);
+        /// Save and say why it failed; stores that cannot fail keep the default.
+        fn try_save(&mut self, config: &UpdateConfig) -> Result<(), String> {
+            self.save(config);
+            Ok(())
+        }
     }
 
     /// The user's real config.json.
@@ -124,9 +145,13 @@ mod recent {
         }
 
         fn save(&mut self, config: &UpdateConfig) {
-            if let Err(e) = config.save() {
+            if let Err(e) = self.try_save(config) {
                 log::warn!("could not save config.json: {e}");
             }
+        }
+
+        fn try_save(&mut self, config: &UpdateConfig) -> Result<(), String> {
+            config.save().map_err(|e| e.to_string())
         }
     }
 

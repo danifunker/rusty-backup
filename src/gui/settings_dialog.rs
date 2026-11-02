@@ -1,33 +1,25 @@
-use rusty_backup::update::UpdateConfig;
+use rusty_backup::controller::settings::{SettingsAction, SettingsController};
+use rusty_backup::controller::Controller as _;
 
-/// Settings dialog state
+/// The Settings window over `SettingsController`; the form's state lives there.
 #[derive(Default)]
 pub struct SettingsDialog {
-    pub open: bool,
-    update_check_enabled: bool,
-    update_repo_url: String,
-    status_message: Option<String>,
-    /// Total recent-file entries across all modes, shown on the "Clear Recent
-    /// Files" button. Refreshed when the dialog opens and zeroed after a clear.
-    recent_count: usize,
-    /// Set when the user clears the recent lists, so the app can also drop the
-    /// in-memory mirrors each tab / Commander pane holds (config alone is the
-    /// source of truth, but those mirrors only reload at construction). Consumed
-    /// via [`Self::take_clear_recents`].
-    clear_recents_requested: bool,
-    /// Windows only: register Rusty Backup as a handler for disk-image files.
-    #[cfg(windows)]
-    file_associations_enabled: bool,
+    ctl: SettingsController,
 }
 
 impl SettingsDialog {
     pub fn show(&mut self, ctx: &egui::Context) {
-        if !self.open {
+        if !self.ctl.is_open() {
             return;
         }
 
-        let mut open = self.open;
+        let mut open = true;
         let mut close_requested = false;
+        let mut update_check = self.ctl.update_check();
+        let mut repo_url = self.ctl.repo_url().to_string();
+        #[cfg(windows)]
+        let mut file_associations = self.ctl.file_associations();
+        let mut actions: Vec<SettingsAction> = Vec::new();
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -61,11 +53,18 @@ impl SettingsDialog {
                     ui.heading("Update Check");
                     ui.add_space(10.0);
 
-                    ui.checkbox(&mut self.update_check_enabled, "Check for updates at startup");
+                    if ui
+                        .checkbox(&mut update_check, "Check for updates at startup")
+                        .changed()
+                    {
+                        actions.push(SettingsAction::SetUpdateCheck(update_check));
+                    }
                     ui.add_space(5.0);
 
                     ui.label("GitHub repository URL:");
-                    ui.text_edit_singleline(&mut self.update_repo_url);
+                    if ui.text_edit_singleline(&mut repo_url).changed() {
+                        actions.push(SettingsAction::SetRepoUrl(repo_url.clone()));
+                    }
                     ui.label("(e.g., https://github.com/owner/repo)");
                     ui.add_space(10.0);
 
@@ -75,10 +74,15 @@ impl SettingsDialog {
                         ui.add_space(10.0);
                         ui.heading("File Associations");
                         ui.add_space(10.0);
-                        ui.checkbox(
-                            &mut self.file_associations_enabled,
-                            "Associate disk image files with Rusty Backup",
-                        );
+                        if ui
+                            .checkbox(
+                                &mut file_associations,
+                                "Associate disk image files with Rusty Backup",
+                            )
+                            .changed()
+                        {
+                            actions.push(SettingsAction::SetFileAssociations(file_associations));
+                        }
                         ui.label(
                             "Adds Rusty Backup to the Windows \"Open with\" list for disk \
                              image files (.img, .vhd, .chd, .adf, ...).",
@@ -95,20 +99,21 @@ impl SettingsDialog {
                          Restore, Optical, Archives, and Commander source pickers.",
                     );
                     ui.add_space(5.0);
-                    let clear_label = if self.recent_count > 0 {
-                        format!("Clear Recent Files ({})", self.recent_count)
+                    let recent_count = self.ctl.recent_count();
+                    let clear_label = if recent_count > 0 {
+                        format!("Clear Recent Files ({recent_count})")
                     } else {
                         "Clear Recent Files".to_string()
                     };
                     if ui
-                        .add_enabled(self.recent_count > 0, egui::Button::new(clear_label))
+                        .add_enabled(recent_count > 0, egui::Button::new(clear_label))
                         .clicked()
                     {
-                        self.clear_recent_files();
+                        actions.push(SettingsAction::ClearRecent);
                     }
                     ui.add_space(10.0);
 
-                    if let Some(ref msg) = self.status_message {
+                    if let Some(msg) = self.ctl.status() {
                         ui.colored_label(
                             if msg.starts_with("Error") {
                                 super::theme::danger(ui.visuals())
@@ -122,7 +127,7 @@ impl SettingsDialog {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            self.save_settings();
+                            actions.push(SettingsAction::Save);
                         }
                         if ui.button("Cancel").clicked() {
                             close_requested = true;
@@ -131,86 +136,21 @@ impl SettingsDialog {
                 });
             });
 
-        // Close if the titlebar X cleared `open`, or the Cancel button asked to.
-        // (Writing `self.open = open` alone would clobber a Cancel-driven close,
-        // which is the bug behind issue #43.)
-        self.open = open && !close_requested;
+        for action in actions {
+            self.ctl.apply(action);
+        }
+        // Close if the titlebar X cleared `open`, or the Cancel button asked to (issue #43).
+        if !open || close_requested {
+            self.ctl.apply(SettingsAction::Close);
+        }
     }
 
     pub fn open_dialog(&mut self) {
-        let config = UpdateConfig::load();
-        self.update_check_enabled = config.update_check.enabled;
-        self.update_repo_url = config.update_check.repository_url;
-        self.recent_count = config.recent_files.total();
-        self.clear_recents_requested = false;
-        #[cfg(windows)]
-        {
-            self.file_associations_enabled = config.file_associations_enabled;
-        }
-        self.status_message = None;
-        self.open = true;
+        self.ctl.apply(SettingsAction::Open);
     }
 
-    /// Forget every mode's recent-files list: clear + persist config now, and
-    /// flag the app to drop the tabs' in-memory mirrors (see
-    /// [`Self::take_clear_recents`]).
-    fn clear_recent_files(&mut self) {
-        let mut config = UpdateConfig::load();
-        let count = config.recent_files.total();
-        config.recent_files.clear();
-        match config.save() {
-            Ok(_) => {
-                self.recent_count = 0;
-                self.clear_recents_requested = true;
-                self.status_message = Some(if count == 1 {
-                    "Cleared 1 recent file.".to_string()
-                } else {
-                    format!("Cleared {count} recent files.")
-                });
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Error clearing recent files: {e}"));
-            }
-        }
-    }
-
-    /// True once (then resets) after the user clears recents, so the app can
-    /// wipe the in-memory mirrors each tab / Commander pane holds.
+    /// True once after the user cleared recents, so the app can wipe each tab's in-memory list.
     pub fn take_clear_recents(&mut self) -> bool {
-        std::mem::take(&mut self.clear_recents_requested)
-    }
-
-    fn save_settings(&mut self) {
-        let mut config = UpdateConfig::load();
-
-        config.update_check.enabled = self.update_check_enabled;
-        config.update_check.repository_url = self.update_repo_url.trim().to_string();
-
-        // Windows: apply the file-association toggle (register/unregister under
-        // HKCU) before persisting the new state.
-        #[cfg(windows)]
-        {
-            let was_enabled = config.file_associations_enabled;
-            config.file_associations_enabled = self.file_associations_enabled;
-            if self.file_associations_enabled {
-                let _ = rusty_backup::os::file_assoc::register_file_associations();
-                config.assoc_registered_version = Some(env!("APP_VERSION").to_string());
-            } else if was_enabled {
-                let _ = rusty_backup::os::file_assoc::unregister_file_associations();
-                config.assoc_registered_version = None;
-            }
-        }
-
-        match config.save() {
-            Ok(_) => {
-                self.status_message = Some(
-                    "Settings saved successfully! Restart to apply update check changes."
-                        .to_string(),
-                );
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Error saving settings: {}", e));
-            }
-        }
+        self.ctl.take_cleared_recents()
     }
 }

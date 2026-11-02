@@ -111,12 +111,12 @@ pub fn pick_image_file(
 ) -> Option<(PathBuf, Option<tempfile::TempDir>)> {
     let mut dialog = super::file_dialog().add_filter(
         "Disk Images",
-        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+        rusty_backup::controller::app::DISK_IMAGE_EXTS,
     );
     if include_mac_archives {
         dialog = dialog.add_filter(
             "Mac archives",
-            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
+            rusty_backup::controller::app::MAC_ARCHIVE_EXTS,
         );
     }
     let path = dialog.add_filter("All Files", &["*"]).pick_file()?;

@@ -9,21 +9,22 @@
 pub mod ids;
 pub mod screen;
 
-pub use crate::controller::browser::{pane, rows};
 pub use crate::controller::browser::{
-    purpose, validate_entry_name, ApplyPreflight, ApplyReport, ArchiveRead, ArchiveRow,
-    ArchiveSave, ArchiveUse, ArchiveViewer, BrowserPaneAction, BrowserPaneController, CheckSummary,
-    DetailPlacement, DisplayRow, FailedEdit, ForkFormat, ImportChoice, JournalDetail, ListingStyle,
-    MacArchiveKind, NoRecent, OnConflict, PaneProfile, PaneServices, RecentStore, RepairSummary,
-    RowKind, SortColumn, SourceKind, StageOutcome, TarChoice, TarPreview, ToolReport, TreeText,
-    VolumeInfo, MAX_CONSECUTIVE_FAILURES,
+    journal_block_class, journal_txn_classes, purpose, validate_entry_name, ApplyPreflight,
+    ApplyReport, ArchiveRead, ArchiveRow, ArchiveSave, ArchiveUse, ArchiveViewer,
+    BrowserPaneAction, BrowserPaneController, CheckSummary, DetailPlacement, DisplayRow,
+    FailedEdit, ForkFormat, ImportChoice, JournalDetail, ListingStyle, MacArchiveKind, NoRecent,
+    OnConflict, PaneProfile, PaneServices, RecentStore, RepairSummary, RowKind, SortColumn,
+    SourceKind, StageOutcome, TarChoice, TarPreview, ToolReport, TreeText, VolumeInfo,
+    MAX_CONSECUTIVE_FAILURES,
 };
+pub use crate::controller::browser::{pane, rows};
 pub use screen::{
-    default_export_format, BudgetAction, BudgetForm, BudgetMode, export_choices, ChecksumRow, Checksums, CommanderAction,
-    CommanderController, DetailField, ExportChoice, ExportFormat, ExtractOptions, FileDetail,
-    HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice, ResourceForkMode, Side, SizePlan,
-    SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
-    MIN_NESTED_IMAGE_BYTES,
+    default_export_format, export_choices, BudgetAction, BudgetForm, BudgetMode, ChecksumRow,
+    Checksums, CommanderAction, CommanderController, DetailField, ExportChoice, ExportFormat,
+    ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice,
+    ResourceForkMode, Side, SizePlan, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem,
+    Xattr, FOLLOW_DELAY, MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

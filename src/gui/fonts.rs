@@ -63,7 +63,7 @@ mod tests {
 
     /// The Mac Roman repertoire surfaces in egui two ways: filesystem/archive
     /// filenames (browse view, Archives tab) and the type/creator OSType codes
-    /// the Archives tab renders via `fs_mac::hfs::format_ostype`. egui's default
+    /// the Archives tab renders as Mac Roman text. egui's default
     /// font doesn't cover the symbol/punctuation half of Mac Roman, so the
     /// bundled Noto fallback must — or those names/codes tofu. Guards against a
     /// future font swap silently dropping coverage.

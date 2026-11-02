@@ -5,9 +5,9 @@
 //! DragValue + effective-size label. The widget emits two grid cells in
 //! sequence (no `ui.end_row()`); callers wrap with their own header cells.
 //!
-//! See `model::size_mode::SizeMode` for the enum.
+//! See `SizeMode` (re-exported by `controller::app`) for the enum.
 
-use rusty_backup::model::size_mode::SizeMode;
+use rusty_backup::controller::app::SizeMode;
 
 /// Optional features per call site. The widget always shows Original + Custom;
 /// Minimum is shown when `minimum_size < original_size`; FillRemaining when

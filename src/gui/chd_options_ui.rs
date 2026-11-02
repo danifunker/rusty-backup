@@ -6,12 +6,10 @@
 //! Backup, optical-convert, and the upcoming bulk-convert flows all embed
 //! the same widget so the UX stays consistent.
 
-use libchdman_rs::{
-    CHD_CODEC_CD_FLAC, CHD_CODEC_CD_LZMA, CHD_CODEC_CD_ZLIB, CHD_CODEC_CD_ZSTD, CHD_CODEC_FLAC,
-    CHD_CODEC_HUFF, CHD_CODEC_LZMA, CHD_CODEC_NONE, CHD_CODEC_ZLIB, CHD_CODEC_ZSTD,
-};
-use rusty_backup::rbformats::chd_options::{
-    codec_label, codec_long_name, is_codec_supported, ChdOptions, ChdProfile,
+use rusty_backup::controller::app::chd::{
+    codec_label, codec_long_name, is_codec_supported, ChdOptions, ChdProfile, CHD_CODEC_CD_FLAC,
+    CHD_CODEC_CD_LZMA, CHD_CODEC_CD_ZLIB, CHD_CODEC_CD_ZSTD, CHD_CODEC_FLAC, CHD_CODEC_HUFF,
+    CHD_CODEC_LZMA, CHD_CODEC_NONE, CHD_CODEC_ZLIB, CHD_CODEC_ZSTD,
 };
 #[cfg(feature = "rust173-polyfill")]
 use rusty_backup::rust173_compat::IntIsMultipleOf as _;

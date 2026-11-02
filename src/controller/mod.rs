@@ -36,6 +36,8 @@ pub mod partition_edit;
 pub mod remote_pick;
 pub mod resize;
 pub mod restore;
+#[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+pub mod settings;
 
 /// A job's outcome once it ended: its result, or why it failed or was cancelled.
 pub(crate) fn job_outcome<R: Send + 'static>(

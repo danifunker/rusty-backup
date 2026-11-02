@@ -25,6 +25,30 @@ pub use crate::model::mac_archive_read::{ArchiveRead, ArchiveUse};
 pub use arc_mac::detect::MacArchiveKind;
 pub use fs_mac::hfsplus_journal::JournalDetail;
 
+/// The metadata structure a journal block's byte offset falls in.
+pub fn journal_block_class(detail: &JournalDetail, target: u64) -> &'static str {
+    fs_mac::hfsplus_journal::classify_target(&detail.regions, target)
+}
+
+/// Which subsystems a journal transaction's blocks touch, as one line ("empty" for none).
+pub fn journal_txn_classes(
+    detail: &JournalDetail,
+    txn: &fs_mac::hfsplus_journal::JournalTxnDetail,
+) -> String {
+    let mut names: Vec<&'static str> = Vec::new();
+    for b in &txn.blocks {
+        let c = journal_block_class(detail, b.target);
+        if !names.contains(&c) {
+            names.push(c);
+        }
+    }
+    if names.is_empty() {
+        "empty".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 use crate::model::mac_archive_read;
 use disk_core::entry::FileEntry;
 

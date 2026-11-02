@@ -11,8 +11,8 @@
 //! GPT/APM disks with many entries. Inline labels render only when a segment
 //! is wide enough; otherwise the legend below carries the identification.
 
-use disk_core::display::format_size;
 use eframe::egui;
+use rusty_backup::controller::app::format_size;
 
 /// One block in the bar: a real partition, trailing unallocated space, or a
 /// dimmed bookkeeping region (APM partition-map entry, SGI volume header).

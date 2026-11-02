@@ -36,7 +36,8 @@ pub use tools::{
 };
 pub use tree::TreeNode;
 pub use volume::{
-    ArchiveRead, ArchiveUse, CheckSummary, JournalDetail, MacArchiveKind, RepairSummary, TreeText,
+    journal_block_class, journal_txn_classes, ArchiveRead, ArchiveUse, CheckSummary, JournalDetail,
+    MacArchiveKind, RepairSummary, TreeText,
 };
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.

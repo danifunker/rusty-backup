@@ -5,8 +5,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use rusty_backup::controller::app::Notify;
 use rusty_backup::controller::log::capture;
-use rusty_backup::model::job::Notify;
 
 /// The egui context, registered once the window exists.
 static REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
