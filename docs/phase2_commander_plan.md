@@ -16,7 +16,7 @@ each green (tests, `scripts/check-boundaries.sh`, the GUI build).
   (~1971), `CommanderState` (~2121), `handle_commander_key` (~7377),
   `draw_commander*` (~9947-10225). It writes immediately (no staging queue) and has
   no unlock, preflight, backup / partclone sources or wrapper tree.
-- The egui Commander has no keyboard shortcuts at all.
+- The egui Commander had no keyboard shortcuts at all (slice 2 added them).
 
 ## Decisions
 
@@ -59,7 +59,7 @@ widget, show_log, the metadata editor widgets.
 |---|---|---|
 | 1 | `controller::commander` skeleton: `CommanderPaneController` owns listing, queue, wrapper tree; display rows move there | done (b940c5f8) |
 | - | Rename `vm` -> `controller`; key map (`controller::keys`) | done (d2ab1e1e, 6aecd207) |
-| 2 | Navigation, selection and cursor as `CommanderPaneAction`s (`Enter`, `Up`, `NavigateTo`, `Click{ctrl,shift}`, `TreeClick`, `ToggleMark`, `SortBy`, cursor moves, `ActivateCursor`); collapse wrappers on cwd change inside the controller; the egui pane dispatches actions; egui keyboard through `KeyMap` | |
+| 2 | Navigation, selection and cursor as `CommanderPaneAction`s (`Enter`, `Up`, `NavigateTo`, `Click{ctrl,shift}`, `TreeClick`, `ToggleMark`, `SortBy`, cursor moves, `ActivateCursor`); collapse wrappers on cwd change inside the controller; the egui pane dispatches actions; egui keyboard through `KeyMap` | done (dc13fc05) |
 | 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` implemented in `gui::run_effects` | |
 | 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | |
 | 5 | Remote (cfg `remote`): connect, open / close image, remote apply | |
