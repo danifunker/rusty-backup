@@ -14,7 +14,7 @@ fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
     let mut fx = ctl.tick();
     loop {
         let checksumming = ctl.checksums.as_ref().is_some_and(|c| c.job.is_some());
-        let busy = ctl.left.is_busy() || ctl.right.is_busy();
+        let busy = ctl.left.is_busy() || ctl.right.is_busy() || ctl.detail_job.is_some();
         if !busy && ctl.copy.is_none() && !checksumming {
             return fx;
         }
@@ -377,8 +377,10 @@ fn file_info_opens_from_a_double_click_and_stages_metadata_on_its_pane() {
         .node_id
         .clone();
     ctl.apply(A::Pane(Side::Left, P::Activate(node)));
-    let d = ctl.detail().expect("File Info opened");
-    assert!(d.editable && d.entry.name == name && d.preview.is_some());
+    assert!(ctl.detail().expect("File Info opened").loading);
+    settle(&mut ctl);
+    let d = ctl.detail().expect("File Info stays open");
+    assert!(d.editable && d.entry.name == name && d.preview.is_some() && !d.loading);
     let entry = d.entry.clone();
     ctl.apply(A::StageMetadata(Box::new(MetadataEdit::Dates {
         entry,
@@ -526,4 +528,17 @@ fn a_detail_prompt_validates_and_stages_on_the_pane() {
     assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
     let result = ctl.detail().and_then(|d| d.result.clone()).unwrap();
     assert!(result.contains("644"), "{result}");
+}
+
+#[test]
+fn keymap_problems_reach_the_status_and_the_log() {
+    let mut ctl = CommanderController::headless();
+    ctl.report_keymap_problems(Vec::new());
+    assert!(ctl.log().is_empty());
+    ctl.report_keymap_problems(vec!["unknown key `F99`".into()]);
+    assert_eq!(ctl.status(), "keybindings: unknown key `F99`");
+    assert_eq!(ctl.log().len(), 1);
+    ctl.report_keymap_problems(vec!["a".into(), "b".into()]);
+    assert!(ctl.status().contains("2 problems"), "{}", ctl.status());
+    assert_eq!(ctl.log().len(), 3);
 }

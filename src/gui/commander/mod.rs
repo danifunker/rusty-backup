@@ -506,12 +506,15 @@ impl CommanderMode {
         if ed.serial != d.serial {
             *ed = DetailEditors {
                 serial: d.serial,
-                content: d
-                    .preview
-                    .as_ref()
-                    .map(|data| file_detail::detect_content_type(&d.entry, data)),
                 ..DetailEditors::default()
             };
+        }
+        // The preview arrives from a job after the window opens.
+        if ed.content.is_none() {
+            ed.content = d
+                .preview
+                .as_ref()
+                .map(|data| file_detail::detect_content_type(&d.entry, data));
         }
         let mut staged = Vec::new();
         let mut open = true;
@@ -647,7 +650,7 @@ fn detail_body(
     // The controller reports staging results in `d.result`; the editors' own line is unused.
     let mut unused = None;
     let mut sink = ToController { queue, staged };
-    file_detail::render_metadata_rows(ui, entry, is_hfs || is_prodos, None);
+    file_detail::render_metadata_rows(ui, entry, is_hfs || is_prodos, Some(&d.id_names));
     if is_hfs && entry.is_file() {
         ui.separator();
         metadata_editor::render_hfs_type_row(ui, entry, edit, &mut sink, &mut ed.hfs, &mut unused);
@@ -688,7 +691,7 @@ fn detail_body(
             ui,
             entry,
             edit,
-            None,
+            Some(&d.id_names),
             &mut sink,
             &mut ed.owner,
             &mut unused,
@@ -702,6 +705,17 @@ fn detail_body(
             &mut ed.xattr,
             &mut unused,
         );
+    }
+    let budget = d.size_budget_lines();
+    if !budget.is_empty() {
+        ui.separator();
+        ui.strong("SquashFS size budget");
+        for line in budget {
+            ui.monospace(line);
+        }
+    }
+    if d.loading {
+        ui.weak("Reading...");
     }
     if let Some(msg) = &d.result {
         ui.add_space(4.0);

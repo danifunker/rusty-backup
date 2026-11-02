@@ -17,6 +17,7 @@
 //! [`commander_ops::spawn_host_copy`](crate::model::commander_ops::spawn_host_copy).
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use md5::{Digest, Md5};
@@ -188,7 +189,7 @@ pub fn spawn(job: ChecksumJob) -> Arc<Mutex<ChecksumStatus>> {
     let status = Arc::new(Mutex::new(ChecksumStatus::default()));
     let status_thread = Arc::clone(&status);
     crate::model::worker::spawn_guarded(Arc::clone(&status), "checksum", move || {
-        run(job, &status_thread);
+        run(job, &status_thread, &AtomicBool::new(false));
         if let Ok(mut g) = status_thread.lock() {
             g.finished = true;
         }
@@ -203,7 +204,7 @@ pub fn checksum_in_job(
     total_bytes: u64,
     ctx: &crate::model::job::JobCtx,
 ) -> anyhow::Result<Vec<FileChecksum>> {
-    ctx.set_can_cancel(false);
+    let cancel = ctx.cancel_flag();
     let status = Arc::new(Mutex::new(ChecksumStatus::default()));
     let mirror = |s: &mut ChecksumStatus, ctx: &crate::model::job::JobCtx| {
         if !s.current_file.is_empty() {
@@ -218,7 +219,8 @@ pub fn checksum_in_job(
             ctx.set_bytes(done.min(total_bytes), total_bytes);
         }
     };
-    crate::model::worker::run_mirrored(ctx, &status, mirror, || run(job, &status));
+    crate::model::worker::run_mirrored(ctx, &status, mirror, || run(job, &status, &cancel));
+    ctx.check_cancel()?;
     let mut st = crate::model::worker::lock_status(&status);
     if let Some(e) = st.error.take() {
         anyhow::bail!(e);
@@ -226,7 +228,7 @@ pub fn checksum_in_job(
     Ok(std::mem::take(&mut st.results))
 }
 
-fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
+fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>, cancel: &AtomicBool) {
     match job {
         ChecksumJob::Image { source, entries } => {
             let files: Vec<FileEntry> = entries.into_iter().filter(|e| e.is_file()).collect();
@@ -241,6 +243,9 @@ fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
                 }
             };
             for entry in files {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 begin_file(status, &entry);
                 let mut hasher = ChecksumHasher::new();
                 let progress = |b: u64| {
@@ -251,6 +256,7 @@ fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
                 let mut sink = ProgressSink {
                     hasher: &mut hasher,
                     progress: &progress,
+                    cancel,
                 };
                 let result = fs.write_file_to(&entry, &mut sink);
                 finish_file(status, &entry, result.map(|_| hasher.finalize()));
@@ -260,14 +266,19 @@ fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
             let files: Vec<FileEntry> = entries.into_iter().filter(|e| e.is_file()).collect();
             set_total(status, files.len());
             for entry in files {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 begin_file(status, &entry);
                 let progress = |b: u64| {
                     if let Ok(mut g) = status.lock() {
                         g.current_bytes = b;
                     }
                 };
-                let result = std::fs::File::open(&entry.path)
-                    .and_then(|mut f| hash_reader(&mut f, &progress));
+                let result = std::fs::File::open(&entry.path).and_then(|f| {
+                    let mut reader = CancelReader { inner: f, cancel };
+                    hash_reader(&mut reader, &progress)
+                });
                 finish_file(status, &entry, result);
             }
         }
@@ -279,10 +290,33 @@ fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
 struct ProgressSink<'a> {
     hasher: &'a mut ChecksumHasher,
     progress: &'a dyn Fn(u64),
+    cancel: &'a AtomicBool,
+}
+
+fn cancelled() -> io::Error {
+    crate::compat::io_other("cancelled")
+}
+
+/// A reader that fails once the job is cancelled, so a large host file stops mid-way.
+struct CancelReader<'a, R> {
+    inner: R,
+    cancel: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        self.inner.read(buf)
+    }
 }
 
 impl Write for ProgressSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         self.hasher.update(buf);
         (self.progress)(self.hasher.total());
         Ok(buf.len())

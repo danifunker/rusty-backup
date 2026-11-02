@@ -26,7 +26,11 @@ use crate::controller::{ConfirmSpec, Controller, Effect};
 use crate::model::checksum::FileChecksum;
 use crate::model::commander_ops::{HostCopyDone, HostCopyJob};
 use crate::model::edit_queue::StagedEdit;
-use crate::model::job::{Job, JobRegistry, NoNotify, Notify, Resource, Snapshot};
+use crate::model::entry_detail::{self, DetailExtras};
+use crate::model::job::{Job, JobCtx, JobRegistry, NoNotify, Notify, Resource, Snapshot};
+pub use disk_core::id_names::IdNameMap;
+pub use disk_core::xattr::Xattr;
+pub use fs_squashfs::squashfs_edit::SizePlan;
 
 pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
@@ -201,12 +205,50 @@ pub struct FileDetail {
     /// The pane takes metadata edits (a writable image volume, not a wrapper's contents).
     pub editable: bool,
     pub fs_type: String,
+    /// The preview, xattrs, names and budget are still being read by a job.
+    pub loading: bool,
     /// Up to [`MAX_PREVIEW_SIZE`] bytes of a file; `None` for a folder or a failed read.
     pub preview: Option<Vec<u8>>,
-    pub xattrs: Vec<disk_core::xattr::Xattr>,
+    pub xattrs: Vec<Xattr>,
+    /// uid/gid -> name from the image's account files, for the Owner row.
+    pub id_names: IdNameMap,
+    /// A SquashFS volume's size budget, when File Info opened in its root folder.
+    pub size_plan: Option<SizePlan>,
     /// What the last staged edit did.
     pub result: Option<String>,
     pub serial: u64,
+}
+
+impl FileDetail {
+    /// The Owner row: `uid:gid` with the image's account names where it has them.
+    pub fn owner(&self) -> Option<String> {
+        let (u, g) = (self.entry.uid?, self.entry.gid?);
+        Some(self.id_names.format_owner(u, g))
+    }
+
+    /// The SquashFS size budget as text lines (empty when there is none).
+    pub fn size_budget_lines(&self) -> Vec<String> {
+        use disk_core::display::format_size;
+        let Some(p) = &self.size_plan else {
+            return Vec::new();
+        };
+        let room = match (p.capacity, p.headroom) {
+            (Some(cap), Some(head)) => format!(
+                "Room available {} ({} unused)",
+                format_size(cap),
+                format_size(head)
+            ),
+            _ => "Room available unbounded - this file is the filesystem".to_string(),
+        };
+        vec![
+            format!("Image occupies {}", format_size(p.image_len)),
+            format!("Content        {} uncompressed", format_size(p.content_len)),
+            format!("Compressed to  {}", p.describe_ratio()),
+            room,
+            // Saving an edit rebuilds the whole image, so only a ceiling can be promised.
+            "Set a ceiling with: rb-cli squashfs put|rm --size|--grow".to_string(),
+        ]
+    }
 }
 
 /// One file's checksums, or why it has none.
@@ -287,6 +329,8 @@ pub struct CommanderController {
     checksums: Option<Checksums>,
     detail: Option<FileDetail>,
     detail_serial: u64,
+    /// Reads the open File Info's extras.
+    detail_job: Option<Job<DetailExtras>>,
     log: Vec<String>,
     show_log: bool,
     show_help: bool,
@@ -323,6 +367,7 @@ impl Controller for CommanderController {
         }
         self.poll_copy();
         self.poll_checksums();
+        self.poll_detail();
         self.left.rebuild_rows();
         self.right.rebuild_rows();
         fx
@@ -364,12 +409,12 @@ impl CommanderController {
                 value.map_or_else(Vec::new, |v| clip(v[algo as usize].clone()))
             }
             A::CloseChecksums => {
-                self.checksums = None;
+                self.close_checksums();
                 Vec::new()
             }
             A::OpenDetail(side, name) => self.open_detail(side, name),
             A::CloseDetail => {
-                self.detail = None;
+                self.close_detail();
                 Vec::new()
             }
             A::StageMetadata(edit) => {
@@ -547,6 +592,7 @@ impl CommanderController {
             checksums: None,
             detail: None,
             detail_serial: 0,
+            detail_job: None,
             log: Vec::new(),
             show_log: false,
             show_help: false,
@@ -595,6 +641,18 @@ impl CommanderController {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    /// Problems found loading the key map, for the status line and the session log.
+    pub fn report_keymap_problems(&mut self, problems: Vec<String>) {
+        for p in &problems {
+            self.record_log(format!("keybindings: {p}"));
+        }
+        match problems.len() {
+            0 => {}
+            1 => self.status = format!("keybindings: {}", problems[0]),
+            n => self.status = format!("keybindings: {n} problems (see the log)"),
+        }
     }
 
     pub fn keep_dates(&self) -> bool {
@@ -661,7 +719,8 @@ impl CommanderController {
     pub fn is_working(&self) -> bool {
         let pane_busy = |p: &CommanderPaneController| p.is_busy() || p.wrapper_opening().is_some();
         let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());
-        self.copy.is_some() || hashing || pane_busy(&self.left) || pane_busy(&self.right)
+        let busy = self.copy.is_some() || hashing || self.detail_job.is_some();
+        busy || pane_busy(&self.left) || pane_busy(&self.right)
     }
 
     /// The first chord for `cmd` as this platform writes it, or "" when unbound.
@@ -940,9 +999,9 @@ impl CommanderController {
         } else if self.pane(active).edits_shown() {
             return self.forward(active, CommanderPaneAction::ShowEdits(false));
         } else if self.detail.is_some() {
-            self.detail = None;
+            self.close_detail();
         } else if self.checksums.is_some() {
-            self.checksums = None;
+            self.close_checksums();
         } else if self.show_log {
             self.show_log = false;
         } else {
@@ -981,11 +1040,24 @@ impl CommanderController {
         let editable =
             !pane.is_host_pane() && !pane.is_backup() && !pane.is_archive() && !pane.tree_active();
         let fs_type = pane.detail_fs_type();
-        let Some((entry, preview)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
+        let Some(entry) = pane.detail_entry(&name) else {
             self.status = format!("[{}] could not open File Info for '{name}'.", side.label());
             return Vec::new();
         };
-        let xattrs = pane.detail_xattrs(&entry);
+        let source = pane.detail_source();
+        let at_root = !pane.tree_active() && !entry.path.trim_start_matches('/').contains('/');
+        self.close_detail();
+        let job = source.and_then(|source| {
+            let entry = entry.clone();
+            let body = move |_: &JobCtx| {
+                entry_detail::read_detail(source, &entry, MAX_PREVIEW_SIZE, at_root)
+            };
+            let reads = self.reads(side);
+            let notify = Arc::clone(&self.notify);
+            self.jobs
+                .spawn("Reading File Info", reads, notify, body)
+                .ok()
+        });
         self.status = format!("File Info: {}", entry.name);
         self.detail_serial += 1;
         self.detail = Some(FileDetail {
@@ -993,12 +1065,47 @@ impl CommanderController {
             entry,
             editable,
             fs_type,
-            preview,
-            xattrs,
+            loading: job.is_some(),
+            preview: None,
+            xattrs: Vec::new(),
+            id_names: IdNameMap::default(),
+            size_plan: None,
             result: None,
             serial: self.detail_serial,
         });
+        self.detail_job = job;
         Vec::new()
+    }
+
+    fn close_detail(&mut self) {
+        if let Some(job) = self.detail_job.take() {
+            job.cancel();
+        }
+        self.detail = None;
+    }
+
+    fn poll_detail(&mut self) {
+        let Some(job) = self.detail_job.as_ref().filter(|j| !j.is_running()) else {
+            return;
+        };
+        let extras = job.take_result();
+        self.detail_job = None;
+        let Some(d) = self.detail.as_mut() else {
+            return;
+        };
+        d.loading = false;
+        if let Some(x) = extras {
+            d.preview = x.preview;
+            d.xattrs = x.xattrs;
+            d.id_names = x.id_names;
+            d.size_plan = x.size_plan;
+        }
+    }
+
+    fn close_checksums(&mut self) {
+        if let Some(job) = self.checksums.take().and_then(|c| c.job) {
+            job.cancel();
+        }
     }
 
     fn stage_metadata(&mut self, edit: MetadataEdit) {

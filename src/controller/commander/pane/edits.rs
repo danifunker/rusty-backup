@@ -26,6 +26,7 @@ use crate::model::commander_ops::{
     self, ApplyOutcome, ApplyPreflight, FailedEdit, StageSource, WrapperExtract, WrapperOpenPlan,
 };
 use crate::model::edit_queue::StagedEdit;
+use crate::model::entry_detail::DetailSource;
 use crate::model::host_ops::{self, DeleteOutcome};
 use crate::model::job::{Job, JobCtx, Resource, Snapshot, Status};
 use crate::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
@@ -204,15 +205,6 @@ fn msg(text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Message(text.into())]
 }
 
-/// Up to `max` bytes of a host file, for the File Info preview.
-fn read_host_file_capped(path: &str, max: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    file.take(max as u64).read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
 impl CommanderPaneController {
     // --- read accessors ---------------------------------------------------
 
@@ -378,14 +370,6 @@ impl CommanderPaneController {
         !self.tree_active() && self.listing.is_host()
     }
 
-    /// The filesystem the selection reads from: the active wrapper mount, else the listing's.
-    fn selection_fs(&mut self) -> Option<&mut (dyn disk_core::filesystem::Filesystem + 'static)> {
-        if let Some((mount, _)) = self.tree_selection() {
-            return self.wrapper_tree.mount_fs(&mount);
-        }
-        self.listing.fs_mut()
-    }
-
     /// The selection's filesystem type for File Info (a wrapper's own type inside one).
     pub fn detail_fs_type(&mut self) -> String {
         if let Some((mount, _)) = self.tree_selection() {
@@ -396,34 +380,20 @@ impl CommanderPaneController {
         self.volume().fs_type.clone()
     }
 
-    /// The named entry and up to `max` bytes of its data (`None` for a folder or a failed read).
-    pub fn detail_payload(
-        &mut self,
-        name: &str,
-        max: usize,
-    ) -> Option<(FileEntry, Option<Vec<u8>>)> {
-        let entry = match self.tree_selection() {
-            Some((_, entries)) => entries.into_iter().find(|e| e.name == name)?,
-            None => self.entry_named(name)?,
-        };
-        if !entry.is_file() {
-            return Some((entry, None));
+    /// The named entry as the listing (or the wrapper-tree selection) holds it.
+    pub fn detail_entry(&self, name: &str) -> Option<FileEntry> {
+        match self.tree_selection() {
+            Some((_, entries)) => entries.into_iter().find(|e| e.name == name),
+            None => self.entry_named(name),
         }
-        let data = if self.is_host_pane() {
-            read_host_file_capped(&entry.path, max)
-        } else {
-            self.selection_fs()
-                .and_then(|fs| fs.read_file(&entry, max).ok())
-        };
-        Some((entry, data))
     }
 
-    /// The entry's extended attributes; empty where the filesystem has none or cannot read them.
-    pub fn detail_xattrs(&mut self, entry: &FileEntry) -> Vec<disk_core::xattr::Xattr> {
-        self.selection_fs()
-            .filter(|fs| fs.supports_xattrs())
-            .and_then(|fs| fs.list_xattrs(entry).ok())
-            .unwrap_or_default()
+    /// Where a File Info job reads the selection's data; `None` when nothing can be read.
+    pub fn detail_source(&self) -> Option<DetailSource> {
+        if self.is_host_pane() {
+            return Some(DetailSource::Host);
+        }
+        self.copy_stage_source().map(DetailSource::Image)
     }
 
     /// What a job reading this pane's source holds, so an apply cannot write under it.

@@ -8900,15 +8900,8 @@ impl App {
                 ],
                 "M5 - reuses archive_edit.",
             ),
-            TabId::Commander => self.stub(
-                "Commander Mode: a dual-pane file explorer.",
-                &[
-                    "Two panes, each an image / container OR a host folder.",
-                    "Copy between panes: image<->image, host<->image.",
-                    "Multi-select, sort, delete, checksum - like the GUI overlay.",
-                ],
-                "M7 - reuses dir_listing + commander_ops + commander_descend.",
-            ),
+            // The Commander view draws its own tab.
+            TabId::Commander => Text::default(),
             TabId::Bulk => self.stub(
                 "Bulk operations across a folder of images.",
                 &[

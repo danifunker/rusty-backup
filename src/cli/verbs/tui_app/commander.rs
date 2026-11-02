@@ -84,7 +84,9 @@ pub(super) struct CommanderView {
 impl CommanderView {
     pub(super) fn new() -> Self {
         // The event loop polls every 50 ms while a job runs, so the controller needs no wake.
-        let ctl = CommanderController::polled(recent_store(), recent_store(), load_keymap());
+        let (keymap, problems) = load_keymap();
+        let mut ctl = CommanderController::polled(recent_store(), recent_store(), keymap);
+        ctl.report_keymap_problems(problems);
         Self {
             ctl,
             modal: None,
@@ -587,13 +589,13 @@ fn recent_store() -> Box<dyn crate::controller::commander::RecentStore> {
 }
 
 #[cfg(not(test))]
-fn load_keymap() -> KeyMap {
-    KeyMap::load_terminal(KeyMap::user_file().as_deref()).0
+fn load_keymap() -> (KeyMap, Vec<String>) {
+    KeyMap::load_terminal(KeyMap::user_file().as_deref())
 }
 
 #[cfg(test)]
-fn load_keymap() -> KeyMap {
-    KeyMap::for_terminal()
+fn load_keymap() -> (KeyMap, Vec<String>) {
+    (KeyMap::for_terminal(), Vec::new())
 }
 
 /// Control characters in a name (the CR in `Icon\r`) as escapes, so a row stays one line.
@@ -1224,8 +1226,8 @@ fn detail_lines(d: &FileDetail) -> Vec<String> {
     if let Some(m) = e.mode {
         out.push(format!("Mode:  {:04o}", m & 0o7777));
     }
-    if let (Some(u), Some(g)) = (e.uid, e.gid) {
-        out.push(format!("Owner: {u}:{g}"));
+    if let Some(owner) = d.owner() {
+        out.push(format!("Owner: {owner}"));
     }
     if let Some(t) = &e.symlink_target {
         out.push(format!("Link:  -> {t}"));
@@ -1249,6 +1251,16 @@ fn detail_lines(d: &FileDetail) -> Vec<String> {
     if let Some(p) = &d.preview {
         out.push(String::new());
         out.push(format!("Preview: first {} byte(s) read.", p.len()));
+    }
+    let budget = d.size_budget_lines();
+    if !budget.is_empty() {
+        out.push(String::new());
+        out.push("SquashFS size budget:".to_string());
+        out.extend(budget.into_iter().map(|l| format!("  {l}")));
+    }
+    if d.loading {
+        out.push(String::new());
+        out.push("Reading...".to_string());
     }
     out
 }

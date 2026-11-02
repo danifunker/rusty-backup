@@ -155,7 +155,7 @@ impl CommanderController {
     }
 
     /// What a job reading the `side` pane's source holds; a host folder needs nothing.
-    fn reads(&self, side: Side) -> Vec<Resource> {
+    pub(super) fn reads(&self, side: Side) -> Vec<Resource> {
         let pane = self.pane(side);
         if pane.is_host_pane() {
             Vec::new()
@@ -462,6 +462,7 @@ impl CommanderController {
             return "Source volume is not open.".to_string();
         };
         let reads = self.reads(from);
+        self.close_checksums();
         let spawned = self
             .jobs
             .spawn("Hashing", reads, Arc::clone(&self.notify), move |ctx| {

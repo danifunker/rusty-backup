@@ -20,6 +20,7 @@ pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
 pub mod dir_listing;
+pub mod entry_detail;
 pub mod disk_builder;
 pub mod edit_queue;
 pub mod export_runner;
