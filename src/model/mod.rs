@@ -72,9 +72,5 @@ pub mod stage_names;
 pub mod status;
 pub mod swab_runner;
 pub mod text_edit;
-// `update_runner` wraps the GUI's update-download/install flow on top of
-// `src/update.rs` — both depend on `reqwest`, which is GUI-feature-only.
-#[cfg(feature = "gui")]
-pub mod update_runner;
 pub mod volume_label_runner;
 pub mod worker;

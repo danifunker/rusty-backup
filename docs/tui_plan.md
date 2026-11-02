@@ -299,4 +299,4 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   `no_binary_name`) → `rusty_backup::cli::dispatch(command)`.
 - **Settings / updater:** `update::UpdateConfig::{load, save, user_config_path}`,
   `update::UpdateCheckConfig{enabled, repository_url}`, `update::check_for_updates`,
-  `model::update_runner` (Windows self-update today).
+  `controller::app`'s install job (Windows self-update today).

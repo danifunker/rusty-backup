@@ -30,9 +30,7 @@ mod settings_dialog;
 mod size_mode_row;
 mod source_picker;
 mod squashfs_budget_dialog;
-// The palette lives in the lib (the old optical widget used it there);
-// re-exported here so `super::theme::` resolves throughout the GUI.
-pub(crate) use rusty_backup::theme;
+pub(crate) mod theme;
 pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
