@@ -15,6 +15,7 @@ fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
     loop {
         let checksumming = ctl.checksums.as_ref().is_some_and(|c| c.job.is_some());
         let busy = ctl.left.is_busy() || ctl.right.is_busy() || ctl.detail_job.is_some();
+        let busy = busy || ctl.is_working();
         if !busy && ctl.copy.is_none() && !checksumming {
             return fx;
         }
@@ -541,4 +542,144 @@ fn keymap_problems_reach_the_status_and_the_log() {
     ctl.report_keymap_problems(vec!["a".into(), "b".into()]);
     assert!(ctl.status().contains("2 problems"), "{}", ctl.status());
     assert_eq!(ctl.log().len(), 3);
+}
+
+fn ctrl_shift(c: char) -> CommanderAction {
+    let mods = Mods {
+        ctrl: true,
+        shift: true,
+        ..Mods::default()
+    };
+    A::Key(Key::Char(c), mods)
+}
+
+fn cursor_name(ctl: &CommanderController, side: Side) -> String {
+    let pane = ctl.pane(side);
+    pane.rows()[pane.cursor_index().unwrap()].name.clone()
+}
+
+#[test]
+fn quick_view_follows_the_active_cursor_and_gives_the_other_pane_back() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    std::fs::write(left.path().join("a.txt"), b"alpha").unwrap();
+    std::fs::write(left.path().join("b.txt"), b"bravo").unwrap();
+    std::fs::write(right.path().join("r.txt"), b"right").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, left.path());
+    open_host(&mut ctl, Side::Right, right.path());
+    select(&mut ctl, Side::Right, "r.txt");
+    ctl.apply(A::Focus(Side::Left));
+    ctl.apply(key(Key::Down));
+    assert_eq!(cursor_name(&ctl, Side::Left), "a.txt");
+
+    ctl.apply(ctrl('k'));
+    assert!(ctl.quick_view(), "{}", ctl.status());
+    let d = ctl.quick_view_detail().unwrap();
+    assert_eq!((d.side, d.entry.name.as_str()), (Side::Left, "a.txt"));
+    assert!(
+        d.loading && ctl.follow_pending(),
+        "the preview waits for the cursor to rest"
+    );
+    std::thread::sleep(FOLLOW_DELAY);
+    settle(&mut ctl);
+    let d = ctl.quick_view_detail().unwrap();
+    assert_eq!(d.preview.as_deref(), Some(&b"alpha"[..]));
+
+    // The cursor moves on: the detail follows; moving fast reads only where it rests.
+    ctl.apply(key(Key::Down));
+    assert_eq!(ctl.quick_view_detail().unwrap().entry.name, "b.txt");
+    std::thread::sleep(FOLLOW_DELAY);
+    settle(&mut ctl);
+    let d = ctl.quick_view_detail().unwrap();
+    assert_eq!(d.preview.as_deref(), Some(&b"bravo"[..]));
+
+    // The other pane's own state was never touched; Ctrl+K again shows it as it was.
+    assert_eq!(ctl.pane(Side::Right).listing.selection(), ["r.txt"]);
+    ctl.apply(ctrl('k'));
+    assert!(!ctl.quick_view() && ctl.quick_view_detail().is_none());
+    assert_eq!(ctl.pane(Side::Right).listing.selection(), ["r.txt"]);
+    assert!(!ctl.follow_pending());
+}
+
+#[test]
+fn primary_k_is_quick_view_and_primary_shift_k_connects() {
+    let mut ctl = CommanderController::headless();
+    assert!(ctl.binds(Key::Char('k'), ctrl_mods()));
+    let fx = ctl.apply(ctrl('k'));
+    assert!(fx.is_empty() && ctl.quick_view());
+    let fx = ctl.apply(ctrl_shift('k'));
+    #[cfg(feature = "remote")]
+    assert!(
+        matches!(&fx[..], [Effect::AskText(s)] if s.purpose == crate::controller::browser::purpose::CONNECT),
+        "{fx:?}"
+    );
+    #[cfg(not(feature = "remote"))]
+    assert!(fx.is_empty() && ctl.status().contains("remote"));
+    // The View menu lists the quick view with its chord and the active pane's styles.
+    ctl.apply(key(Key::F(9)));
+    assert!(ctl.view_menu_shown());
+    let menu = ctl.view_menu();
+    let qv = menu.iter().find(|i| i.label == "Quick view").unwrap();
+    assert!(qv.checked && qv.hint.ends_with("+K") && !qv.hint.contains("Shift"));
+    let styles = menu
+        .iter()
+        .filter(|i| i.kind == ViewItemKind::Style)
+        .count();
+    assert_eq!(styles, 3);
+    ctl.apply(key(Key::Escape));
+    assert!(!ctl.view_menu_shown());
+}
+
+#[test]
+fn left_and_right_stay_free_in_a_flat_list_and_expand_in_a_tree() {
+    let host = tempfile::tempdir().unwrap();
+    std::fs::create_dir(host.path().join("dir")).unwrap();
+    std::fs::write(host.path().join("dir/in.txt"), b"x").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    assert!(
+        !ctl.binds(Key::Right, Mods::default()),
+        "a flat list leaves the arrows to the view"
+    );
+    ctl.apply(A::Pane(
+        Side::Left,
+        P::SetListingStyle(crate::controller::browser::ListingStyle::CombinedTree),
+    ));
+    assert!(ctl.binds(Key::Right, Mods::default()));
+    ctl.apply(key(Key::Down));
+    assert_eq!(cursor_name(&ctl, Side::Left), "dir");
+    ctl.apply(key(Key::Right));
+    settle(&mut ctl);
+    ctl.apply(key(Key::Right));
+    assert_eq!(cursor_name(&ctl, Side::Left), "in.txt");
+}
+
+#[test]
+fn tab_visits_a_folder_tree_then_its_list_then_the_other_pane() {
+    use crate::controller::browser::ListingStyle;
+    let host = tempfile::tempdir().unwrap();
+    std::fs::create_dir(host.path().join("dir")).unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    open_host(&mut ctl, Side::Right, host.path());
+    ctl.apply(A::Pane(
+        Side::Right,
+        P::SetListingStyle(ListingStyle::TreeAndList),
+    ));
+    ctl.apply(key(Key::Tab));
+    assert_eq!(ctl.active(), Side::Right);
+    assert!(ctl.pane(Side::Right).tree_focused());
+    ctl.apply(key(Key::Tab));
+    assert_eq!(ctl.active(), Side::Right);
+    assert!(!ctl.pane(Side::Right).tree_focused());
+    ctl.apply(key(Key::Tab));
+    assert_eq!(ctl.active(), Side::Left);
+}
+
+fn ctrl_mods() -> Mods {
+    Mods {
+        ctrl: true,
+        ..Mods::default()
+    }
 }

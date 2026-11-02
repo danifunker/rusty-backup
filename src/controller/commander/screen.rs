@@ -21,7 +21,7 @@ use disk_core::entry::FileEntry;
 
 use super::{NoRecent, OnConflict, RecentStore};
 use crate::controller::browser::pane::{
-    BrowserPaneAction, BrowserPaneController, PaneServices, StageOutcome,
+    BrowserPaneAction, BrowserPaneController, PaneServices, PrefsOnly, StageOutcome,
 };
 use crate::controller::browser::PaneProfile;
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
@@ -39,10 +39,12 @@ pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
 pub use detail::DetailField;
+pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
 
 mod copy;
 mod detail;
+mod follow;
 #[cfg(test)]
 mod tests;
 
@@ -166,6 +168,10 @@ pub enum CommanderAction {
     ShowHelp(bool),
     /// The partition chooser for the active pane, for views without an always-visible picker.
     ShowPartitions(bool),
+    /// Show the active pane's File Info in the other pane, following its cursor; again to stop.
+    ToggleQuickView,
+    /// The View menu, for views that open it from a key rather than a menu bar.
+    ShowViewMenu(bool),
     /// Close the screen, asking first while either pane has staged edits.
     RequestClose,
     /// Quit the application, asking first while either pane has staged edits.
@@ -382,6 +388,10 @@ pub struct CommanderController {
     askers: Vec<(&'static str, Side)>,
     /// One pane (the TUI Explorer): only the left pane is used and there is nothing to copy to.
     single: bool,
+    quick_view: bool,
+    view_menu: bool,
+    /// Each pane's File Info following its cursor (quick view, side panel).
+    follow: [follow::Follow; 2],
 }
 
 impl Controller for CommanderController {
@@ -398,6 +408,7 @@ impl Controller for CommanderController {
         // A copy stages onto the other pane, so both panes' rows can change.
         self.left.rebuild_rows();
         self.right.rebuild_rows();
+        self.sync_follow();
         fx
     }
 
@@ -412,6 +423,7 @@ impl Controller for CommanderController {
         self.poll_detail();
         self.left.rebuild_rows();
         self.right.rebuild_rows();
+        self.sync_follow();
         fx
     }
 }
@@ -430,10 +442,7 @@ impl CommanderController {
             A::SwitchPane if self.single => {
                 self.forward(Side::Left, BrowserPaneAction::SwitchFocus)
             }
-            A::SwitchPane => {
-                self.active = self.active.other();
-                Vec::new()
-            }
+            A::SwitchPane => self.switch_pane(),
             A::Copy(from) => {
                 self.status = self.copy(from);
                 Vec::new()
@@ -524,6 +533,14 @@ impl CommanderController {
                 if on {
                     self.toggle_partitions(self.active);
                 }
+                Vec::new()
+            }
+            A::ToggleQuickView => {
+                self.toggle_quick_view();
+                Vec::new()
+            }
+            A::ShowViewMenu(on) => {
+                self.view_menu = on;
                 Vec::new()
             }
             A::RequestClose => self.request_close(false),
@@ -617,7 +634,7 @@ impl CommanderController {
     pub fn new(left: PaneServices, right: PaneServices, keymap: KeyMap) -> Self {
         let jobs = left.jobs.clone();
         let notify = Arc::clone(&left.notify);
-        Self {
+        let mut ctl = Self {
             left: BrowserPaneController::with_services(left),
             right: BrowserPaneController::with_services(right),
             active: Side::Left,
@@ -647,25 +664,34 @@ impl CommanderController {
             implicit: None,
             askers: Vec::new(),
             single: false,
-        }
+            quick_view: false,
+            view_menu: false,
+            follow: Default::default(),
+        };
+        ctl.left.remember_style_as("commander-left");
+        ctl.right.remember_style_as("commander-right");
+        ctl
     }
 
     /// One pane configured by `profile` (the TUI Explorer), its jobs in `services.jobs`.
     pub fn single(services: PaneServices, keymap: KeyMap, profile: PaneProfile) -> Self {
-        let spare = PaneServices {
-            jobs: services.jobs.clone(),
-            notify: Arc::clone(&services.notify),
+        let spare = |s: &PaneServices| PaneServices {
+            jobs: s.jobs.clone(),
+            notify: Arc::clone(&s.notify),
             recent: Box::new(NoRecent),
         };
-        let mut ctl = Self::new(services, spare, keymap);
+        let (left, right) = (spare(&services), spare(&services));
+        let mut ctl = Self::new(left, right, keymap);
+        // The host fixed the source, so only the view settings are kept, not recent files.
         ctl.left = BrowserPaneController::with_profile(
             PaneServices {
                 jobs: ctl.jobs.clone(),
                 notify: Arc::clone(&ctl.notify),
-                recent: Box::new(NoRecent),
+                recent: Box::new(PrefsOnly(services.recent)),
             },
             profile,
         );
+        ctl.left.remember_style_as(profile.name);
         ctl.right = BrowserPaneController::with_profile(
             PaneServices::headless(),
             PaneProfile::commander().read_only(),
@@ -811,10 +837,12 @@ impl CommanderController {
 
     /// True while any job runs (an open, apply, copy, export, wrapper or checksum), so a view polls.
     pub fn is_working(&self) -> bool {
-        let pane_busy = |p: &BrowserPaneController| p.is_busy() || p.wrapper_opening().is_some();
+        let pane_busy = |p: &BrowserPaneController| {
+            p.is_busy() || p.wrapper_opening().is_some() || p.is_listing_folders()
+        };
         let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());
         let busy = self.copy.is_some() || hashing || self.detail_job.is_some();
-        busy || pane_busy(&self.left) || pane_busy(&self.right)
+        busy || self.follow_pending() || pane_busy(&self.left) || pane_busy(&self.right)
     }
 
     /// The first chord for `cmd` as this platform writes it, or "" when unbound.
@@ -841,7 +869,8 @@ impl CommanderController {
 
     /// True when this key press means a command here, so a view hands it over instead of using it.
     pub fn binds(&self, key: Key, mods: Mods) -> bool {
-        self.keymap.lookup(key, mods).is_some()
+        let cmd = self.keymap.lookup(key, mods);
+        cmd.is_some_and(|c| !self.tree_command_idle(c))
     }
 
     /// The pane that asked the outstanding prompt with this `purpose`, if a pane did.
@@ -1022,6 +1051,8 @@ impl CommanderController {
             Command::Bless => Some(P::Bless),
             Command::Import => Some(P::Import),
             Command::Metadata => Some(P::EditMetadata),
+            Command::Expand => Some(P::ExpandCursor),
+            Command::Collapse => Some(P::CollapseCursor),
             Command::Apply
             | Command::Delete
             | Command::Edits
@@ -1034,6 +1065,8 @@ impl CommanderController {
             | Command::Checksums
             | Command::Export
             | Command::Log
+            | Command::QuickView
+            | Command::ViewMenu
             | Command::Transforms => None,
         };
         if let Some(action) = pane_action {
@@ -1046,7 +1079,9 @@ impl CommanderController {
         }
         match cmd {
             Command::Help => self.show_help = !self.show_help,
-            Command::SwitchPane => self.active = side.other(),
+            Command::SwitchPane => return self.switch_pane(),
+            Command::QuickView => self.toggle_quick_view(),
+            Command::ViewMenu => self.view_menu = !self.view_menu,
             Command::Copy => {
                 if self.can_copy(side) {
                     self.status = self.copy(side);
@@ -1082,7 +1117,24 @@ impl CommanderController {
             | Command::Repair
             | Command::Bless
             | Command::Import
-            | Command::Metadata => {}
+            | Command::Metadata
+            | Command::Expand
+            | Command::Collapse => {}
+        }
+        Vec::new()
+    }
+
+    /// Tab: a pane with a folder tree takes it in two steps (tree, then list), then the other pane.
+    fn switch_pane(&mut self) -> Vec<Effect> {
+        let side = self.active;
+        let pane = self.pane(side);
+        if pane.has_folder_tree() && pane.tree_focused() {
+            return self.forward(side, BrowserPaneAction::SwitchFocus);
+        }
+        self.active = side.other();
+        let other = self.pane(self.active);
+        if other.has_folder_tree() && !other.tree_focused() {
+            return self.forward(self.active, BrowserPaneAction::SwitchFocus);
         }
         Vec::new()
     }
@@ -1103,6 +1155,8 @@ impl CommanderController {
         let active = self.active;
         if self.show_help {
             self.show_help = false;
+        } else if self.view_menu {
+            self.view_menu = false;
         } else if self.partitions.is_some() {
             self.partitions = None;
         } else if self.pane(active).edits_shown() {
@@ -1113,6 +1167,8 @@ impl CommanderController {
             self.close_checksums();
         } else if self.show_log {
             self.show_log = false;
+        } else if self.quick_view {
+            self.toggle_quick_view();
         } else {
             return self.request_close(false);
         }
@@ -1229,7 +1285,7 @@ impl CommanderController {
     }
 
     fn stage_metadata(&mut self, edit: MetadataEdit) {
-        let Some((side, editable)) = self.detail.as_ref().map(|d| (d.side, d.editable)) else {
+        let Some((side, editable)) = self.metadata_target() else {
             return;
         };
         let pane = self.pane_mut(side);
@@ -1240,8 +1296,6 @@ impl CommanderController {
         } else {
             pane.stage_metadata(edit)
         };
-        if let Some(d) = self.detail.as_mut() {
-            d.result = Some(result);
-        }
+        self.set_metadata_result(result);
     }
 }

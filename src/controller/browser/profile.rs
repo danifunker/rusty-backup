@@ -2,7 +2,7 @@
 //!
 //! A profile is plain data the pane checks before acting; a capability that is off refuses
 //! its action with a message (see [`PaneProfile::refusal`]). Views read it to decide what
-//! to draw (a source bar, an Apply button, the folder tree), never to decide what an input
+//! to draw (a source bar, an Apply button, a detail panel), never to decide what an input
 //! means. The design is in docs/phase2_commander_plan.md § "Slice 10: one browser pane".
 
 /// The sources a user may open from the pane itself.
@@ -56,6 +56,54 @@ pub struct Tools {
     pub transforms: bool,
 }
 
+/// How a pane lists its volume; the profile picks the default and the user can switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListingStyle {
+    /// One expandable tree of folders and files (the Inspect browse view).
+    CombinedTree,
+    /// The current folder's contents with `..` (a Commander pane).
+    FlatList,
+    /// A folder tree beside the current folder's list (the TUI Explorer).
+    TreeAndList,
+}
+
+impl ListingStyle {
+    pub const ALL: [ListingStyle; 3] = [
+        ListingStyle::CombinedTree,
+        ListingStyle::FlatList,
+        ListingStyle::TreeAndList,
+    ];
+
+    /// The View menu's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ListingStyle::CombinedTree => "Combined tree",
+            ListingStyle::FlatList => "Flat list",
+            ListingStyle::TreeAndList => "Folder tree + list",
+        }
+    }
+
+    /// The name stored in config.json.
+    pub fn key(self) -> &'static str {
+        match self {
+            ListingStyle::CombinedTree => "combined-tree",
+            ListingStyle::FlatList => "flat-list",
+            ListingStyle::TreeAndList => "tree-and-list",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<ListingStyle> {
+        ListingStyle::ALL.iter().copied().find(|s| s.key() == key)
+    }
+}
+
+/// Where a pane's File Info goes: beside the listing following the cursor, or a window on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailPlacement {
+    SidePanel,
+    OnRequest,
+}
+
 /// One use of the browser pane: which sources, how edits land, which tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneProfile {
@@ -73,8 +121,11 @@ pub struct PaneProfile {
     pub delete: bool,
     /// Archives and disk images expand in place under their row.
     pub wrappers: bool,
-    /// A folder tree beside the listing (the TUI Explorer's left pane).
-    pub folder_tree: bool,
+    /// The listing style a new pane starts in (a remembered choice replaces it).
+    pub listing: ListingStyle,
+    /// The styles the user may switch to.
+    pub styles: &'static [ListingStyle],
+    pub detail: DetailPlacement,
     pub tools: Tools,
 }
 
@@ -91,7 +142,9 @@ impl PaneProfile {
             new_folder: true,
             delete: true,
             wrappers: true,
-            folder_tree: false,
+            listing: ListingStyle::FlatList,
+            styles: &ListingStyle::ALL,
+            detail: DetailPlacement::OnRequest,
             tools: Tools {
                 fsck: false,
                 repair: false,
@@ -116,7 +169,9 @@ impl PaneProfile {
             new_folder: true,
             delete: true,
             wrappers: true,
-            folder_tree: true,
+            listing: ListingStyle::TreeAndList,
+            styles: &ListingStyle::ALL,
+            detail: DetailPlacement::OnRequest,
             tools: Tools {
                 fsck: true,
                 repair: true,
@@ -141,7 +196,9 @@ impl PaneProfile {
             new_folder: true,
             delete: true,
             wrappers: true,
-            folder_tree: false,
+            listing: ListingStyle::CombinedTree,
+            styles: &ListingStyle::ALL,
+            detail: DetailPlacement::SidePanel,
             tools: Tools {
                 fsck: false,
                 repair: false,
@@ -168,6 +225,10 @@ impl PaneProfile {
     /// The message an action gets when this profile turns its capability off.
     pub fn refusal(&self, what: &str) -> String {
         format!("{what} is not available in this view.")
+    }
+
+    pub fn allows(&self, style: ListingStyle) -> bool {
+        self.styles.contains(&style)
     }
 
     pub fn can_rename(&self) -> bool {
@@ -200,6 +261,19 @@ mod tests {
         assert!(p.staging && !p.fixed_source && !p.read_only && p.wrappers);
         assert!(p.can_rename() && p.can_new_folder() && p.can_delete());
         assert_eq!(p.tools, Tools::default());
+        assert_eq!(p.listing, ListingStyle::FlatList);
+        assert_eq!(p.detail, DetailPlacement::OnRequest);
+    }
+
+    #[test]
+    fn each_profile_keeps_its_look_by_default() {
+        assert_eq!(PaneProfile::explorer().listing, ListingStyle::TreeAndList);
+        let inspect = PaneProfile::inspect();
+        assert_eq!(inspect.listing, ListingStyle::CombinedTree);
+        assert_eq!(inspect.detail, DetailPlacement::SidePanel);
+        for s in ListingStyle::ALL {
+            assert_eq!(ListingStyle::from_key(s.key()), Some(s));
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The folder tree beside a pane's listing (profile `folder_tree`): the TUI Explorer's left pane.
+//! The folder tree beside a pane's listing (style `TreeAndList`): the TUI Explorer's left pane.
 //!
 //! The tree's cursor is always the listing's current folder: moving it navigates the listing,
 //! and any other navigation (Enter on a folder, Parent, a reopen after Apply) moves it, expanding
@@ -58,7 +58,7 @@ impl BrowserPaneController {
 
     /// True while the tree, not the listing, has the keyboard.
     pub fn tree_focused(&self) -> bool {
-        self.profile.folder_tree && self.folders.focused
+        self.has_folder_tree() && self.folders.focused
     }
 
     /// Expand `i`'s child folders under it, listing them now (quick once the volume is open).
@@ -88,7 +88,7 @@ impl BrowserPaneController {
 
     /// Rebuild the tree if it is gone, then expand down to the current folder and select it.
     pub(super) fn sync_tree(&mut self) {
-        if !self.profile.folder_tree {
+        if !self.has_folder_tree() {
             return;
         }
         let Some(root) = self
@@ -157,9 +157,11 @@ impl BrowserPaneController {
             A::CursorPage(n) => self.tree_select(to(i64::from(*n))),
             A::CursorHome => self.tree_select(0),
             A::CursorEnd => self.tree_select(last),
-            A::ActivateCursor => self.tree_expand(sel),
-            A::Up if self.folders.nodes[sel].expanded && sel > 0 => self.tree_collapse(sel),
-            A::Up => {
+            A::ActivateCursor | A::ExpandCursor => self.tree_expand(sel),
+            A::Up | A::CollapseCursor if self.folders.nodes[sel].expanded && sel > 0 => {
+                self.tree_collapse(sel)
+            }
+            A::Up | A::CollapseCursor => {
                 let depth = self.folders.nodes[sel].depth;
                 if let Some(p) = (0..sel)
                     .rev()
@@ -177,8 +179,42 @@ impl BrowserPaneController {
 
     /// Hand the keyboard to the tree or back to the listing.
     pub(super) fn switch_focus(&mut self) {
-        if self.profile.folder_tree {
+        if self.has_folder_tree() {
             self.folders.focused = !self.folders.focused;
+        }
+    }
+
+    /// A click on tree row `i`: show that folder and give the tree the keyboard.
+    pub(super) fn folder_tree_click(&mut self, i: usize) {
+        self.folders.focused = true;
+        self.tree_select(i);
+    }
+
+    /// Expand or collapse tree row `i`; collapsing above the current folder first moves to `i`.
+    pub(super) fn folder_tree_toggle(&mut self, i: usize) {
+        let before = self.folders.nodes.len();
+        match self.folders.nodes.get(i).map(|n| (n.expanded, n.depth)) {
+            Some((true, depth)) if i > 0 => {
+                let sel = self.folders.sel;
+                let inside = sel > i
+                    && self.folders.nodes[i + 1..=sel]
+                        .iter()
+                        .all(|n| n.depth > depth);
+                if inside {
+                    self.tree_select(i);
+                }
+                self.tree_collapse(i);
+                if self.folders.sel > i {
+                    self.folders.sel -= before - self.folders.nodes.len();
+                }
+            }
+            Some((false, _)) => {
+                self.tree_expand(i);
+                if self.folders.sel > i {
+                    self.folders.sel += self.folders.nodes.len() - before;
+                }
+            }
+            _ => {}
         }
     }
 }

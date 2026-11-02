@@ -12,14 +12,14 @@ pub mod screen;
 pub use crate::controller::browser::{pane, rows};
 pub use crate::controller::browser::{
     purpose, validate_entry_name, ApplyPreflight, ApplyReport, BrowserPaneAction,
-    BrowserPaneController, DisplayRow, FailedEdit, NoRecent, OnConflict, PaneProfile, PaneServices,
-    RecentStore, RowKind, SortColumn, SourceKind, StageOutcome, VolumeInfo,
-    MAX_CONSECUTIVE_FAILURES,
+    BrowserPaneController, DetailPlacement, DisplayRow, FailedEdit, ListingStyle, NoRecent,
+    OnConflict, PaneProfile, PaneServices, RecentStore, RowKind, SortColumn, SourceKind,
+    StageOutcome, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 pub use screen::{
     export_choices, ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField,
     ExportChoice, ExportFormat, FileDetail, HashAlgo, IdNameMap, MetadataEdit, RenameNotice,
-    ResourceForkMode, Side, SizePlan, Xattr,
+    ResourceForkMode, Side, SizePlan, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

@@ -97,8 +97,10 @@ enum ApplyPhase {
 }
 
 enum PromptTarget {
-    Rename(Box<FileEntry>),
-    NewFolder,
+    /// The entry and the folder it is in.
+    Rename(Box<(FileEntry, FileEntry)>),
+    /// The folder the new one goes in.
+    NewFolder(Box<FileEntry>),
 }
 
 struct Prompt {
@@ -124,13 +126,26 @@ struct WrapperOpening {
     job: Job<PreparedMount>,
 }
 
+/// The cursor row's File Info inputs, for a detail that follows the cursor.
+pub struct CursorDetail {
+    pub node_id: String,
+    pub entry: FileEntry,
+    pub fs_type: String,
+    /// Metadata edits may be staged on it (a writable image volume, not a wrapper's contents).
+    pub editable: bool,
+    /// Where its preview is read; `None` when nothing can be read.
+    pub source: Option<DetailSource>,
+    /// A top-level entry, where a SquashFS volume's size budget is read.
+    pub at_root: bool,
+}
+
 /// The editing half of a pane's state.
 pub(super) struct EditState {
     show_edits: bool,
     prompt: Option<Prompt>,
     host_delete: Option<Vec<PathBuf>>,
-    /// Names a pane without staging deletes once the user agrees.
-    image_delete: Option<Vec<String>>,
+    /// (folder, entry) pairs a pane without staging deletes once the user agrees.
+    image_delete: Option<Vec<(FileEntry, FileEntry)>>,
     apply: ApplyPhase,
     report: Option<ApplyReport>,
     host_job: Option<HostJob>,
@@ -361,23 +376,27 @@ impl BrowserPaneController {
 
     // --- what the two-pane controller reads and stages ------------------------
 
-    /// True when a row is selected, in the listing or inside an expanded wrapper.
+    /// True when a row is selected: in the listing, inside an expanded wrapper or folder.
     pub fn has_selection(&self) -> bool {
-        self.tree_active() || !self.listing.selection().is_empty()
+        self.tree_active() || self.folder_active() || !self.listing.selection().is_empty()
     }
 
-    /// The selected entries: the wrapper-tree selection when there is one, else the listing's.
+    /// The selected entries: the wrapper tree's or the combined tree's when set, else the listing's.
     pub fn selected_entries(&self) -> Vec<FileEntry> {
         if let Some((_, entries)) = self.tree_selection() {
             return entries;
+        }
+        if self.folder_active() {
+            let rows = self.folder_selection().into_iter();
+            return rows.map(|r| r.entry).collect();
         }
         let selected = self.listing.selected_entries().into_iter();
         selected.cloned().collect()
     }
 
-    /// The current folder's entry, where a copy into this pane lands.
+    /// The folder a copy into this pane lands in: the current one, or the combined tree's cursor folder.
     pub fn cwd_entry(&self) -> Option<FileEntry> {
-        self.listing.cwd().cloned()
+        self.target_folder()
     }
 
     /// True when the selection's source is a host folder (a wrapper selection is not).
@@ -397,10 +416,14 @@ impl BrowserPaneController {
 
     /// The named entry as the listing (or the wrapper-tree selection) holds it.
     pub fn detail_entry(&self, name: &str) -> Option<FileEntry> {
-        match self.tree_selection() {
-            Some((_, entries)) => entries.into_iter().find(|e| e.name == name),
-            None => self.entry_named(name),
+        if let Some((_, entries)) = self.tree_selection() {
+            return entries.into_iter().find(|e| e.name == name);
         }
+        if self.folder_active() {
+            let rows = self.folder_selection().into_iter();
+            return rows.map(|r| r.entry).find(|e| e.name == name);
+        }
+        self.entry_named(name)
     }
 
     /// Where a File Info job reads the selection's data; `None` when nothing can be read.
@@ -411,6 +434,48 @@ impl BrowserPaneController {
         self.copy_stage_source().map(DetailSource::Image)
     }
 
+    /// What File Info would show for the cursor row, without touching the selection.
+    pub fn cursor_detail(&mut self) -> Option<CursorDetail> {
+        let row = self.cursor_row()?;
+        if row.is_parent() || row.kind == super::RowKind::PendingAdd {
+            return None;
+        }
+        if row.is_tree {
+            let tr = self.tree_index.get(&row.node_id)?.clone();
+            let fs_type = self
+                .wrapper_tree
+                .mount_fs(&tr.mount)
+                .map(|fs| fs.fs_type().to_string());
+            let reopen = self.wrapper_tree.mount_reopen(&tr.mount);
+            return Some(CursorDetail {
+                node_id: row.node_id,
+                entry: tr.entry,
+                fs_type: fs_type.unwrap_or_default(),
+                editable: false,
+                source: reopen.map(|r| DetailSource::Image(StageSource::Reopen(r))),
+                at_root: false,
+            });
+        }
+        let entry = match self.dirs.index.get(&row.node_id) {
+            Some(r) => r.entry.clone(),
+            None => self.entry_named(&row.name)?,
+        };
+        let host = self.listing.is_host();
+        let source = if host {
+            Some(DetailSource::Host)
+        } else {
+            self.base_stage_source().map(DetailSource::Image)
+        };
+        Some(CursorDetail {
+            node_id: row.node_id,
+            at_root: !entry.path.trim_start_matches('/').contains('/'),
+            entry,
+            fs_type: self.volume().fs_type.clone(),
+            editable: !host && !self.is_backup() && !self.is_archive(),
+            source,
+        })
+    }
+
     /// What a job reading this pane's source holds, so an apply cannot write under it.
     pub fn source_resources(&self) -> Vec<Resource> {
         self.apply_resources()
@@ -419,24 +484,16 @@ impl BrowserPaneController {
     /// Push a copy batch onto the queue, renaming names this volume cannot hold.
     pub fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
         let queue_start = self.queue.len();
-        let cwd_path = self.listing.cwd_path().to_string();
-        let cwd_names: Vec<String> = self
-            .listing
-            .entries()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
+        let target = self.target_folder();
+        let target_path = target.map(|t| t.path).unwrap_or_default();
+        let target_names = self.names_in(&target_path);
         let queue = &self.queue;
         let mut existing = |path: &str| {
-            let mut names: Vec<String> = queue
-                .pending_adds_for(path)
-                .into_iter()
-                .map(|e| e.name)
-                .collect();
-            if path == cwd_path {
-                names.extend(cwd_names.iter().cloned());
+            if path == target_path {
+                return target_names.clone();
             }
-            names
+            let adds = queue.pending_adds_for(path).into_iter();
+            adds.map(|e| e.name).collect::<Vec<String>>()
         };
         // A remote image has no local fs here; the daemon reports bad names at apply.
         let (report, fs_type) = match self.listing.fs_mut() {
@@ -545,9 +602,9 @@ impl BrowserPaneController {
             }
             A::Confirmed { purpose, yes } if purpose == purpose::DELETE_NOW => {
                 match self.ed.image_delete.take() {
-                    Some(names) if yes && !self.is_busy() => {
-                        self.toggle_delete(&names);
-                        msg(format!("deleting {} item(s)...", names.len()))
+                    Some(pairs) if yes && !self.is_busy() => {
+                        self.toggle_delete(&pairs);
+                        msg(format!("deleting {} item(s)...", pairs.len()))
                     }
                     _ => Vec::new(),
                 }
@@ -585,17 +642,17 @@ impl BrowserPaneController {
         if self.is_busy() {
             return msg("wait for the current operation to finish.");
         }
-        let names: Vec<String> = self.listing.selection().to_vec();
-        if names.is_empty() {
+        let pairs = self.selected_pairs();
+        if pairs.is_empty() {
             return msg("nothing selected to delete.");
         }
         if !self.listing.is_host() && !self.profile.staging {
-            let n = names.len();
-            let what = match names.as_slice() {
-                [one] => format!("'{one}'"),
+            let n = pairs.len();
+            let what = match pairs.as_slice() {
+                [(_, one)] => format!("'{}'", one.name),
                 _ => format!("{n} items"),
             };
-            self.ed.image_delete = Some(names);
+            self.ed.image_delete = Some(pairs);
             return vec![Effect::Confirm(ConfirmSpec {
                 purpose: purpose::DELETE_NOW,
                 title: "Delete?".into(),
@@ -605,15 +662,13 @@ impl BrowserPaneController {
             })];
         }
         if !self.listing.is_host() {
-            self.toggle_delete(&names);
-            return msg(format!("toggled delete on {} item(s).", names.len()));
+            self.toggle_delete(&pairs);
+            return msg(format!("toggled delete on {} item(s).", pairs.len()));
         }
-        let paths: Vec<PathBuf> = self
-            .listing
-            .entries()
+        let paths: Vec<PathBuf> = pairs
             .iter()
-            .filter(|e| names.contains(&e.name))
-            .map(|e| PathBuf::from(&e.path))
+            .filter(|(_, e)| !self.queue.is_pending_add(&e.path))
+            .map(|(_, e)| PathBuf::from(&e.path))
             .collect();
         let n = paths.len();
         self.ed.host_delete = Some(paths);
@@ -629,14 +684,31 @@ impl BrowserPaneController {
         })]
     }
 
-    /// Stage a delete, undelete a pending one, or unstage a pending copy / new folder.
-    fn toggle_delete(&mut self, names: &[String]) {
+    /// The selection as (folder, entry) pairs: the combined tree's, else the listing's (and its staged adds).
+    fn selected_pairs(&self) -> Vec<(FileEntry, FileEntry)> {
+        if self.folder_active() {
+            let rows = self.folder_selection().into_iter();
+            return rows.map(|r| (r.parent, r.entry)).collect();
+        }
         let Some(cwd) = self.listing.cwd().cloned() else {
-            return;
+            return Vec::new();
         };
-        let pending_adds = self.queue.pending_adds_for(&cwd.path);
-        for name in names {
-            if let Some(add) = pending_adds.iter().find(|e| &e.name == name) {
+        let adds = self.queue.pending_adds_for(&cwd.path);
+        let names = self.listing.selection().iter();
+        names
+            .filter_map(|n| {
+                let add = adds.iter().find(|e| &e.name == n).cloned();
+                add.or_else(|| self.entry_named(n))
+            })
+            .map(|e| (cwd.clone(), e))
+            .collect()
+    }
+
+    /// Stage a delete, undelete a pending one, or unstage a pending copy / new folder.
+    fn toggle_delete(&mut self, pairs: &[(FileEntry, FileEntry)]) {
+        for (parent, entry) in pairs {
+            let pending_adds = self.queue.pending_adds_for(&parent.path);
+            if let Some(add) = pending_adds.iter().find(|e| e.path == entry.path) {
                 if add.is_directory() {
                     self.queue.remove_pending_subtree(&add.path);
                 } else {
@@ -644,16 +716,14 @@ impl BrowserPaneController {
                 }
                 continue;
             }
-            let Some(entry) = self.entry_named(name) else {
-                continue;
-            };
+            let entry = entry.clone();
             if self.queue.is_pending_delete(&entry.path) {
                 self.queue.remove_pending_delete(&entry.path);
                 continue;
             }
             // A delete supersedes a staged rename, else apply renames it and then misses the old name.
             self.queue.remove_pending_rename(&entry.path);
-            let parent = cwd.clone();
+            let parent = parent.clone();
             self.queue.push(if entry.is_directory() {
                 StagedEdit::DeleteRecursive { parent, entry }
             } else {
@@ -676,24 +746,22 @@ impl BrowserPaneController {
         if row.is_tree || row.is_parent() || row.kind != super::RowKind::Normal {
             return Vec::new();
         }
+        if row.in_folder {
+            self.folder_context_select(row.node_id.clone());
+            let Some(r) = self.dirs.index.get(&row.node_id).cloned() else {
+                return Vec::new();
+            };
+            return self.request_rename_entry(r.entry, r.parent);
+        }
         self.context_select(&row.name);
         self.request_rename(&row.name)
     }
 
-    /// A text spec for a name in the current folder; `except` is left out of the taken names.
-    fn name_spec(&mut self, purpose: &'static str, except: Option<&str>) -> TextSpec {
-        let cwd = self.listing.cwd_path().to_string();
+    /// A text spec for a name in `folder`; `except` is left out of the taken names.
+    fn name_spec(&mut self, purpose: &'static str, folder: &str, except: Option<&str>) -> TextSpec {
         let taken: Vec<String> = self
-            .listing
-            .entries()
-            .iter()
-            .map(|e| e.name.clone())
-            .chain(
-                self.queue
-                    .pending_adds_for(&cwd)
-                    .into_iter()
-                    .map(|e| e.name),
-            )
+            .names_in(folder)
+            .into_iter()
             .filter(|n| Some(n.as_str()) != except)
             .collect();
         let (fold_case, forbidden) = if self.listing.is_host() {
@@ -725,30 +793,41 @@ impl BrowserPaneController {
         if self.is_remote() {
             return msg(REMOTE_COPIES_ONLY);
         }
+        let (Some(entry), Some(cwd)) = (self.entry_named(name), self.listing.cwd().cloned()) else {
+            return Vec::new();
+        };
+        self.request_rename_entry(entry, cwd)
+    }
+
+    fn request_rename_entry(&mut self, entry: FileEntry, parent: FileEntry) -> Vec<Effect> {
+        if self.is_remote() {
+            return msg(REMOTE_COPIES_ONLY);
+        }
         if !self.can_edit_names() {
             return Vec::new();
         }
-        let Some(entry) = self.entry_named(name) else {
-            return Vec::new();
-        };
-        let mut spec = self.name_spec(purpose::RENAME, Some(name));
+        let name = entry.name.clone();
+        let mut spec = self.name_spec(purpose::RENAME, &parent.path, Some(&name));
         spec.title = "Rename".into();
         spec.prompt = format!("Rename \"{name}\" to:");
         spec.initial = name.to_string();
         spec.unchanged = name.to_string();
         spec.ok_label = "Rename".into();
-        self.ask(spec, PromptTarget::Rename(Box::new(entry)))
+        self.ask(spec, PromptTarget::Rename(Box::new((entry, parent))))
     }
 
     fn request_new_folder(&mut self) -> Vec<Effect> {
         if !self.can_new_folder() {
             return Vec::new();
         }
-        let mut spec = self.name_spec(purpose::NEW_FOLDER, None);
+        let Some(folder) = self.target_folder() else {
+            return Vec::new();
+        };
+        let mut spec = self.name_spec(purpose::NEW_FOLDER, &folder.path, None);
         spec.title = "New Folder".into();
         spec.prompt = "Folder name:".into();
         spec.ok_label = "Create".into();
-        self.ask(spec, PromptTarget::NewFolder)
+        self.ask(spec, PromptTarget::NewFolder(Box::new(folder)))
     }
 
     fn ask(&mut self, spec: TextSpec, target: PromptTarget) -> Vec<Effect> {
@@ -785,12 +864,12 @@ impl BrowserPaneController {
             return self.ask(spec, prompt.target);
         }
         match prompt.target {
-            PromptTarget::Rename(entry) => self.rename(*entry, name),
-            PromptTarget::NewFolder => self.new_folder(name),
+            PromptTarget::Rename(pair) => self.rename(pair.0, pair.1, name),
+            PromptTarget::NewFolder(folder) => self.new_folder(*folder, name),
         }
     }
 
-    fn rename(&mut self, entry: FileEntry, new_name: String) -> Vec<Effect> {
+    fn rename(&mut self, entry: FileEntry, parent: FileEntry, new_name: String) -> Vec<Effect> {
         if self.listing.is_host() {
             let from = entry.name.clone();
             let old = PathBuf::from(&entry.path);
@@ -800,31 +879,25 @@ impl BrowserPaneController {
                 Ok(HostDone::Renamed { from, to })
             });
         }
-        let Some(cwd) = self.listing.cwd().cloned() else {
-            return msg("no directory to rename in.");
-        };
         self.queue.remove_pending_rename(&entry.path);
         self.queue.push(StagedEdit::Rename {
-            parent: cwd,
+            parent,
             entry,
             new_name: new_name.clone(),
         });
         msg(format!("staged rename to '{new_name}'. Apply to write."))
     }
 
-    fn new_folder(&mut self, name: String) -> Vec<Effect> {
+    fn new_folder(&mut self, folder: FileEntry, name: String) -> Vec<Effect> {
         if self.listing.is_host() {
-            let parent = PathBuf::from(self.listing.cwd_path());
+            let parent = PathBuf::from(&folder.path);
             return self.spawn_host("create folder", format!("Creating {name}"), move |_| {
                 host_ops::make_dir(&parent, &name)?;
                 Ok(HostDone::Created(name))
             });
         }
-        let Some(cwd) = self.listing.cwd().cloned() else {
-            return msg("no directory open.");
-        };
         self.queue.push(StagedEdit::CreateDirectory {
-            parent: cwd,
+            parent: folder,
             name: name.clone(),
             qnx2_attrs: None,
         });
@@ -887,6 +960,7 @@ impl BrowserPaneController {
         let text = match (h.job.snapshot().status, h.job.take_result()) {
             (Status::Done, Some(done)) => {
                 let text = self.host_done(done);
+                self.folders_reloaded();
                 if let Err(e) = self.listing.reload() {
                     self.error = Some(format!("cannot refresh: {e}"));
                 }
@@ -1133,13 +1207,7 @@ impl BrowserPaneController {
             ));
             return;
         }
-        let Some(entry) = self
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.path == node_id)
-            .cloned()
-        else {
+        let Some(entry) = self.entry_by_path(node_id) else {
             return;
         };
         let Some(kind) = classify_entry(&entry) else {

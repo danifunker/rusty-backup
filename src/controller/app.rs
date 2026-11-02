@@ -152,6 +152,17 @@ mod recent {
             cfg.remember_file(RecentMode::Commander, path);
             self.0.save(&cfg);
         }
+
+        fn listing_style(&self, view: &str) -> Option<String> {
+            self.0.load().listing_styles.get(view).cloned()
+        }
+
+        fn remember_listing_style(&mut self, view: &str, style: &str) {
+            let mut cfg = self.0.load();
+            cfg.listing_styles
+                .insert(view.to_string(), style.to_string());
+            self.0.save(&cfg);
+        }
     }
 
     impl AppController {
@@ -232,5 +243,51 @@ mod tests {
             .recent_files
             .list(crate::update::RecentMode::Commander);
         assert_eq!(commander, ["/opened.img"]);
+    }
+
+    #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+    #[test]
+    fn listing_styles_round_trip_and_an_old_config_has_none() {
+        use crate::controller::browser::{ListingStyle, PaneServices};
+        use crate::controller::commander::{BrowserPaneAction, RecentStore};
+        let mut recent = CommanderRecent(MemoryConfig::default());
+        assert_eq!(recent.listing_style("commander-left"), None);
+        recent.remember_listing_style("commander-left", "combined-tree");
+        assert_eq!(
+            recent.listing_style("commander-left").as_deref(),
+            Some("combined-tree")
+        );
+        // A pane remembers its choice under its view name and a new pane starts in it.
+        struct Shared(Arc<std::sync::Mutex<MemoryConfig>>);
+        impl ConfigStore for Shared {
+            fn load(&self) -> crate::update::UpdateConfig {
+                self.0.lock().unwrap().load()
+            }
+            fn save(&mut self, config: &crate::update::UpdateConfig) {
+                self.0.lock().unwrap().save(config)
+            }
+        }
+        let cfg = Arc::new(std::sync::Mutex::new(MemoryConfig::default()));
+        let pane = |cfg: &Arc<std::sync::Mutex<MemoryConfig>>| {
+            let mut p =
+                crate::controller::browser::BrowserPaneController::with_services(PaneServices {
+                    jobs: crate::model::job::JobRegistry::new(),
+                    notify: Arc::new(NoNotify),
+                    recent: Box::new(CommanderRecent(Shared(Arc::clone(cfg)))),
+                });
+            p.remember_style_as("explorer");
+            p
+        };
+        let mut first = pane(&cfg);
+        assert_eq!(first.listing_style(), ListingStyle::FlatList);
+        first.apply(BrowserPaneAction::SetListingStyle(
+            ListingStyle::TreeAndList,
+        ));
+        assert_eq!(pane(&cfg).listing_style(), ListingStyle::TreeAndList);
+        // A config.json from before this field still parses, with no styles.
+        let mut json = serde_json::to_value(crate::update::UpdateConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("listing_styles");
+        let old: crate::update::UpdateConfig = serde_json::from_value(json).unwrap();
+        assert!(old.listing_styles.is_empty());
     }
 }

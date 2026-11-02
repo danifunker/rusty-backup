@@ -105,6 +105,14 @@ pub enum Command {
     Export,
     Edits,
     Log,
+    /// Show the active pane's File Info in the other pane, following its cursor.
+    QuickView,
+    /// The View menu: listing style, quick view, the log.
+    ViewMenu,
+    /// Expand the cursor row in a tree (open the folder in a plain list).
+    Expand,
+    /// Collapse the cursor row in a tree, or go to its parent row.
+    Collapse,
     /// Check the open filesystem (the Explorer's volume tools from here down).
     Fsck,
     Repair,
@@ -116,7 +124,7 @@ pub enum Command {
 
 impl Command {
     /// The commands the two-pane file manager binds.
-    pub const FILE_MANAGER: [Command; 30] = [
+    pub const FILE_MANAGER: [Command; 34] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -147,9 +155,13 @@ impl Command {
         Command::Export,
         Command::Edits,
         Command::Log,
+        Command::QuickView,
+        Command::ViewMenu,
+        Command::Expand,
+        Command::Collapse,
     ];
 
-    pub const ALL: [Command; 36] = [
+    pub const ALL: [Command; 40] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -180,6 +192,10 @@ impl Command {
         Command::Export,
         Command::Edits,
         Command::Log,
+        Command::QuickView,
+        Command::ViewMenu,
+        Command::Expand,
+        Command::Collapse,
         Command::Fsck,
         Command::Repair,
         Command::Bless,
@@ -189,7 +205,7 @@ impl Command {
     ];
 
     /// The commands the one-pane Explorer binds.
-    pub const EXPLORER: [Command; 30] = [
+    pub const EXPLORER: [Command; 33] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -214,6 +230,9 @@ impl Command {
         Command::Export,
         Command::Edits,
         Command::Log,
+        Command::ViewMenu,
+        Command::Expand,
+        Command::Collapse,
         Command::Fsck,
         Command::Repair,
         Command::Bless,
@@ -255,6 +274,10 @@ impl Command {
             Command::Export => "export",
             Command::Edits => "edits",
             Command::Log => "log",
+            Command::QuickView => "quick-view",
+            Command::ViewMenu => "view-menu",
+            Command::Expand => "expand",
+            Command::Collapse => "collapse",
             Command::Fsck => "fsck",
             Command::Repair => "repair",
             Command::Bless => "bless",
@@ -301,6 +324,10 @@ impl Command {
             Command::Export => "Export",
             Command::Edits => "Staged edits",
             Command::Log => "Session log",
+            Command::QuickView => "Quick view",
+            Command::ViewMenu => "View menu",
+            Command::Expand => "Expand",
+            Command::Collapse => "Collapse",
             Command::Fsck => "Check filesystem",
             Command::Repair => "Repair filesystem",
             Command::Bless => "Bless System Folder",
@@ -336,14 +363,21 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::OpenImage, &["Primary+O"]),
     (Command::OpenFolder, &["Primary+D"]),
     (Command::OpenBackup, &["Primary+B"]),
-    (Command::Connect, &["Primary+K"]),
+    (Command::Connect, &["Primary+Shift+K"]),
     (Command::Partition, &["Primary+P"]),
     (Command::Sort, &["Primary+S"]),
     (Command::Checksums, &["Primary+G"]),
     (Command::Export, &["Primary+E"]),
     (Command::Edits, &["Primary+U"]),
     (Command::Log, &["Primary+L"]),
+    (Command::QuickView, &["Primary+K"]),
+    (Command::ViewMenu, &["F9"]),
+    (Command::Expand, &["Right"]),
+    (Command::Collapse, &["Left"]),
 ];
+
+/// Extra chords a terminal needs: most cannot tell Ctrl+Shift+K from Ctrl+K.
+const TERMINAL_EXTRA: &[(Command, &[&str])] = &[(Command::Connect, &["Alt+K"])];
 
 /// The Explorer's chords beyond the file-manager ones it keeps (no sources, no second pane).
 const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
@@ -353,9 +387,6 @@ const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
     (Command::Import, &["Primary+O"]),
     (Command::Metadata, &["Primary+A"]),
     (Command::Transforms, &["Primary+T"]),
-    // The tree pane's collapse and expand.
-    (Command::Parent, &["Left"]),
-    (Command::Open, &["Right"]),
 ];
 
 /// The command each chord means, for one platform.
@@ -397,6 +428,15 @@ impl KeyMap {
     /// [`Self::explorer_defaults`] with the PC chords, for a terminal.
     pub fn explorer_terminal() -> Self {
         Self::explorer_defaults(false)
+    }
+
+    fn add(&mut self, table: &[(Command, &[&str])]) {
+        for (cmd, chords) in table {
+            for text in *chords {
+                let chord = Chord::parse(text).expect("built-in chord parses");
+                self.bindings.push((chord, *cmd));
+            }
+        }
     }
 
     /// [`Self::explorer_terminal`] with `path`'s overrides applied, plus any problems found.
@@ -477,7 +517,9 @@ impl KeyMap {
 
     /// The PC chords on every platform: a terminal has no Cmd key, so Primary is Ctrl there too.
     pub fn for_terminal() -> Self {
-        Self::defaults(false)
+        let mut map = Self::defaults(false);
+        map.add(TERMINAL_EXTRA);
+        map
     }
 
     /// The defaults for this platform with `path`'s overrides applied, plus any problems found.
@@ -725,7 +767,18 @@ mod tests {
         };
         let (k, m) = ctrl('f');
         assert_eq!(ex.lookup(k, m), Some(Command::Fsck));
-        assert_eq!(ex.lookup(Key::Right, Mods::default()), Some(Command::Open));
+        assert_eq!(
+            ex.lookup(Key::Right, Mods::default()),
+            Some(Command::Expand)
+        );
+        assert_eq!(
+            ex.lookup(Key::Left, Mods::default()),
+            Some(Command::Collapse)
+        );
+        assert_eq!(
+            ex.lookup(Key::F(9), Mods::default()),
+            Some(Command::ViewMenu)
+        );
         assert_eq!(
             ex.lookup(Key::F(6), Mods::default()),
             None,
@@ -752,7 +805,9 @@ mod tests {
         assert_eq!(pc.lookup(Key::Delete, none), Some(Command::Delete));
         assert_eq!(pc.lookup(Key::Char('n'), ctrl), Some(Command::NewFolder));
         assert_eq!(pc.lookup(Key::F(10), none), Some(Command::Apply));
-        assert_eq!(pc.lookup(Key::F(9), none), None);
+        assert_eq!(pc.lookup(Key::F(9), none), Some(Command::ViewMenu));
+        assert_eq!(pc.lookup(Key::Right, none), Some(Command::Expand));
+        assert_eq!(pc.lookup(Key::Left, none), Some(Command::Collapse));
         assert_eq!(pc.lookup(Key::Backspace, none), Some(Command::Parent));
         assert_eq!(pc.lookup(Key::Escape, none), Some(Command::Close));
     }
@@ -799,7 +854,7 @@ mod tests {
             ('o', Command::OpenImage),
             ('d', Command::OpenFolder),
             ('b', Command::OpenBackup),
-            ('k', Command::Connect),
+            ('k', Command::QuickView),
             ('p', Command::Partition),
             ('s', Command::Sort),
             ('g', Command::Checksums),
@@ -829,6 +884,31 @@ mod tests {
     }
 
     #[test]
+    fn quick_view_has_primary_k_and_connect_moved_to_primary_shift_k() {
+        let ctrl_shift = Mods {
+            ctrl: true,
+            shift: true,
+            ..Mods::default()
+        };
+        let pc = KeyMap::defaults(false);
+        assert_eq!(
+            pc.lookup(Key::Char('k'), ctrl_shift),
+            Some(Command::Connect)
+        );
+        assert_eq!(pc.hint(Command::Connect), "Ctrl+Shift+K");
+        let mac = KeyMap::defaults(true);
+        assert_eq!(mac.hint(Command::QuickView), "Cmd+K");
+        assert_eq!(mac.hint(Command::Connect), "Cmd+Shift+K");
+        let term = KeyMap::for_terminal();
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        assert_eq!(term.lookup(Key::Char('k'), alt), Some(Command::Connect));
+        assert_eq!(term.hint(Command::QuickView), "Ctrl+K");
+    }
+
+    #[test]
     fn a_terminal_uses_ctrl_even_on_a_mac() {
         let term = KeyMap::for_terminal();
         let ctrl = Mods {
@@ -853,7 +933,7 @@ mod tests {
     fn overrides_replace_a_command_and_report_bad_lines() {
         let mut map = KeyMap::defaults(false);
         let problems = map.apply_overrides(
-            "# mine\n[file-manager]\nrename = [\"F4\", \"Primary+R\"]  # two keys\napply = \"F9\"\nbogus = \"F3\"\nhelp = \"Hyper+F1\"\n",
+            "# mine\n[file-manager]\nrename = [\"F4\", \"Primary+R\"]  # two keys\napply = \"F11\"\nbogus = \"F3\"\nhelp = \"Hyper+F1\"\n",
         );
         assert_eq!(problems.len(), 2, "{problems:?}");
         let ctrl = Mods {
@@ -866,7 +946,10 @@ mod tests {
         );
         assert_eq!(map.lookup(Key::Char('r'), ctrl), Some(Command::Rename));
         assert_eq!(map.lookup(Key::F(2), Mods::default()), None);
-        assert_eq!(map.lookup(Key::F(9), Mods::default()), Some(Command::Apply));
+        assert_eq!(
+            map.lookup(Key::F(11), Mods::default()),
+            Some(Command::Apply)
+        );
         assert_eq!(map.lookup(Key::F(10), Mods::default()), None);
         assert_eq!(
             map.lookup(Key::F(1), Mods::default()),

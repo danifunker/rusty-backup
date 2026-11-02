@@ -80,11 +80,37 @@ impl VolumeInfo {
     }
 }
 
-/// Where a pane reads and records its recent files.
+/// Where a pane reads and records its recent files and its view's remembered listing style.
 pub trait RecentStore: Send {
     /// Newest first.
     fn list(&self) -> Vec<String>;
     fn remember(&mut self, path: &str);
+
+    /// The listing style last chosen for `view` (`commander-left`, `explorer`, ...), by its key.
+    fn listing_style(&self, _view: &str) -> Option<String> {
+        None
+    }
+
+    fn remember_listing_style(&mut self, _view: &str, _style: &str) {}
+}
+
+/// Only the view settings of another store: a fixed-source pane records no recent files.
+pub struct PrefsOnly(pub Box<dyn RecentStore>);
+
+impl RecentStore for PrefsOnly {
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn remember(&mut self, _path: &str) {}
+
+    fn listing_style(&self, view: &str) -> Option<String> {
+        self.0.listing_style(view)
+    }
+
+    fn remember_listing_style(&mut self, view: &str, style: &str) {
+        self.0.remember_listing_style(view, style)
+    }
 }
 
 /// No recent files (tests, slim builds).
@@ -414,6 +440,15 @@ impl BrowserPaneController {
     }
 
     /// The registry and wake every pane job uses.
+    /// Where the pane's recent files and view settings are kept.
+    pub(super) fn store_mut(&mut self) -> &mut dyn RecentStore {
+        self.src.services.recent.as_mut()
+    }
+
+    pub(super) fn store(&self) -> &dyn RecentStore {
+        self.src.services.recent.as_ref()
+    }
+
     pub(super) fn job_services(&self) -> (&JobRegistry, Arc<dyn Notify>) {
         (
             &self.src.services.jobs,
@@ -1088,7 +1123,7 @@ pub(in crate::controller) mod tests {
     pub(crate) fn settle(vm: &mut BrowserPaneController) -> Vec<Effect> {
         let start = Instant::now();
         let mut fx = vm.tick();
-        while vm.is_busy() || vm.wrapper_opening().is_some() {
+        while vm.is_busy() || vm.wrapper_opening().is_some() || vm.is_listing_folders() {
             assert!(
                 start.elapsed() < Duration::from_secs(60),
                 "a job never finished"

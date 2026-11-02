@@ -8,11 +8,12 @@ use crate::model::dir_listing::DirListing;
 use crate::model::edit_queue::EditQueue;
 use crate::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
 
-use super::profile::PaneProfile;
+use super::profile::{ListingStyle, PaneProfile};
 use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
 mod edits;
+mod expand;
 mod remote;
 pub(in crate::controller) mod source;
 mod tools;
@@ -22,9 +23,9 @@ pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
 pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
-pub use edits::{validate_entry_name, ApplyReport, StageOutcome};
+pub use edits::{validate_entry_name, ApplyReport, CursorDetail, StageOutcome};
 pub use remote::validate_remote_addr;
-pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, VolumeInfo};
+pub use source::{purpose, NoRecent, PaneServices, PrefsOnly, RecentStore, SourceKind, VolumeInfo};
 pub use tools::{
     format_mac_date, parse_mac_date, MetadataFields, MetadataForm, TextDoc, ToolReport,
     MAX_TEXT_EDIT,
@@ -45,7 +46,7 @@ pub enum BrowserPaneAction {
         ctrl: bool,
         shift: bool,
     },
-    /// Click a row inside an expanded wrapper; takes the selection over from the listing.
+    /// Click a row below an expanded wrapper or folder; takes the selection over from the listing.
     TreeClick {
         node_id: String,
         ctrl: bool,
@@ -53,7 +54,7 @@ pub enum BrowserPaneAction {
     },
     /// Right-click a base row: select just it unless it is already selected.
     ContextSelect(String),
-    /// Right-click a wrapper-tree row: select just it unless it is already selected.
+    /// Right-click a row below an expanded wrapper or folder: select just it unless already selected.
     TreeContextSelect(String),
     /// Toggle the cursor row in or out of the selection, then move down.
     ToggleMark,
@@ -73,6 +74,18 @@ pub enum BrowserPaneAction {
     InfoAtCursor,
     /// Expand or collapse the wrapper or inner folder with this node id.
     ToggleWrapper(String),
+    /// Expand or collapse any expandable row: a folder of the combined tree, a wrapper, its folders.
+    ToggleExpand(String),
+    /// Right: expand the cursor row (a list beside a folder tree opens the folder instead).
+    ExpandCursor,
+    /// Left: collapse the cursor row or step to its parent row (a plain list goes up).
+    CollapseCursor,
+    /// Show the volume as one tree, a flat folder list, or a folder tree beside the list.
+    SetListingStyle(ListingStyle),
+    /// Click this row of the folder tree: show that folder and give the tree the keyboard.
+    FolderTreeClick(usize),
+    /// Expand or collapse this row of the folder tree.
+    FolderTreeToggle(usize),
     /// Open a disk image, Mac archive or optical disc image.
     OpenImage(PathBuf),
     OpenHostFolder(PathBuf),
@@ -196,8 +209,13 @@ pub struct BrowserPaneController {
     profile: PaneProfile,
     /// Check / repair / editor jobs and their results.
     tl: tools::ToolState,
-    /// The folder tree beside the listing, when the profile has one.
+    /// The folder tree beside the listing, in the `TreeAndList` style.
     folders: tree::FolderTree,
+    style: ListingStyle,
+    /// The view name the chosen style is remembered under, when the host set one.
+    style_key: Option<String>,
+    /// The combined tree's expanded folders.
+    dirs: expand::Folders,
 }
 
 impl Default for BrowserPaneController {
@@ -233,12 +251,14 @@ impl Controller for BrowserPaneController {
             }
             BrowserPaneAction::Reload => {
                 self.folders.clear();
+                self.folders_reloaded();
                 if let Err(e) = self.listing.reload() {
                     self.error = Some(format!("cannot refresh: {e}"));
                 }
             }
             BrowserPaneAction::Click { name, ctrl, shift } => {
                 self.tree_selected.clear();
+                self.clear_folder_selection();
                 if shift {
                     self.listing.shift_click(&name);
                 } else if ctrl {
@@ -259,8 +279,12 @@ impl Controller for BrowserPaneController {
             BrowserPaneAction::ClearSelection => {
                 self.listing.clear_selection();
                 self.tree_selected.clear();
+                self.clear_folder_selection();
             }
-            BrowserPaneAction::SortBy(col) => self.listing.resort(col),
+            BrowserPaneAction::SortBy(col) => {
+                self.listing.resort(col);
+                self.resort_folders();
+            }
             BrowserPaneAction::CursorUp => self.move_cursor(-1),
             BrowserPaneAction::CursorDown => self.move_cursor(1),
             BrowserPaneAction::CursorPage(n) => self.move_cursor(i64::from(n)),
@@ -281,6 +305,12 @@ impl Controller for BrowserPaneController {
             }
             BrowserPaneAction::InfoAtCursor => self.info_at_cursor(),
             BrowserPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
+            BrowserPaneAction::ToggleExpand(node_id) => self.toggle_expand(&node_id),
+            BrowserPaneAction::ExpandCursor => self.expand_cursor(),
+            BrowserPaneAction::CollapseCursor => self.collapse_cursor(),
+            BrowserPaneAction::SetListingStyle(style) => fx = self.set_listing_style(style),
+            BrowserPaneAction::FolderTreeClick(i) => self.folder_tree_click(i),
+            BrowserPaneAction::FolderTreeToggle(i) => self.folder_tree_toggle(i),
             other => {
                 let handled = self
                     .apply_remote(other)
@@ -300,8 +330,10 @@ impl Controller for BrowserPaneController {
         fx.extend(self.poll_remote());
         fx.extend(self.poll_edits());
         fx.extend(self.poll_tools());
+        self.poll_folders();
         self.sync_tree();
         self.rebuild_rows();
+        self.pump_folders();
         fx.append(&mut self.out);
         fx
     }
@@ -341,6 +373,9 @@ impl BrowserPaneController {
             profile,
             tl: tools::ToolState::default(),
             folders: tree::FolderTree::new(true),
+            style: profile.listing,
+            style_key: None,
+            dirs: expand::Folders::default(),
         }
     }
 
@@ -363,7 +398,9 @@ impl BrowserPaneController {
             A::RequestRename(_) | A::RenameAtCursor => (p.can_rename(), "rename"),
             A::RequestNewFolder => (p.can_new_folder(), "new folder"),
             A::ToggleWrapper(_) => (p.wrappers, "expanding archives and images"),
-            A::SwitchFocus => (p.folder_tree, "the folder tree"),
+            A::SwitchFocus | A::FolderTreeClick(_) | A::FolderTreeToggle(_) => {
+                (self.has_folder_tree(), "the folder tree")
+            }
             A::Fsck => (p.tools.fsck, "checking the filesystem"),
             A::Repair => (p.tools.repair && !p.read_only, "repair"),
             A::Bless => (p.tools.bless && !p.read_only, "bless"),
@@ -384,6 +421,7 @@ impl BrowserPaneController {
         }
         self.sync_tree();
         self.rebuild_rows();
+        self.pump_folders();
         fx.append(&mut self.out);
         fx
     }
@@ -446,6 +484,7 @@ impl BrowserPaneController {
     pub fn source_changed(&mut self) {
         self.collapse_wrappers();
         self.folders.clear();
+        self.folders_source_changed();
         self.cursor = None;
         self.cursor_at = 0;
         self.error = None;
@@ -494,11 +533,12 @@ impl BrowserPaneController {
             self.remote_host,
         );
         if !self.profile.wrappers {
-            for r in &mut self.rows {
+            for r in self.rows.iter_mut().filter(|r| r.is_wrapper) {
                 r.is_wrapper = false;
                 r.expandable = false;
             }
         }
+        self.splice_folder_rows();
     }
 
     fn collapse_wrappers(&mut self) {
@@ -514,6 +554,7 @@ impl BrowserPaneController {
     fn navigated(&mut self, before: &str, cursor: Option<String>) {
         if self.listing.cwd_path() != before {
             self.collapse_wrappers();
+            self.clear_folder_selection();
             self.cursor = cursor;
             self.cursor_at = 0;
         }
@@ -535,7 +576,11 @@ impl BrowserPaneController {
     }
 
     fn tree_click(&mut self, node_id: String, ctrl: bool, shift: bool) {
+        if self.dirs.index.contains_key(&node_id) {
+            return self.folder_click(node_id, ctrl, shift);
+        }
         self.listing.clear_selection();
+        self.clear_folder_selection();
         self.cursor = Some(node_id.clone());
         let anchor = self
             .tree_anchor
@@ -569,13 +614,18 @@ impl BrowserPaneController {
     fn context_select(&mut self, name: &str) {
         if !self.listing.is_selected(name) {
             self.tree_selected.clear();
+            self.clear_folder_selection();
             self.listing.click(name);
         }
         self.cursor_to_base(name);
     }
 
     fn tree_context_select(&mut self, node_id: String) {
+        if self.dirs.index.contains_key(&node_id) {
+            return self.folder_context_select(node_id);
+        }
         if !self.tree_selected.contains(&node_id) {
+            self.clear_folder_selection();
             self.listing.clear_selection();
             self.tree_selected = vec![node_id.clone()];
         }
@@ -586,12 +636,16 @@ impl BrowserPaneController {
         let Some(row) = self.cursor_row() else {
             return;
         };
-        if row.is_tree {
+        if row.in_folder {
+            self.toggle_folder_selected(&row.node_id);
+        } else if row.is_tree {
             self.listing.clear_selection();
+            self.clear_folder_selection();
             self.toggle_tree_selected(&row.node_id);
             self.tree_anchor = Some(row.node_id);
         } else if !row.is_parent() {
             self.tree_selected.clear();
+            self.clear_folder_selection();
             self.listing.ctrl_click(&row.name);
         }
         self.move_cursor(1);
@@ -604,7 +658,7 @@ impl BrowserPaneController {
         if row.is_parent() || row.kind == RowKind::PendingAdd {
             return;
         }
-        if row.is_tree {
+        if row.is_tree || row.in_folder {
             self.tree_context_select(row.node_id);
         } else {
             self.context_select(&row.name);
@@ -612,10 +666,16 @@ impl BrowserPaneController {
         self.info_request = Some(row.name);
     }
 
-    /// Double-click: `..` goes up, a folder opens, a wrapper toggles, a file shows its info.
+    /// Double-click: `..` goes up, a folder opens (expands in the combined tree), a wrapper
+    /// toggles, a file shows its info.
     fn activate(&mut self, row: DisplayRow) {
         if row.is_parent() {
             self.up();
+        } else if row.expandable && (row.in_folder || (row.is_dir && self.combined())) {
+            self.toggle_expand(&row.node_id);
+        } else if row.in_folder {
+            self.folder_context_select(row.node_id);
+            self.info_request = Some(row.name);
         } else if row.is_tree {
             if row.expandable {
                 self.toggle_wrapper(&row.node_id);
@@ -677,7 +737,7 @@ impl BrowserPaneController {
         if row.is_parent() || (!pending_ok && row.kind == RowKind::PendingAdd) {
             return false;
         }
-        if row.is_tree {
+        if row.is_tree || row.in_folder {
             self.tree_context_select(row.node_id);
         } else {
             self.context_select(&row.name);
@@ -685,9 +745,9 @@ impl BrowserPaneController {
         true
     }
 
-    /// The number of selected rows, listing or wrapper tree.
+    /// The number of selected rows, listing, wrapper tree or combined tree.
     pub(in crate::controller) fn selection_len(&self) -> usize {
-        self.tree_selected.len() + self.listing.selection().len()
+        self.tree_selected.len() + self.listing.selection().len() + self.dirs.selected.len()
     }
 
     fn cursor_row(&self) -> Option<DisplayRow> {

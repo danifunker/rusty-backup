@@ -35,6 +35,9 @@ pub struct UpdateConfig {
     /// newest-first, deduped, and capped; see [`RecentFiles`].
     #[serde(default)]
     pub recent_files: RecentFiles,
+    /// The listing style last chosen per file view (`commander-left`, `explorer`, ...).
+    #[serde(default)]
+    pub listing_styles: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-mode most-recently-used file/folder history for the GUI's "Recent"
@@ -179,6 +182,7 @@ impl Default for UpdateConfig {
             assoc_registered_version: None,
             recent_daemon_addrs: Vec::new(),
             recent_files: RecentFiles::default(),
+            listing_styles: std::collections::BTreeMap::new(),
         }
     }
 }

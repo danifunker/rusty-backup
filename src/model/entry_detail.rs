@@ -9,6 +9,7 @@ use fs_squashfs::squashfs_edit::SizePlan;
 use crate::model::commander_ops::StageSource;
 
 /// Where the entry lives.
+#[derive(Clone)]
 pub enum DetailSource {
     /// A host file, read by its absolute path.
     Host,

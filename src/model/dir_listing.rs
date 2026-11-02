@@ -422,12 +422,7 @@ impl DirListing {
         let Some(frame) = self.stack.last_mut() else {
             return;
         };
-        frame.entries.sort_by(|a, b| cmp_by(a, b, col));
-        if desc {
-            frame.entries.reverse();
-        }
-        // Stable: keeps the just-applied within-group order, groups dirs first.
-        frame.entries.sort_by_key(|e| !e.is_directory());
+        sort_entries(&mut frame.entries, col, desc);
     }
 
     // --- selection ---------------------------------------------------------
@@ -502,6 +497,41 @@ impl DirListing {
             _ => None,
         }
     }
+}
+
+/// Sort `entries` by `col` (flipped when `desc`), folders first, as a listing sorts its folder.
+pub fn sort_entries(entries: &mut [FileEntry], col: SortColumn, desc: bool) {
+    entries.sort_by(|a, b| cmp_by(a, b, col));
+    if desc {
+        entries.reverse();
+    }
+    // Stable: keeps the just-applied within-group order, groups dirs first.
+    entries.sort_by_key(|e| !e.is_directory());
+}
+
+/// Where a folder below the listing's own is read from, on a worker.
+#[derive(Clone)]
+pub enum FolderSource {
+    Host,
+    /// A fresh handle on the pane's image, opened once and kept in the caller's reader.
+    Image(crate::model::commander_ops::StageSource),
+}
+
+/// List `dir` on a worker; `reader` keeps the opened image between calls.
+pub fn list_folder(
+    source: FolderSource,
+    reader: &mut Option<Box<dyn Filesystem>>,
+    dir: &FileEntry,
+) -> Result<Vec<FileEntry>, String> {
+    let source = match source {
+        FolderSource::Host => return list_host_dir(&dir.path).map_err(|e| e.to_string()),
+        FolderSource::Image(source) => source,
+    };
+    if reader.is_none() {
+        *reader = Some(source.open().map_err(|e| format!("{e:#}"))?);
+    }
+    let fs = reader.as_mut().ok_or("no reader")?;
+    fs.list_directory(dir).map_err(|e| e.to_string())
 }
 
 /// Read a host directory into `FileEntry`s (one stack frame's worth). Each
