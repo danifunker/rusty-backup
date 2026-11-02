@@ -523,7 +523,7 @@ impl BrowserPaneController {
         })
     }
 
-    fn spawn_host_write(
+    pub(super) fn spawn_host_write(
         &mut self,
         label: &str,
         folder: PathBuf,

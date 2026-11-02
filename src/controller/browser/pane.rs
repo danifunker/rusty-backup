@@ -183,6 +183,10 @@ pub enum BrowserPaneAction {
     },
     /// Bless the cursor folder (or the current one) as the System Folder, after a confirmation.
     Bless,
+    /// Stage the cursor entry's ProDOS access byte: locked ($21, read + backup) or unlocked ($C3).
+    SetProdosLock(bool),
+    /// Pick a host file and write the last tree listing to it in a job.
+    SaveTree,
     /// Read the cursor file for the text editor in a job; it waits in `take_text_doc`.
     EditText,
     /// Write the editor's text back over the file `name` in `folder` (the `TextDoc`'s).
@@ -493,6 +497,7 @@ impl BrowserPaneController {
             A::Fsck => (p.tools.fsck, "checking the filesystem"),
             A::Repair => (p.tools.repair && !p.read_only, "repair"),
             A::Bless | A::BootBlocks => (p.tools.bless && !p.read_only, "bless"),
+            A::SetProdosLock(_) => (p.tools.metadata && !p.read_only, "locking"),
             A::ShowJournal => (p.tools.fsck, "the journal"),
             A::EditText | A::SaveText { .. } => (p.tools.text_edit && !p.read_only, "editing text"),
             A::Import

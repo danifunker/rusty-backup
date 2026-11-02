@@ -8,14 +8,14 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, ArchiveEditContext, ArchiveUse, BrowseSession, BrowserPaneAction, CommanderAction,
-    CommanderController, DisplayRow, EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry,
-    FileEntryTypeDisplay as _, ForkFormat, ImportChoice, JobRegistry, ListingStyle, MacArchiveKind,
-    ModeAction, PaneProfile, PaneServices, PartcloneCache, ResourceForkMode, RowKind, Side,
-    Snapshot, TarChoice, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
+    format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveEditContext,
+    ArchiveUse, BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow,
+    EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _,
+    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
+    PaneProfile, PaneServices, PartcloneCache, ResourceForkMode, RowKind, Side, Snapshot,
+    TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::{Controller as _, Effect};
-use rusty_backup::model::edit_queue::StagedEdit;
 
 use super::commander::pane::PaneView;
 use super::commander::DetailEditors;
@@ -218,9 +218,9 @@ struct GuiTextEditor {
     /// The editable buffer: UTF-8 with LF endings.
     text: String,
     /// What the file was, and what it will be written back as.
-    shape: rusty_backup::model::text_edit::TextShape,
+    shape: TextShape,
     /// The endings it was found with, so a conversion can be shown as one.
-    original_ending: rusty_backup::model::text_edit::LineEnding,
+    original_ending: LineEnding,
     dirty: bool,
     status: Option<String>,
 }
@@ -1210,7 +1210,7 @@ impl BrowseView {
                 };
                 hover = badge.as_ref().map(|tc| {
                     let tt = entry.prodos_file_type.unwrap_or(0);
-                    let desc = fs_apple2::prodos_types::type_description(tt);
+                    let desc = prodos_type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
                     if desc.is_empty() {
                         format!("{tc} ${:04X}", aux)
@@ -1380,7 +1380,7 @@ impl BrowseView {
             }
         } else if self.is_prodos_type() && entry.is_file() {
             let (t, _) = metadata_editor::resolved_prodos_type(queue, entry);
-            if !fs_apple2::prodos_types::is_known_type(t) {
+            if !is_known_prodos_type(t) {
                 blue
             } else {
                 green
@@ -1430,14 +1430,14 @@ impl BrowseView {
         if self.is_prodos_type() {
             let tt = entry.prodos_file_type;
             if let Some(tt) = tt {
-                if !fs_apple2::prodos_types::is_known_type(tt) {
+                if !is_known_prodos_type(tt) {
                     let aux = entry.aux_type.unwrap_or(0);
                     ui.colored_label(
                         super::theme::warning(ui.visuals()),
                         format!(
                             "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
                             tt,
-                            fs_apple2::prodos_types::UNKNOWN_TYPE_NOTE,
+                            PRODOS_UNKNOWN_TYPE_NOTE,
                             aux,
                             tt,
                             aux,
@@ -1711,12 +1711,8 @@ impl BrowseView {
         }
         if ed.content.is_none() {
             ed.content = d.preview.as_ref().map(|data| {
-                if d.fs_type == "QNX 2" && rusty_backup::fs::qnx2::looks_like_rs_text(data) {
-                    let text = rusty_backup::fs::qnx2::rs_to_lf(data);
-                    file_detail::detect_content_type(&d.entry, &text)
-                } else {
-                    file_detail::detect_content_type(&d.entry, data)
-                }
+                let shown = preview_bytes(&d.fs_type, data);
+                file_detail::detect_content_type(&d.entry, &shown)
             });
         }
         let mut staged = Vec::new();
@@ -1880,13 +1876,7 @@ impl BrowseView {
                     )
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.ctl
-                            .host_pane()
-                            .queue
-                            .push(StagedEdit::BlessFolder { entry: sel.clone() });
-                        self.edit_result = Some(format!("Staged bless folder '{}'", sel.name));
-                    }
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Bless);
                 }
 
                 // Boot Blocks... — copy the 1024-byte boot loader from a
@@ -1927,26 +1917,14 @@ impl BrowseView {
                     .on_hover_text("Set the ProDOS access byte to $21 (read + backup only).")
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.ctl
-                            .host_pane()
-                            .queue
-                            .replace_set_prodos_access(sel, 0x21);
-                        self.edit_result = Some(format!("Staged lock '{}'", sel.name));
-                    }
+                    self.prodos_lock(&ui.ctx().clone(), true);
                 }
                 if ui
                     .add_enabled(can_lock, egui::Button::new("Unlock"))
                     .on_hover_text("Set the ProDOS access byte to $C3 (read/write/destroy/rename).")
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.ctl
-                            .host_pane()
-                            .queue
-                            .replace_set_prodos_access(sel, 0xC3);
-                        self.edit_result = Some(format!("Staged unlock '{}'", sel.name));
-                    }
+                    self.prodos_lock(&ui.ctx().clone(), false);
                 }
             }
 
@@ -1985,6 +1963,12 @@ impl BrowseView {
                 }
             }
         });
+    }
+
+    /// Stage the cursor entry's ProDOS lock through the pane; its status line is the result.
+    fn prodos_lock(&mut self, ctx: &egui::Context, locked: bool) {
+        self.pane_act(ctx, BrowserPaneAction::SetProdosLock(locked));
+        self.edit_result = Some(self.ctl.status().to_string());
     }
 
     /// Show the "Add File" file picker dialog and add files.
@@ -2069,7 +2053,6 @@ impl BrowseView {
 
     /// The text editor window.
     fn render_text_editor(&mut self, ui: &mut egui::Ui) {
-        use rusty_backup::model::text_edit::LineEnding;
         let Some(mut ed) = self.text_editor.take() else {
             return;
         };
@@ -2824,19 +2807,7 @@ impl BrowseView {
             self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
         }
         if save_requested {
-            if let Some(text) = &self.tree_text {
-                let text = text.clone();
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save tree view")
-                    .set_file_name("tree.txt")
-                    .add_filter("Text files", &["txt"])
-                    .save_file()
-                {
-                    if let Err(e) = std::fs::write(&path, &text) {
-                        self.error = Some(format!("Failed to save tree: {}", e));
-                    }
-                }
-            }
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::SaveTree);
         }
     }
 
@@ -2884,25 +2855,8 @@ impl BrowseView {
             self.show_tree_large_dialog = false;
         }
         if save_clicked {
-            if let Some(text) = self.tree_text.clone() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save tree view")
-                    .set_file_name("tree.txt")
-                    .add_filter("Text files", &["txt"])
-                    .save_file()
-                {
-                    match std::fs::write(&path, &text) {
-                        Ok(()) => {
-                            self.show_tree_large_dialog = false;
-                        }
-                        Err(e) => {
-                            self.error = Some(format!("Failed to save tree: {}", e));
-                        }
-                    }
-                }
-            } else {
-                self.show_tree_large_dialog = false;
-            }
+            self.show_tree_large_dialog = false;
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::SaveTree);
         }
         if show_anyway {
             self.show_tree_large_dialog = false;

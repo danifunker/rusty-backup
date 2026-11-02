@@ -52,6 +52,7 @@ pub mod purpose {
     pub const DELETE_FOLDERS: &str = "browser.delete_folders";
     pub const BOOT_DONOR: &str = "browser.boot_donor";
     pub const IMPORT_TAR: &str = "browser.import_tar";
+    pub const TREE_SAVE: &str = "browser.tree_save";
     pub const ARCHIVE_EXTRACT: &str = "browser.archive_extract";
     pub const ARCHIVE_SAVE_RAW: &str = "browser.archive_save_raw";
     pub const ARCHIVE_SAVE_DECODED: &str = "browser.archive_save_decoded";

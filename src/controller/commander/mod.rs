@@ -27,7 +27,21 @@ pub use screen::{
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
+pub use crate::controller::browser::{LineEnding, TextShape};
 pub use crate::fs::entry::FileEntryTypeDisplay;
+pub use fs_apple2::prodos_types::{
+    is_known_type as is_known_prodos_type, type_description as prodos_type_description,
+    UNKNOWN_TYPE_NOTE as PRODOS_UNKNOWN_TYPE_NOTE,
+};
+
+/// A preview's bytes as shown: QNX 2 text has its RS line separators turned into LF.
+pub fn preview_bytes<'a>(fs_type: &str, data: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    if fs_type == "QNX 2" && qnx2fs::looks_like_rs_text(data) {
+        std::borrow::Cow::Owned(qnx2fs::rs_to_lf(data))
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
+}
 pub use crate::model::archive_edit::ArchiveEditContext;
 pub use crate::model::browse_session::BrowseSession;
 /// A Clonezilla partition's shared block cache, as the Inspect tab hands it over.

@@ -186,6 +186,8 @@ pub(super) enum Want {
 #[derive(Default)]
 pub(super) struct VolumeState {
     tree: Option<TreeText>,
+    /// The last tree listing's text, kept for `SaveTree`.
+    last_tree: Option<String>,
     journal: Option<JournalDetail>,
     boot_probe: Option<Job<Option<bool>>>,
     /// Whether the open volume has HFS boot blocks; `None` until probed.
@@ -278,7 +280,13 @@ impl BrowserPaneController {
         }
     }
 
+    /// The last tree listing's text.
+    pub fn last_tree(&self) -> Option<&str> {
+        self.vol.last_tree.as_deref()
+    }
+
     pub(super) fn found_tree(&mut self, tree: TreeText) {
+        self.vol.last_tree = Some(tree.text.clone());
         self.vol.tree = Some(tree);
     }
 

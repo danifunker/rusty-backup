@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) mostly done, the source-level modes and archive / tar import remain (see "Step 3 status") |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) done (871b1680, 219d596c, and the leftovers commit; see "Step 3 status"); `src/gui/browse_view.rs` is enforced |
 
 Slice 3 notes, for the slices that follow:
 
@@ -389,7 +389,7 @@ decisions of 2026-11-02):
 - The Inspect browse view is the first to draw `side_detail` (step 3c); a folder still being
   listed is only a row flag (`loading`), so it draws its own "Loading..." child row.
 
-Step 3 (Inspect browse view): 3a-3e done, 3f in part, 3g not started (see "Step 3 status" below). It is the size of slices 1-8 together.
+Step 3 (Inspect browse view): done, 3a-3g and the leftovers (see "Step 3 status" below). It is the size of slices 1-8 together.
 `src/gui/browse_view.rs` (7,218 lines, about 100 fields of state on `BrowseView`, lines 55-335)
 needs one decision first and then lands in parts, each green:
 
@@ -481,28 +481,56 @@ cache upgrade): the pane reopens the same path keeping the queue, folder and exp
   (`cached_fs`, `take_or_open_fs`) is gone, so a large HFS+ catalog is read by the pane only.
 - `src/gui/browse_view.rs` 6,661 -> 4,752 lines; shells' engine references 775 -> 724.
 
-Remaining (lines in `src/gui/browse_view.rs` at 881da65b):
+- 3f (871b1680): `pane/archives.rs` + `model::archive_import`. `ReadArchive` lands in
+  `archive_viewer()` (Browse: rows, marks, fork container; `ArchiveMark`, `ArchiveFormat`,
+  `ArchiveExtract { all }` picks a folder, `CloseArchive`) or `archive_save()` (Extract:
+  `SaveArchive { raw }` picks a file or folder, `CancelSaveArchive`); `take_archive` is gone.
+  `AddPicked(paths)` (Add File, drops) classifies picks in a job: plain items are staged, a tar waits
+  in `pending_tar()` for `ChooseTar(Import | AsFile | Cancel)`, a Mac archive on HFS waits in
+  `pending_import()` for `ChooseImport(Expand | ConvertOnly | AsIs | Cancel)` (decoded into a temp
+  folder in a job, kept while anything is staged). `ImportTar` picks a tar; the import is a job
+  (preflight, then `tar_preview()` + `ConfirmTarImport(bool)` when lossy) that writes at once and
+  reopens. Results wait in `take_archive_notice()`; `archive_working()` is the job.
+- Export default (1ef20c65, user request): `default_export_format(fs_type)` (PC -> Zip, MFS / HFS /
+  HFS+ -> MAR, Unix -> tar.gz, else loose files). The screen keeps a pick per pane with the volume it
+  was made on (a refresh keeps it, another volume drops it); `export_format()` / `export_format_for`
+  / `export_choice_index()` serve the egui Commander, the Inspect view and the TUI Export-as menu.
+- 3g (219d596c): `screen/modes.rs`, `CommanderAction::Mode(ModeAction)`. The host calls
+  `open_inspect(session, label)` and `inspect_edit_in_place` / `inspect_edit_archive(ctx)` /
+  `inspect_backup_folder`; `close_inspect` drops the panes, then a CHD diff or archive temp.
+  `ToggleEditMode` backs up and opens a CHD over its diff, decompresses a zstd / WOZ partition,
+  measures a SquashFS (`take_size_plan()` for the view's budget dialog, answered by `SetBudget`), or
+  probes an editable open, each a job (`mode_working()`); leaving flattens or recompresses (jobs via
+  `chd_edit_open::flatten_in_job`, `archive_edit::{extract_for_edit, compress_after_edit}`, no more
+  `spawn_guarded` progress structs). `Apply` (recompresses an archive after), `Unsaved(Discard |
+  Apply | Cancel)`, `RequestClose` (`take_close_request()`), `space()` (free-space probe job),
+  `ChdInfo` (a job), `ShowDeleted`, `CarveFullScan`, `UpgradeSeekable`, `Password`, `OpenNested(path)`
+  (room checked, extract into a temp folder, `take_nested_open()`). `volume_generation()` tells the
+  view to drop its panel after a reopen or write (the pane's `write_count()` counts apply, repair and
+  tar import). `BrowseSession::{partclone, streaming}` are the session constructors.
+- Leftovers (this commit): Bless Folder is the pane's `Bless` (asks first); Lock / Unlock are
+  `SetProdosLock(bool)` on the cursor entry; the tree window's Save is `SaveTree` (a save picker, then
+  a host-write job of `last_tree()`). ProDOS type helpers, `preview_bytes` (QNX 2 RS -> LF),
+  `TextShape` / `LineEnding`, `EntryType`, `FileEntryTypeDisplay`, `ArchiveEditContext` and
+  `PartcloneCache` are re-exported from `controller::commander`.
+- `src/gui/browse_view.rs` 4,752 -> 2,920 lines, 0 engine references, in ENFORCED; shells' engine
+  references 724 -> 654. `src/gui/inspect_tab.rs` still has 181 (the next screen in Phase 2).
 
-- 3f: the Mac archive window and its extract (`render_archive_browse_window` :3849,
-  `run_archive_window_extract` :3985), the Save-as / decode modal (`render_archive_extract_dialog`
-  :4037), archive import (`queue_archive_import_if_applicable` :3152, `apply_archive_import_extract`
-  :3206, `render_archive_import_dialog` :3648; it now stages through `AddHostPaths`), tar import
-  (`start_tar_import_dialog` :2708, `spawn_tar_job` :2735, `poll_tar_job` :2751, `tar_import_step`
-  :4662, `render_tar_add_dialog` :2784). The archive and tar intercepts look at top-level picks and
-  drops only (`add_host_paths`).
-- 3g, source-level modes (they open or rewrite the session themselves): CHD edit mode
-  (`enter_chd_edit_mode` :2395, `start_chd_flatten` :2483, `poll_chd_flatten` :2547), direct edit
-  (`enter_direct_edit_mode` :2599), the SquashFS budget (`open_squashfs_budget_dialog` :2621,
-  `poll_squashfs_measure` :2653), the archive edit context (`set_archive_edit_context` :631,
-  `start_archive_extract` :2249, `start_archive_compress` :2271, `poll_archive_edit` :2310), nested
-  open's free-space check (`start_nested_open` :2154), CHD Info (:1076).
-- Small leftovers: the free-space probe (:3066, opens the session editable in a job of its own),
-  Bless Folder (:2947) and ProDOS Lock / Unlock (:3015) still push onto the pane's queue directly
-  rather than through `Bless` (which asks first) or a pane action; the tree popup's Save writes the
-  file from the view.
-- Then `src/gui/browse_view.rs` joins ENFORCED (it still names the engine for the items above).
+What is left in the browse view, none of it engine code: Add File's multi-file picker is still an
+`rfd` call in the view (`add_file_dialog`, `src/gui/browse_view.rs:1975`; `Effect::PickFile` picks one
+file), and the SquashFS budget dialog (`src/gui/squashfs_budget_dialog.rs`) still names
+`fs_squashfs` types (2 references).
 
-Behaviour changes so far: the root is a fixed `/` row (no collapse); archives and images inside
+Behaviour changes since 881da65b: Bless Folder asks first; Lock / Unlock and Bless act on the
+cursor row; entering Edit Mode on an image, CHD Info, the CHD flatten, the archive decompress and
+recompress, and the archive viewer's and save dialog's writes run as jobs with a progress window
+(the flatten and recompress no longer show an inline bar and cannot be cancelled); picks and drops
+are classified off the UI thread and go to the cursor's folder; the decoded-archive temp folder is
+kept until nothing is staged; the unsaved question's Apply with only a CHD diff waiting now leaves
+Edit Mode (it did nothing); "Export selected" starts from the filesystem's default format (Zip /
+MAR / tar.gz / loose files) instead of always MAR, and remembers a pick per volume.
+
+Behaviour changes before that: the root is a fixed `/` row (no collapse); archives and images inside
 the volume expand in place (wrappers), their rows show details only; the shared keys (arrows, Right
 / Left, Space, F2 rename, F8 delete, Ctrl+N, F9, Esc close) work once the tree is clicked; editing
 text needs Edit Mode and Save stages (Apply writes it); after Apply the selection clears and the

@@ -471,6 +471,12 @@ impl BrowserPaneController {
                 Some(p) => self.read_boot_donor(p),
                 None => Vec::new(),
             },
+            A::SetProdosLock(locked) => self.set_prodos_lock(locked),
+            A::SaveTree => self.ask_tree_file(),
+            A::Picked { purpose, path } if purpose == purpose::TREE_SAVE => match path {
+                Some(p) => self.save_tree(p),
+                None => Vec::new(),
+            },
             A::EditText => self.start_read(),
             A::SaveText {
                 name,
@@ -651,6 +657,48 @@ impl BrowserPaneController {
             confirm_label: "Bless".into(),
             destructive: false,
         })]
+    }
+
+    fn set_prodos_lock(&mut self, locked: bool) -> Vec<Effect> {
+        if let Err(fx) = self.writable_volume() {
+            return fx;
+        }
+        let Some(entry) = self.cursor_entry() else {
+            return msg("select a file or folder to lock or unlock.");
+        };
+        let (access, what) = match locked {
+            true => (0x21, "lock"),
+            false => (0xC3, "unlock"),
+        };
+        self.queue.replace_set_prodos_access(&entry, access);
+        self.auto_apply();
+        msg(format!("staged {what} '{}'.", entry.name))
+    }
+
+    fn ask_tree_file(&mut self) -> Vec<Effect> {
+        if self.last_tree().is_none() {
+            return msg("list the tree first.");
+        }
+        vec![Effect::PickFile(PickSpec {
+            purpose: purpose::TREE_SAVE,
+            title: "Save tree view".into(),
+            filters: vec![("Text files".into(), vec!["txt".into()])],
+            save: true,
+            file_name: "tree.txt".into(),
+        })]
+    }
+
+    fn save_tree(&mut self, path: PathBuf) -> Vec<Effect> {
+        let Some(text) = self.last_tree().map(str::to_string) else {
+            return Vec::new();
+        };
+        let folder = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        self.spawn_host_write("Saving the tree", folder, move || {
+            match std::fs::write(&path, text) {
+                Ok(()) => Ok(format!("Saved the tree to {}", path.display())),
+                Err(e) => Err(format!("Failed to save tree: {e}")),
+            }
+        })
     }
 
     fn start_read(&mut self) -> Vec<Effect> {

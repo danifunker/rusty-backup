@@ -225,3 +225,45 @@ fn a_picked_binhex_expands_on_an_hfs_volume_and_stays_plain_elsewhere() {
         ["Note"]
     );
 }
+
+#[test]
+fn the_tree_listing_saves_to_a_picked_file_in_a_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let fx = pane(&mut ctl, A::SaveTree);
+    assert!(fx.iter().all(|e| matches!(e, Effect::Message(_))), "{fx:?}");
+    pane(&mut ctl, A::ListTree { ids: false });
+    settle(&mut ctl);
+    assert!(ctl.host_pane().take_tree_text().is_some());
+    let (purpose, save) = picker(&pane(&mut ctl, A::SaveTree));
+    assert!(save);
+    let out = dir.path().join("tree.txt");
+    answer(&mut ctl, purpose, out.clone());
+    assert!(notice(&mut ctl).starts_with("Saved the tree"));
+    assert!(std::fs::read_to_string(out).unwrap().contains("HELLO.TXT"));
+}
+
+#[test]
+fn prodos_lock_stages_the_access_byte_of_the_cursor_entry_once() {
+    use crate::model::edit_queue::StagedEdit;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let node = ctl
+        .pane(Side::Left)
+        .rows()
+        .iter()
+        .find(|r| r.name == "HELLO.TXT")
+        .unwrap()
+        .node_id
+        .clone();
+    pane(&mut ctl, A::CursorTo(node));
+    pane(&mut ctl, A::SetProdosLock(true));
+    pane(&mut ctl, A::SetProdosLock(false));
+    let q = &ctl.pane(Side::Left).queue;
+    assert_eq!(q.len(), 1);
+    let staged = q.iter().next().unwrap();
+    assert!(
+        matches!(staged, StagedEdit::SetProdosAccess { access: 0xC3, .. }),
+        "{staged:?}"
+    );
+}
