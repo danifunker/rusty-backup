@@ -248,15 +248,10 @@ never copy it sideways.
   raw threads in `src/controller` and on raw threads in views, and counts views'
   direct references to the model and engine. That count only goes down; a path
   that reaches zero is switched to enforcing.
-- Enforced so far (`ENFORCED` in the script): `src/gui/commander`,
-  `src/gui/browse_view.rs`, `src/gui/inspect_tab.rs`, `src/gui/backup_tab.rs`,
-  `src/gui/restore_tab.rs`, `src/gui/physical_disk_export.rs`,
-  `src/gui/partition_editor_modal.rs`, `src/gui/progress.rs`,
-  `src/gui/alto_resize_dialog.rs`, `src/gui/squashfs_budget_dialog.rs`,
-  `src/gui/expand_hfs_dialog.rs`, `src/gui/floppy_convert_dialog.rs`,
-  `src/gui/remote_browser.rs`, `src/gui/resize_popup.rs`, `src/gui/optical_tab.rs`,
-  `src/gui/optical_browse_view.rs`, `src/gui/optical_audio.rs`,
-  `src/cli/verbs/tui_app/commander.rs` and `src/cli/verbs/tui_app/explorer.rs`.
+- Enforced so far (`ENFORCED` in the script): all of `src/gui` (the egui shell,
+  since Phase 2 slice 17), `src/cli/verbs/tui_app/commander.rs` and
+  `src/cli/verbs/tui_app/explorer.rs`. What is left is the rest of the TUI
+  (`src/cli/verbs/tui_app.rs`).
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
   error.
 - Controller logic is tested without any view. Code that cannot be tested

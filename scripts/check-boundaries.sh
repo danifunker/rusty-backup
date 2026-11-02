@@ -6,8 +6,9 @@
 #   - src/controller spawns no raw threads; slow work goes through model::job::Job.
 #   - shells (src/gui, the TUI) spawn no raw threads: use Job,
 #     worker::spawn_guarded or worker::spawn_detached, which catch panics (Phase 1).
-#   - views in ENFORCED (the Commander views, Phase 2 slice 9) name neither the engine/model
-#     nor a split crate: they use what src/controller re-exports.
+#   - views in ENFORCED (all of src/gui since Phase 2 slice 17, and the TUI's Commander and
+#     explorer) name neither the engine/model nor a split crate: they use what src/controller
+#     re-exports.
 # Reported only (warn mode until Phase 2 makes the shells pure view):
 #   - shells reaching past the view-models into the engine or model.
 #
@@ -19,7 +20,7 @@ VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
 SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app)
-ENFORCED=(src/gui/commander src/gui/browse_view.rs src/gui/inspect_tab.rs src/gui/backup_tab.rs src/gui/restore_tab.rs src/gui/physical_disk_export.rs src/gui/partition_editor_modal.rs src/gui/progress.rs src/gui/alto_resize_dialog.rs src/gui/squashfs_budget_dialog.rs src/gui/expand_hfs_dialog.rs src/gui/floppy_convert_dialog.rs src/gui/remote_browser.rs src/gui/resize_popup.rs src/gui/optical_tab.rs src/gui/optical_browse_view.rs src/gui/optical_audio.rs src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
+ENFORCED=(src/gui src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'
