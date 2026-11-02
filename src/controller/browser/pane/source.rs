@@ -38,7 +38,7 @@ pub use crate::model::commander_descend::DiscSource;
 type Disc = crate::model::optical_browse::DiscChoice;
 #[cfg(not(feature = "optical"))]
 #[derive(Clone)]
-enum Disc {}
+struct Disc;
 
 /// The `purpose` of each picker and confirmation a pane asks for.
 pub mod purpose {
@@ -254,6 +254,7 @@ enum Opened {
     Host(HostRoot),
     Archive(Loaded),
     /// A disc source: its filesystem choices, and the first one (or why it did not open).
+    #[cfg_attr(not(feature = "optical"), allow(dead_code))]
     Disc {
         disc: Disc,
         labels: Vec<String>,
@@ -1176,6 +1177,7 @@ fn load(mut fs: Box<dyn Filesystem>, what: &str) -> anyhow::Result<Loaded> {
 }
 
 /// A disc's filesystem as the pane lists it: no usable free-space figure.
+#[cfg_attr(not(feature = "optical"), allow(dead_code))]
 fn load_disc(fs: Box<dyn Filesystem>) -> anyhow::Result<Loaded> {
     let mut loaded = load(fs, "disc")?;
     loaded.volume.total_size = 0;
@@ -1210,8 +1212,8 @@ fn load_disc_choice(disc: &Disc) -> anyhow::Result<Loaded> {
 }
 
 #[cfg(not(feature = "optical"))]
-fn load_disc_choice(disc: &Disc) -> anyhow::Result<Loaded> {
-    match *disc {}
+fn load_disc_choice(_disc: &Disc) -> anyhow::Result<Loaded> {
+    anyhow::bail!("this build was compiled without optical-disc support")
 }
 
 #[cfg(feature = "optical")]
@@ -1220,8 +1222,8 @@ fn disc_with_choice(disc: &Disc, idx: usize) -> Disc {
 }
 
 #[cfg(not(feature = "optical"))]
-fn disc_with_choice(disc: &Disc, _idx: usize) -> Disc {
-    match *disc {}
+fn disc_with_choice(_disc: &Disc, _idx: usize) -> Disc {
+    Disc
 }
 
 #[cfg(feature = "optical")]
@@ -1230,8 +1232,8 @@ fn disc_is_physical(disc: &Disc) -> bool {
 }
 
 #[cfg(not(feature = "optical"))]
-fn disc_is_physical(disc: &Disc) -> bool {
-    match *disc {}
+fn disc_is_physical(_disc: &Disc) -> bool {
+    false
 }
 
 #[cfg(feature = "optical")]
@@ -1240,8 +1242,8 @@ fn disc_stage_source(disc: &Disc) -> StageSource {
 }
 
 #[cfg(not(feature = "optical"))]
-fn disc_stage_source(disc: &Disc) -> StageSource {
-    match *disc {}
+fn disc_stage_source(_disc: &Disc) -> StageSource {
+    unreachable!("no disc source opens without the optical feature")
 }
 
 /// A backup partition's session; a Clonezilla one reuses or loads a scanned cache, or scans now.
