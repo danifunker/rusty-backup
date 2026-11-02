@@ -1153,7 +1153,7 @@ choice. It does not fit cleanly yet:
   additions to it.
 
 So the browser is its own small controller over `model::optical_browse`. Merging the two is a
-decision for later (below).
+decision for later (below). (Slice 18 made it: the gaps above are closed there.)
 
 ### Behaviour changes
 
@@ -1304,5 +1304,108 @@ Shells' engine references 113 -> 20 (all of `src/gui` 69 -> 0; `tui_app.rs` 44 -
   screens' device lists and image probes, the update check, the palette).
 - The TUI keeps its own tab bar, device list and update check; the `controller::app` shell rules
   are there for it.
-- The optical disc browser onto the shared browser pane is the next slice.
+- The optical disc browser onto the shared browser pane: slice 18.
 - Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+
+## Slice 18: the disc browser on the browser pane
+
+User decision (2026-11-02): one browser, not two. The Optical tab's disc browser
+(`DiscBrowseController` + `src/gui/optical_browse_view.rs`) moves onto the browser pane, and the
+four gaps slice 16 listed are closed in the pane rather than special-cased in a view.
+
+### Steps
+
+1. (3896661c) Docs: CLAUDE.md § Amiga no longer names the removed
+   `gui::materialize_amiga_image_path`.
+2. (fd5944fd) The bytes, pinned first. `controller::optical::identity_tests` drives the slice-16
+   browser over five discs (the hybrid ISO 9660 + HFS+ fixture, the same disc as BIN/CUE and as
+   CHD, a new Rock Ridge + Joliet fixture `tests/fixtures/optical/rock_ridge.iso.zst` with a
+   symlink, a deep tree, an empty file, a 63-character name and two names that collide on the
+   host, and that disc with a PReP boot partition patched into sector 0) and every filesystem
+   choice: the tree text, extraction of the root in each of the six fork modes and of each
+   top-level entry, the export of the marked entries in all eleven formats and loose in each fork
+   mode, and the preview. 288 digests in `GOLDEN`, stable across runs.
+3. (d3f64b98) The pane gains a disc source, a new source kind rather than a view special case:
+   - `BrowserPaneAction::OpenDisc(DiscSource)` (refused unless the profile opens images),
+     `open_fixed_disc` / `CommanderController::open_disc` for a host. `DiscSource { path,
+     physical }` lives in `model::commander_descend`, so every build has the action; without
+     `optical` the open fails with "compiled without optical-disc support".
+   - `model::optical_browse::open_source` probes an image (`DiscImageInfo::open`) or a drive
+     (`open_physical`; `ensure_physical_enabled` first), finds the boot areas, and opens choice 0
+     as a rusty-backup filesystem (`DiscChoice::filesystem`, `OpticalFilesystem::from_inner`
+     named by the opticaldiscs display name: "ISO 9660", "HFS", "HFS+", or the boot area's label).
+     A failed probe is the source error ("Failed to open disc image: ...", which is what an
+     unelevated drive gives); a choice that does not open (the NKit hint included) leaves the
+     other choices offered.
+   - The filesystem choices are the pane's partition picker (`partition_labels`): the primary,
+     the hybrid sides, the HP LIF / PReP boot areas (labels: `optical_choice_labels`, the ones
+     Commander already showed). `SelectPartition` switches them even on a fixed source. A drive
+     offers only its primary (its reader always presents that one). The game line is
+     `disc_game()`.
+   - Workers reopen the choice with `ReopenRecipe::Disc(DiscChoice)` (`StageSource::disc()`).
+     Commander's own disc open goes through the same source.
+   - Byte identity: extraction from a disc runs the Optical tab's walker
+     (`HostCopyJob::DiscExtract` -> `DiscChoice::extract_path`, progress through the copy job's
+     status); the pane's `ListTree` on a disc is the disc listing (`DiscChoice::tree_listing`);
+     an export of a disc's selection goes in path order once per path, as the marked map did.
+     The export itself is the screen's generic export, unchanged.
+   - `PaneProfile::optical()`: fixed source, read-only, no staging, no rename / new folder /
+     delete, no wrappers, combined tree, side-panel details, no tools.
+   - `identity_tests` gains the pane runner; all 288 cases match except the preview of a Rock
+     Ridge symlink (decision below).
+4. (a2c3d9bd) The tab moves over. `OpticalController` no longer hosts a browser: Browse Contents
+   pushes `HostRequest::OpenBrowser(DiscSource)`, a new or closed disc pushes
+   `HostRequest::CloseBrowser` (and the detect reopens it, as before), and the view reports its
+   Close with `OpticalAction::BrowserClosed`; `is_browsing()`. `optical::disc_browser(services,
+   keymap)` builds the browser (`CommanderController::single` + `PaneProfile::optical`, exports
+   with AppleDouble forks). The egui tab hosts `BrowseView::optical()`: the Inspect tab's browse
+   view (the same combined tree, mark checkboxes, export bar, side panel and Extract) with a
+   "Disc Browser" header (filesystem picker, Game, Tree, View, Close); the Inspect-only extras
+   (tar export, Open as Disk Image, the Mac archive actions, Edit as text, Show IDs) stay off for
+   a disc. `src/gui/optical_browse_view.rs` (361 lines) and `controller::optical::browse`
+   (596) are gone; `model::optical_browse` keeps the open, the walker and the tree (654 -> 495
+   lines). The controller tests and `tests/ui_scenarios/optical_convert_browse_extract.toml`
+   drive the pane the way a shell does.
+
+### Behaviour changes
+
+- GUI (Optical tab): the browser is the Inspect browse view: rows show the pane's columns and
+  the side panel shows the pane's File Info (Commander's metadata rows and preview: a symlink
+  shows its target instead of an empty preview); the View menu offers the flat list and the
+  folder tree + list (remembered as `optical`); the shared keys work once the tree is clicked;
+  the root is a fixed `/` row; the filesystem picker reads "RETRO (ISO 9660)" / "RETRO (HFS+
+  (Mac))" (Commander's labels) instead of "ISO 9660 (RETRO)"; a drive offers only its primary
+  filesystem (its hybrid choices opened the primary anyway).
+- GUI: extraction shows the copy job's window ("Copying <path>", bytes, Cancel) instead of
+  "Extracting n/m files: path", and ends with "Copied N file(s) to the extract folder." instead
+  of "Extraction complete: N files extracted."; extracting over existing files asks Overwrite /
+  Skip / Cancel first (it overwrote silently).
+- GUI: the export bar's default format follows the filesystem (HFS / HFS+ -> MAR, ISO 9660 ->
+  loose files) instead of always MAR, and its result is the copy job's status line.
+- GUI: the tree window has no Show IDs box for a disc; its Copy and Save are the browse view's.
+- Commander (GUI and TUI): a disc's volume type reads "ISO 9660" / "HFS" / "HFS+" instead of
+  "Iso9660" / "Hfs" / "HfsPlus" (so HFS discs default to MAR exports); a disc whose primary
+  does not open still offers its other filesystems; the selection of a disc exports in path
+  order.
+- TUI: none beyond Commander's disc readout. CLI: none (`rb-cli optical` keeps its verbs).
+
+### Decisions for the user
+
+- Extraction keeps the Optical tab's walker behind the pane (`HostCopyJob::DiscExtract`): the
+  generic `model::extract` writes different bytes in 33 of the 288 cases (Rock Ridge symlinks
+  become real symlinks instead of empty files, the root folder is named `/`-derived instead of
+  `_`, AppleDouble / MacBinary headers carry other dates, BinHex writes `.hqx`). Keep the walker,
+  or switch discs to the generic extraction and accept those changes.
+- The preview of a Rock Ridge symlink: the pane shows the target, the old browser showed an
+  empty text file (`identity_tests::PANE_DIFFERS`). Display only.
+- Picker labels: Commander's ("RETRO (ISO 9660)") now serve both; the Optical tab's style
+  ("ISO 9660 (RETRO)") could replace them in both.
+
+### Left
+
+- The TUI rip screen has no Browse Contents; it could host `disc_browser` as the Explorer does
+  (the TUI Commander already opens disc images read-only in a pane through the same source).
+- A remote daemon's drive is rip-only: the pane has no remote disc source.
+- `rb-cli optical extract` is still its own implementation (case-collision modes, POSIX modes,
+  tar output).
+
