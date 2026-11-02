@@ -235,3 +235,64 @@ fn staged_host_files_wait_for_apply_then_land_and_the_tree_reopens() {
     assert_eq!(row(&ctl, "A.TXT").kind, RowKind::Normal);
     assert!(row(&ctl, "SUB").expanded, "the reopen keeps the tree");
 }
+
+#[test]
+fn the_text_editor_saves_a_file_deep_in_the_tree_back_to_its_folder_on_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = fat_volume(dir.path());
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        let mut fs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        let sub = fs.list_directory(&root).unwrap();
+        let sub = sub.into_iter().find(|e| e.name == "SUB").unwrap();
+        let mut data: &[u8] = b"one\r\n";
+        fs.create_file(&sub, "NOTE.TXT", &mut data, 5, &Default::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+    }
+    let mut ctl = inspect(&img);
+    let sub = row(&ctl, "SUB").node_id;
+    pane(&mut ctl, A::ToggleExpand(sub));
+    settle(&mut ctl);
+    let note = row(&ctl, "NOTE.TXT").node_id;
+    pane(&mut ctl, A::CursorTo(note));
+    ctl.host_pane().set_read_only(true);
+    let said = pane(&mut ctl, A::EditText);
+    assert!(
+        said.is_empty() && ctl.status().contains("not available"),
+        "Edit Mode off"
+    );
+    ctl.host_pane().set_read_only(false);
+    pane(&mut ctl, A::EditText);
+    settle(&mut ctl);
+    let doc = ctl.take_text_doc().expect("the file was read");
+    assert_eq!((doc.folder.as_str(), doc.text.as_str()), ("/SUB", "one\n"));
+    pane(
+        &mut ctl,
+        A::SaveText {
+            name: doc.name,
+            folder: doc.folder,
+            text: "two\n".into(),
+            shape: doc.shape,
+        },
+    );
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1, "a save is staged");
+    pane(&mut ctl, A::Apply);
+    settle(&mut ctl);
+    assert!(ctl.pane(Side::Left).queue.is_empty());
+    let f = std::fs::File::open(&img).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(f, 0).unwrap();
+    use disk_core::filesystem::Filesystem as _;
+    let root = fs.root().unwrap();
+    let sub = fs.list_directory(&root).unwrap();
+    let sub = sub.into_iter().find(|e| e.name == "SUB").unwrap();
+    let kids = fs.list_directory(&sub).unwrap();
+    let note = kids.into_iter().find(|e| e.name == "NOTE.TXT").unwrap();
+    assert_eq!(fs.read_file(&note, 64).unwrap(), b"two\r\n");
+    assert!(crate::controller::browser::explorer_tests::root_file(&img, "NOTE.TXT").is_none());
+}

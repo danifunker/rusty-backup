@@ -161,9 +161,10 @@ pub enum BrowserPaneAction {
     Bless,
     /// Read the cursor file for the text editor in a job; it waits in `take_text_doc`.
     EditText,
-    /// Write the editor's text back over the file `name` in the current folder.
+    /// Write the editor's text back over the file `name` in `folder` (the `TextDoc`'s).
     SaveText {
         name: String,
+        folder: String,
         text: String,
         shape: TextShape,
     },

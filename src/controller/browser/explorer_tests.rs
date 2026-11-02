@@ -167,6 +167,7 @@ fn the_text_editor_reads_and_saves_through_the_queue_at_once() {
     assert!(vm.take_text_doc().is_none(), "handed over once");
     vm.apply(A::SaveText {
         name: doc.name,
+        folder: doc.folder,
         text: "bye\n".into(),
         shape: doc.shape,
     });

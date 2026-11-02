@@ -37,6 +37,8 @@ pub struct ToolReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextDoc {
     pub name: String,
+    /// The folder holding it, where `SaveText` writes it back.
+    pub folder: String,
     pub text: String,
     pub shape: TextShape,
 }
@@ -417,7 +419,12 @@ impl BrowserPaneController {
                 }
             }
             A::EditText => self.start_read(),
-            A::SaveText { name, text, shape } => self.save_text(&name, &text, &shape),
+            A::SaveText {
+                name,
+                folder,
+                text,
+                shape,
+            } => self.save_text(&name, &folder, &text, &shape),
             A::Import => self.pick_import(),
             A::Picked { purpose, path } if purpose == purpose::IMPORT => match path {
                 Some(p) => self.import(p),
@@ -440,7 +447,18 @@ impl BrowserPaneController {
         if row.is_parent() || row.is_tree || row.kind == super::RowKind::PendingAdd {
             return None;
         }
-        self.entry_named(&row.name)
+        let deep = self.dirs.index.get(&row.node_id).map(|r| r.entry.clone());
+        deep.or_else(|| self.entry_named(&row.name))
+    }
+
+    /// The folder the cursor row is in: its combined-tree folder, else the listing's.
+    fn cursor_folder(&self) -> String {
+        let row = self.cursor_row();
+        let deep = row.and_then(|r| self.dirs.index.get(&r.node_id));
+        match deep {
+            Some(r) => r.parent.path.clone(),
+            None => self.listing.cwd_path().to_string(),
+        }
     }
 
     fn writable_volume(&self) -> Result<(), Vec<Effect>> {
@@ -589,6 +607,7 @@ impl BrowserPaneController {
         let Some(source) = self.local_stage_source() else {
             return msg("no volume is open.");
         };
+        let folder = self.cursor_folder();
         let resources = self.apply_resources();
         let (jobs, notify) = self.job_services();
         let spawned = jobs.spawn(format!("Reading {}", entry.name), resources, notify, {
@@ -598,6 +617,7 @@ impl BrowserPaneController {
                 match decode_for_edit(&bytes, fs.fs_type(), None) {
                     Ok(d) => Ok(TextDoc {
                         name: entry.name.clone(),
+                        folder,
                         text: d.text,
                         shape: d.shape,
                     }),
@@ -618,7 +638,13 @@ impl BrowserPaneController {
         }
     }
 
-    fn save_text(&mut self, name: &str, text: &str, shape: &TextShape) -> Vec<Effect> {
+    fn save_text(
+        &mut self,
+        name: &str,
+        folder: &str,
+        text: &str,
+        shape: &TextShape,
+    ) -> Vec<Effect> {
         if let Err(fx) = self.writable_volume() {
             return fx;
         }
@@ -630,7 +656,8 @@ impl BrowserPaneController {
             }
             Err(e) => return msg(format!("cannot save: {e}")),
         };
-        let Some(parent) = self.listing.cwd().cloned() else {
+        let folder = self.entry_at(folder).filter(|e| e.is_directory());
+        let Some(parent) = folder.or_else(|| self.listing.cwd().cloned()) else {
             return msg("no folder open.");
         };
         if self.tl.temp.is_none() {

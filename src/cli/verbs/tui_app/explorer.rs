@@ -83,6 +83,7 @@ impl MetaInput {
 /// config line where there is no `$EDITOR`; the controller reads and writes it.
 pub(super) struct TextEditor {
     name: String,
+    folder: String,
     /// One entry per line, never empty (an empty file is one empty line).
     lines: Vec<String>,
     row: usize,
@@ -101,6 +102,7 @@ impl TextEditor {
         let lines: Vec<String> = doc.text.split('\n').map(str::to_string).collect();
         Self {
             name: doc.name,
+            folder: doc.folder,
             lines,
             row: 0,
             col: 0,
@@ -366,6 +368,7 @@ impl CommanderView {
             KeyCode::F(2) => {
                 let save = P::SaveText {
                     name: ed.name.clone(),
+                    folder: ed.folder.clone(),
                     text: ed.text(),
                     shape: ed.shape,
                 };
@@ -806,6 +809,7 @@ mod tests {
     fn editor(text: &str) -> TextEditor {
         TextEditor::new(TextDoc {
             name: "f.txt".into(),
+            folder: "/".into(),
             text: text.into(),
             shape: TextShape {
                 encoding: crate::controller::browser::TextEncoding::Utf8,

@@ -83,8 +83,6 @@ pub struct BrowseView {
     cursor_seen: Option<String>,
     /// The user moved the cursor since the volume (re)opened; until then it selects nothing.
     cursor_armed: bool,
-    /// A row to put the cursor back on once the reopened pane lists it (a saved text file).
-    cursor_back: Option<String>,
     /// The session changed or the volume was written: the pane reopens on the next frame.
     pane_stale: bool,
     /// The entry the content panel shows: the cursor row, or the root when its row is clicked.
@@ -176,8 +174,6 @@ pub struct BrowseView {
     repair_report: Option<rusty_backup::fs::RepairReport>,
     /// A running Check or Repair on this volume.
     fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
-    /// Opening a file in the text editor, or saving it back.
-    editor_job: Option<rusty_backup::model::job::Job<EditorStep>>,
     /// Folder listings and previews waiting for the reader, one at a time.
     read_queue: std::collections::VecDeque<FsRead>,
     /// The read in flight, and the filesystem generation it borrowed from.
@@ -445,7 +441,6 @@ impl Default for BrowseView {
             scroll_cursor: false,
             cursor_seen: None,
             cursor_armed: false,
-            cursor_back: None,
             pane_stale: false,
             selected_entry: None,
             chd_diff_dirty: false,
@@ -486,7 +481,6 @@ impl Default for BrowseView {
             show_repair_confirm: false,
             repair_report: None,
             fsck_job: None,
-            editor_job: None,
             read_queue: std::collections::VecDeque::new(),
             read_job: None,
             export_job: None,
@@ -564,9 +558,9 @@ pub struct TreeStatus {
 /// open and re-encoded to its own encoding and endings on save, exactly as the
 /// CLI and TUI editors do, via the shared `model::text_edit`.
 struct GuiTextEditor {
-    /// Path inside the image, used as the write target.
-    path: String,
     name: String,
+    /// The folder holding it, where the save is staged.
+    folder: String,
     /// The editable buffer: UTF-8 with LF endings.
     text: String,
     /// What the file was, and what it will be written back as.
@@ -611,7 +605,7 @@ impl BrowseView {
             Some("Apply edits")
         } else if self.tar_job.is_some() {
             Some("Tar import")
-        } else if self.editor_job.is_some() {
+        } else if self.ctl.pane(Side::Left).tool_working().is_some() {
             Some("Text editor")
         } else {
             None
@@ -1010,9 +1004,8 @@ impl BrowseView {
         }
         self.poll_fsck_job();
         self.render_fsck_job(ui);
-        self.poll_editor_job();
-        if let Some(job) = &self.editor_job {
-            let snap = job.snapshot();
+        self.poll_editor();
+        if let Some(snap) = self.ctl.pane(Side::Left).tool_working() {
             egui::Window::new(snap.label.clone())
                 .collapsible(false)
                 .resizable(false)
@@ -1739,20 +1732,6 @@ impl BrowseView {
 
     /// Point the content panel at the cursor row once it moved (a click or a key).
     fn sync_selected(&mut self) {
-        if let Some(id) = self.cursor_back.clone() {
-            if self
-                .ctl
-                .pane(Side::Left)
-                .rows()
-                .iter()
-                .any(|r| r.node_id == id)
-            {
-                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::CursorTo(id));
-                self.ctl.apply(act);
-                self.cursor_back = None;
-                self.cursor_armed = true;
-            }
-        }
         let pane = self.ctl.pane(Side::Left);
         let Some(row) = pane.cursor_index().map(|i| pane.rows()[i].clone()) else {
             return;
@@ -2561,9 +2540,12 @@ impl BrowseView {
         }
         // Editing is offered only where it is safe: a text preview means the content decoded cleanly.
         if matches!(self.side_ed.content, Some(FileContent::Text(_)))
-            && ui.button("Edit as text...").clicked()
+            && ui
+                .add_enabled(self.edit_mode, egui::Button::new("Edit as text..."))
+                .on_disabled_hover_text("Turn on Edit Mode to edit this file.")
+                .clicked()
         {
-            self.open_text_editor(&entry.path, &entry.name);
+            self.open_text_editor();
         }
         super::commander::detail_preview(ui, &self.side_ed, "browse", content_height);
     }
@@ -4636,66 +4618,28 @@ impl BrowseView {
     /// Open a text file in the editor window, decoding it the way the CLI and
     /// TUI editors do.
     /// Open a file in the text editor as a job (the editable open decodes a whole container).
-    fn open_text_editor(&mut self, path: &str, name: &str) {
-        if self.editor_job.is_some() {
-            return;
+    /// Read the cursor's file for the editor through the pane (Edit Mode only).
+    fn open_text_editor(&mut self) {
+        let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::EditText);
+        self.ctl.apply(act);
+        let said = self.ctl.status().to_string();
+        if !said.is_empty() && self.ctl.pane(Side::Left).tool_working().is_none() {
+            self.edit_result = Some(said);
         }
-        let session = self.session.clone();
-        let (path, name) = (path.to_string(), name.to_string());
-        self.editor_job = Some(rusty_backup::model::job::Job::spawn(
-            "Opening the file...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                Ok(EditorStep::Opened(load_editor_text(&session, &path, &name)))
-            },
-        ));
     }
 
-    /// Apply a finished editor open or save.
-    fn poll_editor_job(&mut self) {
-        use rusty_backup::model::job::Status;
-        let Some(job) = &self.editor_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let step = job.take_result();
-        self.editor_job = None;
-        match (snap.status, step) {
-            (Status::Done, Some(EditorStep::Opened(Ok(ed)))) => self.text_editor = Some(ed),
-            (Status::Done, Some(EditorStep::Opened(Err(msg)))) => self.edit_result = Some(msg),
-            (Status::Done, Some(EditorStep::Saved(ed, Ok((n, saved))))) => {
-                self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
-                // Drop the cached read so the preview shows what is now on
-                // disk rather than what was there when it was opened.
-                self.side_ed = DetailEditors::default();
-                self.invalidate_all_caches();
-                self.invalidate_cached_fs();
-                // The invalidation dropped the selection; put the saved file
-                // back so the preview shows what was written, not "Loading...".
-                if let Some(entry) = saved {
-                    self.cursor_back = Some(entry.path);
-                }
-                // A save is a write like any applied edit: the CHD diff is
-                // dirty and an archive session must recompress or lose it.
-                if self.chd_edit.is_some() {
-                    self.chd_diff_dirty = true;
-                }
-                if self.archive_edit_ctx.is_some() {
-                    self.start_archive_compress();
-                }
-            }
-            (Status::Done, Some(EditorStep::Saved(mut ed, Err(e)))) => {
-                // Keep the window open with the text intact: losing an edit
-                // to a failed save is the worst outcome here.
-                ed.status = Some(e);
-                self.text_editor = Some(ed);
-            }
-            (Status::Failed(e), _) => self.edit_result = Some(format!("Error: {e}")),
-            _ => {}
+    /// Take the file the pane read for the editor.
+    fn poll_editor(&mut self) {
+        if let Some(doc) = self.ctl.take_text_doc() {
+            self.text_editor = Some(GuiTextEditor {
+                name: doc.name,
+                folder: doc.folder,
+                text: doc.text,
+                original_ending: doc.shape.ending,
+                shape: doc.shape,
+                dirty: false,
+                status: None,
+            });
         }
     }
 
@@ -4771,7 +4715,11 @@ impl BrowseView {
                     ui.colored_label(super::theme::danger(ui.visuals()), msg);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if ui
+                        .button("Save")
+                        .on_hover_text("Stage the new text; Apply Edits writes it.")
+                        .clicked()
+                    {
                         save = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -4783,21 +4731,24 @@ impl BrowseView {
                 });
             });
 
-        if save && self.editor_job.is_none() {
-            // The editor rides to the worker and back: reopened on a failure, closed on success.
-            self.edit_free_space = None;
-            self.free_space_job = None;
-            let session = self.session.clone();
-            self.editor_job = Some(rusty_backup::model::job::Job::spawn(
-                "Saving the file...",
-                Arc::new(super::ui_logger::EguiWake),
-                move |job| {
-                    job.set_can_cancel(false);
-                    let result = save_editor_text(&session, &ed).map_err(|e| format!("{e:#}"));
-                    Ok(EditorStep::Saved(ed, result))
-                },
-            ));
-            return;
+        if save {
+            // Staged like any edit; a refusal (an unencodable character) keeps the window and the text.
+            let before = self.ctl.pane(Side::Left).queue.len();
+            let act = BrowserPaneAction::SaveText {
+                name: ed.name.clone(),
+                folder: ed.folder.clone(),
+                text: ed.text.clone(),
+                shape: ed.shape,
+            };
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
+            if self.ctl.pane(Side::Left).queue.len() > before {
+                self.edit_result = Some(format!(
+                    "Staged the new {}; Apply Edits writes it.",
+                    ed.name
+                ));
+                return;
+            }
+            ed.status = Some(self.ctl.status().to_string());
         }
         if keep_open {
             self.text_editor = Some(ed);
@@ -6803,81 +6754,3 @@ fn read_mac_archive(
 
 /// A finished read, and the filesystem it borrowed (when it had one to give back).
 type FsReadOut = (Option<Box<dyn Filesystem>>, FsReadDone);
-
-/// A text-editor open or save, finished.
-enum EditorStep {
-    Opened(Result<GuiTextEditor, String>),
-    /// The editor, and the bytes written plus the saved file's entry (to reselect it).
-    Saved(
-        GuiTextEditor,
-        Result<(usize, Option<Box<FileEntry>>), String>,
-    ),
-}
-
-/// Read `path` for the editor and decode it as text; the error is the status-line message.
-fn load_editor_text(
-    session: &BrowseSession,
-    path: &str,
-    name: &str,
-) -> Result<GuiTextEditor, String> {
-    use rusty_backup::model::text_edit::{decode_for_edit, TextEditError};
-    const LIMIT: usize = 1024 * 1024;
-    let (mut fs, _commit) = session
-        .open_editable()
-        .map_err(|e| format!("Cannot open for editing: {e}"))?;
-    let entry = rusty_backup::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), path)
-        .map_err(|e| format!("Cannot find {path}: {e}"))?;
-    let fs_type = fs.fs_type().to_string();
-    let bytes = fs
-        .read_file(&entry, LIMIT)
-        .map_err(|e| format!("Cannot read {path}: {e}"))?;
-    match decode_for_edit(&bytes, &fs_type, None) {
-        Ok(decoded) => Ok(GuiTextEditor {
-            path: path.to_string(),
-            name: name.to_string(),
-            text: decoded.text,
-            shape: decoded.shape,
-            original_ending: decoded.shape.ending,
-            dirty: false,
-            status: None,
-        }),
-        Err(TextEditError::NotText { reason }) => {
-            Err(format!("{name} is not a text file ({reason})"))
-        }
-        Err(e) => Err(format!("{name}: {e}")),
-    }
-}
-
-/// Encode and write the editor's contents through the shared replace path, then find the saved file again.
-fn save_editor_text(
-    session: &BrowseSession,
-    ed: &GuiTextEditor,
-) -> anyhow::Result<(usize, Option<Box<FileEntry>>)> {
-    use rusty_backup::model::text_edit::encode_after_edit;
-    let bytes = encode_after_edit(&ed.text, &ed.shape, false)
-        .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
-    let (mut fs, commit) = session.open_editable()?;
-    let (parent, leaf) =
-        rusty_backup::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &ed.path)?;
-    let mut reader = std::io::Cursor::new(bytes.clone());
-    rusty_backup::fs::replace::create_or_replace(
-        fs.as_mut(),
-        &parent,
-        &leaf,
-        &mut reader,
-        bytes.len() as u64,
-        &disk_core::filesystem::CreateFileOptions::default(),
-        rusty_backup::fs::replace::ReplacePolicy::replace(),
-    )
-    .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
-    fs.sync_metadata()
-        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-    drop(fs);
-    commit.commit()?;
-    let saved = session
-        .open()
-        .ok()
-        .and_then(|mut fs| rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok())
-        .map(Box::new);
-    Ok((bytes.len(), saved))
-}
