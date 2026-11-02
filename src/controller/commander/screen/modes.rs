@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::budget::{BudgetAction, BudgetForm};
 use super::{CommanderController, Side};
 use crate::controller::browser::purpose as pane_purpose;
 use crate::controller::browser::BrowserPaneAction;
@@ -45,6 +46,8 @@ pub enum ModeAction {
     RequestClose,
     /// The SquashFS size budget chosen before Edit Mode (`None` inside: no ceiling); `None`: cancel.
     SetBudget(Option<Option<SizeBudget>>),
+    /// An edit, Start or Cancel in the size-budget dialog.
+    Budget(BudgetAction),
     ChdInfo,
     CloseChdInfo,
     /// Copy the file at this path out and hand it to the host as a disk image.
@@ -160,7 +163,8 @@ pub(super) struct Modes {
     /// The single-file-chd backup whose metadata a flatten refreshes.
     backup_folder: Option<PathBuf>,
     job: Option<ModeJob>,
-    plan: Option<SizePlan>,
+    /// The size-budget dialog, up while it asks.
+    budget: Option<BudgetForm>,
     free: Option<Option<u64>>,
     free_job: Option<Job<Option<u64>>>,
     info: Option<String>,
@@ -299,9 +303,9 @@ impl CommanderController {
         std::mem::take(&mut self.modes.close)
     }
 
-    /// A SquashFS's measurement for the size-budget dialog, handed over once.
-    pub fn take_size_plan(&mut self) -> Option<SizePlan> {
-        self.modes.plan.take()
+    /// The SquashFS size-budget dialog, while it asks.
+    pub fn size_budget(&self) -> Option<&BudgetForm> {
+        self.modes.budget.as_ref()
     }
 
     pub fn space(&self) -> Option<SpaceReadout> {
@@ -374,6 +378,28 @@ impl CommanderController {
                 Vec::new()
             }
             M::SetBudget(None) => Vec::new(),
+            M::Budget(BudgetAction::Start) => {
+                let Some(form) = self.modes.budget.take() else {
+                    return Vec::new();
+                };
+                if form.over_capacity() {
+                    self.modes.budget = Some(form);
+                    return Vec::new();
+                }
+                self.modes.session.rebuild_budget = Some(form.selected());
+                self.probe_editable();
+                Vec::new()
+            }
+            M::Budget(BudgetAction::Cancel) => {
+                self.modes.budget = None;
+                Vec::new()
+            }
+            M::Budget(edit) => {
+                if let Some(form) = self.modes.budget.as_mut() {
+                    form.edit(edit);
+                }
+                Vec::new()
+            }
             M::ChdInfo => {
                 self.start_chd_info();
                 Vec::new()
@@ -791,7 +817,7 @@ impl CommanderController {
             Some(ModeJob::Measure(job)) => {
                 let snap = job.snapshot();
                 match job.take_result() {
-                    Some(Ok(plan)) => self.modes.plan = Some(plan),
+                    Some(Ok(plan)) => self.modes.budget = Some(BudgetForm::new(plan)),
                     Some(Err(e)) => self.modes.error = Some(e),
                     None => {
                         let why = failed(snap);

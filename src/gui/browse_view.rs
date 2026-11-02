@@ -120,10 +120,6 @@ pub struct BrowseView {
     /// laid-out text every frame and grinds to a halt at multi-MB sizes
     /// (originally hit on a 128 GB Amiga RDB partition).
     show_tree_large_dialog: bool,
-    /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
-    /// a SquashFS volume and choosing a ceiling. See
-    /// [`super::squashfs_budget_dialog`].
-    squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
     /// The text editor window, when open.
     text_editor: Option<GuiTextEditor>,
 
@@ -199,7 +195,6 @@ impl Default for BrowseView {
             tree_show_ids: false,
             show_tree_large_dialog: false,
             text_editor: None,
-            squashfs_budget_dialog: None,
             password_input: String::new(),
         }
     }
@@ -326,7 +321,6 @@ impl BrowseView {
         // left open, their Save/Overwrite acted on the next volume.
         self.text_editor = None;
         self.boot_blocks_present = None;
-        self.squashfs_budget_dialog = None;
         self.generation_seen = 0;
     }
 
@@ -917,11 +911,6 @@ impl BrowseView {
         }
         if let Some(e) = self.ctl.take_mode_error() {
             self.error = Some(e);
-        }
-        if let Some(plan) = self.ctl.take_size_plan() {
-            self.squashfs_budget_dialog = Some(Box::new(
-                super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
-            ));
         }
         let generation = self.ctl.volume_generation();
         if generation != self.generation_seen {
@@ -1741,22 +1730,14 @@ impl BrowseView {
         pane.entry_at(parent_path).filter(|e| e.is_directory())
     }
 
-    /// Draw the budget dialog and act on its outcome: a chosen budget is
-    /// installed on the session and Edit Mode is entered; cancelling just
-    /// closes, leaving the volume read-only.
+    /// Draw the size-budget dialog while the controller asks; Start enters Edit Mode.
     fn poll_squashfs_budget_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(dialog) = self.squashfs_budget_dialog.as_mut() else {
+        let Some(form) = self.ctl.size_budget().copied() else {
             return;
         };
-        dialog.show(ui.ctx());
-        let outcome = dialog.take_outcome();
-        let closed = dialog.is_closed();
-        if let Some(budget) = outcome {
-            self.squashfs_budget_dialog = None;
-            let act = CommanderAction::Mode(ModeAction::SetBudget(Some(budget)));
-            self.dispatch(&ui.ctx().clone(), act);
-        } else if closed {
-            self.squashfs_budget_dialog = None;
+        let ctx = ui.ctx().clone();
+        for edit in super::squashfs_budget_dialog::show(&ctx, &form) {
+            self.dispatch(&ctx, CommanderAction::Mode(ModeAction::Budget(edit)));
         }
     }
 

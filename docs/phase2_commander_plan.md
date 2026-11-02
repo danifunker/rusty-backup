@@ -986,3 +986,10 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    window opens at once with "Reading the Alto pack..." and closes with the same log line if the
    file is not a pack; the Save As picker is the shared `EffectHost` one (titled, starting in the
    home folder on Linux).
+3. `src/gui/squashfs_budget_dialog.rs` (2 -> 0): the size-budget form moved into the browse
+   view's modes. `controller::commander::BudgetForm` (`screen/budget.rs`: the seeded fields,
+   `selected`, `ceiling`, `over_capacity`) is what the measurement job now leaves in the modes
+   (`size_budget()` replaces `take_size_plan()`); `ModeAction::Budget(BudgetAction)` edits it,
+   `Start` installs the budget and probes for editing (refused while over capacity), `Cancel`
+   drops it. The egui dialog is a function that draws the form and returns the frame's edits.
+   `edit_mode_on_squashfs_asks_for_a_size_budget_first` drives it headless. No behaviour change.

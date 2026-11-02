@@ -233,3 +233,39 @@ fn open_as_disk_image_copies_the_file_out_for_the_host() {
     assert!(ctl.take_nested_open().is_none());
     assert!(ctl.status().starts_with("Apply or discard"));
 }
+
+#[test]
+fn edit_mode_on_squashfs_asks_for_a_size_budget_first() {
+    use crate::controller::commander::{BudgetAction, BudgetMode};
+    use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("vol.sqfs");
+    let root = BuildNode::dir(
+        "",
+        0o755,
+        vec![BuildNode::file("a.txt", 0o644, b"hi".to_vec())],
+    );
+    let mut out = std::fs::File::create(&img).unwrap();
+    write_squashfs(&mut out, &root, &BuildOptions::default()).unwrap();
+    drop(out);
+    let mut ctl = inspect(session(&img));
+    ctl.inspect_edit_in_place();
+    mode(&mut ctl, ModeAction::ToggleEditMode);
+    let form = *ctl.size_budget().expect("the budget dialog is up");
+    assert_eq!(form.mode(), BudgetMode::Fit);
+    assert!(!ctl.edit_mode());
+    mode(
+        &mut ctl,
+        ModeAction::Budget(BudgetAction::SetMode(BudgetMode::Headroom)),
+    );
+    assert_eq!(
+        ctl.size_budget().map(|f| f.mode()),
+        Some(BudgetMode::Headroom)
+    );
+    mode(&mut ctl, ModeAction::Budget(BudgetAction::Start));
+    assert!(
+        ctl.size_budget().is_none() && ctl.edit_mode(),
+        "{:?}",
+        ctl.take_mode_error()
+    );
+}

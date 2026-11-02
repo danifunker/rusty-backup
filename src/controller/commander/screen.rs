@@ -42,8 +42,10 @@ pub use crate::model::extract::ExtractOptions;
 pub use detail::DetailField;
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
+pub use budget::{BudgetAction, BudgetForm, BudgetMode};
 pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
 
+mod budget;
 mod copy;
 mod detail;
 mod extract;
