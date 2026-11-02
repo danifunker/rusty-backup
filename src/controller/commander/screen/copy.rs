@@ -350,7 +350,7 @@ impl CommanderController {
         }
         let format = format.unwrap_or(self.export_format);
         let src = self.pane(from);
-        let entries = src.selected_entries();
+        let entries = without_nested(src.selected_entries());
         if entries.is_empty() {
             self.status = format!("Nothing selected in the {} pane to export.", from.label());
             return Vec::new();
@@ -547,4 +547,19 @@ fn export_archive_name(entries: &[FileEntry], ext: &str) -> String {
         _ => "export",
     };
     format!("{stem}.{ext}")
+}
+
+/// The selection without entries inside another selected folder, which the folder's walk covers.
+fn without_nested(entries: Vec<FileEntry>) -> Vec<FileEntry> {
+    let inside = |p: &str, dir: &str| {
+        let dir = dir.trim_end_matches('/');
+        p.len() > dir.len() + 1 && p.starts_with(dir) && p.as_bytes()[dir.len()] == b'/'
+    };
+    let dirs: Vec<String> = entries
+        .iter()
+        .filter(|e| e.is_directory())
+        .map(|e| e.path.clone())
+        .collect();
+    let nested = |e: &FileEntry| dirs.iter().any(|d| inside(&e.path, d));
+    entries.into_iter().filter(|e| !nested(e)).collect()
 }

@@ -1944,25 +1944,6 @@ impl BrowseView {
         }
     }
 
-    /// Marked entries to export, with any entry that lives under another marked
-    /// directory dropped — that ancestor's recursive walk already includes it, so
-    /// nothing is archived twice.
-    fn marked_export_entries(&self) -> Vec<FileEntry> {
-        fn is_ancestor(a: &str, p: &str) -> bool {
-            if a == p {
-                return false;
-            }
-            if a == "/" {
-                return p.len() > 1 && p.starts_with('/');
-            }
-            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
-        }
-        let marked = self.ctl.pane(Side::Left).selected_entries();
-        let paths: Vec<&str> = marked.iter().map(|e| e.path.as_str()).collect();
-        let keep = |e: &&FileEntry| !paths.iter().any(|a| is_ancestor(a, &e.path));
-        marked.iter().filter(keep).cloned().collect()
-    }
-
     /// Compact bar shown above the tree when entries are checkbox-marked: the
     /// count, an "Export selected as..." format menu (the shared `export_selection`
     /// engine, so `.mar` and the other formats come for free), and Clear.
