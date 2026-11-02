@@ -1,6 +1,6 @@
 [package]
 name = "qnx2fs"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
@@ -21,9 +21,13 @@ disk-core = { path = "../disk-core", version = "0.2", optional = true }
 chrono = { version = "0.4.31", optional = true }
 log = { version = "0.4", optional = true }
 
+# chrono's `Local` ignores `TZ` on Windows; jiff honours it there, with a bundled zone database.
+[target.'cfg(windows)'.dependencies]
+jiff = { version = "0.2.1", optional = true, default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform"] }
+
 [features]
 # The `adapter` module: `Volume` behind disk-core's Filesystem / EditableFilesystem traits.
-disk-core = ["dep:disk-core", "dep:chrono", "dep:log"]
+disk-core = ["dep:disk-core", "dep:chrono", "dep:log", "dep:jiff"]
 # Only for a Rust 1.73 toolchain; see disk-core.
 rust173-polyfill = ["disk-core?/rust173-polyfill"]
 

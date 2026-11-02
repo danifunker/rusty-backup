@@ -3,6 +3,18 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.4
+
+### Fixed
+- On Windows, the `disk-core` adapter now honours the `TZ` environment
+  variable. chrono's `Local` reads `TZ` on Unix but always uses the system zone
+  on Windows, so `TZ=UTC` had no effect there. When `TZ` is set on Windows,
+  dates convert through [jiff](https://crates.io/crates/jiff) and its bundled
+  zone database. Without `TZ`, and on every other platform, nothing changes.
+
+### Changed
+- The `disk-core` feature pulls in `jiff` on Windows only.
+
 ## 0.3.3
 
 ### Changed
