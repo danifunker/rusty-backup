@@ -1,0 +1,30 @@
+# Convert Floppy Container: a raw X68000 XDF rewritten as a PC-98 HDM (same sectors, new wrapper).
+name = "Floppy convert: XDF to HDM"
+vm = "floppy_convert"
+
+[[step]]
+action = "Open"
+arg = "$xdf"
+settle = true
+expect = { open = true, source_error = "", target = "d88", can_start = false }
+
+[[step]]
+action = "SetTarget"
+arg = "hdm"
+
+[[step]]
+action = "PickOutput"
+effects = ["PickFile"]
+
+[[step]]
+action = "Pick"
+expect = { can_start = true }
+
+[[step]]
+action = "Start"
+settle = true
+expect = { summary = "~Converted to PC-98 HDM (.hdm)", out_bytes = 1261568, can_start = false }
+
+[[step]]
+action = "Close"
+expect = { open = false }

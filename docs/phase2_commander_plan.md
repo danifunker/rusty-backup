@@ -1003,3 +1003,16 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    `tests/ui_scenarios/expand_hfs.toml` grows a 4 MiB flat HFV to 12 MiB.
    Behaviour: the target size is clamped when it is edited rather than every frame (same
    result); the Save As picker is titled ("Save Expanded Volume").
+5. `src/gui/floppy_convert_dialog.rs` (8 -> 0): `controller::floppy_convert::FloppyConvertController`
+   (`Open(Option<PathBuf>)`, `PickSource` / `PickOutput` -> `Effect::PickFile`, `Picked`,
+   `SetTarget`, `Start`, `Close`; `source_kind`, `source_error`, `same_format`, `outcome`,
+   `editable`, `can_start`) over `model::floppy_convert` (`FloppyTarget`, `probe_source`: the
+   256-byte sniff and size cap; `convert`: `convert_floppy_container` and the summary line). The
+   sniff and the conversion are jobs. `rb-cli floppy convert` keeps its verb (its single and bulk
+   modes print their own lines over the same engine call).
+   `tests/ui_scenarios/floppy_convert.toml` rewrites an XDF as an HDM.
+   Behaviour: the source is sniffed in a job (it was read on the UI thread when the dialog opened
+   or a file was picked); the window has no title-bar X and Choose File... is disabled while a
+   conversion runs (closing it then used to drop the dialog with the worker still writing, and a
+   new source reset the form under it); the result shows the "Wrote N bytes" line under the
+   summary instead of in a scroll list; the pickers are titled.

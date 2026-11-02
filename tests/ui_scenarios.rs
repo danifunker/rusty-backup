@@ -986,6 +986,92 @@ impl Target for ExpandHfsTarget {
     }
 }
 
+/// `FloppyConvertController`. Actions: `Open` (arg: `$xdf` writes a blank 1.2 MB XDF, or a path),
+/// `SetTarget` (`xdf`, `hdm`, `dim`, `d88`), `PickOutput`, `Pick` (the output, `out.<ext>` in the
+/// temp folder), `Start`, `Close`. Probes: `open`, `source_kind`, `source_error`, `target`,
+/// `can_start`, `summary`, `out_bytes`.
+struct FloppyConvertTarget {
+    ctl: rusty_backup::controller::floppy_convert::FloppyConvertController,
+    dir: tempfile::TempDir,
+}
+
+impl FloppyConvertTarget {
+    fn new() -> Self {
+        FloppyConvertTarget {
+            ctl: rusty_backup::controller::floppy_convert::FloppyConvertController::new(
+                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+            ),
+            dir: tempfile::tempdir().expect("temp dir"),
+        }
+    }
+
+    fn out(&self) -> PathBuf {
+        self.dir
+            .path()
+            .join(format!("out.{}", self.ctl.target().extension()))
+    }
+}
+
+impl Target for FloppyConvertTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::floppy_convert::{
+            purpose, FloppyConvertAction, FloppyTarget,
+        };
+        let a = match action {
+            "Open" => FloppyConvertAction::Open(Some(match arg_str(arg)? {
+                "$xdf" => {
+                    let p = self.dir.path().join("disk.xdf");
+                    std::fs::write(&p, vec![0xE5u8; 1_261_568]).map_err(|e| e.to_string())?;
+                    p
+                }
+                other => PathBuf::from(other),
+            })),
+            "SetTarget" => {
+                let want = arg_str(arg)?;
+                let t = FloppyTarget::ALL
+                    .iter()
+                    .copied()
+                    .find(|t| t.extension() == want)
+                    .ok_or("SetTarget takes xdf, hdm, dim or d88")?;
+                FloppyConvertAction::SetTarget(t)
+            }
+            "PickOutput" => FloppyConvertAction::PickOutput,
+            "Pick" => FloppyConvertAction::Picked {
+                purpose: purpose::OUTPUT,
+                path: Some(self.out()),
+            },
+            "Start" => FloppyConvertAction::Start,
+            "Close" => FloppyConvertAction::Close,
+            other => return Err(format!("FloppyConvertController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "source_kind" => Value::String(self.ctl.source_kind().unwrap_or("").to_string()),
+            "source_error" => Value::String(self.ctl.source_error().unwrap_or("").to_string()),
+            "target" => Value::String(self.ctl.target().extension().to_string()),
+            "can_start" => Value::Boolean(self.ctl.can_start()),
+            "summary" => Value::String(match self.ctl.outcome() {
+                Some(Ok(done)) => done.summary.clone(),
+                Some(Err(e)) => format!("error: {e}"),
+                None => String::new(),
+            }),
+            "out_bytes" => Value::Integer(
+                std::fs::metadata(self.out()).map(|m| m.len() as i64).unwrap_or(0),
+            ),
+            other => return Err(format!("FloppyConvertController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.tick()
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
@@ -995,6 +1081,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
+        "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

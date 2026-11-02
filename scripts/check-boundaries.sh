@@ -19,7 +19,7 @@ VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
 SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app src/optical/browse_view.rs)
-ENFORCED=(src/gui/commander src/gui/browse_view.rs src/gui/inspect_tab.rs src/gui/backup_tab.rs src/gui/restore_tab.rs src/gui/physical_disk_export.rs src/gui/partition_editor_modal.rs src/gui/progress.rs src/gui/alto_resize_dialog.rs src/gui/squashfs_budget_dialog.rs src/gui/expand_hfs_dialog.rs src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
+ENFORCED=(src/gui/commander src/gui/browse_view.rs src/gui/inspect_tab.rs src/gui/backup_tab.rs src/gui/restore_tab.rs src/gui/physical_disk_export.rs src/gui/partition_editor_modal.rs src/gui/progress.rs src/gui/alto_resize_dialog.rs src/gui/squashfs_budget_dialog.rs src/gui/expand_hfs_dialog.rs src/gui/floppy_convert_dialog.rs src/cli/verbs/tui_app/commander.rs src/cli/verbs/tui_app/explorer.rs)
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'
