@@ -7,16 +7,15 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arc_mac::detect::{detect_mac_archive, MacArchiveKind};
+use arc_mac::detect::detect_mac_archive;
 use arc_mac::extract as mac_extract;
 use disk_core::entry::{EntryType, FileEntry};
-use disk_core::filesystem::Filesystem;
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, ExportFormat,
-    ExtractOptions, JobRegistry, ListingStyle, PaneProfile, PaneServices, ResourceForkMode,
-    RowKind, Side, Snapshot,
+    ArchiveRead, ArchiveUse, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow,
+    EditQueue, ExportFormat, ExtractOptions, JobRegistry, ListingStyle, MacArchiveKind,
+    PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot,
 };
 use rusty_backup::controller::Controller as _;
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
@@ -38,19 +37,8 @@ const NESTED_FREE_MARGIN: u64 = 64 * 1024 * 1024;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
-/// Upper bound on bytes read off the disk image to sniff whether the
-/// selected file is a Mac archive (drives the "Save as Mac archive..." /
-/// "Browse archive..." button visibility). The magics for SIT / SIT5 /
-/// SEA sit at or near the start, and BinHex's banner is at byte 0, so a
-/// generous prefix is enough to classify every archive we'd practically
-/// meet on a vintage Mac volume while keeping the per-selection read
-/// bounded. The click handlers still read the full file authoritatively.
-const ARCHIVE_SNIFF_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
-
-/// Beyond this many bytes, the tree-view popup's `TextEdit::multiline` widget
-/// becomes unresponsive (egui re-lays the entire text every frame). We route
-/// past the threshold straight to a save-to-file dialog with a "show anyway"
-/// escape hatch. 1 MiB ~= 30–50k lines depending on indentation.
+/// Past this the tree popup's multiline widget stalls (egui lays the whole text out every
+/// frame), so a larger listing offers Save first.
 const TREE_INLINE_RENDER_LIMIT: usize = 1024 * 1024;
 
 /// The browser pane behind the view: the Inspect profile, its listing style remembered as `inspect`.
@@ -161,10 +149,6 @@ pub struct BrowseView {
     show_fsck_debug: bool,
     /// The repair report on screen was seen, so its follow-ups ran once.
     repair_seen: bool,
-    /// Folder listings and previews waiting for the reader, one at a time.
-    read_queue: std::collections::VecDeque<FsRead>,
-    /// The read in flight, and the filesystem generation it borrowed from.
-    read_job: Option<(rusty_backup::model::job::Job<FsReadOut>, u64)>,
     /// The screen's export of the marked rows is running; its status line is the result.
     exporting: bool,
     /// A running tar import (its preflight, or the import itself).
@@ -238,17 +222,6 @@ pub struct BrowseView {
     /// User's password input text for the password prompt.
     password_input: String,
 
-    /// One open `Filesystem` instance reused across read-only operations
-    /// (directory listings, file previews, fsck, tree dumps). Re-opening for
-    /// every operation forces a re-read of the entire catalog — fine for
-    /// FAT, slow for HFS+ on a heavily-used volume. Read-only paths borrow
-    /// this via `take_or_open_fs` and return it via `return_fs`. Any code
-    /// that mutates the volume (sync_metadata, archive recompress, edit
-    /// apply) calls `invalidate_cached_fs` so the next read sees disk truth.
-    cached_fs: Option<Box<dyn Filesystem>>,
-    /// Bumped on every invalidation; a worker's handle is only cached if it matches.
-    fs_generation: u64,
-
     /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
     /// `.sea.hqx`) that the user picked via Add File... — each waits on a
     /// user choice in the Workflow A modal (Convert / Expand / Add as-is).
@@ -268,16 +241,6 @@ pub struct BrowseView {
     /// fork-format dropdown + Extract All / Extract Selected, mirroring
     /// the standalone Archives tab shape.
     mac_archive_window: Option<MacArchiveWindow>,
-    /// Cached Mac-archive sniff for the current selection, keyed by path.
-    /// `Some((path, Some(kind)))` means the file at `path` is a Mac
-    /// archive of `kind`; `Some((path, None))` means it was sniffed and
-    /// is not one. Gates the "Save as Mac archive..." / "Browse
-    /// archive..." buttons so they only appear for actual archives rather
-    /// than showing always and erroring on click. Recomputed only when
-    /// the selected path changes — see [`Self::ensure_archive_sniff`].
-    archive_sniff: Option<(String, Option<MacArchiveKind>)>,
-    /// The sniff of the selected path, reading on a worker with the cached filesystem.
-    archive_sniff_job: Option<(String, u64, rusty_backup::model::job::Job<ArchiveSniff>)>,
 }
 
 /// Workflow C state: the selected entry on the disk image is a Mac
@@ -432,8 +395,6 @@ impl Default for BrowseView {
             journal_view: None,
             show_fsck_debug: false,
             repair_seen: false,
-            read_queue: std::collections::VecDeque::new(),
-            read_job: None,
             exporting: false,
             tar_job: None,
             chd_open_job: None,
@@ -457,14 +418,10 @@ impl Default for BrowseView {
             pending_tar_add: None,
             single_file_chd_backup_folder: None,
             password_input: String::new(),
-            cached_fs: None,
-            fs_generation: 0,
             pending_archive_imports: Vec::new(),
             archive_import_tempdir: None,
             pending_archive_extract: None,
             mac_archive_window: None,
-            archive_sniff: None,
-            archive_sniff_job: None,
         }
     }
 }
@@ -746,12 +703,7 @@ impl BrowseView {
         self.archive_import_tempdir = None;
         self.pending_archive_extract = None;
         self.mac_archive_window = None;
-        self.archive_sniff = None;
-        self.archive_sniff_job = None;
-        self.read_queue.clear();
-        self.read_job = None;
         self.password_input.clear();
-        self.cached_fs = None;
         // Clean up archive temp file if present
         if let Some(temp) = self.archive_temp_path.take() {
             let _ = std::fs::remove_file(&temp);
@@ -809,89 +761,26 @@ impl BrowseView {
         )
     }
 
-    /// Sniff the selected file for Mac-archive content, caching the result
-    /// by path so the disk read + [`detect_mac_archive`] runs once per
-    /// selection rather than every frame. Returns the detected kind, if
-    /// any. No-op (returns `None`) for non-files, non-Mac filesystems, or
-    /// when the bytes can't be read. The read is bounded by
-    /// [`ARCHIVE_SNIFF_LIMIT`]; the click handlers re-detect on the full
-    /// file, so a >16 MB archive (vanishingly rare on a vintage volume)
-    /// simply won't surface the buttons rather than mis-detecting.
+    /// The selected file's Mac-archive kind, once the pane's sniff of it has landed.
     fn ensure_archive_sniff(&mut self, entry: &FileEntry) -> Option<MacArchiveKind> {
         if !entry.is_file() || !self.is_mac_filesystem() {
-            self.archive_sniff = None;
             return None;
         }
-        self.poll_archive_sniff();
-        if let Some((path, kind)) = &self.archive_sniff {
-            if path == &entry.path {
-                return *kind;
-            }
+        let pane = self.ctl.pane(Side::Left);
+        if let Some(kind) = pane.archive_sniff(&entry.path) {
+            return kind;
         }
-        if self.archive_sniff_job.is_some() {
-            // One sniff at a time; a newer selection starts when this one lands.
-            return None;
+        if !pane.is_sniffing() {
+            let act = BrowserPaneAction::SniffArchive(entry.path.clone());
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
         }
-        // The cached filesystem goes to the worker and comes back; with none cached, the worker opens one.
-        let cached = self.cached_fs.take();
-        let session = self.session.clone();
-        let show_deleted = self.show_deleted;
-        let target = entry.clone();
-        let job = rusty_backup::model::job::Job::spawn(
-            "Checking for an archive",
-            Arc::new(super::ui_logger::EguiWake),
-            move |_| {
-                let mut fs = match cached {
-                    Some(fs) => fs,
-                    None => match session.open() {
-                        Ok(mut fs) => {
-                            if show_deleted {
-                                fs.set_show_deleted(true);
-                            }
-                            fs
-                        }
-                        Err(_) => return Ok((None, None)),
-                    },
-                };
-                let kind = fs
-                    .read_file(&target, ARCHIVE_SNIFF_LIMIT)
-                    .ok()
-                    .and_then(|bytes| detect_mac_archive(&bytes));
-                Ok((Some(fs), kind))
-            },
-        );
-        self.archive_sniff_job = Some((entry.path.clone(), self.fs_generation, job));
         None
-    }
-
-    /// Take a finished sniff: cache its verdict and put the filesystem back.
-    fn poll_archive_sniff(&mut self) {
-        let Some((_, _, job)) = &self.archive_sniff_job else {
-            return;
-        };
-        if job.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        let Some((path, generation, _)) = self.archive_sniff_job.take() else {
-            return;
-        };
-        let (fs, kind) = out.unwrap_or((None, None));
-        // A filesystem from before an invalidation is stale; drop it.
-        if let Some(fs) = fs {
-            if self.cached_fs.is_none() && generation == self.fs_generation {
-                self.return_fs(fs);
-            }
-        }
-        // A failed open or read caches "not an archive" for this path instead of retrying every frame.
-        self.archive_sniff = Some((path, kind));
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
         }
-        self.render_tool_job(ui);
         self.poll_editor();
         if let Some(snap) = self.ctl.pane(Side::Left).tool_working() {
             egui::Window::new(snap.label.clone())
@@ -901,19 +790,9 @@ impl BrowseView {
                     super::progress::show_job(ui, &snap);
                 });
         }
-        self.poll_reads();
-        if let Some((job, _)) = &self.read_job {
-            let snap = job.snapshot();
-            if snap.label == ARCHIVE_READ_LABEL {
-                egui::Window::new(snap.label.clone())
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ui.ctx(), |ui| {
-                        super::progress::show_job(ui, &snap);
-                    });
-            }
+        if let Some((entry, purpose, read)) = self.ctl.host_pane().take_archive() {
+            self.apply_archive_read(entry, purpose, read);
         }
-        self.poll_archive_sniff();
         self.render_apply_job(ui);
         self.poll_tar_job();
         if let Some(snap) = self.tar_job.as_ref().map(|j| j.snapshot()) {
@@ -1953,87 +1832,6 @@ impl BrowseView {
         egui::RichText::new(label).color(color)
     }
 
-    /// Start the next queued read: it borrows the cached filesystem, or opens one off the UI thread.
-    fn pump_reads(&mut self) {
-        if self.read_job.is_some() {
-            return;
-        }
-        let Some(read) = self.read_queue.pop_front() else {
-            return;
-        };
-        let cached = self.cached_fs.take();
-        let session = self.session.clone();
-        let show_deleted = self.show_deleted;
-        let label = ARCHIVE_READ_LABEL;
-        let job = rusty_backup::model::job::Job::spawn(
-            label,
-            Arc::new(super::ui_logger::EguiWake),
-            move |_| {
-                let mut fs = match cached {
-                    Some(fs) => fs,
-                    None => match session.open() {
-                        Ok(mut fs) => {
-                            if show_deleted {
-                                fs.set_show_deleted(true);
-                            }
-                            fs
-                        }
-                        Err(e) => {
-                            return Ok((
-                                None,
-                                read.failed(format!("Failed to open filesystem: {e}")),
-                            ))
-                        }
-                    },
-                };
-                let done = match read {
-                    FsRead::Archive(entry, purpose) => {
-                        let result = read_mac_archive(&mut *fs, &entry, purpose);
-                        FsReadDone::Archive(entry, purpose, result)
-                    }
-                };
-                Ok((Some(fs), done))
-            },
-        );
-        self.read_job = Some((job, self.fs_generation));
-    }
-
-    /// Apply a finished read, put the filesystem back, and start the next.
-    fn poll_reads(&mut self) {
-        let Some((job, _)) = &self.read_job else {
-            self.pump_reads();
-            return;
-        };
-        if job.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        let Some((_, generation)) = self.read_job.take() else {
-            return;
-        };
-        if let Some((fs, done)) = out {
-            // A filesystem from before an invalidation is stale; so is what it read.
-            let fresh = generation == self.fs_generation;
-            if let Some(fs) = fs {
-                if fresh && self.cached_fs.is_none() {
-                    self.return_fs(fs);
-                }
-            }
-            if fresh {
-                self.apply_read(done);
-            }
-        }
-        self.pump_reads();
-    }
-
-    fn apply_read(&mut self, done: FsReadDone) {
-        match done {
-            FsReadDone::Archive(entry, purpose, result) => {
-                self.apply_archive_read(entry, purpose, result);
-            }
-        }
-    }
-
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
         let entry = self.selected_entry.clone();
         let shown = self.render_detail(ui, entry.as_ref());
@@ -2188,7 +1986,7 @@ impl BrowseView {
                         )
                         .clicked()
                 {
-                    self.open_archive_extract_modal(&entry);
+                    self.open_archive_extract_modal(&ui.ctx().clone(), &entry);
                 }
 
                 // Workflow E: open a floating viewer that lets
@@ -2204,7 +2002,7 @@ impl BrowseView {
                         )
                         .clicked()
                 {
-                    self.open_archive_browse_window(&entry);
+                    self.open_archive_browse_window(&ui.ctx().clone(), &entry);
                 }
             });
 
@@ -3482,36 +3280,24 @@ impl BrowseView {
     /// image, sniff + decode, and open a floating viewer window with
     /// the archive's entries. Read-only — the user can extract any
     /// subset but can't modify the archive itself.
-    fn open_archive_browse_window(&mut self, entry: &FileEntry) {
-        self.read_queue
-            .push_back(FsRead::Archive(entry.clone(), ArchiveUse::Browse));
-        self.pump_reads();
+    fn open_archive_browse_window(&mut self, ctx: &egui::Context, entry: &FileEntry) {
+        let path = entry.path.clone();
+        let purpose = ArchiveUse::Browse;
+        self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
     }
 
     /// Workflow C trigger: read the selected file's bytes off the disk
     /// image, sniff them via [`detect_mac_archive`], and on a hit open
     /// the Save-as-is / Decode-and-save modal. On a non-archive (or a
     /// read failure), surface a one-line error and don't open the modal.
-    fn open_archive_extract_modal(&mut self, entry: &FileEntry) {
-        self.read_queue
-            .push_back(FsRead::Archive(entry.clone(), ArchiveUse::Extract));
-        self.pump_reads();
+    fn open_archive_extract_modal(&mut self, ctx: &egui::Context, entry: &FileEntry) {
+        let path = entry.path.clone();
+        let purpose = ArchiveUse::Extract;
+        self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
     }
 
     /// Open the archive window or the extract modal for a decoded archive.
-    fn apply_archive_read(
-        &mut self,
-        entry: FileEntry,
-        purpose: ArchiveUse,
-        result: Result<ArchiveRead, String>,
-    ) {
-        let read = match result {
-            Ok(read) => read,
-            Err(msg) => {
-                self.edit_result = Some(msg);
-                return;
-            }
-        };
+    fn apply_archive_read(&mut self, entry: FileEntry, purpose: ArchiveUse, read: ArchiveRead) {
         match purpose {
             ArchiveUse::Browse => {
                 let selected = vec![true; read.archive.entries.len()];
@@ -3572,8 +3358,6 @@ impl BrowseView {
             self.pending_close = false;
             return;
         }
-        // The pane reopened the volume itself; only this view's reader is stale.
-        self.forget_cached_fs();
         self.selected_entry = None;
         self.cursor_armed = false;
         let left = self.ctl.pane(Side::Left).queue.len();
@@ -4639,19 +4423,6 @@ impl BrowseView {
         }
     }
 
-    /// The running check, repair, tree listing or journal read.
-    fn render_tool_job(&self, ui: &mut egui::Ui) {
-        let Some(snap) = self.ctl.pane(Side::Left).tool_working() else {
-            return;
-        };
-        egui::Window::new(snap.label.clone())
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                super::progress::show_job(ui, &snap);
-            });
-    }
-
     fn render_tree_popup(&mut self, ui: &mut egui::Ui) {
         if !self.show_tree_popup {
             return;
@@ -4805,26 +4576,11 @@ impl BrowseView {
         }
     }
 
-    /// Return a previously taken filesystem to the cache.
-    fn return_fs(&mut self, fs: Box<dyn Filesystem>) {
-        self.cached_fs = Some(fs);
-    }
-
     /// Drop the cached filesystem so the next read re-opens from disk.
     /// Call this whenever the underlying volume bytes may have changed
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
         self.pane_stale = true;
-        self.forget_cached_fs();
-    }
-
-    /// Drop this view's own reader (the pane reopened by itself after its Apply).
-    fn forget_cached_fs(&mut self) {
-        self.cached_fs = None;
-        self.fs_generation = self.fs_generation.wrapping_add(1);
-        // Boot-block status is recomputed lazily from the (now possibly
-        // changed) backing bytes the next time the header renders.
-        self.boot_blocks_present = None;
     }
 
     /// Best-effort: does the open volume have HFS boot blocks at sector 0?
@@ -4893,9 +4649,6 @@ enum ApplyFollowUp {
     /// Close the view or leave edit mode (the unsaved-changes dialog).
     LeaveEditing,
 }
-
-/// A sniff's result: the filesystem to put back (when there was one), and the archive kind found.
-type ArchiveSniff = (Option<Box<dyn Filesystem>>, Option<MacArchiveKind>);
 
 /// What a tar-import job ended with.
 enum TarStep {
@@ -4997,77 +4750,3 @@ fn tar_import_step(
     }
     TarStep::Finished(msg, true)
 }
-
-/// A read the browse view queues off the UI thread.
-enum FsRead {
-    /// Read a whole file and decode it as a Mac archive.
-    Archive(FileEntry, ArchiveUse),
-}
-
-impl FsRead {
-    /// The same read, failed with `message` (when the filesystem would not open).
-    fn failed(self, message: String) -> FsReadDone {
-        match self {
-            FsRead::Archive(entry, purpose) => FsReadDone::Archive(entry, purpose, Err(message)),
-        }
-    }
-}
-
-/// What a queued read produced.
-enum FsReadDone {
-    Archive(FileEntry, ArchiveUse, Result<ArchiveRead, String>),
-}
-
-/// The label of a Mac-archive read, which gets its own progress window.
-const ARCHIVE_READ_LABEL: &str = "Reading the archive...";
-
-/// Which window a decoded archive opens.
-#[derive(Clone, Copy)]
-enum ArchiveUse {
-    /// The read-only archive viewer (Workflow E).
-    Browse,
-    /// The Save-as-is / Decode-and-save modal (Workflow C).
-    Extract,
-}
-
-/// A Mac archive read off the volume and decoded.
-struct ArchiveRead {
-    kind: MacArchiveKind,
-    /// The file as stored (Extract saves it as-is).
-    raw: Vec<u8>,
-    bytes: Vec<u8>,
-    archive: arc_mac::stuffit::StuffItArchive,
-}
-
-/// Read `entry` whole, check it is a Mac archive, and decode it; the error is the status-line message.
-fn read_mac_archive(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-    purpose: ArchiveUse,
-) -> Result<ArchiveRead, String> {
-    let raw = fs
-        .read_file(entry, usize::MAX)
-        .map_err(|e| format!("Read failed: {e}"))?;
-    let kind = detect_mac_archive(&raw).ok_or_else(|| match purpose {
-        ArchiveUse::Browse => format!("{} is not a recognized Mac archive.", entry.name),
-        ArchiveUse::Extract => format!(
-            "{} is not a recognized Mac archive (use Extract File to save raw bytes).",
-            entry.name
-        ),
-    })?;
-    let keep_raw = match purpose {
-        ArchiveUse::Browse => Vec::new(),
-        ArchiveUse::Extract => raw.clone(),
-    };
-    let (bytes, archive) =
-        mac_extract::open_bytes(raw).map_err(|e| format!("{} decode failed: {e}", entry.name))?;
-    Ok(ArchiveRead {
-        kind,
-        raw: keep_raw,
-        bytes,
-        archive,
-    })
-}
-
-/// A finished read, and the filesystem it borrowed (when it had one to give back).
-type FsReadOut = (Option<Box<dyn Filesystem>>, FsReadDone);

@@ -458,6 +458,15 @@ impl BrowserPaneController {
                 self.start_volume_read(title, "Reading the journal", Want::Journal)
             }
             A::BootBlocks => self.pick_boot_donor(),
+            A::SniffArchive(path) => self.sniff_archive(&path),
+            A::ReadArchive { path, purpose } => match self.entry_at(&path) {
+                Some(entry) => {
+                    let title = format!("archive - {}", entry.name);
+                    let want = Want::Archive(entry, purpose);
+                    self.start_volume_read(title, "Reading the archive...", want)
+                }
+                None => msg(format!("'{path}' is not on this volume.")),
+            },
             A::Picked { purpose, path } if purpose == purpose::BOOT_DONOR => match path {
                 Some(p) => self.read_boot_donor(p),
                 None => Vec::new(),
@@ -551,6 +560,7 @@ impl BrowserPaneController {
             Want::Check => "checking the filesystem...",
             Want::Tree(_) => "listing the tree...",
             Want::Journal => "reading the journal...",
+            Want::Sniff(_) | Want::Archive(..) => "reading the archive...",
         };
         match self.spawn_read(label, what) {
             Ok(job) => {
@@ -903,6 +913,7 @@ impl BrowserPaneController {
         match self.tl.job.take() {
             Some(ToolJob::Volume { title, job }) => match self.read_done(job) {
                 Ok(Found::Check(result)) => {
+                    let result = *result;
                     let check = match &result {
                         Some(Ok(r)) => Some(CheckSummary::of(r)),
                         _ => None,
@@ -921,6 +932,11 @@ impl BrowserPaneController {
                     Vec::new()
                 }
                 Ok(Found::Journal(j)) => self.found_journal(j),
+                Ok(Found::Archive(found)) => {
+                    let (entry, purpose, read) = *found;
+                    self.found_archive(entry, purpose, read)
+                }
+                Ok(Found::Sniffed(..)) => Vec::new(),
                 Err(e) => msg(e),
             },
             Some(ToolJob::Repair { title, job }) => {

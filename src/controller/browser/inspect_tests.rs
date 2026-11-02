@@ -713,3 +713,75 @@ fn one_entry_or_the_whole_volume_exports_and_tar_follows_the_picked_name() {
     let text = std::fs::read_to_string(&hqx).unwrap();
     assert!(text.contains("BinHex"), "{}", &text[..text.len().min(80)]);
 }
+
+#[test]
+fn a_mac_archive_is_sniffed_and_read_on_the_shared_reader() {
+    use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+    let dir = tempfile::tempdir().unwrap();
+    let img = fat_volume(dir.path());
+    let sit = build_archive_tree(
+        &[StuffItInputNode::File(StuffItInput {
+            name: "inner.txt".into(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"x".to_vec(),
+            resource_fork: Vec::new(),
+        })],
+        WriteMethod::Store,
+    )
+    .unwrap();
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        let mut fs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        let mut data: &[u8] = &sit;
+        let len = sit.len() as u64;
+        fs.create_file(&root, "ARC.SIT", &mut data, len, &Default::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+    }
+    let mut ctl = inspect(&img);
+    pane(&mut ctl, A::SniffArchive("/HELLO.TXT".into()));
+    pane(&mut ctl, A::SniffArchive("/ARC.SIT".into()));
+    settle(&mut ctl);
+    assert_eq!(ctl.pane(Side::Left).archive_sniff("/HELLO.TXT"), Some(None));
+    pane(&mut ctl, A::SniffArchive("/ARC.SIT".into()));
+    settle(&mut ctl);
+    let kind = ctl.pane(Side::Left).archive_sniff("/ARC.SIT");
+    assert!(matches!(kind, Some(Some(_))), "{kind:?}");
+    pane(
+        &mut ctl,
+        A::ReadArchive {
+            path: "/ARC.SIT".into(),
+            purpose: ArchiveUse::Browse,
+        },
+    );
+    settle(&mut ctl);
+    let (entry, purpose, read) = ctl.host_pane().take_archive().expect("the archive");
+    assert_eq!(
+        (entry.name.as_str(), purpose),
+        ("ARC.SIT", ArchiveUse::Browse)
+    );
+    assert_eq!(read.archive.entries.len(), 1);
+    pane(
+        &mut ctl,
+        A::ReadArchive {
+            path: "/HELLO.TXT".into(),
+            purpose: ArchiveUse::Extract,
+        },
+    );
+    settle(&mut ctl);
+    assert!(ctl.host_pane().take_archive().is_none());
+    assert!(
+        ctl.status().contains("not a recognized Mac archive"),
+        "{}",
+        ctl.status()
+    );
+}

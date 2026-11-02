@@ -32,7 +32,9 @@ pub use tools::{
     MAX_TEXT_EDIT,
 };
 pub use tree::TreeNode;
-pub use volume::{CheckSummary, JournalDetail, RepairSummary, TreeText};
+pub use volume::{
+    ArchiveRead, ArchiveUse, CheckSummary, JournalDetail, MacArchiveKind, RepairSummary, TreeText,
+};
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +171,13 @@ pub enum BrowserPaneAction {
     ShowJournal,
     /// Pick a bootable donor disk and stage its HFS boot blocks.
     BootBlocks,
+    /// Find out in a job whether the file at this path is a Mac archive (`archive_sniff`).
+    SniffArchive(String),
+    /// Read and decode the Mac archive at `path` in a job; it waits in `take_archive`.
+    ReadArchive {
+        path: String,
+        purpose: ArchiveUse,
+    },
     /// Bless the cursor folder (or the current one) as the System Folder, after a confirmation.
     Bless,
     /// Read the cursor file for the text editor in a job; it waits in `take_text_doc`.

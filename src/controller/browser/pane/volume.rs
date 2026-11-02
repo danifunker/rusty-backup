@@ -21,7 +21,12 @@ use crate::model::commander_ops::StageSource;
 use crate::model::edit_queue::StagedEdit;
 use crate::model::job::{Job, Status};
 
+pub use crate::model::mac_archive_read::{ArchiveRead, ArchiveUse};
+pub use arc_mac::detect::MacArchiveKind;
 pub use fs_mac::hfsplus_journal::JournalDetail;
+
+use crate::model::mac_archive_read;
+use disk_core::entry::FileEntry;
 
 /// What a check found, drawn as a window or printed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,9 +110,11 @@ pub struct TreeText {
 
 /// What a reading tool found; the reader rides back with it.
 pub(super) enum Found {
-    Check(Option<Result<FsckResult, String>>),
+    Check(Box<Option<Result<FsckResult, String>>>),
     Tree(TreeText),
-    Journal(Option<JournalDetail>),
+    Journal(Option<Box<JournalDetail>>),
+    Sniffed(String, Option<MacArchiveKind>),
+    Archive(Box<(FileEntry, ArchiveUse, Result<ArchiveRead, String>)>),
 }
 
 pub(super) struct ReadOut {
@@ -142,7 +149,7 @@ fn read_volume(
 ) -> Result<Found, String> {
     let fs = reader_for(source, reader)?;
     Ok(match what {
-        Want::Check => Found::Check(fs.fsck().map(|r| r.map_err(|e| e.to_string()))),
+        Want::Check => Found::Check(Box::new(fs.fsck().map(|r| r.map_err(|e| e.to_string())))),
         Want::Tree(ids) => {
             let text = if *ids {
                 crate::fs::tree::format_tree_with_ids(fs.as_mut())
@@ -152,8 +159,16 @@ fn read_volume(
             let text = text.map_err(|e| format!("cannot list the tree: {e}"))?;
             Found::Tree(TreeText { text, ids: *ids })
         }
+        Want::Sniff(entry) => Found::Sniffed(
+            entry.path.clone(),
+            mac_archive_read::sniff(fs.as_mut(), entry),
+        ),
+        Want::Archive(entry, purpose) => {
+            let read = mac_archive_read::read(fs.as_mut(), entry, *purpose);
+            Found::Archive(Box::new((entry.clone(), *purpose, read)))
+        }
         Want::Journal => match fs.journal_detail() {
-            Ok(Some(any)) => Found::Journal(Some(journal_of(any)?)),
+            Ok(Some(any)) => Found::Journal(Some(Box::new(journal_of(any)?))),
             Ok(None) => Found::Journal(None),
             Err(e) => return Err(format!("cannot read the journal: {e}")),
         },
@@ -164,6 +179,8 @@ pub(super) enum Want {
     Check,
     Tree(bool),
     Journal,
+    Sniff(FileEntry),
+    Archive(FileEntry, ArchiveUse),
 }
 
 #[derive(Default)]
@@ -174,6 +191,11 @@ pub(super) struct VolumeState {
     /// Whether the open volume has HFS boot blocks; `None` until probed.
     boot_blocks: Option<Option<bool>>,
     donor: Option<Job<Box<[u8; 1024]>>>,
+    /// The Mac-archive sniff in flight (its own slot: it follows the cursor and must not block Apply).
+    sniff: Option<Job<ReadOut>>,
+    /// The last sniff's verdict, by path.
+    sniffed: Option<(String, Option<MacArchiveKind>)>,
+    archive: Option<(FileEntry, ArchiveUse, ArchiveRead)>,
 }
 
 impl BrowserPaneController {
@@ -194,7 +216,55 @@ impl BrowserPaneController {
 
     /// True while a donor read or the boot-block probe runs (they do not block Apply).
     pub fn volume_probing(&self) -> bool {
-        self.vol.donor.is_some() || self.vol.boot_probe.is_some()
+        self.vol.donor.is_some() || self.vol.boot_probe.is_some() || self.vol.sniff.is_some()
+    }
+
+    /// Whether the file at `path` is a Mac archive: `None` until `SniffArchive` for it has landed.
+    pub fn archive_sniff(&self, path: &str) -> Option<Option<MacArchiveKind>> {
+        let sniffed = self.vol.sniffed.as_ref().filter(|(p, _)| p == path);
+        sniffed.map(|(_, kind)| *kind)
+    }
+
+    /// True while a sniff runs (the view asks again for its path once it lands).
+    pub fn is_sniffing(&self) -> bool {
+        self.vol.sniff.is_some()
+    }
+
+    /// A Mac archive read by `ReadArchive`, handed over once.
+    pub fn take_archive(&mut self) -> Option<(FileEntry, ArchiveUse, ArchiveRead)> {
+        self.vol.archive.take()
+    }
+
+    /// Sniff the file at `path` for a Mac archive, unless known or already sniffing.
+    pub(super) fn sniff_archive(&mut self, path: &str) -> Vec<Effect> {
+        if self.archive_sniff(path).is_some() || self.vol.sniff.is_some() {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry_at(path).filter(|e| e.is_file()) else {
+            self.vol.sniffed = Some((path.to_string(), None));
+            return Vec::new();
+        };
+        match self.spawn_read("Checking for an archive", Want::Sniff(entry)) {
+            Ok(job) => self.vol.sniff = Some(job),
+            // The source is busy; a failed sniff reads as "not an archive" rather than retrying.
+            Err(_) => self.vol.sniffed = Some((path.to_string(), None)),
+        }
+        Vec::new()
+    }
+
+    pub(super) fn found_archive(
+        &mut self,
+        entry: FileEntry,
+        purpose: ArchiveUse,
+        read: Result<ArchiveRead, String>,
+    ) -> Vec<Effect> {
+        match read {
+            Ok(read) => {
+                self.vol.archive = Some((entry, purpose, read));
+                Vec::new()
+            }
+            Err(e) => msg(e),
+        }
     }
 
     /// Spawn a reading tool on the shared reader.
@@ -233,10 +303,10 @@ impl BrowserPaneController {
         self.vol.tree = Some(tree);
     }
 
-    pub(super) fn found_journal(&mut self, journal: Option<JournalDetail>) -> Vec<Effect> {
+    pub(super) fn found_journal(&mut self, journal: Option<Box<JournalDetail>>) -> Vec<Effect> {
         match journal {
             Some(j) => {
-                self.vol.journal = Some(j);
+                self.vol.journal = Some(*j);
                 Vec::new()
             }
             None => msg("this volume is not journaled."),
@@ -294,6 +364,12 @@ impl BrowserPaneController {
                 _ => {}
             }
         }
+        if self.vol.sniff.as_ref().is_some_and(|j| !j.is_running()) {
+            let job = self.vol.sniff.take().expect("checked");
+            if let Ok(Found::Sniffed(path, kind)) = self.read_done(job) {
+                self.vol.sniffed = Some((path, kind));
+            }
+        }
         if self
             .vol
             .boot_probe
@@ -311,6 +387,7 @@ impl BrowserPaneController {
     pub(super) fn volume_changed(&mut self) {
         self.vol.boot_blocks = None;
         self.vol.boot_probe = None;
+        self.vol.sniffed = None;
     }
 
     fn probe_boot_blocks(&mut self) {

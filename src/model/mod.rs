@@ -31,6 +31,7 @@ pub mod hfs_expand_runner;
 pub mod host_ops;
 pub mod image_prep;
 pub mod job;
+pub mod mac_archive_read;
 pub mod min_size_runner;
 pub mod multi_volume_fs;
 #[cfg(feature = "optical")]
