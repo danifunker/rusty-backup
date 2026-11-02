@@ -5,124 +5,13 @@
 //! `docs/commander_mode.md` §3) so the classic browse view and Commander
 //! Mode's File Info window render identical detail. Pure view helpers — no
 //! `self`, no background work; they take a `&FileEntry` (and the decoded
-//! bytes, for the preview) and draw into the supplied `egui::Ui`.
+//! bytes, for the preview) and draw into the supplied `egui::Ui`. The
+//! text-or-binary classification lives in `model::entry_detail`.
 
-use disk_core::entry::FileEntry;
-use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
-
-/// Decoded file content for the preview pane: either a text rendering or the
-/// raw bytes for a hex dump.
-#[derive(Debug, Clone)]
-pub enum FileContent {
-    Binary(Vec<u8>),
-    Text(String),
-}
-
-/// HFS/HFS+ file type classification from `assets/hfs_file_types.json`,
-/// embedded at compile time.
-mod hfs_file_types {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-
-    #[derive(serde::Deserialize)]
-    struct TypeInfo {
-        category: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct HfsFileTypes {
-        types: HashMap<String, TypeInfo>,
-    }
-
-    static HFS_TYPES: OnceLock<HashMap<String, bool>> = OnceLock::new();
-    const HFS_FILE_TYPES_JSON: &str =
-        include_str!("../../crates/fs-mac/assets/hfs_file_types.json");
-
-    fn get() -> &'static HashMap<String, bool> {
-        HFS_TYPES.get_or_init(|| {
-            let ft: HfsFileTypes =
-                serde_json::from_str(HFS_FILE_TYPES_JSON).unwrap_or(HfsFileTypes {
-                    types: HashMap::new(),
-                });
-            ft.types
-                .into_iter()
-                .map(|(k, v)| (k, v.category == "text"))
-                .collect()
-        })
-    }
-
-    /// Returns Some(true) for known text type, Some(false) for known binary, None for unknown.
-    pub fn classify(type_code: &str) -> Option<bool> {
-        get().get(type_code).copied()
-    }
-}
-
-/// Detect whether data is text or binary and return appropriate content.
-pub fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
-    if data.is_empty() {
-        return FileContent::Text(String::new());
-    }
-
-    // Check HFS type code first (if present)
-    if let Some(ref type_code) = entry.type_code {
-        let type_str = fs_mac::hfs_common::decode_ostype(type_code);
-        if let Some(is_text) = hfs_file_types::classify(&type_str) {
-            if !is_text {
-                return FileContent::Binary(data.to_vec());
-            }
-            // Known text type — decode as text (Mac files may not be UTF-8)
-            if let Ok(text) = std::str::from_utf8(data) {
-                return FileContent::Text(text.to_string());
-            }
-            // Not valid UTF-8 but known text type — show as lossy text
-            let text = data
-                .iter()
-                .map(|&b| {
-                    if b.is_ascii_graphic() || b.is_ascii_whitespace() {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-            return FileContent::Text(text);
-        }
-    }
-
-    // Fall back to content heuristics
-    // Try UTF-8 first
-    if let Ok(text) = std::str::from_utf8(data) {
-        let non_printable = text
-            .chars()
-            .filter(|c| !c.is_ascii_graphic() && !c.is_ascii_whitespace())
-            .count();
-        if non_printable * 10 < text.len() {
-            return FileContent::Text(text.to_string());
-        }
-    }
-
-    // Check if mostly printable bytes
-    let printable = data
-        .iter()
-        .filter(|&&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-        .count();
-    if printable * 10 >= data.len() * 8 {
-        // 80% printable
-        let text = data
-            .iter()
-            .map(|&b| {
-                if b.is_ascii_graphic() || b.is_ascii_whitespace() {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        return FileContent::Text(text);
-    }
-
-    FileContent::Binary(data.to_vec())
-}
+pub use rusty_backup::controller::commander::{detect_content_type, FileContent};
+use rusty_backup::controller::commander::{
+    format_size, FileEntry, FileEntryTypeDisplay as _, IdNameMap,
+};
 
 /// Render a hex dump view of binary data.
 pub fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
@@ -185,7 +74,7 @@ pub fn render_metadata_rows(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     suppress_type_creator: bool,
-    id_names: Option<&disk_core::id_names::IdNameMap>,
+    id_names: Option<&IdNameMap>,
 ) {
     // File info header
     ui.label(egui::RichText::new(&entry.name).strong());
@@ -209,7 +98,7 @@ pub fn render_metadata_rows(
         }
         if let Some(ref rsrc) = entry.resource_fork_size {
             if *rsrc > 0 {
-                ui.label(format!("Rsrc: {}", disk_core::display::format_size(*rsrc)));
+                ui.label(format!("Rsrc: {}", format_size(*rsrc)));
             }
         }
         if let Some(mode_str) = entry.mode_string() {

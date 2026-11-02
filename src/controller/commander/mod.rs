@@ -49,6 +49,7 @@ pub use crate::model::browse_session::BrowseSession;
 pub type PartcloneCache =
     std::sync::Arc<std::sync::Mutex<dsk_clonezilla::block_cache::PartcloneBlockCache>>;
 pub use crate::model::edit_queue::EditQueue;
+pub use crate::model::entry_detail::{detect_content_type, FileContent};
 pub use crate::model::job::{JobRegistry, Snapshot};
 pub use disk_core::display::format_size;
 pub use disk_core::entry::{EntryType, FileEntry};
