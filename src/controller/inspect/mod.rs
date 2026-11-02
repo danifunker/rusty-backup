@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use crate::backup::metadata::BackupMetadata;
 use crate::controller::log::LogLevel;
 use crate::controller::{ConfirmSpec, Controller, Effect, PickSpec};
-use crate::model::job::{Job, JobRegistry, Notify, Snapshot};
+use crate::model::job::{Job, Notify, Snapshot};
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
 use dsk_clonezilla::metadata::ClonezillaImage;
 
@@ -38,6 +38,7 @@ pub use tools::{FsckView, ResizePlan};
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::export_runner::PartitionExportConfig;
+pub use crate::model::job::{JobRegistry, NoNotify};
 pub use crate::model::partition_editor::PartitionEditor;
 pub use crate::rbformats::chd_options::ChdProfile;
 pub use crate::rbformats::export::ExportFormat;
@@ -849,6 +850,17 @@ impl InspectController {
     /// The label of a running job other tabs must wait for, if any.
     pub fn running_job(&self) -> Option<&'static str> {
         self.export.running().or_else(|| self.tools.running())
+    }
+
+    /// Block until the open and its probes end; for a headless shell's worker, never a UI thread.
+    pub fn wait_opened(&mut self) {
+        loop {
+            self.poll_open();
+            if self.open.loading().is_none() && !self.open.probing() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // --- source changes -----------------------------------------------------------------

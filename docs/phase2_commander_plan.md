@@ -68,6 +68,7 @@ widget, show_log, the metadata editor widgets.
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
 | 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) done (871b1680, 219d596c, and the leftovers commit; see "Step 3 status"); `src/gui/browse_view.rs` is enforced |
+| 11 | The Inspect tab on `controller::inspect` (`InspectController`); the TUI's image / backup open drives it too; `src/gui/inspect_tab.rs` enforced | done (d135d11d, 74d65c28, and the enforcement commit; see "Slice 11: the Inspect tab") |
 
 Slice 3 notes, for the slices that follow:
 
@@ -514,7 +515,7 @@ cache upgrade): the pane reopens the same path keeping the queue, folder and exp
   `TextShape` / `LineEnding`, `EntryType`, `FileEntryTypeDisplay`, `ArchiveEditContext` and
   `PartcloneCache` are re-exported from `controller::commander`.
 - `src/gui/browse_view.rs` 4,752 -> 2,920 lines, 0 engine references, in ENFORCED; shells' engine
-  references 724 -> 654. `src/gui/inspect_tab.rs` still has 181 (the next screen in Phase 2).
+  references 724 -> 654. `src/gui/inspect_tab.rs` still had 181 (slice 11 below).
 
 What is left in the browse view, none of it engine code: Add File's multi-file picker is still an
 `rfd` call in the view (`add_file_dialog`, `src/gui/browse_view.rs:1975`; `Effect::PickFile` picks one
@@ -541,6 +542,91 @@ top-level picks and drops ask); Delete acts on the marks (else the cursor row) a
 question is the shared confirmation; Repair needs Edit Mode; the extraction's overwrite question
 gains Skip and its progress is the copy job's window; the single-file BinHex export asks for a
 folder; Check reuses the pane's reader.
+
+## Slice 11: the Inspect tab
+
+`src/gui/inspect_tab.rs` (6,212 lines, 181 engine references) was the GUI's largest screen: the source
+picker, the open (a 800-line worker body), the partition grid, and a dozen disk tools, each with its
+own `Arc<Mutex<Status>>` thread or job, all in the view.
+
+### Steps
+
+1. (d135d11d) Model and controller. `model::inspect_runner::inspect_source` is the old worker body
+   (elevated / streamed / remote open, format and table detection, APM HFS and Linux relabels, HFS
+   block sizes, volume labels, cheap minimum sizes, the optical redirect); `is_floppy_container_file`
+   and `apply_volume_label` moved with it. `cache_runner::build_seekable_zstd` is the seekable-cache
+   build. `worker::wait_spawned` follows a runner that spawns its own worker from inside a job.
+   `controller::inspect::InspectController` (`mod.rs`, `open.rs`, `tools.rs`, `export.rs`,
+   `browse.rs`) owns the source and what was found in it, every job, and the rules:
+   - Sources: `InspectSource::{Device { slot, identity }, Image { path, temp }, Backup { folder },
+     Remote { conn }}`. `Open` / `Close` ask `purpose::DISCARD_EDITS` first while the browse view
+     holds edits (the shell reports that with `set_browse_dirty` each frame); `Load` / `Unload` are
+     the unasked hand-offs (another tab, Open as Disk Image, a remote pick, Close Remote).
+     `reconcile_devices` is the old device-slot check. A Mac archive becomes
+     `HostRequest::OpenArchive`; a single-file-CHD backup reopens as its CHD with the folder kept
+     for the export warning and the browse view's metadata refresh.
+   - Results as plain data: `table_summary`, `alignment`, `backup_summary` (with the minimum restore
+     size), `clonezilla_summary`, `min_cell` / `defrag_min` (backup record, else computed, else
+     Calc min), `row_actions` (Browse, Check, Expand HFS, Defragment, Alto resize), `layout` (the
+     disk bar's segments and trailing free space), `disk_size`, `flux_faults`, the enablement
+     accessors (`can_edit_table`, `can_expand_image`, `can_make_bootable`, `can_export`, ...).
+   - Jobs: the inspect and the backup load, Calc min and the backup label probes, Check / Repair
+     (`purpose::REPAIR`), Make Bootable (`purpose::BOOT_DONOR` picker), the table write, Expand
+     Image (raw and CHD), Defragment (`purpose::DEFRAGMENT`), the word swap (`purpose::SWAB_DEST`),
+     Expand HFS's summary (`HostRequest::ExpandHfs`), CHD Info, Export (`EXPORT_DISK` /
+     `EXPORT_FOLDER` / `EXPORT_HFV` pickers, the CHD free-space check, the sector-0 read in the
+     job), the remote Back Up Image (`REMOTE_BACKUP`), the partclone scan and the seekable build.
+     Log lines go through a sink jobs share; the shell drains `take_log`.
+   - Browse: `HostRequest::OpenBrowse(BrowseOpen { session, edit: BrowseEdit, label_prefix,
+     backup_folder })`, `UpgradeSeekable(path)`, `CloseBrowse`. The browse view's
+     `open_request` replaced `open` / `open_partclone` / `open_streaming` and the edit setters.
+   - `wait_opened` blocks until an open settles, for a headless shell's worker.
+2. (74d65c28) The egui tab renders and maps: it keeps only widget state (the CHD options control,
+   the Expand Image MiB field, the dialogs it hosts) and the recent-files mirror.
+3. (this commit) `src/gui/inspect_tab.rs` joins `ENFORCED`; the TUI's Inspect tab opens an image file
+   and a backup folder through the controller (`inspected_rows`, `open_backup_headless` in
+   `tui_app.rs`); a ui scenario (`tests/ui_scenarios/inspect_open_check_close.toml`, vm `inspect`)
+   opens, checks and closes behind the discard question.
+
+Shells' engine references 654 -> 470 (`inspect_tab.rs` 181 -> 0, an unused re-export in
+`expand_hfs_dialog.rs`, two `backup_loader` calls in the TUI).
+
+### Behaviour changes
+
+- The discard, Repair and Defragment questions are the shared confirmation dialog (the
+  Defragment warning is part of its message, no longer a coloured line).
+- Expand Image on a raw or VHD image, CHD Info, and the CHD sector-0 read for an export run in jobs
+  (they ran on the UI thread). Expand Image (raw and CHD), Defragment and the check / table / Make
+  Bootable steps show a small progress window; the export, the partclone scan and the seekable
+  build use the shared job bar (rate and time left from the job).
+- Closing or switching the source cancels running Calc min walks (they ran on to the end).
+- Every source change closes the browse view, including a hand-off from another tab, Open as Disk
+  Image and Close Remote (they left the old volume's browse view open).
+- The top bar's Close Backup closes Inspect's source only when it is that backup (it cleared the
+  partition list under an open image or device).
+- Cancelling the discard question no longer ends a remote session that was open.
+- A streamed zstd partition that cannot be opened logs the error and closes the browse view (the
+  browse view showed it).
+- The sector-by-sector warning reads the metadata loaded with the backup instead of re-reading
+  `metadata.json` every frame.
+- TUI: an image file's rows come from the controller, so a CHD, VHD or other container shows its
+  partitions and Linux / APM rows name the filesystem found; a single-file-CHD backup folder opens
+  as its disk image; a backup's info lines include the loader's progress lines. Devices keep the
+  plain, unelevated read (the controller's open elevates, which prompts on macOS); when the
+  controller finds no table the old raw read is used, so a table-less image still shows one row.
+  The open also measures the cheap minimum sizes (FAT, NTFS, exFAT), so a large image opens a
+  little slower.
+
+### Left
+
+- The TUI Inspect tab has none of the disk tools, Calc min or Export; it would drive the same
+  `InspectController` actions (its effects are the TUI's existing pickers and confirmations).
+- The dialogs the tab hosts still reach the engine: `partition_editor_modal.rs` (25),
+  `resize_popup.rs` (22), `physical_disk_export.rs` (19), `remote_browser.rs` (12),
+  `floppy_convert_dialog.rs` (8), `progress.rs` (7), `expand_hfs_dialog.rs` (4),
+  `alto_resize_dialog.rs` (2). Each is a controller of its own (resize, Expand HFS, physical
+  export) or plain data the inspect controller could re-export (`PartitionInfo`, the editor).
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`), as in every egui view.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),

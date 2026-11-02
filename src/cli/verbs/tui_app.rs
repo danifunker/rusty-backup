@@ -1947,27 +1947,13 @@ impl App {
         self.status = None;
         if path.is_dir() {
             self.start_task("Loading the backup", move |job| {
-                use crate::model::backup_loader::LoadOutcome;
                 job.set_can_cancel(false);
-                let loaded =
-                    crate::model::backup_loader::load_backup(&path).map(|outcome| match outcome {
-                        LoadOutcome::Backup(b) => {
-                            ("rusty-backup".to_string(), b.partitions.len(), b.info)
-                        }
-                        LoadOutcome::Clonezilla(c) => {
-                            ("Clonezilla".to_string(), c.partitions.len(), c.info)
-                        }
-                    });
+                let opened = open_backup_headless(path.clone());
                 let display = path.display().to_string();
-                Ok(Box::new(move |app: &mut App| match loaded {
-                    Ok((kind, partitions, info)) => {
+                Ok(Box::new(move |app: &mut App| match opened {
+                    Ok(opened) => {
                         crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
-                        app.opened = Some(Opened::Backup {
-                            path: display,
-                            kind,
-                            partitions,
-                            info,
-                        });
+                        app.opened = Some(opened);
                     }
                     Err(e) => app.status = Some(format!("Cannot open: {e}")),
                 }) as TaskDone)
@@ -1996,7 +1982,14 @@ impl App {
         self.start_task("Reading the partition table", move |job| {
             job.set_can_cancel(false);
             let size = readable_size(&path);
-            let parts = size.as_ref().ok().map(|&s| parse_partitions(&path, s));
+            // An image file is read by the Inspect controller; a device keeps the plain, unelevated read.
+            let inspected = (disk.is_none() && path.is_file())
+                .then(|| inspected_rows(path.clone()))
+                .flatten();
+            let parts = size.as_ref().ok().map(|&s| match inspected {
+                Some(rows) => Ok(rows),
+                None => parse_partitions(path.as_path(), s),
+            });
             Ok(
                 Box::new(move |app: &mut App| app.apply_image_open(path, disk, size, parts))
                     as TaskDone,
@@ -6778,7 +6771,7 @@ impl App {
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Parsed via the shared model::backup_loader (same as the GUI).".to_string(),
+                "Read by the shared Inspect controller (same as the GUI).".to_string(),
                 self.palette.dim(),
             ));
             lines.push(Line::raw("Esc to close."));
@@ -6928,6 +6921,100 @@ fn load_restore_backup(path: &std::path::Path, job: &crate::model::job::JobCtx) 
         ),
         Err(e) => RestoreLoad::Refused(format!("Not a rusty-backup folder: {e}")),
     }
+}
+
+/// A headless Inspect controller that opened `source`, its open and probes finished.
+fn inspect_headless(
+    source: crate::controller::inspect::InspectSource,
+) -> crate::controller::inspect::InspectController {
+    use crate::controller::inspect::{InspectAction, InspectController, InspectServices};
+    use crate::controller::Controller as _;
+    let mut ctl = InspectController::new(InspectServices {
+        jobs: crate::controller::inspect::JobRegistry::new(),
+        notify: Arc::new(crate::controller::inspect::NoNotify),
+    });
+    ctl.apply(InspectAction::Load(source));
+    ctl.wait_opened();
+    ctl
+}
+
+/// The Inspect tab's rows for what the controller found; `None` when it found no table.
+fn rows_from(ctl: &mut crate::controller::inspect::InspectController) -> Option<Vec<PartRow>> {
+    let table = ctl.table_summary()?;
+    let parts = ctl.partitions();
+    if parts.is_empty() {
+        let size = ctl.disk_size().unwrap_or(0);
+        return Some(vec![PartRow {
+            selector: None,
+            label: format!("Whole volume ({})", table.type_name),
+            fs_hint: table.type_name,
+            size,
+        }]);
+    }
+    Some(
+        parts
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let n = (k + 1) as u32;
+                PartRow {
+                    selector: Some(n.into()),
+                    label: format!("#{n}  {}", p.type_name),
+                    fs_hint: p
+                        .partition_type_string
+                        .clone()
+                        .unwrap_or_else(|| p.type_name.clone()),
+                    size: p.size_bytes,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// An image file's rows as the GUI's Inspect tab reads them (containers, real filesystem names).
+fn inspected_rows(path: std::path::PathBuf) -> Option<Vec<PartRow>> {
+    let mut ctl =
+        inspect_headless(crate::controller::inspect::InspectSource::Image { path, temp: None });
+    rows_from(&mut ctl)
+}
+
+/// A backup folder through the Inspect controller; a single-file-CHD backup opens as its disk image.
+fn open_backup_headless(folder: std::path::PathBuf) -> std::result::Result<Opened, String> {
+    use crate::controller::log::LogLevel;
+    let mut ctl = inspect_headless(crate::controller::inspect::InspectSource::Backup { folder });
+    if let Some(err) = ctl.last_error() {
+        return Err(err.to_string());
+    }
+    let info: Vec<String> = ctl
+        .take_log()
+        .into_iter()
+        .filter(|(level, _)| *level == LogLevel::Info)
+        .map(|(_, msg)| msg)
+        .collect();
+    if let Some(image) = ctl.image_path().map(|p| p.to_path_buf()) {
+        let size = ctl.disk_size().unwrap_or(0);
+        let parts = rows_from(&mut ctl).ok_or_else(|| "no partition table".to_string())?;
+        return Ok(Opened::Image {
+            path: image.display().to_string(),
+            size,
+            parts,
+            disk: None,
+        });
+    }
+    let kind = if ctl.clonezilla_summary().is_some() {
+        "Clonezilla"
+    } else {
+        "rusty-backup"
+    };
+    Ok(Opened::Backup {
+        path: ctl
+            .backup_folder()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        kind: kind.to_string(),
+        partitions: ctl.partitions().len(),
+        info,
+    })
 }
 
 /// Heuristic: does this content look like text (worth showing verbatim) rather
@@ -7440,6 +7527,17 @@ mod tests {
             parse_partitions(missing, 0).is_err(),
             "an unreadable path must surface its error"
         );
+    }
+
+    /// An image file's rows come from the Inspect controller, which names the volume's filesystem.
+    #[test]
+    fn an_image_file_is_read_by_the_inspect_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = crate::controller::commander::blank_fat_image(dir.path());
+        let rows = inspected_rows(img).expect("a FAT volume has a table");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].fs_hint.contains("FAT"), "{}", rows[0].fs_hint);
+        assert!(open_backup_headless(dir.path().join("missing")).is_err());
     }
 
     /// Walk the wizard's class list to a given class the way the arrow keys do.

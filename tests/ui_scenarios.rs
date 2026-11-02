@@ -191,9 +191,129 @@ impl Target for JobProbeController {
     }
 }
 
+/// `InspectController`. Actions: `OpenImage` (arg: a path, or `$blank_fat` for a fresh 2 MiB FAT
+/// image), `Close`, `Reinspect`, `Check` (arg: row number from 0), `SetBrowseDirty` (bool), `Confirm`
+/// (bool, answers the pending question). Probes: `source`, `partitions`, `superfloppy`, `error`,
+/// `check_clean`, `log` (every line so far).
+struct InspectTarget {
+    ctl: rusty_backup::controller::inspect::InspectController,
+    dir: tempfile::TempDir,
+    asked: Option<&'static str>,
+    log: Vec<String>,
+}
+
+impl InspectTarget {
+    fn new() -> Self {
+        use rusty_backup::controller::inspect::{
+            InspectController, InspectServices, JobRegistry, NoNotify,
+        };
+        InspectTarget {
+            ctl: InspectController::new(InspectServices {
+                jobs: JobRegistry::new(),
+                notify: std::sync::Arc::new(NoNotify),
+            }),
+            dir: tempfile::tempdir().expect("temp dir"),
+            asked: None,
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
+        for e in &fx {
+            if let Effect::Confirm(c) = e {
+                self.asked = Some(c.purpose);
+            }
+        }
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        fx
+    }
+}
+
+impl Target for InspectTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::inspect::{InspectAction, InspectSource};
+        let a = match action {
+            "OpenImage" => {
+                let arg = arg_str(arg)?;
+                let path = if arg == "$blank_fat" {
+                    let p = self.dir.path().join("vol.img");
+                    let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T"))
+                        .map_err(|e| e.to_string())?;
+                    std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                    p
+                } else {
+                    PathBuf::from(arg)
+                };
+                InspectAction::Open(InspectSource::Image { path, temp: None })
+            }
+            "Close" => InspectAction::Close,
+            "Reinspect" => InspectAction::Reinspect,
+            "Check" => {
+                let row = arg.and_then(Value::as_integer).ok_or("Check needs a row")? as usize;
+                let index = self.ctl.partitions().get(row).ok_or("no such row")?.index;
+                InspectAction::Check(index)
+            }
+            "SetBrowseDirty" => {
+                self.ctl
+                    .set_browse_dirty(arg.and_then(Value::as_bool).ok_or("needs a bool")?);
+                return Ok(Vec::new());
+            }
+            "Confirm" => InspectAction::Confirmed {
+                purpose: self.asked.take().ok_or("nothing was asked")?,
+                yes: arg.and_then(Value::as_bool).ok_or("needs a bool")?,
+            },
+            other => return Err(format!("InspectController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        Ok(self.note(fx))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "source" => Value::String(
+                if self.ctl.image_path().is_some() {
+                    "image"
+                } else if self.ctl.has_source() {
+                    "other"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ),
+            "partitions" => Value::Integer(self.ctl.partitions().len() as i64),
+            "superfloppy" => {
+                Value::Boolean(self.ctl.table_summary().is_some_and(|t| t.superfloppy))
+            }
+            "error" => Value::String(self.ctl.last_error().unwrap_or("").to_string()),
+            "check_clean" => {
+                Value::Boolean(self.ctl.fsck_view().is_some_and(|v| v.result.is_clean()))
+            }
+            "log" => Value::String(self.log.join("\n")),
+            other => return Err(format!("InspectController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        loop {
+            fx.extend(self.ctl.tick());
+            if self.ctl.loading().is_none()
+                && self.ctl.tool_jobs().is_empty()
+                && !self.ctl.probing()
+            {
+                fx.extend(self.ctl.tick());
+                return self.note(fx);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
+        "inspect" => Ok(Box::new(InspectTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

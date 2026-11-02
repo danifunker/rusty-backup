@@ -30,7 +30,7 @@ use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 
 fn new_controller() -> InspectController {
     InspectController::new(InspectServices {
-        jobs: rusty_backup::controller::commander::JobRegistry::new(),
+        jobs: rusty_backup::controller::inspect::JobRegistry::new(),
         notify: Arc::new(super::ui_logger::EguiWake),
     })
 }

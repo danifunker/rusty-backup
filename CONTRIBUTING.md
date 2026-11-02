@@ -248,7 +248,8 @@ never copy it sideways.
   raw threads in `src/controller` and on raw threads in views, and counts views'
   direct references to the model and engine. That count only goes down; a path
   that reaches zero is switched to enforcing.
-- Enforced so far (`ENFORCED` in the script): `src/gui/commander` and `src/cli/verbs/tui_app/commander.rs`.
+- Enforced so far (`ENFORCED` in the script): `src/gui/commander`, `src/gui/browse_view.rs`,
+  `src/gui/inspect_tab.rs`, `src/cli/verbs/tui_app/commander.rs` and `src/cli/verbs/tui_app/explorer.rs`.
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
   error.
 - Controller logic is tested without any view. Code that cannot be tested
