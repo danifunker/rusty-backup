@@ -20,6 +20,7 @@
 
 pub mod app;
 pub mod commander;
+pub mod keys;
 pub mod log;
 
 /// The shape every controller shares.
