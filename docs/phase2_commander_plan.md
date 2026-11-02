@@ -707,6 +707,110 @@ is the FAT defragment, nothing is resized), so `build_config` would change what 
   GUI's (the three differences above).
 - The pickers are still blocking rfd calls on the UI thread (`EffectHost`).
 
+## Slice 13: the Restore tab
+
+`src/gui/restore_tab.rs` (3,181 lines, 85 engine references) held five restore modes in the view:
+the backup-folder load (metadata, Clonezilla partclone headers) on the UI thread, the size and
+alignment rules, the trailing-free-space plan and its preview, the layout-fit projection, the
+single-partition target scan, a `gui::pending_image` decode, Write Image's decoded-size probe on
+the UI thread, Build Disk's target and plan, the remote target's connect worker, the confirmation
+window, and four `spawn_guarded` restore workers plus the provision runner. The TUI's Restore
+screen read the backup with its own loader and ran `run_restore` on its own thread.
+
+### Steps
+
+1. (ca83aa31) Model and controller. `model::restore_plan` holds the rules: `load_backup` (native
+   `metadata.json`, a Clonezilla image, or a `.cbk` unpacked to a temp folder) into a
+   `LoadedBackup` whose `SizeRow`s carry each partition's safe minimum (defragmented, then in
+   place, then imaged), `SizeRow::choice` (the `SizeMode` -> `RestoreSizeChoice` mapping),
+   `partition_sizes` (extend-last forces Fill), `ExpandPlan` (trailing free space: image targets
+   only, the MiB cap), `resolve_alignment`, `layout_fit` (the engine's `calculate_restore_layout`
+   projected before Start), `plan_segments`, `summary`, `original_alignment_label`, and the
+   single-partition / new-disk configs with `new_disk_start_lba`. The layouts themselves
+   (alignment preservation, the disk-label schemes' `restore_patch`, the single-file CHD path)
+   stay in `crate::restore`. `controller::restore::RestoreController` (`mod.rs`, `source.rs`,
+   `target.rs`, `remote.rs`, `run.rs`) owns:
+   - Sources: `OpenBackup` (a job; a folder handed over during a restore loads when it ends),
+     `PickBackupFolder`, `OpenSourceImage` / `PickSourceImage` (a wrapped image is decoded in a
+     job), `OpenDropped` (a folder restores in full, a file is a partition image), `ClearBackup`,
+     `SetSourcePartition`. `HostRequest::RememberRecent` asks the shell to remember a folder.
+   - Targets per `TargetSlot` (FullDisk, SinglePartition, NewDisk, BuildDisk): `SelectDevice {
+     slot, row, device }`, `ClearDevice`, `SetTargetIsDevice`, `PickTargetImage` (a save picker),
+     and `reconcile_devices` (a refreshed list moves each target with its row; the
+     single-partition scan is dropped when its disk changed). The full-disk form: alignment,
+     per-partition sizes, the trailing free space, `target_size`, `fixed_total`, `layout_fit`;
+     the remote target (`SetRemote`, `RemoteConnect` as a job, `RemotePickDevice`,
+     `RemoteUseImage`). The single-partition `ScanTarget` job and `target_partitions` (with
+     whether the source fits). The new-disk `NewDiskChoice`.
+   - Write Image File: `OpenWriteImage` measures the decoded size in a job; `WriteImageTarget`
+     is `HostRequest::WriteImage { path, size }` for the shell's disk writer.
+   - Build Disk: `SetBuildSize`, `BuildDefine` (opens the plan, a `DiskBuilder` the shell's editor
+     edits through `builder()`), `BuildApply` (an image target builds at once; a device is an
+     `Effect::AskText` whose validator wants the device's name), `BuildCancel`. The build is a
+     job over `provision_runner`, its log lines and bytes mirrored.
+   - Start: `validate()` per mode, `Start` -> `Effect::Confirm(purpose::RESTORE)` naming what is
+     overwritten, `Confirmed` runs the mode's restore as a job (`run_mirrored` over
+     `run_restore`, `restore_to_remote` or `run_single_partition_restore`), `Cancel`,
+     `progress()` (`RestoreBar`), `last_result`. `wait_idle` / `wait_finished` for a headless
+     shell or a test.
+2. (7582a373) The egui tab renders and maps. It keeps only the recent-list mirror, the shared
+   progress bar flag and the Physical Disk Export window Write Image hands its image to; the
+   partition editor edits the controller's `DiskBuilder`. `gui::pending_image` is gone (its last
+   user was this tab).
+3. (this commit) `src/gui/restore_tab.rs` joins `ENFORCED`; the TUI's Restore screen loads a
+   backup folder, `.cbk` or Clonezilla image through a headless `RestoreController`, hands it the
+   target, sizes and alignment, presses Start, answers the confirmation (after its own device
+   prompt) and mirrors the run (`the_restore_screen_restores_a_backup_through_the_controller`);
+   its image source is measured through the controller too. A ui scenario
+   (`tests/ui_scenarios/restore_open_validate_run.toml`, vm `restore`) refuses an empty folder,
+   loads a backup, walks Start's refusals, confirms, restores to an image byte for byte and closes.
+
+Shells' engine references 393 -> 291 (`restore_tab.rs` 85 -> 0, `pending_image.rs` 2 -> 0,
+`tui_app.rs` 81 -> 66).
+
+`rb-cli restore` keeps its own `RestoreConfig`: its `--size minimum` is the engine's floor
+(`RestoreSizeChoice::Minimum`) where the GUI sizes to the recorded minimum, Original is an empty
+size list, the target size comes from `--target-size`, the device or the metadata, and the
+alignment can come from the config file; `model::restore_plan` would change the bytes it writes.
+
+### Behaviour changes
+
+- GUI: the restore confirmation is the shared confirmation dialog (same wording, the partition
+  list included, no coloured line); Build Disk's typed device name is a text prompt whose OK
+  enables only on the exact name (it was a field in the confirmation window).
+- GUI: loading a backup folder (metadata, Clonezilla partclone headers) and Write Image's
+  decoded-size probe run in jobs with a progress line (they ran on the UI thread).
+- GUI: picking a partition image forgets a loaded Clonezilla image and its size rows too (they
+  stayed); loading a different backup resets the source-partition pick; a backup folder handed
+  over from Inspect replaces a picked partition image.
+- GUI: a failed partition-image decode is logged in the log panel (it went to stderr only).
+- GUI: Build Disk's progress is the shared job bar (phase, rate, Cancel); once it ends only the
+  result line stays (the bar stayed at 100%).
+- GUI: Cancel shows only while a restore runs (another tab's job showed a Cancel that did nothing).
+- TUI: Clonezilla images restore (they were refused); load errors are the GUI's ("No backup found
+  (metadata.json or Clonezilla image)", "Invalid metadata.json: ..."); the load shows "Loading the
+  backup..." on the source step instead of the task box.
+- TUI: Minimum sizes each partition as the GUI does (its recorded minimum, defragmented first)
+  and by its own index (it sent the engine's Minimum floor for indices 0..n, which skipped
+  logical partitions); a device target is sized to the device, as in the GUI and the CLI (it was
+  the backup's source size).
+- TUI: a `.cbk`'s default target sits beside the `.cbk` (it was beside the temp folder); after
+  Esc cancels a run, the final result replaces "Cancel requested...".
+- CLI: none.
+
+### Left
+
+- The TUI Restore screen has no single-partition, new-disk or Build Disk mode, remote target,
+  trailing free space or per-partition sizes; each is an existing `RestoreAction`.
+- Write Image File's target, confirmation and write are still the Physical Disk Export window
+  (`physical_disk_export.rs`, 19 references) and the TUI's own `physical_write_runner` call; one
+  write controller would serve both and Inspect's export.
+- The partition editor (`partition_editor_modal.rs`, 25) reaches the model for `DiskBuilder`'s
+  rows; it is a controller of its own.
+- `rb-cli restore` could take `model::restore_plan` once its Minimum and size defaults agree with
+  the GUI's (the differences above).
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.

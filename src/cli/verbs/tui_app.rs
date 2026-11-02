@@ -1304,8 +1304,9 @@ impl BackupState {
 }
 
 /// The Restore screen: source (backup folder / `.cbk`) -> config (target /
-/// sizing / alignment) -> run, driving `restore::run_restore` on a worker
-/// thread. Mirrors the Backup screen.
+/// sizing / alignment) -> run, over a headless `controller::restore::RestoreController`,
+/// the controller behind the GUI's Restore tab. An image source is poured by
+/// `physical_write_runner` instead (the GUI's Write Image window is not a controller yet).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RestoreStep {
     Source,
@@ -1313,8 +1314,7 @@ enum RestoreStep {
     Run,
 }
 
-/// Partition-sizing policy applied to every partition (a first cut; per-partition
-/// custom sizing is a later phase). Index into these must match `start_restore`.
+/// Partition-sizing policy applied to every partition; index 1 is the controller's Minimum.
 const RESTORE_SIZE_LABELS: &[&str] = &["Original", "Minimum"];
 /// Restore alignment choices; index must match `start_restore`.
 const RESTORE_ALIGN_LABELS: &[&str] = &["Original", "Modern 1MB"];
@@ -1323,12 +1323,17 @@ const RESTORE_FIELDS: usize = 4;
 
 struct RestoreState {
     step: RestoreStep,
-    /// The loaded backup folder (a native folder, or a temp dir from a `.cbk`).
+    ctl: crate::controller::restore::RestoreController,
+    /// The backup folder or `.cbk` (or, for an image source, the image) as picked.
     backup_folder: String,
     /// Original disk size from the backup metadata (default target size).
     source_size: u64,
     part_count: usize,
     loaded: bool,
+    /// The controller is loading the picked backup.
+    loading: bool,
+    /// The controller runs the restore this screen started.
+    restoring: bool,
     /// Shared picker; `picker_target` says whether a confirm sets the target.
     picker: Option<FilePicker>,
     picker_target: bool,
@@ -1337,13 +1342,9 @@ struct RestoreState {
     size_sel: usize,
     align_sel: usize,
     field: usize,
-    /// A running restore's shared progress, once started.
-    run: Option<Arc<Mutex<crate::restore::RestoreProgress>>>,
     op: String,
     result: Option<String>,
     is_error: bool,
-    /// Keeps a `.cbk` temp dir alive until a restore from it finishes.
-    cbk_guard: Option<tempfile::TempDir>,
     /// The "Target type" chooser (Image file / Physical device) opened with Tab
     /// on the target field; its selected index when open.
     target_type_menu: Option<usize>,
@@ -1371,23 +1372,30 @@ struct RestoreState {
 
 impl Default for RestoreState {
     fn default() -> Self {
+        use crate::controller::restore::{
+            JobRegistry, NoNotify, RestoreController, RestoreServices,
+        };
         RestoreState {
             step: RestoreStep::Source,
+            ctl: RestoreController::new(RestoreServices {
+                jobs: JobRegistry::new(),
+                notify: Arc::new(NoNotify),
+            }),
             backup_folder: String::new(),
             source_size: 0,
             part_count: 0,
             loaded: false,
+            loading: false,
+            restoring: false,
             picker: None,
             picker_target: false,
             target: String::new(),
             size_sel: 0,
             align_sel: 0,
             field: 0,
-            run: None,
             op: String::new(),
             result: None,
             is_error: false,
-            cbk_guard: None,
             target_type_menu: None,
             device_pick: false,
             device_sel: 0,
@@ -1399,6 +1407,93 @@ impl Default for RestoreState {
             target_partition: None,
             write_run: None,
         }
+    }
+}
+
+impl RestoreState {
+    fn act(&mut self, action: crate::controller::restore::RestoreAction) {
+        use crate::controller::Controller as _;
+        // The TUI answers the controller's confirmation with its own device prompt.
+        let _ = self.ctl.apply(action);
+        self.after();
+    }
+
+    /// Carry out the controller's requests and follow its load and run.
+    fn after(&mut self) {
+        use crate::controller::restore::HostRequest;
+        for req in self.ctl.take_requests() {
+            match req {
+                // Tests leave the user's recent list alone.
+                HostRequest::RememberRecent(path) if !cfg!(test) => {
+                    crate::update::push_recent(
+                        crate::update::RecentMode::Restore,
+                        &path.to_string_lossy(),
+                    );
+                }
+                HostRequest::RememberRecent(_) => {}
+                // The TUI pours an image itself; it never asks for the GUI's writer.
+                HostRequest::WriteImage { .. } => {}
+            }
+        }
+        let _ = self.ctl.take_log();
+        if self.loading && self.ctl.loading().is_none() {
+            self.loading = false;
+            self.loaded_backup();
+        }
+        if let Some(bar) = self.ctl.progress() {
+            self.op = bar.operation;
+        }
+        if self.restoring && !self.ctl.is_running() {
+            self.restoring = false;
+            match self.ctl.last_result() {
+                Some(Ok(())) => {
+                    self.result = Some("Restore complete.".to_string());
+                    self.is_error = false;
+                }
+                Some(Err(e)) => {
+                    self.result = Some(e.clone());
+                    self.is_error = true;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// The load ended: on to the options, or the reason on the source step.
+    fn loaded_backup(&mut self) {
+        if !self.ctl.has_backup() {
+            self.result = Some(
+                self.ctl
+                    .load_error()
+                    .unwrap_or("Not a backup folder.")
+                    .to_string(),
+            );
+            self.is_error = true;
+            return;
+        }
+        let folder = std::path::PathBuf::from(self.backup_folder.as_str());
+        let default_target = folder
+            .parent()
+            .map(|par| {
+                let stem = folder
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "restore".to_string());
+                par.join(format!("{stem}_restored.img"))
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        self.source_size = self.ctl.source_size().unwrap_or(0);
+        self.part_count = self.ctl.size_rows().len();
+        self.loaded = true;
+        if self.target.is_empty() {
+            self.target = default_target;
+        }
+        self.step = RestoreStep::Config;
+        self.field = 0;
+        self.result = None;
+        self.is_error = false;
     }
 }
 
@@ -2279,9 +2374,9 @@ impl App {
                 b.act(BackupAction::CancelPendingStart);
             }
         }
-        if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
-            if let Ok(mut p) = run.lock() {
-                p.cancel_requested = true;
+        if let Some(r) = self.restore.as_mut() {
+            if r.ctl.restore_running() {
+                r.act(crate::controller::restore::RestoreAction::Cancel);
             }
         }
         if let Some(run) = self.bulk.as_ref().and_then(|b| b.run.clone()) {
@@ -3347,7 +3442,6 @@ impl App {
                     } else {
                         self.progress = None;
                         if let Some(r) = self.restore.as_mut() {
-                            r.run = None;
                             r.result = None;
                             r.step = RestoreStep::Config;
                         }
@@ -3437,11 +3531,16 @@ impl App {
     }
 
     fn load_restore_source(&mut self, path: std::path::PathBuf) {
+        use crate::controller::restore::RestoreAction;
+        let Some(r) = self.restore.as_mut() else {
+            return;
+        };
         // Image-write source: no metadata to read, just the decoded length.
-        if self.restore.as_ref().map(|r| r.source_is_image) == Some(true) {
-            let size = crate::model::source_reader::decoded_image_size(&path);
-            let r = self.restore.as_mut().unwrap();
-            match size {
+        if r.source_is_image {
+            r.act(RestoreAction::OpenWriteImage(path.clone()));
+            r.ctl.wait_idle();
+            r.after();
+            match r.ctl.write_image().map(|(_, n)| n).filter(|&n| n > 0) {
                 Some(n) => {
                     crate::update::push_recent(
                         crate::update::RecentMode::Restore,
@@ -3463,66 +3562,14 @@ impl App {
             }
             return;
         }
-
-        // Unpacking a .cbk and reading the metadata can take a while, so both run as a task.
-        self.start_task("Loading the backup", move |job| {
-            job.set_can_cancel(false);
-            let loaded = load_restore_backup(&path, job);
-            Ok(Box::new(move |app: &mut App| app.apply_restore_backup(path, loaded)) as TaskDone)
-        });
+        // The controller unpacks a .cbk and reads the metadata in a job; `tick` follows it.
+        r.backup_folder = path.to_string_lossy().into_owned();
+        r.result = None;
+        r.is_error = false;
+        r.loading = true;
+        r.act(RestoreAction::OpenBackup(path));
     }
 
-    /// Show a backup loaded by [`load_restore_backup`] on the Restore screen.
-    fn apply_restore_backup(&mut self, path: std::path::PathBuf, loaded: RestoreLoad) {
-        let Some(r) = self.restore.as_mut() else {
-            return;
-        };
-        match loaded {
-            RestoreLoad::Backup {
-                folder,
-                guard,
-                source_size,
-                part_count,
-            } => {
-                crate::update::push_recent(
-                    crate::update::RecentMode::Restore,
-                    &path.to_string_lossy(),
-                );
-                let default_target = folder
-                    .parent()
-                    .map(|par| {
-                        par.join(format!(
-                            "{}_restored.img",
-                            folder
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "restore".to_string())
-                        ))
-                        .display()
-                        .to_string()
-                    })
-                    .unwrap_or_default();
-                r.backup_folder = folder.display().to_string();
-                r.source_size = source_size;
-                r.part_count = part_count;
-                r.loaded = true;
-                r.cbk_guard = guard;
-                if r.target.is_empty() {
-                    r.target = default_target;
-                }
-                r.step = RestoreStep::Config;
-                r.field = 0;
-                r.result = None;
-                r.is_error = false;
-            }
-            RestoreLoad::Refused(msg) => {
-                r.result = Some(msg);
-                r.is_error = true;
-            }
-        }
-    }
-
-    /// Validate the config and start `restore::run_restore` on a worker thread.
     /// Handle the "Start" action: an image-file target starts the restore
     /// directly; a physical-device target first raises a destructive-write
     /// confirmation (naming the device) that `start_restore_confirmed` clears.
@@ -3552,7 +3599,11 @@ impl App {
         }
     }
 
+    /// Hand the form to the controller, press its Start and answer its confirmation.
     fn start_restore_confirmed(&mut self) {
+        use crate::controller::restore::{
+            AlignmentChoice, RestoreAction, RestoreMode, SizeMode, TargetSlot,
+        };
         let Some(r) = self.restore.as_ref() else {
             return;
         };
@@ -3569,67 +3620,83 @@ impl App {
             r.step = RestoreStep::Run;
             return;
         }
-        let partition_sizes = if r.size_sel == 1 {
-            (0..r.part_count)
-                .map(|i| crate::restore::RestorePartitionSize {
-                    index: i,
-                    size_choice: crate::restore::RestoreSizeChoice::Minimum,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         if r.source_is_image {
             self.start_image_write(target, is_device);
             return;
         }
-        let alignment = if r.align_sel == 1 {
-            crate::restore::RestoreAlignment::Modern1MB
+        let device = if is_device {
+            self.disks.as_ref().and_then(|d| {
+                d.iter()
+                    .enumerate()
+                    .find(|(_, dev)| dev.path == target)
+                    .map(|(row, dev)| (row, dev.clone()))
+            })
         } else {
-            crate::restore::RestoreAlignment::Original
+            None
         };
-        let config = crate::restore::RestoreConfig {
-            backup_folder: std::path::PathBuf::from(&r.backup_folder),
-            target_path: target,
-            target_is_device: is_device,
-            target_size: r.source_size,
-            alignment,
-            partition_sizes,
-            write_zeros_to_unused: false,
-        };
-        let progress = Arc::new(Mutex::new(crate::restore::RestoreProgress::new()));
-        let worker = Arc::clone(&progress);
-        // Move the .cbk temp-dir guard into the worker so it outlives the restore.
-        let guard = self.restore.as_mut().and_then(|r| r.cbk_guard.take());
-        crate::model::worker::spawn_guarded(Arc::clone(&progress), "restore", move || {
-            let _guard = guard;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::restore::run_restore(config, Arc::clone(&worker))
-            }));
-            if let Ok(mut p) = worker.lock() {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        if p.error.is_none() {
-                            p.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    Err(_) => {
-                        if p.error.is_none() {
-                            p.error = Some("restore thread panicked".to_string());
-                        }
-                    }
-                }
-                p.finished = true;
-            }
-            Ok(())
-        });
         let r = self.restore.as_mut().unwrap();
-        r.run = Some(progress);
+        r.act(RestoreAction::SetMode(RestoreMode::FullDisk));
+        r.act(RestoreAction::SetRemote(false));
+        r.act(RestoreAction::SetTargetIsDevice(
+            TargetSlot::FullDisk,
+            is_device,
+        ));
+        match device {
+            Some((row, device)) => r.act(RestoreAction::SelectDevice {
+                slot: TargetSlot::FullDisk,
+                row,
+                device,
+            }),
+            None => r.act(RestoreAction::ClearDevice(TargetSlot::FullDisk)),
+        }
+        r.act(RestoreAction::SetTargetImage(
+            TargetSlot::FullDisk,
+            (!is_device).then_some(target),
+        ));
+        r.act(RestoreAction::SetAlignment(if r.align_sel == 1 {
+            AlignmentChoice::Modern1MB
+        } else {
+            AlignmentChoice::Original
+        }));
+        let mode = if r.size_sel == 1 {
+            SizeMode::Minimum
+        } else {
+            SizeMode::Original
+        };
+        let rows: Vec<(usize, u32)> = r
+            .ctl
+            .size_rows()
+            .iter()
+            .map(|row| (row.index, row.custom_mib))
+            .collect();
+        for (index, custom_mib) in rows {
+            r.act(RestoreAction::SetPartitionSize {
+                index,
+                mode,
+                custom_mib,
+            });
+        }
+        use crate::controller::Controller as _;
+        let fx = r.ctl.apply(RestoreAction::Start);
+        r.after();
+        r.step = RestoreStep::Run;
+        // The device prompt (or, for an image file, the path typed) was the confirmation.
+        let Some(crate::controller::Effect::Confirm(spec)) = fx.into_iter().next() else {
+            r.result = Some(match r.ctl.last_result() {
+                Some(Err(e)) => e.clone(),
+                _ => "Restore could not start.".to_string(),
+            });
+            r.is_error = true;
+            return;
+        };
+        r.act(RestoreAction::Confirmed {
+            purpose: spec.purpose,
+            yes: true,
+        });
+        r.restoring = true;
         r.result = None;
         r.is_error = false;
         r.op = "Starting...".to_string();
-        r.step = RestoreStep::Run;
         self.progress = Some(Progress {
             shared: Arc::new(Mutex::new(ProgressShared::default())),
             tracker: RateTracker::default(),
@@ -4390,38 +4457,20 @@ impl App {
             }
             self.poll_image_write();
         }
-        // Mirror a running restore's progress into the visual bar (same shape).
-        if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
-            let snap = run.lock().ok().map(|p| {
-                (
-                    p.current_bytes,
-                    p.total_bytes,
-                    p.finished,
-                    p.error.clone(),
-                    p.operation.clone(),
-                )
-            });
-            if let Some((cur, total, done, err, op)) = snap {
+        // Drive the Restore controller and mirror its run into the visual bar.
+        if let Some(r) = self.restore.as_mut() {
+            use crate::controller::Controller as _;
+            let _ = r.ctl.tick();
+            r.after();
+            if r.step == RestoreStep::Run && r.write_run.is_none() {
+                let bar = r.ctl.progress();
                 if let Some(prog) = self.progress.as_ref() {
                     if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = cur;
-                        sh.total = total;
-                        sh.done = done;
-                    }
-                }
-                if let Some(r) = self.restore.as_mut() {
-                    r.op = op;
-                    if done && r.result.is_none() {
-                        match err {
-                            Some(e) => {
-                                r.result = Some(format!("Restore failed: {e}"));
-                                r.is_error = true;
-                            }
-                            None => {
-                                r.result = Some("Restore complete.".to_string());
-                                r.is_error = false;
-                            }
+                        if let Some(bar) = &bar {
+                            sh.current = bar.current_bytes;
+                            sh.total = bar.total_bytes;
                         }
+                        sh.done = !r.ctl.is_running();
                     }
                 }
             }
@@ -5456,6 +5505,10 @@ impl App {
                         "choose a backup folder or .cbk file"
                     }),
                 ]));
+                if r.loading {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled("  Loading the backup...", self.palette.dim()));
+                }
                 if let Some(res) = &r.result {
                     lines.push(Line::raw(""));
                     lines.push(Line::styled(format!("  {res}"), self.palette.warn()));
@@ -6878,48 +6931,6 @@ impl App {
     }
 }
 
-/// A Restore-screen backup load: the folder (and the .cbk temp dir that holds it), or why not.
-enum RestoreLoad {
-    Backup {
-        folder: std::path::PathBuf,
-        guard: Option<tempfile::TempDir>,
-        source_size: u64,
-        part_count: usize,
-    },
-    Refused(String),
-}
-
-/// Unpack a `.cbk` to a temp folder when given one, then read the backup's metadata.
-fn load_restore_backup(path: &std::path::Path, job: &crate::model::job::JobCtx) -> RestoreLoad {
-    let (folder, guard): (std::path::PathBuf, Option<tempfile::TempDir>) =
-        if path.is_file() && crate::rbformats::cbk::is_cbk(path) {
-            job.set_phase("Unpacking the .cbk");
-            match tempfile::TempDir::new().and_then(|tmp| {
-                crate::rbformats::cbk::materialize_cbk_to_folder(path, tmp.path())
-                    .map(|_| tmp)
-                    .map_err(crate::compat::io_other)
-            }) {
-                Ok(tmp) => (tmp.path().to_path_buf(), Some(tmp)),
-                Err(e) => return RestoreLoad::Refused(format!("Cannot open .cbk: {e}")),
-            }
-        } else {
-            (path.to_path_buf(), None)
-        };
-    job.set_phase("Reading the backup");
-    match crate::model::backup_loader::load_backup(&folder) {
-        Ok(crate::model::backup_loader::LoadOutcome::Backup(b)) => RestoreLoad::Backup {
-            folder,
-            guard,
-            source_size: b.metadata.source_size_bytes,
-            part_count: b.partitions.len(),
-        },
-        Ok(crate::model::backup_loader::LoadOutcome::Clonezilla(_)) => RestoreLoad::Refused(
-            "Clonezilla images: restore via the CLI (`rb-cli restore`) for now.".to_string(),
-        ),
-        Err(e) => RestoreLoad::Refused(format!("Not a rusty-backup folder: {e}")),
-    }
-}
-
 /// A headless Inspect controller that opened `source`, its open and probes finished.
 fn inspect_headless(
     source: crate::controller::inspect::InspectSource,
@@ -7432,6 +7443,62 @@ mod tests {
         assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
         let folder = out.path().join(b.ctl.name());
         assert!(folder.join("metadata.json").exists());
+    }
+
+    #[test]
+    fn the_restore_screen_restores_a_backup_through_the_controller() {
+        use crate::controller::backup::{BackupAction, BackupController, BackupServices};
+        use crate::controller::Controller as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("vol.img");
+        let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        std::fs::write(&img, &bytes).unwrap();
+        let mut b = BackupController::new(BackupServices {
+            jobs: crate::controller::backup::JobRegistry::new(),
+            notify: Arc::new(crate::controller::backup::NoNotify),
+        });
+        b.apply(BackupAction::OpenImage {
+            path: img.clone(),
+            rename: false,
+        });
+        b.wait_idle();
+        b.apply(BackupAction::SetDestination(Some(dir.path().to_path_buf())));
+        b.apply(BackupAction::SetName("bk".into()));
+        b.apply(BackupAction::Start(None));
+        b.wait_finished();
+        let folder = dir.path().join("bk");
+
+        let mut app = App::new_on(BACKUP_TAB + 1);
+        app.restore = Some(RestoreState::default());
+        app.load_restore_source(folder.clone());
+        for _ in 0..3000 {
+            app.tick();
+            if app.restore.as_ref().unwrap().step == RestoreStep::Config {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let r = app.restore.as_mut().unwrap();
+        assert!(r.step == RestoreStep::Config, "{:?}", r.result);
+        assert_eq!(r.part_count, 1);
+        assert_eq!(
+            r.target,
+            dir.path().join("bk_restored.img").display().to_string()
+        );
+        r.field = 3;
+        assert!(app.handle_restore_key(KeyCode::Enter));
+        assert!(app.progress.is_some());
+        for _ in 0..6000 {
+            app.tick();
+            if app.restore.as_ref().unwrap().result.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(r.result.as_deref(), Some("Restore complete."));
+        let out = std::fs::read(dir.path().join("bk_restored.img")).unwrap();
+        assert_eq!(out, bytes);
     }
 
     /// The file picker must accept a raw device path.

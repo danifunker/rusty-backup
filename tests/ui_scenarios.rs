@@ -433,11 +433,178 @@ impl Target for BackupTarget {
     }
 }
 
+/// The Restore tab's controller. Actions: `OpenBackup` (a path, `$backup` for a fresh zstd backup
+/// of a blank FAT image, or `$empty` for an empty folder), `SetMode` (`full`, `single`, `new`,
+/// `write`, `build`), `SetTargetIsDevice` (bool), `SetTargetImage` (a path, or `$out`),
+/// `SetSize` (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`.
+/// Probes: `backup` (one is loaded), `partitions`, `error` (why Start is refused, empty when it is
+/// not), `load_error`, `result` (`ok`, the failure, or empty), `output` (the restored image equals
+/// the image backed up), `log` (every line so far).
+struct RestoreTarget {
+    ctl: rusty_backup::controller::restore::RestoreController,
+    dir: tempfile::TempDir,
+    log: Vec<String>,
+}
+
+impl RestoreTarget {
+    fn new() -> Self {
+        use rusty_backup::controller::restore::{
+            JobRegistry, NoNotify, RestoreController, RestoreServices,
+        };
+        RestoreTarget {
+            ctl: RestoreController::new(RestoreServices {
+                jobs: JobRegistry::new(),
+                notify: std::sync::Arc::new(NoNotify),
+            }),
+            dir: tempfile::tempdir().expect("temp dir"),
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        fx
+    }
+
+    /// A zstd backup of a blank FAT image, made by the Backup controller.
+    fn make_backup(&self) -> Result<PathBuf, String> {
+        use rusty_backup::controller::backup::{
+            BackupAction, BackupController, BackupServices, JobRegistry, NoNotify,
+        };
+        let img = self.dir.path().join("vol.img");
+        let bytes =
+            fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).map_err(|e| e.to_string())?;
+        std::fs::write(&img, bytes).map_err(|e| e.to_string())?;
+        let mut b = BackupController::new(BackupServices {
+            jobs: JobRegistry::new(),
+            notify: std::sync::Arc::new(NoNotify),
+        });
+        b.apply(BackupAction::OpenImage {
+            path: img,
+            rename: false,
+        });
+        b.wait_idle();
+        b.apply(BackupAction::SetDestination(Some(
+            self.dir.path().to_path_buf(),
+        )));
+        b.apply(BackupAction::SetName("bk".into()));
+        b.apply(BackupAction::Start(None));
+        b.wait_finished();
+        match b.last_result() {
+            Some(Ok(())) => Ok(self.dir.path().join("bk")),
+            other => Err(format!("the fixture backup failed: {other:?}")),
+        }
+    }
+}
+
+impl Target for RestoreTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::restore::{
+            purpose, RestoreAction, RestoreMode, SizeMode, TargetSlot,
+        };
+        let a = match action {
+            "OpenBackup" => {
+                let path = match arg_str(arg)? {
+                    "$backup" => self.make_backup()?,
+                    "$empty" => {
+                        let p = self.dir.path().join("empty");
+                        std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+                        p
+                    }
+                    other => PathBuf::from(other),
+                };
+                RestoreAction::OpenBackup(path)
+            }
+            "SetMode" => RestoreAction::SetMode(match arg_str(arg)? {
+                "full" => RestoreMode::FullDisk,
+                "single" => RestoreMode::SinglePartition,
+                "new" => RestoreMode::NewDisk,
+                "write" => RestoreMode::WriteImage,
+                "build" => RestoreMode::BuildDisk,
+                other => return Err(format!("unknown mode {other:?}")),
+            }),
+            "SetTargetIsDevice" => RestoreAction::SetTargetIsDevice(
+                TargetSlot::FullDisk,
+                arg.and_then(Value::as_bool)
+                    .ok_or_else(|| "SetTargetIsDevice needs a bool `arg`".to_string())?,
+            ),
+            "SetTargetImage" => {
+                let path = match arg_str(arg)? {
+                    "$out" => self.dir.path().join("restored.img"),
+                    other => PathBuf::from(other),
+                };
+                RestoreAction::SetTargetImage(TargetSlot::FullDisk, Some(path))
+            }
+            "SetSize" => {
+                let mode = match arg_str(arg)? {
+                    "original" => SizeMode::Original,
+                    "minimum" => SizeMode::Minimum,
+                    other => return Err(format!("unknown size {other:?}")),
+                };
+                let rows: Vec<(usize, u32)> = self
+                    .ctl
+                    .size_rows()
+                    .iter()
+                    .map(|r| (r.index, r.custom_mib))
+                    .collect();
+                for (index, custom_mib) in rows {
+                    self.ctl.apply(RestoreAction::SetPartitionSize {
+                        index,
+                        mode,
+                        custom_mib,
+                    });
+                }
+                return Ok(Vec::new());
+            }
+            "Start" => RestoreAction::Start,
+            "Confirm" => RestoreAction::Confirmed {
+                purpose: purpose::RESTORE,
+                yes: true,
+            },
+            "ClearBackup" => RestoreAction::ClearBackup,
+            other => return Err(format!("RestoreController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        Ok(self.note(fx))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "backup" => Value::Boolean(self.ctl.has_backup()),
+            "partitions" => Value::Integer(self.ctl.size_rows().len() as i64),
+            "error" => Value::String(self.ctl.validate().err().unwrap_or_default()),
+            "load_error" => Value::String(self.ctl.load_error().unwrap_or("").to_string()),
+            "result" => Value::String(match self.ctl.last_result() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "output" => {
+                let read = |n: &str| std::fs::read(self.dir.path().join(n)).ok();
+                Value::Boolean(
+                    read("restored.img").is_some() && read("restored.img") == read("vol.img"),
+                )
+            }
+            "log" => Value::String(self.log.join("\n")),
+            other => return Err(format!("RestoreController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.wait_finished();
+        let fx = self.ctl.tick();
+        self.note(fx)
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
         "backup" => Ok(Box::new(BackupTarget::new())),
         "inspect" => Ok(Box::new(InspectTarget::new())),
+        "restore" => Ok(Box::new(RestoreTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,
