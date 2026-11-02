@@ -7562,6 +7562,43 @@ mod tests {
     }
 
     #[test]
+    fn the_archives_screen_opens_and_extracts_through_the_controller() {
+        use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = StuffItInput {
+            name: "readme".into(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"hello".to_vec(),
+            resource_fork: Vec::new(),
+        };
+        let sit = dir.path().join("a.sit");
+        std::fs::write(&sit, build_archive(&[input], WriteMethod::Store).unwrap()).unwrap();
+        let mut app = App::new_on(BACKUP_TAB);
+        app.archive = Some(ArchiveState::default());
+        app.load_archive(sit);
+        app.archive.as_mut().unwrap().ctl.wait_idle();
+        app.tick();
+        let a = app.archive.as_ref().unwrap();
+        assert_eq!(a.status.as_deref(), Some("Opened (1 entries)."));
+        assert!(a.entries[0].starts_with("FILE  readme"), "{:?}", a.entries);
+        let out = dir.path().join("out");
+        app.archive.as_mut().unwrap().fork_fmt_sel = 3;
+        app.archive_extract(out.clone());
+        app.archive.as_mut().unwrap().ctl.wait_idle();
+        app.tick();
+        let a = app.archive.as_ref().unwrap();
+        assert_eq!(
+            a.status.as_deref(),
+            Some(format!("Extracted 1 file(s) to {}", out.display()).as_str())
+        );
+        assert_eq!(std::fs::read(out.join("readme")).unwrap(), b"hello");
+    }
+
+    #[test]
     fn the_bulk_screen_converts_through_the_controller() {
         let src = tempfile::tempdir().expect("tempdir");
         let out = tempfile::tempdir().expect("tempdir");
