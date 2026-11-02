@@ -207,7 +207,9 @@ impl CommanderView {
     /// The Explorer over `path`, showing its `partition` (the first browsable one when `None`).
     pub(super) fn explorer(path: PathBuf, partition: Option<usize>, label: String) -> Self {
         let (keymap, problems) = load_keymap();
-        let services = PaneServices::headless();
+        let mut services = PaneServices::headless();
+        // The Explorer remembers its listing style under "explorer" (recent files are not kept).
+        services.recent = super::commander::recent_store();
         let mut ctl = CommanderController::single(services, keymap, PaneProfile::explorer());
         ctl.report_keymap_problems(problems);
         ctl.open_fixed(path, partition);
@@ -421,7 +423,7 @@ impl CommanderView {
 // --- drawing ------------------------------------------------------------------
 
 impl App {
-    /// The Explorer's body: the folder tree beside the listing, with the path and status lines.
+    /// The Explorer's body: the folder tree beside the listing (in that style), and the status line.
     pub(super) fn draw_explorer_body(&self, frame: &mut Frame, area: Rect, v: &CommanderView) {
         let ctl = &v.ctl;
         let pane = ctl.pane(Side::Left);
@@ -430,44 +432,17 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(1)])
             .split(area);
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(32), Constraint::Min(24)])
-            .split(rows[0]);
-        let focused = pane.tree_focused();
-        let visible = cols[0].height.saturating_sub(2) as usize;
-        let sel = pane.tree_cursor();
-        let start = sel.saturating_sub(visible.saturating_sub(1));
-        let mut lines = Vec::new();
-        for (i, n) in pane
-            .folder_tree()
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-        {
-            let indent = "  ".repeat(n.depth);
-            let mark = if n.expanded { "[-] " } else { "[+] " };
-            let name = if n.depth == 0 {
-                "/".to_string()
-            } else {
-                format!("{}/", n.entry.name)
-            };
-            let style = if i == sel && focused {
-                pal.accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else if i == sel {
-                pal.accent().add_modifier(Modifier::BOLD)
-            } else {
-                pal.accent()
-            };
-            lines.push(Line::styled(format!(" {indent}{mark}{name}"), style));
+        // Another listing style, chosen in the View menu, draws the pane alone.
+        if pane.has_folder_tree() {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(32), Constraint::Min(24)])
+                .split(rows[0]);
+            self.draw_folder_tree(frame, cols[0], pane, pane.tree_focused());
+            self.draw_cmd_pane(frame, cols[1], v, Side::Left);
+        } else {
+            self.draw_cmd_pane(frame, rows[0], v, Side::Left);
         }
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block("Tree", focused)),
-            cols[0],
-        );
-        self.draw_cmd_pane(frame, cols[1], v, Side::Left);
         frame.render_widget(
             Paragraph::new(Line::styled(format!(" {}", ctl.status()), pal.dim())),
             rows[1],

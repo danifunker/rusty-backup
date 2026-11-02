@@ -430,13 +430,17 @@ impl KeyMap {
         Self::explorer_defaults(false)
     }
 
-    fn add(&mut self, table: &[(Command, &[&str])]) {
+    /// Put `table`'s chords first, so a hint names the chord that works here.
+    fn add_first(&mut self, table: &[(Command, &[&str])]) {
+        let mut first = Vec::new();
         for (cmd, chords) in table {
             for text in *chords {
                 let chord = Chord::parse(text).expect("built-in chord parses");
-                self.bindings.push((chord, *cmd));
+                first.push((chord, *cmd));
             }
         }
+        first.append(&mut self.bindings);
+        self.bindings = first;
     }
 
     /// [`Self::explorer_terminal`] with `path`'s overrides applied, plus any problems found.
@@ -518,7 +522,7 @@ impl KeyMap {
     /// The PC chords on every platform: a terminal has no Cmd key, so Primary is Ctrl there too.
     pub fn for_terminal() -> Self {
         let mut map = Self::defaults(false);
-        map.add(TERMINAL_EXTRA);
+        map.add_first(TERMINAL_EXTRA);
         map
     }
 
@@ -905,6 +909,7 @@ mod tests {
             ..Mods::default()
         };
         assert_eq!(term.lookup(Key::Char('k'), alt), Some(Command::Connect));
+        assert_eq!(term.hint(Command::Connect), "Alt+K");
         assert_eq!(term.hint(Command::QuickView), "Ctrl+K");
     }
 

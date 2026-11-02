@@ -22,7 +22,7 @@ use super::{bytes_to_lines, centered_rect, App, FilePicker, PickKind, PickResult
 use crate::controller::commander::{
     export_choices, format_size, purpose, BrowserPaneAction, BrowserPaneController,
     CommanderAction, CommanderController, DetailField, DisplayRow, FileDetail, HashAlgo,
-    OnConflict, RowKind, Side, MAX_CONSECUTIVE_FAILURES,
+    OnConflict, RowKind, Side, ViewItemKind, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
@@ -83,6 +83,8 @@ pub(super) struct CommanderView {
     export_sel: Option<usize>,
     /// File Info shows the resource fork instead of the data fork.
     show_rsrc: bool,
+    /// The View popup's row.
+    view_sel: usize,
     /// The Explorer's own windows, when this is the one-pane Explorer.
     pub(super) ex: Option<super::explorer::ExplorerState>,
 }
@@ -112,6 +114,7 @@ impl CommanderView {
             muted: None,
             export_sel: None,
             show_rsrc: false,
+            view_sel: 0,
             ex: None,
         }
     }
@@ -395,6 +398,25 @@ impl CommanderView {
                 return Some(true);
             }
         }
+        if self.ctl.view_menu_shown() {
+            let items = self.ctl.view_menu();
+            let last = items.len().saturating_sub(1);
+            self.view_sel = self.view_sel.min(last);
+            match code {
+                KeyCode::Up => self.view_sel = self.view_sel.saturating_sub(1),
+                KeyCode::Down => self.view_sel = (self.view_sel + 1).min(last),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(item) = items.get(self.view_sel).filter(|i| i.enabled) {
+                        let action = item.action.clone();
+                        self.send(A::ShowViewMenu(false));
+                        self.send(action);
+                    }
+                }
+                KeyCode::Esc | KeyCode::F(9) => self.send(A::ShowViewMenu(false)),
+                _ => {}
+            }
+            return Some(true);
+        }
         if let Some(side) = self.ctl.partitions_shown() {
             let n = self.ctl.pane(side).partition_labels().len();
             match code {
@@ -584,6 +606,7 @@ impl CommanderView {
             (Command::Export, "Export"),
             (Command::Import, "Import"),
             (Command::Fsck, "Check"),
+            (Command::ViewMenu, "View"),
             (Command::Help, "Keys"),
             (Command::Close, "Close"),
         ];
@@ -598,6 +621,7 @@ impl CommanderView {
             (Command::Apply, "Apply"),
             (Command::OpenImage, "Image"),
             (Command::OpenFolder, "Folder"),
+            (Command::ViewMenu, "View"),
             (Command::Help, "Keys"),
             (Command::Close, "Close"),
         ];
@@ -652,14 +676,14 @@ fn page_rows() -> i32 {
 }
 
 #[cfg(not(test))]
-fn recent_store() -> Box<dyn crate::controller::commander::RecentStore> {
+pub(super) fn recent_store() -> Box<dyn crate::controller::commander::RecentStore> {
     use crate::controller::app::{CommanderRecent, UserConfig};
     Box::new(CommanderRecent(UserConfig))
 }
 
 /// Tests never touch the user's recent files.
 #[cfg(test)]
-fn recent_store() -> Box<dyn crate::controller::commander::RecentStore> {
+pub(super) fn recent_store() -> Box<dyn crate::controller::commander::RecentStore> {
     Box::new(crate::controller::commander::NoRecent)
 }
 
@@ -720,6 +744,9 @@ impl App {
             self.draw_job_box(frame, area, "Checksums", &snap);
         }
         self.draw_explorer_windows(frame, area, v);
+        if ctl.view_menu_shown() {
+            self.draw_view_menu(frame, area, v);
+        }
         if let Some(sel) = v.export_sel {
             let pal = self.palette;
             let mut lines = Vec::new();
@@ -748,7 +775,20 @@ impl App {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(rows[0]);
         for (side, col) in [(Side::Left, cols[0]), (Side::Right, cols[1])] {
-            self.draw_cmd_pane(frame, col, v, side);
+            // The quick view takes the other pane's half; that pane keeps its own state.
+            if ctl.quick_view() && side != ctl.active() {
+                self.draw_quick_view(frame, col, v);
+            } else if ctl.pane(side).has_folder_tree() {
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(35), Constraint::Min(4)])
+                    .split(col);
+                let focused = ctl.active() == side && ctl.pane(side).tree_focused();
+                self.draw_folder_tree(frame, parts[0], ctl.pane(side), focused);
+                self.draw_cmd_pane(frame, parts[1], v, side);
+            } else {
+                self.draw_cmd_pane(frame, col, v, side);
+            }
         }
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -756,6 +796,102 @@ impl App {
                 self.palette.dim(),
             )),
             rows[1],
+        );
+    }
+
+    /// The active pane's File Info in the other pane's place.
+    fn draw_quick_view(&self, frame: &mut Frame, area: Rect, v: &CommanderView) {
+        let ctl = &v.ctl;
+        let pal = self.palette;
+        let hint = ctl.key_hint(Command::QuickView);
+        let (title, mut lines) = match ctl.quick_view_detail() {
+            Some(d) => {
+                let lines = detail_lines(d, false).into_iter();
+                let lines = lines.map(|l| Line::raw(format!(" {l}"))).collect();
+                (format!("Quick view: {}", printable(&d.entry.name)), lines)
+            }
+            None => (
+                "Quick view".to_string(),
+                vec![Line::styled(
+                    " No file or folder under the cursor.",
+                    pal.dim(),
+                )],
+            ),
+        };
+        let room = (area.height as usize).saturating_sub(3);
+        lines.truncate(room);
+        lines.push(Line::styled(
+            format!(" {hint} closes the quick view"),
+            pal.dim(),
+        ));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, false)),
+            area,
+        );
+    }
+
+    /// The View popup: the active pane's listing styles, then the toggles and commands.
+    fn draw_view_menu(&self, frame: &mut Frame, area: Rect, v: &CommanderView) {
+        let pal = self.palette;
+        let mut lines = Vec::new();
+        for (i, item) in v.ctl.view_menu().iter().enumerate() {
+            let mark = match (item.kind, item.checked) {
+                (ViewItemKind::Style, true) => "(*)",
+                (ViewItemKind::Style, false) => "( )",
+                (ViewItemKind::Toggle, true) => "[x]",
+                (ViewItemKind::Toggle, false) => "[ ]",
+                (ViewItemKind::Command, _) => "   ",
+            };
+            let text = format!(" {mark} {:<22} {}", item.label, item.hint);
+            let mut style = if item.enabled {
+                Style::default()
+            } else {
+                pal.dim()
+            };
+            if i == v.view_sel {
+                style = pal.accent().add_modifier(Modifier::REVERSED);
+            }
+            lines.push(Line::styled(text, style));
+        }
+        lines.push(Line::styled(" Enter choose   Esc close", pal.dim()));
+        self.draw_cmd_box_auto(frame, area, 44, "View", lines);
+    }
+
+    /// The folder tree of a `TreeAndList` pane; `focused` while it has the keyboard.
+    pub(super) fn draw_folder_tree(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        pane: &BrowserPaneController,
+        focused: bool,
+    ) {
+        let pal = self.palette;
+        let visible = area.height.saturating_sub(2) as usize;
+        let sel = pane.tree_cursor();
+        let start = sel.saturating_sub(visible.saturating_sub(1));
+        let mut lines = Vec::new();
+        let nodes = pane.folder_tree().iter().enumerate();
+        for (i, n) in nodes.skip(start).take(visible) {
+            let indent = "  ".repeat(n.depth);
+            let mark = if n.expanded { "[-] " } else { "[+] " };
+            let name = if n.depth == 0 {
+                "/".to_string()
+            } else {
+                format!("{}/", printable(&n.entry.name))
+            };
+            let style = if i == sel && focused {
+                pal.accent()
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else if i == sel {
+                pal.accent().add_modifier(Modifier::BOLD)
+            } else {
+                pal.accent()
+            };
+            lines.push(Line::styled(format!(" {indent}{mark}{name}"), style));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(self.pane_block("Tree", focused)),
+            area,
         );
     }
 
@@ -903,11 +1039,7 @@ impl App {
         let start = cursor.saturating_sub(visible.saturating_sub(1));
         let name_w = width.saturating_sub(2 + 11 + 7).max(8);
         for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
-            let marked = if row.is_tree {
-                pane.tree_selected.contains(&row.node_id)
-            } else {
-                !row.is_parent() && pane.listing.is_selected(&row.name)
-            };
+            let marked = pane.row_selected(row);
             let text = row_text(row, marked, name_w);
             let mut style = match row.kind {
                 RowKind::PendingAdd => self.palette.styled(Color::Green),
@@ -1319,6 +1451,9 @@ fn row_text(row: &DisplayRow, marked: bool, name_w: usize) -> String {
     if row.is_dir && !row.is_parent() {
         name.push('/');
     }
+    if row.loading {
+        name.push_str(" (reading...)");
+    }
     let name = clip(&format!("{indent}{disclosure}{name}"), name_w);
     let size = if row.is_dir {
         String::new()
@@ -1726,5 +1861,58 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(ctrl('n'));
         assert!(screen(&app).contains("New Folder (R)"), "{}", screen(&app));
+    }
+
+    #[test]
+    fn f9_opens_the_view_menu_and_a_style_choice_changes_the_pane() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(host.path().join("DIR")).unwrap();
+        std::fs::write(host.path().join("DIR/IN.TXT"), b"in").unwrap();
+        let mut app = commander_app();
+        open_folder(&mut app, host.path());
+        app.on_key(key(KeyCode::F(9)));
+        let text = screen(&app);
+        assert!(
+            text.contains("(*) Flat list") && text.contains("Quick view"),
+            "{text}"
+        );
+        // The first entry is the combined tree.
+        app.on_key(key(KeyCode::Enter));
+        assert!(!view(&app).ctl.view_menu_shown());
+        let side = view(&app).ctl.active();
+        assert_eq!(
+            view(&app).ctl.pane(side).listing_style(),
+            crate::controller::commander::ListingStyle::CombinedTree
+        );
+        // Right expands the folder in place (it is no longer the tab shell's key).
+        cursor_to(&mut app, "DIR");
+        app.on_key(key(KeyCode::Right));
+        settle(&mut app);
+        assert!(app.current() == TabId::Commander);
+        assert_eq!(row(&app, side, "IN.TXT").map(|r| r.depth), Some(1));
+        assert!(screen(&app).contains("[-] DIR/"), "{}", screen(&app));
+        // The folder tree + list style draws a tree above the list.
+        app.on_key(key(KeyCode::F(9)));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(view(&app).ctl.pane(side).has_folder_tree());
+        assert!(screen(&app).contains("Tree"), "{}", screen(&app));
+    }
+
+    #[test]
+    fn ctrl_k_shows_the_cursor_file_in_the_other_pane() {
+        let (_h, _i, mut app) = host_and_image(&["PEEK.TXT"]);
+        cursor_to(&mut app, "PEEK.TXT");
+        app.on_key(ctrl('k'));
+        assert!(view(&app).ctl.quick_view(), "{}", status(&app));
+        std::thread::sleep(crate::controller::commander::FOLLOW_DELAY);
+        settle(&mut app);
+        let text = screen(&app);
+        assert!(text.contains("Quick view: PEEK.TXT"), "{text}");
+        assert!(text.contains("PEEK.TXT"), "{text}");
+        app.on_key(ctrl('k'));
+        assert!(!view(&app).ctl.quick_view());
+        assert!(screen(&app).contains("vol.img"), "{}", screen(&app));
     }
 }
