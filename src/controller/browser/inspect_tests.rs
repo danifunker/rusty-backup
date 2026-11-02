@@ -329,3 +329,106 @@ fn marked_rows_from_an_expanded_folder_export_through_the_screen() {
     settle(&mut ctl);
     assert!(out.join("DEEP").is_dir(), "{}", ctl.status());
 }
+
+/// Marks `HELLO.TXT` (top level) and `/SUB/DEEP` (below an expanded folder) without moving the cursor.
+fn mark_both_levels(ctl: &mut CommanderController) {
+    let sub = row(ctl, "SUB").node_id;
+    pane(ctl, A::ToggleExpand(sub.clone()));
+    settle(ctl);
+    pane(ctl, A::CursorTo(sub.clone()));
+    pane(ctl, A::Mark(row(ctl, "HELLO.TXT").node_id));
+    pane(ctl, A::Mark(row(ctl, "DEEP").node_id));
+    let p = ctl.pane(Side::Left);
+    assert_eq!(
+        p.rows()[p.cursor_index().unwrap()].node_id,
+        sub,
+        "a mark keeps the cursor"
+    );
+    let mut names: Vec<String> = p.selected_entries().into_iter().map(|e| e.name).collect();
+    names.sort();
+    assert_eq!(names, ["DEEP", "HELLO.TXT"], "one selection across levels");
+    assert!(p.row_selected(&row(ctl, "HELLO.TXT")) && p.row_selected(&row(ctl, "DEEP")));
+}
+
+#[test]
+fn marks_mix_levels_and_delete_and_export_act_on_all_of_them() {
+    use crate::controller::commander::screen::purpose as screen_purpose;
+    use crate::controller::commander::ExportFormat;
+    use crate::model::edit_queue::StagedEdit;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    mark_both_levels(&mut ctl);
+    // A ctrl-click on a deep row keeps the top-level mark too.
+    let deep = row(&ctl, "DEEP").node_id;
+    let ctrl = |node_id: String| A::TreeClick {
+        node_id,
+        ctrl: true,
+        shift: false,
+    };
+    pane(&mut ctl, ctrl(deep.clone()));
+    pane(&mut ctl, ctrl(deep));
+    assert_eq!(ctl.pane(Side::Left).selected_entries().len(), 2);
+
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    ctl.apply(CommanderAction::Export {
+        from: Side::Left,
+        format: Some(ExportFormat::LooseFiles),
+    });
+    ctl.apply(CommanderAction::Picked {
+        purpose: screen_purpose::EXPORT,
+        path: Some(out.clone()),
+    });
+    settle(&mut ctl);
+    // Each entry keeps its folder below the common parent.
+    assert!(out.join("SUB").join("DEEP").is_dir(), "{}", ctl.status());
+    assert_eq!(std::fs::read(out.join("HELLO.TXT")).unwrap(), b"hello\r\n");
+
+    pane(&mut ctl, A::Delete);
+    let p = ctl.pane(Side::Left);
+    let staged: Vec<(String, String)> = p
+        .queue
+        .iter()
+        .map(|e| match e {
+            StagedEdit::DeleteEntry { parent, entry }
+            | StagedEdit::DeleteRecursive { parent, entry } => {
+                (parent.path.clone(), entry.name.clone())
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        staged,
+        [
+            ("/".into(), "HELLO.TXT".into()),
+            ("/SUB".into(), "DEEP".into())
+        ]
+    );
+}
+
+#[test]
+fn marks_from_both_levels_copy_and_checksum_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    ctl.apply(CommanderAction::Pane(
+        Side::Left,
+        A::OpenImage(fat_volume(dir.path())),
+    ));
+    ctl.apply(CommanderAction::Pane(
+        Side::Right,
+        A::OpenHostFolder(host.path().to_path_buf()),
+    ));
+    settle(&mut ctl);
+    pane(&mut ctl, A::SetListingStyle(ListingStyle::CombinedTree));
+    mark_both_levels(&mut ctl);
+    ctl.apply(CommanderAction::Copy(Side::Left));
+    settle(&mut ctl);
+    assert!(host.path().join("DEEP").is_dir(), "{}", ctl.status());
+    assert!(host.path().join("HELLO.TXT").is_file(), "{}", ctl.status());
+    ctl.apply(CommanderAction::Checksums(Side::Left));
+    settle(&mut ctl);
+    let sums = ctl.checksums().expect("the checksum window");
+    let rows: Vec<&str> = sums.rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(rows, ["HELLO.TXT"], "folders are skipped");
+}

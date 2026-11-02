@@ -381,17 +381,14 @@ impl BrowserPaneController {
         self.tree_active() || self.folder_active() || !self.listing.selection().is_empty()
     }
 
-    /// The selected entries: the wrapper tree's or the combined tree's when set, else the listing's.
+    /// The selected entries: the wrapper tree's when set, else the listing's and the combined tree's.
     pub fn selected_entries(&self) -> Vec<FileEntry> {
         if let Some((_, entries)) = self.tree_selection() {
             return entries;
         }
-        if self.folder_active() {
-            let rows = self.folder_selection().into_iter();
-            return rows.map(|r| r.entry).collect();
-        }
-        let selected = self.listing.selected_entries().into_iter();
-        selected.cloned().collect()
+        let selected = self.listing.selected_entries().into_iter().cloned();
+        let deep = self.folder_selection().into_iter().map(|r| r.entry);
+        selected.chain(deep).collect()
     }
 
     /// The folder a copy into this pane lands in: the current one, or the combined tree's cursor folder.
@@ -419,7 +416,7 @@ impl BrowserPaneController {
         if let Some((_, entries)) = self.tree_selection() {
             return entries.into_iter().find(|e| e.name == name);
         }
-        if self.folder_active() {
+        if self.folder_active() && self.listing.selection().is_empty() {
             let rows = self.folder_selection().into_iter();
             return rows.map(|r| r.entry).find(|e| e.name == name);
         }
@@ -699,24 +696,20 @@ impl BrowserPaneController {
         })]
     }
 
-    /// The selection as (folder, entry) pairs: the combined tree's, else the listing's (and its staged adds).
+    /// The selection as (folder, entry) pairs: the listing's (with its staged adds), then the deep rows.
     fn selected_pairs(&self) -> Vec<(FileEntry, FileEntry)> {
-        if self.folder_active() {
-            let rows = self.folder_selection().into_iter();
-            return rows.map(|r| (r.parent, r.entry)).collect();
-        }
+        let deep = self.folder_selection().into_iter();
+        let deep: Vec<_> = deep.map(|r| (r.parent, r.entry)).collect();
         let Some(cwd) = self.listing.cwd().cloned() else {
-            return Vec::new();
+            return deep;
         };
         let adds = self.queue.pending_adds_for(&cwd.path);
         let names = self.listing.selection().iter();
-        names
-            .filter_map(|n| {
-                let add = adds.iter().find(|e| &e.name == n).cloned();
-                add.or_else(|| self.entry_named(n))
-            })
-            .map(|e| (cwd.clone(), e))
-            .collect()
+        let top = names.filter_map(|n| {
+            let add = adds.iter().find(|e| &e.name == n).cloned();
+            add.or_else(|| self.entry_named(n))
+        });
+        top.map(|e| (cwd.clone(), e)).chain(deep).collect()
     }
 
     /// Stage a delete, undelete a pending one, or unstage a pending copy / new folder.

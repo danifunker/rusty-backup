@@ -34,6 +34,6 @@ pub use disk_core::rust173 as rust173_compat;
 // config persistence (load_recent / push_recent / UpdateConfig — pure std/serde,
 // no network). The reqwest-backed update *check* inside is separately gated on
 // `gui` / `tui-update`, so a plain-`tui` (e.g. vintage) build links no network.
+pub mod controller;
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 pub mod update;
-pub mod controller;

@@ -522,23 +522,6 @@ impl Default for BrowseView {
     }
 }
 
-/// The checkbox's toggle: a ctrl-click on the row, so the rest of the selection stays.
-fn mark_action(row: &DisplayRow) -> BrowserPaneAction {
-    if row.depth == 0 && !row.is_tree {
-        BrowserPaneAction::Click {
-            name: row.name.clone(),
-            ctrl: true,
-            shift: false,
-        }
-    } else {
-        BrowserPaneAction::TreeClick {
-            node_id: row.node_id.clone(),
-            ctrl: true,
-            shift: false,
-        }
-    }
-}
-
 /// Shared state between the GUI and the worker thread that runs
 /// `format_tree`. The walk can take seconds on large HFS+ volumes, so it
 /// runs off the UI thread and the GUI polls this struct each frame. The
@@ -1839,7 +1822,7 @@ impl BrowseView {
                         .checkbox(&mut marked, "")
                         .on_hover_text("Mark for multi-select export");
                     if resp.changed() {
-                        acts.push(p(mark_action(row)));
+                        acts.push(p(BrowserPaneAction::Mark(row.node_id.clone())));
                     }
                 }
                 let resp = self.row_label(ui, row, entry.as_ref(), is_cursor);

@@ -3,9 +3,9 @@
 //! In the combined tree a folder row expands in place: its children are listed by a job on a
 //! reader opened from the pane's source (a host folder lists through `std::fs`), kept between
 //! listings and dropped when the source changes or is written. Expanded folders survive a
-//! reopen after Apply and are listed again. Rows below an expanded folder are selected by path,
-//! exclusive with the listing's own selection and the wrapper tree's (as those two already are);
-//! a Shift range stays inside one folder. Staging (delete, rename, new folder, a copy into the
+//! reopen after Apply and are listed again. Rows below an expanded folder are selected by path;
+//! ctrl-clicks and marks mix them with the listing's own selection (one selection across levels),
+//! the wrapper tree's stays exclusive, and a Shift range stays inside one folder. Staging (delete, rename, new folder, a copy into the
 //! pane) acts on a deep row's own folder. See docs/phase2_commander_plan.md § "Slice 10 notes".
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -203,6 +203,11 @@ impl BrowserPaneController {
         self.base_stage_source().map(FolderSource::Image)
     }
 
+    /// True when marks on top-level rows and rows below expanded folders form one selection.
+    pub(super) fn mixes_levels(&self) -> bool {
+        self.style == ListingStyle::CombinedTree
+    }
+
     /// True when this pane draws the combined tree with expandable folders.
     pub(super) fn combined(&self) -> bool {
         self.style == ListingStyle::CombinedTree && self.listing.is_loaded()
@@ -302,7 +307,9 @@ impl BrowserPaneController {
 
     /// Click a row below an expanded folder.
     pub(super) fn folder_click(&mut self, node_id: String, ctrl: bool, shift: bool) {
-        self.listing.clear_selection();
+        if !(ctrl && self.mixes_levels()) {
+            self.listing.clear_selection();
+        }
         self.tree_selected.clear();
         self.cursor = Some(node_id.clone());
         let anchor = self.dirs.anchor.clone();
@@ -333,7 +340,9 @@ impl BrowserPaneController {
     }
 
     pub(super) fn toggle_folder_selected(&mut self, node_id: &str) {
-        self.listing.clear_selection();
+        if !self.mixes_levels() {
+            self.listing.clear_selection();
+        }
         self.tree_selected.clear();
         if let Some(pos) = self.dirs.selected.iter().position(|n| n == node_id) {
             self.dirs.selected.remove(pos);

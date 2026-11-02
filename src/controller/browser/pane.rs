@@ -58,6 +58,8 @@ pub enum BrowserPaneAction {
     TreeContextSelect(String),
     /// Toggle the cursor row in or out of the selection, then move down.
     ToggleMark,
+    /// Toggle the row with this node id in or out of the selection; the cursor stays (a checkbox).
+    Mark(String),
     ClearSelection,
     SortBy(SortColumn),
     CursorUp,
@@ -271,7 +273,9 @@ impl Controller for BrowserPaneController {
             }
             BrowserPaneAction::Click { name, ctrl, shift } => {
                 self.tree_selected.clear();
-                self.clear_folder_selection();
+                if !(ctrl && self.mixes_levels()) {
+                    self.clear_folder_selection();
+                }
                 if shift {
                     self.listing.shift_click(&name);
                 } else if ctrl {
@@ -289,6 +293,7 @@ impl Controller for BrowserPaneController {
             BrowserPaneAction::ContextSelect(name) => self.context_select(&name),
             BrowserPaneAction::TreeContextSelect(node_id) => self.tree_context_select(node_id),
             BrowserPaneAction::ToggleMark => self.toggle_mark(),
+            BrowserPaneAction::Mark(node_id) => self.mark(&node_id),
             BrowserPaneAction::ClearSelection => {
                 self.listing.clear_selection();
                 self.tree_selected.clear();
@@ -654,6 +659,18 @@ impl BrowserPaneController {
         let Some(row) = self.cursor_row() else {
             return;
         };
+        self.toggle_row_mark(row);
+        self.move_cursor(1);
+    }
+
+    fn mark(&mut self, node_id: &str) {
+        if let Some(row) = self.rows.iter().find(|r| r.node_id == node_id).cloned() {
+            self.toggle_row_mark(row);
+        }
+    }
+
+    /// Toggle one row's mark; the combined tree keeps top-level and deep marks together.
+    fn toggle_row_mark(&mut self, row: DisplayRow) {
         if row.in_folder {
             self.toggle_folder_selected(&row.node_id);
         } else if row.is_tree {
@@ -663,10 +680,11 @@ impl BrowserPaneController {
             self.tree_anchor = Some(row.node_id);
         } else if !row.is_parent() {
             self.tree_selected.clear();
-            self.clear_folder_selection();
+            if !self.mixes_levels() {
+                self.clear_folder_selection();
+            }
             self.listing.ctrl_click(&row.name);
         }
-        self.move_cursor(1);
     }
 
     fn info_at_cursor(&mut self) {
