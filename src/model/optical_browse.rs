@@ -232,8 +232,10 @@ impl DiscChoice {
         match result {
             Ok(()) => Ok(tally.files_extracted),
             Err(e) => {
-                let msg =
-                    crate::cli::optical_hint::with_nkit_hint(anyhow::anyhow!("{e}"), &src.path);
+                let msg = crate::cli::optical_hint::with_nkit_hint(
+                    anyhow::anyhow!("{e}"),
+                    src.path.as_path(),
+                );
                 Err(format!("{msg:#}"))
             }
         }
@@ -568,7 +570,7 @@ fn extract_entry(
     if ctx.is_cancelled() {
         return Err("Extraction cancelled".into());
     }
-    let safe_name = resource_fork::sanitize_filename(&entry.name);
+    let safe_name = resource_fork::sanitize_filename(entry.name.as_str());
     match entry.entry_type {
         EntryType::File => {
             tally.report(ctx, entry.path.as_str());
