@@ -437,9 +437,8 @@ impl BulkConvertDialog {
             });
 
         if let Some(conflicts) = self.ctl.conflicts() {
-            match show_conflict_modal(ctx, conflicts) {
-                Some(choice) => actions.push(BulkConvertAction::ResolveConflicts(choice)),
-                None => {}
+            if let Some(choice) = show_conflict_modal(ctx, conflicts) {
+                actions.push(BulkConvertAction::ResolveConflicts(choice));
             }
         }
         actions

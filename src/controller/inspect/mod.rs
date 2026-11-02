@@ -307,6 +307,9 @@ pub struct InspectServices {
     pub notify: Arc<dyn Notify>,
 }
 
+/// An image file ready to open, and the temporary folder that holds it when it was decoded.
+type Prepared = (PathBuf, Option<tempfile::TempDir>);
+
 /// Lines for the log panel, shared with running jobs.
 type LogSink = Arc<Mutex<Vec<(LogLevel, String)>>>;
 
@@ -352,7 +355,7 @@ pub struct InspectController {
     /// Bumped when the partition list's text changes width, so the shell re-measures.
     layout_generation: u64,
     /// An `ImageFile` whose wrapper is being decoded before it opens.
-    prepare: Option<(PathBuf, Job<(PathBuf, Option<tempfile::TempDir>)>)>,
+    prepare: Option<(PathBuf, Job<Prepared>)>,
     open: open::OpenState,
     tools: tools::ToolState,
     export: export::ExportState,

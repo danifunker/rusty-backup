@@ -128,7 +128,13 @@ pub fn files_to_extract(archive: &StuffItArchive, keep: Option<&[bool]>) -> usiz
         .entries
         .iter()
         .enumerate()
-        .filter(|(i, e)| !e.is_dir && keep.map_or(true, |k| k.get(*i).copied().unwrap_or(true)))
+        .filter(|(i, e)| {
+            let kept = match keep {
+                Some(k) => k.get(*i).copied().unwrap_or(true),
+                None => true,
+            };
+            !e.is_dir && kept
+        })
         .count()
 }
 

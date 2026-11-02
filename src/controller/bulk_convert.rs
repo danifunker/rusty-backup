@@ -255,11 +255,11 @@ impl BulkConvertController {
         if self.selected_count() == 0 {
             return Some("No files selected to convert.");
         }
-        if self
-            .output
-            .as_ref()
-            .map_or(true, |p| p.as_os_str().is_empty())
-        {
+        let no_output = match &self.output {
+            Some(p) => p.as_os_str().is_empty(),
+            None => true,
+        };
+        if no_output {
             return Some("Enter an output folder.");
         }
         let ext = self.extension.as_str();
