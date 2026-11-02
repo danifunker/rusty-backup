@@ -170,6 +170,24 @@ every shell shares, and `src/gui/commander/` only draws:
 - `src/gui/commander/mod.rs` / `pane.rs`: egui drawing, egui keys translated to
   `controller::keys::Key`, and one `EffectHost` for pickers and prompts. The File
   Info metadata editors stay in the view and send `StageMetadata` back.
+- `src/cli/verbs/tui_app/commander.rs` (the `rb-cli tui` Commander tab): ratatui
+  drawing over the same controller. Crossterm keys become `Key` + `Mods`; a key the
+  map binds goes to the controller, anything else falls through to the tab shell
+  (tab switching, `q`, `:`). Effects: pickers use the TUI `FilePicker` (a save
+  picker for single-file exports), `Confirm` is a y/n box, `AskText` a one-line
+  prompt that runs the spec's validator per keystroke, `CopyToClipboard` shows the
+  text (a terminal has no clipboard), `CloseScreen` returns to the tab Commander was
+  opened from. The windows the controller holds (apply review / report, host
+  conflicts, rename notice, staged edits, partitions, help, File Info, checksums,
+  log) take their button keys in the view. The terminal key map is the PC one on
+  every platform (`KeyMap::for_terminal`: a terminal has no Cmd key). The File Info
+  window edits mode, owner and xattrs through `EditDetail` prompts instead of the
+  egui editors.
+- Keyboard commands beyond the F-keys (all views): Ctrl/Cmd+O open image, +D open
+  folder, +B open backup, +K connect, +P partition chooser, +S sort (column
+  descending, then the next column), +G checksums, +E export, +U staged edits,
+  +L session log. Copy, Delete, Checksums and Export act on the cursor row when
+  nothing is selected; that implicit selection is dropped by the next key.
 
 ---
 

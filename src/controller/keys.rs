@@ -95,10 +95,20 @@ pub enum Command {
     PageDown,
     Home,
     End,
+    OpenImage,
+    OpenFolder,
+    OpenBackup,
+    Connect,
+    Partition,
+    Sort,
+    Checksums,
+    Export,
+    Edits,
+    Log,
 }
 
 impl Command {
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 30] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -119,6 +129,16 @@ impl Command {
         Command::PageDown,
         Command::Home,
         Command::End,
+        Command::OpenImage,
+        Command::OpenFolder,
+        Command::OpenBackup,
+        Command::Connect,
+        Command::Partition,
+        Command::Sort,
+        Command::Checksums,
+        Command::Export,
+        Command::Edits,
+        Command::Log,
     ];
 
     /// The name used in `keybindings.toml`.
@@ -144,6 +164,16 @@ impl Command {
             Command::PageDown => "page-down",
             Command::Home => "home",
             Command::End => "end",
+            Command::OpenImage => "open-image",
+            Command::OpenFolder => "open-folder",
+            Command::OpenBackup => "open-backup",
+            Command::Connect => "connect",
+            Command::Partition => "partition",
+            Command::Sort => "sort",
+            Command::Checksums => "checksums",
+            Command::Export => "export",
+            Command::Edits => "edits",
+            Command::Log => "log",
         }
     }
 
@@ -174,6 +204,16 @@ impl Command {
             Command::PageDown => "Page down",
             Command::Home => "Top",
             Command::End => "Bottom",
+            Command::OpenImage => "Open image",
+            Command::OpenFolder => "Open folder",
+            Command::OpenBackup => "Open backup",
+            Command::Connect => "Connect to remote",
+            Command::Partition => "Choose partition",
+            Command::Sort => "Sort",
+            Command::Checksums => "Checksums",
+            Command::Export => "Export",
+            Command::Edits => "Staged edits",
+            Command::Log => "Session log",
         }
     }
 }
@@ -200,6 +240,16 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::PageDown, &["PageDown"]),
     (Command::Home, &["Home"]),
     (Command::End, &["End"]),
+    (Command::OpenImage, &["Primary+O"]),
+    (Command::OpenFolder, &["Primary+D"]),
+    (Command::OpenBackup, &["Primary+B"]),
+    (Command::Connect, &["Primary+K"]),
+    (Command::Partition, &["Primary+P"]),
+    (Command::Sort, &["Primary+S"]),
+    (Command::Checksums, &["Primary+G"]),
+    (Command::Export, &["Primary+E"]),
+    (Command::Edits, &["Primary+U"]),
+    (Command::Log, &["Primary+L"]),
 ];
 
 /// The command each chord means, for one platform.
@@ -293,9 +343,22 @@ impl KeyMap {
         crate::update::UpdateConfig::user_config_dir().map(|d| d.join("keybindings.toml"))
     }
 
+    /// The PC chords on every platform: a terminal has no Cmd key, so Primary is Ctrl there too.
+    pub fn for_terminal() -> Self {
+        Self::defaults(false)
+    }
+
     /// The defaults for this platform with `path`'s overrides applied, plus any problems found.
     pub fn load(path: Option<&Path>) -> (Self, Vec<String>) {
-        let mut map = Self::for_this_platform();
+        Self::load_onto(Self::for_this_platform(), path)
+    }
+
+    /// [`Self::for_terminal`] with `path`'s overrides applied, plus any problems found.
+    pub fn load_terminal(path: Option<&Path>) -> (Self, Vec<String>) {
+        Self::load_onto(Self::for_terminal(), path)
+    }
+
+    fn load_onto(mut map: Self, path: Option<&Path>) -> (Self, Vec<String>) {
         let mut problems = Vec::new();
         if let Some(path) = path {
             if let Ok(text) = std::fs::read_to_string(path) {
@@ -551,6 +614,62 @@ mod tests {
         assert_eq!(mac.lookup(Key::Up, cmd), Some(Command::Parent));
         assert_eq!(mac.hint(Command::NewFolder), "Cmd+N");
         assert_eq!(KeyMap::defaults(false).hint(Command::NewFolder), "Ctrl+N");
+    }
+
+    #[test]
+    fn the_source_and_window_commands_use_primary_letters() {
+        let pc = KeyMap::defaults(false);
+        let ctrl = |c| {
+            (
+                Key::Char(c),
+                Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                },
+            )
+        };
+        let cases = [
+            ('o', Command::OpenImage),
+            ('d', Command::OpenFolder),
+            ('b', Command::OpenBackup),
+            ('k', Command::Connect),
+            ('p', Command::Partition),
+            ('s', Command::Sort),
+            ('g', Command::Checksums),
+            ('e', Command::Export),
+            ('u', Command::Edits),
+            ('l', Command::Log),
+        ];
+        for (c, cmd) in cases {
+            let (k, m) = ctrl(c);
+            assert_eq!(pc.lookup(k, m), Some(cmd), "Ctrl+{c}");
+            assert_eq!(pc.lookup(k, Mods::default()), None, "a bare {c} stays free");
+        }
+        // Every chord means one command, so no new binding shadows an agreed one.
+        for mac in [false, true] {
+            let map = KeyMap::defaults(mac);
+            for (i, (a, _)) in map.bindings.iter().enumerate() {
+                for (b, _) in &map.bindings[i + 1..] {
+                    let same = a.key == b.key && a.primary == b.primary && a.alt == b.alt;
+                    let overlap = a.applies(mac) && b.applies(mac);
+                    assert!(
+                        !(same && a.shift == b.shift && overlap),
+                        "{a:?} bound twice"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_uses_ctrl_even_on_a_mac() {
+        let term = KeyMap::for_terminal();
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        assert_eq!(term.lookup(Key::Char('n'), ctrl), Some(Command::NewFolder));
+        assert_eq!(term.hint(Command::OpenImage), "Ctrl+O");
     }
 
     #[test]

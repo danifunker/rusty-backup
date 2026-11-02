@@ -53,6 +53,8 @@ use crate::model::rate_tracker::RateTracker;
 use disk_core::display::format_size;
 use disk_core::entry::{EntryType, FileEntry};
 
+mod commander;
+
 /// Shared state for a running progress task: a worker thread advances
 /// `current` toward `total`; the UI thread reads it each frame.
 #[derive(Default)]
@@ -539,6 +541,8 @@ enum PickKind {
     File,
     /// An existing directory (export destination).
     Dir,
+    /// A file to write: not a directory, in a folder that exists.
+    Save,
 }
 
 /// The outcome of feeding a key to a [`FilePicker`].
@@ -654,13 +658,17 @@ impl FilePicker {
             // seeking rather than `metadata.len()` (which is 0 for a device).
             PickKind::File => path.exists() && !path.is_dir(),
             PickKind::Dir => path.is_dir(),
+            PickKind::Save => {
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+                !path.is_dir() && parent.is_some_and(|p| p.is_dir())
+            }
         };
         if ok {
             Some(PickResult::Confirm(path))
         } else {
             let what = match self.kind {
                 PickKind::Dir => "directory",
-                PickKind::File => "file",
+                PickKind::File | PickKind::Save => "file",
                 PickKind::Any => "path",
             };
             // Distinguish "wrong kind" from "absent"; the old message claimed
@@ -833,8 +841,8 @@ impl FilePicker {
                 }
                 None
             }
-            // File mode: descend dirs, confirm files.
-            PickKind::File => {
+            // File mode: descend dirs, confirm files; Save overwrites the file picked.
+            PickKind::File | PickKind::Save => {
                 if is_dir {
                     self.populate(path);
                     self.sel = 0;
@@ -1957,1461 +1965,6 @@ impl Default for OpticalState {
     }
 }
 
-/// Which Commander pane has focus.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum Side {
-    #[default]
-    Left,
-    Right,
-}
-
-/// One Commander pane: a host folder or an image partition, browsed through the
-/// shared `DirListing`. Image panes keep a `BrowseSession` so a host->image copy
-/// can be applied through `commander_ops::apply_edits`.
-struct CmdPane {
-    listing: crate::model::dir_listing::DirListing,
-    session: Option<crate::model::browse_session::BrowseSession>,
-    is_host: bool,
-    loaded: bool,
-    label: String,
-    sel: usize,
-    /// Open flow: a folder/file picker (host vs image by `picker_host`).
-    picker: Option<FilePicker>,
-    picker_host: bool,
-    /// Partition chooser for a multi-partition image.
-    parts: Vec<crate::partition::PartitionInfo>,
-    part_pick: bool,
-    part_sel: usize,
-    pending_img: Option<std::path::PathBuf>,
-    /// Set when this pane is showing an optical disc image's filesystem (a
-    /// hybrid CD's ISO 9660 / HFS side). Read-only; carries what a refresh /
-    /// re-switch needs. `None` for host / partition-image / archive panes.
-    optical: Option<OpticalPane>,
-    /// The optical-filesystem chooser modal (ISO 9660 vs HFS side) + its cursor.
-    optical_pick: bool,
-    optical_sel: usize,
-    /// Set when this pane is browsing a remote daemon (host FS or an image on
-    /// it). The listing reads over the wire; uploads go to the daemon. `None`
-    /// for local panes.
-    #[cfg(feature = "remote")]
-    remote: Option<crate::model::remote_browser::RemoteBrowser>,
-}
-
-/// An optical disc image opened in a Commander pane: the path, its selectable
-/// filesystems (primary ISO 9660 + any hybrid Mac side), and the one currently
-/// shown. Read-only; a refresh / re-switch reopens via `commander_descend`.
-#[derive(Clone)]
-struct OpticalPane {
-    path: std::path::PathBuf,
-    choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
-    sel: usize,
-}
-
-impl Default for CmdPane {
-    fn default() -> Self {
-        CmdPane {
-            listing: crate::model::dir_listing::DirListing::new(),
-            session: None,
-            is_host: false,
-            loaded: false,
-            label: String::new(),
-            sel: 0,
-            picker: None,
-            picker_host: false,
-            parts: Vec::new(),
-            part_pick: false,
-            part_sel: 0,
-            pending_img: None,
-            optical: None,
-            optical_pick: false,
-            optical_sel: 0,
-            #[cfg(feature = "remote")]
-            remote: None,
-        }
-    }
-}
-
-impl CmdPane {
-    fn rows_len(&self) -> usize {
-        self.listing.current_rows().len()
-    }
-    /// The `FileEntry` under the cursor, if the cursor is on a real entry.
-    fn selected(&self) -> Option<FileEntry> {
-        match self.listing.current_rows().get(self.sel) {
-            Some(crate::model::dir_listing::Row::Entry(e)) => Some((*e).clone()),
-            _ => None,
-        }
-    }
-
-    /// The entries a copy/delete should act on: the multi-selection if any is
-    /// marked (Space), else the single entry under the cursor.
-    fn action_entries(&self) -> Vec<FileEntry> {
-        if !self.listing.selection().is_empty() {
-            self.listing
-                .selected_entries()
-                .into_iter()
-                .cloned()
-                .collect()
-        } else {
-            self.selected().into_iter().collect()
-        }
-    }
-
-    /// Toggle the multi-selection state of the entry under the cursor.
-    fn toggle_mark(&mut self) {
-        if let Some(e) = self.selected() {
-            self.listing.ctrl_click(&e.name);
-        }
-    }
-
-    /// Stage the optical-filesystem chooser (used when a disc carries more than
-    /// one filesystem — e.g. a hybrid CD's ISO 9660 + HFS sides). Nothing is
-    /// loaded until the user confirms a choice.
-    fn optical_choices_stage(
-        &mut self,
-        choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
-        path: std::path::PathBuf,
-    ) {
-        self.optical = Some(OpticalPane {
-            path,
-            choices,
-            sel: 0,
-        });
-        self.optical_pick = true;
-        self.optical_sel = 0;
-    }
-
-    /// True when this pane is browsing a remote daemon (host FS or an image).
-    #[cfg(feature = "remote")]
-    fn is_remote(&self) -> bool {
-        self.remote.is_some()
-    }
-
-    /// True when this pane is browsing a remote daemon's *host* filesystem
-    /// (vs. an image opened on it).
-    #[cfg(feature = "remote")]
-    fn is_remote_host(&self) -> bool {
-        matches!(
-            self.remote.as_ref().map(|b| b.mode()),
-            Some(crate::model::remote_browser::BrowseMode::Host)
-        )
-    }
-
-    /// The daemon address (`host:port`) this pane is connected to, if remote.
-    #[cfg(feature = "remote")]
-    fn remote_addr(&self) -> Option<String> {
-        self.remote.as_ref().map(|b| b.addr().to_string())
-    }
-
-    /// The remote image `(image_path, partition)` this pane is browsing, if it
-    /// is inside a disk image on the daemon (vs. the host file browser).
-    #[cfg(feature = "remote")]
-    fn remote_image_target(&self) -> Option<(String, Option<crate::cli::img_at::PartSelector>)> {
-        match self.remote.as_ref().map(|b| b.mode()) {
-            Some(crate::model::remote_browser::BrowseMode::Image { path, partition }) => {
-                Some((path.clone(), partition.clone()))
-            }
-            _ => None,
-        }
-    }
-}
-
-/// The Commander dual-pane file manager.
-#[derive(Default)]
-struct CommanderState {
-    left: CmdPane,
-    right: CmdPane,
-    active: Side,
-    status: Option<String>,
-    is_error: bool,
-    /// A new-folder name being typed for the active pane, if the mkdir prompt
-    /// is showing.
-    mkdir_input: Option<String>,
-    /// The noun phrase (e.g. `folder "System"` or `3 items`) of the active
-    /// pane's pending delete, shown in the confirmation prompt.
-    confirm_delete: Option<String>,
-    /// A running checksum job (CRC32/MD5/SHA1/SHA256 of the marked files),
-    /// polled each `tick`. `None` when idle.
-    checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
-    /// A running host-to-host copy, polled in `tick`: status, label, destination side.
-    host_copy: Option<(
-        Arc<Mutex<crate::model::commander_ops::HostCopyStatus>>,
-        String,
-        Side,
-    )>,
-    /// The scrollable checksum-results overlay once a job completes.
-    checksum_report: Option<ChecksumReportView>,
-    /// The File Info overlay for the active pane's cursor entry (`i`), holding
-    /// the rendered attribute lines. `None` when closed.
-    info: Option<InfoView>,
-    /// An attribute edit being typed from the info overlay: which field, and the
-    /// text so far. `None` when no prompt is showing.
-    attr_input: Option<AttrPrompt>,
-    /// A `host:port` being typed in the "Connect to remote" prompt, if showing.
-    #[cfg(feature = "remote")]
-    connect_input: Option<String>,
-    /// An in-flight daemon connection (blocking, so it runs on a worker and is
-    /// polled each `tick`); carries the side to install the result into.
-    #[cfg(feature = "remote")]
-    pending_connect: Option<(Side, Arc<Mutex<ConnectStatus>>)>,
-}
-
-/// The File Info overlay: the entry it describes plus its rendered lines.
-struct InfoView {
-    /// The entry being described (re-resolved on each edit so staged changes
-    /// show immediately).
-    entry: disk_core::entry::FileEntry,
-    /// On-disk extended attributes, read when the overlay opened.
-    xattrs: Vec<disk_core::xattr::Xattr>,
-    /// uid/gid -> name map from the image's own account files, if any.
-    id_names: disk_core::id_names::IdNameMap,
-    /// For a SquashFS volume viewed at its root: what the image occupies and
-    /// what it may grow into (`docs/squashfs_edit.md` §2.6 — the GUI budget
-    /// dialog's content, ASCII-only). `None` for anything else.
-    size_plan: Option<fs_squashfs::squashfs_edit::SizePlan>,
-}
-
-/// Which attribute the user is typing a new value for, from the info overlay.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AttrField {
-    /// Octal permission bits.
-    Mode,
-    /// `uid:gid`.
-    Owner,
-    /// `name=value` (value may be `0x`-hex); an empty value deletes.
-    Xattr,
-}
-
-impl AttrField {
-    /// The prompt label shown above the input line.
-    fn label(self) -> &'static str {
-        match self {
-            Self::Mode => "New permissions (octal, e.g. 755):",
-            Self::Owner => "New owner (uid:gid, e.g. 0:0):",
-            Self::Xattr => "Xattr as name=value (0x.. for hex; empty value deletes):",
-        }
-    }
-}
-
-/// An in-progress attribute edit typed in the info overlay.
-struct AttrPrompt {
-    field: AttrField,
-    text: String,
-}
-
-/// Result of a background [`RemoteBrowser::connect`]: the browser plus its first
-/// browse target, or an error string.
-#[cfg(feature = "remote")]
-type ConnectResult = Result<
-    (
-        crate::model::remote_browser::RemoteBrowser,
-        crate::model::remote_browser::BrowseTarget,
-    ),
-    String,
->;
-
-/// Shared state for a background connect, polled in `tick`.
-#[cfg(feature = "remote")]
-#[derive(Default)]
-struct ConnectStatus {
-    finished: bool,
-    result: Option<ConnectResult>,
-}
-
-/// A scrollable checksum-results overlay (per-file SHA256 + CRC32).
-struct ChecksumReportView {
-    lines: Vec<String>,
-    scroll: usize,
-}
-
-impl CommanderState {
-    fn pane(&self, side: Side) -> &CmdPane {
-        match side {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
-        }
-    }
-    fn pane_mut(&mut self, side: Side) -> &mut CmdPane {
-        match side {
-            Side::Left => &mut self.left,
-            Side::Right => &mut self.right,
-        }
-    }
-
-    /// Load a host folder into the active pane.
-    fn open_host(&mut self, path: std::path::PathBuf) {
-        let side = self.active;
-        match cmd_load_host(self.pane_mut(side), path) {
-            Ok(()) => {
-                self.status = None;
-                self.is_error = false;
-            }
-            Err(e) => {
-                self.status = Some(e);
-                self.is_error = true;
-            }
-        }
-    }
-
-    /// Open an image file into the active pane: show the partition chooser when
-    /// there's more than one, else load directly (superfloppy = whole disk).
-    fn open_image(&mut self, path: std::path::PathBuf) {
-        let side = self.active;
-
-        // Optical disc image first: a hybrid Mac/PC CD carries an ISO 9660 volume
-        // *and* an HFS side that the partition table (APM) hides, so enumerate
-        // its filesystems via opticaldiscs and offer them in the chooser.
-        if is_optical_image_path(&path) {
-            let choices = crate::model::commander_descend::optical_filesystems(&path);
-            if !choices.is_empty() {
-                if choices.len() > 1 {
-                    let p = self.pane_mut(side);
-                    p.optical_choices_stage(choices, path);
-                } else {
-                    match cmd_load_optical(self.pane_mut(side), &path, choices, 0) {
-                        Ok(()) => {
-                            self.status = None;
-                            self.is_error = false;
-                        }
-                        Err(e) => {
-                            self.status = Some(e);
-                            self.is_error = true;
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Report a probe failure instead of discarding it. On a raw device this
-        // is normally "needs elevation", and `unwrap_or_default()` turned that
-        // into an empty partition list, which then failed one step later trying
-        // to open a filesystem at offset 0 - an error that named the filesystem
-        // and never mentioned privileges.
-        let parts = match crate::model::commander_source::probe_partitions(&path) {
-            Ok(p) => p,
-            Err(e) => {
-                let denied = e
-                    .chain()
-                    .any(|c| c.to_string().to_lowercase().contains("permission denied"));
-                if denied {
-                    self.status = Some(format!(
-                        "{}: permission denied - raw device access needs elevation; \
-                         re-run rb-cli tui elevated",
-                        path.display()
-                    ));
-                    self.is_error = true;
-                    return;
-                }
-                // Not a privilege problem: it may legitimately have no table
-                // (a superfloppy), so fall through and try it as one volume.
-                Vec::new()
-            }
-        };
-        if parts.len() > 1 {
-            let p = self.pane_mut(side);
-            p.parts = parts;
-            p.part_pick = true;
-            p.part_sel = 0;
-            p.pending_img = Some(path);
-        } else {
-            let part = parts.first().cloned();
-            match cmd_load_image(self.pane_mut(side), &path, part.as_ref()) {
-                Ok(()) => {
-                    self.status = None;
-                    self.is_error = false;
-                }
-                Err(e) => {
-                    self.status = Some(e);
-                    self.is_error = true;
-                }
-            }
-        }
-    }
-
-    /// Confirm the partition chooser and open the selected partition.
-    fn choose_partition(&mut self) {
-        let side = self.active;
-        let (path, part) = {
-            let p = self.pane_mut(side);
-            (p.pending_img.clone(), p.parts.get(p.part_sel).cloned())
-        };
-        if let Some(path) = path {
-            match cmd_load_image(self.pane_mut(side), &path, part.as_ref()) {
-                Ok(()) => {
-                    self.status = None;
-                    self.is_error = false;
-                }
-                Err(e) => {
-                    self.status = Some(e);
-                    self.is_error = true;
-                }
-            }
-        }
-    }
-
-    /// Confirm the optical-filesystem chooser and open the selected side.
-    fn choose_optical(&mut self) {
-        let side = self.active;
-        let (path, choices, idx) = {
-            let p = self.pane(side);
-            match &p.optical {
-                Some(op) => (op.path.clone(), op.choices.clone(), p.optical_sel),
-                None => return,
-            }
-        };
-        match cmd_load_optical(self.pane_mut(side), &path, choices, idx) {
-            Ok(()) => {
-                self.status = None;
-                self.is_error = false;
-            }
-            Err(e) => {
-                self.status = Some(e);
-                self.is_error = true;
-            }
-        }
-    }
-
-    /// Reopen the filesystem chooser for the active pane so the user can switch
-    /// sides of a hybrid optical disc (ISO 9660 <-> HFS) after opening.
-    fn reopen_chooser(&mut self) {
-        let side = self.active;
-        let p = self.pane_mut(side);
-        match &p.optical {
-            Some(op) if op.choices.len() > 1 => {
-                p.optical_sel = op.sel;
-                p.optical_pick = true;
-            }
-            _ => {
-                self.status = Some("Filesystem switching is for hybrid optical discs.".to_string());
-                self.is_error = false;
-            }
-        }
-    }
-
-    fn refresh_active(&mut self) {
-        let side = self.active;
-        cmd_refresh(self.pane_mut(side));
-        self.status = Some("Refreshed.".to_string());
-        self.is_error = false;
-    }
-
-    /// Start hashing the active pane's marked files (CRC32/MD5/SHA1/SHA256) on a
-    /// worker thread; `tick` polls it and shows the results overlay when done.
-    /// Directories in the selection are skipped.
-    fn start_checksum(&mut self) {
-        if self.checksum.is_some() {
-            self.status = Some("A checksum is already running.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let side = self.active;
-        let pane = self.pane(side);
-        if !pane.loaded {
-            self.status = Some("Open a source first.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let entries: Vec<FileEntry> = pane
-            .action_entries()
-            .into_iter()
-            .filter(|e| matches!(e.entry_type, EntryType::File))
-            .collect();
-        if entries.is_empty() {
-            self.status =
-                Some("Select one or more files to checksum (Space marks more).".to_string());
-            self.is_error = true;
-            return;
-        }
-        let n = entries.len();
-        let job = if pane.is_host {
-            crate::model::checksum::ChecksumJob::Host { entries }
-        } else {
-            match cmd_checksum_source(pane) {
-                Some(source) => crate::model::checksum::ChecksumJob::Image { source, entries },
-                None => {
-                    self.status = Some("Source volume is not open.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            }
-        };
-        self.checksum = Some(crate::model::checksum::spawn(job));
-        self.checksum_report = None;
-        self.status = Some(format!("Hashing {n} file(s)..."));
-        self.is_error = false;
-    }
-
-    /// Begin connecting the active pane to a daemon at `addr` (a bare host uses
-    /// the default port). Blocking, so it runs on a worker thread; `tick`
-    /// installs the resulting remote listing into the pane.
-    #[cfg(feature = "remote")]
-    fn start_connect(&mut self, addr: String) {
-        if self.pending_connect.is_some() {
-            self.status = Some("A connection is already in progress.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let side = self.active;
-        let addr = if addr.contains(':') {
-            addr
-        } else {
-            format!("{addr}:{}", crate::remote::protocol::DEFAULT_PORT)
-        };
-        let status = Arc::new(Mutex::new(ConnectStatus::default()));
-        let st = Arc::clone(&status);
-        let addr_worker = addr.clone();
-        crate::model::worker::spawn_guarded(Arc::clone(&status), "remote connect", move || {
-            let r = crate::model::remote_browser::RemoteBrowser::connect(&addr_worker, "/")
-                .map_err(|e| format!("{e:#}"));
-            if let Ok(mut g) = st.lock() {
-                g.result = Some(r);
-                g.finished = true;
-            }
-            Ok(())
-        });
-        self.pending_connect = Some((side, status));
-        self.status = Some(format!("Connecting to {addr}..."));
-        self.is_error = false;
-    }
-
-    /// Copy the selected entry from the active pane to the other pane's cwd.
-    /// host->image stages + applies edits; image->host exports the fork; host->
-    /// host is a plain copy; image->image extracts+stages. A remote destination
-    /// uploads over the wire.
-    fn copy(&mut self) {
-        if self.host_copy.is_some() {
-            self.status = Some("A copy is already running.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let dst_side = match self.active {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
-        };
-        let (src, dst) = match self.active {
-            Side::Left => (&mut self.left, &mut self.right),
-            Side::Right => (&mut self.right, &mut self.left),
-        };
-        if !src.loaded || !dst.loaded {
-            self.status = Some("Both panes must be open to copy.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let entries = src.action_entries();
-        if entries.is_empty() {
-            self.status = Some("Select a file to copy (Space marks more).".to_string());
-            self.is_error = true;
-            return;
-        }
-        // A short summary of what was copied for the status line.
-        let label = if entries.len() == 1 {
-            entries[0].name.clone()
-        } else {
-            format!("{} items", entries.len())
-        };
-
-        // Remote destination: upload over the wire (a remote pane has
-        // is_host == false, so it would otherwise misroute to the image path,
-        // which needs a local write session it doesn't have). Downloads FROM a
-        // remote pane fall through to the normal image-source branches below,
-        // which already read over the wire via the boxed remote filesystem.
-        #[cfg(feature = "remote")]
-        if dst.is_remote() {
-            use crate::model::commander_ops;
-            let result: Result<String, String> = (|| {
-                let addr = dst
-                    .remote_addr()
-                    .ok_or_else(|| "the remote connection is unavailable".to_string())?;
-                let dest_parent = dst
-                    .listing
-                    .cwd()
-                    .cloned()
-                    .ok_or_else(|| "no destination directory".to_string())?;
-                if dst.is_remote_host() {
-                    // Remote host filesystem: upload files/dirs directly.
-                    if src.is_host {
-                        commander_ops::upload_host_entries_to_remote(
-                            &entries,
-                            &addr,
-                            &dest_parent.path,
-                        )
-                        .map_err(|e| format!("Upload failed: {e:#}"))?;
-                    } else {
-                        let fs = src
-                            .listing
-                            .fs_mut()
-                            .ok_or_else(|| "source has no filesystem".to_string())?;
-                        commander_ops::upload_fs_entries_to_remote(
-                            fs,
-                            &entries,
-                            &addr,
-                            &dest_parent.path,
-                            RfMode::AppleDouble,
-                        )
-                        .map_err(|e| format!("Upload failed: {e:#}"))?;
-                    }
-                } else {
-                    // Remote disk image: stage AddFile/CreateDirectory edits and
-                    // apply them over the daemon's Family-F write path.
-                    let (image_path, partition) = dst
-                        .remote_image_target()
-                        .ok_or_else(|| "the remote image target is unavailable".to_string())?;
-                    if src.is_host {
-                        let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
-                        commander_ops::apply_edits_to_remote_image(
-                            &addr,
-                            &image_path,
-                            partition,
-                            &edits,
-                        )
-                        .map_err(|e| format!("Upload failed: {e:#}"))?;
-                    } else {
-                        // image -> remote image: extract to a temp dir, stage the
-                        // AddFiles (which point into it), then apply. The temp dir
-                        // must outlive the apply.
-                        let src_fs = src
-                            .listing
-                            .fs_mut()
-                            .ok_or_else(|| "source has no filesystem".to_string())?;
-                        let temp = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
-                        let edits = with_stderr_suppressed(|| {
-                            commander_ops::stage_copy(
-                                src_fs,
-                                &entries,
-                                &dest_parent,
-                                temp.path(),
-                                true,
-                            )
-                        })
-                        .map_err(|e| format!("Copy failed: {e:#}"))?;
-                        commander_ops::apply_edits_to_remote_image(
-                            &addr,
-                            &image_path,
-                            partition,
-                            &edits,
-                        )
-                        .map_err(|e| format!("Upload failed: {e:#}"))?;
-                    }
-                }
-                Ok(format!("Uploaded {label} to the remote."))
-            })();
-            if result.is_ok() {
-                cmd_refresh(dst);
-                src.listing.clear_selection();
-            }
-            match result {
-                Ok(m) => {
-                    self.status = Some(m);
-                    self.is_error = false;
-                }
-                Err(e) => {
-                    self.status = Some(e);
-                    self.is_error = true;
-                }
-            }
-            return;
-        }
-
-        let result: Result<String, String> = if src.is_host && !dst.is_host {
-            let dest_parent = match dst.listing.cwd() {
-                Some(e) => e.clone(),
-                None => {
-                    self.status = Some("No destination directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let session = match dst.session.clone() {
-                Some(s) => s,
-                None => {
-                    self.status = Some("Destination has no write session.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let mut edits =
-                crate::model::commander_ops::stage_host_to_image(&entries, &dest_parent);
-            let note = legalize_into(dst, &mut edits);
-            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Copied {label} into the image.{note}"))
-                .map_err(|e| format!("Copy failed: {e:#}"))
-        } else if !src.is_host && dst.is_host {
-            let dest_dir = match dst.listing.cwd() {
-                Some(e) => std::path::PathBuf::from(&e.path),
-                None => {
-                    self.status = Some("No destination directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let fs = match src.listing.fs_mut() {
-                Some(f) => f,
-                None => {
-                    self.status = Some("Source has no filesystem.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            // Through the shared recursive walker: a selected folder has to be
-            // rebuilt on the host with its whole subtree, forks included. The
-            // flat loop this replaces wrote a directory as a zero-byte file and
-            // reported success (R-041).
-            with_stderr_suppressed(|| {
-                crate::model::commander_ops::export_fs_entries_to_host(
-                    fs,
-                    &entries,
-                    &dest_dir,
-                    RfMode::AppleDouble,
-                )
-            })
-            .map(|n| format!("Copied {n} item(s) to the host."))
-            .map_err(|e| format!("Copy failed: {e:#}"))
-        } else if src.is_host && dst.is_host {
-            let dest_dir = match dst.listing.cwd() {
-                Some(e) => std::path::PathBuf::from(&e.path),
-                None => {
-                    self.status = Some("No destination directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            // The shared runner recurses folders, refuses a copy into itself
-            // and keeps forks; the flat loop wrote a folder as an empty file.
-            // `tick` finishes it (status, refresh, marks), so the screen keeps drawing meanwhile.
-            let status = crate::model::commander_ops::spawn_host_copy(
-                crate::model::commander_ops::HostCopyJob::HostToHost {
-                    entries: entries.clone(),
-                    dest_dir,
-                    on_conflict: crate::fs::replace::OnConflict::Replace,
-                },
-            );
-            self.host_copy = Some((status, label.clone(), dst_side));
-            self.status = Some(format!("Copying {label}..."));
-            self.is_error = false;
-            return;
-        } else {
-            // image -> image: extract the entries to a temp dir, stage them as
-            // AddFiles on the destination's browse session, then apply. The temp
-            // dir must outlive apply_edits (the staged edits point into it).
-            let dest_parent = match dst.listing.cwd() {
-                Some(e) => e.clone(),
-                None => {
-                    self.status = Some("No destination directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let session = match dst.session.clone() {
-                Some(s) => s,
-                None => {
-                    self.status = Some("Destination has no write session.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let src_fs = match src.listing.fs_mut() {
-                Some(f) => f,
-                None => {
-                    self.status = Some("Source has no filesystem.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            (|| -> Result<String, String> {
-                let temp = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
-                let mut edits = with_stderr_suppressed(|| {
-                    crate::model::commander_ops::stage_copy(
-                        src_fs,
-                        &entries,
-                        &dest_parent,
-                        temp.path(),
-                        true,
-                    )
-                })
-                .map_err(|e| format!("Copy failed: {e:#}"))?;
-                let note = legalize_into(dst, &mut edits);
-                with_stderr_suppressed(|| {
-                    crate::model::commander_ops::apply_edits(&session, &edits)
-                })
-                .map_err(|e| format!("Copy failed: {e:#}"))?;
-                Ok(format!("Copied {label} into the image.{note}"))
-            })()
-        };
-        // The destination refreshes after the source borrow is released
-        // (host or image, both kinds); the source's marks are consumed.
-        if result.is_ok() {
-            cmd_refresh(dst);
-            src.listing.clear_selection();
-        }
-        match result {
-            Ok(m) => {
-                self.status = Some(m);
-                self.is_error = false;
-            }
-            Err(e) => {
-                self.status = Some(e);
-                self.is_error = true;
-            }
-        }
-    }
-
-    /// Set the status line from a `Result`, error styling on `Err`.
-    fn set_result(&mut self, r: Result<String, String>) {
-        match r {
-            Ok(m) => {
-                self.status = Some(m);
-                self.is_error = false;
-            }
-            Err(e) => {
-                self.status = Some(e);
-                self.is_error = true;
-            }
-        }
-    }
-
-    /// Create a directory named `name` in the active pane's cwd (host: real
-    /// `create_dir`; image: a `CreateDirectory` staged edit applied through the
-    /// pane's browse session), then refresh the pane.
-    fn mkdir(&mut self, name: &str) {
-        let name = name.trim();
-        if name.is_empty() {
-            self.status = Some("Folder name can't be empty.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let side = self.active;
-        let pane = self.pane_mut(side);
-        let result: Result<String, String> = if pane.is_host {
-            match pane.listing.cwd() {
-                Some(cwd) => std::fs::create_dir(std::path::PathBuf::from(&cwd.path).join(name))
-                    .map(|()| format!("Created folder {name}."))
-                    .map_err(|e| format!("New folder failed: {e}")),
-                None => Err("No current directory.".to_string()),
-            }
-        } else {
-            let parent = match pane.listing.cwd() {
-                Some(e) => e.clone(),
-                None => {
-                    self.status = Some("No current directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let session = match pane.session.clone() {
-                Some(s) => s,
-                None => {
-                    self.status = Some("Pane has no write session.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let edits = vec![crate::model::edit_queue::StagedEdit::CreateDirectory {
-                parent,
-                name: name.to_string(),
-                qnx2_attrs: None,
-            }];
-            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Created folder {name}."))
-                .map_err(|e| format!("New folder failed: {e:#}"))
-        };
-        if result.is_ok() {
-            cmd_refresh(self.pane_mut(side));
-        }
-        self.set_result(result);
-    }
-
-    /// Open the File Info overlay on the active pane's cursor entry, reading its
-    /// extended attributes and the image's uid/gid name map. Best-effort: an
-    /// entry with no POSIX metadata still opens, just with fewer lines.
-    fn open_info(&mut self) {
-        let side = self.active;
-        let pane = self.pane_mut(side);
-        let Some(entry) = pane.selected() else {
-            self.status = Some("Nothing selected.".to_string());
-            self.is_error = true;
-            return;
-        };
-        // Read xattrs + the account maps through the pane's filesystem when it
-        // has one (a host-folder pane has none; the overlay still shows size and
-        // name).
-        let (xattrs, id_names, size_plan) = match pane.session.clone() {
-            Some(session) => with_stderr_suppressed(|| {
-                let mut fs = match session.open() {
-                    Ok(fs) => fs,
-                    Err(_) => return (Vec::new(), Default::default(), None),
-                };
-                let x = if fs.supports_xattrs() {
-                    fs.list_xattrs(&entry).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                // Only for the volume root: measuring walks the whole directory
-                // tree, and "how big is this image" is a question about the
-                // volume, not about a file inside it.
-                let plan = if fs.fs_type() == "SquashFS" && entry.path == "/" {
-                    let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
-                    let capacity = (session.partition_offset != 0)
-                        .then_some(session.partition_size)
-                        .flatten();
-                    fs_squashfs::squashfs_edit::plan_size(&mut *fs, image_len, capacity).ok()
-                } else {
-                    None
-                };
-                let names = disk_core::id_names::IdNameMap::from_filesystem(&mut *fs);
-                (x, names, plan)
-            }),
-            None => (Vec::new(), Default::default(), None),
-        };
-        self.info = Some(InfoView {
-            entry,
-            xattrs,
-            id_names,
-            size_plan,
-        });
-    }
-
-    /// The rendered lines of the info overlay.
-    fn info_lines(&self) -> Vec<String> {
-        let Some(info) = &self.info else {
-            return Vec::new();
-        };
-        let e = &info.entry;
-        let mut out = vec![
-            format!("Name:  {}", e.name),
-            format!("Path:  {}", e.path),
-            format!("Size:  {}", e.size),
-        ];
-        if let Some(m) = e.mode {
-            out.push(format!(
-                "Mode:  {}  ({:04o})",
-                e.mode_string().unwrap_or_default(),
-                m & 0o7777
-            ));
-        }
-        if let (Some(u), Some(g)) = (e.uid, e.gid) {
-            out.push(format!("Owner: {}", info.id_names.format_owner(u, g)));
-        }
-        if let Some(t) = &e.symlink_target {
-            out.push(format!("Link:  -> {t}"));
-        }
-        if let Some(s) = &e.special_type {
-            out.push(format!("Type:  {s}"));
-        }
-        if let Some(m) = &e.modified {
-            out.push(format!("Mtime: {m}"));
-        }
-        if !info.xattrs.is_empty() {
-            out.push(String::new());
-            out.push("Extended attributes:".to_string());
-            for x in &info.xattrs {
-                out.push(format!("  {} = {}", x.name, x.value_display()));
-            }
-        }
-        if let Some(p) = &info.size_plan {
-            use disk_core::display::format_size;
-            out.push(String::new());
-            out.push("SquashFS size budget:".to_string());
-            out.push(format!("  Image occupies {}", format_size(p.image_len)));
-            out.push(format!(
-                "  Content        {} uncompressed",
-                format_size(p.content_len)
-            ));
-            out.push(format!("  Compressed to  {}", p.describe_ratio()));
-            match (p.capacity, p.headroom) {
-                (Some(cap), Some(head)) => out.push(format!(
-                    "  Room available {} ({} unused)",
-                    format_size(cap),
-                    format_size(head)
-                )),
-                _ => {
-                    out.push("  Room available unbounded - this file is the filesystem".to_string())
-                }
-            }
-            // Saving an edit rebuilds the whole image, so the ceiling is the
-            // only thing that can be promised in advance.
-            out.push("  Set a ceiling with: rb-cli squashfs put|rm --size|--grow".to_string());
-        }
-        out
-    }
-
-    /// Apply the attribute edit typed in the info overlay's prompt.
-    fn apply_attr_edit(&mut self, field: AttrField, text: &str) {
-        let side = self.active;
-        let Some(info) = &self.info else { return };
-        let entry = info.entry.clone();
-        let Some(session) = self.pane_mut(side).session.clone() else {
-            self.set_result(Err("Pane has no write session.".to_string()));
-            return;
-        };
-        let text = text.trim();
-
-        let edit = match field {
-            AttrField::Mode => match u32::from_str_radix(text, 8) {
-                Ok(m) if m <= 0o7777 => crate::model::edit_queue::StagedEdit::SetPermissions {
-                    entry: entry.clone(),
-                    // The drivers take the complete mode; keep the entry's type
-                    // bits and replace only the permission bits.
-                    mode: (entry.mode.unwrap_or(0) & !0o7777) | m,
-                },
-                _ => {
-                    self.set_result(Err(format!(
-                        "Bad octal mode {text:?} (1-4 digits, <= 7777)"
-                    )));
-                    return;
-                }
-            },
-            AttrField::Owner => {
-                let parsed = text
-                    .split_once(':')
-                    .and_then(|(u, g)| Some((u.trim().parse().ok()?, g.trim().parse().ok()?)));
-                match parsed {
-                    Some((uid, gid)) => crate::model::edit_queue::StagedEdit::SetOwner {
-                        entry: entry.clone(),
-                        uid,
-                        gid,
-                    },
-                    None => {
-                        self.set_result(Err(format!("Bad owner {text:?} (want uid:gid)")));
-                        return;
-                    }
-                }
-            }
-            AttrField::Xattr => {
-                let (name, value) = match text.split_once('=') {
-                    Some((n, v)) => (n.trim().to_string(), v),
-                    None => {
-                        self.set_result(Err("Want name=value (empty value deletes)".to_string()));
-                        return;
-                    }
-                };
-                if !disk_core::xattr::has_valid_namespace(&name) {
-                    self.set_result(Err(format!(
-                        "Xattr {name:?} needs a user. / trusted. / security. / system. prefix"
-                    )));
-                    return;
-                }
-                if value.trim().is_empty() {
-                    crate::model::edit_queue::StagedEdit::RemoveXattr {
-                        entry: entry.clone(),
-                        name,
-                    }
-                } else {
-                    match disk_core::xattr::parse_value(value) {
-                        Ok(v) => crate::model::edit_queue::StagedEdit::SetXattr {
-                            entry: entry.clone(),
-                            name,
-                            value: v,
-                        },
-                        Err(e) => {
-                            self.set_result(Err(e));
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-
-        let result = with_stderr_suppressed(|| {
-            crate::model::commander_ops::apply_edits(&session, std::slice::from_ref(&edit))
-        })
-        .map(|()| "Attribute updated.".to_string())
-        .map_err(|e| format!("Attribute edit failed: {e:#}"));
-        let ok = result.is_ok();
-        self.set_result(result);
-        if ok {
-            cmd_refresh(self.pane_mut(side));
-            // Re-read so the overlay reflects what actually landed.
-            self.open_info();
-        }
-    }
-
-    /// Delete the active pane's selected entry (host: `remove_file` /
-    /// `remove_dir_all`; image: a `DeleteRecursive` staged edit applied through
-    /// the pane's browse session), then refresh the pane.
-    fn delete_selected(&mut self) {
-        let side = self.active;
-        let pane = self.pane_mut(side);
-        let entries = pane.action_entries();
-        if entries.is_empty() {
-            self.status = Some("Select a file or folder to delete.".to_string());
-            self.is_error = true;
-            return;
-        }
-        let label = if entries.len() == 1 {
-            entries[0].name.clone()
-        } else {
-            format!("{} items", entries.len())
-        };
-        let result: Result<String, String> = if pane.is_host {
-            (|| -> Result<(), String> {
-                for e in &entries {
-                    let path = std::path::PathBuf::from(&e.path);
-                    let r = if matches!(e.entry_type, EntryType::Directory) {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                    r.map_err(|err| format!("Delete failed on {}: {err}", e.name))?;
-                }
-                Ok(())
-            })()
-            .map(|()| format!("Deleted {label}."))
-        } else {
-            let parent = match pane.listing.cwd() {
-                Some(e) => e.clone(),
-                None => {
-                    self.status = Some("No current directory.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let session = match pane.session.clone() {
-                Some(s) => s,
-                None => {
-                    self.status = Some("Pane has no write session.".to_string());
-                    self.is_error = true;
-                    return;
-                }
-            };
-            let edits: Vec<_> = entries
-                .iter()
-                .map(|e| crate::model::edit_queue::StagedEdit::DeleteRecursive {
-                    parent: parent.clone(),
-                    entry: e.clone(),
-                })
-                .collect();
-            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Deleted {label}."))
-                .map_err(|e| format!("Delete failed: {e:#}"))
-        };
-        if result.is_ok() {
-            let p = self.pane_mut(side);
-            p.listing.clear_selection();
-            cmd_refresh(p);
-            p.sel = p.sel.min(p.rows_len().saturating_sub(1));
-        }
-        self.set_result(result);
-    }
-}
-
-/// Load a host folder into a Commander pane.
-fn cmd_load_host(pane: &mut CmdPane, path: std::path::PathBuf) -> Result<(), String> {
-    pane.listing
-        .load_host_root(path.clone())
-        .map_err(|e| format!("{e}"))?;
-    pane.session = None;
-    pane.is_host = true;
-    pane.loaded = true;
-    pane.label = format!("host: {}", path.display());
-    pane.sel = 0;
-    pane.optical = None;
-    pane.optical_pick = false;
-    pane.part_pick = false;
-    pane.parts.clear();
-    Ok(())
-}
-
-/// Build a `BrowseSession` for a partition (or the whole disk when `part` is
-/// `None`, i.e. a superfloppy).
-fn cmd_build_session(
-    path: &std::path::Path,
-    part: Option<&crate::partition::PartitionInfo>,
-) -> crate::model::browse_session::BrowseSession {
-    match part {
-        Some(p) => crate::model::commander_source::session_for(path, p),
-        None => crate::model::browse_session::BrowseSession {
-            source_path: Some(path.to_path_buf()),
-            partition_offset: 0,
-            partition_type: 0,
-            ..Default::default()
-        },
-    }
-}
-
-/// Open an image partition into a Commander pane and list its root.
-fn cmd_load_image(
-    pane: &mut CmdPane,
-    path: &std::path::Path,
-    part: Option<&crate::partition::PartitionInfo>,
-) -> Result<(), String> {
-    let session = cmd_build_session(path, part);
-    let mut fs = session
-        .open()
-        .map_err(|e| format!("opening filesystem: {e}"))?;
-    let root = fs.root().map_err(|e| format!("reading root: {e}"))?;
-    let entries = fs.list_directory(&root).unwrap_or_default();
-    pane.listing.load_root(fs, root, entries, false);
-    pane.session = Some(session);
-    pane.is_host = false;
-    pane.loaded = true;
-    pane.label = format!("img: {}", basename(&path.to_string_lossy()));
-    pane.sel = 0;
-    pane.part_pick = false;
-    pane.parts.clear();
-    pane.pending_img = None;
-    pane.optical = None;
-    pane.optical_pick = false;
-    Ok(())
-}
-
-/// Build a reopen-able [`StageSource`](crate::model::commander_ops::StageSource)
-/// for a non-host pane, so a checksum worker can read its files off a fresh
-/// handle. A session image reopens by session; an optical pane reopens the
-/// selected filesystem (primary / hybrid). `None` for a host pane or an
-/// unopened source.
-fn cmd_checksum_source(pane: &CmdPane) -> Option<crate::model::commander_ops::StageSource> {
-    use crate::model::commander_ops::StageSource;
-    if let Some(op) = &pane.optical {
-        let label = op
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
-        let recipe = match op.choices.get(op.sel).and_then(|c| c.hybrid_index) {
-            Some(index) => crate::model::commander_descend::ReopenRecipe::OpticalHybrid {
-                path: op.path.clone(),
-                index,
-                label,
-            },
-            None => crate::model::commander_descend::ReopenRecipe::Optical {
-                path: op.path.clone(),
-                label,
-            },
-        };
-        return Some(StageSource::Reopen(recipe));
-    }
-    pane.session.clone().map(StageSource::Session)
-}
-
-/// True when `path` names an optical disc image (by extension) we can browse via
-/// `opticaldiscs` — the discriminator for routing to [`cmd_load_optical`]
-/// instead of the partition-table path.
-fn is_optical_image_path(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .and_then(crate::model::commander_descend::classify)
-        == Some(crate::model::commander_descend::DescendKind::Optical)
-}
-
-/// Open the filesystem at `choices[idx]` of the optical disc image at `path`
-/// (the primary ISO 9660, or a hybrid Mac HFS/HFS+ side) into a Commander pane
-/// and list its root. Read-only and session-less — like a Mac archive.
-fn cmd_load_optical(
-    pane: &mut CmdPane,
-    path: &std::path::Path,
-    choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
-    idx: usize,
-) -> Result<(), String> {
-    let choice = choices
-        .get(idx)
-        .cloned()
-        .ok_or_else(|| "no such filesystem on this disc".to_string())?;
-    let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-    let mut fs = match choice.hybrid_index {
-        None => crate::model::commander_descend::open_optical(path, label),
-        Some(h) => crate::model::commander_descend::open_optical_hybrid(path, h, label),
-    }
-    .map_err(|e| format!("{e:#}"))?;
-    let root = fs.root().map_err(|e| format!("reading root: {e}"))?;
-    let entries = fs.list_directory(&root).unwrap_or_default();
-    pane.listing.load_root(fs, root, entries, false);
-    pane.session = None;
-    pane.is_host = false;
-    pane.loaded = true;
-    pane.label = format!(
-        "cd: {} [{}]",
-        basename(&path.to_string_lossy()),
-        choice.label
-    );
-    pane.sel = 0;
-    pane.part_pick = false;
-    pane.parts.clear();
-    pane.pending_img = None;
-    pane.optical_pick = false;
-    pane.optical_sel = idx;
-    pane.optical = Some(OpticalPane {
-        path: path.to_path_buf(),
-        choices,
-        sel: idx,
-    });
-    Ok(())
-}
-
-/// Refresh a pane after a write: host panes reload; image panes reopen from the
-/// session and re-navigate to the same directory.
-/// Rename copied names the destination can't hold (shared with the GUI); a status-line note.
-fn legalize_into(
-    dst: &mut CmdPane,
-    edits: &mut Vec<crate::model::edit_queue::StagedEdit>,
-) -> String {
-    let cwd = dst.listing.cwd_path().to_string();
-    let cwd_names: Vec<String> = dst
-        .listing
-        .entries()
-        .iter()
-        .map(|e| e.name.clone())
-        .collect();
-    let Some(fs) = dst.listing.fs_mut() else {
-        return String::new();
-    };
-    let fold = fs.case_insensitive_lookup();
-    let fs_type = fs.fs_type().to_string();
-    let validate = |n: &str| fs.validate_name(n);
-    let mut existing = |path: &str| {
-        if path == cwd {
-            cwd_names.clone()
-        } else {
-            Vec::new()
-        }
-    };
-    let report =
-        crate::model::stage_names::legalize_staged_names(edits, &validate, fold, &mut existing);
-    if report.renamed.is_empty() && report.dropped.is_empty() {
-        return String::new();
-    }
-    format!(
-        " {} renamed and {} left out for {fs_type}; export as .mar to keep every name.",
-        report.renamed.len(),
-        report.dropped.len()
-    )
-}
-
-fn cmd_refresh(pane: &mut CmdPane) {
-    let cwd_path = pane.listing.cwd().map(|e| e.path.clone());
-    #[cfg(feature = "remote")]
-    if pane.is_remote() {
-        // A remote pane reads over the wire through the boxed filesystem in its
-        // listing; a plain reload re-lists the current directory (no session).
-        let _ = pane.listing.reload();
-        return;
-    }
-    if pane.is_host {
-        let _ = pane.listing.reload();
-    } else if let Some(op) = pane.optical.clone() {
-        // Optical panes have no `BrowseSession`; reopen the selected filesystem
-        // (primary or hybrid) fresh from the disc image.
-        let label = op
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
-        let reopened = op.choices.get(op.sel).and_then(|c| match c.hybrid_index {
-            None => crate::model::commander_descend::open_optical(&op.path, label).ok(),
-            Some(h) => {
-                crate::model::commander_descend::open_optical_hybrid(&op.path, h, label).ok()
-            }
-        });
-        if let Some(mut fs) = reopened {
-            if let Ok(root) = fs.root() {
-                let entries = fs.list_directory(&root).unwrap_or_default();
-                pane.listing.load_root(fs, root, entries, false);
-                if let Some(p) = cwd_path {
-                    let _ = pane.listing.navigate_to(&p);
-                }
-            }
-        }
-    } else if let Some(session) = pane.session.clone() {
-        if let Ok(mut fs) = session.open() {
-            if let Ok(root) = fs.root() {
-                let entries = fs.list_directory(&root).unwrap_or_default();
-                pane.listing.load_root(fs, root, entries, false);
-                if let Some(p) = cwd_path {
-                    let _ = pane.listing.navigate_to(&p);
-                }
-            }
-        }
-    }
-    let n = pane.listing.current_rows().len();
-    if pane.sel >= n {
-        pane.sel = n.saturating_sub(1);
-    }
-}
-
-/// Enter the row under a pane's cursor (`..` = up, directory = descend).
-fn cmd_enter(pane: &mut CmdPane) -> Option<Result<String, String>> {
-    enum Act {
-        Up,
-        Enter(String),
-        #[cfg(feature = "remote")]
-        OpenRemoteImage(String, String),
-        None,
-    }
-    let act = match pane.listing.current_rows().get(pane.sel) {
-        Some(crate::model::dir_listing::Row::Parent) => Act::Up,
-        Some(crate::model::dir_listing::Row::Entry(e)) if e.is_directory() => {
-            Act::Enter(e.name.clone())
-        }
-        // On a remote *host* pane, Enter on a file opens it as a disk image on
-        // the same daemon connection (no reconnect) — the TUI half of "browse
-        // remote disk images".
-        #[cfg(feature = "remote")]
-        Some(crate::model::dir_listing::Row::Entry(e)) if e.is_file() && pane.is_remote_host() => {
-            Act::OpenRemoteImage(e.path.clone(), e.name.clone())
-        }
-        _ => Act::None,
-    };
-    match act {
-        Act::Up => {
-            pane.listing.up();
-            pane.sel = 0;
-            None
-        }
-        Act::Enter(n) => {
-            let _ = pane.listing.enter(&n);
-            pane.sel = 0;
-            None
-        }
-        #[cfg(feature = "remote")]
-        Act::OpenRemoteImage(path, name) => Some(cmd_open_remote_image(pane, &path, &name)),
-        Act::None => None,
-    }
-}
-
-/// Open the remote host file at `path` as a disk image on the pane's existing
-/// daemon connection, replacing the pane's listing with the image's root.
-#[cfg(feature = "remote")]
-fn cmd_open_remote_image(pane: &mut CmdPane, path: &str, name: &str) -> Result<String, String> {
-    let cwd = pane
-        .listing
-        .cwd()
-        .map(|e| e.path.clone())
-        .unwrap_or_else(|| "/".to_string());
-    let browser = pane
-        .remote
-        .as_mut()
-        .ok_or_else(|| "the remote connection is unavailable".to_string())?;
-    let target = browser
-        .open_image(path, None, &cwd)
-        .map_err(|e| format!("{name} is not a disk image we can open: {e:#}"))?;
-    let label = format!("remote img: {name} [{}]", target.fs_type);
-    pane.listing
-        .load_root(target.fs, target.root, target.entries, false);
-    pane.label = label;
-    pane.sel = 0;
-    Ok(format!("Opened {name} on the remote."))
-}
-
-/// Step a remote-image pane back out to the daemon's host file browser (the TUI
-/// analog of the GUI's "close image"). Returns true when it handled the step
-/// (the pane was a remote image at its root); the caller falls back to a normal
-/// `up()` otherwise.
-#[cfg(feature = "remote")]
-fn cmd_remote_up(pane: &mut CmdPane) -> bool {
-    if !pane.is_remote() || pane.is_remote_host() || !pane.listing.at_root() {
-        return false;
-    }
-    if let Some(browser) = pane.remote.as_mut() {
-        if let Ok(target) = browser.close_image() {
-            let addr = browser.addr().to_string();
-            pane.listing
-                .load_root(target.fs, target.root, target.entries, false);
-            pane.label = format!("remote {addr}: /");
-            pane.sel = 0;
-            return true;
-        }
-    }
-    false
-}
-
 /// Fork container formats for archive extraction.
 const ARCHIVE_FORK_FORMATS: &[(&str, arc_mac::extract::ForkFormat)] = &[
     ("BinHex (.hqx)", arc_mac::extract::ForkFormat::BinHex),
@@ -3496,7 +2049,9 @@ struct App {
     /// The Archives screen state (lazily created on first visit).
     archive: Option<ArchiveState>,
     /// The Commander dual-pane state (lazily created on first visit).
-    commander: Option<CommanderState>,
+    commander: Option<commander::CommanderView>,
+    /// The tab Commander's Close returns to; `None` when the TUI started on Commander.
+    tab_before_commander: Option<usize>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     /// The `:` command-palette input line being typed, if open.
@@ -3538,6 +2093,7 @@ impl App {
             optical: None,
             archive: None,
             commander: None,
+            tab_before_commander: None,
             settings: None,
             palette_input: None,
             pending_palette: None,
@@ -3620,7 +2176,10 @@ impl App {
         // Advance progress every tick, even when no key arrives, so the bar and
         // its rate / ETA animate.
         self.tick();
-        if !event::poll(Duration::from_millis(200))? {
+        // Commander jobs finish without a keypress, so poll faster while one runs.
+        let working = self.commander.as_ref().is_some_and(|c| c.is_working());
+        let wait = if working { 50 } else { 200 };
+        if !event::poll(Duration::from_millis(wait))? {
             return Ok(());
         }
         let Event::Key(key) = event::read()? else {
@@ -3629,17 +2188,27 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
+        self.on_key(key);
+        Ok(())
+    }
 
+    /// One key press, routed to whatever owns the keyboard.
+    fn on_key(&mut self, key: crossterm::event::KeyEvent) {
+        self.on_key_inner(key);
+        self.leave_commander_if_closed();
+    }
+
+    fn on_key_inner(&mut self, key: crossterm::event::KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
-            return Ok(());
+            return;
         }
         // A running task owns the keyboard: Esc asks it to stop, everything else waits.
         if let Some(task) = &self.task {
             if key.code == KeyCode::Esc && task.job.snapshot().can_cancel {
                 task.job.cancel();
             }
-            return Ok(());
+            return;
         }
 
         // The help overlay is modal. It scrolls: the Explorer's list is longer
@@ -3663,7 +2232,7 @@ impl App {
                 KeyCode::End => self.help_scroll = usize::MAX / 2,
                 _ => {}
             }
-            return Ok(());
+            return;
         }
 
         // The `:` command palette input is modal while open.
@@ -3688,7 +2257,7 @@ impl App {
                 }
                 _ => {}
             }
-            return Ok(());
+            return;
         }
 
         // The shared Open picker (path + recent + Tab-browse).
@@ -3701,7 +2270,7 @@ impl App {
                 }
                 None => {}
             }
-            return Ok(());
+            return;
         }
 
         // The filesystem Explorer is a modal window over the Inspect tab.
@@ -3726,52 +2295,56 @@ impl App {
             {
                 self.show_help = true;
                 self.help_scroll = 0;
-                return Ok(());
+                return;
             }
             self.handle_explorer_key(key.code);
-            return Ok(());
+            return;
         }
 
         // The New Disk wizard owns most keys on its tab (Left/Right still switch
         // tabs; typed text in the details form is consumed here).
         if self.current() == TabId::NewDisk && self.handle_newdisk_key(key.code) {
-            return Ok(());
+            return;
         }
 
         // The Backup screen owns most keys on its tab.
         if self.current() == TabId::Backup && self.handle_backup_key(key.code) {
-            return Ok(());
+            return;
         }
 
         // The Restore screen owns most keys on its tab.
         if self.current() == TabId::Restore && self.handle_restore_key(key.code) {
-            return Ok(());
+            return;
         }
 
         // The Bulk convert screen owns most keys on its tab.
         if self.current() == TabId::Bulk && self.handle_bulk_key(key.code) {
-            return Ok(());
+            return;
         }
 
         // The Optical screen owns most keys on its tab.
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.handle_optical_key(key.code) {
-            return Ok(());
+            return;
         }
 
         // The Archives screen owns most keys on its tab.
         if self.current() == TabId::Archives && self.handle_archive_key(key.code) {
-            return Ok(());
+            return;
         }
 
-        // The Commander screen owns most keys on its tab.
-        if self.current() == TabId::Commander && self.handle_commander_key(key.code) {
-            return Ok(());
+        // The Commander screen hands its keys to its controller; unbound ones fall through.
+        if self.current() == TabId::Commander {
+            if let Some(c) = self.commander.as_mut() {
+                if c.handle_key(key) {
+                    return;
+                }
+            }
         }
 
         // The Settings tab owns Up/Down/Enter (Left/Right still switch tabs).
         if self.current() == TabId::Settings && self.handle_settings_key(key.code) {
-            return Ok(());
+            return;
         }
 
         match key.code {
@@ -3813,7 +2386,6 @@ impl App {
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// targets. A directory is routed through the shared `backup_loader`
@@ -5222,6 +3794,22 @@ impl App {
 
     /// Esc: unwind one level — cancel a running task, then close a drill-down,
     /// then quit.
+    /// Commander's Close: drop its controller and go back to the tab it was opened from.
+    fn leave_commander_if_closed(&mut self) {
+        if !self.commander.as_ref().is_some_and(|c| c.closed()) {
+            return;
+        }
+        self.commander = None;
+        match self.tab_before_commander {
+            Some(tab) => {
+                self.active = tab;
+                self.scroll = 0;
+                self.on_tab_changed();
+            }
+            None => self.should_quit = true,
+        }
+    }
+
     fn on_back(&mut self) {
         if self.progress.is_some() {
             self.cancel_progress();
@@ -5305,7 +3893,10 @@ impl App {
             self.archive = Some(ArchiveState::default());
         }
         if self.current() == TabId::Commander && self.commander.is_none() {
-            self.commander = Some(CommanderState::default());
+            self.commander = Some(commander::CommanderView::new());
+        }
+        if self.current() != TabId::Commander {
+            self.tab_before_commander = Some(self.active);
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -7374,406 +5965,6 @@ impl App {
     }
 
     /// Commander screen keys. Returns `true` when consumed.
-    fn handle_commander_key(&mut self, code: KeyCode) -> bool {
-        if self.commander.is_none() {
-            self.commander = Some(CommanderState::default());
-        }
-        let page = self.explorer_page() as isize;
-        let c = self.commander.as_mut().unwrap();
-        let active = c.active;
-
-        // Open picker on the active pane (modal).
-        if c.pane(active).picker.is_some() {
-            let host = c.pane(active).picker_host;
-            let res = c.pane_mut(active).picker.as_mut().unwrap().handle_key(code);
-            match res {
-                Some(PickResult::Cancel) => c.pane_mut(active).picker = None,
-                Some(PickResult::Confirm(path)) => {
-                    c.pane_mut(active).picker = None;
-                    if host {
-                        c.open_host(path);
-                    } else {
-                        c.open_image(path);
-                    }
-                }
-                None => {}
-            }
-            return true;
-        }
-
-        // Attribute-edit prompt from the info overlay (modal, innermost).
-        if let Some(p) = c.attr_input.as_mut() {
-            match code {
-                KeyCode::Esc => c.attr_input = None,
-                KeyCode::Enter => {
-                    let p = c.attr_input.take().unwrap();
-                    c.apply_attr_edit(p.field, &p.text);
-                }
-                KeyCode::Backspace => {
-                    p.text.pop();
-                }
-                KeyCode::Char(ch) => p.text.push(ch),
-                _ => {}
-            }
-            return true;
-        }
-
-        // File Info overlay (modal): m/o/x start an attribute edit, Esc closes.
-        if c.info.is_some() {
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => c.info = None,
-                KeyCode::Char('m') => {
-                    c.attr_input = Some(AttrPrompt {
-                        field: AttrField::Mode,
-                        text: String::new(),
-                    })
-                }
-                KeyCode::Char('o') => {
-                    c.attr_input = Some(AttrPrompt {
-                        field: AttrField::Owner,
-                        text: String::new(),
-                    })
-                }
-                KeyCode::Char('x') => {
-                    c.attr_input = Some(AttrPrompt {
-                        field: AttrField::Xattr,
-                        text: String::new(),
-                    })
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Checksum results overlay (modal): scroll, Esc/q/Enter to close.
-        if let Some(rv) = c.checksum_report.as_mut() {
-            let page = page.max(1) as usize;
-            let max = rv.lines.len().saturating_sub(1);
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => c.checksum_report = None,
-                KeyCode::Up | KeyCode::Char('k') => rv.scroll = rv.scroll.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => rv.scroll = (rv.scroll + 1).min(max),
-                KeyCode::PageUp => rv.scroll = rv.scroll.saturating_sub(page),
-                KeyCode::PageDown => rv.scroll = (rv.scroll + page).min(max),
-                KeyCode::Home => rv.scroll = 0,
-                KeyCode::End => rv.scroll = max,
-                _ => {}
-            }
-            return true;
-        }
-
-        // New-folder name prompt (modal).
-        if c.mkdir_input.is_some() {
-            match code {
-                KeyCode::Esc => c.mkdir_input = None,
-                KeyCode::Enter => {
-                    let name = c.mkdir_input.take().unwrap_or_default();
-                    c.mkdir(&name);
-                }
-                KeyCode::Backspace => {
-                    if let Some(s) = c.mkdir_input.as_mut() {
-                        s.pop();
-                    }
-                }
-                KeyCode::Char(ch) => {
-                    if let Some(s) = c.mkdir_input.as_mut() {
-                        s.push(ch);
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Connect-to-remote host:port prompt (modal).
-        #[cfg(feature = "remote")]
-        if c.connect_input.is_some() {
-            match code {
-                KeyCode::Esc => c.connect_input = None,
-                KeyCode::Enter => {
-                    let addr = c.connect_input.take().unwrap_or_default();
-                    let addr = addr.trim().to_string();
-                    if addr.is_empty() {
-                        c.status = Some("Enter a host:port to connect.".to_string());
-                        c.is_error = true;
-                    } else {
-                        c.start_connect(addr);
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(s) = c.connect_input.as_mut() {
-                        s.pop();
-                    }
-                }
-                KeyCode::Char(ch) => {
-                    if let Some(s) = c.connect_input.as_mut() {
-                        s.push(ch);
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Delete confirmation (modal).
-        if c.confirm_delete.is_some() {
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    c.confirm_delete = None;
-                    c.delete_selected();
-                }
-                _ => c.confirm_delete = None,
-            }
-            return true;
-        }
-
-        // Partition chooser on the active pane (modal).
-        if c.pane(active).part_pick {
-            let np = c.pane(active).parts.len();
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let p = c.pane_mut(active);
-                    p.part_sel = p.part_sel.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let p = c.pane_mut(active);
-                    p.part_sel = (p.part_sel + 1).min(np.saturating_sub(1));
-                }
-                KeyCode::Esc => {
-                    let p = c.pane_mut(active);
-                    p.part_pick = false;
-                    p.pending_img = None;
-                    p.parts.clear();
-                }
-                KeyCode::Enter => c.choose_partition(),
-                _ => {}
-            }
-            return true;
-        }
-
-        // Optical-filesystem chooser on the active pane (modal): pick the ISO
-        // 9660 or HFS side of a hybrid disc.
-        if c.pane(active).optical_pick {
-            let nfs = c
-                .pane(active)
-                .optical
-                .as_ref()
-                .map(|o| o.choices.len())
-                .unwrap_or(0);
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let p = c.pane_mut(active);
-                    p.optical_sel = p.optical_sel.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let p = c.pane_mut(active);
-                    p.optical_sel = (p.optical_sel + 1).min(nfs.saturating_sub(1));
-                }
-                KeyCode::Esc => {
-                    let p = c.pane_mut(active);
-                    p.optical_pick = false;
-                    // If nothing was ever loaded (first open), drop the staged
-                    // optical state so the pane returns to empty.
-                    if !p.loaded {
-                        p.optical = None;
-                    }
-                }
-                KeyCode::Enter => c.choose_optical(),
-                _ => {}
-            }
-            return true;
-        }
-
-        // Tab / BackTab switch the focused pane.
-        if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
-            c.active = match active {
-                Side::Left => Side::Right,
-                Side::Right => Side::Left,
-            };
-            return true;
-        }
-
-        // Connect the active pane to a remote daemon (works whether or not a
-        // source is already open — it replaces the pane's source).
-        #[cfg(feature = "remote")]
-        if code == KeyCode::Char('R') {
-            c.connect_input = Some(String::new());
-            c.status = None;
-            c.is_error = false;
-            return true;
-        }
-
-        let loaded = c.pane(active).loaded;
-        if !loaded {
-            return match code {
-                KeyCode::Char('o') => {
-                    let p = c.pane_mut(active);
-                    p.picker = Some(FilePicker::new(PickKind::Dir, "Open host folder"));
-                    p.picker_host = true;
-                    true
-                }
-                KeyCode::Char('i') => {
-                    let p = c.pane_mut(active);
-                    p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
-                    p.picker_host = false;
-                    true
-                }
-                _ => false,
-            };
-        }
-
-        let n = c.pane(active).rows_len() as isize;
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                let p = c.pane_mut(active);
-                p.sel = p.sel.saturating_sub(1);
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let p = c.pane_mut(active);
-                p.sel = ((p.sel as isize + 1).min(n - 1).max(0)) as usize;
-                true
-            }
-            KeyCode::PageUp => {
-                let p = c.pane_mut(active);
-                p.sel = (p.sel as isize - page).max(0) as usize;
-                true
-            }
-            KeyCode::PageDown => {
-                let p = c.pane_mut(active);
-                p.sel = ((p.sel as isize + page).min(n - 1).max(0)) as usize;
-                true
-            }
-            KeyCode::Home => {
-                c.pane_mut(active).sel = 0;
-                true
-            }
-            KeyCode::End => {
-                c.pane_mut(active).sel = (n - 1).max(0) as usize;
-                true
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(r) = cmd_enter(c.pane_mut(active)) {
-                    match r {
-                        Ok(m) => {
-                            c.status = Some(m);
-                            c.is_error = false;
-                        }
-                        Err(e) => {
-                            c.status = Some(e);
-                            c.is_error = true;
-                        }
-                    }
-                }
-                true
-            }
-            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                // In a remote image at its root, step back out to the daemon's
-                // host browser (close the image); otherwise navigate up normally.
-                #[cfg(feature = "remote")]
-                if cmd_remote_up(c.pane_mut(active)) {
-                    return true;
-                }
-                let p = c.pane_mut(active);
-                p.listing.up();
-                p.sel = 0;
-                true
-            }
-            KeyCode::Char('o') => {
-                let p = c.pane_mut(active);
-                p.picker = Some(FilePicker::new(PickKind::Dir, "Open host folder"));
-                p.picker_host = true;
-                true
-            }
-            KeyCode::Char('i') => {
-                let p = c.pane_mut(active);
-                p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
-                p.picker_host = false;
-                true
-            }
-            // File Info overlay: permissions / owner / xattrs, with m/o/x to
-            // edit them. F3 mirrors the Midnight Commander "View" key.
-            KeyCode::Char('v') | KeyCode::F(3) => {
-                c.open_info();
-                true
-            }
-            KeyCode::Char('r') => {
-                c.refresh_active();
-                true
-            }
-            // Switch the filesystem shown for a hybrid optical disc (ISO 9660
-            // <-> HFS side).
-            KeyCode::Char('p') => {
-                c.reopen_chooser();
-                true
-            }
-            KeyCode::Char('c') | KeyCode::F(5) => {
-                c.copy();
-                true
-            }
-            // Checksum the marked files (CRC32 / SHA256), shown in an overlay.
-            KeyCode::Char('#') => {
-                c.start_checksum();
-                true
-            }
-            KeyCode::Char('n') => {
-                c.mkdir_input = Some(String::new());
-                c.status = None;
-                c.is_error = false;
-                true
-            }
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::F(8) => {
-                let entries = c.pane(active).action_entries();
-                match entries.len() {
-                    0 => {
-                        c.status = Some("Select a file or folder to delete.".to_string());
-                        c.is_error = true;
-                    }
-                    1 => {
-                        let e = &entries[0];
-                        let kind = if matches!(e.entry_type, EntryType::Directory) {
-                            "folder"
-                        } else {
-                            "file"
-                        };
-                        c.confirm_delete = Some(format!("{kind} \"{}\"", e.name));
-                    }
-                    n => c.confirm_delete = Some(format!("{n} items")),
-                }
-                true
-            }
-            // Space marks/unmarks the entry under the cursor and advances.
-            KeyCode::Char(' ') => {
-                let p = c.pane_mut(active);
-                p.toggle_mark();
-                p.sel = ((p.sel as isize + 1).min(n - 1).max(0)) as usize;
-                true
-            }
-            // `s` cycles the sort column; `S` flips the current direction.
-            KeyCode::Char('s') => {
-                use crate::model::dir_listing::SortColumn::*;
-                let p = c.pane_mut(active);
-                let next = match p.listing.sort_column() {
-                    Name => Size,
-                    Size => Modified,
-                    Modified => Type,
-                    Type => Name,
-                };
-                p.listing.resort(next);
-                c.status = Some(format!("Sorted by {next:?}."));
-                c.is_error = false;
-                true
-            }
-            KeyCode::Char('S') => {
-                let p = c.pane_mut(active);
-                let col = p.listing.sort_column();
-                p.listing.resort(col);
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.opened.is_none()
@@ -7958,110 +6149,10 @@ impl App {
             let cur = p.shared.lock().map(|s| s.current).unwrap_or(0);
             p.tracker.record(cur, &p.label);
         }
-        // Finish a background host-to-host copy, or show its progress.
         if let Some(c) = self.commander.as_mut() {
-            let snapshot = c.host_copy.as_ref().map(|(status, label, side)| {
-                let g = crate::model::worker::lock_status(status);
-                (
-                    g.finished,
-                    g.error.clone(),
-                    g.copied,
-                    g.files_total,
-                    label.clone(),
-                    *side,
-                )
-            });
-            if let Some((finished, error, copied, total, label, dst)) = snapshot {
-                if finished {
-                    c.host_copy = None;
-                    match error {
-                        Some(e) => c.set_result(Err(format!("Copy failed: {e}"))),
-                        None => {
-                            cmd_refresh(c.pane_mut(dst));
-                            let src = match dst {
-                                Side::Left => Side::Right,
-                                Side::Right => Side::Left,
-                            };
-                            c.pane_mut(src).listing.clear_selection();
-                            c.set_result(Ok(format!("Copied {copied} item(s) to {label}.")));
-                        }
-                    }
-                } else {
-                    c.status = Some(format!("Copying {label}: {copied}/{total} file(s)..."));
-                    c.is_error = false;
-                }
-            }
+            c.tick();
         }
-        // Poll a running Commander checksum job: mirror progress to the status
-        // line while it runs, and pop the results overlay when it finishes.
-        if let Some(job) = self.commander.as_ref().and_then(|c| c.checksum.clone()) {
-            let (done, report, progress_msg) = match job.lock() {
-                Ok(s) if s.finished => (true, Some(build_checksum_lines(&s)), None),
-                Ok(s) => (
-                    false,
-                    None,
-                    Some(format!(
-                        "Hashing {}/{} - {}",
-                        s.done_files, s.total_files, s.current_file
-                    )),
-                ),
-                Err(_) => (false, None, None),
-            };
-            if let Some(c) = self.commander.as_mut() {
-                if done {
-                    c.checksum = None;
-                    c.checksum_report = report.map(|lines| ChecksumReportView { lines, scroll: 0 });
-                    c.status = None;
-                    c.is_error = false;
-                } else if let Some(m) = progress_msg {
-                    c.status = Some(m);
-                    c.is_error = false;
-                }
-            }
-        }
-        // Poll a background Commander connect: install the remote listing into
-        // the target pane when it lands, or surface the error.
-        #[cfg(feature = "remote")]
-        {
-            let pending = self
-                .commander
-                .as_ref()
-                .and_then(|c| c.pending_connect.as_ref().map(|(s, j)| (*s, Arc::clone(j))));
-            if let Some((side, job)) = pending {
-                let outcome: Option<ConnectResult> = match job.lock() {
-                    Ok(mut g) if g.finished => g.result.take(),
-                    _ => None,
-                };
-                if let Some(result) = outcome {
-                    if let Some(c) = self.commander.as_mut() {
-                        c.pending_connect = None;
-                        match result {
-                            Ok((browser, target)) => {
-                                let addr = browser.addr().to_string();
-                                let p = c.pane_mut(side);
-                                p.session = None;
-                                p.is_host = false;
-                                p.optical = None;
-                                p.parts.clear();
-                                p.pending_img = None;
-                                p.listing
-                                    .load_root(target.fs, target.root, target.entries, false);
-                                p.remote = Some(browser);
-                                p.loaded = true;
-                                p.sel = 0;
-                                p.label = format!("remote {addr}: /");
-                                c.status = Some(format!("Connected to {addr}."));
-                                c.is_error = false;
-                            }
-                            Err(e) => {
-                                c.status = Some(format!("Connect failed: {e}"));
-                                c.is_error = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.leave_commander_if_closed();
     }
 
     // --- rendering -------------------------------------------------------
@@ -8128,7 +6219,17 @@ impl App {
         let Some(task) = &self.task else {
             return;
         };
-        let snap = task.job.snapshot();
+        self.draw_job_box(frame, area, "Working", &task.job.snapshot());
+    }
+
+    /// A job's step, bar, speed and time in a centred box titled `title`.
+    fn draw_job_box(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        snap: &crate::model::job::Snapshot,
+    ) {
         let what = if snap.phase.is_empty() {
             &snap.label
         } else {
@@ -8188,7 +6289,7 @@ impl App {
                 Line::raw(format!(" {}", snap.detail())),
                 Line::styled(format!(" {hint}"), self.palette.dim()),
             ]))
-            .block(self.pane_block("Working", true)),
+            .block(self.pane_block(title, true)),
             r,
         );
     }
@@ -9944,314 +8045,6 @@ impl App {
     }
 
     /// The Commander dual-pane file manager.
-    fn draw_commander(&self, frame: &mut Frame, area: Rect, c: &CommanderState) {
-        // Body: two panes over a one-line status.
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(area);
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[0]);
-        self.draw_commander_pane(frame, cols[0], c.pane(Side::Left), c.active == Side::Left);
-        self.draw_commander_pane(frame, cols[1], c.pane(Side::Right), c.active == Side::Right);
-
-        let status = match &c.status {
-            Some(s) => s.clone(),
-            None => {
-                "Tab pane  Enter open  Space mark  c copy  v info  # hash  n mkdir  x del  s sort  p fs  r refresh"
-                    .to_string()
-            }
-        };
-        let style = if c.is_error {
-            self.palette.warn()
-        } else {
-            self.palette.dim()
-        };
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {status}"), style)),
-            rows[1],
-        );
-
-        // A pane's open picker / partition chooser draws on top.
-        for side in [Side::Left, Side::Right] {
-            let pane = c.pane(side);
-            if let Some(picker) = &pane.picker {
-                picker.draw(frame, area, self.palette, self.border);
-            }
-            if pane.part_pick {
-                self.draw_commander_partpick(frame, area, pane);
-            }
-            if pane.optical_pick {
-                self.draw_commander_opticalpick(frame, area, pane);
-            }
-        }
-
-        // New-folder name prompt (active pane).
-        if let Some(name) = &c.mkdir_input {
-            let cp = centered_rect(50, 5, area);
-            frame.render_widget(Clear, cp);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(vec![
-                        Span::styled("  Name: ", self.palette.accent()),
-                        Span::raw(name.clone()),
-                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
-                    ]),
-                    Line::raw(""),
-                    Line::styled("  Enter create   Esc cancel", self.palette.dim()),
-                ]))
-                .block(self.pane_block("New folder", true)),
-                cp,
-            );
-        }
-
-        // Connect-to-remote host:port prompt (active pane).
-        #[cfg(feature = "remote")]
-        if let Some(addr) = &c.connect_input {
-            let cp = centered_rect(56, 5, area);
-            frame.render_widget(Clear, cp);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(vec![
-                        Span::styled("  Host:port: ", self.palette.accent()),
-                        Span::raw(addr.clone()),
-                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
-                    ]),
-                    Line::raw(""),
-                    Line::styled("  Enter connect   Esc cancel", self.palette.dim()),
-                ]))
-                .block(self.pane_block("Connect to remote", true)),
-                cp,
-            );
-        }
-
-        // Delete confirmation (active pane).
-        if let Some(phrase) = &c.confirm_delete {
-            let cp = centered_rect(60, 5, area);
-            frame.render_widget(Clear, cp);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::raw(""),
-                    Line::styled(format!("  Delete {phrase}?  (y / n)"), self.palette.warn()),
-                ]))
-                .block(self.pane_block("Confirm delete", true)),
-                cp,
-            );
-        }
-
-        // Checksum results overlay (scrollable).
-        if let Some(rv) = &c.checksum_report {
-            let popup = centered_rect(84, area.height.saturating_sub(4).clamp(8, 24), area);
-            frame.render_widget(Clear, popup);
-            let inner_h = popup.height.saturating_sub(2) as usize;
-            let start = rv.scroll.min(rv.lines.len().saturating_sub(1));
-            let mut lines: Vec<Line> = rv
-                .lines
-                .iter()
-                .skip(start)
-                .take(inner_h.saturating_sub(1))
-                .map(|l| {
-                    let style = if l.trim_start().starts_with("SHA256")
-                        || l.trim_start().starts_with("CRC32")
-                    {
-                        self.palette.accent()
-                    } else if l.contains("failed") || l.starts_with("Error") {
-                        self.palette.warn()
-                    } else {
-                        self.palette.dim()
-                    };
-                    Line::styled(format!(" {l}"), style)
-                })
-                .collect();
-            lines.push(Line::styled(
-                " Up/Down scroll   Esc close",
-                self.palette.dim(),
-            ));
-            frame.render_widget(
-                Paragraph::new(Text::from(lines)).block(self.pane_block("Checksums", true)),
-                popup,
-            );
-        }
-
-        // File Info overlay: attributes, with the edit keys along the bottom.
-        if c.info.is_some() {
-            let body = c.info_lines();
-            let h = (body.len() as u16 + 4).clamp(8, area.height.saturating_sub(2));
-            let popup = centered_rect(76, h, area);
-            frame.render_widget(Clear, popup);
-            let mut lines: Vec<Line> = body
-                .iter()
-                .map(|l| {
-                    let style = if l.starts_with("Extended attributes") {
-                        self.palette.accent()
-                    } else {
-                        self.palette.dim()
-                    };
-                    Line::styled(format!(" {l}"), style)
-                })
-                .collect();
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                " m mode   o owner   x xattr   Esc close",
-                self.palette.dim(),
-            ));
-            frame.render_widget(
-                Paragraph::new(Text::from(lines)).block(self.pane_block("File Info", true)),
-                popup,
-            );
-        }
-
-        // Attribute-edit prompt (innermost overlay).
-        if let Some(p) = &c.attr_input {
-            let popup = centered_rect(66, 6, area);
-            frame.render_widget(Clear, popup);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::raw(""),
-                    Line::styled(format!("  {}", p.field.label()), self.palette.dim()),
-                    Line::styled(format!("  > {}", p.text), self.palette.accent()),
-                    Line::styled("  Enter apply   Esc cancel", self.palette.dim()),
-                ]))
-                .block(self.pane_block("Edit attribute", true)),
-                popup,
-            );
-        }
-    }
-
-    fn draw_commander_pane(&self, frame: &mut Frame, area: Rect, pane: &CmdPane, focused: bool) {
-        if !pane.loaded {
-            let body = Text::from(vec![
-                Line::raw(""),
-                Line::styled("  Empty pane.", self.palette.dim()),
-                Line::raw(""),
-                Line::from(vec![
-                    Span::styled("  o  ", self.palette.accent()),
-                    Span::raw("open a host folder"),
-                ]),
-                Line::from(vec![
-                    Span::styled("  i  ", self.palette.accent()),
-                    Span::raw("open an image file"),
-                ]),
-            ]);
-            frame.render_widget(
-                Paragraph::new(body).block(self.pane_block("(empty)", focused)),
-                area,
-            );
-            return;
-        }
-        let rows = pane.listing.current_rows();
-        let visible = area.height.saturating_sub(2) as usize;
-        let start = pane.sel.saturating_sub(visible.saturating_sub(1));
-        let mut lines = Vec::new();
-        for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
-            let on = focused && i == pane.sel;
-            let (text, is_dir, marked) = match row {
-                crate::model::dir_listing::Row::Parent => ("..".to_string(), true, false),
-                crate::model::dir_listing::Row::Entry(e) => {
-                    let marked = pane.listing.is_selected(&e.name);
-                    if e.is_directory() {
-                        (format!("{}/", e.name), true, marked)
-                    } else {
-                        (
-                            format!("{:<28} {:>9}", e.name, format_size(e.size)),
-                            false,
-                            marked,
-                        )
-                    }
-                }
-            };
-            let base = if is_dir {
-                self.palette.accent()
-            } else {
-                Style::default()
-            };
-            let style = if on {
-                base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else if marked {
-                base.add_modifier(Modifier::BOLD)
-            } else {
-                base
-            };
-            // A leading '*' marks multi-selected entries (Space toggles).
-            let prefix = if marked { "*" } else { " " };
-            lines.push(Line::styled(format!("{prefix}{text}"), style));
-        }
-        let title = if pane.label.len() > area.width.saturating_sub(4) as usize {
-            format!(
-                "...{}",
-                &pane.label[pane.label.len().saturating_sub(area.width as usize - 8)..]
-            )
-        } else {
-            pane.label.clone()
-        };
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, focused)),
-            area,
-        );
-    }
-
-    fn draw_commander_partpick(&self, frame: &mut Frame, area: Rect, pane: &CmdPane) {
-        let mut lines: Vec<Line> = vec![Line::raw("")];
-        for (i, _p) in pane.parts.iter().enumerate() {
-            let sel = i == pane.part_sel;
-            let marker = if sel { "> " } else { "  " };
-            let style = if sel {
-                self.palette
-                    .accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                self.palette.accent()
-            };
-            lines.push(Line::styled(format!("{marker}Partition {}", i + 1), style));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Up/Down select   Enter open   Esc cancel",
-            self.palette.dim(),
-        ));
-        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
-        let popup = centered_rect(46, h, area);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block("Choose partition", true)),
-            popup,
-        );
-    }
-
-    /// The optical-filesystem chooser overlay (ISO 9660 / HFS side of a hybrid
-    /// disc). Mirrors `draw_commander_partpick` but lists the disc's filesystems.
-    fn draw_commander_opticalpick(&self, frame: &mut Frame, area: Rect, pane: &CmdPane) {
-        let Some(op) = &pane.optical else { return };
-        let mut lines: Vec<Line> = vec![Line::raw("")];
-        for (i, choice) in op.choices.iter().enumerate() {
-            let sel = i == pane.optical_sel;
-            let marker = if sel { "> " } else { "  " };
-            let style = if sel {
-                self.palette
-                    .accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                self.palette.accent()
-            };
-            lines.push(Line::styled(format!("{marker}{}", choice.label), style));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Up/Down select   Enter open   Esc cancel",
-            self.palette.dim(),
-        ));
-        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
-        let popup = centered_rect(52, h, area);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block("Choose disc filesystem", true)),
-            popup,
-        );
-    }
-
     /// The Archives screen: open a Mac archive, list its entries, extract.
     fn draw_archive(&self, frame: &mut Frame, area: Rect, a: &ArchiveState) {
         let mut lines: Vec<Line> = Vec::new();
@@ -10844,13 +8637,15 @@ impl App {
                 vec![("<-/->", "Tabs"), ("Enter/o", "Open"), ("?", "Help")]
             }
         } else if self.current() == TabId::Commander {
-            vec![
-                ("Tab", "Pane"),
-                ("Enter", "Open"),
-                ("o/i", "Host/Img"),
-                ("c", "Copy"),
-                ("q", "Quit"),
-            ]
+            let keys = self
+                .commander
+                .as_ref()
+                .map(|c| c.footer_keys())
+                .unwrap_or_default();
+            let refs: Vec<(&str, &str)> = keys.iter().map(|(k, d)| (k.as_str(), *d)).collect();
+            frame.render_widget(Paragraph::new(self.key_bar(&refs)), cols[0]);
+            self.draw_footer_badge(frame, cols[1]);
+            return;
         } else if self.current() == TabId::NewDisk {
             let step = self.newdisk.as_ref().map(|w| w.step);
             match step {
@@ -10911,7 +8706,11 @@ impl App {
         };
         frame.render_widget(Paragraph::new(self.key_bar(&keys)), cols[0]);
 
-        // Privilege badge + version, right-aligned (as the GUI shows version).
+        self.draw_footer_badge(frame, cols[1]);
+    }
+
+    /// Privilege badge + version, right-aligned (as the GUI shows version).
+    fn draw_footer_badge(&self, frame: &mut Frame, area: Rect) {
         let priv_style = if self.elevated {
             self.palette.accent()
         } else {
@@ -10921,7 +8720,7 @@ impl App {
             Span::styled(self.privilege_label(), priv_style),
             Span::styled(format!(" v{} ", env!("APP_VERSION")), self.palette.dim()),
         ]);
-        frame.render_widget(Paragraph::new(right).right_aligned(), cols[1]);
+        frame.render_widget(Paragraph::new(right).right_aligned(), area);
     }
 
     fn key_bar(&self, keys: &[(&str, &str)]) -> Line<'static> {
@@ -12001,32 +9800,6 @@ fn format_repair_lines(report: &crate::fs::RepairReport) -> Vec<String> {
     lines
 }
 
-/// Format a finished [`ChecksumStatus`](crate::model::checksum::ChecksumStatus)
-/// into display lines for the Commander's results overlay: each file's SHA256
-/// and CRC32 (or the error that stopped it), plus any fatal job error.
-fn build_checksum_lines(status: &crate::model::checksum::ChecksumStatus) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(e) = &status.error {
-        lines.push(format!("Error: {e}"));
-        lines.push(String::new());
-    }
-    let ok = status.results.iter().filter(|r| r.set.is_some()).count();
-    lines.push(format!("Hashed {ok}/{} file(s).", status.results.len()));
-    for r in &status.results {
-        lines.push(String::new());
-        lines.push(format!("{}  ({})", r.name, format_size(r.size)));
-        match (&r.set, &r.error) {
-            (Some(set), _) => {
-                lines.push(format!("  SHA256  {}", set.sha256_hex()));
-                lines.push(format!("  CRC32   {}", set.crc32_hex()));
-            }
-            (None, Some(err)) => lines.push(format!("  failed: {err}")),
-            (None, None) => lines.push("  (no result)".to_string()),
-        }
-    }
-    lines
-}
-
 /// Open the partition read-write and bless the directory at `dir_path` as the
 /// bootable System Folder, then commit. Mirrors the `bless set` verb's core
 /// (`set_blessed_folder`); errors (non-HFS filesystem, missing folder) bubble up
@@ -12400,54 +10173,49 @@ fn run_palette_command(input: &str) -> anyhow::Result<()> {
     crate::cli::dispatch(parsed.command)
 }
 
-/// Run `f` with the process's stdout AND stderr redirected to the null device,
-/// so shared code that prints advisories (`new::run` logs to both streams
-/// depending on the fs) doesn't scribble on the TUI's alternate screen. Safe
-/// because ratatui isn't writing during the synchronous call. Restores both
-/// afterward. No-op off Unix.
+/// Stderr pointed at the null device until dropped, so a worker's advisories cannot scribble on the screen.
 #[cfg(unix)]
-fn with_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        // Flush ratatui's buffered stdout before swapping the fd out.
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let saved_out = libc::dup(libc::STDOUT_FILENO);
-        let saved_err = libc::dup(libc::STDERR_FILENO);
-        if saved_out < 0 || saved_err < 0 {
-            if saved_out >= 0 {
-                libc::close(saved_out);
+struct MutedStderr(libc::c_int);
+
+#[cfg(unix)]
+impl MutedStderr {
+    fn new() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .ok()?;
+        // SAFETY: plain descriptor duplication; the saved copy is restored and closed on drop.
+        unsafe {
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                return None;
             }
-            if saved_err >= 0 {
-                libc::close(saved_err);
-            }
-            return f();
+            libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO);
+            Some(MutedStderr(saved))
         }
-        match std::fs::OpenOptions::new().write(true).open("/dev/null") {
-            Ok(devnull) => {
-                let nfd = devnull.as_raw_fd();
-                libc::dup2(nfd, libc::STDOUT_FILENO);
-                libc::dup2(nfd, libc::STDERR_FILENO);
-                let out = f();
-                let _ = std::io::stdout().flush();
-                libc::dup2(saved_out, libc::STDOUT_FILENO);
-                libc::dup2(saved_err, libc::STDERR_FILENO);
-                libc::close(saved_out);
-                libc::close(saved_err);
-                out
-            }
-            Err(_) => {
-                libc::close(saved_out);
-                libc::close(saved_err);
-                f()
-            }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MutedStderr {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the descriptor `new` saved and nothing else closes it.
+        unsafe {
+            libc::dup2(self.0, libc::STDERR_FILENO);
+            libc::close(self.0);
         }
     }
 }
 
 #[cfg(not(unix))]
-fn with_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
-    f()
+struct MutedStderr;
+
+#[cfg(not(unix))]
+impl MutedStderr {
+    fn new() -> Option<Self> {
+        Some(MutedStderr)
+    }
 }
 
 /// For task bodies on a worker: silence stderr only, since stdout carries the TUI's own drawing.
@@ -12501,14 +10269,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
-}
-
-#[cfg(feature = "remote")]
-impl crate::model::worker::WorkerStatus for ConnectStatus {
-    fn fail(&mut self, message: String) {
-        self.result = Some(Err(message));
-        self.finished = true;
-    }
 }
 
 #[cfg(test)]

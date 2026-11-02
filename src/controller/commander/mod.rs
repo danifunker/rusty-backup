@@ -18,6 +18,6 @@ pub use pane::{
 };
 pub use rows::{DisplayRow, RowKind};
 pub use screen::{
-    ChecksumRow, Checksums, CommanderAction, CommanderController, ExportFormat, FileDetail,
-    HashAlgo, MetadataEdit, RenameNotice, ResourceForkMode, Side,
+    ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField, ExportFormat,
+    FileDetail, HashAlgo, MetadataEdit, RenameNotice, ResourceForkMode, Side,
 };

@@ -66,7 +66,9 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   via `optical::rip::run_rip`. Wired; needs a physical drive to verify a full rip.
 - [x] **Archives** — open a Mac archive, list entries, extract to host (fork
   format cycled with `f`) via `macarchive::extract`.
-- [x] **Commander** — dual-pane (host folder / image partition) browse + copy
+- [x] **Commander** — now a view over the shared `CommanderController` (Phase 2
+  slice 8; keys and behaviour in `docs/commander_mode.md` §2.4). Original notes:
+  dual-pane (host folder / image partition) browse + copy
   between panes (host↔image, host↔host, **image↔image**) via `dir_listing` +
   `commander_ops`; **multi-select** (Space), **sort** (`s`/`S`), **new folder**
   (`n`), **delete** (`x`, confirmed) — all batch-aware.

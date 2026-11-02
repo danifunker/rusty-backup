@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-SHELLS=(src/gui src/cli/verbs/tui_app.rs src/optical/browse_view.rs)
+SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app src/optical/browse_view.rs)
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'

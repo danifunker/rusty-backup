@@ -394,3 +394,113 @@ fn a_pane_prompt_answer_returns_to_the_pane_that_asked() {
         ctl.log()
     );
 }
+
+fn ctrl(c: char) -> CommanderAction {
+    let mods = Mods {
+        ctrl: true,
+        ..Mods::default()
+    };
+    A::Key(Key::Char(c), mods)
+}
+
+#[test]
+fn keyboard_copy_and_delete_act_on_the_cursor_row_when_nothing_is_marked() {
+    let img = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("CUR.TXT"), b"c").unwrap();
+    let mut ctl = CommanderController::headless();
+    open_host(&mut ctl, Side::Left, host.path());
+    open_image(&mut ctl, Side::Right, img.path());
+    // A host pane starts on `..`, which is never copied.
+    ctl.apply(key(Key::F(6)));
+    assert!(ctl.pane(Side::Right).queue.is_empty());
+    ctl.apply(key(Key::Down));
+    ctl.apply(key(Key::F(6)));
+    assert_eq!(ctl.pane(Side::Right).queue.len(), 1, "{}", ctl.status());
+    ctl.apply(key(Key::Tab));
+    ctl.apply(key(Key::End));
+    ctl.apply(key(Key::F(8)));
+    assert!(
+        ctl.pane(Side::Right).queue.is_empty(),
+        "removed from staging"
+    );
+}
+
+#[test]
+fn source_sort_partition_and_log_commands() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    match ctl.apply(ctrl('o')).as_slice() {
+        [Effect::PickFile(spec)] => assert_eq!(
+            spec.purpose,
+            crate::controller::commander::purpose::OPEN_IMAGE
+        ),
+        other => panic!("expected an image picker, got {other:?}"),
+    }
+    assert_eq!(
+        ctl.asker(crate::controller::commander::purpose::OPEN_IMAGE),
+        Some(Side::Left)
+    );
+    let path = mbr_fat16(img.path());
+    ctl.apply(A::Picked {
+        purpose: crate::controller::commander::purpose::OPEN_IMAGE,
+        path: Some(path),
+    });
+    settle(&mut ctl);
+    assert!(ctl.pane(Side::Left).listing.is_loaded(), "{}", ctl.status());
+    assert!(!ctl.is_working());
+
+    ctl.apply(ctrl('s'));
+    assert!(ctl.pane(Side::Left).listing.is_descending());
+    assert!(
+        ctl.status().contains("Name, descending"),
+        "{}",
+        ctl.status()
+    );
+    ctl.apply(ctrl('s'));
+    assert_eq!(ctl.pane(Side::Left).listing.sort_column(), SortColumn::Size);
+
+    ctl.apply(ctrl('p'));
+    assert_eq!(
+        ctl.partitions_shown(),
+        None,
+        "one partition: nothing to choose"
+    );
+    ctl.apply(ctrl('l'));
+    assert!(ctl.log_shown());
+    ctl.apply(key(Key::Escape));
+    assert!(!ctl.log_shown());
+    assert_eq!(ctl.key_hint(Command::Checksums), "Ctrl+G");
+}
+
+#[test]
+fn a_detail_prompt_validates_and_stages_on_the_pane() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    ctl.apply(key(Key::End));
+    ctl.apply(key(Key::F(3)));
+    assert!(ctl.detail().is_some(), "{}", ctl.status());
+    let spec = match ctl.apply(A::EditDetail(DetailField::Mode)).as_slice() {
+        [Effect::AskText(spec)] => spec.clone(),
+        other => panic!("expected a prompt, got {other:?}"),
+    };
+    assert_eq!(spec.validate(""), Err(String::new()));
+    assert!(spec.validate("9").is_err());
+    assert!(spec.validate("644").is_ok());
+    let fx = ctl.apply(A::Answered {
+        purpose: spec.purpose,
+        text: Some("99999".into()),
+    });
+    assert!(
+        matches!(fx.as_slice(), [Effect::AskText(s)] if s.error.is_some()),
+        "a refused answer asks again: {fx:?}"
+    );
+    ctl.apply(A::Answered {
+        purpose: spec.purpose,
+        text: Some("644".into()),
+    });
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
+    let result = ctl.detail().and_then(|d| d.result.clone()).unwrap();
+    assert!(result.contains("644"), "{result}");
+}

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use disk_core::entry::FileEntry;
 
 use super::pane::{CommanderPaneAction, CommanderPaneController, PaneServices, StageOutcome};
-use super::{NoRecent, OnConflict};
+use super::{NoRecent, OnConflict, RecentStore};
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect};
 use crate::model::checksum::FileChecksum;
@@ -29,10 +29,13 @@ use crate::model::edit_queue::StagedEdit;
 use crate::model::job::{Job, JobRegistry, NoNotify, Notify, Resource, Snapshot};
 
 pub use crate::fs::export_selection::ExportFormat;
+use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
+pub use detail::DetailField;
 pub use fs_mac::resource_fork::ResourceForkMode;
 
 mod copy;
+mod detail;
 #[cfg(test)]
 mod tests;
 
@@ -70,6 +73,9 @@ impl Side {
 pub mod purpose {
     pub const EXPORT: &str = "commander.export";
     pub const CLOSE_UNSAVED: &str = "commander.close_unsaved";
+    pub const DETAIL_MODE: &str = "commander.detail_mode";
+    pub const DETAIL_OWNER: &str = "commander.detail_owner";
+    pub const DETAIL_XATTR: &str = "commander.detail_xattr";
 }
 
 /// Bytes of a file File Info reads for its preview.
@@ -133,6 +139,8 @@ pub enum CommanderAction {
     CloseDetail,
     /// A File Info editor's change, staged on the detail's pane.
     StageMetadata(Box<MetadataEdit>),
+    /// Ask for a new value of this File Info field, then stage it (the terminal's editors).
+    EditDetail(DetailField),
     /// Run the held host copy, settling existing files this way.
     HostConflict(OnConflict),
     HostConflictCancel,
@@ -148,6 +156,8 @@ pub enum CommanderAction {
     CopyLog,
     ClearLog,
     ShowHelp(bool),
+    /// The partition chooser for the active pane, for views without an always-visible picker.
+    ShowPartitions(bool),
     /// Close the screen, asking first while either pane has staged edits.
     RequestClose,
     /// A key press, resolved through the key map.
@@ -277,6 +287,10 @@ pub struct CommanderController {
     log: Vec<String>,
     show_log: bool,
     show_help: bool,
+    /// The pane whose partition chooser is up.
+    partitions: Option<Side>,
+    /// The pane where a key command selected the cursor row itself; a later key drops that selection.
+    implicit: Option<Side>,
     /// Which pane asked each outstanding picker, confirmation or prompt.
     askers: Vec<(&'static str, Side)>,
 }
@@ -285,6 +299,35 @@ impl Controller for CommanderController {
     type Action = CommanderAction;
 
     fn apply(&mut self, action: CommanderAction) -> Vec<Effect> {
+        if !matches!(
+            action,
+            CommanderAction::Key(..) | CommanderAction::SetPageRows(..)
+        ) {
+            self.implicit = None;
+        }
+        let fx = self.apply_action(action);
+        // A copy stages onto the other pane, so both panes' rows can change.
+        self.left.rebuild_rows();
+        self.right.rebuild_rows();
+        fx
+    }
+
+    fn tick(&mut self) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        for side in [Side::Left, Side::Right] {
+            let pane_fx = self.pane_mut(side).tick();
+            fx.extend(self.absorb(side, pane_fx));
+        }
+        self.poll_copy();
+        self.poll_checksums();
+        self.left.rebuild_rows();
+        self.right.rebuild_rows();
+        fx
+    }
+}
+
+impl CommanderController {
+    fn apply_action(&mut self, action: CommanderAction) -> Vec<Effect> {
         use CommanderAction as A;
         match action {
             A::Pane(side, a) => self.forward(side, a),
@@ -330,6 +373,7 @@ impl Controller for CommanderController {
                 self.stage_metadata(*edit);
                 Vec::new()
             }
+            A::EditDetail(field) => self.ask_detail(field, None, None),
             A::HostConflict(on) => {
                 self.resolve_conflict(Some(on));
                 Vec::new()
@@ -380,6 +424,13 @@ impl Controller for CommanderController {
                 self.show_help = on;
                 Vec::new()
             }
+            A::ShowPartitions(on) => {
+                self.partitions = None;
+                if on {
+                    self.toggle_partitions(self.active);
+                }
+                Vec::new()
+            }
             A::RequestClose => self.request_close(),
             A::Key(key, mods) => self.key(key, mods),
             A::SetPageRows(side, rows) => {
@@ -412,22 +463,14 @@ impl Controller for CommanderController {
                 let side = self.asker_take(purpose);
                 self.forward(side, CommanderPaneAction::Confirmed { purpose, yes })
             }
+            A::Answered { purpose, text } if DetailField::for_purpose(purpose).is_some() => {
+                self.detail_answered(purpose, text)
+            }
             A::Answered { purpose, text } => {
                 let side = self.asker_take(purpose);
                 self.forward(side, CommanderPaneAction::Answered { purpose, text })
             }
         }
-    }
-
-    fn tick(&mut self) -> Vec<Effect> {
-        let mut fx = Vec::new();
-        for side in [Side::Left, Side::Right] {
-            let pane_fx = self.pane_mut(side).tick();
-            fx.extend(self.absorb(side, pane_fx));
-        }
-        self.poll_copy();
-        self.poll_checksums();
-        fx
     }
 }
 
@@ -437,6 +480,30 @@ fn clip(text: String) -> Vec<Effect> {
 
 fn log_timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// The sort the Sort command steps to: this column descending, then the next column ascending.
+fn next_sort(pane: &CommanderPaneController) -> SortColumn {
+    let col = pane.listing.sort_column();
+    if !pane.listing.is_descending() {
+        return col;
+    }
+    match col {
+        SortColumn::Name => SortColumn::Size,
+        SortColumn::Size => SortColumn::Modified,
+        SortColumn::Modified => SortColumn::Type,
+        SortColumn::Type => SortColumn::Name,
+    }
+}
+
+fn sort_status(side: Side, listing: &crate::model::dir_listing::DirListing) -> String {
+    let dir = if listing.is_descending() {
+        "descending"
+    } else {
+        "ascending"
+    };
+    let col = listing.sort_column();
+    format!("[{}] Sorted by {col:?}, {dir}.", side.label())
 }
 
 impl CommanderController {
@@ -469,19 +536,34 @@ impl CommanderController {
             log: Vec::new(),
             show_log: false,
             show_help: false,
+            partitions: None,
+            implicit: None,
             askers: Vec::new(),
         }
     }
 
     /// One shared job registry, no wake, no recent files and the default keys: for tests and the CLI.
     pub fn headless() -> Self {
+        Self::polled(
+            Box::new(NoRecent),
+            Box::new(NoRecent),
+            KeyMap::for_this_platform(),
+        )
+    }
+
+    /// One shared job registry and no wake, for a view that polls `tick` while [`Self::is_working`].
+    pub fn polled(
+        left_recent: Box<dyn RecentStore>,
+        right_recent: Box<dyn RecentStore>,
+        keymap: KeyMap,
+    ) -> Self {
         let jobs = JobRegistry::new();
-        let services = || PaneServices {
+        let services = |recent| PaneServices {
             jobs: jobs.clone(),
             notify: Arc::new(NoNotify),
-            recent: Box::new(NoRecent),
+            recent,
         };
-        Self::new(services(), services(), KeyMap::for_this_platform())
+        Self::new(services(left_recent), services(right_recent), keymap)
     }
 
     // --- read accessors ---------------------------------------------------
@@ -551,6 +633,23 @@ impl CommanderController {
         self.show_help
     }
 
+    /// The pane whose partition chooser is up, if one is.
+    pub fn partitions_shown(&self) -> Option<Side> {
+        self.partitions
+    }
+
+    /// True while any job runs (an open, apply, copy, export, wrapper or checksum), so a view polls.
+    pub fn is_working(&self) -> bool {
+        let pane_busy = |p: &CommanderPaneController| p.is_busy() || p.wrapper_opening().is_some();
+        let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());
+        self.copy.is_some() || hashing || pane_busy(&self.left) || pane_busy(&self.right)
+    }
+
+    /// The first chord for `cmd` as this platform writes it, or "" when unbound.
+    pub fn key_hint(&self, cmd: Command) -> String {
+        self.keymap.hint(cmd)
+    }
+
     /// Every command with its first chord on this platform, for the help window.
     pub fn key_help(&self) -> Vec<(&'static str, String)> {
         let rows = Command::ALL.iter();
@@ -613,6 +712,9 @@ impl CommanderController {
     }
 
     fn forward(&mut self, side: Side, action: CommanderPaneAction) -> Vec<Effect> {
+        if matches!(action, CommanderPaneAction::SelectPartition(_)) {
+            self.partitions = None;
+        }
         let fx = self.pane_mut(side).apply(action);
         self.absorb(side, fx)
     }
@@ -695,7 +797,23 @@ impl CommanderController {
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
         use CommanderPaneAction as P;
         let side = self.active;
+        if let Some(was) = self.implicit.take() {
+            if self.pane(was).selection_len() == 1 {
+                self.forward(was, P::ClearSelection);
+            }
+        }
+        if matches!(
+            cmd,
+            Command::Copy | Command::Delete | Command::Checksums | Command::Export
+        ) && self
+            .pane_mut(side)
+            .select_cursor_if_none(cmd == Command::Delete)
+        {
+            self.implicit = Some(side);
+        }
         let page = self.page_rows[side.idx()];
+        let pane = self.pane(side);
+        let remote_root = pane.is_remote_image() && pane.listing.at_root();
         let pane_action = match cmd {
             Command::CursorUp => Some(P::CursorUp),
             Command::CursorDown => Some(P::CursorDown),
@@ -704,24 +822,42 @@ impl CommanderController {
             Command::Home => Some(P::CursorHome),
             Command::End => Some(P::CursorEnd),
             Command::Open => Some(P::ActivateCursor),
+            // At a remote image's root, going up leaves it for the daemon's host listing.
+            Command::Parent if remote_root => Some(P::CloseRemoteImage),
             Command::Parent => Some(P::Up),
             Command::Mark => Some(P::ToggleMark),
             Command::Refresh => Some(P::Reload),
             Command::Info => Some(P::InfoAtCursor),
             Command::Rename => Some(P::RenameAtCursor),
             Command::NewFolder => Some(P::RequestNewFolder),
-            Command::Apply if self.pane(side).can_apply() => Some(P::Apply),
+            Command::Apply if pane.can_apply() => Some(P::Apply),
             Command::Delete if self.can_delete() => Some(P::Delete),
+            Command::OpenImage => Some(P::PickImage),
+            Command::OpenFolder => Some(P::PickHostFolder),
+            Command::OpenBackup => Some(P::PickBackupFolder),
+            Command::Connect => Some(P::Connect),
+            Command::Sort => Some(P::SortBy(next_sort(pane))),
+            Command::Edits if !pane.queue.is_empty() => Some(P::ShowEdits(!pane.edits_shown())),
             Command::Apply
             | Command::Delete
+            | Command::Edits
             | Command::Help
             | Command::SwitchPane
             | Command::Copy
             | Command::Edit
-            | Command::Close => None,
+            | Command::Close
+            | Command::Partition
+            | Command::Checksums
+            | Command::Export
+            | Command::Log => None,
         };
         if let Some(action) = pane_action {
-            return self.forward(side, action);
+            let sort = matches!(action, P::SortBy(_));
+            let fx = self.forward(side, action);
+            if sort {
+                self.status = sort_status(side, &self.pane(side).listing);
+            }
+            return fx;
         }
         match cmd {
             Command::Help => self.show_help = !self.show_help,
@@ -732,6 +868,11 @@ impl CommanderController {
                 }
             }
             Command::Close => return self.close_shortcut(),
+            Command::Partition => self.toggle_partitions(side),
+            Command::Checksums => self.status = self.start_checksums(side),
+            Command::Export => return self.request_export(side, None),
+            Command::Log => self.show_log = !self.show_log,
+            Command::Edits => self.status = format!("[{}] No staged edits.", side.label()),
             // No edit operation exists yet; Apply and Delete land here only when refused.
             Command::Edit | Command::Apply | Command::Delete => {}
             Command::CursorUp
@@ -746,15 +887,36 @@ impl CommanderController {
             | Command::Refresh
             | Command::Info
             | Command::Rename
-            | Command::NewFolder => {}
+            | Command::NewFolder
+            | Command::OpenImage
+            | Command::OpenFolder
+            | Command::OpenBackup
+            | Command::Connect
+            | Command::Sort => {}
         }
         Vec::new()
     }
 
+    /// Show `side`'s partition chooser, or hide it; a source with one volume has nothing to choose.
+    fn toggle_partitions(&mut self, side: Side) {
+        if self.partitions.is_some() {
+            self.partitions = None;
+        } else if self.pane(side).partition_labels().len() > 1 {
+            self.partitions = Some(side);
+        } else {
+            self.status = format!("[{}] No other partition to choose.", side.label());
+        }
+    }
+
     /// Esc closes the topmost Commander window, then Commander itself.
     fn close_shortcut(&mut self) -> Vec<Effect> {
+        let active = self.active;
         if self.show_help {
             self.show_help = false;
+        } else if self.partitions.is_some() {
+            self.partitions = None;
+        } else if self.pane(active).edits_shown() {
+            return self.forward(active, CommanderPaneAction::ShowEdits(false));
         } else if self.detail.is_some() {
             self.detail = None;
         } else if self.checksums.is_some() {

@@ -52,3 +52,9 @@ for wasm32) is a CI target too; the check script knows it.
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 
 Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`).
+
+## Screens on the shared controllers
+
+| Screen | Controller | egui | TUI | Gaps |
+|---|---|---|---|---|
+| Commander | `controller::commander` (`CommanderController`) | yes | yes (Phase 2 slice 8): staged edits + Apply (F10) with preflight, review and report; unlock; image, host, backup (native / Clonezilla + partclone caches), archive and optical sources; wrapper expansion; rename (F2); new folder (Ctrl+N); export; host-copy conflict review; rename notice; remote (Ctrl+K); checksums; File Info with mode / owner / xattr prompts | TUI: no clipboard (the text is shown to select instead); the type/creator, ProDOS and date editors and the content preview are egui-only |

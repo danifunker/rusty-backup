@@ -21,8 +21,8 @@ use eframe::egui;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    CommanderAction, CommanderController, ExportFormat, FileDetail, HashAlgo, MetadataEdit,
-    OnConflict, PaneServices, ResourceForkMode, Side,
+    CommanderAction, CommanderController, CommanderPaneAction, ExportFormat, FileDetail, HashAlgo,
+    MetadataEdit, OnConflict, PaneServices, ResourceForkMode, Side,
 };
 use rusty_backup::controller::keys::{Key, KeyMap, Mods};
 use rusty_backup::controller::Controller;
@@ -228,6 +228,7 @@ impl CommanderMode {
         self.render_detail_window(&ctx, &mut acts);
         self.render_log_window(&ctx, &mut acts);
         self.render_help(&ctx, &mut acts);
+        self.render_partitions(&ctx, &mut acts);
 
         let whose = self
             .effects
@@ -588,6 +589,33 @@ impl CommanderMode {
             });
         if !open {
             acts.push(A::ShowHelp(false));
+        }
+    }
+}
+
+impl CommanderMode {
+    /// The partition chooser the Partition shortcut opens (the source bar's combo does the same).
+    fn render_partitions(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        let Some(side) = self.ctl.partitions_shown() else {
+            return;
+        };
+        let pane = self.ctl.pane(side);
+        let mut open = true;
+        egui::Window::new(format!("Choose partition ({})", side.label()))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                for (i, label) in pane.partition_labels().iter().enumerate() {
+                    let on = pane.selected_partition() == Some(i);
+                    if ui.selectable_label(on, label).clicked() {
+                        acts.push(A::Pane(side, CommanderPaneAction::SelectPartition(i)));
+                    }
+                }
+            });
+        if !open {
+            acts.push(A::ShowPartitions(false));
         }
     }
 }

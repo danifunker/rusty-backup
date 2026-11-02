@@ -372,7 +372,7 @@ impl CommanderPaneController {
         out
     }
 
-    fn rebuild_rows(&mut self) {
+    pub(in crate::controller::commander) fn rebuild_rows(&mut self) {
         // A remote host listing tints images and never expands wrappers.
         self.remote_host = self.is_remote_host();
         self.rows = build_display_rows(
@@ -550,6 +550,30 @@ impl CommanderPaneController {
         if let Some(note) = self.wrapper_tree.note(node_id) {
             self.out.push(Effect::Message(format!("{name}: {note}")));
         }
+    }
+
+    /// Select the cursor row for a key command when nothing is selected; true when it did.
+    pub(in crate::controller::commander) fn select_cursor_if_none(
+        &mut self,
+        pending_ok: bool,
+    ) -> bool {
+        let Some(row) = self.cursor_row().filter(|_| !self.has_selection()) else {
+            return false;
+        };
+        if row.is_parent() || (!pending_ok && row.kind == RowKind::PendingAdd) {
+            return false;
+        }
+        if row.is_tree {
+            self.tree_context_select(row.node_id);
+        } else {
+            self.context_select(&row.name);
+        }
+        true
+    }
+
+    /// The number of selected rows, listing or wrapper tree.
+    pub(in crate::controller::commander) fn selection_len(&self) -> usize {
+        self.tree_selected.len() + self.listing.selection().len()
     }
 
     fn cursor_row(&self) -> Option<DisplayRow> {
