@@ -63,8 +63,8 @@ widget, show_log, the metadata editor widgets.
 | 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` answered by a per-view `gui::effects::EffectHost` | done (ad0950b4, 49fdb34b) |
 | 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | done (52b691de, eddb9dee) |
 | 5 | Remote (cfg `remote`): connect, open / close image, remote apply | done (1718ee44) |
-| 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | |
-| 7 | Full key map wired in egui (help overlay listing the bindings) | |
+| 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | done (4b807866, 665f7573) |
+| 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | |
 | 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | |
@@ -118,7 +118,7 @@ Slice 5 notes:
   its queue and report, and is not reopened.
 - `PaneRequest` is down to `ShowInfo`; `SourceReset` and `OpenImage` are gone.
   `display_rows()` takes no argument (the controller knows when it is remote).
-- `gui/commander/progress.rs` stays: the host copy and stage copy still use it.
+- `gui/commander/progress.rs` stays: the host copy and stage copy still use it (gone in slice 6).
 - Behaviour changes: a remote host pane no longer shows Apply / Discard / New
   Folder (staging there never worked); Delete / F8 / rename on a remote pane are
   refused up front; the connect prompt validates the port; a remote copy that hits
@@ -126,6 +126,38 @@ Slice 5 notes:
 - Tests: `tests/remote_filesystem.rs` `commander_remote::*` drive the controller
   against a loopback daemon (connect, open, new folder, apply, reopen, close,
   disconnect; Skip and Replace; a refused connect).
+
+Slice 6 notes:
+
+- `CommanderController` (`controller/commander/screen.rs`, `screen/copy.rs`) owns both
+  panes. `Pane(side, ..)` forwards; a pane's `Message`s become the status line
+  (`[L] ...`), its `take_log` lines the session log, its File Info requests
+  (`take_info_request`, which replaced `PaneRequest`) open the detail data. A pane's
+  picker / confirm / prompt leaves as an effect and the answer is routed back to the
+  pane that asked by `purpose` (`asker`); the screen's own purposes are `EXPORT` and
+  `CLOSE_UNSAVED`. The egui Commander has one `EffectHost`.
+- Copy, stage copy, export and checksums are jobs on the app registry
+  (`commander_ops::{host_copy_in_job, stage_copy_in_job}`, `checksum::checksum_in_job`,
+  all over the old runners through `worker::run_mirrored`). They hold the destination
+  folder and the source image they read, so an apply on that source waits. One copy or
+  export runs at a time.
+- Archive wrapper mounts now carry a reopen recipe (`ReopenRecipe::ArchiveBytes` or
+  by path), so the synchronous wrapper copy / export fallbacks and `export_now` are gone.
+- `Key(Key, Mods)` resolves through the `KeyMap` in the controller (`binds` tells the
+  view which events to hand over); the F1 help rows come from `key_help()`. That
+  covers slice 7.
+- File Info: the controller holds side, entry, editable, fs type, preview bytes,
+  xattrs and the last result; the egui editors read the pane queue through a
+  `MetadataSink` and send `StageMetadata(MetadataEdit)`; `EditQueue::stage_metadata`
+  does the staging (the browse view uses the same sink on its own queue).
+- Transitional: the File Info preview (up to 1 MiB) and xattrs are still read
+  synchronously from the pane's open filesystem in `OpenDetail`; host-copy conflict
+  detection stats the destination on the UI thread, as before.
+- Behaviour changes: the checksum window shows a progress bar, then all results (not
+  each file as it finishes) and gains "Copy all"; a second copy cannot start while a
+  stage copy runs (before only host copies blocked it); metadata edits are refused
+  while the pane applies; a copy/export from a `.sit` expanded inside an image now
+  runs as a job with progress; the unsaved-close dialog is the shared confirmation.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,

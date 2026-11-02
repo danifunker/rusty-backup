@@ -153,6 +153,24 @@ read-only `open()` and the editable `open_editable()` → `(efs, commit)` pair. 
 image pane owns one. This is the single biggest reuse: Commander does **not** learn
 container formats — it asks `BrowseSession`.
 
+### 2.4 Where the code lives now (Phase 2)
+
+The sketches above are the original plan. Since Phase 2 of
+[native_frontends_plan.md](native_frontends_plan.md) the logic lives in controllers
+every shell shares, and `src/gui/commander/` only draws:
+
+- `controller::commander::CommanderPaneController` (`src/controller/commander/pane*`):
+  one pane's source, listing, queue, wrapper tree, apply, host writes, remote.
+- `controller::commander::CommanderController` (`src/controller/commander/screen*`):
+  both panes, the active side, the status line and session log, the key map, the
+  cross-pane copy, export, checksums, the File Info data, the host-conflict review,
+  the rename notice and Close (`Effect::Confirm` while edits are staged, then
+  `Effect::CloseScreen`). Copy, stage copy, export and checksums are `model::job`
+  jobs; the view draws them with `gui::progress::show_job`.
+- `src/gui/commander/mod.rs` / `pane.rs`: egui drawing, egui keys translated to
+  `controller::keys::Key`, and one `EffectHost` for pickers and prompts. The File
+  Info metadata editors stay in the view and send `StageMetadata` back.
+
 ---
 
 ## 3. Reuse & refactor strategy
@@ -261,7 +279,7 @@ backend combinations; each preserves as much metadata as the destination support
 | Source → Dest | Mechanism | Staged? |
 |---------------|-----------|---------|
 | **host → image** | stage `StagedEdit::AddFile { host_path = real file, ... }` (the existing add-file flow) | yes (dest queue) |
-| **image → image** | extract source entry (data fork **+** resource fork + type/creator/aux) to `CommanderMode::temp`, then stage `AddFile { host_path = temp, resource_fork, hfs_type_override, .. }` on dest | yes (dest queue) |
+| **image → image** | extract source entry (data fork **+** resource fork + type/creator/aux) to the controller's temp dir (a job), then stage `AddFile { host_path = temp, resource_fork, hfs_type_override, .. }` on dest | yes (dest queue) |
 | **image → host** | extract source data fork straight to the host destination path | no (immediate) |
 | **host → host** | `std::fs::copy` | no (immediate) |
 
@@ -333,8 +351,8 @@ The TUI keeps the stop-at-first-failure `apply_edits` contract.
 
 ### 5.5 Temp-file lifetime
 
-Files extracted for image→image / import copies live in `CommanderMode::temp`
-(a `tempfile::TempDir`) until the destination queue is **applied**, because the staged
+Files extracted for image→image / import copies live in the screen controller's
+temp dir (`CommanderController`, a `tempfile::TempDir`) until the destination queue is **applied**, because the staged
 `AddFile` references them by path. Applying the queue (or discarding it) is when the
 temp entries can be reclaimed.
 
