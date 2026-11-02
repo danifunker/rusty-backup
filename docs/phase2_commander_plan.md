@@ -66,7 +66,7 @@ widget, show_log, the metadata editor widgets.
 | 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | done (4b807866, 665f7573) |
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
-| 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | |
+| 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
 | 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | |
 
 Slice 3 notes, for the slices that follow:
@@ -193,7 +193,40 @@ Slice 8 notes:
   log. Behaviour change (both views): F6 / F8 / Ctrl+G / Ctrl+E act on the cursor
   row when nothing is selected.
 - Not carried over: the old File Info's SquashFS size budget and uid/gid names
-  (FileDetail does not carry them yet).
+  (FileDetail does not carry them yet). Restored in slice 9.
+
+Slice 9 notes:
+
+- Quit guard (7f677b11): `CommanderAction::RequestQuit` asks with the shared
+  unsaved-edits confirmation (purpose `QUIT_UNSAVED`) and emits the new `Effect::Quit`.
+  The TUI's `q` and top-level Esc go through it from any tab (switching to Commander to
+  ask); the GUI cancels a window close (`ViewportCommand::CancelClose`) while edits are
+  staged and closes on yes. Ctrl+C in the TUI still quits at once (the emergency exit).
+  The GUI Commander is a full-window overlay, so there is no tab switch that could drop it.
+- Leftovers (c3e749c5): File Info reads its preview, xattrs, uid/gid names and (in a
+  SquashFS volume's root folder) the size budget in a job (`model::entry_detail`) over the
+  pane's `StageSource`; `FileDetail.loading` is true until it lands, and closing File Info
+  cancels it. Closing the checksum window cancels the hashing job. The TUI shows
+  `keybindings.toml` problems in the status line and the session log. The TUI's
+  unreachable Commander placeholder is gone.
+- Enforcement (283d6f92): `ENFORCED` in `scripts/check-boundaries.sh` lists
+  `src/gui/commander` and `src/cli/verbs/tui_app/commander.rs`; both are at 0. The global
+  report went 863 -> 858. `controller::commander` re-exports `EditQueue`, `JobRegistry`,
+  `FileEntry`, `format_size`, `IdNameMap`, `Xattr`, `SizePlan`.
+- Behaviour changes: quitting with staged edits asks (TUI and GUI); File Info shows owner
+  names and the SquashFS budget in both views, and its preview appears a moment after the
+  window opens ("Reading..." until then).
+- Left:
+  - `host_copy_conflicts` still stats the destination on the UI thread
+    (`controller/commander/screen/copy.rs` `copy` and `export_picked`); it is one stat per
+    selected top-level entry, not a walk, but a slow network folder would stall a frame.
+    Making it a job needs a "checking" step before the conflict review.
+  - The TUI has no wake: crossterm's `event::poll` cannot be woken from another thread,
+    so a real wake needs an input-reader thread feeding a channel (and stopping it around
+    the `:` palette, which reads stdin itself). The 50 ms poll while working stays.
+  - The GUI Commander still reaches the model through shared egui helpers outside the
+    enforced path (`gui::metadata_editor`, `gui::file_detail`, `gui::source_picker`);
+    slice 10 and later move those.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
