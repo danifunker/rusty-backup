@@ -20,7 +20,6 @@ mod optical_audio;
 mod optical_tab;
 mod partition_bar;
 mod partition_editor_modal;
-mod pending_image;
 mod physical_disk_export;
 mod progress;
 mod remote_browser;

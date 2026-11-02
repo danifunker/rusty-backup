@@ -27,7 +27,7 @@ Line numbers are a snapshot. Re-check them before editing.
 | 1. Backup source scan / image preview | **Done** (ab571753): `model::source_scan`. |
 | 2. Browse writes | **Done.** Apply (2bb6fad1, `commander_ops::apply_queue`), export selection with progress and cancel, tar import (3895cbd1), text editor open / save (6b2a71bd), free-space probe (4d124701). |
 | 3. CHD edit mode | **Done** (5a3aea86): `model::chd_edit_open`, with a progress bar for the backup copy. |
-| 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep` + `gui::pending_image`, with a progress bar for `.hdz` / `.adz`. |
+| 4. `prepare_disk_image_path` | **Done** (3f926ec0): `model::image_prep`, decoded in a job by `controller::backup` and `controller::restore` (`gui::pending_image` retired in slice 13), with a progress bar for `.hdz` / `.adz`. |
 | 5. fsck / repair | **Done.** GUI (6883328f): `fsck_runner::{check_target, repair_and_recheck}`. TUI: Explorer check and repair as tasks (896e8c6c). |
 | 6. Archive sniff during render | **Done** (6fd8b904). |
 | 7. Remote I/O | **Done except Commander.** Optical drive re-scan and remote-browser folder entry (772c422c). Commander's remote navigation waits for the Phase 2 Commander view-model: its listing is shared with copy, tree and selection. |
