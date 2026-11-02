@@ -2,7 +2,7 @@
 
 This document describes how to contribute code to Rusty Backup. The first half is the usual setup / build / test / commit info. The second half — **Architecture & code-placement rules** — is the important part: it captures the lessons from the large late-april refactor (the in-tree audit checklist that drove it has since been retired) so that future code lands in the right place the first time and we don't have to do that kind of cleanup pass again.
 
-If you only read one section, read **"Where code lives"** and **"Adding a feature: the playbook"**.
+If you only read one section, read **"Architecture policy (MVC)"**: it is binding for every change.
 
 ---
 
@@ -59,138 +59,210 @@ numbers: [docs/build-memory-crashes.md](docs/build-memory-crashes.md).
 
 ---
 
-## Where code lives
+## Architecture policy (MVC) — read before adding any code
 
-The codebase has four layers. **Adding code in the wrong layer is the single biggest source of entanglement.** Know which layer your change belongs in before you start.
+This section is **binding**. Every change, in every front end, follows it. If a
+change seems to need an exception, stop and raise it instead of working around
+it. `CLAUDE.md` points every agent here before it writes code.
+
+### The three layers
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  src/gui/        — view layer (egui widgets, dialogs)    │  pure rendering + dispatch
-│                    NEVER owns long-running work          │
-├──────────────────────────────────────────────────────────┤
-│  src/model/      — orchestration (runners, queues,       │  spawns workers, owns Status,
-│                    status structs, edit queues)          │  exposes pure functions
-├──────────────────────────────────────────────────────────┤
-│  src/fs/         — filesystem trait + implementations    │  per-FS readers/editors
-│  src/rbformats/  — VHD/CHD/zstd/raw compress/decompress  │  format codecs
-│  src/partition/  — MBR/GPT/APM parsing + alignment       │  partition tables
-│  src/backup/     — backup orchestration + sizing         │  cross-FS workflows
-│  src/restore/    — restore orchestration + validation    │  cross-FS workflows
-│  src/clonezilla/ — Clonezilla image format reader        │  external format
-├──────────────────────────────────────────────────────────┤
-│  src/error.rs, src/os/, src/device/, src/update/, etc.   │  utilities, OS shims
-└──────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│ VIEW        src/gui/ (egui)   src/cli/ (rb-cli verbs)   the TUI            │
+│             future native shells (AppKit / GTK4 / Win32, written in Rust)  │
+│             renders state, maps input to Actions, fulfils Effects          │
+├───────────────────────────────────────────────────────────────────────────┤
+│ CONTROLLER  src/vm/  (one controller per task, screen or dialog)           │
+│             state machines, Actions in / Effects out, validation rules,    │
+│             key bindings, widget ids, job orchestration                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│ MODEL       crates/*   (formats, filesystems, partition tables, containers)│
+│             src/{fs,partition,rbformats,backup,restore,os,optical,...}     │
+│             src/model/ (domain operations, runners, edit queue, jobs)      │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Dependency direction
+**One controller per task, shared by every view.** The GUI, the TUI and the CLI
+drive the *same* controller for the same task. Backup is one controller whether
+it is started from the Backup tab, a TUI screen or `rb-cli backup`. A view never
+re-implements what a controller does, and a controller never knows which view
+is driving it.
 
-Always upward — never sideways within a layer or downward.
+Dependencies point **down only**: view -> controller -> model. A model module
+never imports a controller or a view; a controller never imports a view or a
+toolkit.
 
-- `gui/` may depend on `model/` and the engine layer (`fs/`, `rbformats/`, `partition/`, `backup/`, `restore/`).
-- `model/` may depend on the engine layer.
-- Engine modules may depend on each other within the same layer **only** when the dependency direction is obvious (e.g. `restore/` calls into `fs/` and `partition/`, never the other way around).
-- The classic violation we just had to fix: `partition/` must **not** depend on `restore/`. `PartitionSizeOverride` lives in `partition/` because `partition/mbr.rs`, `partition/apm.rs`, and `partition/gpt.rs` consume it. Don't move things to where the *use case* lives if the *types* are shared more broadly.
+### Separation of duties
 
-### What `gui/` may NOT do
+| Layer | Owns | Must not |
+|---|---|---|
+| **Model** | The truth: on-disk formats, filesystems, partition tables, containers, persistence (config, recent files), and domain operations (open, list, stage, apply, back up, restore). Pure functions and runners that report progress through callbacks or `model::job`. | Touch any UI toolkit, hold UI state (selection, cursor, which dialog is open), format text for display beyond plain data, or know a controller exists. |
+| **Controller** (`src/vm/`) | Everything the user is *doing*: what is open, selected, staged, running and failing; which dialog or prompt is up; what an input means (the key map); validation rules; the `Action` enum it accepts and the `Effect` enum it emits; stable widget ids; starting, polling and cancelling jobs. | Import a toolkit (egui, ratatui/crossterm, rfd, objc2, gtk, Win32 UI), spawn raw threads, draw, block on I/O on the caller's thread, or assume a particular view. |
+| **View** | Presentation only: layout, colours, fonts, scrolling, focus, animation. Turns raw input into controller `Action`s (through the controller's key map), draws from the controller's read accessors, and fulfils `Effect`s (file pickers, prompts, confirmations, clipboard). | Contain domain logic or business rules, import `model`/engine/crate types directly (the controller re-exports the plain data it hands out), spawn threads, decide what a key does, or keep state the controller should own. |
 
-- Spawn background work directly. Always go through a `model/*_runner.rs`.
-- Hold heavy state. The view holds `Arc<Mutex<XxxStatus>>` snapshots and small UI scratch (text fields, scroll positions, popup open/closed flags). The actual data lives in a model object.
-- Define on-the-wire types (Status structs, edit enums). Those go in `model/`.
-- Inline 50+ line orchestration bodies. If a button handler grew past ~30 lines, the work belongs behind a model function.
+**The litmus test** for any piece of logic: *could a second view need it?* If
+yes, it is controller or model code, even if only one view uses it today.
+Copying logic into a second view is how two implementations drift (Commander
+Mode once could not open Clonezilla backups because source resolution was
+trapped in the Inspect view). When logic is found in a view, **move it down**;
+never copy it sideways.
 
-### What `model/` may NOT do
+| Kind of logic | Home |
+|---|---|
+| A format, filesystem, partition-table or container rule | a `crates/*` crate (or `src/fs`, `src/partition`, ... until it moves) |
+| A domain operation with progress (open, list, stage, apply, back up) | `src/model/` runner or function, run as a `model::job` |
+| "What happens when the user does X" (state, sequencing, enablement, validation) | the task's controller in `src/vm/` |
+| A key binding or shortcut | the controller key map (`src/vm/keys.rs`), never a view |
+| Layout, widget state, scroll position, colours | the view |
 
-- Touch egui or `eframe::App`. Model code must be testable without a GUI.
-- Render anything. Model functions return data; the view renders it.
+### Rust and the front end
 
----
+- **All logic is Rust.** The model and controllers are Rust in this repository,
+  compiled by every target, including the vintage ones (Rust 1.73 and mrustc;
+  see [Rust 1.73 floor for engine code](#rust-173-floor-for-engine-code)).
+- **Views are Rust too.** egui, the TUI and the CLI already are. Native shells
+  (AppKit, GTK4, Win32) are written in Rust over the platform's bindings
+  (`objc2`, `gtk4-rs`, `windows-rs`): Rust calls into the native toolkit, so the
+  boundary between our code and the platform is the toolkit's API, inside Rust.
+- A non-Rust file in a shell (an `Info.plist`, a manifest, an icon, a XIB or
+  resource script) carries **no logic**. If a platform genuinely needs native
+  code (Swift, Objective-C, C#), it is a thin widget wrapper that calls back
+  into Rust and holds no rules or state.
 
-## Presentation layers: one model, many UIs (CLI, GUI, and a future TUI)
+### Controllers: the contract
 
-This project has **more than one front end over the same core**, and is adding
-more. Today: `src/gui/` (egui) and `src/cli/` (40+ verbs over `model/` with no
-egui). A **TUI** (`src/tui/`, crossterm) is planned. They are all *thin adapters*
-over the same `model/` + engine. The CLI is the proof the pattern works — it
-drives backup, inspect, browse-view editing, fsck, resize, etc. without a single
-GUI type.
+- A controller implements `vm::ViewModel`: `apply(Action) -> Vec<Effect>` for
+  user intents and `tick() -> Vec<Effect>` to drain finished jobs. Views read
+  state through plain accessors.
+- **`Action` and `Effect` enums are exhaustive.** Views `match` them with no `_`
+  arm, so a new action or effect fails to compile in every view that has not
+  handled it. That compile error is how a feature reaches every front end.
+- **Every actionable element has a stable widget id** in the controller's `ids`
+  module; every view sets it as the accessibility identifier, so one UI
+  scenario test drives every view.
+- **One controller, many uses.** When a second use case needs a variation, add
+  a *profile* (a configuration struct of capabilities: read-only, staging on or
+  off, which columns, which sources) to the existing controller. Do not fork
+  it. The file browser is the reference: one browser-pane controller, configured
+  per use (each Commander pane, the Inspect browse view, the TUI explorer).
+- **The CLI is a view.** An `rb-cli` verb parses arguments into the
+  controller's input, runs it (interactive prompts become flags or `--yes`), and
+  prints its results. It does not reach past the controller into the model for
+  anything the controller covers.
 
-**The rule that keeps it that way — the litmus test:**
+### Prompts, confirmations and validation
 
-> **Could the CLI (or a headless test, or a TUI) call this without egui /
-> crossterm / rfd?** If yes, it belongs in `model/` or the engine — *not* in
-> `gui/` (or `tui/`). A pure predicate, a partition probe, a "resolve this picked
-> source into openable partitions" routine, a thread-spawn that reports progress
-> — all pass the test, so none of them may live in a view.
+- A view asks the user something only because a controller emitted an `Effect`
+  (`PickFile`, `PickFolder`, `Confirm`, `AskPassword`, `AskText`), and it
+  answers with the matching `Action`.
+- **Validation rules belong to the controller; the view runs them.** A text
+  prompt carries a validator the controller defines (a plain Rust function from
+  the input to "ok" or an error message). The view calls it as the user types
+  to show the error inline and to enable the OK button. The controller runs the
+  same validator again on the answer: the view's check is for feedback, the
+  controller's is authoritative.
 
-When a view needs logic that fails the test only because it's *currently written*
-inside a view (a private `fn` in `gui/inspect_tab.rs`, say), the fix is to **move
-it down**, not to copy it into the second UI. Copying is how you get two
-divergent implementations that drift — exactly the trap that left Commander Mode
-unable to open Clonezilla backups or to gate out non-filesystem partitions,
-because the source-resolution + `is_browsable_type*` gates were trapped in the
-Inspect view. (The gates now live in `fs/`; source resolution is being lifted
-into `model/`.)
+### Key bindings
 
-**Where each kind of shared logic goes:**
+- Every shortcut is **data**: one table in `src/vm/keys.rs` of
+  (key, modifiers) -> action, per controller. Views translate their native key
+  events into the table's key type and look the action up; no view hard-codes
+  what a key does.
+- The table is the single place to change a shortcut, and a user override file
+  (loaded through the config store) can replace any entry.
+- `Primary` means Ctrl on Windows and Linux and Cmd on macOS, so one entry
+  serves every platform. Platform-specific entries are allowed where a platform
+  convention differs (for example, the Mac Delete key).
+- Shortcuts act only when no text field has focus.
+- Default file-manager bindings (Commander and every browser pane):
 
-| Kind of logic | Home | Example |
-|---------------|------|---------|
-| Pure capability predicate (`(type byte/string) -> bool`) | engine (`fs/`, `partition/`) | `fs::partition_is_browsable`, `fs::is_checkable_type` |
-| "Resolve a picked source → openable partitions" | `model/` | `model::commander_source` / the source resolver |
-| Background work with progress | `model/*_runner.rs` (callbacks at the leaf, `Status` at the runner) | `model::export_runner`, the cache-scan runner |
-| Pure query/transform the view calls inline | `model/` pure fn or engine | `EditQueue` helpers, `partition::format_size` |
-| Rendering, widget state, dialog open/closed flags | the view (`gui/`, later `tui/`) | egui panels, `ScrollArea` state |
+| Key | Action |
+|---|---|
+| F1 | Help |
+| F2 | Rename |
+| F3 or Primary+I | Info |
+| F5 | Refresh |
+| F6 | Copy to the other pane |
+| F8 or Delete (Mac: Delete / Backspace) | Delete |
+| Primary+N | New folder |
+| Tab | Switch pane |
+| Enter | Open |
+| Space or Insert | Mark |
 
-**Checklist when adding a user-facing feature (extends the playbook below):**
+### Async work
 
-- [ ] Is any of this logic something a *second* UI would need? If yes, it goes in
-      `model/`/engine now — even if only one UI consumes it today.
-- [ ] Does the GUI button handler contain a predicate, a probe, a resolve, or a
-      spawn? Move it down; the handler should be ~10–20 lines of dispatch.
-- [ ] Could I write a unit test for this logic without a GUI? If not, it's in the
-      wrong layer.
-- [ ] Would the CLI (and the future TUI) call the *same function*, or would each
-      re-derive it? It must be the same function.
+- **Every slow operation is a `model::job::Job`**: anything that touches a
+  device or image, the network, or walks a filesystem. Nothing slow runs on a
+  view's thread or inside `apply` / `tick`.
+- Jobs declare the resources they touch (`Resource` keys) and register with the
+  `JobRegistry`, which is what disables conflicting controls and says why.
+- A job reports phase, progress and log lines through `JobCtx`, honours
+  cancellation, and is panic-guarded. Views show a job only through its
+  snapshot (`gui::progress::show_job`, the TUI "Working" box, `rb-cli --status`).
+- Views wake through `Notify` (egui repaint, the TUI wake channel, the native
+  main-thread dispatch) instead of polling every frame.
+- **No `thread::spawn` outside `model::job` and `worker::spawn_guarded`.**
+  `scripts/check-boundaries.sh` fails the build on a raw spawn in a view or a
+  controller.
 
-When in doubt, look at how an existing `cli/verbs/*.rs` calls into `model/` for
-the same capability and mirror it — the CLI is the reference adapter.
+### Crates
 
----
+- **What goes in a crate:** format, filesystem, partition-table and container
+  logic that is useful on its own: no UI, no app configuration, no controller
+  types. Each crate has its own tests and builds on Rust 1.73 (and for `qnx2fs`,
+  `wasm32`).
+- **A fix in a crate ships.** Bump the crate's version in the same change
+  (semver: adding a public field to a struct with public fields, or removing
+  public API, is a minor bump while the major is 0), bump dependents that need
+  the new version, update every lockfile (`Cargo.lock`, `rb-cli-vintage/`,
+  `rb-cli-ppc/`, `rb-cli-sol9/`; each must pass `cargo metadata --locked`), and
+  publish through `publish-crates.yml` (dry run first). A crate with a
+  changelog gets an entry.
+- The app depends on crates by path, so it sees a fix immediately; other
+  consumers (icon-emu and others) only see it once it is published.
 
-## Adding a feature: the playbook
+### Regression
 
-Follow this order. Every step makes the next one easier.
+- **Every change** runs the tests for what it touched: unit tests in the same
+  file, controller tests (`#[cfg(test)]` in `src/vm`, and the scenarios in
+  `tests/ui_scenarios/`), the matching `rb-regress run --filter` cases, and, when
+  it changes how a filesystem is written, the emulator scenario where the real
+  operating system judges it (`regression-tests/emulator/`).
+- **A milestone** (the end of a phase, before merging to `main`) runs the full
+  suite: `regression-tests/scripts/regress-local.sh` on Linux, plus the Windows
+  and macOS legs and `rb-regress parity` / `verify` across all three.
+- A new checker (oracle or emulator scenario) is not trusted until its control
+  — the same check on deliberately damaged input — has failed.
+- A defect found by any of this gets an `R-NNN` entry in
+  `docs/Regression_Bugs.md`; if it is not fixed in the same change it goes in
+  `regression-tests/data/known-failures.toml` (or the emulator `cases.txt`).
 
-### 1. Decide where it lives
+### Enforcement
 
-Walk down the layer diagram. "Where does the *data* this feature operates on live? Who consumes it?" If the answer is "engines" (a filesystem, a format, a partition table), it goes there. If the answer is "the GUI needs to coordinate work and show progress", you're adding a model module + a thin view binding.
+- `scripts/check-boundaries.sh` (CI job `boundaries`) fails on toolkit code or
+  raw threads in `src/vm` and on raw threads in views, and counts views'
+  direct references to the model and engine. That count only goes down; a path
+  that reaches zero is switched to enforcing.
+- Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
+  error.
+- Controller logic is tested without any view. Code that cannot be tested
+  without a view is in the wrong layer.
 
-### 2. Engine layer first (if applicable)
+### Adding a feature: the playbook
 
-If the feature requires new filesystem behavior, new format support, or a new orchestration step, land that **first**, with unit tests, before touching the GUI. The engine layer is far easier to test in isolation. Most engine modules have inline `#[cfg(test)]` blocks; follow the pattern in the same file.
-
-### 3. Model layer
-
-Create or extend a `src/model/<name>.rs`:
-
-- **Status struct** for any background work — goes in `src/model/status.rs` (joining `InspectStatus`, `CacheStatus`, `BlockCacheScan`, `VhdExportStatus`, `ExtractionProgress`, `ResizeStatus`, `ExpandStatus`, `BulkConvertStatus`). Fields are `pub`. Document units (bytes, items, percent).
-- **Runner function** that spawns the worker thread and returns `Arc<Mutex<XxxStatus>>`. Pattern: leaf I/O takes callbacks (`progress_cb`, `cancel_check`, `log_cb`); the runner owns the Status mutex and translates callback fires into Status field writes. See [`docs/progress_pattern.md`](docs/progress_pattern.md) for the canonical shape.
-- **Pure helpers** (no threading) for query/mutation logic the view calls inline. `EditQueue` is the reference implementation: a wrapper struct around `Vec<StagedEdit>` exposing every is-pending / pending-for / space-delta / replace-set-X helper the view used to inline.
-
-### 4. View layer
-
-In the appropriate `src/gui/<tab>.rs`:
-
-- Hold `Arc<Mutex<XxxStatus>>` (or the `EditQueue` model object) on the view struct.
-- In `update`, poll the status (`try_lock`, snapshot scalars, drain `log_messages: Vec<String>` into the shared `LogPanel`).
-- Button handlers call the model runner and store the returned Arc. They should fit in ~10–20 lines.
-- Use `TabContext<'a> { devices, log }` (in `src/gui/context.rs`) for tabs that need both — don't add new `(devices: &[DiskDevice], log: &mut LogPanel)` argument pairs.
-
-### 5. Tests
-
-- Engine logic: unit tests in the same file under `#[cfg(test)]`.
-- Model orchestration: unit tests where the worker is called inline (skip the thread spawn) — every existing runner is testable this way.
-- GUI: not unit-tested. If the change is GUI-only, run it locally and verify behavior in `cargo run`.
+1. **Model first.** New format, filesystem or domain behaviour lands in its
+   crate or model module, with unit tests.
+2. **Controller.** Add or extend the task's controller: its state, its
+   `Action`s and `Effect`s, any validators, key-map entries and widget ids. Test
+   it with no view.
+3. **Every view.** Each view handles the new actions and effects (the compiler
+   lists the ones that do not): the GUI, the TUI, and the CLI where the feature
+   is scriptable. Interactive-only dialogs (Settings, elevation prompts) are
+   GUI- and TUI-only. Record any view that cannot support it, with the reason,
+   in `docs/platform_matrix.md`.
+4. **Tests and regression** as above, then the documentation sync in
+   `CLAUDE.md` (README tables, MiSTer matrix, picker extensions).
 
 ---
 

@@ -6,7 +6,7 @@ This plan moves rusty-backup from one egui GUI to a native front-end on every pl
 
 Companion documents:
 - [long_operations_inventory.md](long_operations_inventory.md): every slow operation and its wait-state bug (the Phase 1 work list).
-- CONTRIBUTING.md § "Presentation layers": the existing layering rules this plan builds on.
+- CONTRIBUTING.md § "Architecture policy (MVC)": the binding layering rules (model / controller / view) this plan implements.
 
 ## 1. Decisions so far
 
@@ -177,6 +177,15 @@ Work through [long_operations_inventory.md](long_operations_inventory.md), worst
 - Every wait shows a bar (or a sweeping bar when the total is unknown), the step, amounts, speed and time left; `rb-cli --status` prints the same line periodically.
 
 ### Phase 2: Extract the view-models
+
+**Decisions (2026-11-01), binding with CONTRIBUTING.md § Architecture policy (MVC):**
+- The view-models in `src/vm/` are the **controllers**. The GUI, the TUI and the CLI all drive the same controller for a task; every interface is a view.
+- **The TUI Commander stages edits** and applies them like the GUI, instead of writing immediately.
+- **One key map, defined as data** in `src/vm/keys.rs` and overridable by the user: F1 help, F2 rename, F3 or Primary+I info, F5 refresh, F6 copy, F8 or Delete (Mac: Delete/Backspace) delete, Primary+N new folder, Tab switch pane, Enter open, Space/Insert mark. `Primary` is Ctrl on Windows/Linux and Cmd on macOS.
+- **No cross-volume move.** F6 is copy.
+- **Text prompts are effects** (`AskText`) that carry a controller-defined validator; the view runs it for inline feedback and the controller re-checks the answer.
+- **One browser pane, configured by profile:** the Commander panes, the Inspect browse view and the TUI explorer share one browser-pane controller with per-use capabilities, instead of three implementations.
+
 
 The pilot is **Commander**. Lift `CommanderPane` (`gui/commander/pane.rs:164`) and the orchestration in `commander/mod.rs` into `CommanderPaneVm` / `CommanderVm`. Rebuild both the egui and TUI Commander on top of them. **The proof is TUI parity:** unlock, preflight, async apply, partclone and wrappers arrive in the TUI with little or no new logic.
 

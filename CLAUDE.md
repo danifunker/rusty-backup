@@ -8,8 +8,16 @@ Rusty Backup is a cross-platform GUI application (Rust, egui/eframe) for backing
 
 Licensed under AGPL-3.0. The full specification lives in `PROJECT-SPEC.md`.
 
-## Coding Style
-Read CONTRIBUTING.md prior to making code changes in this repository.
+## Architecture policy (mandatory)
+
+**Before adding or changing any code, read [CONTRIBUTING.md § Architecture policy (MVC)](CONTRIBUTING.md#architecture-policy-mvc--read-before-adding-any-code) in full, every session.** It is binding. In short:
+
+- **Model** (`crates/*`, `src/{fs,partition,rbformats,backup,restore,os,optical,...}`, `src/model/`) owns formats, domain operations and persistence. No UI.
+- **Controller** (`src/vm/`) owns what the user is doing: state, `Action`s in, `Effect`s out, validation rules, key bindings, widget ids, jobs. One controller per task, shared by the GUI, the TUI and the CLI. No toolkit, no raw threads.
+- **View** (`src/gui/`, the TUI, `src/cli/` verbs, future native shells written in Rust) renders, maps input to actions through the controller's key map, and fulfils effects. No domain logic, no direct model imports, no threads.
+- Slow work is a `model::job::Job`; a crate fix ships with a version bump and a publish; regression runs per change and in full at milestones.
+
+The rest of CONTRIBUTING.md (coding style, comments, the Rust 1.73 floor) applies too.
 
 ## Build Commands
 
@@ -155,8 +163,8 @@ All OS-specific code lives in `src/os/`:
 ## Development Guidelines
 
 - Separate business logic from GUI code; core modules should be independently testable.
-- **GUI / CLI feature parity.** When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. Check `rb-cli --help` and `docs/cli-reference.md` for the canonical grammar before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
-- **Shared business logic between GUI and CLI.** When implementing a feature, put the logic in a core module (e.g. `src/backup/`, `src/fs/`, `src/model/`) and have both `src/gui/` and `src/cli.rs` call into it. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules.
+- **GUI / CLI feature parity** (the architecture policy above governs; this is the CLI angle). When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. Check `rb-cli --help` and `docs/cli-reference.md` for the canonical grammar before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
+- **Shared business logic between GUI and CLI.** Per the architecture policy, logic lives in the model and the task's controller (`src/vm/`), and the GUI, TUI and CLI all drive that same controller. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules.
 - Use streaming I/O with large blocks (64KB-1MB chunks) for disk operations; never load entire partitions into RAM.
 - Disk I/O must be sector-aligned (512 bytes or 4KB).
 - Disable UI controls during active operations to prevent conflicts.
