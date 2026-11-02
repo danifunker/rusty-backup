@@ -14,6 +14,8 @@ pub mod browse;
 mod remote;
 mod run;
 
+#[cfg(all(test, feature = "native-zstd"))]
+mod identity_tests;
 #[cfg(test)]
 mod tests;
 
