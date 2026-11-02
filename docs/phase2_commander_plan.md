@@ -1209,3 +1209,100 @@ controller would change what they print or write.
 - Shells still reaching the engine: `tui_app.rs` (44), `gui/mod.rs` (22), `archives_tab.rs` (12),
   `metadata_editor.rs` (11), `bulk_convert_dialog.rs` (7), `file_detail.rs` (5), and a few one- to
   three-reference helpers.
+
+## Slice 17: the rest of the egui shell
+
+What was left in `src/gui` after slice 16 reached the engine 69 times: the app shell
+`gui/mod.rs` (22), `archives_tab.rs` (12), `metadata_editor.rs` (11), `bulk_convert_dialog.rs`
+(7), `file_detail.rs` (5), `journal_view.rs` (3), `source_picker.rs` and `settings_dialog.rs` (2
+each), and one each in `ui_logger.rs`, `size_mode_row.rs`, `partition_bar.rs`, `fonts.rs` (a
+comment) and `chd_options_ui.rs`. One step per file or group; each commit builds.
+
+### Steps
+
+1. (ef7b0d5c) Small helpers. `controller::app` re-exports plain data only: `format_size`,
+   `SizeMode`, `Notify` (the wake a shell implements), the picker extension lists
+   (`DISK_IMAGE_EXTS`, `MAC_ARCHIVE_EXTS`, `archives_picker_exts`) and, cfg `chd`, the CHD codec
+   choices (`controller::app::chd`). The journal viewer's transaction classification moves to the
+   browser pane (`journal_txn_classes`, `journal_block_class`). `controller::settings::
+   SettingsController` owns the Settings form, its save (and the Windows file associations) and
+   Clear Recent Files over a `ConfigStore` (`try_save` reports a failed write), so its test and
+   scenario never touch config.json.
+2. (cdeaeab7) `file_detail.rs`: the preview's text-or-binary classification (`FileContent`,
+   `detect_content_type`, the embedded HFS file-type table) moves to `model::entry_detail`.
+3. (66f0d042) `metadata_editor.rs`: `controller::browser::metadata` (re-exported as
+   `controller::commander::metadata`) holds the File Info editors' rules: each row's effective
+   value (a staged edit over the on-disk one), the type/creator and ProDOS dictionaries, and the
+   field parsers. The egui editors stage the same `MetadataEdit`s.
+4. (48a3bcd6) `bulk_convert_dialog.rs`: `controller::bulk_convert::BulkConvertController` owns the
+   form (folders through `PickFolder`), the scan job, the review (ticks, extension), the
+   output-conflict question (`ResolveConflicts`: Skip / Overwrite / Back) and the conversion, a
+   job waiting on the unchanged `bulk_convert_runner::start_bulk_convert`. The app's progress
+   strip draws `progress()`. The TUI Bulk screen drives the controller headless.
+   `tests/ui_scenarios/bulk_convert.toml`.
+5. (226808ed) Explicit `as_str` / `as_slice` / `as_path` at the call sites steps 2-4 added, for
+   mrustc.
+6. (e6ac5261, 5ae0bdce) `archives_tab.rs`: `controller::archives::ArchivesController` opens an
+   archive in a job (`model::mac_archive_extract`, the bodies moved from the tab and the TUI),
+   keeps the rows and ticks, extracts all or the ticked entries in a job (the same
+   `extract_all` / `extract_filtered`), and writes a single-entry disk image payload for Inspect
+   (`HostRequest::OpenInInspect`). The TUI Archives screen drives it headless.
+   `tests/ui_scenarios/archives_open_extract.toml`.
+7. (a3bb09b2) `gui/mod.rs`: `controller::app` becomes a directory. `app/shell.rs`: the active tab,
+   `route_drop`, `busy_elsewhere`, `share_backup` (the backup folder Restore and Inspect share:
+   publish a new one, adopt only when empty), the device list (`load_devices` at start-up with
+   the same log lines, `RefreshDevices` as a job), the elevation gate and its texts,
+   `RequestElevation` / `ConfirmElevation`, `picker_start_folder`. `app/update.rs` (cfg `gui`):
+   the start-up release check and the Windows in-app install as jobs. Inspect gains
+   `InspectSource::ImageFile`: an image file as the user named it is prepared
+   (`model::image_prep`, floppy containers kept) in a job, then opened, so no view calls
+   `prepare_disk_image_path`; the source picker hands back the picked path. The unused
+   `open_disk_image_for_reading` is gone. `tests/ui_scenarios/{app_shell,settings}.toml`.
+8. (81425388) The colour theme lives in the GUI again (`gui::theme`; nothing outside `src/gui`
+   used it, so nothing had to move into the controller or model). `model::update_runner` has no
+   caller left and is removed.
+9. (5e5d5552) `scripts/check-boundaries.sh` enforces all of `src/gui` (a planted reference in a
+   new file fails it); CONTRIBUTING's list follows.
+
+Shells' engine references 113 -> 20 (all of `src/gui` 69 -> 0; `tui_app.rs` 44 -> 20).
+
+### Behaviour changes
+
+- GUI: the Bulk Convert, Archives and Settings pickers are the shared `EffectHost` ones (titled:
+  "Choose Source Folder", "Choose Output Folder", "Open Mac Archive", "Extract All To",
+  "Extract Selected To"). Bulk Convert's run is a job; its strip text, log lines and the
+  "cancellation requested" line are unchanged.
+- GUI: an archive extraction is a job (it was a `spawn_guarded` thread); its warnings, result
+  line and bar text are the same. An archive dropped or handed over while an extraction runs
+  still opens (the running extraction keeps its own copy).
+- GUI: a dropped, command-line or Recent image opens through Inspect's prepare job (it ran
+  `prepare_disk_image_path` on the UI thread; with Inspect's flags that step never decodes, so
+  the opened file is the same). The Recent list records the dropped path itself. A failed
+  prepare logs "Failed to materialize ... - opening raw bytes" for every route (Recent logged
+  "Failed to decompress" at error level).
+- GUI: the update check is a job (it was a detached thread); the Windows install is a job over
+  `update::download_and_apply_update` (it was `model::update_runner`'s thread), same states and
+  buttons.
+- TUI: the Bulk screen scans in a job ("Scanning the source folder..." while it runs) and asks
+  before overwriting outputs that already exist (s Skip / o Overwrite / Esc Back; it overwrote
+  silently); after Esc cancels a run, the final counts replace "Cancel requested...".
+- TUI: the Archives screen opens and extracts through the controller's jobs ("Opening the
+  archive..." / "Extracting..." on the status line instead of the task box); the status texts
+  are unchanged.
+- CLI: none. `rb-cli convert` and `rb-cli archive` keep their own loops and output; driving the
+  controllers would change what they print.
+
+### Decisions for the user
+
+- The Inspect prepare step (`InspectSource::ImageFile`) is a pass-through for every format today
+  (Inspect keeps floppy and gzip containers so edits go back into them). Keep the job as the
+  one place a future decode would run, or drop it and open the path directly.
+
+### Left
+
+- `src/cli/verbs/tui_app.rs` still reaches the engine 20 times (its Inspect, Backup and Restore
+  screens' device lists and image probes, the update check, the palette).
+- The TUI keeps its own tab bar, device list and update check; the `controller::app` shell rules
+  are there for it.
+- The optical disc browser onto the shared browser pane is the next slice.
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
