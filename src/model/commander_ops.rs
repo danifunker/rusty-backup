@@ -786,7 +786,7 @@ pub fn stage_host_for(
                 .unwrap_or(*size);
         }
         if fs_type == "ProDOS" {
-            if let Some((stem, tt, aa)) = fs_apple2::prodos_types::decode_cp_suffix(name) {
+            if let Some((stem, tt, aa)) = fs_apple2::prodos_types::decode_cp_suffix(name.as_str()) {
                 let stem = stem.to_string();
                 *name = stem;
                 *prodos_type = Some(tt);
