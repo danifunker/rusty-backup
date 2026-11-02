@@ -162,6 +162,23 @@ impl PaneView {
         self.render_apply_report(ui.ctx(), pane, out);
     }
 
+    /// The listing alone (a folder tree, the header and the rows), for a host that draws the rest.
+    pub(crate) fn show_listing(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let pane = ctl.pane(self.side);
+        if pane.has_folder_tree() {
+            self.render_folder_tree(ui, pane, true, out);
+            ui.separator();
+        }
+        self.render_header(ui, pane, out);
+        self.render_rows(ui, ctl, true, scroll, out);
+    }
+
     /// Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
     fn unlock_prompt(
         &mut self,

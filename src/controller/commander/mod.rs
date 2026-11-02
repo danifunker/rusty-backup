@@ -23,6 +23,7 @@ pub use screen::{
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
+pub use crate::model::browse_session::BrowseSession;
 pub use crate::model::edit_queue::EditQueue;
 pub use crate::model::job::JobRegistry;
 pub use disk_core::display::format_size;

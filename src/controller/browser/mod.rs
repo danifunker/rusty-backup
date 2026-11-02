@@ -23,3 +23,5 @@ pub use rows::{DisplayRow, RowKind};
 
 #[cfg(test)]
 pub(crate) mod explorer_tests;
+#[cfg(test)]
+mod inspect_tests;

@@ -712,6 +712,21 @@ impl CommanderController {
         self.absorb(Side::Left, fx)
     }
 
+    /// The host hands the single pane a ready session; `label` names it in the status line.
+    pub fn open_fixed_session(
+        &mut self,
+        session: crate::model::browse_session::BrowseSession,
+        label: &str,
+    ) -> Vec<Effect> {
+        let fx = self.left.open_fixed_session(session, label);
+        self.absorb(Side::Left, fx)
+    }
+
+    /// The single pane, for a host screen that still stages through it directly (Inspect).
+    pub fn host_pane(&mut self) -> &mut BrowserPaneController {
+        &mut self.left
+    }
+
     /// The single pane's file read for the text editor, handed over once.
     pub fn take_text_doc(&mut self) -> Option<crate::controller::browser::TextDoc> {
         self.left.take_text_doc()

@@ -518,6 +518,7 @@ impl BrowserPaneController {
             fs_type: target.fs_type.clone(),
             total_size: target.total_size,
             used_size: target.used_size,
+            blessed: None,
         };
         let mode = target.mode.clone();
         self.show_remote_listing(target.fs, target.root, target.entries, volume);

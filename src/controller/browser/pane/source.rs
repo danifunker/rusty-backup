@@ -67,6 +67,8 @@ pub struct VolumeInfo {
     pub fs_type: String,
     pub total_size: u64,
     pub used_size: u64,
+    /// The blessed System Folder (HFS / HFS+): its catalog id and name.
+    pub blessed: Option<(u64, String)>,
 }
 
 impl VolumeInfo {
@@ -280,6 +282,8 @@ pub(super) struct SourceState {
     reopen_restore: Option<(Vec<StagedEdit>, String)>,
     /// The partition a host-opened image shows instead of the first browsable one.
     fixed_partition: Option<usize>,
+    /// The host handed over a ready session (`open_fixed_session`); a reopen reuses it.
+    fixed_session: bool,
 }
 
 impl SourceState {
@@ -305,6 +309,7 @@ impl SourceState {
             pending_switch: None,
             reopen_restore: None,
             fixed_partition: None,
+            fixed_session: false,
         }
     }
 }
@@ -465,6 +470,12 @@ impl BrowserPaneController {
                 false => Vec::new(),
             };
         }
+        if self.src.fixed_session {
+            let Some(session) = self.src.session.clone() else {
+                return Vec::new();
+            };
+            return self.reopen_session(session);
+        }
         let Some(i) = self.src.selected else {
             return Vec::new();
         };
@@ -498,9 +509,47 @@ impl BrowserPaneController {
     /// The host screen opens the source of a fixed-source pane: an image and this partition of it.
     pub fn open_fixed(&mut self, path: PathBuf, partition: Option<usize>) -> Vec<Effect> {
         self.src.fixed_partition = partition;
+        self.src.fixed_session = false;
         let mut fx = self.switch(Switch::Open(OpenRequest::Image(path)));
         fx.append(&mut self.out);
         fx
+    }
+
+    /// The host hands a fixed-source pane a ready session (a partition, a partclone cache, a stream).
+    pub fn open_fixed_session(&mut self, session: BrowseSession, label: &str) -> Vec<Effect> {
+        let mut fx = self.reopen_session(session);
+        if let Some(Effect::Message(m)) = fx.first_mut() {
+            *m = format!("opening {label} ...");
+        }
+        fx.append(&mut self.out);
+        fx
+    }
+
+    /// Open `session` in place of the current one, keeping what is staged and the current folder.
+    fn reopen_session(&mut self, session: BrowseSession) -> Vec<Effect> {
+        let keep: Vec<StagedEdit> = self.queue.drain().collect();
+        let cwd = self.listing.cwd_path().to_string();
+        let path = session
+            .source_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("partition"));
+        // The same source keeps its expanded folders; another one starts afresh.
+        if self.src.path.as_deref() == Some(path.as_path()) && self.src.fixed_session {
+            self.clear_for_open();
+        } else {
+            self.reset_local_source();
+            self.src.path = Some(path.clone());
+        }
+        self.src.kind = Some(SourceKind::Image);
+        self.src.fixed_session = true;
+        self.src.reopen_restore = Some((keep, cwd));
+        let label = file_name(&path);
+        self.spawn(Plan::Partition {
+            how: PartOpen::Session(session),
+            resource: Resource::Image(path),
+            label,
+        });
+        vec![message("opening ...".into())]
     }
 
     // --- actions ----------------------------------------------------------
@@ -664,8 +713,13 @@ impl BrowserPaneController {
 
     /// Clears the listing for a partition or disc filesystem about to open.
     fn clear_for_partition(&mut self, idx: usize) {
-        self.abandon_open();
         self.src.selected = Some(idx);
+        self.clear_for_open();
+    }
+
+    /// Clears the listing for the same source opening again (a partition, or a fixed session).
+    fn clear_for_open(&mut self) {
+        self.abandon_open();
         self.src.error = None;
         self.src.needs_password = false;
         self.src.session = None;
@@ -1031,6 +1085,7 @@ fn load(mut fs: Box<dyn Filesystem>, what: &str) -> anyhow::Result<Loaded> {
         fs_type: fs.fs_type().to_string(),
         total_size: fs.total_size(),
         used_size: fs.used_size(),
+        blessed: fs.blessed_system_folder(),
     };
     Ok(Loaded {
         fs,
@@ -1088,6 +1143,7 @@ fn finish_open(session: BrowseSession, mut st: BrowseOpenStatus) -> anyhow::Resu
         fs_type: st.fs_type.clone(),
         total_size: st.total_size,
         used_size: st.used_size,
+        blessed: st.blessed_folder.take(),
     };
     if st.needs_password {
         return Ok(Opened::Locked { session, volume });

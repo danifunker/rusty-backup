@@ -35,7 +35,7 @@ use super::metadata_editor::{
     OwnerEditorState, ProdosTypeEditorState, XattrEditorState,
 };
 
-mod pane;
+pub(crate) mod pane;
 
 use pane::PaneView;
 
@@ -260,12 +260,12 @@ impl CommanderMode {
             });
         });
 
-        self.render_checksum_window(&ctx, &mut acts);
+        Self::render_checksum_window(&self.ctl, &ctx, &mut acts);
         self.render_detail_window(&ctx, &mut acts);
-        self.render_log_window(&ctx, &mut acts);
-        self.render_help(&ctx, &mut acts);
+        Self::render_log_window(&self.ctl, &ctx, &mut acts);
+        Self::render_help(&self.ctl, &ctx, &mut acts);
         self.render_partitions(&ctx, &mut acts);
-        self.render_view_window(&ctx, &mut acts);
+        Self::render_view_window(&self.ctl, &ctx, &mut acts);
 
         let whose = self
             .effects
@@ -452,8 +452,12 @@ impl CommanderMode {
     }
 
     /// The checksum window: the hashing job while it runs, then a CRC32 / MD5 / SHA1 / SHA256 grid.
-    fn render_checksum_window(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
-        let Some(c) = self.ctl.checksums() else {
+    pub(crate) fn render_checksum_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(c) = ctl.checksums() else {
             return;
         };
         let mut open = true;
@@ -555,11 +559,15 @@ impl CommanderMode {
     }
 
     /// The session log: completed operations, newest at the bottom, with Copy all / Clear.
-    fn render_log_window(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
-        if !self.ctl.log_shown() {
+    pub(crate) fn render_log_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.log_shown() {
             return;
         }
-        let log = self.ctl.log();
+        let log = ctl.log();
         let mut open = true;
         egui::Window::new("Session log")
             .open(&mut open)
@@ -603,8 +611,12 @@ impl CommanderMode {
     }
 
     /// Every shortcut with its first chord on this platform, from the controller's key map.
-    fn render_help(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
-        if !self.ctl.help_shown() {
+    pub(crate) fn render_help(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.help_shown() {
             return;
         }
         let mut open = true;
@@ -616,14 +628,14 @@ impl CommanderMode {
                 egui::Grid::new("commander_keys")
                     .striped(true)
                     .show(ui, |ui| {
-                        for (label, chord) in self.ctl.key_help() {
+                        for (label, chord) in ctl.key_help() {
                             ui.label(label);
                             ui.monospace(chord);
                             ui.end_row();
                         }
                     });
                 ui.add_space(4.0);
-                ui.weak(self.ctl.key_help_footer());
+                ui.weak(ctl.key_help_footer());
             });
         if !open {
             acts.push(A::ShowHelp(false));
@@ -633,8 +645,12 @@ impl CommanderMode {
 
 impl CommanderMode {
     /// The View menu as a window, for the key that opens it (the menu bar has the same entries).
-    fn render_view_window(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
-        if !self.ctl.view_menu_shown() {
+    pub(crate) fn render_view_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.view_menu_shown() {
             return;
         }
         let mut open = true;
@@ -644,7 +660,7 @@ impl CommanderMode {
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
             .show(ctx, |ui| {
-                if let Some(action) = view_menu_body(ui, &self.ctl.view_menu()) {
+                if let Some(action) = view_menu_body(ui, &ctl.view_menu()) {
                     acts.push(action);
                     acts.push(A::ShowViewMenu(false));
                 }
@@ -681,7 +697,7 @@ impl CommanderMode {
 }
 
 /// The View menu's entries: the active pane's listing styles, then toggles and commands.
-fn view_menu_body(ui: &mut egui::Ui, items: &[ViewMenuItem]) -> Option<CommanderAction> {
+pub(crate) fn view_menu_body(ui: &mut egui::Ui, items: &[ViewMenuItem]) -> Option<CommanderAction> {
     let mut chosen = None;
     let mut styles_done = false;
     for item in items {
@@ -1077,7 +1093,7 @@ fn printable(name: &str) -> String {
 }
 
 /// The shortcut map, logging any lines of the user's file it could not use.
-fn load_keymap() -> KeyMap {
+pub(crate) fn load_keymap() -> KeyMap {
     let (map, problems) = KeyMap::load(KeyMap::user_file().as_deref());
     for p in problems {
         log::warn!("keybindings: {p}");
@@ -1086,7 +1102,7 @@ fn load_keymap() -> KeyMap {
 }
 
 /// An egui key as the key map names it; keys no binding can use are `None`.
-fn egui_key(key: egui::Key) -> Option<Key> {
+pub(crate) fn egui_key(key: egui::Key) -> Option<Key> {
     use egui::Key as K;
     Some(match key {
         K::Tab => Key::Tab,
@@ -1128,7 +1144,7 @@ fn egui_key(key: egui::Key) -> Option<Key> {
 }
 
 /// egui's modifiers; `mac_cmd` is Cmd on macOS and never set elsewhere.
-fn egui_mods(m: egui::Modifiers) -> Mods {
+pub(crate) fn egui_mods(m: egui::Modifiers) -> Mods {
     Mods {
         ctrl: m.ctrl,
         alt: m.alt,

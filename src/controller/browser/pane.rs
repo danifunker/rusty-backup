@@ -66,6 +66,8 @@ pub enum BrowserPaneAction {
     CursorPage(i32),
     CursorHome,
     CursorEnd,
+    /// Put the cursor on the row with this node id, leaving the selection as it is.
+    CursorTo(String),
     /// What double-click does, on the cursor row.
     ActivateCursor,
     /// What double-click does, on the row with this node id (`""` is `..`).
@@ -302,6 +304,11 @@ impl Controller for BrowserPaneController {
             BrowserPaneAction::CursorEnd => {
                 let last = self.rows.len().saturating_sub(1);
                 self.set_cursor_index(last);
+            }
+            BrowserPaneAction::CursorTo(node_id) => {
+                if let Some(i) = self.rows.iter().position(|r| r.node_id == node_id) {
+                    self.set_cursor_index(i);
+                }
             }
             BrowserPaneAction::ActivateCursor => {
                 if let Some(row) = self.cursor_row() {

@@ -73,6 +73,8 @@ pub struct BrowseSession {
     /// image open and serves / patches byte ranges).
     #[cfg(feature = "remote")]
     pub remote: Option<(Arc<Mutex<crate::remote::RemoteConnection>>, String)>,
+    /// List deleted entries the filesystem can still read (QNX 2); applied by every `open`.
+    pub show_deleted: bool,
 }
 
 /// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
@@ -113,6 +115,14 @@ impl BrowseSession {
 
     /// Open a read-only filesystem from this session.
     pub fn open(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
+        let mut fs = self.open_reader()?;
+        if self.show_deleted {
+            fs.set_show_deleted(true);
+        }
+        Ok(fs)
+    }
+
+    fn open_reader(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
         // Remote image over the block tier — a fresh RemoteBlockReader per open
         // (the daemon keeps the image open and serves byte ranges).
         #[cfg(feature = "remote")]

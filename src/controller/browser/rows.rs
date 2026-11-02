@@ -220,7 +220,13 @@ pub fn splice_folders(
             .then(|| base_dirs.get(row.node_id.as_str()).map(|e| (*e).clone()))
             .flatten();
         let Some(dir) = dir else {
+            let staged_dir = (row.kind == RowKind::PendingAdd && row.is_dir)
+                .then(|| staged_entry(f.queue, &row.node_id))
+                .flatten();
             out.push(row);
+            if let Some(d) = staged_dir {
+                staged_children(&mut out, &d, 1, f, index);
+            }
             continue;
         };
         mark_folder(&mut row, f);
@@ -251,7 +257,6 @@ fn folder_children(
     let Some(kids) = f.children.get(&dir.path) else {
         return;
     };
-    let adds = f.queue.pending_adds_for(&dir.path);
     for e in kids {
         let mut row = entry_row(e, f.queue, wrapper_tree, f.remote_host, depth);
         index.insert(
@@ -278,7 +283,28 @@ fn folder_children(
             }
         }
     }
-    for e in adds {
+    staged_children(out, dir, depth, f, index);
+}
+
+/// The staged-add entry at `path`, looked up in its parent folder's adds.
+fn staged_entry(queue: &EditQueue, path: &str) -> Option<FileEntry> {
+    let parent = match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((p, _)) => p,
+    };
+    let mut adds = queue.pending_adds_for(parent).into_iter();
+    adds.find(|e| e.path == path)
+}
+
+/// The staged adds in `dir`, a staged folder's own adds always shown open beneath it.
+fn staged_children(
+    out: &mut Vec<DisplayRow>,
+    dir: &FileEntry,
+    depth: usize,
+    f: &FolderSplice<'_>,
+    index: &mut HashMap<String, FolderRow>,
+) {
+    for e in f.queue.pending_adds_for(&dir.path) {
         index.insert(
             e.path.clone(),
             FolderRow {
@@ -287,6 +313,9 @@ fn folder_children(
             },
         );
         out.push(pending_add_row(&e, depth));
+        if e.is_directory() {
+            staged_children(out, &e, depth + 1, f, index);
+        }
     }
 }
 

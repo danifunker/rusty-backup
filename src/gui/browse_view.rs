@@ -3,7 +3,6 @@
 #![allow(clippy::too_many_arguments)]
 
 use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,13 +15,21 @@ use disk_core::filesystem::Filesystem;
 use dsk_clonezilla::block_cache::PartcloneBlockCache;
 use fs_mac::fork_export;
 use fs_mac::resource_fork::{self, ResourceForkMode};
+use rusty_backup::controller::app::{CommanderRecent, UserConfig};
+use rusty_backup::controller::commander::{
+    BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue, JobRegistry,
+    ListingStyle, PaneProfile, PaneServices, RowKind, Side,
+};
+use rusty_backup::controller::Controller as _;
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
-use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
-use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
+use rusty_backup::model::browse_session::BrowseSession;
+use rusty_backup::model::edit_queue::StagedEdit;
 use rusty_backup::model::status::ExtractionProgress;
 use rusty_backup::rbformats::chd_edit;
 
+use super::commander::pane::PaneView;
+use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
 use super::metadata_editor::{
     self, ExtPermsEditorState, HfsTypeEditorState, OwnerEditorState, ProdosTypeEditorState,
@@ -51,21 +58,37 @@ const ARCHIVE_SNIFF_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
 /// escape hatch. 1 MiB ~= 30–50k lines depending on indentation.
 const TREE_INLINE_RENDER_LIMIT: usize = 1024 * 1024;
 
+/// The browser pane behind the view: the Inspect profile, its listing style remembered as `inspect`.
+fn new_controller() -> CommanderController {
+    let services = PaneServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(super::ui_logger::EguiWake),
+        recent: Box::new(CommanderRecent(UserConfig)),
+    };
+    let keymap = super::commander::load_keymap();
+    CommanderController::single(services, keymap, PaneProfile::inspect())
+}
+
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
-    /// Root entry of the filesystem.
-    root: Option<FileEntry>,
-    /// Cached directory listings keyed by path.
-    directory_cache: HashMap<String, Vec<FileEntry>>,
-    /// Which directories are expanded in the tree.
-    expanded_paths: HashSet<String>,
-    /// Currently selected file entry.
+    /// The browser pane (profile `inspect`): source, listing, tree, cursor, selection, queue.
+    ctl: CommanderController,
+    /// Pickers, confirmations and prompts the controller asks for.
+    effects: EffectHost,
+    /// Draws the flat list and folder-tree styles, as Commander does.
+    pane_view: PaneView,
+    /// The tree was clicked last, so bound keys go to the pane.
+    keys_active: bool,
+    /// A key moved the cursor, so the tree scrolls it into view.
+    scroll_cursor: bool,
+    /// The cursor row `selected_entry` was last taken from.
+    cursor_seen: Option<String>,
+    /// The user moved the cursor since the volume (re)opened; until then it selects nothing.
+    cursor_armed: bool,
+    /// The session changed or the volume was written: the pane reopens on the next frame.
+    pane_stale: bool,
+    /// The entry the content panel shows: the cursor row, or the root when its row is clicked.
     selected_entry: Option<FileEntry>,
-    /// Checkbox-marked entries for multi-select export (independent of the
-    /// single-click `selected_entry` preview), keyed by path. The entry is stored
-    /// so export can read it without re-walking the tree. Fed to the shared
-    /// `export_selection` engine by the "Export selected..." bar.
-    marked: std::collections::BTreeMap<String, FileEntry>,
     /// Edits applied into a compressed CHD's diff that no flatten has
     /// committed yet; closing on an empty queue deleted that diff silently.
     chd_diff_dirty: bool,
@@ -200,8 +223,6 @@ pub struct BrowseView {
     /// ownership of the cached filesystem; we poll the status each frame and
     /// hand the fs back to `cached_fs` once the walk completes.
     pending_tree: Option<Arc<Mutex<TreeStatus>>>,
-    /// Queued edit operations awaiting "Apply Edits".
-    staged_edits: EditQueue,
     /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
     edit_free_space: Option<Option<u64>>,
     /// The free-space probe in flight (an editable open decodes a whole container).
@@ -271,15 +292,6 @@ pub struct BrowseView {
     /// SHA-1). `None` for plain CHD images that aren't part of a backup.
     single_file_chd_backup_folder: Option<PathBuf>,
 
-    /// Set while the worker spawned by `BrowseSession::spawn_open` is loading
-    /// the filesystem and root listing. Polled each frame in `show()`; once
-    /// the worker reports `finished`, its results are drained into this view's
-    /// state. Showing a spinner + phase here is much friendlier than freezing
-    /// the UI for the seconds a 500k-file HFS+ open can take.
-    pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
-
-    /// Whether the container requires a password (detected on open failure).
-    needs_password: bool,
     /// User's password input text for the password prompt.
     password_input: String,
 
@@ -458,11 +470,15 @@ enum ViewMode {
 impl Default for BrowseView {
     fn default() -> Self {
         Self {
-            root: None,
-            directory_cache: HashMap::new(),
-            expanded_paths: HashSet::new(),
+            ctl: new_controller(),
+            effects: EffectHost::default(),
+            pane_view: PaneView::new(Side::Left),
+            keys_active: false,
+            scroll_cursor: false,
+            cursor_seen: None,
+            cursor_armed: false,
+            pane_stale: false,
             selected_entry: None,
-            marked: std::collections::BTreeMap::new(),
             chd_diff_dirty: false,
             export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
             content: None,
@@ -515,7 +531,6 @@ impl Default for BrowseView {
             show_tree_popup: false,
             tree_show_ids: false,
             show_tree_large_dialog: false,
-            staged_edits: EditQueue::new(),
             edit_free_space: None,
             free_space_job: None,
             show_unsaved_dialog: false,
@@ -539,8 +554,6 @@ impl Default for BrowseView {
             pending_tar_import: None,
             pending_tar_add: None,
             single_file_chd_backup_folder: None,
-            pending_open: None,
-            needs_password: false,
             password_input: String::new(),
             cached_fs: None,
             fs_generation: 0,
@@ -552,6 +565,23 @@ impl Default for BrowseView {
             mac_archive_window: None,
             archive_sniff: None,
             archive_sniff_job: None,
+        }
+    }
+}
+
+/// The checkbox's toggle: a ctrl-click on the row, so the rest of the selection stays.
+fn mark_action(row: &DisplayRow) -> BrowserPaneAction {
+    if row.depth == 0 && !row.is_tree {
+        BrowserPaneAction::Click {
+            name: row.name.clone(),
+            ctrl: true,
+            shift: false,
+        }
+    } else {
+        BrowserPaneAction::TreeClick {
+            node_id: row.node_id.clone(),
+            ctrl: true,
+            shift: false,
         }
     }
 }
@@ -648,7 +678,27 @@ impl BrowseView {
         self.close();
         self.session = session;
         self.active = true;
-        self.pending_open = Some(self.session.spawn_open());
+        self.reopen_pane();
+    }
+
+    /// Hand the pane the current session; it lists the volume in a job.
+    fn reopen_pane(&mut self) {
+        self.pane_stale = false;
+        let label = self
+            .session
+            .source_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "partition".into());
+        self.ctl.open_fixed_session(self.session.clone(), &label);
+        self.cursor_seen = None;
+        self.cursor_armed = false;
+    }
+
+    /// The pane's staged-edit queue.
+    fn queue(&self) -> &EditQueue {
+        &self.ctl.pane(Side::Left).queue
     }
 
     pub fn open(
@@ -797,16 +847,18 @@ impl BrowseView {
         }
         self.session.source_path = Some(cache_path);
         self.session.zstd_cache = None;
+        self.pane_stale = true;
     }
 
     pub fn close(&mut self) {
-        self.root = None;
+        // A fresh pane drops the old one's readers before any CHD diff below is removed.
+        self.ctl = new_controller();
+        self.effects = EffectHost::default();
+        self.keys_active = false;
+        self.cursor_seen = None;
         self.edit_free_space = None;
         self.free_space_job = None;
-        self.directory_cache.clear();
-        self.expanded_paths.clear();
         self.selected_entry = None;
-        self.marked.clear();
         self.content = None;
         self.id_names = None;
         self.xattr_cache = None;
@@ -837,7 +889,6 @@ impl BrowseView {
         self.show_tree_large_dialog = false;
         self.tree_show_ids = false;
         self.pending_tree = None;
-        self.staged_edits.clear();
         self.show_unsaved_dialog = false;
         self.pending_close = false;
         self.pending_archive_imports.clear();
@@ -848,10 +899,6 @@ impl BrowseView {
         self.archive_sniff_job = None;
         self.read_queue.clear();
         self.read_job = None;
-        // Detach any in-flight open worker. The thread keeps running but its
-        // result will be dropped when the Arc dies on completion.
-        self.pending_open = None;
-        self.needs_password = false;
         self.password_input.clear();
         self.cached_fs = None;
         // Clean up archive temp file if present
@@ -873,6 +920,7 @@ impl BrowseView {
         self.text_editor = None;
         self.pending_extraction = None;
         self.boot_blocks_present = None;
+        self.pane_stale = false;
     }
 
     pub fn is_active(&self) -> bool {
@@ -884,7 +932,7 @@ impl BrowseView {
     /// a source switch behind its own confirm dialog (see Inspect's deferred
     /// source-switch guard) before calling [`close`](Self::close).
     pub fn has_unsaved_edits(&self) -> bool {
-        self.active && self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
+        self.active && self.edit_mode && (!self.queue().is_empty() || self.chd_diff_dirty)
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -1063,15 +1111,21 @@ impl BrowseView {
                 });
         }
 
-        // If a background open is in progress, drain its status and either
-        // render a spinner or finalize the open with the results it produced.
-        if self.pending_open.is_some() {
-            self.poll_pending_open(ui);
-            if self.pending_open.is_some() {
-                // Still loading — show only the progress indicator.
-                return;
-            }
+        if self.pane_stale {
+            self.reopen_pane();
         }
+        self.ctl.host_pane().set_read_only(!self.edit_mode);
+        let ctx = ui.ctx().clone();
+        let fx = self.ctl.tick();
+        self.run_effects(&ctx, fx);
+        if self.ctl.is_working() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // The first open takes the whole view; a reopen after a write shows in the tree's place.
+        if self.fs_type.is_empty() && self.pane_opening(ui) {
+            return;
+        }
+        self.sync_volume();
 
         // Poll background tree-view generation. Only renders a spinner here;
         // the rest of the UI stays interactive while the walk runs.
@@ -1085,8 +1139,8 @@ impl BrowseView {
         // Unlock prompt for an encrypted container (e.g. IMZ with ZipCrypto)
         // or an encrypted filesystem (APFS FileVault). The retry loop is shared:
         // stash the secret on the session and re-spawn the open.
-        if self.needs_password {
-            let is_apfs = self.fs_type == "APFS";
+        if self.ctl.pane(Side::Left).needs_password() {
+            let is_apfs = self.ctl.pane(Side::Left).volume().fs_type == "APFS";
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
                 if is_apfs {
@@ -1106,10 +1160,11 @@ impl BrowseView {
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Unlock").clicked() || enter {
-                        self.session.password = Some(self.password_input.clone());
-                        self.needs_password = false;
+                        let secret = self.password_input.clone();
+                        self.session.password = Some(secret.clone());
                         self.error = None;
-                        self.pending_open = Some(self.session.spawn_open());
+                        let act = BrowserPaneAction::SubmitPassword(secret);
+                        self.ctl.apply(CommanderAction::Pane(Side::Left, act));
                     }
                 });
             });
@@ -1192,7 +1247,7 @@ impl BrowseView {
                 if resp.changed() {
                     rusty_backup::fs::carve::set_full_scan(self.carve_full_scan);
                     self.error = None;
-                    self.pending_open = Some(self.session.spawn_open());
+                    self.invalidate_cached_fs();
                 }
             }
 
@@ -1203,6 +1258,7 @@ impl BrowseView {
                     "List deleted entries whose data can still be read, named 'NAME [deleted]'.",
                 );
                 if resp.changed() {
+                    self.session.show_deleted = self.show_deleted;
                     self.invalidate_all_caches();
                 }
             }
@@ -1231,7 +1287,7 @@ impl BrowseView {
                         // the diff back into the parent on exit.
                         if !self.edit_mode {
                             self.enter_chd_edit_mode();
-                        } else if !self.staged_edits.is_empty() {
+                        } else if !self.ctl.pane(Side::Left).queue.is_empty() {
                             self.show_unsaved_dialog = true;
                         } else {
                             self.exit_edit_mode();
@@ -1241,14 +1297,15 @@ impl BrowseView {
                         if !self.edit_mode {
                             log::info!("Starting archive extract for editing");
                             self.start_archive_extract();
-                        } else if !self.staged_edits.is_empty() {
+                        } else if !self.ctl.pane(Side::Left).queue.is_empty() {
                             self.show_unsaved_dialog = true;
                         } else {
                             self.start_archive_compress();
                         }
                     } else {
                         // Direct editing (raw image / device)
-                        if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
+                        if self.edit_mode
+                            && (!self.ctl.pane(Side::Left).queue.is_empty() || self.chd_diff_dirty)
                         {
                             self.show_unsaved_dialog = true;
                         } else if !self.edit_mode {
@@ -1266,7 +1323,7 @@ impl BrowseView {
                             self.edit_result = None;
                             self.show_new_folder_dialog = false;
                             self.pending_delete = None;
-                            self.staged_edits.clear();
+                            self.ctl.host_pane().queue.clear();
                             self.pending_archive_imports.clear();
                             self.archive_import_tempdir = None;
                         }
@@ -1371,8 +1428,18 @@ impl BrowseView {
                 self.generate_tree_text();
             }
 
+            ui.menu_button("View", |ui| {
+                let items = self.ctl.view_menu();
+                if let Some(action) = super::commander::view_menu_body(ui, &items) {
+                    self.ctl.apply(action);
+                    ui.close();
+                }
+            });
+
             if ui.button("Close").clicked() {
-                if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty) {
+                if self.edit_mode
+                    && (!self.ctl.pane(Side::Left).queue.is_empty() || self.chd_diff_dirty)
+                {
                     self.show_unsaved_dialog = true;
                 } else {
                     self.close();
@@ -1532,15 +1599,7 @@ impl BrowseView {
                 ui.set_width(tree_width);
                 ui.set_min_height(panel_height);
                 self.render_selection_bar(ui);
-                egui::ScrollArea::vertical()
-                    .id_salt("browse_tree")
-                    .max_height(panel_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if let Some(root) = self.root.clone() {
-                            self.render_tree_entry(ui, &root);
-                        }
-                    });
+                self.render_listing(ui, panel_height);
             });
 
             ui.separator();
@@ -1565,104 +1624,346 @@ impl BrowseView {
                 self.journal_view = None;
             }
         }
+
+        // Commander's windows for what the shared keys and the View menu open.
+        let mut acts = Vec::new();
+        type Cm = super::commander::CommanderMode;
+        Cm::render_checksum_window(&self.ctl, &ctx, &mut acts);
+        Cm::render_log_window(&self.ctl, &ctx, &mut acts);
+        Cm::render_help(&self.ctl, &ctx, &mut acts);
+        Cm::render_view_window(&self.ctl, &ctx, &mut acts);
+        // The content panel already shows what File Info would.
+        if self.ctl.detail().is_some() {
+            acts.push(CommanderAction::CloseDetail);
+        }
+        for a in acts {
+            self.dispatch(&ctx, a);
+        }
+        if let Some(reply) = self.effects.show(&ctx, "") {
+            self.answer(&ctx, reply);
+        }
+        self.handle_keys(&ctx);
+        self.sync_selected();
     }
 
-    fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let pending_del = self.edit_mode && self.staged_edits.is_pending_delete(&entry.path);
+    /// The pane's open in progress, or a failed one: drawn instead of the browser.
+    fn pane_opening(&mut self, ui: &mut egui::Ui) -> bool {
+        let pane = self.ctl.pane(Side::Left);
+        if let Some(snap) = pane.opening() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label("Loading filesystem:");
+            });
+            if super::progress::show_job(ui, &snap) {
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::CancelOpen);
+                self.ctl.apply(act);
+            }
+            ui.label(
+                "Large volumes (e.g. HFS+ catalogs with hundreds of \
+                 thousands of files) can take several seconds.",
+            );
+            return true;
+        }
+        if pane.is_opening() {
+            ui.spinner();
+            return true;
+        }
+        if let Some(err) = pane.source_error() {
+            if !pane.listing.is_loaded() && !pane.needs_password() {
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
+                if ui.button("Close").clicked() {
+                    self.close();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The header's volume readout, from the volume the pane opened.
+    fn sync_volume(&mut self) {
+        let pane = self.ctl.pane(Side::Left);
+        if !pane.listing.is_loaded() {
+            return;
+        }
+        let v = pane.volume();
+        if self.fs_type != v.fs_type {
+            self.fs_type = v.fs_type.clone();
+        }
+        if self.volume_label != v.label {
+            self.volume_label = v.label.clone();
+        }
+        self.volume_total = v.total_size;
+        self.volume_used = v.used_size;
+        if self.blessed_folder != v.blessed {
+            self.blessed_folder = v.blessed.clone();
+        }
+    }
+
+    /// Carry out the pane's effects; answers go straight back to it.
+    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<rusty_backup::controller::Effect>) {
+        let mut messages = Vec::new();
+        let replies = self.effects.run(ctx, fx, &mut messages);
+        for m in messages {
+            log::info!("{m}");
+        }
+        for reply in replies {
+            self.answer(ctx, reply);
+        }
+    }
+
+    fn answer(&mut self, ctx: &egui::Context, reply: Reply) {
+        let action = match reply {
+            Reply::Picked { purpose, path } => CommanderAction::Picked { purpose, path },
+            Reply::Confirmed { purpose, yes } => CommanderAction::Confirmed { purpose, yes },
+            Reply::Answered { purpose, text } => CommanderAction::Answered { purpose, text },
+            Reply::CloseScreen => {
+                self.request_close();
+                return;
+            }
+        };
+        self.dispatch(ctx, action);
+    }
+
+    fn dispatch(&mut self, ctx: &egui::Context, action: CommanderAction) {
+        let fx = self.ctl.apply(action);
+        self.run_effects(ctx, fx);
+    }
+
+    /// Close, after the unsaved-edits dialog when edits wait.
+    fn request_close(&mut self) {
+        if self.edit_mode && (!self.queue().is_empty() || self.chd_diff_dirty) {
+            self.pending_close = true;
+            self.show_unsaved_dialog = true;
+        } else {
+            self.close();
+        }
+    }
+
+    /// Bound keys go to the pane while the tree was clicked last and no text field has focus.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        let modal = self.effects.modal_open() || self.ctl.modal_open();
+        if !self.keys_active || modal || ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let ctl = &self.ctl;
+        let keys: Vec<_> = ctx.input_mut(|i| {
+            let mut found = Vec::new();
+            i.events.retain(|ev| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                else {
+                    return true;
+                };
+                let mods = super::commander::egui_mods(*modifiers);
+                let bound = super::commander::egui_key(*key).filter(|k| ctl.binds(*k, mods));
+                found.extend(bound.map(|k| (k, mods)));
+                bound.is_none()
+            });
+            found
+        });
+        if keys.is_empty() {
+            return;
+        }
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        for (key, mods) in keys {
+            self.dispatch(ctx, CommanderAction::Key(key, mods));
+        }
+        self.cursor_armed = true;
+        self.scroll_cursor = true;
+        ctx.request_repaint();
+    }
+
+    /// Point the content panel at the cursor row once it moved (a click or a key).
+    fn sync_selected(&mut self) {
+        let pane = self.ctl.pane(Side::Left);
+        let Some(row) = pane.cursor_index().map(|i| pane.rows()[i].clone()) else {
+            return;
+        };
+        if self.cursor_seen.as_deref() == Some(row.node_id.as_str()) {
+            return;
+        }
+        self.cursor_seen = Some(row.node_id.clone());
+        if !self.cursor_armed {
+            return;
+        }
+        // Rows inside an expanded archive or image belong to another filesystem.
+        let entry = if row.is_tree {
+            None
+        } else {
+            pane.row_entry(&row)
+        };
+        let Some(entry) = entry else {
+            self.selected_entry = None;
+            self.content = None;
+            return;
+        };
+        if self.selected_entry.as_ref().map(|e| &e.path) == Some(&entry.path) {
+            return;
+        }
+        if entry.is_directory() || row.kind == RowKind::PendingAdd {
+            self.selected_entry = Some(entry);
+            self.content = None;
+            self.error = None;
+        } else {
+            self.select_file(&entry);
+        }
+    }
+
+    /// The listing in the pane's style: the combined tree as the browser always drew it, or Commander's.
+    fn render_listing(&mut self, ui: &mut egui::Ui, height: f32) {
+        let mut acts: Vec<CommanderAction> = Vec::new();
+        let pane = self.ctl.pane(Side::Left);
+        if !pane.listing.is_loaded() {
+            if pane.is_opening() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading the volume...");
+                });
+            } else if let Some(err) = pane.source_error() {
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
+            }
+            return;
+        }
+        if pane.listing_style() == ListingStyle::CombinedTree {
+            egui::ScrollArea::vertical()
+                .id_salt("browse_tree")
+                .max_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.render_tree_rows(ui, &mut acts));
+            self.scroll_cursor = false;
+        } else {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let scroll = self.scroll_cursor;
+                    self.pane_view
+                        .show_listing(ui, &self.ctl, scroll, &mut acts)
+                },
+            );
+            self.scroll_cursor = false;
+        }
+        if !acts.is_empty() {
+            self.keys_active = true;
+            self.cursor_armed = true;
+            self.cursor_seen = None;
+            let ctx = ui.ctx().clone();
+            for a in acts {
+                self.dispatch(&ctx, a);
+            }
+        }
+    }
+
+    /// One row per entry of the combined tree, indented by depth, with the mark checkbox.
+    fn render_tree_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<CommanderAction>) {
+        let pane = self.ctl.pane(Side::Left);
+        let rows = pane.rows().to_vec();
+        let cursor = pane.cursor_index();
+        let root_selected = self.selected_entry.as_ref().is_some_and(|e| e.path == "/");
+        let p = |a| CommanderAction::Pane(Side::Left, a);
+        // The volume's root: always open; clicking it shows the volume in the content panel.
+        ui.horizontal(|ui| {
+            if ui.selectable_label(root_selected, "/").clicked() {
+                self.selected_entry = pane.entry_at("/").or_else(|| Some(FileEntry::root()));
+                self.content = None;
+                self.error = None;
+                self.keys_active = true;
+            }
+        });
+        let indent = ui.spacing().indent;
+        for (i, row) in rows.iter().enumerate() {
+            if row.is_parent() {
+                continue;
+            }
+            let entry = pane.row_entry(row);
+            let is_cursor = cursor == Some(i) && !root_selected;
+            ui.horizontal(|ui| {
+                ui.add_space(indent * (row.depth as f32 + 1.0));
+                if row.expandable {
+                    let size = egui::vec2(indent, ui.spacing().interact_size.y);
+                    let (_, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let openness = if row.expanded { 1.0 } else { 0.0 };
+                    egui::collapsing_header::paint_default_icon(ui, openness, &resp);
+                    if resp.clicked() {
+                        acts.push(p(BrowserPaneAction::ToggleExpand(row.node_id.clone())));
+                    }
+                } else {
+                    ui.add_space(indent);
+                }
+                let markable = !matches!(row.kind, RowKind::PendingAdd | RowKind::PendingDelete);
+                if markable {
+                    let mut marked = pane.row_selected(row);
+                    let resp = ui
+                        .checkbox(&mut marked, "")
+                        .on_hover_text("Mark for multi-select export");
+                    if resp.changed() {
+                        acts.push(p(mark_action(row)));
+                    }
+                }
+                let resp = self.row_label(ui, row, entry.as_ref(), is_cursor);
+                if resp.double_clicked() {
+                    acts.push(p(BrowserPaneAction::Activate(row.node_id.clone())));
+                } else if resp.clicked() {
+                    acts.push(p(BrowserPaneAction::CursorTo(row.node_id.clone())));
+                }
+                if is_cursor && self.scroll_cursor {
+                    resp.scroll_to_me(None);
+                }
+            });
+            if row.loading {
+                ui.horizontal(|ui| {
+                    ui.add_space(indent * (row.depth as f32 + 3.0));
+                    ui.label("Loading...");
+                });
+            }
+        }
+    }
+
+    /// A row's label as the tree always showed it: sizes, ProDOS badges, links, staged edits.
+    fn row_label(
+        &self,
+        ui: &mut egui::Ui,
+        row: &DisplayRow,
+        entry: Option<&FileEntry>,
+        selected: bool,
+    ) -> egui::Response {
         let dimmed = super::theme::muted(ui.visuals());
-
-        match entry.entry_type {
+        if row.kind == RowKind::PendingAdd {
+            let text = match entry {
+                Some(e) => self.pending_add_text(ui, e),
+                None => egui::RichText::new(format!("+ {}", row.name)),
+            };
+            return ui.selectable_label(selected, text);
+        }
+        let Some(entry) = entry else {
+            return ui.selectable_label(selected, &row.name);
+        };
+        let mut hover = None;
+        let mut label = match entry.entry_type {
             EntryType::Directory => {
-                let path = entry.path.clone();
-                let has_children = self.directory_cache.contains_key(&path);
-
-                let dir_label = if self
+                let blessed = self
                     .blessed_folder
                     .as_ref()
-                    .map(|(cnid, _)| *cnid == entry.location)
-                    .unwrap_or(false)
-                {
+                    .is_some_and(|(cnid, _)| *cnid == entry.location);
+                if blessed {
                     format!("{} [System]", entry.name)
                 } else {
                     entry.name.clone()
-                };
-
-                let id = ui.make_persistent_id(&path);
-                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    id,
-                    path == "/",
-                );
-
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
-                let header_res = ui.horizontal(|ui| {
-                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                    if !pending_del {
-                        self.mark_checkbox(ui, entry);
-                    }
-                    if pending_del {
-                        let text = egui::RichText::new(&dir_label)
-                            .color(dimmed)
-                            .strikethrough();
-                        ui.label(text);
-                    } else if ui.selectable_label(is_selected, &dir_label).clicked() {
-                        self.selected_entry = Some(entry.clone());
-                        self.content = None;
-                        self.error = None;
-                    }
-                });
-
-                state.show_body_indented(&header_res.response, ui, |ui| {
-                    if let Some(children) = self.directory_cache.get(&path).cloned() {
-                        for child in &children {
-                            self.render_tree_entry(ui, child);
-                        }
-                    } else {
-                        ui.label("Loading...");
-                    }
-
-                    // Append pending-add entries for this directory
-                    if self.edit_mode {
-                        let pending = self.staged_edits.pending_adds_for(&path);
-                        for pentry in &pending {
-                            self.render_pending_add_entry(ui, pentry);
-                        }
-                    }
-                });
-
-                let is_now_open = state.is_open();
-
-                // Load directory contents on first expansion
-                if is_now_open {
-                    if !has_children {
-                        self.load_directory(entry);
-                    }
-                    self.expanded_paths.insert(path.clone());
-                } else {
-                    self.expanded_paths.remove(&path);
                 }
             }
             EntryType::File => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let size_str = entry.size_string();
-                // ProDOS entries get an inline "$XX ABC" type badge so the user
-                // can see the file's type/aux without clicking into it.
-                let prodos_badge = if self.is_prodos_type() {
+                let badge = if self.is_prodos_type() {
                     entry.type_code_display()
                 } else {
                     None
                 };
-                let hover_text = prodos_badge.as_ref().map(|tc| {
+                hover = badge.as_ref().map(|tc| {
                     let tt = entry.prodos_file_type.unwrap_or(0);
                     let desc = fs_apple2::prodos_types::type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
@@ -1672,101 +1973,37 @@ impl BrowseView {
                         format!("{desc} ${:04X}", aux)
                     }
                 });
-
-                if pending_del {
-                    let label = if let Some(ref b) = prodos_badge {
-                        format!("{}  [{}]  ({})", entry.name, b, size_str)
-                    } else {
-                        format!("{}  ({})", entry.name, size_str)
-                    };
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else {
-                    let label = if let Some(ref b) = prodos_badge {
-                        format!("{}  [{}]  ({})", entry.name, b, size_str)
-                    } else {
-                        format!("{}  ({})", entry.name, size_str)
-                    };
-                    // Tint files with staged metadata edits (type/dates/perms)
-                    // blue so the user sees what they've changed before Apply.
-                    let meta_changed =
-                        self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
-                    ui.horizontal(|ui| {
-                        // Directory rows spend `spacing().indent` on the collapse
-                        // toggle before their checkbox; files must match or the
-                        // checkbox column zig-zags. See egui show_button_indented.
-                        ui.add_space(ui.spacing().indent);
-                        self.mark_checkbox(ui, entry);
-                        let rich = if meta_changed {
-                            egui::RichText::new(&label).color(super::theme::info(ui.visuals()))
-                        } else {
-                            egui::RichText::new(&label)
-                        };
-                        let resp = ui.selectable_label(is_selected, rich);
-                        let resp = if let Some(h) = hover_text {
-                            resp.on_hover_text(h)
-                        } else {
-                            resp
-                        };
-                        if resp.clicked() {
-                            self.select_file(entry);
-                        }
-                    });
+                match badge {
+                    Some(b) => format!("{}  [{}]  ({})", entry.name, b, size_str),
+                    None => format!("{}  ({})", entry.name, size_str),
                 }
             }
             EntryType::Symlink => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let target = entry.symlink_target.as_deref().unwrap_or("?");
-                let label = format!("{} -> {}", entry.name, target);
-
-                if pending_del {
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else if ui.selectable_label(is_selected, &label).clicked() {
-                    self.select_file(entry);
-                }
+                format!("{} -> {}", entry.name, target)
             }
             EntryType::Special => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let stype = entry.special_type.as_deref().unwrap_or("special");
-                let label = format!("{}  ({})", entry.name, stype);
-
-                if pending_del {
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else if ui.selectable_label(is_selected, &label).clicked() {
-                    self.selected_entry = Some(entry.clone());
-                    self.content = None;
-                }
+                format!("{}  ({})", entry.name, stype)
             }
+        };
+        if row.is_wrapper {
+            label = format!("{label}  {}", row.type_tag);
         }
-    }
-
-    /// Render the multi-select checkbox for `entry`, toggling its mark. Marked
-    /// entries feed the "Export selected..." bar; independent of the single-click
-    /// `selected_entry` preview.
-    fn mark_checkbox(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let mut marked = self.marked.contains_key(&entry.path);
-        if ui
-            .checkbox(&mut marked, "")
-            .on_hover_text("Mark for multi-select export")
-            .changed()
-        {
-            if marked {
-                self.marked.insert(entry.path.clone(), entry.clone());
-            } else {
-                self.marked.remove(&entry.path);
+        if let Some(to) = &row.rename_to {
+            label = format!("{label} -> {to}");
+        }
+        let text = match row.kind {
+            RowKind::PendingDelete => egui::RichText::new(label).color(dimmed).strikethrough(),
+            _ if row.meta_changed || row.rename_to.is_some() => {
+                egui::RichText::new(label).color(super::theme::info(ui.visuals()))
             }
+            _ => egui::RichText::new(label),
+        };
+        let resp = ui.selectable_label(selected, text);
+        match hover {
+            Some(h) => resp.on_hover_text(h),
+            None => resp,
         }
     }
 
@@ -1783,19 +2020,18 @@ impl BrowseView {
             }
             p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
         }
-        let marked_paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
-        self.marked
-            .iter()
-            .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
-            .map(|(_, e)| e.clone())
-            .collect()
+        let marked = self.ctl.pane(Side::Left).selected_entries();
+        let paths: Vec<&str> = marked.iter().map(|e| e.path.as_str()).collect();
+        let keep = |e: &&FileEntry| !paths.iter().any(|a| is_ancestor(a, &e.path));
+        marked.iter().filter(keep).cloned().collect()
     }
 
     /// Compact bar shown above the tree when entries are checkbox-marked: the
     /// count, an "Export selected as..." format menu (the shared `export_selection`
     /// engine, so `.mar` and the other formats come for free), and Clear.
     fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
-        if self.marked.is_empty() {
+        let count = self.ctl.pane(Side::Left).selected_entries().len();
+        if count == 0 {
             return;
         }
         use rusty_backup::fs::export_selection::ExportFormat;
@@ -1803,7 +2039,7 @@ impl BrowseView {
         let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} selected", self.marked.len()));
+            ui.label(format!("{count} selected"));
             ui.label("Export as:");
             egui::ComboBox::from_id_salt("browse_export_fmt")
                 .selected_text(fmt.label())
@@ -1822,7 +2058,8 @@ impl BrowseView {
         ui.separator();
         self.export_format = fmt;
         if clear {
-            self.marked.clear();
+            let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::ClearSelection);
+            self.ctl.apply(act);
         }
         if do_export {
             self.export_marked(fmt);
@@ -1936,23 +2173,21 @@ impl BrowseView {
         });
     }
 
-    /// Render a pending-add entry with green "+" prefix (not selectable for content).
-    fn render_pending_add_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+    /// A staged add's label: green, blue when its type is unresolved, with its fork badge.
+    fn pending_add_text(&self, ui: &egui::Ui, entry: &FileEntry) -> egui::RichText {
         let green = super::theme::success(ui.visuals());
         let blue = super::theme::info(ui.visuals());
-        // On HFS/HFS+ and ProDOS, surface files that will be added without a
-        // resolved type by tinting them blue so the user can fix them before
-        // Apply. HFS: no FInfo + no dict match + no override. ProDOS: type byte
-        // not in the registry.
+        let queue = self.queue();
+        // HFS: no FInfo, no dictionary match, no override. ProDOS: a type byte not in the registry.
         let color = if self.is_hfs_type() && entry.is_file() {
-            let (t, c) = self.staged_edits.resolved_hfs_type_creator(entry);
+            let (t, c) = queue.resolved_hfs_type_creator(entry);
             if t == [0; 4] && c == [0; 4] {
                 blue
             } else {
                 green
             }
         } else if self.is_prodos_type() && entry.is_file() {
-            let (t, _) = metadata_editor::resolved_prodos_type(&self.staged_edits, entry);
+            let (t, _) = metadata_editor::resolved_prodos_type(queue, entry);
             if !fs_apple2::prodos_types::is_known_type(t) {
                 blue
             } else {
@@ -1961,36 +2196,25 @@ impl BrowseView {
         } else {
             green
         };
-        let is_selected = self
-            .selected_entry
-            .as_ref()
-            .map(|s| s.path == entry.path)
-            .unwrap_or(false);
-
-        // Look up the staged AddFile for this entry to surface rsrc/type info.
-        let rsrc_badge: Option<String> = self
-            .staged_edits
-            .pending_resource_fork_for(&entry.path)
-            .map(|imp| {
-                let tc = imp
-                    .type_code
-                    .map(|c| String::from_utf8_lossy(&c).to_string());
-                let cc = imp
-                    .creator_code
-                    .map(|c| String::from_utf8_lossy(&c).to_string());
-                let codes = match (tc, cc) {
-                    (Some(t), Some(c)) => format!("{t}/{c} "),
-                    (Some(t), None) => format!("{t} "),
-                    (None, Some(c)) => format!("?/{c} "),
-                    (None, None) => String::new(),
-                };
-                format!(
-                    "[{}+rsrc {}]",
-                    codes,
-                    disk_core::display::format_size(imp.data.len() as u64)
-                )
-            });
-
+        let rsrc_badge: Option<String> = queue.pending_resource_fork_for(&entry.path).map(|imp| {
+            let tc = imp
+                .type_code
+                .map(|c| String::from_utf8_lossy(&c).to_string());
+            let cc = imp
+                .creator_code
+                .map(|c| String::from_utf8_lossy(&c).to_string());
+            let codes = match (tc, cc) {
+                (Some(t), Some(c)) => format!("{t}/{c} "),
+                (Some(t), None) => format!("{t} "),
+                (None, Some(c)) => format!("?/{c} "),
+                (None, None) => String::new(),
+            };
+            format!(
+                "[{}+rsrc {}]",
+                codes,
+                disk_core::display::format_size(imp.data.len() as u64)
+            )
+        });
         let label = if entry.is_directory() {
             format!("+ {}", entry.name)
         } else if let Some(ref badge) = rsrc_badge {
@@ -1998,48 +2222,7 @@ impl BrowseView {
         } else {
             format!("+ {}  ({})", entry.name, entry.size_string())
         };
-
-        let text = egui::RichText::new(&label).color(color);
-
-        if entry.is_directory() {
-            // Pending directories collapse open just like real ones, and their
-            // staged children render underneath via recursion.
-            let id = ui.make_persistent_id(("pending-dir", &entry.path));
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                true,
-            );
-            let header_res = ui.horizontal(|ui| {
-                state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                if ui.selectable_label(is_selected, text).clicked() {
-                    self.selected_entry = Some(entry.clone());
-                    self.content = None;
-                }
-            });
-            state.show_body_indented(&header_res.response, ui, |ui| {
-                let nested = self.staged_edits.pending_adds_for(&entry.path);
-                for child in &nested {
-                    self.render_pending_add_entry(ui, child);
-                }
-            });
-        } else if ui.selectable_label(is_selected, text).clicked() {
-            // Allow selecting pending-add entries (for unstaging via delete)
-            self.selected_entry = Some(entry.clone());
-            self.content = None;
-        }
-    }
-
-    /// Queue a folder listing; the tree shows "Loading..." until it lands.
-    fn load_directory(&mut self, entry: &FileEntry) {
-        let queued = self
-            .read_queue
-            .iter()
-            .any(|r| matches!(r, FsRead::List(e) if e.path == entry.path));
-        if !queued {
-            self.read_queue.push_back(FsRead::List(entry.clone()));
-        }
-        self.pump_reads();
+        egui::RichText::new(label).color(color)
     }
 
     /// Start the next queued read: it borrows the cached filesystem, or opens one off the UI thread.
@@ -2079,10 +2262,6 @@ impl BrowseView {
                     },
                 };
                 let done = match read {
-                    FsRead::List(dir) => {
-                        let result = fs.list_directory(&dir).map_err(|e| e.to_string());
-                        FsReadDone::List(dir, result)
-                    }
                     FsRead::Preview(entry) => {
                         let result = fs
                             .read_file(&entry, MAX_PREVIEW_SIZE)
@@ -2130,13 +2309,6 @@ impl BrowseView {
 
     fn apply_read(&mut self, done: FsReadDone) {
         match done {
-            FsReadDone::List(dir, Ok(mut entries)) => {
-                disk_core::entry::sort_for_display(&mut entries);
-                self.directory_cache.insert(dir.path.clone(), entries);
-            }
-            FsReadDone::List(dir, Err(e)) => {
-                self.error = Some(format!("Failed to read {}: {e}", dir.path));
-            }
             FsReadDone::Archive(entry, purpose, result) => {
                 self.apply_archive_read(entry, purpose, result);
             }
@@ -2272,7 +2444,7 @@ impl BrowseView {
                         ui,
                         &entry,
                         self.edit_mode,
-                        &mut self.staged_edits,
+                        &mut self.ctl.host_pane().queue,
                         &mut self.hfs_type_editor,
                         &mut self.edit_result,
                     );
@@ -2285,7 +2457,7 @@ impl BrowseView {
                         ui,
                         &entry,
                         self.edit_mode,
-                        &mut self.staged_edits,
+                        &mut self.ctl.host_pane().queue,
                         &mut self.prodos_type_editor,
                         &mut self.edit_result,
                     );
@@ -2325,7 +2497,7 @@ impl BrowseView {
                         ui,
                         &entry,
                         self.edit_mode,
-                        &mut self.staged_edits,
+                        &mut self.ctl.host_pane().queue,
                         &mut self.ext_perms_editor,
                         &mut self.edit_result,
                     );
@@ -2334,7 +2506,7 @@ impl BrowseView {
                         &entry,
                         self.edit_mode,
                         self.id_names.as_ref(),
-                        &mut self.staged_edits,
+                        &mut self.ctl.host_pane().queue,
                         &mut self.owner_editor,
                         &mut self.edit_result,
                     );
@@ -2364,7 +2536,7 @@ impl BrowseView {
                         &entry,
                         self.edit_mode,
                         xattrs,
-                        &mut self.staged_edits,
+                        &mut self.ctl.host_pane().queue,
                         &mut self.xattr_editor,
                         &mut self.edit_result,
                     );
@@ -2638,7 +2810,7 @@ impl BrowseView {
 
     /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
     fn start_nested_open(&mut self, entry: &FileEntry) {
-        if !self.staged_edits.is_empty() {
+        if !self.ctl.pane(Side::Left).queue.is_empty() {
             self.extraction_result = Some(
                 "Apply or discard the staged edits first: opening a disk image replaces this view."
                     .to_string(),
@@ -2803,8 +2975,15 @@ impl BrowseView {
                 return parent;
             }
         }
-        // Default to root
-        self.root.clone().unwrap_or_else(FileEntry::root)
+        self.root_entry()
+    }
+
+    /// The volume's root entry as the pane listed it.
+    fn root_entry(&self) -> FileEntry {
+        let pane = self.ctl.pane(Side::Left);
+        pane.entry_at("/")
+            .or_else(|| pane.listing.root_entry())
+            .unwrap_or_else(FileEntry::root)
     }
 
     /// The directory entry holding `path`, from the expanded-directory cache.
@@ -2813,16 +2992,10 @@ impl BrowseView {
             .rsplit_once('/')
             .map(|(p, _)| if p.is_empty() { "/" } else { p })?;
         if parent_path == "/" {
-            return self.root.clone();
+            return Some(self.root_entry());
         }
-        for entries in self.directory_cache.values() {
-            for entry in entries {
-                if entry.path == parent_path && entry.is_directory() {
-                    return Some(entry.clone());
-                }
-            }
-        }
-        None
+        let pane = self.ctl.pane(Side::Left);
+        pane.entry_at(parent_path).filter(|e| e.is_directory())
     }
 
     /// Start background extraction of an archive to a temp file for editing.
@@ -2864,10 +3037,8 @@ impl BrowseView {
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
 
-        // Switch browse source back to archive (read-only) — close the browser
-        // while compressing to release the temp file.
-        self.root = None;
-        self.directory_cache.clear();
+        // Close the browser while compressing to release the temp file.
+        self.ctl = new_controller();
         self.selected_entry = None;
         self.content = None;
 
@@ -2884,29 +3055,10 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
 
-        // Re-open filesystem from temp file. Invalidate the cache
-        // first because the source bytes have changed.
+        // The source bytes changed: the pane reopens on the temp file.
         self.invalidate_cached_fs();
-        match self.session.open() {
-            Ok(mut fs) => {
-                self.fs_type = fs.fs_type().to_string();
-                self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                self.volume_total = fs.total_size();
-                self.volume_used = fs.used_size();
-                self.blessed_folder = fs.blessed_system_folder();
-                if let Ok(root) = fs.root() {
-                    self.root = Some(root);
-                }
-                self.directory_cache.clear();
-                self.expanded_paths.clear();
-                self.selected_entry = None;
-                self.content = None;
-                self.return_fs(fs);
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Error opening temp file: {e}"));
-            }
-        }
+        self.selected_entry = None;
+        self.content = None;
     }
 
     /// Poll archive edit background operations for completion.
@@ -2969,29 +3121,9 @@ impl BrowseView {
                 self.session.source_path = Some(ctx.archive_path.clone());
                 self.archive_temp_path = None;
                 self.invalidate_cached_fs();
-
-                match self.session.open() {
-                    Ok(mut fs) => {
-                        self.fs_type = fs.fs_type().to_string();
-                        self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                        self.volume_total = fs.total_size();
-                        self.volume_used = fs.used_size();
-                        self.blessed_folder = fs.blessed_system_folder();
-                        if let Ok(root) = fs.root() {
-                            self.root = Some(root);
-                        }
-                        self.directory_cache.clear();
-                        self.expanded_paths.clear();
-                        self.selected_entry = None;
-                        self.content = None;
-                        self.edit_result = Some("Changes saved successfully.".to_string());
-                        self.return_fs(fs);
-                    }
-                    Err(e) => {
-                        self.edit_result =
-                            Some(format!("Saved but failed to re-open archive: {e}"));
-                    }
-                }
+                self.selected_entry = None;
+                self.content = None;
+                self.edit_result = Some("Changes saved successfully.".to_string());
             }
         }
     }
@@ -3088,6 +3220,7 @@ impl BrowseView {
     fn discard_chd_edit_session(&mut self) {
         self.chd_diff_dirty = false;
         self.session.chd_edit_session = None;
+        self.pane_stale = true;
         if let Some(state) = self.chd_edit.take() {
             if let Some(diff) = state.diff_path {
                 if diff.exists() {
@@ -3718,11 +3851,11 @@ impl BrowseView {
                     // For pending directories, also drop every nested staged
                     // edit so we don't leave AddFile orphans whose parent.path
                     // no longer resolves at apply time.
-                    if self.staged_edits.is_pending_add(&sel.path) {
+                    if self.ctl.pane(Side::Left).queue.is_pending_add(&sel.path) {
                         let removed = if sel.is_directory() {
-                            self.staged_edits.remove_pending_subtree(&sel.path)
+                            self.ctl.host_pane().queue.remove_pending_subtree(&sel.path)
                         } else {
-                            self.staged_edits.remove_pending_add(&sel.path) as usize
+                            self.ctl.host_pane().queue.remove_pending_add(&sel.path) as usize
                         };
                         self.edit_result = if sel.is_directory() && removed > 1 {
                             Some(format!(
@@ -3740,13 +3873,15 @@ impl BrowseView {
                         // not its own parent.
                         let parent = self
                             .parent_entry_of_path(&sel.path)
-                            .unwrap_or_else(|| self.root.clone().unwrap_or_else(FileEntry::root));
+                            .unwrap_or_else(|| self.root_entry());
+                        // Not listed yet counts as non-empty.
                         let is_non_empty_dir = sel.is_directory()
                             && self
-                                .directory_cache
-                                .get(&sel.path)
+                                .ctl
+                                .pane(Side::Left)
+                                .folder_children(&sel.path)
                                 .map(|c| !c.is_empty())
-                                .unwrap_or(true); // assume non-empty if not cached
+                                .unwrap_or(true);
                         self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
                     }
                 }
@@ -3771,7 +3906,9 @@ impl BrowseView {
                     .clicked()
                 {
                     if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits
+                        self.ctl
+                            .host_pane()
+                            .queue
                             .push(StagedEdit::BlessFolder { entry: sel.clone() });
                         self.edit_result = Some(format!("Staged bless folder '{}'", sel.name));
                     }
@@ -3816,7 +3953,10 @@ impl BrowseView {
                     .clicked()
                 {
                     if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits.replace_set_prodos_access(sel, 0x21);
+                        self.ctl
+                            .host_pane()
+                            .queue
+                            .replace_set_prodos_access(sel, 0x21);
                         self.edit_result = Some(format!("Staged lock '{}'", sel.name));
                     }
                 }
@@ -3826,7 +3966,10 @@ impl BrowseView {
                     .clicked()
                 {
                     if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits.replace_set_prodos_access(sel, 0xC3);
+                        self.ctl
+                            .host_pane()
+                            .queue
+                            .replace_set_prodos_access(sel, 0xC3);
                         self.edit_result = Some(format!("Staged unlock '{}'", sel.name));
                     }
                 }
@@ -3838,8 +3981,8 @@ impl BrowseView {
 
             // Apply button: only with staged edits, and not while an extraction
             // or tar export is still reading the volume the apply would rewrite.
-            if !self.staged_edits.is_empty() {
-                let label = format!("Apply Edits ({})", self.staged_edits.len());
+            if !self.ctl.pane(Side::Left).queue.is_empty() {
+                let label = format!("Apply Edits ({})", self.ctl.pane(Side::Left).queue.len());
                 let reading =
                     self.extraction_progress.is_some() || self.tar_export_progress.is_some();
                 if ui
@@ -3882,8 +4025,8 @@ impl BrowseView {
             if let Some(Some(free)) = self.edit_free_space {
                 ui.label(format!("Free: {}", disk_core::display::format_size(free)));
 
-                if !self.staged_edits.is_empty() {
-                    let delta = self.staged_edits.space_delta();
+                if !self.ctl.pane(Side::Left).queue.is_empty() {
+                    let delta = self.ctl.pane(Side::Left).queue.space_delta();
                     let projected = free.saturating_add(delta.freed).saturating_sub(delta.added);
                     let color = if delta.added > free + delta.freed {
                         super::theme::danger(ui.visuals()) // red — won't fit
@@ -3929,7 +4072,9 @@ impl BrowseView {
 
         match rusty_backup::fs::hfs_boot::read_donor_boot_blocks_from_image(&donor) {
             Ok(d) => {
-                self.staged_edits
+                self.ctl
+                    .host_pane()
+                    .queue
                     .push(StagedEdit::WriteBootBlocks { blocks: d.blocks });
                 let donor_name = donor
                     .file_name()
@@ -4044,7 +4189,11 @@ impl BrowseView {
         }
 
         // Duplicate-name check against pending adds in this parent.
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
+        let pending = self
+            .ctl
+            .pane(Side::Left)
+            .queue
+            .pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             errors.push((
                 host_path.to_path_buf(),
@@ -4053,11 +4202,14 @@ impl BrowseView {
             return 0;
         }
 
-        self.staged_edits.push(StagedEdit::CreateDirectory {
-            parent: parent.clone(),
-            name: name.clone(),
-            qnx2_attrs: None,
-        });
+        self.ctl
+            .host_pane()
+            .queue
+            .push(StagedEdit::CreateDirectory {
+                parent: parent.clone(),
+                name: name.clone(),
+                qnx2_attrs: None,
+            });
 
         // Build a synthetic FileEntry for children to reference as parent.
         let dir_path = if parent.path == "/" {
@@ -4485,12 +4637,16 @@ impl BrowseView {
             .map_err(|e| format!("'{name}': {e}"))?;
 
         // Check for duplicate name in pending adds for this parent
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
+        let pending = self
+            .ctl
+            .pane(Side::Left)
+            .queue
+            .pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             return Err(format!("'{name}' is already staged in this directory"));
         }
 
-        self.staged_edits.push(StagedEdit::AddFile {
+        self.ctl.host_pane().queue.push(StagedEdit::AddFile {
             parent: parent.clone(),
             name,
             host_path: effective_path,
@@ -4513,12 +4669,15 @@ impl BrowseView {
         let entry_name = entry.name.clone();
 
         if recursive {
-            self.staged_edits.push(StagedEdit::DeleteRecursive {
-                parent: parent.clone(),
-                entry: entry.clone(),
-            });
+            self.ctl
+                .host_pane()
+                .queue
+                .push(StagedEdit::DeleteRecursive {
+                    parent: parent.clone(),
+                    entry: entry.clone(),
+                });
         } else {
-            self.staged_edits.push(StagedEdit::DeleteEntry {
+            self.ctl.host_pane().queue.push(StagedEdit::DeleteEntry {
                 parent: parent.clone(),
                 entry: entry.clone(),
             });
@@ -4539,7 +4698,7 @@ impl BrowseView {
         self.free_space_job = None;
         log::info!(
             "Applying {} staged edit(s) to {}",
-            self.staged_edits.len(),
+            self.ctl.pane(Side::Left).queue.len(),
             self.session
                 .source_path
                 .as_ref()
@@ -4548,7 +4707,7 @@ impl BrowseView {
         );
         // Collisions are found before anything is written, so the questions are asked once.
         let check_conflicts = self.conflict_review.is_none();
-        let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
+        let edits: Vec<StagedEdit> = self.ctl.host_pane().queue.drain().collect();
         let session = self.session.clone();
         let job = rusty_backup::model::job::Job::spawn(
             "Applying edits...",
@@ -4567,9 +4726,9 @@ impl BrowseView {
 
     /// Put edits back at the front of the queue, ahead of any staged while the job ran.
     fn restage(&mut self, edits: impl IntoIterator<Item = StagedEdit>) {
-        let newer: Vec<StagedEdit> = self.staged_edits.drain().collect();
+        let newer: Vec<StagedEdit> = self.ctl.host_pane().queue.drain().collect();
         for e in edits.into_iter().chain(newer) {
-            self.staged_edits.push(e);
+            self.ctl.host_pane().queue.push(e);
         }
     }
 
@@ -4711,23 +4870,10 @@ impl BrowseView {
     /// filesystem has stale in-memory tables (catalog, bitmap), so drop it
     /// and re-open against the freshly written disk bytes.
     fn invalidate_all_caches(&mut self) {
-        self.directory_cache.clear();
         self.selected_entry = None;
         self.content = None;
-        // Checkbox marks hold FileEntry snapshots; after a write they may
-        // name renamed or deleted files, and an export would use them.
-        self.marked.clear();
+        // The pane's reopen drops marks too: after a write they may name renamed or deleted files.
         self.invalidate_cached_fs();
-        if let Some(mut fs) = self.take_or_open_fs() {
-            if let Ok(root) = fs.root() {
-                if let Ok(mut children) = fs.list_directory(&root) {
-                    disk_core::entry::sort_for_display(&mut children);
-                    self.directory_cache.insert(root.path.clone(), children);
-                }
-                self.root = Some(root);
-            }
-            self.return_fs(fs);
-        }
     }
 
     /// Render the delete confirmation dialog.
@@ -5000,7 +5146,7 @@ impl BrowseView {
         }
         if apply {
             for (path, _name, decision) in &rows {
-                self.staged_edits.set_conflict_for(path, *decision);
+                self.ctl.host_pane().queue.set_conflict_for(path, *decision);
             }
             // Keep the review non-None so the apply does not ask again; the poll clears it.
             self.conflict_review = Some(rows);
@@ -5015,7 +5161,7 @@ impl BrowseView {
             return;
         }
 
-        let count = self.staged_edits.len();
+        let count = self.ctl.pane(Side::Left).queue.len();
 
         egui::Window::new("Unsaved Changes")
             .collapsible(false)
@@ -5030,7 +5176,7 @@ impl BrowseView {
                 let mut dirs_added = 0usize;
                 let mut entries_deleted = 0usize;
                 let mut bytes_added: u64 = 0;
-                for edit in self.staged_edits.iter() {
+                for edit in self.ctl.pane(Side::Left).queue.iter() {
                     match edit {
                         StagedEdit::AddFile { size, .. } => {
                             files_added += 1;
@@ -5066,7 +5212,7 @@ impl BrowseView {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Discard Edits").clicked() {
-                        self.staged_edits.clear();
+                        self.ctl.host_pane().queue.clear();
                         self.pending_archive_imports.clear();
                         self.archive_import_tempdir = None;
                         self.show_unsaved_dialog = false;
@@ -5707,7 +5853,7 @@ impl BrowseView {
         self.edit_result = None;
         self.show_new_folder_dialog = false;
         self.pending_delete = None;
-        self.staged_edits.clear();
+        self.ctl.host_pane().queue.clear();
         self.pending_archive_imports.clear();
         self.archive_import_tempdir = None;
 
@@ -6160,7 +6306,6 @@ impl BrowseView {
                         self.error = Some("Failed to re-check after repair".into());
                     }
                 }
-                self.directory_cache.clear();
             }
             (Status::Failed(e), _) => self.error = Some(e),
             _ => {}
@@ -6410,7 +6555,11 @@ impl BrowseView {
         let parent = self.current_parent_entry();
 
         // Check for duplicate name in pending adds
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
+        let pending = self
+            .ctl
+            .pane(Side::Left)
+            .queue
+            .pending_adds_for(&parent.path);
         if pending.iter().any(|e| e.name == name) {
             self.edit_result = Some(format!(
                 "Error: '{name}' is already staged in this directory"
@@ -6418,11 +6567,14 @@ impl BrowseView {
             return;
         }
 
-        self.staged_edits.push(StagedEdit::CreateDirectory {
-            parent,
-            name: name.clone(),
-            qnx2_attrs: None,
-        });
+        self.ctl
+            .host_pane()
+            .queue
+            .push(StagedEdit::CreateDirectory {
+                parent,
+                name: name.clone(),
+                qnx2_attrs: None,
+            });
 
         self.edit_result = Some(format!("Staged folder '{name}'"));
     }
@@ -6443,76 +6595,6 @@ impl BrowseView {
 
         if !dropped.is_empty() {
             self.add_host_paths(&dropped);
-        }
-    }
-
-    /// Poll extraction progress and update UI state.
-    /// Drain the background-open worker. While it's still running, render a
-    /// spinner + phase label and request a repaint. Once finished, copy the
-    /// fs metadata + root listing into self and clear `pending_open`.
-    fn poll_pending_open(&mut self, ui: &mut egui::Ui) {
-        let mut take_now = false;
-        if let Some(arc) = &self.pending_open {
-            if let Ok(g) = arc.lock() {
-                if g.finished {
-                    take_now = true;
-                } else if g.scan_total > 0 {
-                    // Synthetic carve scan in progress — determinate bar. A
-                    // full scan of a large device is the slow case the
-                    // "Full scan" toggle introduces; show real progress.
-                    let frac = (g.scan_done as f32 / g.scan_total as f32).clamp(0.0, 1.0);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(format!(
-                            "{} ({} / {})",
-                            g.phase,
-                            disk_core::display::format_size(g.scan_done),
-                            disk_core::display::format_size(g.scan_total),
-                        ));
-                    });
-                    ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    ui.ctx().request_repaint();
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(format!("Loading filesystem: {}", g.phase));
-                    });
-                    ui.label(
-                        "Large volumes (e.g. HFS+ catalogs with hundreds of \
-                         thousands of files) can take several seconds.",
-                    );
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-        if take_now {
-            if let Some(arc) = self.pending_open.take() {
-                if let Ok(mut g) = arc.lock() {
-                    self.fs_type = std::mem::take(&mut g.fs_type);
-                    self.volume_label = std::mem::take(&mut g.volume_label);
-                    self.volume_total = g.total_size;
-                    self.volume_used = g.used_size;
-                    self.blessed_folder = g.blessed_folder.take();
-                    if let Some(root) = g.root.take() {
-                        if let Some(mut entries) = g.root_entries.take() {
-                            disk_core::entry::sort_for_display(&mut entries);
-                            self.directory_cache.insert("/".into(), entries);
-                            self.expanded_paths.insert("/".into());
-                        }
-                        self.root = Some(root);
-                    }
-                    if g.needs_password {
-                        self.needs_password = true;
-                        self.error = None;
-                    } else if let Some(err) = g.error.take() {
-                        self.error = Some(err);
-                    }
-                    // Hand the live filesystem into the read cache so we
-                    // don't re-open (and re-read the catalog) for the first
-                    // user action.
-                    self.cached_fs = g.fs.take();
-                }
-            }
         }
     }
 
@@ -6549,6 +6631,7 @@ impl BrowseView {
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
         self.cached_fs = None;
+        self.pane_stale = true;
         self.fs_generation = self.fs_generation.wrapping_add(1);
         // Boot-block status is recomputed lazily from the (now possibly
         // changed) backing bytes the next time the header renders.
@@ -7061,7 +7144,6 @@ fn tar_import_step(
 
 /// A read the browse view queues off the UI thread.
 enum FsRead {
-    List(FileEntry),
     Preview(FileEntry),
     /// Read a whole file and decode it as a Mac archive.
     Archive(FileEntry, ArchiveUse),
@@ -7071,7 +7153,6 @@ impl FsRead {
     /// The same read, failed with `message` (when the filesystem would not open).
     fn failed(self, message: String) -> FsReadDone {
         match self {
-            FsRead::List(dir) => FsReadDone::List(dir, Err(message)),
             FsRead::Preview(entry) => FsReadDone::Preview(entry, Err(message)),
             FsRead::Archive(entry, purpose) => FsReadDone::Archive(entry, purpose, Err(message)),
         }
@@ -7080,7 +7161,6 @@ impl FsRead {
 
 /// What a queued read produced.
 enum FsReadDone {
-    List(FileEntry, Result<Vec<FileEntry>, String>),
     Preview(FileEntry, Result<Vec<u8>, String>),
     Archive(FileEntry, ArchiveUse, Result<ArchiveRead, String>),
 }

@@ -96,6 +96,44 @@ impl BrowserPaneController {
         }
     }
 
+    /// The entry a row draws: a listed, deep, wrapper or staged one; `None` for `..`.
+    pub fn row_entry(&self, row: &super::DisplayRow) -> Option<FileEntry> {
+        if row.is_tree {
+            return self.tree_index.get(&row.node_id).map(|r| r.entry.clone());
+        }
+        if row.kind == RowKind::PendingAdd {
+            let parent = match row.node_id.rsplit_once('/') {
+                Some(("", _)) | None => "/",
+                Some((p, _)) => p,
+            };
+            let mut adds = self.queue.pending_adds_for(parent).into_iter();
+            return adds.find(|e| e.path == row.node_id);
+        }
+        if row.is_parent() {
+            return None;
+        }
+        self.entry_by_path(&row.node_id)
+    }
+
+    /// The folder or file at `path`: the root, a listed entry or one below an expanded folder.
+    pub fn entry_at(&self, path: &str) -> Option<FileEntry> {
+        let root = self.listing.root_entry().filter(|r| r.path == path);
+        root.or_else(|| self.entry_by_path(path))
+    }
+
+    /// What an expanded folder was listed to hold; `None` before it is listed.
+    pub fn folder_children(&self, path: &str) -> Option<&[FileEntry]> {
+        if path == self.listing.cwd_path() {
+            return Some(self.listing.entries());
+        }
+        self.dirs.children.get(path).map(|v| v.as_slice())
+    }
+
+    /// Turn writes off or on while the pane is open (the Inspect tab's Edit Mode).
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.profile.read_only = read_only;
+    }
+
     /// The selected deep rows, in selection order.
     pub(super) fn folder_selection(&self) -> Vec<FolderRow> {
         let rows = self.dirs.selected.iter();
