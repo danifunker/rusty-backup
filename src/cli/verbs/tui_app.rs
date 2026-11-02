@@ -947,40 +947,6 @@ enum HdPlatform {
     Atari,
 }
 
-/// Step the "write to" choice: whole disk -> each partition -> back to whole
-/// disk. `None` is the whole device.
-fn next_write_region(
-    parts: &[crate::partition::PartitionInfo],
-    current: Option<usize>,
-) -> Option<usize> {
-    match current {
-        None => parts.first().map(|p| p.index),
-        Some(cur) => match parts.iter().position(|p| p.index == cur) {
-            Some(i) if i + 1 < parts.len() => Some(parts[i + 1].index),
-            // Past the last one, and an index that has since vanished, both
-            // land back on the whole disk rather than sticking.
-            _ => None,
-        },
-    }
-}
-
-/// Partitions on a write target, or empty when it has no readable table.
-fn read_target_partitions(device: &std::path::Path) -> Vec<crate::partition::PartitionInfo> {
-    let Ok(mut reader) =
-        crate::model::source_reader::open_peeled_read_with_entry(device, None, None)
-    else {
-        return Vec::new();
-    };
-    match crate::partition::PartitionTable::detect(&mut reader) {
-        Ok(t) => t
-            .partitions()
-            .into_iter()
-            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Wrap the shared args with the default cylinder geometry, for the two
 /// tables whose partitions land on cylinder boundaries.
 fn cylinder_args(
@@ -1305,8 +1271,8 @@ impl BackupState {
 
 /// The Restore screen: source (backup folder / `.cbk`) -> config (target /
 /// sizing / alignment) -> run, over a headless `controller::restore::RestoreController`,
-/// the controller behind the GUI's Restore tab. An image source is poured by
-/// `physical_write_runner` instead (the GUI's Write Image window is not a controller yet).
+/// the controller behind the GUI's Restore tab. An image source is poured by a headless
+/// `controller::disk_write::DiskWriteController`, the GUI's Physical Disk Export window.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RestoreStep {
     Source,
@@ -1361,13 +1327,10 @@ struct RestoreState {
     source_is_image: bool,
     /// Decoded length of the chosen image; a container's file size is not it.
     image_size: u64,
-    /// Partitions on the chosen device, for writing an image into just one.
-    /// Empty when the target has no readable table.
-    target_partitions: Vec<crate::partition::PartitionInfo>,
-    /// `None` writes the whole device; `Some(index)` writes one partition.
-    target_partition: Option<usize>,
-    /// A running image write's shared status, once started.
-    write_run: Option<Arc<Mutex<crate::model::physical_write_runner::PhysicalWriteStatus>>>,
+    /// Pours an image source: the target, its partitions and the write.
+    writer: crate::controller::disk_write::DiskWriteController,
+    /// The writer runs the write this screen started.
+    writing: bool,
 }
 
 impl Default for RestoreState {
@@ -1403,9 +1366,13 @@ impl Default for RestoreState {
             confirm_device: None,
             source_is_image: false,
             image_size: 0,
-            target_partitions: Vec::new(),
-            target_partition: None,
-            write_run: None,
+            writer: crate::controller::disk_write::DiskWriteController::new(
+                crate::controller::disk_write::DiskWriteServices {
+                    jobs: crate::controller::disk_write::JobRegistry::new(),
+                    notify: Arc::new(crate::controller::disk_write::NoNotify),
+                },
+            ),
+            writing: false,
         }
     }
 }
@@ -3291,15 +3258,12 @@ impl App {
                         .and_then(|d| d.get(sel))
                         .map(|d| d.path.display().to_string());
                     if let Some(path) = dev {
-                        // Read the target's partitions so an image can be
-                        // written into just one of them.
-                        let parts = read_target_partitions(std::path::Path::new(&path));
                         let r = self.restore.as_mut().unwrap();
                         r.device_pick = false;
                         r.target = path;
                         r.target_is_device = true;
-                        r.target_partitions = parts;
-                        r.target_partition = None;
+                        // The writer reads the target's partitions, so an image can go into one.
+                        self.select_write_device();
                     }
                 }
                 _ => {}
@@ -3382,8 +3346,10 @@ impl App {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                     if r.field == 1 && r.source_is_image =>
                 {
-                    r.target_partition =
-                        next_write_region(&r.target_partitions, r.target_partition);
+                    use crate::controller::Controller as _;
+                    r.writer.apply(
+                        crate::controller::disk_write::DiskWriteAction::CycleTargetPartition,
+                    );
                     true
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 1 => {
@@ -3454,77 +3420,134 @@ impl App {
     /// Load a chosen backup source (native folder or `.cbk`), read its metadata
     /// for defaults, and advance to the config form. Errors show on the source
     /// screen.
-    /// Pour the chosen image onto the target, whole-disk or into one partition.
-    fn start_image_write(&mut self, target: std::path::PathBuf, is_device: bool) {
-        use crate::model::physical_write_runner::{
-            self, PhysicalWriteRequest, PhysicalWriteSource, WriteExtent,
-        };
+    /// Hand the device named in the target field to the writer, which reads its partitions.
+    fn select_write_device(&mut self) {
+        use crate::controller::disk_write::DiskWriteAction;
+        use crate::controller::Controller as _;
         let Some(r) = self.restore.as_mut() else {
             return;
         };
+        let target = std::path::PathBuf::from(r.target.trim());
+        let picked = self.disks.as_ref().and_then(|d| {
+            d.iter()
+                .enumerate()
+                .find(|(_, dev)| dev.path == target)
+                .map(|(row, dev)| (row, dev.clone()))
+        });
+        if let Some((row, device)) = picked {
+            r.writer
+                .apply(DiskWriteAction::SelectDevice { row, device });
+            r.writer.wait_idle();
+        }
+    }
 
-        let target_size = if is_device {
-            crate::device::enumerate_devices()
-                .into_iter()
-                .find(|d| d.path == target)
-                .map(|d| d.size_bytes)
-                .unwrap_or(0)
-        } else {
-            std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0)
+    /// Pour the chosen image onto the target, whole-disk or into one partition.
+    fn start_image_write(&mut self, target: std::path::PathBuf, is_device: bool) {
+        use crate::controller::disk_write::{DiskWriteAction, DiskWriteController};
+        use crate::controller::{Controller as _, Effect};
+        let same_device = self
+            .restore
+            .as_ref()
+            .and_then(|r| r.writer.target_device())
+            .is_some_and(|d| d.path == target);
+        if is_device && !same_device {
+            self.select_write_device();
+        }
+        let Some(r) = self.restore.as_mut() else {
+            return;
         };
-
-        let extent = match r.target_partition {
-            Some(idx) => match r.target_partitions.iter().find(|p| p.index == idx) {
-                Some(p) => WriteExtent::partition(p.start_lba, p.size_bytes),
-                None => {
-                    r.result = Some("Selected partition is no longer present.".to_string());
-                    r.is_error = true;
-                    r.step = RestoreStep::Run;
-                    return;
-                }
-            },
-            None => WriteExtent::whole_disk(target_size.max(r.image_size)),
-        };
-
-        let req = PhysicalWriteRequest {
-            source: PhysicalWriteSource::Image(std::path::PathBuf::from(&r.backup_folder)),
-            target_device_path: target,
-            target_size_bytes: target_size,
-            extent,
-            wrap: None,
-        };
-        r.write_run = Some(physical_write_runner::start_physical_write(req));
+        if !is_device {
+            r.writer.apply(DiskWriteAction::SetTargetImage(target));
+        }
+        // The device was confirmed by this screen's own prompt, so the writer's question is answered here.
+        fn answer(w: &mut DiskWriteController, fx: Vec<Effect>) {
+            for e in fx {
+                let reply = match e {
+                    Effect::AskText(spec) => DiskWriteAction::Answered {
+                        purpose: spec.purpose,
+                        text: spec.taken.first().cloned(),
+                    },
+                    Effect::Confirm(spec) => DiskWriteAction::Confirmed {
+                        purpose: spec.purpose,
+                        yes: true,
+                    },
+                    Effect::PickFile(_)
+                    | Effect::PickFolder(_)
+                    | Effect::AskPassword(_)
+                    | Effect::Message(_)
+                    | Effect::OpenUrl(_)
+                    | Effect::CopyToClipboard(_)
+                    | Effect::CloseScreen
+                    | Effect::Quit => continue,
+                };
+                w.apply(reply);
+            }
+        }
+        if !r.writer.can_write() {
+            r.result = Some("Choose a target.".to_string());
+            r.is_error = true;
+            r.step = RestoreStep::Run;
+            return;
+        }
+        let fx = r.writer.apply(DiskWriteAction::Write);
+        answer(&mut r.writer, fx);
+        r.step = RestoreStep::Run;
+        if !r.writer.is_writing() {
+            r.result = Some(
+                r.writer
+                    .error()
+                    .unwrap_or("The image write did not start.")
+                    .to_string(),
+            );
+            r.is_error = true;
+            return;
+        }
+        r.writing = true;
         r.op = "Writing image...".to_string();
         r.result = None;
         r.is_error = false;
-        r.step = RestoreStep::Run;
     }
 
-    /// Read the image-write status into the shared result/op fields the Run
-    /// step already renders.
+    /// Follow the writer's job into the shared result/op fields the Run step already renders.
     fn poll_image_write(&mut self) {
+        use crate::controller::Controller as _;
         let Some(r) = self.restore.as_mut() else {
             return;
         };
-        let Some(status) = r.write_run.as_ref() else {
+        let _ = r.writer.tick();
+        let _ = r.writer.take_log();
+        if !r.writing {
             return;
-        };
-        let Ok(s) = status.lock() else { return };
-        if s.finished {
-            r.result = Some(match &s.error {
-                Some(e) => format!("Image write failed: {e}"),
-                None => format!("Wrote {} to the target.", format_size(s.current_bytes)),
-            });
-            r.is_error = s.error.is_some();
-            r.op = String::new();
-            drop(s);
-            r.write_run = None;
-        } else if s.total_bytes > 0 {
-            r.op = format!(
-                "Writing image: {} / {}",
-                format_size(s.current_bytes),
-                format_size(s.total_bytes),
-            );
+        }
+        if r.writer.is_writing() {
+            if let Some(snap) = r.writer.progress() {
+                if let crate::controller::disk_write::Progress::Determinate {
+                    done, total, ..
+                } = snap.progress
+                {
+                    if total > 0 {
+                        r.op = format!(
+                            "Writing image: {} / {}",
+                            format_size(done),
+                            format_size(total),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        r.writing = false;
+        r.op = String::new();
+        match r.writer.result() {
+            Some(Ok(n)) => {
+                r.result = Some(format!("Wrote {} to the target.", format_size(*n)));
+                r.is_error = false;
+            }
+            Some(Err(e)) => {
+                r.result = Some(format!("Image write failed: {e}"));
+                r.is_error = true;
+            }
+            None => {}
         }
     }
 
@@ -3552,6 +3575,16 @@ impl App {
                     r.result = None;
                     r.is_error = false;
                     r.step = RestoreStep::Config;
+                    use crate::controller::Controller as _;
+                    r.writer
+                        .apply(crate::controller::disk_write::DiskWriteAction::Open(
+                            crate::controller::disk_write::WriteOpen::image(path.clone(), n),
+                        ));
+                    r.writer.wait_idle();
+                    // A new source starts the writer with no target; keep the one on the form.
+                    if r.target_is_device {
+                        self.select_write_device();
+                    }
                 }
                 None => {
                     r.result = Some(format!("Cannot read {} as a disk image", path.display()));
@@ -4438,29 +4471,34 @@ impl App {
                 }
             }
         }
-        // An image write reports through its own status struct.
-        if let Some(run) = self.restore.as_ref().and_then(|r| r.write_run.clone()) {
-            let snap = run
-                .lock()
-                .ok()
-                .map(|s| (s.current_bytes, s.total_bytes, s.finished));
-            if let Some((cur, total, done)) = snap {
-                if let Some(prog) = self.progress.as_ref() {
+        // An image write reports through the writer's job.
+        let writing = self.restore.as_ref().is_some_and(|r| r.writing);
+        if writing {
+            self.poll_image_write();
+            if let Some(r) = self.restore.as_ref() {
+                let snap = r.writer.progress();
+                if let (Some(prog), Some(snap)) = (self.progress.as_ref(), snap) {
                     if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = cur;
-                        sh.total = total;
-                        sh.done = done;
+                        if let crate::controller::disk_write::Progress::Determinate {
+                            done,
+                            total,
+                            ..
+                        } = snap.progress
+                        {
+                            sh.current = done;
+                            sh.total = total;
+                        }
+                        sh.done = !r.writer.is_writing();
                     }
                 }
             }
-            self.poll_image_write();
         }
         // Drive the Restore controller and mirror its run into the visual bar.
         if let Some(r) = self.restore.as_mut() {
             use crate::controller::Controller as _;
             let _ = r.ctl.tick();
             r.after();
-            if r.step == RestoreStep::Run && r.write_run.is_none() {
+            if r.step == RestoreStep::Run && !writing {
                 let bar = r.ctl.progress();
                 if let Some(prog) = self.progress.as_ref() {
                     if let Ok(mut sh) = prog.shared.lock() {
@@ -5567,19 +5605,14 @@ impl App {
                 if r.source_is_image {
                     // Size mode and alignment don't apply to a fixed image;
                     // the choice that matters is where on the target it lands.
-                    let region = match r.target_partition {
+                    let parts = r.writer.target_partitions();
+                    let region = match r.writer.target_partition() {
                         None => "< Entire disk >".to_string(),
-                        // Position, matching every other surface; selection
-                        // still keys on the slot in `p.index`.
-                        Some(idx) => match r
-                            .target_partitions
-                            .iter()
-                            .enumerate()
-                            .find(|(_, p)| p.index == idx)
-                        {
-                            Some((pos, p)) => format!(
+                        // Position, matching every other surface; selection keys on `p.index`.
+                        Some(idx) => match parts.iter().find(|p| p.index == idx) {
+                            Some(p) => format!(
                                 "< Partition {} - {} ({}) >",
-                                pos + 1,
+                                p.position,
                                 p.type_name,
                                 format_size(p.size_bytes),
                             ),
@@ -5587,7 +5620,7 @@ impl App {
                         },
                     };
                     lines.push(row(1, "Write to:", region, false));
-                    if r.target_is_device && r.target_partitions.is_empty() {
+                    if r.target_is_device && parts.is_empty() {
                         lines.push(Line::styled(
                             "             (no partition table on the target)",
                             self.palette.dim(),
@@ -7257,48 +7290,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
 
-    fn part(index: usize) -> crate::partition::PartitionInfo {
-        crate::partition::PartitionInfo {
-            index,
-            type_name: "HFS".into(),
-            partition_type_byte: 0xAF,
-            start_lba: 2048 * (index as u64 + 1),
-            start_byte: None,
-            size_bytes: 1024 * 1024,
-            bootable: false,
-            is_logical: false,
-            is_extended_container: false,
-            partition_type_string: None,
-            hfs_block_size: None,
-            rdb_part_block: None,
-            drv_name: None,
-        }
-    }
-
-    #[test]
-    fn write_region_cycles_whole_disk_then_each_partition() {
-        let parts = vec![part(0), part(1), part(2)];
-        // Whole disk -> first -> second -> third -> back to whole disk.
-        let mut sel = None;
-        sel = next_write_region(&parts, sel);
-        assert_eq!(sel, Some(0));
-        sel = next_write_region(&parts, sel);
-        assert_eq!(sel, Some(1));
-        sel = next_write_region(&parts, sel);
-        assert_eq!(sel, Some(2));
-        sel = next_write_region(&parts, sel);
-        assert_eq!(sel, None, "must wrap back to the whole disk");
-    }
-
-    #[test]
-    fn write_region_handles_no_table_and_stale_selection() {
-        // A target with no partition table only ever offers the whole disk.
-        assert_eq!(next_write_region(&[], None), None);
-        assert_eq!(next_write_region(&[], Some(3)), None);
-        // A selection that no longer exists falls back rather than sticking.
-        assert_eq!(next_write_region(&[part(0)], Some(9)), None);
-    }
-
     /// `g`/`G` is the deliberate exception - the vim top/bottom pair. It is
     /// kept *and* spelled out in the hint tables, rather than left to be
     /// discovered.
@@ -7497,6 +7488,95 @@ mod tests {
         assert_eq!(r.result.as_deref(), Some("Restore complete."));
         let out = std::fs::read(dir.path().join("bk_restored.img")).unwrap();
         assert_eq!(out, bytes);
+    }
+
+    /// An image source pours through the disk writer: whole into an image file, then into one
+    /// partition of a disk-image file standing in for a device (never a real disk).
+    #[test]
+    fn the_restore_screen_writes_an_image_through_the_disk_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("src.img");
+        let bytes: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 249) as u8).collect();
+        std::fs::write(&img, &bytes).unwrap();
+        let run = |app: &mut App| {
+            for _ in 0..3000 {
+                app.tick();
+                if app.restore.as_ref().unwrap().result.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let mut app = App::new_on(BACKUP_TAB + 1);
+        app.restore = Some(RestoreState {
+            source_is_image: true,
+            ..RestoreState::default()
+        });
+        app.load_restore_source(img.clone());
+        let r = app.restore.as_mut().unwrap();
+        assert!(r.step == RestoreStep::Config, "{:?}", r.result);
+        let out = dir.path().join("out.img");
+        r.target = out.display().to_string();
+        r.field = 3;
+        assert!(app.handle_restore_key(KeyCode::Enter));
+        run(&mut app);
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(
+            r.result.as_deref(),
+            Some("Wrote 1.0 MiB to the target."),
+            "{:?}",
+            r.result
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+
+        // A "device" with one MBR partition at LBA 2048; the table must survive.
+        let disk = dir.path().join("disk.img");
+        let mut d = vec![0u8; 4 << 20];
+        d[0x1BE + 4] = 0x06;
+        d[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
+        d[0x1BE + 12..0x1BE + 16].copy_from_slice(&4096u32.to_le_bytes());
+        d[510] = 0x55;
+        d[511] = 0xAA;
+        std::fs::write(&disk, &d).unwrap();
+        app.disks = Some(vec![DiskDevice {
+            name: "fake".into(),
+            path: disk.clone(),
+            size_bytes: 4 << 20,
+            is_removable: true,
+            is_read_only: false,
+            is_system: false,
+            bus_protocol: "USB".into(),
+            media_name: "Fake".into(),
+            partitions: Vec::new(),
+        }]);
+        let r = app.restore.as_mut().unwrap();
+        r.result = None;
+        r.step = RestoreStep::Config;
+        r.target = disk.display().to_string();
+        r.target_is_device = true;
+        app.select_write_device();
+        let r = app.restore.as_mut().unwrap();
+        assert_eq!(r.writer.target_partitions().len(), 1);
+        r.field = 1;
+        assert!(app.handle_restore_key(KeyCode::Right));
+        let r = app.restore.as_mut().unwrap();
+        assert!(r.writer.target_partition().is_some());
+        r.field = 3;
+        assert!(app.handle_restore_key(KeyCode::Enter));
+        assert!(app.restore.as_ref().unwrap().confirm_device.is_some());
+        assert!(app.handle_restore_key(KeyCode::Char('y')));
+        run(&mut app);
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(
+            r.result.as_deref(),
+            Some("Wrote 1.0 MiB to the target."),
+            "{:?}",
+            r.result
+        );
+        let after = std::fs::read(&disk).unwrap();
+        assert_eq!(&after[..512], &d[..512]);
+        assert_eq!(&after[1 << 20..2 << 20], &bytes[..]);
     }
 
     /// The file picker must accept a raw device path.

@@ -811,6 +811,108 @@ alignment can come from the config file; `model::restore_plan` would change the 
   the GUI's (the differences above).
 - Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
 
+## Slice 14: the disk writer (Physical Disk Export, Write Image File)
+
+`src/gui/physical_disk_export.rs` (737 lines, 19 engine references) was the Physical Disk Export
+window: its own form state, a VBR read for the hidden-sectors hint on the UI thread, a
+`Job::spawn` for the target's partitions, the size / alignment / GPT rules and a
+`physical_write_runner::start_physical_write` thread polled each frame. Inspect's export and the
+Restore tab's Write Image File both opened it. The TUI's Restore screen poured an image source
+with its own copy of the partition read, region cycling and request building, on its own
+`start_physical_write` thread.
+
+Step 0 (b30a9597, 7119b5ba): unit tests wrote temp paths into the user's
+`~/.config/rusty-backup/config.json` recent lists (the TUI's Inspect opens, and anything else
+reaching `UpdateConfig::save`). `UpdateConfig::user_config_dir()` now returns
+`<temp>/rusty-backup-test-config` under `cfg(test)`, which covers every recent list, the Commander
+recent store, the Custom CHD choice and `keybindings.toml`; slice 13's `cfg!(test)` special case
+in the TUI Restore screen is gone.
+
+### Steps
+
+1. (8eabc8b4) Model and controller. `model::disk_write_plan` holds the rules: `WriteOpen` (what a
+   screen hands over: path, decoded size if known, fs hint, whether it has a table, whether it is
+   a superfloppy), `prepare` (measures the decoded size, reads the VBR hint, seeds the
+   `WrapForm` from `superfloppy_wrap::suggest_wrap_params`), `read_target_partitions`,
+   `partition_fit_warning`, `TYPE_BYTE_PRESETS` and `build_request` (a partition write by byte
+   offset, a whole-disk write capped at the device or grown for an image file, the synthesized
+   table's size / alignment / GPT type checks). `controller::disk_write::DiskWriteController`
+   (`mod.rs`, `target.rs`, `run.rs`) owns:
+   - `Open(WriteOpen)` (a job; a new source drops the target), `Close`, `is_open`, `opening()`.
+   - The target: `SelectDevice { row, device }` (the partitions are read in a job; the same disk
+     is not re-read), `SetTargetImage` (the TUI's image-file target), `reconcile_devices` (the
+     target follows its row, as the window's index did), `SetTargetPartition`,
+     `CycleTargetPartition` (whole disk, each partition, whole disk), `target_partitions()`
+     (`TargetPartition` with position and label), `partition_warning()`.
+   - The form: `SetSynthesize`, `SetTableKind`, `SetAlignment`, `SetCustomAlignment`,
+     `SetTypeByte`, `SetSize`; `can_synthesize()`; edits are refused while a write runs.
+   - `Write`: `build_request`'s refusal lands in `error()`; a device asks
+     `Effect::AskText(purpose::DEVICE_NAME)` whose validator wants the device's exact name (checked
+     again on `Answered`), an image file `Effect::Confirm(purpose::OVERWRITE_FILE)`. The write is a
+     job over `physical_write_runner::run_worker` through `run_mirrored` (bytes, log lines and
+     cancel mirrored, wake lock held); `progress()`, `result()` (bytes written or the error),
+     `has_run()`, `is_writing()`, `Cancel`. `wait_idle` / `wait_finished` for a headless shell or
+     a test.
+2. (036d6883) The egui window renders and maps; it keeps only its `EffectHost`. Inspect hands it
+   `InspectController::physical_source()` (now a `WriteOpen`; the size is measured in the writer's
+   job, not on the UI thread), the Restore tab `WriteOpen::image(path, size)` from
+   `HostRequest::WriteImage`. Both tabs poll it in the background too.
+3. (this commit) `src/gui/physical_disk_export.rs` joins `ENFORCED`. The TUI's Restore screen pours
+   an image source through a headless `DiskWriteController` (opened when the image loads, the
+   device handed over when picked, Space / arrows send `CycleTargetPartition`, Start answers the
+   writer's question after the screen's own `y` prompt, the bar and result follow the job;
+   `the_restore_screen_writes_an_image_through_the_disk_writer`). `read_target_partitions` and
+   `next_write_region` are gone from `tui_app.rs`. A ui scenario vm `disk_write`
+   (`tests/ui_scenarios/disk_write_partition_and_superfloppy.toml`,
+   `disk_write_image_file.toml`) writes into one partition of a disk-image file standing in for a
+   device behind the typed name (a wrong name writes nothing), wraps a superfloppy in a fresh MBR,
+   and writes to an image file after a yes.
+
+Shells' engine references 291 -> 263 (`physical_disk_export.rs` 19 -> 0, `tui_app.rs` 66 -> 57).
+
+`rb-cli write` keeps its own request: its `--partition` takes the `IMG@` selector forms, and its
+system-disk and mount preflight (`cli::device_safety`) runs before the write.
+
+### Behaviour changes
+
+- GUI: the device name is typed into the shared text prompt that "Write to disk..." opens (OK
+  enables only on the exact name); it was a field under the form that enabled the button.
+- GUI: opening the window measures the source (decoded size, VBR hint) in a job ("Reading the
+  source..."); Inspect measured the decoded size on the UI thread when Physical Disk Export was
+  clicked.
+- GUI: the write's progress is the shared job widget (phase, percentage, rate and time left,
+  Cancel); the source, wrap and completion lines and "Wrote N to the target" / "Disk write failed:
+  ..." go to the log panel (they were dropped).
+- GUI: without a synthesized table the synthesized partition's size checks no longer run, so an
+  image exactly the device's size (or not a multiple of 512 bytes) is no longer refused with
+  "Partition end ... exceeds target disk size"; a source larger than the target is still refused
+  (by the runner's fit check).
+- GUI: a refreshed device list whose row no longer exists clears the target (the combo showed
+  "Select a device..." while the old index stayed).
+- TUI: a partition write addresses the partition by its byte offset, as the GUI and `rb-cli write`
+  do; on an X68000 SASI disk (256-byte sectors) the old `start_lba * 512` landed 256 bytes early.
+  Every other table writes the same bytes.
+- TUI: a whole-device write is capped at the device's size up front (it was the larger of the
+  device and the image, so an oversized image failed at the end of the device); the device's size
+  comes from the device list instead of a second enumeration at Start.
+- TUI: a source too large for the chosen partition, or a partition that vanished, is refused before
+  anything is written with the controller's message ("Source is X but partition N holds only Y").
+- TUI: loading a new image source keeps the device target on the form (the writer is re-pointed at
+  it and its partitions re-read).
+- CLI: none.
+
+### Left
+
+- The TUI has no synthesize form (its image source always counts as having a table) and no Inspect
+  export, so it never opens the writer for a superfloppy.
+- `rb-cli write` could build its request through `disk_write_plan::build_request` once its
+  partition selector maps to the plan's `PartitionInfo`.
+- The dialogs the Inspect and Restore tabs host that still reach the engine:
+  `partition_editor_modal.rs` (25), `resize_popup.rs` (22), `remote_browser.rs` (12),
+  `floppy_convert_dialog.rs` (8), `progress.rs` (7), `expand_hfs_dialog.rs` (4),
+  `alto_resize_dialog.rs` (2).
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.

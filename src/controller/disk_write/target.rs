@@ -140,8 +140,11 @@ impl DiskWriteController {
         self.target
             .partitions
             .iter()
-            .map(|p| TargetPartition {
+            .enumerate()
+            .map(|(pos, p)| TargetPartition {
                 index: p.index,
+                position: pos + 1,
+                type_name: p.type_name.clone(),
                 label: format!(
                     "Partition {} - {} ({}) at LBA {}",
                     p.index + 1,
@@ -152,6 +155,11 @@ impl DiskWriteController {
                 size_bytes: p.size_bytes,
             })
             .collect()
+    }
+
+    pub(super) fn cycle_target_partition(&mut self) {
+        let indices: Vec<usize> = self.target.partitions.iter().map(|p| p.index).collect();
+        self.target.partition = next_region(indices.as_slice(), self.target.partition);
     }
 
     pub fn target_partition(&self) -> Option<usize> {
@@ -186,5 +194,16 @@ impl DiskWriteController {
             size_bytes,
             is_device: false,
         })
+    }
+}
+
+/// Whole disk (`None`) -> each partition -> whole disk; a vanished choice falls back to the disk.
+pub(super) fn next_region(parts: &[usize], current: Option<usize>) -> Option<usize> {
+    match current {
+        None => parts.first().copied(),
+        Some(cur) => match parts.iter().position(|&p| p == cur) {
+            Some(i) if i + 1 < parts.len() => Some(parts[i + 1]),
+            _ => None,
+        },
     }
 }

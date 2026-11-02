@@ -1,0 +1,22 @@
+# The disk writer onto an image file (the TUI's target): a yes/no question, then byte for byte.
+name = "Disk write: image file target"
+vm = "disk_write"
+
+[[step]]
+action = "Open"
+arg = "$image"
+settle = true
+
+[[step]]
+action = "SetTargetImage"
+arg = "$out"
+expect = { can_write = true }
+
+[[step]]
+action = "Write"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok", written = true }

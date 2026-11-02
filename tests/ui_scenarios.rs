@@ -599,12 +599,187 @@ impl Target for RestoreTarget {
     }
 }
 
+/// The disk writer (Physical Disk Export, Write Image File). Actions: `Open` (`$image` for a
+/// patterned 1 MiB image, `$superfloppy` for the same as a table-less FAT16 volume),
+/// `SelectDevice` (`$disk` for an 8 MiB disk-image file standing in for a device, `$table` for one
+/// with an MBR partition at LBA 2048), `SetTargetImage` (`$out`), `CyclePartition`,
+/// `SetSynthesize` (bool), `Write`, `AnswerName` (a string, or `$name` for the device's own),
+/// `Confirm`, `Close`. Probes: `open`, `size`, `synthesize`, `partitions`, `partition` (the
+/// chosen index, -1 for the whole disk), `can_write`, `error`, `result` (`ok`, the failure or
+/// empty), `written` (the source landed where the write was aimed, the table intact), `log`.
+struct DiskWriteTarget {
+    ctl: rusty_backup::controller::disk_write::DiskWriteController,
+    dir: tempfile::TempDir,
+    log: Vec<String>,
+}
+
+impl DiskWriteTarget {
+    fn new() -> Self {
+        use rusty_backup::controller::disk_write::{
+            DiskWriteController, DiskWriteServices, JobRegistry, NoNotify,
+        };
+        DiskWriteTarget {
+            ctl: DiskWriteController::new(DiskWriteServices {
+                jobs: JobRegistry::new(),
+                notify: std::sync::Arc::new(NoNotify),
+            }),
+            dir: tempfile::tempdir().expect("temp dir"),
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        fx
+    }
+
+    fn source_bytes() -> Vec<u8> {
+        (0..(1usize << 20)).map(|i| (i % 247) as u8).collect()
+    }
+
+    /// An 8 MiB disk-image file standing in for a device; tests never touch a real disk.
+    fn fake_disk(&self, table: bool) -> Result<rusty_backup::device::DiskDevice, String> {
+        let path = self.dir.path().join("disk.img");
+        let mut d = vec![0u8; 8 << 20];
+        if table {
+            d[0x1BE + 4] = 0x06;
+            d[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
+            d[0x1BE + 12..0x1BE + 16].copy_from_slice(&4096u32.to_le_bytes());
+            d[510] = 0x55;
+            d[511] = 0xAA;
+        }
+        std::fs::write(&path, &d).map_err(|e| e.to_string())?;
+        std::fs::write(self.dir.path().join("disk.before"), &d).map_err(|e| e.to_string())?;
+        Ok(rusty_backup::device::DiskDevice {
+            name: "fake".into(),
+            path,
+            size_bytes: 8 << 20,
+            is_removable: true,
+            is_read_only: false,
+            is_system: false,
+            bus_protocol: "USB".into(),
+            media_name: "Fake".into(),
+            partitions: Vec::new(),
+        })
+    }
+
+    /// Whether the source sits where the last write aimed it, and nothing else moved.
+    fn written(&self) -> bool {
+        let src = Self::source_bytes();
+        let read = |n: &str| std::fs::read(self.dir.path().join(n)).ok();
+        if let Some(out) = read("out.img") {
+            return out == src;
+        }
+        let (Some(disk), Some(before)) = (read("disk.img"), read("disk.before")) else {
+            return false;
+        };
+        let at = 1usize << 20;
+        let body = disk[at..at + src.len()] == src[..];
+        let wrapped = disk[510..512] == [0x55, 0xAA];
+        // A partition write keeps the table; a synthesized one writes a fresh MBR.
+        let head = if before[510] == 0x55 {
+            disk[..512] == before[..512]
+        } else {
+            wrapped
+        };
+        body && head
+    }
+}
+
+impl Target for DiskWriteTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::disk_write::{purpose, DiskWriteAction, WriteOpen};
+        let a = match action {
+            "Open" => {
+                let path = self.dir.path().join("src.img");
+                std::fs::write(&path, Self::source_bytes()).map_err(|e| e.to_string())?;
+                DiskWriteAction::Open(match arg_str(arg)? {
+                    "$image" => WriteOpen::image(path, 1 << 20),
+                    "$superfloppy" => WriteOpen {
+                        path,
+                        size_bytes: None,
+                        fs_hint: "FAT16".into(),
+                        has_partition_table: false,
+                        superfloppy: true,
+                    },
+                    other => return Err(format!("unknown source {other:?}")),
+                })
+            }
+            "SelectDevice" => {
+                let device = match arg_str(arg)? {
+                    "$disk" => self.fake_disk(false)?,
+                    "$table" => self.fake_disk(true)?,
+                    other => return Err(format!("unknown device {other:?}")),
+                };
+                DiskWriteAction::SelectDevice { row: 0, device }
+            }
+            "SetTargetImage" => DiskWriteAction::SetTargetImage(match arg_str(arg)? {
+                "$out" => self.dir.path().join("out.img"),
+                other => PathBuf::from(other),
+            }),
+            "CyclePartition" => DiskWriteAction::CycleTargetPartition,
+            "SetSynthesize" => DiskWriteAction::SetSynthesize(
+                arg.and_then(Value::as_bool)
+                    .ok_or_else(|| "SetSynthesize needs a bool `arg`".to_string())?,
+            ),
+            "Write" => DiskWriteAction::Write,
+            "AnswerName" => {
+                let text = match arg_str(arg)? {
+                    "$name" => self.ctl.device_name().unwrap_or_default(),
+                    other => other.to_string(),
+                };
+                DiskWriteAction::Answered {
+                    purpose: purpose::DEVICE_NAME,
+                    text: Some(text),
+                }
+            }
+            "Confirm" => DiskWriteAction::Confirmed {
+                purpose: purpose::OVERWRITE_FILE,
+                yes: true,
+            },
+            "Close" => DiskWriteAction::Close,
+            other => return Err(format!("DiskWriteController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        Ok(self.note(fx))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "size" => Value::Integer(self.ctl.source().map_or(0, |s| s.size_bytes) as i64),
+            "synthesize" => Value::Boolean(self.ctl.form().synthesize),
+            "partitions" => Value::Integer(self.ctl.target_partitions().len() as i64),
+            "partition" => Value::Integer(self.ctl.target_partition().map_or(-1, |i| i as i64)),
+            "can_write" => Value::Boolean(self.ctl.can_write()),
+            "error" => Value::String(self.ctl.error().unwrap_or("").to_string()),
+            "result" => Value::String(match self.ctl.result() {
+                Some(Ok(_)) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "written" => Value::Boolean(self.written()),
+            "log" => Value::String(self.log.join("\n")),
+            other => return Err(format!("DiskWriteController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.wait_finished();
+        let fx = self.ctl.tick();
+        self.note(fx)
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
         "backup" => Ok(Box::new(BackupTarget::new())),
         "inspect" => Ok(Box::new(InspectTarget::new())),
         "restore" => Ok(Box::new(RestoreTarget::new())),
+        "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

@@ -29,7 +29,7 @@ use crate::model::job::{Job, Notify, Status};
 pub use crate::model::disk_write_plan::{
     TableKind, WrapAlign, WrapForm, WriteOpen, WriteSource, TYPE_BYTE_PRESETS,
 };
-pub use crate::model::job::{JobRegistry, NoNotify, Snapshot};
+pub use crate::model::job::{JobRegistry, NoNotify, Progress, Snapshot};
 pub use crate::model::size_mode::SizeMode;
 pub use disk_core::display::format_size;
 
@@ -70,6 +70,8 @@ pub enum DiskWriteAction {
     SetTargetImage(std::path::PathBuf),
     /// `None` writes the whole target; `Some(index)` writes into that partition.
     SetTargetPartition(Option<usize>),
+    /// Step the choice: whole disk, each partition, then the whole disk again.
+    CycleTargetPartition,
     SetSynthesize(bool),
     SetTableKind(TableKind),
     SetAlignment(WrapAlign),
@@ -97,7 +99,10 @@ pub enum DiskWriteAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPartition {
     pub index: usize,
-    /// "Partition N - type (size) at LBA n".
+    /// 1-based position, matching `inspect`'s `#`.
+    pub position: usize,
+    pub type_name: String,
+    /// "Partition N - type (size) at LBA n", N from the table slot.
     pub label: String,
     pub size_bytes: u64,
 }
@@ -301,6 +306,7 @@ impl Controller for DiskWriteController {
             DiskWriteAction::SelectDevice { row, device } => self.select_device(row, device),
             DiskWriteAction::SetTargetImage(path) => self.set_target_image(path),
             DiskWriteAction::SetTargetPartition(idx) => self.target.partition = idx,
+            DiskWriteAction::CycleTargetPartition => self.cycle_target_partition(),
             DiskWriteAction::SetSynthesize(on) => self.form.synthesize = on,
             DiskWriteAction::SetTableKind(k) => self.form.table_kind = k,
             DiskWriteAction::SetAlignment(a) => self.form.alignment = a,

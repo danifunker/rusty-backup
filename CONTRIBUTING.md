@@ -250,7 +250,8 @@ never copy it sideways.
   that reaches zero is switched to enforcing.
 - Enforced so far (`ENFORCED` in the script): `src/gui/commander`, `src/gui/browse_view.rs`,
   `src/gui/inspect_tab.rs`, `src/gui/backup_tab.rs`, `src/gui/restore_tab.rs`,
-  `src/cli/verbs/tui_app/commander.rs` and `src/cli/verbs/tui_app/explorer.rs`.
+  `src/gui/physical_disk_export.rs`, `src/cli/verbs/tui_app/commander.rs` and
+  `src/cli/verbs/tui_app/explorer.rs`.
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
   error.
 - Controller logic is tested without any view. Code that cannot be tested

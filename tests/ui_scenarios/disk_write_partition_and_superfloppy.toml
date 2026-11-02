@@ -1,0 +1,71 @@
+# The disk writer: refuse without a target, write into one partition of a disk-image file standing
+# in for a device behind the typed device name, then wrap a superfloppy in a fresh MBR.
+name = "Disk write: partition write, typed name, synthesized table"
+vm = "disk_write"
+
+[[step]]
+action = "Open"
+arg = "$image"
+settle = true
+expect = { open = true, size = 1048576, synthesize = false, can_write = false }
+
+[[step]]
+action = "Write"
+effects = []
+expect = { result = "" }
+
+[[step]]
+action = "SelectDevice"
+arg = "$table"
+settle = true
+expect = { partitions = 1, partition = -1, can_write = true }
+
+[[step]]
+action = "CyclePartition"
+expect = { partition = 0 }
+
+[[step]]
+action = "Write"
+effects = ["AskText"]
+
+[[step]]
+action = "AnswerName"
+arg = "not the device"
+settle = true
+expect = { result = "", log = "~does not match" }
+
+[[step]]
+action = "Write"
+effects = ["AskText"]
+
+[[step]]
+action = "AnswerName"
+arg = "$name"
+settle = true
+expect = { result = "ok", written = true, log = "~Wrote 1.0 MiB to the target" }
+
+[[step]]
+action = "Close"
+expect = { open = false }
+
+[[step]]
+action = "Open"
+arg = "$superfloppy"
+settle = true
+expect = { open = true, size = 1048576, synthesize = true, result = "" }
+
+[[step]]
+action = "SelectDevice"
+arg = "$disk"
+settle = true
+expect = { partitions = 0 }
+
+[[step]]
+action = "Write"
+effects = ["AskText"]
+
+[[step]]
+action = "AnswerName"
+arg = "$name"
+settle = true
+expect = { result = "ok", written = true }

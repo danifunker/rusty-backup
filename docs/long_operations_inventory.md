@@ -99,7 +99,7 @@ Line numbers are a snapshot. Re-check them before editing.
 | Build disk / provision | restore:2557 | - | RUN | bytes | yes | no panic guard |
 | Target partition scan | restore:1253 | tui:1399 | **SYNC** | none | no | elevation prompt on the UI thread |
 | Backup metadata load | restore:1300, inspect:2816 | tui:3807/6600 | **SYNC** | none | no | |
-| Physical disk export / write | physical_disk_export:527 | tui:6478 | RUN | bytes | yes | no panic guard; target read happens during render (:385) |
+| Physical disk export / write | physical_disk_export:527 | tui:6478 | RUN | bytes | yes | **Done** (slice 14): `controller::disk_write` runs the source probe, the target read and the write as jobs, for egui and the TUI |
 | `prepare_disk_image_path` | mod:293 and 7 callers | - | **SYNC** | none | no | |
 
 ### Inspect

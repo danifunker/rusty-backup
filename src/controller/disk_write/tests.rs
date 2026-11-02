@@ -170,7 +170,8 @@ fn a_partition_write_keeps_the_table_and_refuses_a_source_too_big() {
         device: fake_device(&disk),
     });
     c.wait_idle();
-    c.apply(DiskWriteAction::SetTargetPartition(Some(parts[0].index)));
+    c.apply(DiskWriteAction::CycleTargetPartition);
+    assert_eq!(c.target_partition(), Some(parts[0].index));
     let fx = c.apply(DiskWriteAction::Write);
     answer_name(&mut c, fx);
     c.wait_finished();
@@ -202,4 +203,19 @@ fn a_refreshed_device_list_moves_the_target_with_its_row() {
     c.wait_idle();
     c.apply(DiskWriteAction::Close);
     assert!(!c.is_open());
+}
+
+#[test]
+fn the_write_region_cycles_whole_disk_then_each_partition() {
+    use super::target::next_region;
+    let parts = [0, 1, 2];
+    let mut sel = None;
+    for want in [Some(0), Some(1), Some(2), None] {
+        sel = next_region(&parts, sel);
+        assert_eq!(sel, want);
+    }
+    // No table offers only the whole disk; a vanished choice falls back rather than sticking.
+    assert_eq!(next_region(&[], None), None);
+    assert_eq!(next_region(&[], Some(3)), None);
+    assert_eq!(next_region(&[0], Some(9)), None);
 }
