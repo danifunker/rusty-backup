@@ -558,7 +558,11 @@ impl BrowserPaneController {
         let fx = match action {
             A::Delete => self.delete(),
             A::CancelRename(name) => {
-                let path = self.entry_named(&name).map(|e| e.path);
+                // A combined-tree row below the current folder is named by its path.
+                let found = self
+                    .entry_named(&name)
+                    .or_else(|| self.entry_by_path(&name));
+                let path = found.map(|e| e.path);
                 match path {
                     Some(p) if self.queue.remove_pending_rename(&p) => {
                         msg("cancelled staged rename.")

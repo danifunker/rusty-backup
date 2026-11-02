@@ -675,6 +675,11 @@ fn tab_visits_a_folder_tree_then_its_list_then_the_other_pane() {
     assert!(!ctl.pane(Side::Right).tree_focused());
     ctl.apply(key(Key::Tab));
     assert_eq!(ctl.active(), Side::Left);
+    // A click in the list takes the keyboard back from the tree.
+    ctl.apply(A::Pane(Side::Right, P::FolderTreeClick(0)));
+    assert!(ctl.pane(Side::Right).tree_focused());
+    select(&mut ctl, Side::Right, "dir");
+    assert!(!ctl.pane(Side::Right).tree_focused());
 }
 
 fn ctrl_mods() -> Mods {

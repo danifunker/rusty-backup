@@ -184,6 +184,11 @@ impl BrowserPaneController {
         }
     }
 
+    /// The list was clicked, so it takes the keyboard back from the tree.
+    pub(super) fn focus_list(&mut self) {
+        self.folders.focused = false;
+    }
+
     /// A click on tree row `i`: show that folder and give the tree the keyboard.
     pub(super) fn folder_tree_click(&mut self, i: usize) {
         self.folders.focused = true;

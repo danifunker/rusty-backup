@@ -117,7 +117,7 @@ pub enum BrowserPaneAction {
     RecentCleared,
     /// Toggle a staged delete on the selection; a host pane asks, then deletes now.
     Delete,
-    /// Drop the staged rename of the entry with this name.
+    /// Drop the staged rename of the entry with this name (a combined-tree row: its node id).
     CancelRename(String),
     /// Ask for a new name for the entry with this name.
     RequestRename(String),
@@ -237,6 +237,16 @@ impl Controller for BrowserPaneController {
         let mut fx = Vec::new();
         if self.tree_key(&action).is_some() {
             return self.finish_apply(fx, staged_before);
+        }
+        if matches!(
+            action,
+            BrowserPaneAction::Click { .. }
+                | BrowserPaneAction::TreeClick { .. }
+                | BrowserPaneAction::ContextSelect(_)
+                | BrowserPaneAction::TreeContextSelect(_)
+                | BrowserPaneAction::Activate(_)
+        ) {
+            self.focus_list();
         }
         match action {
             BrowserPaneAction::SwitchFocus => self.switch_focus(),

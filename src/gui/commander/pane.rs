@@ -11,8 +11,8 @@ use eframe::egui;
 
 use rusty_backup::controller::browser::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    format_size, CommanderAction, CommanderController, BrowserPaneAction,
-    BrowserPaneController, ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
+    format_size, BrowserPaneAction, BrowserPaneController, CommanderAction, CommanderController,
+    ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
 
 const ROW_H: f32 = 20.0;
@@ -145,6 +145,10 @@ impl PaneView {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
         } else if pane.listing.is_loaded() {
+            if pane.has_folder_tree() {
+                self.render_folder_tree(ui, pane, active, out);
+                ui.separator();
+            }
             self.render_header(ui, pane, out);
             self.render_rows(ui, ctl, active, scroll, out);
         } else {
@@ -669,6 +673,91 @@ impl PaneView {
         }
     }
 
+    // --- folder tree (TreeAndList) ------------------------------------------
+
+    /// The folder tree above the list: a half-width pane has no room beside it.
+    fn render_folder_tree(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        active: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let side = self.side;
+        let height = (ui.available_height() * 0.3).clamp(ROW_H * 3.0, ROW_H * 12.0);
+        let sel = pane.tree_cursor();
+        let focused = active && pane.tree_focused();
+        let mut acts = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt(("commander_folder_tree", side.idx()))
+            .max_height(height)
+            .min_scrolled_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, node) in pane.folder_tree().iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), ROW_H),
+                        egui::Sense::click(),
+                    );
+                    let v = ui.visuals();
+                    if i == sel {
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            v.selection.bg_fill,
+                        );
+                    } else if resp.hovered() {
+                        let fill = v.widgets.hovered.bg_fill;
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+                    }
+                    if i == sel && focused {
+                        let stroke = egui::Stroke::new(1.0_f32, v.selection.stroke.color);
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let x = rect.left() + 6.0 + node.depth as f32 * TREE_INDENT;
+                    let mid = rect.center().y;
+                    let font = egui::FontId::proportional(13.0);
+                    ui.painter().text(
+                        egui::pos2(x, mid),
+                        egui::Align2::LEFT_CENTER,
+                        if node.expanded { "-" } else { "+" },
+                        font.clone(),
+                        v.weak_text_color(),
+                    );
+                    let name = if node.depth == 0 {
+                        "/".to_string()
+                    } else {
+                        format!("{}/", node.entry.name)
+                    };
+                    ui.painter().text(
+                        egui::pos2(x + TOGGLE_W, mid),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        font,
+                        super::super::theme::info(v),
+                    );
+                    let on_toggle = resp
+                        .interact_pointer_pos()
+                        .is_some_and(|p| p.x >= x && p.x < x + TOGGLE_W);
+                    if (resp.clicked() && on_toggle) || resp.double_clicked() {
+                        acts.push(P::FolderTreeToggle(i));
+                    } else if resp.clicked() {
+                        acts.push(P::FolderTreeClick(i));
+                    }
+                }
+            });
+        if !acts.is_empty() {
+            out.push(A::Focus(side));
+        }
+        out.extend(acts.into_iter().map(|a| A::Pane(side, a)));
+    }
+
     // --- listing grid ------------------------------------------------------
 
     fn render_header(
@@ -797,13 +886,7 @@ impl PaneView {
                         egui::vec2(ui.available_width(), ROW_H),
                         egui::Sense::click(),
                     );
-                    let selected = if row.is_parent() {
-                        false
-                    } else if row.is_tree {
-                        pane.tree_selected.contains(&row.node_id)
-                    } else {
-                        pane.listing.is_selected(&row.name)
-                    };
+                    let selected = pane.row_selected(row);
                     if selected {
                         ui.painter().rect_filled(
                             rect,
@@ -817,7 +900,8 @@ impl PaneView {
                             ui.visuals().widgets.hovered.bg_fill,
                         );
                     }
-                    if cursor == Some(i) {
+                    // With the folder tree holding the keyboard, the list shows no cursor.
+                    if cursor == Some(i) && !pane.tree_focused() {
                         ui.painter().rect_stroke(
                             rect,
                             egui::CornerRadius::ZERO,
@@ -842,14 +926,14 @@ impl PaneView {
                     };
                     if resp.double_clicked() {
                         acts.push(if hit_toggle(&resp) {
-                            P::ToggleWrapper(row.node_id.clone())
+                            P::ToggleExpand(row.node_id.clone())
                         } else {
                             P::Activate(row.node_id.clone())
                         });
                     } else if resp.clicked() {
                         if hit_toggle(&resp) {
-                            acts.push(P::ToggleWrapper(row.node_id.clone()));
-                        } else if row.is_tree {
+                            acts.push(P::ToggleExpand(row.node_id.clone()));
+                        } else if row.depth > 0 {
                             acts.push(P::TreeClick {
                                 node_id: row.node_id.clone(),
                                 ctrl: mods.command,
@@ -870,7 +954,7 @@ impl PaneView {
                             row_menu(ui, row, side, remote_host, host_pane, read_only, &mut after)
                         });
                         if menu.is_some() {
-                            acts.push(if row.is_tree {
+                            acts.push(if row.depth > 0 {
                                 P::TreeContextSelect(row.node_id.clone())
                             } else {
                                 P::ContextSelect(row.name.clone())
@@ -952,11 +1036,24 @@ fn row_menu(
     if row.is_tree || read_only {
         return;
     }
+    // A combined-tree row is named by its node id; the row's own select puts the cursor on it.
+    let target = if row.in_folder {
+        row.node_id.clone()
+    } else {
+        row.name.clone()
+    };
     if matches!(row.kind, RowKind::PendingRename) && ui.button("Cancel rename").clicked() {
-        out.push(A::Pane(side, P::CancelRename(row.name.clone())));
+        out.push(A::Pane(side, P::CancelRename(target)));
         ui.close();
     } else if matches!(row.kind, RowKind::Normal) && ui.button("Rename...").clicked() {
-        out.push(A::Pane(side, P::RequestRename(row.name.clone())));
+        out.push(A::Pane(
+            side,
+            if row.in_folder {
+                P::RenameAtCursor
+            } else {
+                P::RequestRename(target)
+            },
+        ));
         ui.close();
     }
     let label = match row.kind {
@@ -1072,6 +1169,11 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
             ui.visuals().weak_text_color(),
         );
     }
+    let display_name = if row.loading {
+        format!("{display_name}  (reading...)")
+    } else {
+        display_name
+    };
     painter.text(
         egui::pos2(name_x, mid),
         egui::Align2::LEFT_CENTER,

@@ -21,11 +21,11 @@ use eframe::egui;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, CommanderAction, CommanderController, BrowserPaneAction, EditQueue,
-    ExportFormat, FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices,
-    ResourceForkMode, Side,
+    format_size, BrowserPaneAction, CommanderAction, CommanderController, EditQueue, ExportFormat,
+    FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices, ResourceForkMode,
+    Side, ViewItemKind, ViewMenuItem,
 };
-use rusty_backup::controller::keys::{Key, KeyMap, Mods};
+use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::Controller;
 
 use super::effects::{EffectHost, Reply};
@@ -78,6 +78,8 @@ pub struct CommanderMode {
     left: PaneView,
     right: PaneView,
     detail: DetailEditors,
+    /// The quick view's widget state, apart from the File Info window's.
+    quick: DetailEditors,
     /// A key moved the cursor, so the active listing scrolls it into view.
     scroll_cursor: bool,
     close: bool,
@@ -97,6 +99,7 @@ impl CommanderMode {
             left: PaneView::new(Side::Left),
             right: PaneView::new(Side::Right),
             detail: DetailEditors::default(),
+            quick: DetailEditors::default(),
             scroll_cursor: false,
             close: false,
         }
@@ -169,6 +172,12 @@ impl CommanderMode {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("Commander Mode");
+                ui.menu_button("View", |ui| {
+                    if let Some(action) = view_menu_body(ui, &self.ctl.view_menu()) {
+                        acts.push(action);
+                        ui.close();
+                    }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         acts.push(A::RequestClose);
@@ -196,6 +205,14 @@ impl CommanderMode {
 
         let active = self.ctl.active();
         let scroll = std::mem::take(&mut self.scroll_cursor);
+        // The quick view takes the other pane's column; that pane's own state stays as it was.
+        let quick_on = self.ctl.quick_view().then(|| active.other());
+        if self.ctl.follow_pending()
+            || self.ctl.pane(Side::Left).is_listing_folders()
+            || self.ctl.pane(Side::Right).is_listing_folders()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             let full_h = ui.available_height();
             let full_w = ui.available_width();
@@ -212,8 +229,12 @@ impl CommanderMode {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let mine = active == Side::Left;
-                        self.left
-                            .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
+                        if quick_on == Some(Side::Left) {
+                            quick_view(ui, &self.ctl, &mut self.quick);
+                        } else {
+                            self.left
+                                .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
+                        }
                     },
                 );
                 ui.separator();
@@ -228,8 +249,12 @@ impl CommanderMode {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let mine = active == Side::Right;
-                        self.right
-                            .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
+                        if quick_on == Some(Side::Right) {
+                            quick_view(ui, &self.ctl, &mut self.quick);
+                        } else {
+                            self.right
+                                .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
+                        }
                     },
                 );
             });
@@ -240,6 +265,7 @@ impl CommanderMode {
         self.render_log_window(&ctx, &mut acts);
         self.render_help(&ctx, &mut acts);
         self.render_partitions(&ctx, &mut acts);
+        self.render_view_window(&ctx, &mut acts);
 
         let whose = self
             .effects
@@ -519,7 +545,9 @@ impl CommanderMode {
             .open(&mut open)
             .resizable(true)
             .default_width(620.0)
-            .show(ctx, |ui| detail_body(ui, d, ed, queue, &mut staged));
+            .show(ctx, |ui| {
+                detail_body(ui, d, ed, queue, &mut staged, "commander_detail")
+            });
         acts.extend(staged.into_iter().map(|e| A::StageMetadata(Box::new(e))));
         if !open {
             acts.push(A::CloseDetail);
@@ -604,6 +632,28 @@ impl CommanderMode {
 }
 
 impl CommanderMode {
+    /// The View menu as a window, for the key that opens it (the menu bar has the same entries).
+    fn render_view_window(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        if !self.ctl.view_menu_shown() {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("View")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
+            .show(ctx, |ui| {
+                if let Some(action) = view_menu_body(ui, &self.ctl.view_menu()) {
+                    acts.push(action);
+                    acts.push(A::ShowViewMenu(false));
+                }
+            });
+        if !open {
+            acts.push(A::ShowViewMenu(false));
+        }
+    }
+
     /// The partition chooser the Partition shortcut opens (the source bar's combo does the same).
     fn render_partitions(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
         let Some(side) = self.ctl.partitions_shown() else {
@@ -630,6 +680,71 @@ impl CommanderMode {
     }
 }
 
+/// The View menu's entries: the active pane's listing styles, then toggles and commands.
+fn view_menu_body(ui: &mut egui::Ui, items: &[ViewMenuItem]) -> Option<CommanderAction> {
+    let mut chosen = None;
+    let mut styles_done = false;
+    for item in items {
+        if item.kind != ViewItemKind::Style && !styles_done {
+            styles_done = true;
+            ui.separator();
+        }
+        let label = if item.hint.is_empty() {
+            item.label.clone()
+        } else {
+            format!("{}    {}", item.label, item.hint)
+        };
+        let clicked = ui
+            .add_enabled_ui(item.enabled, |ui| match item.kind {
+                ViewItemKind::Style => ui.radio(item.checked, label).clicked(),
+                ViewItemKind::Toggle => {
+                    let mut on = item.checked;
+                    ui.checkbox(&mut on, label).clicked()
+                }
+                ViewItemKind::Command => ui.button(label).clicked(),
+            })
+            .inner;
+        if clicked {
+            chosen = Some(item.action.clone());
+        }
+    }
+    chosen
+}
+
+/// The quick view: the active pane's File Info drawn in the other pane's column.
+fn quick_view(ui: &mut egui::Ui, ctl: &CommanderController, ed: &mut DetailEditors) {
+    ui.horizontal(|ui| {
+        ui.strong("Quick view");
+        ui.weak(format!("({} to close)", ctl.key_hint(Command::QuickView)));
+    });
+    ui.separator();
+    let Some(d) = ctl.quick_view_detail() else {
+        ui.weak("No file or folder under the cursor.");
+        return;
+    };
+    if ed.serial != d.serial {
+        *ed = DetailEditors {
+            serial: d.serial,
+            ..DetailEditors::default()
+        };
+    }
+    if ed.content.is_none() {
+        ed.content = d
+            .preview
+            .as_ref()
+            .map(|data| file_detail::detect_content_type(&d.entry, data));
+    }
+    ui.strong(&d.entry.name);
+    let queue = &ctl.pane(d.side).queue;
+    let mut staged = Vec::new();
+    egui::ScrollArea::vertical()
+        .id_salt("commander_quick_view")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            detail_body(ui, d, ed, queue, &mut staged, "commander_quick")
+        });
+}
+
 /// The File Info window's contents; editor changes land in `staged`.
 fn detail_body(
     ui: &mut egui::Ui,
@@ -637,6 +752,7 @@ fn detail_body(
     ed: &mut DetailEditors,
     queue: &EditQueue,
     staged: &mut Vec<MetadataEdit>,
+    id: &str,
 ) {
     let fs = d.fs_type.as_str();
     let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
@@ -721,7 +837,7 @@ fn detail_body(
     match &ed.content {
         Some(FileContent::Text(text)) => {
             egui::ScrollArea::vertical()
-                .id_salt("commander_detail_preview")
+                .id_salt((id, "preview"))
                 .max_height(280.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -734,7 +850,7 @@ fn detail_body(
         }
         Some(FileContent::Binary(data)) => {
             egui::ScrollArea::vertical()
-                .id_salt("commander_detail_preview")
+                .id_salt((id, "preview"))
                 .max_height(280.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| file_detail::render_hex_view(ui, data));
