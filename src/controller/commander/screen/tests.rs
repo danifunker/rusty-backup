@@ -208,6 +208,8 @@ fn export_asks_for_a_folder_and_the_answer_runs_the_export_job() {
     open_image(&mut ctl, Side::Left, img.path());
     let name = files(&ctl, Side::Left)[0].clone();
     select(&mut ctl, Side::Left, &name);
+    // A FAT volume defaults to Zip; loose files ask for a folder.
+    ctl.apply(A::SetExportFormat(ExportFormat::LooseFiles));
     let fx = ctl.apply(A::Export {
         from: Side::Left,
         format: None,
@@ -687,4 +689,42 @@ fn ctrl_mods() -> Mods {
         ctrl: true,
         ..Mods::default()
     }
+}
+
+#[test]
+fn the_export_default_follows_the_filesystem_family() {
+    use ExportFormat as F;
+    let cases = [
+        ("FAT16", F::Zip),
+        ("NTFS", F::Zip),
+        ("HFS", F::MacArchive),
+        ("HFS+", F::MacArchive),
+        ("MFS", F::MacArchive),
+        ("ext4", F::TarGz),
+        ("UFS", F::TarGz),
+        ("Alto BFS", F::LooseFiles),
+        ("ProDOS", F::LooseFiles),
+    ];
+    for (fs, want) in cases {
+        assert_eq!(default_export_format(fs), want, "{fs}");
+    }
+}
+
+#[test]
+fn an_explicit_export_pick_survives_a_refresh_but_not_another_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, dir.path());
+    assert_eq!(ctl.export_format(), ExportFormat::Zip);
+    ctl.apply(A::SetExportFormat(ExportFormat::TarZstd));
+    ctl.apply(A::Pane(Side::Left, P::Reload));
+    settle(&mut ctl);
+    assert_eq!(ctl.export_format(), ExportFormat::TarZstd);
+    assert_eq!(
+        export_choices()[ctl.export_choice_index()].format,
+        ExportFormat::TarZstd
+    );
+    let other = tempfile::tempdir().unwrap();
+    open_image(&mut ctl, Side::Left, other.path());
+    assert_eq!(ctl.export_format(), ExportFormat::Zip);
 }

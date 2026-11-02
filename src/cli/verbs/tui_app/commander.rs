@@ -262,7 +262,7 @@ impl CommanderView {
         // These two show a chooser first; the controller acts on the choice.
         match self.ctl.command_for(k, m) {
             Some(Command::Export) if !self.ctl.modal_open() => {
-                self.export_sel = Some(0);
+                self.export_sel = Some(self.ctl.export_choice_index());
                 return true;
             }
             Some(Command::Transforms) => {
@@ -291,6 +291,7 @@ impl CommanderView {
                 if let Some(fork) = c.fork {
                     self.send(A::SetForkMode(fork));
                 }
+                self.send(A::SetExportFormat(c.format));
                 let from = self.ctl.active();
                 self.send(A::Export {
                     from,

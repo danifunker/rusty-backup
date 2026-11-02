@@ -19,10 +19,10 @@ pub use crate::controller::browser::{
     VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 pub use screen::{
-    export_choices, ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField,
-    ExportChoice, ExportFormat, ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit,
-    RenameNotice, ResourceForkMode, Side, SizePlan, ViewItemKind, ViewMenuItem, Xattr,
-    FOLLOW_DELAY,
+    default_export_format, export_choices, ChecksumRow, Checksums, CommanderAction,
+    CommanderController, DetailField, ExportChoice, ExportFormat, ExtractOptions, FileDetail,
+    HashAlgo, IdNameMap, MetadataEdit, RenameNotice, ResourceForkMode, Side, SizePlan,
+    ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

@@ -377,7 +377,7 @@ impl CommanderController {
             self.status = "A copy is already in progress; wait for it to finish.".to_string();
             return Vec::new();
         }
-        let format = format.unwrap_or(self.export_format);
+        let format = format.unwrap_or_else(|| self.export_format_for(from));
         let src = self.pane(from);
         if entries.is_empty() {
             self.status = format!("Nothing selected in the {} pane to export.", from.label());

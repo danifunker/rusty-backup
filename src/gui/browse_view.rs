@@ -74,8 +74,6 @@ pub struct BrowseView {
     /// Edits applied into a compressed CHD's diff that no flatten has
     /// committed yet; closing on an empty queue deleted that diff silently.
     chd_diff_dirty: bool,
-    /// Chosen output format for the "Export selected" pulldown.
-    export_format: ExportFormat,
     /// The side panel's preview and editor widgets, rebuilt when its detail changes.
     side_ed: DetailEditors,
     /// View mode for file content.
@@ -273,7 +271,6 @@ impl Default for BrowseView {
             pane_stale: false,
             selected_entry: None,
             chd_diff_dirty: false,
-            export_format: ExportFormat::MacArchive,
             side_ed: DetailEditors::default(),
             view_mode: ViewMode::Auto,
             error: None,
@@ -1570,7 +1567,8 @@ impl BrowseView {
         if count == 0 {
             return;
         }
-        let mut fmt = self.export_format;
+        let picked = self.ctl.export_format();
+        let mut fmt = picked;
         let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
@@ -1591,7 +1589,9 @@ impl BrowseView {
             }
         });
         ui.separator();
-        self.export_format = fmt;
+        if fmt != picked {
+            self.ctl.apply(CommanderAction::SetExportFormat(fmt));
+        }
         if clear {
             let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::ClearSelection);
             self.ctl.apply(act);

@@ -223,6 +223,27 @@ pub struct ExportChoice {
     pub fork: Option<ResourceForkMode>,
 }
 
+/// The export format a volume of `fs_type` starts with: Zip for PC, MAR for Mac, tar.gz for Unix.
+pub fn default_export_format(fs_type: &str) -> ExportFormat {
+    let t = fs_type.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
+    if t == "mfs" || t.starts_with("hfs") {
+        return ExportFormat::MacArchive;
+    }
+    if t.starts_with("fat") || t.starts_with("vfat") || has(&["exfat", "ntfs", "hpfs", "msdos"]) {
+        return ExportFormat::Zip;
+    }
+    let unix = [
+        "ext", "ufs", "xfs", "efs", "jfs", "minix", "reiser", "btrfs", "squashfs", "cramfs",
+        "romfs", "sysv", "xenix", "zfs", "f2fs",
+    ];
+    // Xerox Alto's BFS shares the name with BeOS's but is no Unix filesystem.
+    if has(&unix) || (t.contains("bfs") && !t.contains("alto")) {
+        return ExportFormat::TarGz;
+    }
+    ExportFormat::LooseFiles
+}
+
 /// The "Export as" menu for a view without an always-visible format chooser.
 pub fn export_choices() -> Vec<ExportChoice> {
     use ResourceForkMode as M;
@@ -383,7 +404,8 @@ pub struct CommanderController {
     page_rows: [i32; 2],
     keep_dates: bool,
     export_fork_mode: ResourceForkMode,
-    export_format: ExportFormat,
+    /// Each pane's explicit export format pick and the volume it was made on.
+    export_pick: [Option<(ExportFormat, String)>; 2],
     copy: Option<CopyRun>,
     conflict: Option<PendingConflict>,
     rename_notice: Option<RenameNotice>,
@@ -529,7 +551,9 @@ impl CommanderController {
                 Vec::new()
             }
             A::SetExportFormat(format) => {
-                self.export_format = format;
+                let side = self.active;
+                let key = self.volume_key(side);
+                self.export_pick[side.idx()] = Some((format, key));
                 Vec::new()
             }
             A::ShowLog(on) => {
@@ -677,7 +701,7 @@ impl CommanderController {
             page_rows: [1, 1],
             keep_dates: true,
             export_fork_mode: ResourceForkMode::MacBinary,
-            export_format: ExportFormat::LooseFiles,
+            export_pick: [None, None],
             copy: None,
             conflict: None,
             rename_notice: None,
@@ -828,8 +852,40 @@ impl CommanderController {
         self.export_fork_mode
     }
 
+    /// The active pane's export format: the user's pick for this volume, else its filesystem's default.
     pub fn export_format(&self) -> ExportFormat {
-        self.export_format
+        self.export_format_for(self.active)
+    }
+
+    pub fn export_format_for(&self, side: Side) -> ExportFormat {
+        let key = self.volume_key(side);
+        match &self.export_pick[side.idx()] {
+            Some((format, k)) if *k == key => *format,
+            _ => default_export_format(&self.pane(side).volume().fs_type),
+        }
+    }
+
+    /// Where `export_choices()` starts for the active pane: its export format (and fork mode).
+    pub fn export_choice_index(&self) -> usize {
+        let (format, fork) = (self.export_format(), self.export_fork_mode);
+        let choices = export_choices();
+        let exact = choices
+            .iter()
+            .position(|c| c.format == format && c.fork.unwrap_or(fork) == fork);
+        exact
+            .or_else(|| choices.iter().position(|c| c.format == format))
+            .unwrap_or(0)
+    }
+
+    /// What a pick is remembered against: a refresh keeps it, another volume does not.
+    fn volume_key(&self, side: Side) -> String {
+        let p = self.pane(side);
+        format!(
+            "{:?}|{:?}|{}",
+            p.source_path(),
+            p.selected_partition(),
+            p.volume().fs_type
+        )
     }
 
     /// The running copy or export: the progress window's title and its job.
