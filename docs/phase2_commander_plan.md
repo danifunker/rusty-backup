@@ -62,7 +62,7 @@ widget, show_log, the metadata editor widgets.
 | 2 | Navigation, selection and cursor as `CommanderPaneAction`s (`Enter`, `Up`, `NavigateTo`, `Click{ctrl,shift}`, `TreeClick`, `ToggleMark`, `SortBy`, cursor moves, `ActivateCursor`); collapse wrappers on cwd change inside the controller; the egui pane dispatches actions; egui keyboard through `KeyMap` | done (dc13fc05) |
 | 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` answered by a per-view `gui::effects::EffectHost` | done (ad0950b4, 49fdb34b) |
 | 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | done (52b691de, eddb9dee) |
-| 5 | Remote (cfg `remote`): connect, open / close image, remote apply | |
+| 5 | Remote (cfg `remote`): connect, open / close image, remote apply | done (1718ee44) |
 | 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | |
 | 7 | Full key map wired in egui (help overlay listing the bindings) | |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | |
@@ -100,6 +100,32 @@ Slice 4 notes:
 - Behaviour changes: Discard asks first; the edits list can remove one edit;
   New Folder and Rename are refused on an archive pane; a taken name is
   refused in the prompt (it used to fail at Apply).
+
+Slice 5 notes:
+
+- Remote state lives in `controller/commander/pane/remote.rs`. The `RemoteBrowser`
+  moves into each connect / open / close job and comes back with the listing, so the
+  pane holds it only between jobs; `opening()` / `is_opening()` cover those jobs.
+  Job keys are `rb://host:port/` (connect, close) and `rb://host:port/path` (open,
+  apply).
+- Actions are unconditional; without the `remote` feature `Connect`,
+  `OpenRemoteImage` and `CloseRemoteImage` report "remote browsing is not built in."
+- Remote apply is the local flow with a different target (`ApplyTarget` in
+  `edits.rs`): `preflight_remote_apply`, the same review, `remote_apply_in_job`.
+  The daemon cannot skip, so a review's Skip drops the conflicting copies from the
+  queue; Replace uploads with force. Only copies and new folders travel; delete and
+  rename are refused when asked for. A failed remote apply changed nothing, keeps
+  its queue and report, and is not reopened.
+- `PaneRequest` is down to `ShowInfo`; `SourceReset` and `OpenImage` are gone.
+  `display_rows()` takes no argument (the controller knows when it is remote).
+- `gui/commander/progress.rs` stays: the host copy and stage copy still use it.
+- Behaviour changes: a remote host pane no longer shows Apply / Discard / New
+  Folder (staging there never worked); Delete / F8 / rename on a remote pane are
+  refused up front; the connect prompt validates the port; a remote copy that hits
+  an existing name now gets the review instead of failing the whole upload.
+- Tests: `tests/remote_filesystem.rs` `commander_remote::*` drive the controller
+  against a loopback daemon (connect, open, new folder, apply, reopen, close,
+  disconnect; Skip and Replace; a refused connect).
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
