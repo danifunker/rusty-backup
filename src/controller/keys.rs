@@ -515,8 +515,15 @@ impl KeyMap {
     }
 
     /// Where the user's override file lives: `keybindings.toml` beside `config.json`.
+    #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
     pub fn user_file() -> Option<PathBuf> {
         crate::update::UpdateConfig::user_config_dir().map(|d| d.join("keybindings.toml"))
+    }
+
+    /// A slim build has no config directory, so there is no override file.
+    #[cfg(not(any(feature = "gui", feature = "tui-update", feature = "tui")))]
+    pub fn user_file() -> Option<PathBuf> {
+        None
     }
 
     /// The PC chords on every platform: a terminal has no Cmd key, so Primary is Ctrl there too.
