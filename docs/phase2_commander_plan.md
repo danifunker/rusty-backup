@@ -1074,3 +1074,136 @@ Shells' engine references 238 -> 181 (`resize_popup.rs` 22, `remote_browser.rs` 
 - Shells still reaching the engine: `tui_app.rs` (57), `optical_tab.rs` (33), `gui/mod.rs` (22),
   `optical/browse_view.rs` (19), `archives_tab.rs` (12), `metadata_editor.rs` (11),
   `bulk_convert_dialog.rs` (7), `file_detail.rs` (5), and a few one- to three-reference helpers.
+
+## Slice 16: the Optical tab
+
+`src/gui/optical_tab.rs` (1,398 lines, 33 engine references) held the Optical tab in the view: the
+drive list and its scan job, the "Add remote daemon" connect on a `spawn_guarded` thread, the
+detect job, Eject and CHD Info on the UI thread, the output rules, and three worker threads (rip,
+rip to CHD, conversion) polled each frame. `src/optical/browse_view.rs` (1,451 lines, 19) was an
+egui widget living in the lib: the disc open, folder reads, preview, tree listing and the export
+of the marked entries all ran on the UI thread, and extraction on its own thread.
+`src/gui/optical_audio.rs` (3) ran CD-DA playback on a detached thread. The TUI's rip screen listed
+drives and ran `run_rip` on its own `spawn_guarded` thread.
+
+### Steps
+
+1. (bb8bebbf) Model and controller. The bodies moved out of the views unchanged, so the files a
+   rip, conversion, extraction or export writes are the same bytes:
+   - `model::optical_ops`: `OutputFormat` (labels, extensions, `converts_from`: never to the
+     source's own format), `detect`, `default_output_name`, `rip`, `run_conversion`,
+     `rip_to_chd` (the temporary BIN/CUE beside the CHD, the cancel relays), `chd_info`, `eject`.
+   - `model::optical_browse`: `DiscSource { path, physical }`, `open_disc` (the probe, the
+     NKit hint, the boot areas), `DiscChoice` (`read_root`, `list_dir`, `preview`,
+     `tree_listing`, `extract` with its counts reported through the job, `export` through
+     `fs::export_selection`), `fs_choice_labels`, `marked_export_entries`, `FileContent`,
+     `hex_dump`, `format_size`.
+   - `model::cd_audio_player` (cfg `audio`): `read_tracks` and `play`, the rodio body as a job
+     (cancel is Stop).
+   - `controller::optical::OpticalController` (`mod.rs`, `run.rs`, `remote.rs` cfg `remote`):
+     source mode, the drive list (`FindDrives` at start-up logs "Found N optical drive(s)",
+     `RefreshDrives` logs "Refreshed: ..."), `SelectDrive`, `Eject`, `PickImage` / `OpenImage`
+     (`HostRequest::RememberRecent`), the detect (re-run on every source change; it reopens the
+     browser when one was open), `BrowseContents`, `CloseDisc`, `ChdInfo`, the output form
+     (`SetOutputFormat` refuses a format `format_choices` disables, `PickOutput` with the
+     suggested name, `SetEjectAfter`), `Start(Option<ChdChoice>)` (a Custom CD choice is saved to
+     config.json; `saved_chd_custom` restores it with the CD rules), `Cancel`, the shared bar
+     (`progress() -> OpticalBar`), `last_result`, the remote dialog (`OpenAddRemote`,
+     `ConnectRemote(addr)` as a job, the recent addresses), `wait_idle`.
+   - `controller::optical::browse::DiscBrowseController`: the disc tree (`Expand` lists a folder
+     in a job), `SelectFs` (hybrid side or boot area), `Select` (a file's preview in a job),
+     marks, `Export` (`PickFile` / `PickFolder` by format), `SetForkMode`, `Extract`
+     (`PickFolder`, then a job; `CancelExtract`), `Tree` / `CopyTree` / `SaveTree` / `CloseTree`.
+     The tab controller forwards `OpticalAction::Browse` and the browser's pickers.
+   - `controller::optical::audio::AudioPlayerController` (cfg `audio`; `AudioAction` always):
+     the track list read in a job on each source change, the player window, `Play` / `Stop`,
+     `now_playing` (`PlayState::Preparing` / `Playing(secs)`).
+2. (352fbfc6) The egui tab, `src/gui/optical_browse_view.rs` (moved out of the lib, now view
+   functions over `DiscBrowseController`) and `src/gui/optical_audio.rs` render and map. The tab
+   keeps only widget state: the CHD options control, the remote address being typed, the recent
+   list mirror and whether it drives the shared bar. `optical::browse_view` is gone.
+3. (4b1448bb) The TUI's rip screen drives a headless `OpticalController`: the drive scan, the
+   pick, the rip with its bar, Esc's cancel and the result
+   (`the_optical_screen_starts_the_rip_through_the_controller`).
+4. (1c6605ae) `optical_tab.rs`, `optical_browse_view.rs` and `optical_audio.rs` join `ENFORCED`
+   (`src/optical/browse_view.rs` leaves `SHELLS`). The ui scenario vm `optical`
+   (`tests/ui_scenarios/optical_convert_browse_extract.toml`) converts the hybrid fixture disc
+   to BIN/CUE, browses its HFS side, previews and extracts a forked file (AppleDouble) and lists
+   the tree. A scenario may name the features it needs (`requires = ["optical"]`); a build
+   without them (the vintage manifest) skips it.
+
+Shells' engine references 181 -> 113 (`optical_tab.rs` 33 -> 0, `optical/browse_view.rs` 19 ->
+gone, `optical_audio.rs` 3 -> 0, `tui_app.rs` 57 -> 44).
+
+### Why the disc browser is not the shared browser pane
+
+The browser pane already opens optical images in Commander (`commander_source::open_optical`,
+hybrid sides through `OpticalFilesystem`), so one pane with an optical profile was the first
+choice. It does not fit cleanly yet:
+
+- The Optical tab browses a drive's disc through the device-backed reader
+  (`open_physical_filesystem`, the elevation check); the pane has no physical-drive source.
+- HP LIF / PReP boot areas are filesystem choices here; the pane offers only the hybrid sides.
+- Extraction writes through its own walker (fork modes, Mac dates from opticaldiscs'
+  timestamps, `sanitize_filename`); the pane's extract goes through the screen's
+  `ExtractOptions` and the rusty-backup `FileEntry` translation. Moving onto it could change the
+  bytes an extraction writes, which this slice must not do.
+- The Inspect profile is an editing surface (staging, edit modes, metadata editors) that a
+  read-only disc never uses; the game identity and the hybrid picker would be optical-only
+  additions to it.
+
+So the browser is its own small controller over `model::optical_browse`. Merging the two is a
+decision for later (below).
+
+### Behaviour changes
+
+- GUI: the start-up drive scan is a job, so the window opens without waiting for it; "Found N
+  optical drive(s)" is logged when it ends.
+- GUI: Eject, CHD Info and the remote connect run in jobs (Eject and CHD Info ran on the UI
+  thread). The disc browser's open, filesystem switch, folder reads, file preview, tree listing,
+  tree save and the export of the marked entries run in jobs (all ran on the UI thread) and show
+  "Loading..." or the shared job widget meanwhile. Extraction shows the shared job widget
+  ("Extracting n/m files: path", bytes, rate, time left, Cancel) instead of its own bar.
+- GUI: changing the source mode detects the new mode's source (the per-frame check could leave
+  the other mode's disc info showing); an image dropped or handed over by Inspect while another
+  tab's job runs is detected at once (it waited for the controls to re-enable).
+- GUI: a drive the browser cannot open unelevated shows the error (the browser stayed hidden with
+  it set); a file whose disc cannot be reopened for the preview shows "Cannot open filesystem:
+  ..." (the preview spun "Loading..." for good).
+- GUI: the image and output pickers are the shared `EffectHost` ones, titled ("Open Disc Image",
+  "Save Output As"); the browser's extract, export and tree-save pickers keep their titles and now
+  start in the home folder on Linux like the others.
+- GUI: closing the Tree View window drops its text (Tree builds it again); the remote address
+  field clears whenever the dialog closes (it cleared only after a connect).
+- GUI: the CD-DA track list is read in a job on a source change (it was read on the UI thread);
+  playback is a job (it was a detached thread); same states, labels and Stop.
+- TUI: the drive scan is a job ("Looking for optical drives..." while it runs); picking a drive
+  detects the disc and the options step shows it ("Disc: format / filesystem label"); after Esc
+  cancels a rip the final result replaces "Cancel requested..."; a Start the controller refuses
+  reads "Cannot start the rip: <why>"; a panic reads "Rip failed: <message>" (it read "rip thread
+  panicked").
+- CLI: none.
+
+`rb-cli optical rip` / `convert` keep their own loops (`drain_rip` / `drain_convert` print the
+progress and log lines, `--device rb://...` resolves its own target) and `rb-cli optical extract`
+is a different implementation (case-collision modes, POSIX modes, tar output); driving the
+controller would change what they print or write.
+
+### Decisions for the user
+
+- Move the disc browser onto the browser pane (an `optical` profile) once the pane has a
+  physical-drive source and boot areas and an extraction through it is shown to write the same
+  bytes, or keep the two.
+- `rusty_backup::theme` stays in the lib (it was there for the old widget); it could move back to
+  `src/gui`.
+
+### Left
+
+- The TUI has no convert, CHD rip, disc browser or player; each is an existing `OpticalAction`
+  (its image-ops menu still pre-fills `rb-cli optical ...` command lines).
+- `rb-cli optical` verbs could share `model::optical_ops` / `optical_browse` once their output is
+  reconciled with the GUI's.
+- Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
+- Shells still reaching the engine: `tui_app.rs` (44), `gui/mod.rs` (22), `archives_tab.rs` (12),
+  `metadata_editor.rs` (11), `bulk_convert_dialog.rs` (7), `file_detail.rs` (5), and a few one- to
+  three-reference helpers.
