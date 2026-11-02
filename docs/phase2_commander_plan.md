@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); step 3 (Inspect browse view) planned below |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) planned below |
 
 Slice 3 notes, for the slices that follow:
 
@@ -264,13 +264,17 @@ decide what to draw.
   review / write / reopen jobs (false; the Explorer's "writes immediately").
 - `read_only`, `rename`, `new_folder`, `delete`: what may be written.
 - `wrappers`: archives and images expand in place (off: they are plain files).
-- `folder_tree`: a folder tree beside the listing (the TUI Explorer's left pane).
+- `listing: ListingStyle` (`CombinedTree`, `FlatList`, `TreeAndList`): the style a pane
+  starts in; `styles` lists the ones the user may switch to (`SetListingStyle` is refused
+  otherwise). `detail: DetailPlacement` (`SidePanel` follows the cursor, `OnRequest` is
+  the File Info window). See "Listing styles and quick view" below.
 - `tools: Tools { fsck, repair, bless, text_edit, import, metadata, transforms }`.
 
 Constructors: `PaneProfile::commander()` (today's Commander pane exactly: every source,
-staging, wrappers, no tools), `explorer()` (fixed source, no staging, folder tree, every
-tool), `inspect()` (fixed source, staging, bless / text / import / metadata), and
-`.read_only()` on any of them.
+staging, wrappers, no tools, flat list, File Info on request), `explorer()` (fixed source,
+no staging, folder tree + list, every tool), `inspect()` (fixed source, staging, bless /
+text / import / metadata, combined tree, side-panel details), and `.read_only()` on any
+of them.
 
 ### Who owns what
 
@@ -336,15 +340,63 @@ Step 2 (639c37e8, TUI Explorer):
   pane's path (`BrowseSession`) instead of `cli::resolve`. Gained: rename, checksums, the
   session log, sort, wrapper expansion, the staged-edits list and the help window.
 
+Listing styles and quick view (00835cc5 controller, 55a57f48 egui, b5eb93ac TUI; user
+decisions of 2026-11-02):
+
+- The pane's style is runtime state (`listing_style()`), seeded from the profile and from
+  the view's remembered choice (`RecentStore::listing_style`, stored in config.json
+  `listing_styles` by `CommanderRecent`; `remember_style_as("commander-left")` etc.). A
+  fixed-source pane gets `PrefsOnly(store)`, so it keeps its style but records no recent
+  files. Switching keeps the folder and the listing's selection; leaving the combined tree
+  moves a deep cursor to its top row and drops the deep selection.
+- Combined tree (`pane/expand.rs`, `rows::splice_folders`): base folder rows are
+  expandable; `ToggleExpand(node_id)` (also wrappers), `ExpandCursor` / `CollapseCursor`
+  (Right / Left; Collapse on a closed row steps to its parent row). Children are listed by a
+  job (`model::dir_listing::list_folder`) on a reader opened once from the pane's
+  `StageSource` and handed back by each job, holding the source's `Resource` (Busy: retried
+  next tick); a host pane lists through `std::fs`. A reload, host write, apply reopen or new
+  source bumps a generation (in-flight listings are dropped) and re-lists the expanded set,
+  which survives a reopen of the same source. Deep rows (`DisplayRow.in_folder`) select by
+  path in their own selection, exclusive with the listing's and the wrapper tree's (as those
+  two already were); `TreeClick` / `TreeContextSelect` / `ToggleMark` route to it, a Shift
+  range stays in one folder. Delete stages against each row's own folder (`selected_pairs`),
+  rename goes through `RenameAtCursor` (`PromptTarget::Rename` carries the folder),
+  `target_folder()` (the cursor's open folder, else the cursor row's folder) is where new
+  folders and copies land (`cwd_entry()`), and name checks read that folder (`names_in`).
+  Wrappers inside an expanded folder expand too (`entry_by_path`).
+- Tree and list: the existing `pane/tree.rs`, now behind the style; `FolderTreeClick(i)` /
+  `FolderTreeToggle(i)` for mouse views; a click in the list takes the keyboard back. In
+  two-pane Commander, Tab visits a pane's tree, its list, then the other pane. egui and the
+  two-pane TUI put the tree above the list (a half-width pane has no room beside it); the
+  TUI Explorer keeps it beside.
+- Following detail (`screen/follow.rs`): one slot per side, used by the quick view (active
+  side, `ToggleQuickView`, Primary+K) and by a `SidePanel` profile. The cursor row's
+  `FileDetail` metadata comes at once from `pane.cursor_detail()` (no selection change);
+  the slice-9 `entry_detail` job starts once the cursor rested `FOLLOW_DELAY` (150 ms) and
+  is cancelled when it moves. Accessors: `quick_view()`, `quick_view_detail()`,
+  `side_detail(side)`, `follow_pending()` (views keep ticking / repainting). Quick-view
+  details are never editable; a side panel's are, and `StageMetadata` falls back to the
+  active pane's side panel when no File Info window is open.
+- Keys: `QuickView` Primary+K, `Connect` moved to Primary+Shift+K (terminal table: Alt+K
+  first, since most terminals send Ctrl+Shift+K as Ctrl+K), `ViewMenu` F9, `Expand` Right,
+  `Collapse` Left. `binds()` reports Expand / Collapse unbound while the active pane is a
+  flat list, so the TUI keeps Left / Right for tab switching there. The Explorer's Left /
+  Right are now Expand / Collapse (same behaviour in the tree; in the list Right opens a
+  folder or wrapper, no longer a file's File Info, and Left goes up).
+- View menu: `view_menu()` returns `ViewMenuItem`s (styles, Quick view, Session log,
+  Keyboard shortcuts) that egui draws as its "View" menu / F9 window and the TUI as its F9
+  popup; `ShowViewMenu(bool)` and Esc close it.
+- Left for the Inspect migration: no view draws `side_detail` yet (no Commander or Explorer
+  profile places details beside the list); a folder still being listed is only a row flag
+  (`loading`), so a view that wants a "Loading..." child row draws it itself.
+
 Step 3 (Inspect browse view): not started; it is the size of slices 1-8 together.
 `src/gui/browse_view.rs` (7,218 lines, about 100 fields of state on `BrowseView`, lines 55-335)
 needs one decision first and then lands in parts, each green:
 
-- Decision: the browse view is one expandable tree (`render_tree_entry`, :1570, fed by the lazy
-  `FsRead` queue, :2034-2160). Either the Inspect profile turns `folder_tree` on and egui draws
-  tree + list like the TUI Explorer, or the pane grows a tree-only listing style
-  (`PaneProfile::listing: Flat | Tree`). The second keeps the Inspect look; the first is no new
-  controller code.
+- Decision (made 2026-11-02, done above): the pane grew listing styles; `inspect()` is the
+  combined tree with a side panel, so the browse view keeps its look (`render_tree_entry`,
+  :1570, and its lazy `FsRead` queue, :2034-2160, become the pane's combined tree).
 - 3a, source and listing: `open_with_session` / `open` / `open_partclone` / `open_streaming`
   (:647-745) and the password prompt (:225-230) become `open_fixed_session(BrowseSession)` on
   the pane (partclone and streaming are session constructors in the model); selection and marks

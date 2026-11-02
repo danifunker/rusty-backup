@@ -189,10 +189,30 @@ every shell shares, and `src/gui/commander/` only draws:
 - The TUI Explorer (Inspect tab) is the same screen with one pane:
   `CommanderController::single` + `PaneProfile::explorer` (Phase 2 slice 10).
 - Keyboard commands beyond the F-keys (all views): Ctrl/Cmd+O open image, +D open
-  folder, +B open backup, +K connect, +P partition chooser, +S sort (column
+  folder, +B open backup, +Shift+K connect (a terminal also takes Alt+K, since most
+  send Ctrl+Shift+K as Ctrl+K), +K quick view, +P partition chooser, +S sort (column
   descending, then the next column), +G checksums, +E export, +U staged edits,
-  +L session log. Copy, Delete, Checksums and Export act on the cursor row when
-  nothing is selected; that implicit selection is dropped by the next key.
+  +L session log, F9 the View menu. Copy, Delete, Checksums and Export act on the
+  cursor row when nothing is selected; that implicit selection is dropped by the next key.
+- **View menu** (egui: "View" in the top bar, and a window on F9; TUI: a popup on F9).
+  Its entries come from `CommanderController::view_menu()`, so both views list the
+  same things: the active pane's listing style (radio), Quick view (with its chord),
+  Session log and Keyboard shortcuts.
+- **Listing styles** (per pane, remembered per view in config.json `listing_styles`
+  under `commander-left` / `commander-right` / `explorer` / `inspect`):
+  - *Flat list* (the default): the current folder with `..`, as before.
+  - *Combined tree*: folders expand in place (+/- toggle, Right / Left, double-click or
+    Enter); a folder's children are listed by a job and show "(reading...)" until
+    they arrive. Delete, rename, new folder and a copy into the pane act on the
+    folder of the cursor row; a Shift range stays inside one folder.
+  - *Folder tree + list*: a folder tree above the list (egui and the two-pane TUI;
+    the TUI Explorer keeps it beside the list). Tab visits the tree, then its list,
+    then the other pane.
+- **Quick view** (Primary+K): the other pane shows the active pane's File Info
+  (metadata and a text / hex preview) for the cursor row, following it; the preview
+  is read once the cursor rests (150 ms) and a read for a row already left is
+  cancelled. Toggling it off (Primary+K, the View menu, or Esc when nothing else is
+  open) shows the other pane exactly as it was.
 
 ---
 

@@ -186,8 +186,12 @@ never copy it sideways.
 | F6 | Copy to the other pane |
 | F8 or Delete (Mac: Delete / Backspace) | Delete |
 | Primary+N | New folder |
-| Tab | Switch pane |
+| F9 | View menu (listing style, quick view, log) |
+| Primary+K | Quick view: the active pane's File Info in the other pane |
+| Primary+Shift+K | Connect to an `rb-cli serve` daemon (a terminal also takes Alt+K, since most send Ctrl+Shift+K as Ctrl+K) |
+| Tab | Switch pane (a folder tree, then its list, then the other pane) |
 | Enter | Open |
+| Right / Left | Expand / collapse in a tree (a flat list leaves them to the view) |
 | Space or Insert | Mark |
 
 ### Async work
