@@ -297,6 +297,26 @@ pub fn push_recent(mode: RecentMode, path: &str) -> Vec<String> {
     list
 }
 
+/// Commander's merged recent list: the newest 3 of each mode, deduped, Inspect first.
+pub fn merged_recent(cfg: &UpdateConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mode in [
+        RecentMode::Inspect,
+        RecentMode::Restore,
+        RecentMode::Optical,
+        RecentMode::Archives,
+        RecentMode::Commander,
+        RecentMode::Backup,
+    ] {
+        for p in cfg.recent_files.list(mode).iter().take(3) {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub current_version: String,

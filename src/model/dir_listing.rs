@@ -25,6 +25,21 @@ use crate::fs::entry::FileEntryTypeDisplay as _;
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::{Filesystem, FilesystemError};
 
+/// A host folder and its children, read ahead of [`DirListing::load_host_prepared`].
+pub struct HostRoot {
+    pub dir: FileEntry,
+    pub entries: Vec<FileEntry>,
+}
+
+/// Read a host folder as a listing root; the slow half of [`DirListing::load_host_root`].
+pub fn read_host_root(root: std::path::PathBuf) -> Result<HostRoot, FilesystemError> {
+    let path = root.to_string_lossy().to_string();
+    let entries = list_host_dir(&path)?;
+    let name = host_dir_name(&root, &path);
+    let dir = FileEntry::new_directory(name, path, 0);
+    Ok(HostRoot { dir, entries })
+}
+
 /// Where a [`DirListing`] reads its directory listings from.
 #[derive(Default)]
 enum ListingSource {
@@ -111,13 +126,14 @@ impl DirListing {
     /// Load a host-OS folder as the listing root (a `std::fs` read). The pane
     /// can navigate below it, and `..` may ascend above it on the real tree.
     pub fn load_host_root(&mut self, root: std::path::PathBuf) -> Result<(), FilesystemError> {
-        let path = root.to_string_lossy().to_string();
-        let entries = list_host_dir(&path)?;
-        let name = host_dir_name(&root, &path);
-        let dir = FileEntry::new_directory(name, path, 0);
-        self.reset(ListingSource::Host, true);
-        self.push_dir(dir, entries);
+        self.load_host_prepared(read_host_root(root)?);
         Ok(())
+    }
+
+    /// Install a host folder read earlier by [`read_host_root`] (off the UI thread).
+    pub fn load_host_prepared(&mut self, root: HostRoot) {
+        self.reset(ListingSource::Host, true);
+        self.push_dir(root.dir, root.entries);
     }
 
     /// Reset to a fresh source, clearing the stack and selection.

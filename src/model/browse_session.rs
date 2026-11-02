@@ -631,6 +631,30 @@ impl BrowseSession {
         status
     }
 
+    /// Run [`Self::spawn_open`] to the end inside a job, forwarding its phase and scan progress.
+    pub fn open_in_job(&self, ctx: &crate::model::job::JobCtx) -> anyhow::Result<BrowseOpenStatus> {
+        let status = self.spawn_open();
+        let mut phase = String::new();
+        loop {
+            {
+                let mut g = crate::model::worker::lock_status(&status);
+                if g.finished {
+                    return Ok(std::mem::replace(&mut *g, BrowseOpenStatus::starting()));
+                }
+                if g.phase != phase {
+                    phase = g.phase.clone();
+                    ctx.set_phase(phase.clone());
+                }
+                if g.scan_total > 0 {
+                    ctx.set_bytes(g.scan_done, g.scan_total);
+                }
+            }
+            // The open thread cannot stop mid-read; a cancel abandons it, as a source switch always did.
+            ctx.check_cancel()?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Open the filesystem read-write for editing operations.
     ///
     /// Unlike [`open`](Self::open) this requires a real `source_path` (or a

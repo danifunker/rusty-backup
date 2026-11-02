@@ -53,3 +53,27 @@ pub fn spawn_partclone_scan(
     );
     status
 }
+
+/// Run [`spawn_partclone_scan`] to the end inside a job; `Err` carries the scan's failure.
+pub fn scan_in_job(
+    ctx: &crate::model::job::JobCtx,
+    cache: Arc<Mutex<PartcloneBlockCache>>,
+    partition_index: usize,
+    partition_type: u8,
+    cache_path: PathBuf,
+) -> anyhow::Result<()> {
+    let status = spawn_partclone_scan(cache, partition_index, partition_type, cache_path);
+    loop {
+        {
+            let mut g = crate::model::worker::lock_status(&status);
+            if g.finished {
+                return match g.error.take() {
+                    Some(e) => Err(anyhow::anyhow!("Clonezilla metadata scan failed: {e}")),
+                    None => Ok(()),
+                };
+            }
+        }
+        ctx.check_cancel()?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
