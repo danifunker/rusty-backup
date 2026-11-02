@@ -19,6 +19,7 @@
 //! - Tier A tests replay `tests/ui_scenarios/*.toml` against controllers (`tests/ui_scenarios.rs`).
 
 pub mod app;
+pub mod backup;
 pub mod browser;
 pub mod commander;
 pub mod inspect;

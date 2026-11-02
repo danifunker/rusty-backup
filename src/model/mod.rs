@@ -6,6 +6,7 @@
 pub mod archive_edit;
 pub mod archive_import;
 pub mod backup_loader;
+pub mod backup_plan;
 #[cfg(feature = "remote")]
 pub mod backup_remote;
 pub mod browse_session;
