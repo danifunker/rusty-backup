@@ -1423,14 +1423,12 @@ impl RestoreState {
         use crate::controller::restore::HostRequest;
         for req in self.ctl.take_requests() {
             match req {
-                // Tests leave the user's recent list alone.
-                HostRequest::RememberRecent(path) if !cfg!(test) => {
+                HostRequest::RememberRecent(path) => {
                     crate::update::push_recent(
                         crate::update::RecentMode::Restore,
                         &path.to_string_lossy(),
                     );
                 }
-                HostRequest::RememberRecent(_) => {}
                 // The TUI pours an image itself; it never asks for the GUI's writer.
                 HostRequest::WriteImage { .. } => {}
             }
