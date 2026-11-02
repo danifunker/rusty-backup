@@ -344,7 +344,12 @@ impl CommanderController {
         from: Side,
         format: Option<ExportFormat>,
     ) -> Vec<Effect> {
-        let entries = without_nested(self.pane(from).selected_entries());
+        let mut entries = without_nested(self.pane(from).selected_entries());
+        // A disc exports in path order, once per path, as the Optical tab's browser always has.
+        if self.pane(from).is_optical() {
+            entries.sort_by(|a, b| a.path.cmp(&b.path));
+            entries.dedup_by(|a, b| a.path == b.path);
+        }
         self.request_export_of(from, format, entries, None)
     }
 

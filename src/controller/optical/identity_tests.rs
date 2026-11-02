@@ -216,8 +216,14 @@ pub(super) fn run_cases(b: &mut dyn DiscBrowser) -> Vec<(String, String)> {
     out
 }
 
-/// Check `got` against `GOLDEN` (or print it with `RB_IDENTITY_PRINT=1`).
-pub(super) fn check(got: &[(String, String)]) {
+/// What the pane shows differently, never what it writes: a Rock Ridge symlink has no preview.
+const PANE_DIFFERS: &[(&str, &str)] = &[
+    ("rr fs0 preview /link", "none"),
+    ("rr-prep fs0 preview /link", "none"),
+];
+
+/// Check `got` against `GOLDEN`, `differs` excepted (or print it with `RB_IDENTITY_PRINT=1`).
+pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
     if std::env::var("RB_IDENTITY_PRINT").is_ok() {
         for (c, d) in got {
             println!("    (\"{c}\", \"{d}\"),");
@@ -226,6 +232,9 @@ pub(super) fn check(got: &[(String, String)]) {
     }
     let mut bad = Vec::new();
     for (c, d) in got {
+        if differs.iter().any(|(g, v)| g == c && v == d) {
+            continue;
+        }
         match GOLDEN.iter().find(|(g, _)| g == c) {
             Some((_, want)) if want == d => {}
             Some((_, want)) => bad.push(format!("{c}: {d} (want {want})")),
@@ -375,13 +384,187 @@ impl DiscBrowser for OldBrowser {
     }
 }
 
+/// The browser pane under `PaneProfile::optical`, as the Optical tab hosts it since slice 18.
+struct PaneBrowser {
+    ctl: Option<crate::controller::commander::CommanderController>,
+}
+
+impl PaneBrowser {
+    fn ctl(&mut self) -> &mut crate::controller::commander::CommanderController {
+        self.ctl.as_mut().expect("open first")
+    }
+
+    fn settle(&mut self) {
+        let ctl = self.ctl();
+        let start = std::time::Instant::now();
+        ctl.tick();
+        while ctl.is_working() {
+            assert!(start.elapsed().as_secs() < 60, "a job never ended");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ctl.tick();
+        }
+    }
+
+    fn pane_act(&mut self, a: crate::controller::browser::BrowserPaneAction) {
+        use crate::controller::commander::{CommanderAction, Side};
+        self.ctl().apply(CommanderAction::Pane(Side::Left, a));
+        self.settle();
+    }
+
+    fn pane(&self) -> &crate::controller::browser::BrowserPaneController {
+        let ctl = self.ctl.as_ref().expect("open first");
+        ctl.pane(crate::controller::commander::Side::Left)
+    }
+
+    /// The node id of the row showing `path`.
+    fn node(&self, path: &str) -> Option<(String, bool)> {
+        let p = self.pane();
+        let rows = p.rows();
+        let row = rows
+            .iter()
+            .find(|r| !r.is_parent() && p.row_entry(r).is_some_and(|e| e.path == path))?;
+        Some((row.node_id.clone(), row.expanded))
+    }
+
+    fn copied(&self) -> Result<(), ()> {
+        let ctl = self.ctl.as_ref().expect("open first");
+        match ctl.status().starts_with("Copied ") {
+            true => Ok(()),
+            false => Err(()),
+        }
+    }
+}
+
+impl DiscBrowser for PaneBrowser {
+    fn open(&mut self, disc: &Path) {
+        use crate::controller::browser::{DiscSource, PaneProfile, PaneServices};
+        let mut ctl = crate::controller::commander::CommanderController::single(
+            PaneServices::headless(),
+            crate::controller::keys::KeyMap::for_this_platform(),
+            PaneProfile::optical(),
+        );
+        ctl.open_disc(DiscSource {
+            path: disc.to_path_buf(),
+            physical: false,
+        });
+        self.ctl = Some(ctl);
+        self.settle();
+    }
+
+    fn choices(&self) -> Vec<String> {
+        self.pane().partition_labels()
+    }
+
+    fn select_fs(&mut self, i: usize) {
+        use crate::controller::browser::BrowserPaneAction as A;
+        self.pane_act(A::SelectPartition(i));
+    }
+
+    fn children(&mut self, folder: &str) -> Vec<(String, bool)> {
+        use crate::controller::browser::BrowserPaneAction as A;
+        if folder != "/" {
+            if let Some((id, false)) = self.node(folder) {
+                self.pane_act(A::ToggleExpand(id));
+            }
+        }
+        let kids = self.pane().folder_children(folder).unwrap_or(&[]);
+        kids.iter()
+            .map(|k| (k.path.clone(), k.is_directory()))
+            .collect()
+    }
+
+    fn tree(&mut self) -> String {
+        use crate::controller::browser::BrowserPaneAction as A;
+        self.pane_act(A::ListTree { ids: false });
+        let t = self.ctl().host_pane().take_tree_text();
+        t.map(|t| t.text).unwrap_or_default()
+    }
+
+    fn extract(&mut self, path: &str, mode: ResourceForkMode, dest: &Path) -> Result<(), ()> {
+        use crate::controller::commander::{CommanderAction, ExtractOptions, Side};
+        let options = ExtractOptions {
+            fork_mode: mode,
+            ..ExtractOptions::default()
+        };
+        self.ctl().apply(CommanderAction::Extract {
+            from: Side::Left,
+            path: path.to_string(),
+            options,
+            dest: Some(dest.to_path_buf()),
+        });
+        self.settle();
+        self.copied()
+    }
+
+    fn export_all(
+        &mut self,
+        format: ExportFormat,
+        mode: ResourceForkMode,
+        dest: &Path,
+    ) -> Result<(), ()> {
+        use crate::controller::browser::BrowserPaneAction as A;
+        use crate::controller::commander::screen::purpose;
+        use crate::controller::commander::{CommanderAction, Side};
+        self.pane_act(A::ClearSelection);
+        let p = self.pane();
+        let top: Vec<String> = p
+            .rows()
+            .iter()
+            .filter(|r| r.depth == 0 && !r.is_parent())
+            .map(|r| r.node_id.clone())
+            .collect();
+        for id in top {
+            self.pane_act(A::Mark(id));
+        }
+        self.ctl().apply(CommanderAction::SetForkMode(mode));
+        let fx = self.ctl().apply(CommanderAction::Export {
+            from: Side::Left,
+            format: Some(format),
+        });
+        if fx.is_empty() {
+            return Err(());
+        }
+        self.ctl().apply(CommanderAction::Picked {
+            purpose: purpose::EXPORT,
+            path: Some(dest.to_path_buf()),
+        });
+        self.settle();
+        self.copied()
+    }
+
+    fn preview(&mut self, path: &str) -> String {
+        use crate::controller::browser::BrowserPaneAction as A;
+        use crate::controller::commander::Side;
+        let size = self.pane().entry_at(path).map(|e| e.size).unwrap_or(0);
+        if size > crate::model::optical_browse::MAX_PREVIEW_SIZE as u64 {
+            return "too large".to_string();
+        }
+        let Some((id, _)) = self.node(path) else {
+            return "no row".to_string();
+        };
+        self.pane_act(A::CursorTo(id));
+        let ctl = self.ctl.as_ref().expect("open first");
+        match ctl.side_detail(Side::Left).and_then(|d| d.preview.as_ref()) {
+            Some(data) => preview_text(&crate::model::optical_browse::detect_content_type(data)),
+            None => "none".to_string(),
+        }
+    }
+}
+
+#[test]
+fn the_browser_pane_writes_the_disc_browsers_golden_bytes() {
+    let mut b = PaneBrowser { ctl: None };
+    let got = run_cases(&mut b);
+    check(&got, PANE_DIFFERS);
+}
+
 #[test]
 fn the_slice_16_disc_browser_writes_the_golden_bytes() {
     let mut b = OldBrowser {
         ctl: OpticalController::new(Arc::new(NoNotify)),
     };
     let got = run_cases(&mut b);
-    check(&got);
+    check(&got, &[]);
 }
 
 /// Case -> sha256 of its manifest (or of the tree text / choice count / preview).

@@ -29,7 +29,9 @@ pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
 pub use archives::{ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice, TarChoice};
 pub use edits::{validate_entry_name, ApplyReport, CursorDetail, StageOutcome};
 pub use remote::validate_remote_addr;
-pub use source::{purpose, NoRecent, PaneServices, PrefsOnly, RecentStore, SourceKind, VolumeInfo};
+pub use source::{
+    purpose, DiscSource, NoRecent, PaneServices, PrefsOnly, RecentStore, SourceKind, VolumeInfo,
+};
 pub use tools::{
     format_mac_date, parse_mac_date, MetadataFields, MetadataForm, TextDoc, ToolReport,
     MAX_TEXT_EDIT,
@@ -105,6 +107,8 @@ pub enum BrowserPaneAction {
     OpenBackupFolder(PathBuf),
     /// A dropped or recent path: a folder opens as a host folder, a file as an image.
     OpenPath(PathBuf),
+    /// Open a disc image or the disc in a drive, browsed by its filesystems.
+    OpenDisc(DiscSource),
     PickImage,
     PickHostFolder,
     PickBackupFolder,
@@ -482,12 +486,16 @@ impl BrowserPaneController {
         use BrowserPaneAction as A;
         let p = &self.profile;
         let (allowed, what) = match action {
-            A::OpenImage(_) | A::PickImage => (p.sources.image, "opening an image"),
+            A::OpenImage(_) | A::PickImage | A::OpenDisc(_) => {
+                (p.sources.image, "opening an image")
+            }
             A::OpenHostFolder(_) | A::PickHostFolder => (p.sources.host, "opening a folder"),
             A::OpenBackupFolder(_) | A::PickBackupFolder => (p.sources.backup, "opening a backup"),
             A::OpenPath(_) => (p.sources.image || p.sources.host, "opening another source"),
             A::Connect | A::OpenRemoteImage(_) => (p.sources.remote, "remote browsing"),
-            A::SelectPartition(_) | A::CloseSource => (!p.fixed_source, "changing the source"),
+            // A disc's filesystems are its own choices, even when the host fixed the disc.
+            A::SelectPartition(_) => (!p.fixed_source || self.is_optical(), "changing the source"),
+            A::CloseSource => (!p.fixed_source, "changing the source"),
             A::Delete => (p.can_delete(), "delete"),
             A::RequestRename(_) | A::RenameAtCursor => (p.can_rename(), "rename"),
             A::RequestNewFolder => (p.can_new_folder(), "new folder"),

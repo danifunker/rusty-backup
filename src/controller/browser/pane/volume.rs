@@ -171,6 +171,12 @@ fn read_volume(
     reader: &mut Option<Box<dyn Filesystem>>,
     what: &Want,
 ) -> Result<Found, String> {
+    // A disc's tree is the Optical tab's listing (type / creator, resource forks), not the generic one.
+    #[cfg(feature = "optical")]
+    if let (Want::Tree(_), Some(disc)) = (what, source.disc()) {
+        let text = disc.tree_listing()?;
+        return Ok(Found::Tree(TreeText { text, ids: false }));
+    }
     let fs = reader_for(source, reader)?;
     Ok(match what {
         Want::Check => Found::Check(Box::new(fs.fsck().map(|r| r.map_err(|e| e.to_string())))),

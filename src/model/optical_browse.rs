@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use opticaldiscs::browse::filesystem::{Filesystem, FilesystemError};
 use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
@@ -17,6 +17,7 @@ use opticaldiscs::formats::FilesystemType;
 
 use crate::model::job::{JobCtx, Progress, Unit};
 use crate::optical::boot_area::{self, BootArea};
+use disk_core::filesystem::Filesystem as RbFilesystem;
 use fs_mac::resource_fork;
 
 pub use crate::fs::export_selection::ExportFormat;
@@ -26,11 +27,89 @@ pub use opticaldiscs::browse::entry::{EntryType, FileEntry};
 /// Files larger than this are not read for the preview.
 pub const MAX_PREVIEW_SIZE: usize = 1024 * 1024;
 
-/// A disc image file, or the disc in a drive (`physical`, read through the device-backed reader).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscSource {
-    pub path: PathBuf,
-    pub physical: bool,
+pub use crate::model::commander_descend::DiscSource;
+
+/// A disc source opened for the browser pane: its filesystem choices and the first one, opened.
+pub struct DiscOpen {
+    pub disc: DiscChoice,
+    pub labels: Vec<String>,
+    /// "Game: ..." for a recognised console disc.
+    pub game: Option<String>,
+    /// The first choice's filesystem, or why it did not open (the other choices stay offered).
+    pub fs: Result<Box<dyn RbFilesystem>, String>,
+}
+
+/// Probe `src` and open its first filesystem; the picker labels are the pane's (Commander's).
+pub fn open_source(src: &DiscSource) -> Result<DiscOpen, String> {
+    let path = src.path.as_path();
+    if src.physical {
+        crate::os::ensure_physical_enabled().map_err(|e| e.to_string())?;
+    }
+    // A drive is not a file: its raw node is read as flat cooked sectors (EBUSY on macOS otherwise).
+    let probe = if src.physical {
+        DiscImageInfo::open_physical(path)
+    } else {
+        DiscImageInfo::open(path)
+    };
+    let info = probe.map_err(|e| format!("Failed to open disc image: {e}"))?;
+    let boot_areas = match src.physical {
+        true => Vec::new(),
+        false => boot_area::detect(path),
+    };
+    let mut labels =
+        crate::model::commander_descend::optical_choice_labels(&info, boot_areas.as_slice());
+    // A drive always presents its primary volume.
+    if src.physical {
+        labels.truncate(1);
+    }
+    let game = info.game.as_ref().map(crate::optical::format_game_identity);
+    let disc = DiscChoice {
+        src: src.clone(),
+        info: std::sync::Arc::new(info),
+        selected: 0,
+        boot_areas,
+    };
+    let fs = disc.filesystem().map_err(|e| {
+        // An NKit image that reaches here could not be reconstructed: add the convert-it hint.
+        let msg = crate::cli::optical_hint::with_nkit_hint(
+            anyhow::anyhow!("Cannot open filesystem: {e}"),
+            path,
+        );
+        format!("{msg:#}")
+    });
+    Ok(DiscOpen {
+        disc,
+        labels,
+        game,
+        fs,
+    })
+}
+
+/// Find the entry at `path` by listing each folder on the way from the root.
+fn entry_at(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, FilesystemError> {
+    let mut cur = fs.root()?;
+    if path == "/" || path.is_empty() {
+        return Ok(cur);
+    }
+    loop {
+        let mut next = None;
+        for k in fs.list_directory(&cur)? {
+            if k.path == path {
+                return Ok(k);
+            }
+            let ancestor = k.is_directory()
+                && path.len() > k.path.len()
+                && path.starts_with(k.path.as_str())
+                && path.as_bytes().get(k.path.len()) == Some(&b'/');
+            if ancestor && next.is_none() {
+                next = Some(k);
+            }
+        }
+        match next {
+            Some(dir) => cur = dir,
+            None => return Err(FilesystemError::NotFound(path.to_string())),
+        }
+    }
 }
 
 /// What opening a disc found; `error` is shown above the tree.
@@ -192,6 +271,101 @@ impl DiscChoice {
     /// The selected filesystem's type (the primary, or the chosen hybrid side).
     pub fn fs_type(&self) -> Option<FilesystemType> {
         selected_fs_type(self.info.as_ref(), self.selected)
+    }
+
+    /// The same disc on picker choice `selected`.
+    pub fn with_choice(&self, selected: usize) -> DiscChoice {
+        DiscChoice {
+            selected,
+            ..self.clone()
+        }
+    }
+
+    /// The choice's name as the pane shows it: "ISO 9660", "HFS+", or the boot area's label.
+    pub fn fs_name(&self) -> String {
+        match self.fs_type() {
+            Some(t) => t.display_name().to_string(),
+            None => {
+                let hybrids = self.info.hybrid_filesystems.len();
+                let area = self.selected.checked_sub(1 + hybrids);
+                let area = area.and_then(|i| self.boot_areas.get(i));
+                area.map(|a| a.label.clone()).unwrap_or_default()
+            }
+        }
+    }
+
+    /// The browsed filesystem keeps resource forks (HFS / HFS+).
+    pub fn has_forks(&self) -> bool {
+        matches!(
+            self.fs_type(),
+            Some(FilesystemType::Hfs | FilesystemType::HfsPlus)
+        )
+    }
+
+    /// The choice as a rusty-backup filesystem, for the browser pane's listing and copies.
+    pub fn filesystem(&self) -> Result<Box<dyn RbFilesystem>, String> {
+        let inner = self.open().map_err(|e| e.to_string())?;
+        let label = self
+            .src
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, self.fs_name(), label)
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(fs))
+    }
+
+    /// Extract the entry at `path` with the slice-16 walker, reporting through a host-copy status.
+    pub fn extract_path(
+        &self,
+        path: &str,
+        dest: &Path,
+        mode: ResourceForkMode,
+        status: &std::sync::Arc<std::sync::Mutex<crate::model::commander_ops::HostCopyStatus>>,
+    ) -> Result<u32, String> {
+        let src = &self.src;
+        let mut tally = Tally::default();
+        let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // Re-probe as the extraction always has: a file-based reopen of a drive is EBUSY.
+            let info = if src.physical {
+                DiscImageInfo::open_physical(src.path.as_path())?
+            } else {
+                DiscImageInfo::open(src.path.as_path())?
+            };
+            let reopen = || {
+                open_choice(
+                    &info,
+                    src.path.as_path(),
+                    src.physical,
+                    self.selected,
+                    self.boot_areas.as_slice(),
+                )
+            };
+            let mut counting_fs = reopen()?;
+            let entry = entry_at(&mut *counting_fs, path)?;
+            let (total_files, total_bytes) = count_entry(&mut *counting_fs, &entry)?;
+            tally.total_files = total_files;
+            tally.total_bytes = total_bytes;
+            if let Ok(mut g) = status.lock() {
+                g.files_total = total_files as usize;
+                g.bytes_total = total_bytes;
+            }
+            drop(counting_fs);
+            let mut fs = reopen()?;
+            let report = StatusReport(status);
+            extract_entry(&mut *fs, &entry, dest, mode, &mut tally, &report)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(tally.files_extracted),
+            Err(e) => {
+                let msg = crate::cli::optical_hint::with_nkit_hint(
+                    anyhow::anyhow!("{e}"),
+                    src.path.as_path(),
+                );
+                Err(format!("{msg:#}"))
+            }
+        }
     }
 
     /// Extract `entry` (a file or a folder) into `dest`; the number of files written.
@@ -540,21 +714,50 @@ struct Tally {
     total_files: u32,
 }
 
-impl Tally {
-    fn report(&self, ctx: &JobCtx, current_file: &str) {
-        ctx.set_phase(format!(
+/// Where an extraction reports its counts and learns it was cancelled.
+trait ExtractReport {
+    fn report(&self, tally: &Tally, current_file: &str);
+    fn cancelled(&self) -> bool;
+}
+
+impl ExtractReport for JobCtx {
+    fn report(&self, tally: &Tally, current_file: &str) {
+        self.set_phase(format!(
             "Extracting {}/{} files: {}",
-            self.files_extracted, self.total_files, current_file
+            tally.files_extracted, tally.total_files, current_file
         ));
-        if self.total_bytes > 0 {
-            ctx.set_bytes(self.current_bytes, self.total_bytes);
+        if tally.total_bytes > 0 {
+            self.set_bytes(tally.current_bytes, tally.total_bytes);
         } else {
-            ctx.set_progress(Progress::Determinate {
-                done: u64::from(self.files_extracted),
-                total: u64::from(self.total_files),
+            self.set_progress(Progress::Determinate {
+                done: u64::from(tally.files_extracted),
+                total: u64::from(tally.total_files),
                 unit: Unit::Items,
             });
         }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+/// The browser pane's copy job reads an extraction's progress from its host-copy status.
+struct StatusReport<'a>(
+    &'a std::sync::Arc<std::sync::Mutex<crate::model::commander_ops::HostCopyStatus>>,
+);
+
+impl ExtractReport for StatusReport<'_> {
+    fn report(&self, tally: &Tally, current_file: &str) {
+        if let Ok(mut g) = self.0.lock() {
+            g.current_file = current_file.to_string();
+            g.copied = tally.files_extracted as usize;
+            g.bytes_done = tally.current_bytes;
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0.lock().map(|g| g.cancel_requested).unwrap_or(false)
     }
 }
 
@@ -565,15 +768,15 @@ fn extract_entry(
     dest: &Path,
     resource_fork_mode: ResourceForkMode,
     tally: &mut Tally,
-    ctx: &JobCtx,
+    ctx: &dyn ExtractReport,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if ctx.is_cancelled() {
+    if ctx.cancelled() {
         return Err("Extraction cancelled".into());
     }
     let safe_name = resource_fork::sanitize_filename(entry.name.as_str());
     match entry.entry_type {
         EntryType::File => {
-            tally.report(ctx, entry.path.as_str());
+            ctx.report(tally, entry.path.as_str());
             // Only fork-capable filesystems (HFS / HFS+) report a non-zero resource fork.
             let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
             if has_rsrc && resource_fork_mode == ResourceForkMode::MacBinary {
@@ -639,7 +842,7 @@ fn extract_entry(
                 }
                 tally.files_extracted += 1;
             }
-            tally.report(ctx, entry.path.as_str());
+            ctx.report(tally, entry.path.as_str());
         }
         EntryType::Directory => {
             let dir_path = dest.join(&safe_name);

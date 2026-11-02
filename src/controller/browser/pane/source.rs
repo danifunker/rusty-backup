@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context as _};
+use anyhow::anyhow;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 
@@ -20,10 +20,7 @@ use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::fs::partition_is_browsable;
 use crate::model::browse_session::{looks_like_password_error, BrowseOpenStatus, BrowseSession};
 use crate::model::cache_runner;
-use crate::model::commander_descend::{
-    classify, open_archive, open_optical, open_optical_hybrid, optical_filesystems, DescendKind,
-    OpticalFsChoice, ReopenRecipe,
-};
+use crate::model::commander_descend::{classify, open_archive, DescendKind, ReopenRecipe};
 use crate::model::commander_ops::StageSource;
 use crate::model::commander_source::{
     self, BackupPartitionOpen, PartcloneCacheStore, PartcloneLookup, ResolvedBackup,
@@ -33,6 +30,15 @@ use crate::model::edit_queue::StagedEdit;
 use crate::model::job::{Job, JobCtx, JobRegistry, NoNotify, Notify, Resource, Snapshot, Status};
 use crate::model::worker::lock_status;
 use crate::partition::PartitionInfo;
+
+pub use crate::model::commander_descend::DiscSource;
+
+/// A disc source's chosen filesystem (none can be built without the `optical` feature).
+#[cfg(feature = "optical")]
+type Disc = crate::model::optical_browse::DiscChoice;
+#[cfg(not(feature = "optical"))]
+#[derive(Clone)]
+enum Disc {}
 
 /// The `purpose` of each picker and confirmation a pane asks for.
 pub mod purpose {
@@ -158,6 +164,8 @@ pub(super) enum OpenRequest {
     Image(PathBuf),
     Host(PathBuf),
     Backup(PathBuf),
+    /// A disc image file or a drive, browsed by its filesystems (hybrid sides, boot areas).
+    Disc(DiscSource),
 }
 
 impl OpenRequest {
@@ -167,6 +175,7 @@ impl OpenRequest {
             | OpenRequest::Image(p)
             | OpenRequest::Host(p)
             | OpenRequest::Backup(p) => p,
+            OpenRequest::Disc(d) => d.path.as_path(),
         }
     }
 
@@ -174,6 +183,8 @@ impl OpenRequest {
         match self {
             OpenRequest::Host(p) | OpenRequest::Backup(p) => Resource::Folder(p.clone()),
             OpenRequest::Path(p) | OpenRequest::Image(p) => Resource::Image(p.clone()),
+            OpenRequest::Disc(d) if d.physical => Resource::Device(d.path.clone()),
+            OpenRequest::Disc(d) => Resource::Image(d.path.clone()),
         }
     }
 }
@@ -205,10 +216,11 @@ enum Plan {
         resource: Resource,
         label: String,
     },
-    Optical {
-        path: PathBuf,
-        choices: Vec<OpticalFsChoice>,
-        idx: usize,
+    /// Another filesystem of the open disc.
+    DiscFs {
+        disc: Disc,
+        label: String,
+        resource: Resource,
     },
 }
 
@@ -219,10 +231,9 @@ impl Plan {
             Plan::Partition {
                 resource, label, ..
             } => (format!("Opening {label}"), resource.clone()),
-            Plan::Optical { path, choices, idx } => (
-                format!("Opening {}", choices[*idx].label),
-                Resource::Image(path.clone()),
-            ),
+            Plan::DiscFs {
+                label, resource, ..
+            } => (format!("Opening {label}"), resource.clone()),
         }
     }
 
@@ -242,11 +253,14 @@ struct Loaded {
 enum Opened {
     Host(HostRoot),
     Archive(Loaded),
-    Optical {
-        choices: Vec<OpticalFsChoice>,
-        idx: usize,
-        loaded: Loaded,
+    /// A disc source: its filesystem choices, and the first one (or why it did not open).
+    Disc {
+        disc: Disc,
+        labels: Vec<String>,
+        game: Option<String>,
+        loaded: Result<Loaded, String>,
     },
+    DiscFs(Loaded),
     Partitions(Vec<PartitionInfo>),
     Backup(ResolvedBackup),
     Volume {
@@ -272,7 +286,10 @@ pub(super) struct SourceState {
     kind: Option<SourceKind>,
     partitions: Vec<PartitionInfo>,
     backup: Option<Arc<ResolvedBackup>>,
-    optical: Vec<OpticalFsChoice>,
+    /// A disc's filesystem labels (the partition picker's entries), its open choice and game.
+    optical: Vec<String>,
+    disc: Option<Disc>,
+    game: Option<String>,
     selected: Option<usize>,
     session: Option<BrowseSession>,
     /// Scanned Clonezilla caches; replaced (not cleared) per source so an abandoned job cannot refill it.
@@ -305,6 +322,8 @@ impl SourceState {
             partitions: Vec::new(),
             backup: None,
             optical: Vec::new(),
+            disc: None,
+            game: None,
             selected: None,
             session: None,
             cache_store: Arc::new(Mutex::new(PartcloneCacheStore::new())),
@@ -379,10 +398,20 @@ impl BrowserPaneController {
         self.src.kind == Some(SourceKind::Optical)
     }
 
+    /// The open disc is a drive's (read through the device), not an image file.
+    pub fn is_physical_disc(&self) -> bool {
+        self.src.disc.as_ref().is_some_and(disc_is_physical)
+    }
+
+    /// "Game: ..." for a recognised console disc.
+    pub fn disc_game(&self) -> Option<&str> {
+        self.src.game.as_deref()
+    }
+
     /// The partition picker's entries: a disc's filesystems, or the partition table.
     pub fn partition_labels(&self) -> Vec<String> {
         if self.is_optical() {
-            self.src.optical.iter().map(|c| c.label.clone()).collect()
+            self.src.optical.clone()
         } else {
             let parts = self.src.partitions.iter().enumerate();
             parts.map(|(i, p)| partition_label(i, p)).collect()
@@ -438,15 +467,8 @@ impl BrowserPaneController {
         let recipe = match self.src.kind? {
             SourceKind::Archive => ReopenRecipe::Archive { path, label },
             SourceKind::Optical => {
-                let hybrid = self
-                    .src
-                    .selected
-                    .and_then(|i| self.src.optical.get(i))
-                    .and_then(|c| c.hybrid_index);
-                match hybrid {
-                    Some(index) => ReopenRecipe::OpticalHybrid { path, index, label },
-                    None => ReopenRecipe::Optical { path, label },
-                }
+                let _ = (path, label);
+                return self.src.disc.as_ref().map(disc_stage_source);
             }
             _ => return None,
         };
@@ -535,6 +557,15 @@ impl BrowserPaneController {
         fx
     }
 
+    /// The host opens a fixed-source pane on a disc image or a drive.
+    pub fn open_fixed_disc(&mut self, src: DiscSource) -> Vec<Effect> {
+        self.src.fixed_partition = None;
+        self.src.fixed_session = false;
+        let mut fx = self.switch(Switch::Open(OpenRequest::Disc(src)));
+        fx.append(&mut self.out);
+        fx
+    }
+
     /// The host hands a fixed-source pane a ready session (a partition, a partclone cache, a stream).
     pub fn open_fixed_session(&mut self, session: BrowseSession, label: &str) -> Vec<Effect> {
         let mut fx = self.reopen_session(session);
@@ -581,6 +612,7 @@ impl BrowserPaneController {
             A::OpenHostFolder(p) => self.request_switch(Switch::Open(OpenRequest::Host(p))),
             A::OpenBackupFolder(p) => self.request_switch(Switch::Open(OpenRequest::Backup(p))),
             A::OpenPath(p) => self.request_switch(Switch::Open(OpenRequest::Path(p))),
+            A::OpenDisc(d) => self.request_switch(Switch::Open(OpenRequest::Disc(d))),
             A::PickImage => vec![Effect::PickFile(PickSpec {
                 purpose: purpose::OPEN_IMAGE,
                 title: "Open disk image".into(),
@@ -705,6 +737,8 @@ impl BrowserPaneController {
         s.partitions.clear();
         s.backup = None;
         s.optical.clear();
+        s.disc = None;
+        s.game = None;
         s.selected = None;
         s.session = None;
         s.cache_store = Arc::new(Mutex::new(PartcloneCacheStore::new()));
@@ -724,7 +758,7 @@ impl BrowserPaneController {
         self.src.kind = match req {
             OpenRequest::Host(_) => Some(SourceKind::Host),
             OpenRequest::Backup(_) => Some(SourceKind::Backup),
-            OpenRequest::Image(_) | OpenRequest::Path(_) => None,
+            OpenRequest::Image(_) | OpenRequest::Path(_) | OpenRequest::Disc(_) => None,
         };
         self.src.path = Some(path.clone());
         self.spawn(Plan::Source(req));
@@ -795,13 +829,23 @@ impl BrowserPaneController {
     }
 
     fn open_optical_choice(&mut self, path: PathBuf, idx: usize) -> Vec<Effect> {
-        let Some(choice) = self.src.optical.get(idx).cloned() else {
+        let (Some(label), Some(disc)) = (self.src.optical.get(idx).cloned(), &self.src.disc) else {
             return Vec::new();
         };
+        let disc = disc_with_choice(disc, idx);
+        let resource = match self.is_physical_disc() {
+            true => Resource::Device(path),
+            false => Resource::Image(path),
+        };
         self.clear_for_partition(idx);
-        let choices = self.src.optical.clone();
-        self.spawn(Plan::Optical { path, choices, idx });
-        vec![message(format!("opening {} ...", choice.label))]
+        self.src.disc = Some(disc.clone());
+        let msg = format!("opening {label} ...");
+        self.spawn(Plan::DiscFs {
+            disc,
+            label,
+            resource,
+        });
+        vec![message(msg)]
     }
 
     fn submit_password(&mut self, secret: String) -> Vec<Effect> {
@@ -954,18 +998,35 @@ impl BrowserPaneController {
                 let n = self.show_loaded(loaded);
                 vec![message(format!("opened archive {path} ({n} item(s))."))]
             }
-            Opened::Optical {
-                choices,
-                idx,
+            Opened::Disc {
+                disc,
+                labels,
+                game,
                 loaded,
             } => {
-                if self.src.kind != Some(SourceKind::Optical) {
-                    self.src.kind = Some(SourceKind::Optical);
+                self.src.kind = Some(SourceKind::Optical);
+                if !disc_is_physical(&disc) {
                     self.remember_source();
                 }
-                let label = choices[idx].label.clone();
-                self.src.optical = choices;
-                self.src.selected = Some(idx);
+                let label = labels.first().cloned().unwrap_or_default();
+                self.src.optical = labels;
+                self.src.disc = Some(disc);
+                self.src.game = game;
+                self.src.selected = Some(0);
+                match loaded {
+                    Ok(loaded) => {
+                        let n = self.show_loaded(loaded);
+                        vec![message(format!("opened {label} ({n} item(s))."))]
+                    }
+                    Err(e) => {
+                        self.src.error = Some(e.clone());
+                        vec![message(e)]
+                    }
+                }
+            }
+            Opened::DiscFs(loaded) => {
+                let label = self.src.selected.and_then(|i| self.src.optical.get(i));
+                let label = label.cloned().unwrap_or_default();
                 let n = self.show_loaded(loaded);
                 vec![message(format!("opened {label} ({n} item(s))."))]
             }
@@ -1034,13 +1095,9 @@ fn run_plan(plan: Plan, ctx: &JobCtx) -> anyhow::Result<Opened> {
             let status = session.open_in_job(ctx)?;
             finish_open(session, status)
         }
-        Plan::Optical { path, choices, idx } => {
-            let loaded = load_optical(&path, &choices[idx])?;
-            Ok(Opened::Optical {
-                choices,
-                idx,
-                loaded,
-            })
+        Plan::DiscFs { disc, .. } => {
+            ctx.set_phase("Reading disc...");
+            Ok(Opened::DiscFs(load_disc_choice(&disc)?))
         }
     }
 }
@@ -1057,6 +1114,10 @@ fn run_source(req: OpenRequest, ctx: &JobCtx) -> anyhow::Result<Opened> {
         OpenRequest::Image(path) => open_image(&path, ctx),
         OpenRequest::Path(path) if path.is_dir() => open_host(path),
         OpenRequest::Path(path) => open_image(&path, ctx),
+        OpenRequest::Disc(src) => {
+            ctx.set_phase("Reading disc...");
+            open_disc(&src).map_err(|e| anyhow!(e))
+        }
     }
 }
 
@@ -1077,14 +1138,13 @@ fn open_image(path: &Path, ctx: &JobCtx) -> anyhow::Result<Opened> {
     let name = path.file_name().and_then(|n| n.to_str());
     if name.and_then(classify) == Some(DescendKind::Optical) {
         ctx.set_phase("Reading disc...");
-        let choices = optical_filesystems(path);
-        if !choices.is_empty() {
-            let loaded = load_optical(path, &choices[0])?;
-            return Ok(Opened::Optical {
-                choices,
-                idx: 0,
-                loaded,
-            });
+        let src = DiscSource {
+            path: path.to_path_buf(),
+            physical: false,
+        };
+        // Not a disc after all (the probe failed): try it as a partitioned image.
+        if let Ok(opened) = open_disc(&src) {
+            return Ok(opened);
         }
     }
     ctx.set_phase("Reading partition table...");
@@ -1115,18 +1175,73 @@ fn load(mut fs: Box<dyn Filesystem>, what: &str) -> anyhow::Result<Loaded> {
     })
 }
 
-fn load_optical(path: &Path, choice: &OpticalFsChoice) -> anyhow::Result<Loaded> {
-    let label = file_label(path);
-    let fs = match choice.hybrid_index {
-        None => open_optical(path, label),
-        Some(h) => open_optical_hybrid(path, h, label),
-    }
-    .with_context(|| format!("cannot open {}", choice.label))?;
+/// A disc's filesystem as the pane lists it: no usable free-space figure.
+fn load_disc(fs: Box<dyn Filesystem>) -> anyhow::Result<Loaded> {
     let mut loaded = load(fs, "disc")?;
-    // Optical discs report no usable free-space figure.
     loaded.volume.total_size = 0;
     loaded.volume.used_size = 0;
     Ok(loaded)
+}
+
+#[cfg(feature = "optical")]
+fn open_disc(src: &DiscSource) -> Result<Opened, String> {
+    let o = crate::model::optical_browse::open_source(src)?;
+    let loaded =
+        o.fs.and_then(|fs| load_disc(fs).map_err(|e| format!("{e:#}")));
+    Ok(Opened::Disc {
+        disc: o.disc,
+        labels: o.labels,
+        game: o.game,
+        loaded,
+    })
+}
+
+#[cfg(not(feature = "optical"))]
+fn open_disc(_src: &DiscSource) -> Result<Opened, String> {
+    Err("this build was compiled without optical-disc support".to_string())
+}
+
+#[cfg(feature = "optical")]
+fn load_disc_choice(disc: &Disc) -> anyhow::Result<Loaded> {
+    let fs = disc
+        .filesystem()
+        .map_err(|e| anyhow!("Cannot open filesystem: {e}"))?;
+    load_disc(fs)
+}
+
+#[cfg(not(feature = "optical"))]
+fn load_disc_choice(disc: &Disc) -> anyhow::Result<Loaded> {
+    match *disc {}
+}
+
+#[cfg(feature = "optical")]
+fn disc_with_choice(disc: &Disc, idx: usize) -> Disc {
+    disc.with_choice(idx)
+}
+
+#[cfg(not(feature = "optical"))]
+fn disc_with_choice(disc: &Disc, _idx: usize) -> Disc {
+    match *disc {}
+}
+
+#[cfg(feature = "optical")]
+fn disc_is_physical(disc: &Disc) -> bool {
+    disc.src.physical
+}
+
+#[cfg(not(feature = "optical"))]
+fn disc_is_physical(disc: &Disc) -> bool {
+    match *disc {}
+}
+
+#[cfg(feature = "optical")]
+fn disc_stage_source(disc: &Disc) -> StageSource {
+    StageSource::Reopen(ReopenRecipe::Disc(Box::new(disc.clone())))
+}
+
+#[cfg(not(feature = "optical"))]
+fn disc_stage_source(disc: &Disc) -> StageSource {
+    match *disc {}
 }
 
 /// A backup partition's session; a Clonezilla one reuses or loads a scanned cache, or scans now.

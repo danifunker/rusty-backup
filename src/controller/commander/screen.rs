@@ -39,10 +39,10 @@ pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
 pub use crate::model::extract::ExtractOptions;
+pub use budget::{BudgetAction, BudgetForm, BudgetMode};
 pub use detail::DetailField;
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
-pub use budget::{BudgetAction, BudgetForm, BudgetMode};
 pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
 
 mod budget;
@@ -784,6 +784,12 @@ impl CommanderController {
         label: &str,
     ) -> Vec<Effect> {
         let fx = self.left.open_fixed_session(session, label);
+        self.absorb(Side::Left, fx)
+    }
+
+    /// The host opens the single pane on a disc image or a drive (the Optical tab's browser).
+    pub fn open_disc(&mut self, src: crate::controller::browser::DiscSource) -> Vec<Effect> {
+        let fx = self.left.open_fixed_disc(src);
         self.absorb(Side::Left, fx)
     }
 

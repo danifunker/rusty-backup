@@ -7,6 +7,8 @@ use disk_core::entry::FileEntry;
 use super::{purpose, CommanderController, Side};
 use crate::controller::{Effect, PickSpec};
 use crate::fs::replace::OnConflict;
+#[cfg(feature = "optical")]
+use crate::model::commander_ops::DiscExtractJob;
 use crate::model::commander_ops::HostCopyJob;
 use crate::model::extract::{extraction_conflicts, ExtractJob, ExtractOptions};
 use crate::model::job::Resource;
@@ -80,6 +82,18 @@ impl CommanderController {
             .collect();
         let mut resources = self.reads(from);
         resources.push(Resource::Folder(dest.clone()));
+        // A disc keeps the Optical tab's walker, so an extraction writes the bytes it always did.
+        #[cfg(feature = "optical")]
+        if let Some(disc) = source.disc() {
+            let job = HostCopyJob::DiscExtract(Box::new(DiscExtractJob {
+                disc: disc.clone(),
+                entry,
+                dest,
+                fork_mode: options.fork_mode,
+                on_conflict: OnConflict::Fail,
+            }));
+            return self.start_host_copy(job, None, conflicts, resources, "extract folder".into());
+        }
         let job = HostCopyJob::Extract(Box::new(ExtractJob {
             source,
             entry,

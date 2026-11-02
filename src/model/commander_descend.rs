@@ -288,6 +288,13 @@ pub struct OpticalFsChoice {
     pub hybrid_index: Option<usize>,
 }
 
+/// A disc image file, or the disc in a drive (`physical`, read through the device-backed reader).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscSource {
+    pub path: PathBuf,
+    pub physical: bool,
+}
+
 /// Turn an opticaldiscs `FilesystemType` debug token + optional volume label
 /// into a friendly picker label. Only the optical build enumerates filesystems.
 #[cfg(feature = "optical")]
@@ -317,30 +324,35 @@ pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
     let Ok(info) = DiscImageInfo::open(path) else {
         return Vec::new();
     };
-    let mut choices = vec![OpticalFsChoice {
-        label: optical_fs_label(
-            &format!("{:?}", info.filesystem),
-            info.volume_label.as_deref(),
-        ),
-        hybrid_index: None,
-    }];
-    for (i, h) in info.hybrid_filesystems.iter().enumerate() {
-        choices.push(OpticalFsChoice {
-            label: optical_fs_label(&format!("{:?}", h.filesystem), h.volume_label.as_deref()),
-            hybrid_index: Some(i),
-        });
-    }
-    let hybrids = info.hybrid_filesystems.len();
-    for (j, area) in crate::optical::boot_area::detect(path)
+    let areas = crate::optical::boot_area::detect(path);
+    let labels = optical_choice_labels(&info, areas.as_slice());
+    let hybrid = |i: usize| if i == 0 { None } else { Some(i - 1) };
+    labels
         .into_iter()
         .enumerate()
-    {
-        choices.push(OpticalFsChoice {
-            label: area.label,
-            hybrid_index: Some(hybrids + j),
-        });
+        .map(|(i, label)| OpticalFsChoice {
+            label,
+            hybrid_index: hybrid(i),
+        })
+        .collect()
+}
+
+/// The picker labels of a disc: its primary filesystem, the hybrid sides, then the boot areas.
+#[cfg(feature = "optical")]
+pub fn optical_choice_labels(
+    info: &opticaldiscs::detect::DiscImageInfo,
+    areas: &[crate::optical::boot_area::BootArea],
+) -> Vec<String> {
+    let mut labels = vec![optical_fs_label(
+        &format!("{:?}", info.filesystem),
+        info.volume_label.as_deref(),
+    )];
+    for h in &info.hybrid_filesystems {
+        let ty = format!("{:?}", h.filesystem);
+        labels.push(optical_fs_label(&ty, h.volume_label.as_deref()));
     }
-    choices
+    labels.extend(areas.iter().map(|a| a.label.clone()));
+    labels
 }
 
 /// Stub for builds without the `optical` feature.
@@ -500,6 +512,9 @@ pub enum ReopenRecipe {
         path: PathBuf,
         label: Option<String>,
     },
+    /// Reopen the chosen filesystem of a browser pane's disc source (an image file or a drive).
+    #[cfg(feature = "optical")]
+    Disc(Box<crate::model::optical_browse::DiscChoice>),
 }
 
 impl ReopenRecipe {
@@ -526,6 +541,8 @@ impl ReopenRecipe {
             ReopenRecipe::OpticalHybrid { path, index, label } => {
                 open_optical_hybrid(path, *index, label.clone())
             }
+            #[cfg(feature = "optical")]
+            ReopenRecipe::Disc(disc) => disc.filesystem().map_err(|e| anyhow::anyhow!(e)),
             ReopenRecipe::OpticalMulti { path, label } => {
                 #[cfg(feature = "optical")]
                 {

@@ -474,6 +474,15 @@ impl StageSource {
             StageSource::Reopen(recipe) => recipe.open(),
         }
     }
+
+    /// The disc a browser pane's disc source reopens, for the tools that keep the disc walker.
+    #[cfg(feature = "optical")]
+    pub fn disc(&self) -> Option<&crate::model::optical_browse::DiscChoice> {
+        match self {
+            StageSource::Reopen(crate::model::commander_descend::ReopenRecipe::Disc(d)) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 /// How a wrapper-open worker gets the wrapper file's bytes to mount. Materializing
@@ -922,6 +931,46 @@ pub enum HostCopyJob {
     ExportSelection(Box<ExportJob>),
     /// Extract one entry (a folder with its contents) to a host folder.
     Extract(Box<crate::model::extract::ExtractJob>),
+    /// Extract one entry of a disc source with the Optical tab's walker (its bytes, its fork modes).
+    #[cfg(feature = "optical")]
+    DiscExtract(Box<DiscExtractJob>),
+}
+
+/// Payload for [`HostCopyJob::DiscExtract`].
+#[cfg(feature = "optical")]
+pub struct DiscExtractJob {
+    pub disc: crate::model::optical_browse::DiscChoice,
+    pub entry: FileEntry,
+    pub dest: PathBuf,
+    pub fork_mode: ResourceForkMode,
+    /// What to do when the entry's own output already exists.
+    pub on_conflict: crate::fs::replace::OnConflict,
+}
+
+#[cfg(feature = "optical")]
+fn run_disc_extract(job: DiscExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+    use crate::fs::replace::OnConflict;
+    use crate::model::extract::{extraction_conflicts, ExtractOptions};
+    let options = ExtractOptions {
+        fork_mode: job.fork_mode,
+        prodos_suffix: false,
+        rs_to_lf: false,
+    };
+    let forks = job.disc.has_forks();
+    let taken = extraction_conflicts(&job.entry, &job.dest, &options, forks);
+    if !taken.is_empty() && job.on_conflict == OnConflict::Skip {
+        if let Ok(mut g) = status.lock() {
+            g.skipped
+                .push(format!("{} (already exists)", job.entry.name));
+        }
+        return Ok(0);
+    }
+    let path = job.entry.path.as_str();
+    let n = job
+        .disc
+        .extract_path(path, job.dest.as_path(), job.fork_mode, status)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(n as usize)
 }
 
 /// Payload for [`HostCopyJob::ExportSelection`].
@@ -977,6 +1026,8 @@ impl HostCopyJob {
             HostCopyJob::ImageToHost { on_conflict, .. }
             | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
             HostCopyJob::Extract(job) => job.on_conflict = on,
+            #[cfg(feature = "optical")]
+            HostCopyJob::DiscExtract(job) => job.on_conflict = on,
             _ => {}
         }
         self
@@ -1151,6 +1202,8 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
         HostCopyJob::Extract(job) => crate::model::extract::run(*job, status),
+        #[cfg(feature = "optical")]
+        HostCopyJob::DiscExtract(job) => run_disc_extract(*job, status),
     }
 }
 

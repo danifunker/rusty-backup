@@ -216,6 +216,34 @@ impl PaneProfile {
         }
     }
 
+    /// The Optical tab's disc browser: the disc the tab chose, read-only, one tree with its details beside.
+    pub const fn optical() -> Self {
+        PaneProfile {
+            name: "optical",
+            sources: Sources::NONE,
+            fixed_source: true,
+            staging: false,
+            read_only: true,
+            rename: false,
+            new_folder: false,
+            delete: false,
+            confirm_folder_delete: false,
+            wrappers: false,
+            listing: ListingStyle::CombinedTree,
+            styles: &ListingStyle::ALL,
+            detail: DetailPlacement::SidePanel,
+            tools: Tools {
+                fsck: false,
+                repair: false,
+                bless: false,
+                text_edit: false,
+                import: false,
+                metadata: false,
+                transforms: false,
+            },
+        }
+    }
+
     /// The same profile with nothing writable, for a view-only browser.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
@@ -279,6 +307,17 @@ mod tests {
         for s in ListingStyle::ALL {
             assert_eq!(ListingStyle::from_key(s.key()), Some(s));
         }
+    }
+
+    #[test]
+    fn the_optical_profile_reads_a_disc_like_the_old_disc_browser() {
+        let p = PaneProfile::optical();
+        assert!(p.read_only && p.fixed_source && !p.staging && !p.wrappers);
+        assert!(!p.can_rename() && !p.can_new_folder() && !p.can_delete());
+        assert_eq!(p.tools, Tools::default());
+        assert_eq!(p.sources, Sources::NONE);
+        assert_eq!(p.listing, ListingStyle::CombinedTree);
+        assert_eq!(p.detail, DetailPlacement::SidePanel);
     }
 
     #[test]
