@@ -45,6 +45,10 @@ pub mod purpose {
     pub const RENAME: &str = "commander.rename";
     pub const NEW_FOLDER: &str = "commander.new_folder";
     pub const CONNECT: &str = "commander.connect";
+    pub const REPAIR: &str = "browser.repair";
+    pub const BLESS: &str = "browser.bless";
+    pub const IMPORT: &str = "browser.import";
+    pub const DELETE_NOW: &str = "browser.delete";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

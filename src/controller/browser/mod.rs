@@ -12,9 +12,14 @@ pub mod profile;
 pub mod rows;
 
 pub use pane::{
-    purpose, validate_entry_name, ApplyPreflight, ApplyReport, BrowserPaneAction,
-    BrowserPaneController, FailedEdit, NoRecent, OnConflict, PaneServices, RecentStore, SortColumn,
-    SourceKind, StageOutcome, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
+    format_mac_date, parse_mac_date, purpose, validate_entry_name, ApplyPreflight, ApplyReport,
+    BrowserPaneAction, BrowserPaneController, FailedEdit, LineEnding, MetadataFields, MetadataForm,
+    NoRecent, OnConflict, PaneServices, RecentStore, SortColumn, SourceKind, StageOutcome, TextDoc,
+    TextEncoding, TextShape, ToolReport, TreeNode, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
+    MAX_TEXT_EDIT,
 };
 pub use profile::{PaneProfile, Sources};
 pub use rows::{DisplayRow, RowKind};
+
+#[cfg(test)]
+pub(crate) mod explorer_tests;

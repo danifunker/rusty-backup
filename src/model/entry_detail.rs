@@ -20,6 +20,8 @@ pub enum DetailSource {
 pub struct DetailExtras {
     /// Up to the asked-for number of bytes of a file; `None` for a folder or a failed read.
     pub preview: Option<Vec<u8>>,
+    /// Up to the same number of bytes of the resource fork, for a file that has one.
+    pub rsrc_preview: Option<Vec<u8>>,
     pub xattrs: Vec<Xattr>,
     /// uid/gid -> name from the image's own account files, if any.
     pub id_names: IdNameMap,
@@ -57,6 +59,15 @@ pub fn read_detail(
     } else {
         None
     };
+    let rsrc_preview = if entry.is_file() && entry.resource_fork_size.unwrap_or(0) > 0 {
+        let mut buf = Vec::new();
+        fs.write_resource_fork_to(entry, &mut buf).ok().map(|_| {
+            buf.truncate(max);
+            buf
+        })
+    } else {
+        None
+    };
     let xattrs = if fs.supports_xattrs() {
         fs.list_xattrs(entry).unwrap_or_default()
     } else {
@@ -71,6 +82,7 @@ pub fn read_detail(
     let id_names = IdNameMap::from_filesystem(&mut *fs);
     Ok(DetailExtras {
         preview,
+        rsrc_preview,
         xattrs,
         id_names,
         size_plan,

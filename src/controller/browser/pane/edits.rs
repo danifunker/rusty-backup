@@ -25,7 +25,7 @@ use crate::model::commander_descend::classify_entry;
 use crate::model::commander_ops::{
     self, ApplyOutcome, ApplyPreflight, FailedEdit, StageSource, WrapperExtract, WrapperOpenPlan,
 };
-use crate::model::edit_queue::StagedEdit;
+use crate::model::edit_queue::{EditQueue, StagedEdit};
 use crate::model::entry_detail::DetailSource;
 use crate::model::host_ops::{self, DeleteOutcome};
 use crate::model::job::{Job, JobCtx, Resource, Snapshot, Status};
@@ -129,6 +129,8 @@ pub(super) struct EditState {
     show_edits: bool,
     prompt: Option<Prompt>,
     host_delete: Option<Vec<PathBuf>>,
+    /// Names a pane without staging deletes once the user agrees.
+    image_delete: Option<Vec<String>>,
     apply: ApplyPhase,
     report: Option<ApplyReport>,
     host_job: Option<HostJob>,
@@ -142,6 +144,7 @@ impl EditState {
             show_edits: false,
             prompt: None,
             host_delete: None,
+            image_delete: None,
             apply: ApplyPhase::Idle,
             report: None,
             host_job: None,
@@ -161,6 +164,7 @@ impl EditState {
     pub(super) fn drop_in_flight(&mut self) {
         self.prompt = None;
         self.host_delete = None;
+        self.image_delete = None;
         self.apply = ApplyPhase::Idle;
         self.cancel_wrapper();
     }
@@ -263,6 +267,12 @@ impl BrowserPaneController {
         self.is_opening()
             || !matches!(self.ed.apply, ApplyPhase::Idle | ApplyPhase::Review(_))
             || self.ed.host_job.is_some()
+            || self.tool_busy()
+    }
+
+    /// Add a line to the session log.
+    pub(super) fn ed_log(&mut self, line: String) {
+        self.ed.log.push(line);
     }
 
     /// True for a pane whose edits are staged (an image volume, not a host folder or read-only source).
@@ -533,6 +543,15 @@ impl BrowserPaneController {
                     _ => Vec::new(),
                 }
             }
+            A::Confirmed { purpose, yes } if purpose == purpose::DELETE_NOW => {
+                match self.ed.image_delete.take() {
+                    Some(names) if yes && !self.is_busy() => {
+                        self.toggle_delete(&names);
+                        msg(format!("deleting {} item(s)...", names.len()))
+                    }
+                    _ => Vec::new(),
+                }
+            }
             A::Confirmed { purpose, yes } if purpose == purpose::DISCARD_STAGED => {
                 if !yes || self.is_busy() {
                     return Ok(Vec::new());
@@ -545,7 +564,7 @@ impl BrowserPaneController {
         Ok(fx)
     }
 
-    fn entry_named(&self, name: &str) -> Option<FileEntry> {
+    pub(super) fn entry_named(&self, name: &str) -> Option<FileEntry> {
         let entries = self.listing.entries();
         entries.iter().find(|e| e.name == name).cloned()
     }
@@ -569,6 +588,21 @@ impl BrowserPaneController {
         let names: Vec<String> = self.listing.selection().to_vec();
         if names.is_empty() {
             return msg("nothing selected to delete.");
+        }
+        if !self.listing.is_host() && !self.profile.staging {
+            let n = names.len();
+            let what = match names.as_slice() {
+                [one] => format!("'{one}'"),
+                _ => format!("{n} items"),
+            };
+            self.ed.image_delete = Some(names);
+            return vec![Effect::Confirm(ConfirmSpec {
+                purpose: purpose::DELETE_NOW,
+                title: "Delete?".into(),
+                message: format!("Delete {what} from the volume? Folders go with their contents."),
+                confirm_label: "Delete".into(),
+                destructive: true,
+            })];
         }
         if !self.listing.is_host() {
             self.toggle_delete(&names);
@@ -904,7 +938,7 @@ impl BrowserPaneController {
     }
 
     /// The source the apply jobs hold while they run.
-    fn apply_resources(&self) -> Vec<Resource> {
+    pub(super) fn apply_resources(&self) -> Vec<Resource> {
         #[cfg(feature = "remote")]
         if let Some(image) = self.remote_image() {
             return vec![image.resource()];
@@ -1013,8 +1047,32 @@ impl BrowserPaneController {
         }
     }
 
+    /// A copy that already says Replace or Skip (a saved text) is no question for the review.
+    fn drop_decided_conflicts(&self, p: &mut ApplyPreflight) {
+        let decided: Vec<String> = self
+            .queue
+            .iter()
+            .filter_map(|e| match e {
+                StagedEdit::AddFile {
+                    parent,
+                    name,
+                    on_conflict,
+                    ..
+                } if *on_conflict != OnConflict::Fail => {
+                    Some(EditQueue::pending_path(&parent.path, name))
+                }
+                _ => None,
+            })
+            .collect();
+        p.scan.conflicts.retain(|(full, _)| !decided.contains(full));
+    }
+
     fn checked(&mut self, job: Job<ApplyPreflight>) -> Vec<Effect> {
-        match (job.snapshot().status, job.take_result()) {
+        let result = job.take_result().map(|mut p| {
+            self.drop_decided_conflicts(&mut p);
+            p
+        });
+        match (job.snapshot().status, result) {
             (Status::Done, Some(p)) if p.is_clean() => self.start_write(),
             (Status::Done, Some(p)) => {
                 self.ed.apply = ApplyPhase::Review(p);

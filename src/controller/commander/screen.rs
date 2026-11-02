@@ -23,6 +23,7 @@ use super::{NoRecent, OnConflict, RecentStore};
 use crate::controller::browser::pane::{
     BrowserPaneAction, BrowserPaneController, PaneServices, StageOutcome,
 };
+use crate::controller::browser::PaneProfile;
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect};
 use crate::model::checksum::FileChecksum;
@@ -192,6 +193,41 @@ pub enum CommanderAction {
     },
 }
 
+/// One entry of a view's "Export as" menu: a format, and the fork container for loose files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportChoice {
+    pub label: String,
+    pub format: ExportFormat,
+    pub fork: Option<ResourceForkMode>,
+}
+
+/// The "Export as" menu for a view without an always-visible format chooser.
+pub fn export_choices() -> Vec<ExportChoice> {
+    use ResourceForkMode as M;
+    let forks = [
+        M::AppleDouble,
+        M::DataForkOnly,
+        M::MacBinary,
+        M::BinHex,
+        M::SeparateRsrc,
+    ];
+    let loose = forks.iter().map(|m| ExportChoice {
+        label: format!("Files, {}", m.label()),
+        format: ExportFormat::LooseFiles,
+        fork: Some(*m),
+    });
+    let rest = ExportFormat::ALL
+        .iter()
+        .filter(|f| **f != ExportFormat::LooseFiles);
+    loose
+        .chain(rest.map(|f| ExportChoice {
+            label: f.label().to_string(),
+            format: *f,
+            fork: None,
+        }))
+        .collect()
+}
+
 /// Names a staged copy changed (or left out) for the destination filesystem.
 #[derive(Debug, Clone)]
 pub struct RenameNotice {
@@ -211,6 +247,8 @@ pub struct FileDetail {
     pub loading: bool,
     /// Up to [`MAX_PREVIEW_SIZE`] bytes of a file; `None` for a folder or a failed read.
     pub preview: Option<Vec<u8>>,
+    /// The same of its resource fork, when it has one.
+    pub rsrc_preview: Option<Vec<u8>>,
     pub xattrs: Vec<Xattr>,
     /// uid/gid -> name from the image's account files, for the Owner row.
     pub id_names: IdNameMap,
@@ -342,6 +380,8 @@ pub struct CommanderController {
     implicit: Option<Side>,
     /// Which pane asked each outstanding picker, confirmation or prompt.
     askers: Vec<(&'static str, Side)>,
+    /// One pane (the TUI Explorer): only the left pane is used and there is nothing to copy to.
+    single: bool,
 }
 
 impl Controller for CommanderController {
@@ -382,8 +422,13 @@ impl CommanderController {
         match action {
             A::Pane(side, a) => self.forward(side, a),
             A::Focus(side) => {
-                self.active = side;
+                if !self.single {
+                    self.active = side;
+                }
                 Vec::new()
+            }
+            A::SwitchPane if self.single => {
+                self.forward(Side::Left, BrowserPaneAction::SwitchFocus)
             }
             A::SwitchPane => {
                 self.active = self.active.other();
@@ -601,7 +646,54 @@ impl CommanderController {
             partitions: None,
             implicit: None,
             askers: Vec::new(),
+            single: false,
         }
+    }
+
+    /// One pane configured by `profile` (the TUI Explorer), its jobs in `services.jobs`.
+    pub fn single(services: PaneServices, keymap: KeyMap, profile: PaneProfile) -> Self {
+        let spare = PaneServices {
+            jobs: services.jobs.clone(),
+            notify: Arc::clone(&services.notify),
+            recent: Box::new(NoRecent),
+        };
+        let mut ctl = Self::new(services, spare, keymap);
+        ctl.left = BrowserPaneController::with_profile(
+            PaneServices {
+                jobs: ctl.jobs.clone(),
+                notify: Arc::clone(&ctl.notify),
+                recent: Box::new(NoRecent),
+            },
+            profile,
+        );
+        ctl.right = BrowserPaneController::with_profile(
+            PaneServices::headless(),
+            PaneProfile::commander().read_only(),
+        );
+        ctl.single = true;
+        ctl.status = String::new();
+        ctl
+    }
+
+    /// True for a one-pane screen; only [`Side::Left`] is drawn.
+    pub fn is_single(&self) -> bool {
+        self.single
+    }
+
+    /// The host opens the single pane's source: an image and this partition of it.
+    pub fn open_fixed(&mut self, path: PathBuf, partition: Option<usize>) -> Vec<Effect> {
+        let fx = self.left.open_fixed(path, partition);
+        self.absorb(Side::Left, fx)
+    }
+
+    /// The single pane's file read for the text editor, handed over once.
+    pub fn take_text_doc(&mut self) -> Option<crate::controller::browser::TextDoc> {
+        self.left.take_text_doc()
+    }
+
+    /// The command a key press means here, for a view that shows its own chooser first (Export).
+    pub fn command_for(&self, key: Key, mods: Mods) -> Option<Command> {
+        self.keymap.lookup(key, mods)
     }
 
     /// One shared job registry, no wake, no recent files and the default keys: for tests and the CLI.
@@ -732,8 +824,10 @@ impl CommanderController {
 
     /// Every command with its first chord on this platform, for the help window.
     pub fn key_help(&self) -> Vec<(&'static str, String)> {
-        let rows = Command::ALL.iter();
-        rows.map(|c| (c.label(), self.keymap.hint(*c))).collect()
+        let rows = Command::ALL
+            .iter()
+            .map(|c| (c.label(), self.keymap.hint(*c)));
+        rows.filter(|(_, k)| !k.is_empty()).collect()
     }
 
     /// The help window's footer, naming the keys that close it.
@@ -921,6 +1015,13 @@ impl CommanderController {
             Command::Connect => Some(P::Connect),
             Command::Sort => Some(P::SortBy(next_sort(pane))),
             Command::Edits if !pane.queue.is_empty() => Some(P::ShowEdits(!pane.edits_shown())),
+            Command::SwitchPane if self.single => Some(P::SwitchFocus),
+            Command::Edit if pane.profile().tools.text_edit => Some(P::EditText),
+            Command::Fsck => Some(P::Fsck),
+            Command::Repair => Some(P::Repair),
+            Command::Bless => Some(P::Bless),
+            Command::Import => Some(P::Import),
+            Command::Metadata => Some(P::EditMetadata),
             Command::Apply
             | Command::Delete
             | Command::Edits
@@ -932,7 +1033,8 @@ impl CommanderController {
             | Command::Partition
             | Command::Checksums
             | Command::Export
-            | Command::Log => None,
+            | Command::Log
+            | Command::Transforms => None,
         };
         if let Some(action) = pane_action {
             let sort = matches!(action, P::SortBy(_));
@@ -956,8 +1058,8 @@ impl CommanderController {
             Command::Export => return self.request_export(side, None),
             Command::Log => self.show_log = !self.show_log,
             Command::Edits => self.status = format!("[{}] No staged edits.", side.label()),
-            // No edit operation exists yet; Apply and Delete land here only when refused.
-            Command::Edit | Command::Apply | Command::Delete => {}
+            // Apply and Delete land here only when refused; the view shows the transforms menu.
+            Command::Apply | Command::Delete | Command::Transforms | Command::Edit => {}
             Command::CursorUp
             | Command::CursorDown
             | Command::PageUp
@@ -975,7 +1077,12 @@ impl CommanderController {
             | Command::OpenFolder
             | Command::OpenBackup
             | Command::Connect
-            | Command::Sort => {}
+            | Command::Sort
+            | Command::Fsck
+            | Command::Repair
+            | Command::Bless
+            | Command::Import
+            | Command::Metadata => {}
         }
         Vec::new()
     }
@@ -1014,6 +1121,15 @@ impl CommanderController {
 
     fn request_close(&mut self, quit: bool) -> Vec<Effect> {
         let n = self.left.queue.len() + self.right.queue.len();
+        if n == 0 && self.single && !quit {
+            return vec![Effect::Confirm(ConfirmSpec {
+                purpose: purpose::CLOSE_UNSAVED,
+                title: "Close".into(),
+                message: format!("Close {}?", self.left.volume().name()),
+                confirm_label: "Close".into(),
+                destructive: false,
+            })];
+        }
         if n == 0 {
             return vec![close_effect(quit)];
         }
@@ -1069,6 +1185,7 @@ impl CommanderController {
             fs_type,
             loading: job.is_some(),
             preview: None,
+            rsrc_preview: None,
             xattrs: Vec::new(),
             id_names: IdNameMap::default(),
             size_plan: None,
@@ -1098,6 +1215,7 @@ impl CommanderController {
         d.loading = false;
         if let Some(x) = extras {
             d.preview = x.preview;
+            d.rsrc_preview = x.rsrc_preview;
             d.xattrs = x.xattrs;
             d.id_names = x.id_names;
             d.size_plan = x.size_plan;
@@ -1120,7 +1238,7 @@ impl CommanderController {
         } else if pane.is_busy() {
             "Wait for the running apply to finish.".to_string()
         } else {
-            pane.queue.stage_metadata(edit)
+            pane.stage_metadata(edit)
         };
         if let Some(d) = self.detail.as_mut() {
             d.result = Some(result);

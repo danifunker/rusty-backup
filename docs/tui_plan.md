@@ -44,8 +44,10 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
 - [x] **Inspect** — disk list → device detail; `o` opens a file/backup (path +
   MRU move-to-front via `update::{load_recent,push_recent}` + Tab-to-browse);
   backup-aware (`model::backup_loader::load_backup`). Opened image shows its
-  **partition table**; each partition opens a two-pane **Explorer** (tree + list)
-  over the shared `resolve` + `open_filesystem` + `list_directory`:
+  **partition table**; each partition opens a two-pane **Explorer** (tree + list).
+  Since Phase 2 slice 10 the Explorer is a view over the shared browser pane
+  (`PaneProfile::explorer`, keys from `controller::keys`, see
+  `docs/phase2_commander_plan.md` § Slice 10); the original notes follow:
   browse/PageUp-Down/Home-End, **View** (data + resource fork, `r` toggles, hex
   for binary), **Export** (`e`: 5 fork modes + `.tar`/`.tar.gz` + `.mar`),
   **Import** (`i`), **metadata edit** (`m`: HFS/HFS+ Type/Creator + modified

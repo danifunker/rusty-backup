@@ -105,10 +105,18 @@ pub enum Command {
     Export,
     Edits,
     Log,
+    /// Check the open filesystem (the Explorer's volume tools from here down).
+    Fsck,
+    Repair,
+    Bless,
+    Import,
+    Metadata,
+    Transforms,
 }
 
 impl Command {
-    pub const ALL: [Command; 30] = [
+    /// The commands the two-pane file manager binds.
+    pub const FILE_MANAGER: [Command; 30] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -139,6 +147,79 @@ impl Command {
         Command::Export,
         Command::Edits,
         Command::Log,
+    ];
+
+    pub const ALL: [Command; 36] = [
+        Command::Help,
+        Command::Rename,
+        Command::Info,
+        Command::Refresh,
+        Command::Copy,
+        Command::Edit,
+        Command::Delete,
+        Command::NewFolder,
+        Command::Apply,
+        Command::SwitchPane,
+        Command::Open,
+        Command::Parent,
+        Command::Mark,
+        Command::Close,
+        Command::CursorUp,
+        Command::CursorDown,
+        Command::PageUp,
+        Command::PageDown,
+        Command::Home,
+        Command::End,
+        Command::OpenImage,
+        Command::OpenFolder,
+        Command::OpenBackup,
+        Command::Connect,
+        Command::Partition,
+        Command::Sort,
+        Command::Checksums,
+        Command::Export,
+        Command::Edits,
+        Command::Log,
+        Command::Fsck,
+        Command::Repair,
+        Command::Bless,
+        Command::Import,
+        Command::Metadata,
+        Command::Transforms,
+    ];
+
+    /// The commands the one-pane Explorer binds.
+    pub const EXPLORER: [Command; 30] = [
+        Command::Help,
+        Command::Rename,
+        Command::Info,
+        Command::Refresh,
+        Command::Edit,
+        Command::Delete,
+        Command::NewFolder,
+        Command::Apply,
+        Command::SwitchPane,
+        Command::Open,
+        Command::Parent,
+        Command::Mark,
+        Command::Close,
+        Command::CursorUp,
+        Command::CursorDown,
+        Command::PageUp,
+        Command::PageDown,
+        Command::Home,
+        Command::End,
+        Command::Sort,
+        Command::Checksums,
+        Command::Export,
+        Command::Edits,
+        Command::Log,
+        Command::Fsck,
+        Command::Repair,
+        Command::Bless,
+        Command::Import,
+        Command::Metadata,
+        Command::Transforms,
     ];
 
     /// The name used in `keybindings.toml`.
@@ -174,6 +255,12 @@ impl Command {
             Command::Export => "export",
             Command::Edits => "edits",
             Command::Log => "log",
+            Command::Fsck => "fsck",
+            Command::Repair => "repair",
+            Command::Bless => "bless",
+            Command::Import => "import",
+            Command::Metadata => "metadata",
+            Command::Transforms => "transforms",
         }
     }
 
@@ -214,6 +301,12 @@ impl Command {
             Command::Export => "Export",
             Command::Edits => "Staged edits",
             Command::Log => "Session log",
+            Command::Fsck => "Check filesystem",
+            Command::Repair => "Repair filesystem",
+            Command::Bless => "Bless System Folder",
+            Command::Import => "Import host file",
+            Command::Metadata => "Edit metadata",
+            Command::Transforms => "Transform image",
         }
     }
 }
@@ -252,6 +345,19 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::Log, &["Primary+L"]),
 ];
 
+/// The Explorer's chords beyond the file-manager ones it keeps (no sources, no second pane).
+const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
+    (Command::Fsck, &["Primary+F"]),
+    (Command::Repair, &["Primary+R"]),
+    (Command::Bless, &["Primary+B"]),
+    (Command::Import, &["Primary+O"]),
+    (Command::Metadata, &["Primary+A"]),
+    (Command::Transforms, &["Primary+T"]),
+    // The tree pane's collapse and expand.
+    (Command::Parent, &["Left"]),
+    (Command::Open, &["Right"]),
+];
+
 /// The command each chord means, for one platform.
 #[derive(Debug, Clone)]
 pub struct KeyMap {
@@ -270,6 +376,32 @@ impl KeyMap {
             }
         }
         Self { mac, bindings }
+    }
+
+    /// The Explorer's bindings: the file-manager ones for its commands, plus its volume tools.
+    pub fn explorer_defaults(mac: bool) -> Self {
+        let mut map = Self::defaults(mac);
+        map.bindings.retain(|(_, c)| Command::EXPLORER.contains(c));
+        // A terminal reads Ctrl+I as Tab and Ctrl+M as Enter, so those chords never arrive.
+        let aliased = |c: &Chord| c.primary && matches!(c.key, Key::Char('i' | 'm' | 'h' | 'j'));
+        map.bindings.retain(|(chord, _)| !aliased(chord));
+        for (cmd, chords) in EXPLORER_EXTRA {
+            for text in *chords {
+                let chord = Chord::parse(text).expect("built-in chord parses");
+                map.bindings.push((chord, *cmd));
+            }
+        }
+        map
+    }
+
+    /// [`Self::explorer_defaults`] with the PC chords, for a terminal.
+    pub fn explorer_terminal() -> Self {
+        Self::explorer_defaults(false)
+    }
+
+    /// [`Self::explorer_terminal`] with `path`'s overrides applied, plus any problems found.
+    pub fn load_explorer_terminal(path: Option<&Path>) -> (Self, Vec<String>) {
+        Self::load_onto(Self::explorer_terminal(), path)
     }
 
     /// The defaults for the platform this was built for.
@@ -556,14 +688,49 @@ mod tests {
     fn every_default_parses_and_every_command_has_a_key() {
         for mac in [false, true] {
             let map = KeyMap::defaults(mac);
-            for cmd in Command::ALL {
+            for cmd in Command::FILE_MANAGER {
                 assert!(
                     !map.chords_for(cmd).is_empty(),
                     "{} unbound (mac {mac})",
                     cmd.name()
                 );
             }
+            let ex = KeyMap::explorer_defaults(mac);
+            for cmd in Command::ALL {
+                let bound = !ex.chords_for(cmd).is_empty();
+                assert_eq!(bound, Command::EXPLORER.contains(&cmd), "{}", cmd.name());
+            }
         }
+    }
+
+    #[test]
+    fn the_explorer_keys_have_no_terminal_aliases() {
+        // Ctrl+I is Tab, Ctrl+M is Enter and Ctrl+H is Backspace in a terminal.
+        let ex = KeyMap::explorer_terminal();
+        for c in ['i', 'm', 'h', 'j'] {
+            let mods = Mods {
+                ctrl: true,
+                ..Mods::default()
+            };
+            assert_eq!(ex.lookup(Key::Char(c), mods), None, "Ctrl+{c}");
+        }
+        let ctrl = |c| {
+            (
+                Key::Char(c),
+                Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                },
+            )
+        };
+        let (k, m) = ctrl('f');
+        assert_eq!(ex.lookup(k, m), Some(Command::Fsck));
+        assert_eq!(ex.lookup(Key::Right, Mods::default()), Some(Command::Open));
+        assert_eq!(
+            ex.lookup(Key::F(6), Mods::default()),
+            None,
+            "no second pane"
+        );
     }
 
     #[test]

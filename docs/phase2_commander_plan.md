@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | in progress (see below) |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, TUI Explorer); step 3 (Inspect browse view) open |
 
 Slice 3 notes, for the slices that follow:
 
@@ -297,6 +297,44 @@ tool), `inspect()` (fixed source, staging, bless / text / import / metadata), an
 3. Inspect browse view onto the pane with the `inspect` profile: listing / navigation /
    selection / staging / apply first, then export / extract, the text editor, archive import,
    tar, CHD edit mode and the SquashFS budget.
+
+### Slice 10 notes
+
+Step 1 (4a1918a1): the move, `PaneProfile`, `open_fixed`, staging off. Behaviour unchanged.
+
+Step 2 (TUI Explorer):
+
+- The Explorer is the Commander screen with one pane: `CommanderController::single(services,
+  keymap, PaneProfile::explorer())`, opened with `open_fixed(image, partition)` (the Inspect
+  tab's partition-table row is the pane's partition index; the two read the same table).
+  `is_single()` screens draw one pane, Tab is `SwitchFocus` (tree / list), Copy has no target,
+  and Esc asks "Close <volume>?" even with nothing staged.
+- New pane parts, behind the profile: `pane/tree.rs` (the folder tree; its cursor is always the
+  listing's folder) and `pane/tools.rs` (check / repair jobs and their `ToolReport`; bless,
+  import, the metadata form (`MetadataFields` -> `MetadataEdit`s) and saved text (a temp file
+  staged as a replacing `AddFile`) all through the queue; `transforms()` for the command line).
+  A pane without staging applies each staged edit at once and asks before a delete
+  (`purpose::DELETE_NOW`). A copy that already says Replace / Skip is not a review question
+  (`drop_decided_conflicts`).
+- Keys: `KeyMap::explorer_defaults` / `explorer_terminal` (`Command::EXPLORER`): the
+  file-manager keys without sources, copy and partition, plus Ctrl+F check, Ctrl+R repair,
+  Ctrl+B bless, Ctrl+O import, Ctrl+A metadata, Ctrl+T transforms, F7 edit text, Left / Right
+  for the tree. No Ctrl+I / M / H / J (a terminal reads them as Tab / Enter / Backspace / LF).
+  `key_help()` lists only bound commands.
+- `src/cli/verbs/tui_app/explorer.rs` (ENFORCED, 0 references) draws the tree beside the
+  Commander pane drawing and the Explorer's own windows; the text editor's buffer stays view
+  state. `Explorer`, `build_explorer`, `explorer_write_task` and the `cli::resolve` write
+  helpers are gone from `tui_app.rs` (10,978 -> 7,616 lines); shells' engine references 858 -> 808.
+- Both TUI views gained an "Export as" menu (`export_choices()`, chosen before the controller's
+  `Export`) and a text / hex preview in File Info with `r` for the resource fork
+  (`FileDetail.rsrc_preview`).
+- Behaviour changes (Explorer): the shared keys replace the letter keys (`d e i m n x f r b t`)
+  and vim `hjkl`; Enter on a file opens File Info (with the preview) instead of a preview
+  window; an import onto a taken name gets the apply review (Skip / Overwrite) instead of the
+  r/s/c prompt; repair asks first; marks are per folder (they no longer span folders, and the
+  tree takes no marks); the "Blessed:" crumb is gone; the volume opens through the browser
+  pane's path (`BrowseSession`) instead of `cli::resolve`. Gained: rename, checksums, the
+  session log, sort, wrapper expansion, the staged-edits list and the help window.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,

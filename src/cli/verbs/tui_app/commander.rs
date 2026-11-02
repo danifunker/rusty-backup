@@ -18,11 +18,11 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::{centered_rect, App, FilePicker, PickKind, PickResult};
+use super::{bytes_to_lines, centered_rect, App, FilePicker, PickKind, PickResult};
 use crate::controller::commander::{
-    format_size, purpose, CommanderAction, CommanderController, BrowserPaneAction,
-    BrowserPaneController, DetailField, DisplayRow, FileDetail, HashAlgo, OnConflict, RowKind,
-    Side, MAX_CONSECUTIVE_FAILURES,
+    export_choices, format_size, purpose, BrowserPaneAction, BrowserPaneController,
+    CommanderAction, CommanderController, DetailField, DisplayRow, FileDetail, HashAlgo,
+    OnConflict, RowKind, Side, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
@@ -63,7 +63,7 @@ enum Window {
 }
 
 pub(super) struct CommanderView {
-    ctl: CommanderController,
+    pub(super) ctl: CommanderController,
     modal: Option<Modal>,
     /// Effects that need the user, answered one at a time.
     waiting: VecDeque<Effect>,
@@ -79,6 +79,12 @@ pub(super) struct CommanderView {
     quit: bool,
     /// Held while jobs run, whose engine code may print to stderr.
     muted: Option<super::MutedStderr>,
+    /// The "Export as" menu's row, while it is up.
+    export_sel: Option<usize>,
+    /// File Info shows the resource fork instead of the data fork.
+    show_rsrc: bool,
+    /// The Explorer's own windows, when this is the one-pane Explorer.
+    pub(super) ex: Option<super::explorer::ExplorerState>,
 }
 
 impl CommanderView {
@@ -87,6 +93,10 @@ impl CommanderView {
         let (keymap, problems) = load_keymap();
         let mut ctl = CommanderController::polled(recent_store(), recent_store(), keymap);
         ctl.report_keymap_problems(problems);
+        Self::with_ctl(ctl)
+    }
+
+    pub(super) fn with_ctl(ctl: CommanderController) -> Self {
         Self {
             ctl,
             modal: None,
@@ -100,6 +110,9 @@ impl CommanderView {
             closed: false,
             quit: false,
             muted: None,
+            export_sel: None,
+            show_rsrc: false,
+            ex: None,
         }
     }
 
@@ -128,9 +141,10 @@ impl CommanderView {
     pub(super) fn tick(&mut self) {
         let fx = self.ctl.tick();
         self.run(fx);
+        self.explorer_tick();
     }
 
-    fn send(&mut self, action: CommanderAction) {
+    pub(super) fn send(&mut self, action: CommanderAction) {
         let fx = self.ctl.apply(action);
         self.run(fx);
     }
@@ -220,6 +234,13 @@ impl CommanderView {
             self.modal_key(key);
             return true;
         }
+        if let Some(done) = self.explorer_key(key) {
+            return done;
+        }
+        if self.export_sel.is_some() {
+            self.export_key(key.code);
+            return true;
+        }
         self.sync_scroll();
         if let Some(done) = self.window_key(key) {
             return done;
@@ -235,11 +256,46 @@ impl CommanderView {
         if !self.ctl.binds(k, m) {
             return false;
         }
+        // These two show a chooser first; the controller acts on the choice.
+        match self.ctl.command_for(k, m) {
+            Some(Command::Export) if !self.ctl.modal_open() => {
+                self.export_sel = Some(0);
+                return true;
+            }
+            Some(Command::Transforms) => {
+                self.open_transforms();
+                return true;
+            }
+            _ => {}
+        }
         let page = page_rows();
         self.ctl.apply(A::SetPageRows(Side::Left, page));
         self.ctl.apply(A::SetPageRows(Side::Right, page));
         self.send(A::Key(k, m));
         true
+    }
+
+    fn export_key(&mut self, code: KeyCode) {
+        let choices = export_choices();
+        let sel = self.export_sel.unwrap_or(0);
+        match code {
+            KeyCode::Esc => self.export_sel = None,
+            KeyCode::Up => self.export_sel = Some(sel.saturating_sub(1)),
+            KeyCode::Down => self.export_sel = Some((sel + 1).min(choices.len() - 1)),
+            KeyCode::Enter => {
+                self.export_sel = None;
+                let c = &choices[sel];
+                if let Some(fork) = c.fork {
+                    self.send(A::SetForkMode(fork));
+                }
+                let from = self.ctl.active();
+                self.send(A::Export {
+                    from,
+                    format: Some(c.format),
+                });
+            }
+            _ => {}
+        }
     }
 
     fn top_window(&self) -> Option<Window> {
@@ -380,6 +436,11 @@ impl CommanderView {
                 (Window::Detail, KeyCode::Char('m')) => Some(A::EditDetail(DetailField::Mode)),
                 (Window::Detail, KeyCode::Char('o')) => Some(A::EditDetail(DetailField::Owner)),
                 (Window::Detail, KeyCode::Char('x')) => Some(A::EditDetail(DetailField::Xattr)),
+                (Window::Detail, KeyCode::Char('r')) => {
+                    self.show_rsrc = !self.show_rsrc;
+                    self.scroll = 0;
+                    return Some(true);
+                }
                 _ => None,
             };
             if let Some(action) = button {
@@ -516,6 +577,20 @@ impl CommanderView {
 
     /// The footer's key hints, from the key map.
     pub(super) fn footer_keys(&self) -> Vec<(String, &'static str)> {
+        let explorer = [
+            (Command::SwitchPane, "Tree/List"),
+            (Command::Edit, "Edit"),
+            (Command::Delete, "Delete"),
+            (Command::Export, "Export"),
+            (Command::Import, "Import"),
+            (Command::Fsck, "Check"),
+            (Command::Help, "Keys"),
+            (Command::Close, "Close"),
+        ];
+        if self.ctl.is_single() {
+            let hints = explorer.iter().map(|(c, d)| (self.ctl.key_hint(*c), *d));
+            return hints.filter(|(k, _)| !k.is_empty()).collect();
+        }
         let cmds = [
             (Command::SwitchPane, "Pane"),
             (Command::Copy, "Copy"),
@@ -625,6 +700,45 @@ fn clip(text: &str, width: usize) -> String {
 impl App {
     pub(super) fn draw_commander(&self, frame: &mut Frame, area: Rect, v: &CommanderView) {
         let ctl = &v.ctl;
+        if ctl.is_single() {
+            self.draw_explorer_body(frame, area, v);
+        } else {
+            self.draw_two_panes(frame, area, v);
+        }
+        self.draw_cmd_windows(frame, area, v);
+        self.draw_cmd_reviews(frame, area, v);
+        if let Some((title, snap)) = ctl.copy_job() {
+            self.draw_job_box(frame, area, title, &snap);
+        }
+        for side in [Side::Left, Side::Right] {
+            if let Some(snap) = ctl.pane(side).applying() {
+                let title = format!("Applying {} pane edits", side.label());
+                self.draw_job_box(frame, area, &title, &snap);
+            }
+        }
+        if let Some(snap) = ctl.checksums().and_then(|c| c.running()) {
+            self.draw_job_box(frame, area, "Checksums", &snap);
+        }
+        self.draw_explorer_windows(frame, area, v);
+        if let Some(sel) = v.export_sel {
+            let pal = self.palette;
+            let mut lines = Vec::new();
+            for (i, c) in export_choices().iter().enumerate() {
+                let style = if i == sel {
+                    pal.accent().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(format!(" {}", c.label), style));
+            }
+            lines.push(Line::styled(" Enter choose   Esc cancel", pal.dim()));
+            self.draw_cmd_box_auto(frame, area, 56, "Export as", lines);
+        }
+        self.draw_cmd_modal(frame, area, v);
+    }
+
+    fn draw_two_panes(&self, frame: &mut Frame, area: Rect, v: &CommanderView) {
+        let ctl = &v.ctl;
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(1)])
@@ -643,21 +757,6 @@ impl App {
             )),
             rows[1],
         );
-        self.draw_cmd_windows(frame, area, v);
-        self.draw_cmd_reviews(frame, area, v);
-        if let Some((title, snap)) = ctl.copy_job() {
-            self.draw_job_box(frame, area, title, &snap);
-        }
-        for side in [Side::Left, Side::Right] {
-            if let Some(snap) = ctl.pane(side).applying() {
-                let title = format!("Applying {} pane edits", side.label());
-                self.draw_job_box(frame, area, &title, &snap);
-            }
-        }
-        if let Some(snap) = ctl.checksums().and_then(|c| c.running()) {
-            self.draw_job_box(frame, area, "Checksums", &snap);
-        }
-        self.draw_cmd_modal(frame, area, v);
     }
 
     fn pane_title(&self, pane: &BrowserPaneController, side: Side) -> String {
@@ -673,7 +772,11 @@ impl App {
         } else {
             "(empty)".to_string()
         };
-        let mut t = format!("{}: {source}", side.label());
+        let mut t = if pane.profile().fixed_source {
+            source
+        } else {
+            format!("{}: {source}", side.label())
+        };
         let vol = pane.volume().name();
         if pane.listing.is_loaded() && !pane.listing.is_host() && !vol.is_empty() {
             t.push_str(&format!(" - {vol}"));
@@ -688,10 +791,16 @@ impl App {
         t
     }
 
-    fn draw_cmd_pane(&self, frame: &mut Frame, area: Rect, v: &CommanderView, side: Side) {
+    pub(super) fn draw_cmd_pane(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        v: &CommanderView,
+        side: Side,
+    ) {
         let ctl = &v.ctl;
         let pane = ctl.pane(side);
-        let focused = ctl.active() == side;
+        let focused = ctl.active() == side && !pane.tree_focused();
         let pal = self.palette;
         let width = area.width.saturating_sub(2) as usize;
         let mut title = self.pane_title(pane, side);
@@ -840,7 +949,7 @@ impl App {
             }
             Some(Window::Detail) => {
                 let Some(d) = ctl.detail() else { return };
-                let mut lines = detail_lines(d)
+                let mut lines = detail_lines(d, v.show_rsrc)
                     .into_iter()
                     .map(|l| Line::raw(format!(" {l}")))
                     .collect::<Vec<_>>();
@@ -848,10 +957,11 @@ impl App {
                     lines.push(Line::raw(""));
                     lines.push(Line::styled(format!(" {result}"), pal.accent()));
                 }
-                let foot = if d.editable {
-                    "m mode   o owner   x xattr   Esc close"
-                } else {
-                    "Esc close"
+                let foot = match (d.editable, d.rsrc_preview.is_some()) {
+                    (true, true) => "m mode   o owner   x xattr   r fork   Esc close",
+                    (true, false) => "m mode   o owner   x xattr   Esc close",
+                    (false, true) => "r fork   Esc close",
+                    (false, false) => "Esc close",
                 };
                 (format!("File Info: {}", d.entry.name), lines, foot.into())
             }
@@ -1156,7 +1266,7 @@ impl App {
     }
 
     /// A box sized to its lines (capped by `area`).
-    fn draw_cmd_box_auto(
+    pub(super) fn draw_cmd_box_auto(
         &self,
         frame: &mut Frame,
         area: Rect,
@@ -1169,7 +1279,13 @@ impl App {
         self.draw_cmd_box(frame, centered_rect(w, h, area), title, lines);
     }
 
-    fn draw_cmd_box(&self, frame: &mut Frame, r: Rect, title: &str, lines: Vec<Line<'static>>) {
+    pub(super) fn draw_cmd_box(
+        &self,
+        frame: &mut Frame,
+        r: Rect,
+        title: &str,
+        lines: Vec<Line<'static>>,
+    ) {
         frame.render_widget(Clear, r);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
@@ -1212,8 +1328,11 @@ fn row_text(row: &DisplayRow, marked: bool, name_w: usize) -> String {
     format!("{mark}{flag}{name} {size:>10} {}", row.type_tag)
 }
 
-/// File Info as text: the entry's metadata and extended attributes.
-fn detail_lines(d: &FileDetail) -> Vec<String> {
+/// Bytes of a fork File Info draws (it reads more; a terminal shows a screenful at a time).
+const PREVIEW_DRAWN: usize = 64 * 1024;
+
+/// File Info as text: the entry's metadata, extended attributes and a preview of one fork.
+fn detail_lines(d: &FileDetail, rsrc: bool) -> Vec<String> {
     let e = &d.entry;
     let mut out = vec![
         format!("Name:  {}", printable(&e.name)),
@@ -1248,9 +1367,14 @@ fn detail_lines(d: &FileDetail) -> Vec<String> {
             out.push(format!("  {} = {}", x.name, x.value_display()));
         }
     }
-    if let Some(p) = &d.preview {
+    let (fork, bytes) = match (&d.rsrc_preview, rsrc) {
+        (Some(r), true) => ("Resource fork", Some(r)),
+        _ => ("Preview", d.preview.as_ref()),
+    };
+    if let Some(p) = bytes {
         out.push(String::new());
-        out.push(format!("Preview: first {} byte(s) read.", p.len()));
+        out.push(format!("{fork} ({} byte(s) read):", p.len()));
+        out.extend(bytes_to_lines(&p[..p.len().min(PREVIEW_DRAWN)]));
     }
     let budget = d.size_budget_lines();
     if !budget.is_empty() {

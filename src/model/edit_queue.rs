@@ -722,7 +722,7 @@ impl EditQueue {
     }
 
     /// Full path for an `AddFile` / `CreateDirectory` edit, anchored at root.
-    fn pending_path(parent_path: &str, name: &str) -> String {
+    pub fn pending_path(parent_path: &str, name: &str) -> String {
         if parent_path == "/" {
             format!("/{name}")
         } else {

@@ -17,9 +17,9 @@ pub use crate::controller::browser::{
     MAX_CONSECUTIVE_FAILURES,
 };
 pub use screen::{
-    ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField, ExportFormat,
-    FileDetail, HashAlgo, IdNameMap, MetadataEdit, RenameNotice, ResourceForkMode, Side, SizePlan,
-    Xattr,
+    export_choices, ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField,
+    ExportChoice, ExportFormat, FileDetail, HashAlgo, IdNameMap, MetadataEdit, RenameNotice,
+    ResourceForkMode, Side, SizePlan, Xattr,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

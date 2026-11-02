@@ -347,7 +347,7 @@ fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
 
 /// Human-readable label for one edit, shown as the "Writing X" line while
 /// that edit is in flight. Kept short and stable across edit shapes.
-fn edit_label(edit: &StagedEdit) -> String {
+pub fn edit_label(edit: &StagedEdit) -> String {
     match edit {
         StagedEdit::AddFile { parent, name, .. } => join_path(&parent.path, name),
         StagedEdit::CreateDirectory { parent, name, .. } => join_path(&parent.path, name),

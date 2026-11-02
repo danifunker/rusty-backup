@@ -184,6 +184,10 @@ every shell shares, and `src/gui/commander/` only draws:
   every platform (`KeyMap::for_terminal`: a terminal has no Cmd key). The File Info
   window edits mode, owner and xattrs through `EditDetail` prompts instead of the
   egui editors.
+- The TUI's Ctrl+E opens an "Export as" menu (`export_choices()`) before exporting, and its
+  File Info shows a text / hex preview of the file (`r` switches to the resource fork).
+- The TUI Explorer (Inspect tab) is the same screen with one pane:
+  `CommanderController::single` + `PaneProfile::explorer` (Phase 2 slice 10).
 - Keyboard commands beyond the F-keys (all views): Ctrl/Cmd+O open image, +D open
   folder, +B open backup, +K connect, +P partition chooser, +S sort (column
   descending, then the next column), +G checksums, +E export, +U staged edits,

@@ -15,13 +15,21 @@ use crate::controller::{Controller, Effect};
 mod edits;
 mod remote;
 pub(in crate::controller) mod source;
+mod tools;
+mod tree;
 
 pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
+pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
 pub use edits::{validate_entry_name, ApplyReport, StageOutcome};
 pub use remote::validate_remote_addr;
 pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, VolumeInfo};
+pub use tools::{
+    format_mac_date, parse_mac_date, MetadataFields, MetadataForm, TextDoc, ToolReport,
+    MAX_TEXT_EDIT,
+};
+pub use tree::TreeNode;
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +135,29 @@ pub enum BrowserPaneAction {
     CloseRemoteImage,
     /// Drop the remote connection (asks first when edits are staged).
     Disconnect,
+    /// Hand the keyboard between the folder tree and the listing (profile `folder_tree`).
+    SwitchFocus,
+    /// Check the open filesystem in a job; the result waits in `tool_report`.
+    Fsck,
+    /// Repair the open filesystem in place, after a confirmation.
+    Repair,
+    DismissToolReport,
+    /// Bless the cursor folder (or the current one) as the System Folder, after a confirmation.
+    Bless,
+    /// Read the cursor file for the text editor in a job; it waits in `take_text_doc`.
+    EditText,
+    /// Write the editor's text back over the file `name` in the current folder.
+    SaveText {
+        name: String,
+        text: String,
+        shape: TextShape,
+    },
+    /// Pick a host file and stage it into the current folder.
+    Import,
+    /// Open the metadata form for the cursor row.
+    EditMetadata,
+    SubmitMetadata(Box<MetadataFields>),
+    CancelMetadata,
 }
 
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
@@ -163,6 +194,10 @@ pub struct BrowserPaneController {
     remote: remote::RemoteState,
     /// What this use of the pane may do; checked before every action.
     profile: PaneProfile,
+    /// Check / repair / editor jobs and their results.
+    tl: tools::ToolState,
+    /// The folder tree beside the listing, when the profile has one.
+    folders: tree::FolderTree,
 }
 
 impl Default for BrowserPaneController {
@@ -182,7 +217,11 @@ impl Controller for BrowserPaneController {
         self.rebuild_rows();
         let staged_before = self.queue.len();
         let mut fx = Vec::new();
+        if self.tree_key(&action).is_some() {
+            return self.finish_apply(fx, staged_before);
+        }
         match action {
+            BrowserPaneAction::SwitchFocus => self.switch_focus(),
             BrowserPaneAction::Enter(name) => self.enter(&name),
             BrowserPaneAction::Up => self.up(),
             BrowserPaneAction::NavigateTo(path) => {
@@ -193,6 +232,7 @@ impl Controller for BrowserPaneController {
                 self.navigated(&before, None);
             }
             BrowserPaneAction::Reload => {
+                self.folders.clear();
                 if let Err(e) = self.listing.reload() {
                     self.error = Some(format!("cannot refresh: {e}"));
                 }
@@ -242,25 +282,25 @@ impl Controller for BrowserPaneController {
             BrowserPaneAction::InfoAtCursor => self.info_at_cursor(),
             BrowserPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
             other => {
-                fx = match self.apply_remote(other).or_else(|a| self.apply_edit(a)) {
+                let handled = self
+                    .apply_remote(other)
+                    .or_else(|a| self.apply_edit(a))
+                    .or_else(|a| self.apply_tool(a));
+                fx = match handled {
                     Ok(fx) => fx,
                     Err(other) => self.apply_source(other),
                 }
             }
         }
-        self.password_error_locks();
-        if self.queue.len() > staged_before {
-            self.auto_apply();
-        }
-        self.rebuild_rows();
-        fx.append(&mut self.out);
-        fx
+        self.finish_apply(fx, staged_before)
     }
 
     fn tick(&mut self) -> Vec<Effect> {
         let mut fx = self.poll_open();
         fx.extend(self.poll_remote());
         fx.extend(self.poll_edits());
+        fx.extend(self.poll_tools());
+        self.sync_tree();
         self.rebuild_rows();
         fx.append(&mut self.out);
         fx
@@ -299,6 +339,8 @@ impl BrowserPaneController {
             ed: edits::EditState::new(),
             remote: remote::RemoteState::default(),
             profile,
+            tl: tools::ToolState::default(),
+            folders: tree::FolderTree::new(true),
         }
     }
 
@@ -321,9 +363,29 @@ impl BrowserPaneController {
             A::RequestRename(_) | A::RenameAtCursor => (p.can_rename(), "rename"),
             A::RequestNewFolder => (p.can_new_folder(), "new folder"),
             A::ToggleWrapper(_) => (p.wrappers, "expanding archives and images"),
+            A::SwitchFocus => (p.folder_tree, "the folder tree"),
+            A::Fsck => (p.tools.fsck, "checking the filesystem"),
+            A::Repair => (p.tools.repair && !p.read_only, "repair"),
+            A::Bless => (p.tools.bless && !p.read_only, "bless"),
+            A::EditText | A::SaveText { .. } => (p.tools.text_edit && !p.read_only, "editing text"),
+            A::Import => (p.tools.import && !p.read_only, "import"),
+            A::EditMetadata | A::SubmitMetadata(_) => {
+                (p.tools.metadata && !p.read_only, "editing metadata")
+            }
             _ => (true, ""),
         };
         (!allowed).then(|| p.refusal(what))
+    }
+
+    fn finish_apply(&mut self, mut fx: Vec<Effect>, staged_before: usize) -> Vec<Effect> {
+        self.password_error_locks();
+        if self.queue.len() > staged_before {
+            self.auto_apply();
+        }
+        self.sync_tree();
+        self.rebuild_rows();
+        fx.append(&mut self.out);
+        fx
     }
 
     /// Without staging, what was just staged applies at once (through the same preflight and review).
@@ -383,6 +445,7 @@ impl BrowserPaneController {
     /// Drops expanded wrappers, the tree selection and the cursor after the view swaps the source.
     pub fn source_changed(&mut self) {
         self.collapse_wrappers();
+        self.folders.clear();
         self.cursor = None;
         self.cursor_at = 0;
         self.error = None;
