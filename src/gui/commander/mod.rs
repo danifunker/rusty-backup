@@ -26,6 +26,8 @@ use disk_core::entry::FileEntry;
 #[allow(unused_imports)] // referenced from a doc comment below
 use fs_mac::fork_export::export_file_with_fork;
 use fs_mac::resource_fork::ResourceForkMode;
+use rusty_backup::controller::commander::CommanderPaneAction;
+use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::replace::OnConflict;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
@@ -190,6 +192,10 @@ pub struct CommanderMode {
     session_log: Vec<String>,
     /// Whether the session-log window is open.
     show_log: bool,
+    /// Shortcuts: the defaults plus the user's `keybindings.toml`.
+    keymap: KeyMap,
+    /// Whether the keyboard-shortcut help window is open.
+    show_help: bool,
 }
 
 impl Default for CommanderMode {
@@ -221,6 +227,8 @@ impl CommanderMode {
             active: Side::Left,
             session_log: Vec::new(),
             show_log: false,
+            keymap: load_keymap(),
+            show_help: false,
         }
     }
 
@@ -268,18 +276,17 @@ impl CommanderMode {
         self.render_progress_modal(ui.ctx());
         self.render_host_conflict_modal(ui.ctx());
         self.render_rename_notice(ui.ctx());
+        if self.handle_keys(ui.ctx()) {
+            close = true;
+        }
 
         egui::Panel::top("commander_top").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("Commander Mode");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        if self.left.staged_count() + self.right.staged_count() > 0 {
-                            self.unsaved_close = true;
-                        } else {
-                            close = true;
-                        }
+                    if ui.button("Close").clicked() && self.request_close() {
+                        close = true;
                     }
                     if ui
                         .button(format!("Log ({})", self.session_log.len()))
@@ -317,7 +324,7 @@ impl CommanderMode {
                     egui::vec2(pane_w, full_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        let resp = self.left.show(ui);
+                        let resp = self.left.show(ui, self.active == Side::Left);
                         for ev in resp.log_events {
                             self.record_log(ev);
                         }
@@ -359,7 +366,7 @@ impl CommanderMode {
                     egui::vec2(pane_w, full_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        let resp = self.right.show(ui);
+                        let resp = self.right.show(ui, self.active == Side::Right);
                         for ev in resp.log_events {
                             self.record_log(ev);
                         }
@@ -392,6 +399,7 @@ impl CommanderMode {
         self.render_checksum_window(ui.ctx());
         self.render_detail_window(ui.ctx());
         self.render_log_window(ui.ctx());
+        self.render_help(ui.ctx());
 
         if self.unsaved_close {
             let n = self.left.staged_count() + self.right.staged_count();
@@ -432,9 +440,8 @@ impl CommanderMode {
 
         // A copy needs a selection on the source and a ready destination, and no
         // host-write already in flight.
-        let idle = self.pending_host_copy.is_none();
-        let l_can = idle && self.left.has_selection() && self.right.can_receive();
-        let r_can = idle && self.right.has_selection() && self.left.can_receive();
+        let l_can = self.can_copy(Side::Left);
+        let r_can = self.can_copy(Side::Right);
 
         // When a destination can't receive a copy, say why in the hover so the
         // greyed button reads as "by design" rather than "broken": read-only
@@ -471,19 +478,7 @@ impl CommanderMode {
         // that pane is read-only (backup or archive) or a remote image (the
         // remote write path carries copies only for now, not deletes).
         let active = self.active;
-        let (active_has_sel, active_readonly, active_remote) = match active {
-            Side::Left => (
-                self.left.has_selection(),
-                self.left.is_backup_pane() || self.left.is_archive_pane(),
-                self.left.is_remote(),
-            ),
-            Side::Right => (
-                self.right.has_selection(),
-                self.right.is_backup_pane() || self.right.is_archive_pane(),
-                self.right.is_remote(),
-            ),
-        };
-        let del_enabled = idle && active_has_sel && !active_readonly && !active_remote;
+        let del_enabled = self.can_delete();
         let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
         if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
             status = Some(match active {
@@ -545,6 +540,205 @@ impl CommanderMode {
                 );
         });
         status
+    }
+
+    fn pane_mut(&mut self, side: Side) -> &mut CommanderPane {
+        match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
+    }
+
+    /// A copy needs a selection on the source, a ready destination and no host write in flight.
+    fn can_copy(&self, from: Side) -> bool {
+        let (src, dst) = match from {
+            Side::Left => (&self.left, &self.right),
+            Side::Right => (&self.right, &self.left),
+        };
+        self.pending_host_copy.is_none() && src.has_selection() && dst.can_receive()
+    }
+
+    /// Delete acts on the active pane; read-only and remote panes take no deletes.
+    fn can_delete(&self) -> bool {
+        let pane = match self.active {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        };
+        self.pending_host_copy.is_none()
+            && pane.has_selection()
+            && !(pane.is_backup_pane() || pane.is_archive_pane())
+            && !pane.is_remote()
+    }
+
+    /// The Close button: true to close now, or raises the unsaved-edits prompt.
+    fn request_close(&mut self) -> bool {
+        if self.left.staged_count() + self.right.staged_count() > 0 {
+            self.unsaved_close = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Runs the shortcuts pressed this frame; true when one asks to close Commander.
+    fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
+        let modal = self.unsaved_close
+            || self.pending_host_conflict.is_some()
+            || self.rename_notice.is_some()
+            || self.left.modal_open()
+            || self.right.modal_open();
+        if modal || ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) {
+            return false;
+        }
+        let keymap = &self.keymap;
+        let commands: Vec<Command> = ctx.input_mut(|i| {
+            let mut found = Vec::new();
+            i.events.retain(|ev| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                else {
+                    return true;
+                };
+                let cmd = egui_key(*key).and_then(|k| keymap.lookup(k, egui_mods(*modifiers)));
+                found.extend(cmd);
+                cmd.is_none()
+            });
+            found
+        });
+        if commands.is_empty() {
+            return false;
+        }
+        // egui already read Tab and the arrows as focus moves this frame; a shortcut cancels that.
+        ctx.memory_mut(|m| {
+            m.move_focus(egui::FocusDirection::None);
+            m.stop_text_input();
+        });
+        let mut close = false;
+        for cmd in commands {
+            close |= self.run_command(cmd);
+        }
+        close
+    }
+
+    /// Does what `cmd` means here: pane commands go to the active pane, the rest to the buttons.
+    fn run_command(&mut self, cmd: Command) -> bool {
+        let side = self.active;
+        let page = self.pane_mut(side).page_rows();
+        let pane_action = match cmd {
+            Command::CursorUp => Some(CommanderPaneAction::CursorUp),
+            Command::CursorDown => Some(CommanderPaneAction::CursorDown),
+            Command::PageUp => Some(CommanderPaneAction::CursorPage(-page)),
+            Command::PageDown => Some(CommanderPaneAction::CursorPage(page)),
+            Command::Home => Some(CommanderPaneAction::CursorHome),
+            Command::End => Some(CommanderPaneAction::CursorEnd),
+            Command::Open => Some(CommanderPaneAction::ActivateCursor),
+            Command::Parent => Some(CommanderPaneAction::Up),
+            Command::Mark => Some(CommanderPaneAction::ToggleMark),
+            Command::Refresh => Some(CommanderPaneAction::Reload),
+            Command::Info => Some(CommanderPaneAction::InfoAtCursor),
+            Command::Help
+            | Command::SwitchPane
+            | Command::Copy
+            | Command::Delete
+            | Command::Rename
+            | Command::NewFolder
+            | Command::Apply
+            | Command::Edit
+            | Command::Close => None,
+        };
+        if let Some(action) = pane_action {
+            self.pane_mut(side).key_action(action);
+            return false;
+        }
+        match cmd {
+            Command::Help => self.show_help = !self.show_help,
+            Command::SwitchPane => self.active = side.other(),
+            Command::Copy => {
+                if self.can_copy(side) {
+                    self.status = self.copy(side);
+                }
+            }
+            Command::Delete => {
+                if self.can_delete() {
+                    self.status = self.pane_mut(side).delete_selection();
+                }
+            }
+            Command::Rename => self.pane_mut(side).rename_shortcut(),
+            Command::NewFolder => self.pane_mut(side).new_folder_shortcut(),
+            Command::Apply => {
+                if let Some(s) = self.pane_mut(side).apply_shortcut() {
+                    self.status = s;
+                }
+            }
+            Command::Close => return self.close_shortcut(),
+            // No GUI edit operation exists yet.
+            Command::Edit => {}
+            Command::CursorUp
+            | Command::CursorDown
+            | Command::PageUp
+            | Command::PageDown
+            | Command::Home
+            | Command::End
+            | Command::Open
+            | Command::Parent
+            | Command::Mark
+            | Command::Refresh
+            | Command::Info => {}
+        }
+        false
+    }
+
+    /// Esc closes the topmost Commander window, then Commander itself.
+    fn close_shortcut(&mut self) -> bool {
+        if self.show_help {
+            self.show_help = false;
+        } else if self.detail.is_some() {
+            self.detail = None;
+        } else if self.checksums.is_some() {
+            self.checksums = None;
+        } else if self.show_log {
+            self.show_log = false;
+        } else {
+            return self.request_close();
+        }
+        false
+    }
+
+    /// Every shortcut with its first chord on this platform.
+    fn render_help(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = true;
+        let keymap = &self.keymap;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("commander_keys")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for cmd in Command::ALL {
+                            ui.label(cmd.label());
+                            ui.monospace(keymap.hint(cmd));
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.weak(format!(
+                    "{} or {} closes this window. Rebind keys in keybindings.toml.",
+                    keymap.hint(Command::Help),
+                    keymap.hint(Command::Close)
+                ));
+            });
+        if !open {
+            self.show_help = false;
+        }
     }
 
     /// Copy the `from` pane's selection into the other pane's current directory.
@@ -1696,4 +1890,65 @@ fn printable(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The shortcut map, logging any lines of the user's file it could not use.
+fn load_keymap() -> KeyMap {
+    let (map, problems) = KeyMap::load(KeyMap::user_file().as_deref());
+    for p in problems {
+        log::warn!("keybindings: {p}");
+    }
+    map
+}
+
+/// An egui key as the key map names it; keys no binding can use are `None`.
+fn egui_key(key: egui::Key) -> Option<Key> {
+    use egui::Key as K;
+    Some(match key {
+        K::Tab => Key::Tab,
+        K::Enter => Key::Enter,
+        K::Escape => Key::Escape,
+        K::Backspace => Key::Backspace,
+        K::Delete => Key::Delete,
+        K::Insert => Key::Insert,
+        K::Space => Key::Space,
+        K::ArrowUp => Key::Up,
+        K::ArrowDown => Key::Down,
+        K::ArrowLeft => Key::Left,
+        K::ArrowRight => Key::Right,
+        K::PageUp => Key::PageUp,
+        K::PageDown => Key::PageDown,
+        K::Home => Key::Home,
+        K::End => Key::End,
+        K::F1 => Key::F(1),
+        K::F2 => Key::F(2),
+        K::F3 => Key::F(3),
+        K::F4 => Key::F(4),
+        K::F5 => Key::F(5),
+        K::F6 => Key::F(6),
+        K::F7 => Key::F(7),
+        K::F8 => Key::F(8),
+        K::F9 => Key::F(9),
+        K::F10 => Key::F(10),
+        K::F11 => Key::F(11),
+        K::F12 => Key::F(12),
+        other => {
+            let name = other.name();
+            let mut chars = name.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphanumeric() => Key::Char(c.to_ascii_lowercase()),
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// egui's modifiers; `mac_cmd` is Cmd on macOS and never set elsewhere.
+fn egui_mods(m: egui::Modifiers) -> Mods {
+    Mods {
+        ctrl: m.ctrl,
+        alt: m.alt,
+        shift: m.shift,
+        cmd: m.mac_cmd,
+    }
 }

@@ -42,19 +42,21 @@ use rusty_backup::model::commander_ops::{
     WrapperOpenPlan, WrapperOpenStatus,
 };
 use rusty_backup::model::commander_source;
-use rusty_backup::model::dir_listing::{DirListing, SortColumn};
+use rusty_backup::model::dir_listing::DirListing;
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::model::wrapper_tree::{tree_range, TreeRow};
 use rusty_backup::partition::PartitionInfo;
 use rusty_backup::update::RecentMode;
 
 use rusty_backup::controller::commander::rows::{
     is_mac_archive_path, partition_label, remote_parent_dir, DisplayRow, RowKind,
 };
-use rusty_backup::controller::commander::CommanderPaneController;
+use rusty_backup::controller::commander::{
+    CommanderPaneAction, CommanderPaneController, PaneRequest, SortColumn,
+};
+use rusty_backup::controller::Controller;
 
 use super::Side;
 
@@ -272,6 +274,12 @@ pub(crate) struct CommanderPane {
     /// The optical disc's selectable filesystems (primary + any hybrid Mac side);
     /// drives the picker when `optical_source`. `selected_part` indexes into it.
     optical_choices: Vec<OpticalFsChoice>,
+    /// Keyboard actions for this pane, run at the start of the next row render.
+    key_actions: Vec<CommanderPaneAction>,
+    /// This is the active pane, so it draws the keyboard cursor.
+    has_focus: bool,
+    /// Rows that fit in the listing, for Page Up / Page Down.
+    page_rows: i32,
 }
 
 /// Display cache for a remote pane (addr + what it's browsing). The live engine
@@ -340,6 +348,8 @@ enum PendingSwitch {
 /// name (for the spinner + status), and the worker's shared status handle.
 struct PendingWrapper {
     node_id: String,
+    /// The controller's wrapper epoch at spawn; a different one means the row is gone.
+    epoch: u64,
     name: String,
     status: Arc<Mutex<WrapperOpenStatus>>,
 }
@@ -392,6 +402,9 @@ impl CommanderPane {
             archive_source: false,
             optical_source: false,
             optical_choices: Vec::new(),
+            key_actions: Vec::new(),
+            has_focus: false,
+            page_rows: 1,
         }
     }
 
@@ -401,7 +414,7 @@ impl CommanderPane {
     /// `session` all switch to the wrapper context so the existing copy
     /// dispatch pulls files straight out.
     fn tree_active(&self) -> bool {
-        !self.ctl.tree_selected.is_empty()
+        self.ctl.tree_active()
     }
 
     /// The mount key and selected entries for the active tree selection, all
@@ -420,107 +433,57 @@ impl CommanderPane {
         Some((mount, entries))
     }
 
-    /// Clear the tree selection (e.g. when the base listing is clicked).
-    fn clear_tree_selection(&mut self) {
-        self.ctl.tree_selected.clear();
-    }
-
     /// Drop this pane's in-memory recent-files mirror (the Settings dialog
     /// cleared the persisted lists).
     pub(crate) fn clear_recent_files(&mut self) {
         self.recent.clear();
     }
 
-    /// Expand or collapse a wrapper / inner-folder node. Opening a wrapper
-    /// materializes + mounts its contents (reading the wrapper's bytes from the
-    /// host, the base filesystem, or the enclosing mount). Returns a status
-    /// line on error or a note (e.g. a multi-volume image).
-    fn toggle_wrapper(
-        &mut self,
-        node_id: &str,
-        name: &str,
-        is_tree: bool,
-        is_wrapper: bool,
-        expanded: bool,
-    ) -> Option<String> {
-        if expanded {
-            self.ctl.wrapper_tree.collapse(node_id);
-            // Drop any selection that was inside the collapsed subtree.
-            self.ctl.tree_selected.retain(|id| !id.starts_with(node_id));
-            return None;
+    /// Open a base-row wrapper off the UI thread with a spinner; only one opens at a time.
+    fn open_base_wrapper(&mut self, node_id: &str, name: &str) -> Option<String> {
+        if self.pending_wrapper.is_some() {
+            let side = self.side.label();
+            return Some(format!(
+                "[{side}] a wrapper is already opening; wait for it."
+            ));
         }
-        if is_tree {
-            if is_wrapper {
-                // Nested wrapper: read its bytes out of the enclosing mount.
-                let row = self.ctl.tree_index.get(node_id)?.clone();
-                let kind = classify_entry(&row.entry)?;
-                let source = match self.ctl.wrapper_tree.read_wrapper_source(&row) {
-                    Ok(s) => s,
-                    Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
-                };
-                if let Err(e) = self
-                    .ctl
-                    .wrapper_tree
-                    .expand_wrapper(node_id, name, kind, source)
-                {
-                    return self.wrapper_open_failed(name, format!("{e:#}"));
-                }
-            } else {
-                // Plain folder inside a mount — just reveal its children.
-                self.ctl.wrapper_tree.expand_folder(node_id);
-            }
+        let entry = self
+            .ctl
+            .listing
+            .entries()
+            .iter()
+            .find(|e| e.path == node_id)
+            .cloned()?;
+        let kind = classify_entry(&entry)?;
+        // A host file opens by its real path — cheaper than reading it all,
+        // and required for multi-file optical formats (bin/cue, mdf/mds)
+        // whose sibling data file sits next to it. A wrapper inside an image
+        // pane is extracted on the worker from a fresh reopen of the base
+        // source; a non-reopenable base (rare) extracts synchronously here.
+        let plan = if self.ctl.listing.is_host() {
+            WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
+        } else if let Some(base) = self.base_stage_source() {
+            WrapperOpenPlan::Extract(Box::new(WrapperExtract {
+                base,
+                entry: entry.clone(),
+            }))
         } else {
-            // Base wrapper: open it off the UI thread with a spinner —
-            // materializing a large `.toast`/`.chd`/`.iso` to a temp file and
-            // probing it can take seconds. Only one wrapper opens at a time.
-            if self.pending_wrapper.is_some() {
-                let side = self.side.label();
-                return Some(format!(
-                    "[{side}] a wrapper is already opening; wait for it."
-                ));
-            }
-            let entry = self
-                .ctl
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.path == node_id)
-                .cloned()?;
-            let kind = classify_entry(&entry)?;
-            // A host file opens by its real path — cheaper than reading it all,
-            // and required for multi-file optical formats (bin/cue, mdf/mds)
-            // whose sibling data file sits next to it. A wrapper inside an image
-            // pane is extracted on the worker from a fresh reopen of the base
-            // source; a non-reopenable base (rare) extracts synchronously here.
-            let plan = if self.ctl.listing.is_host() {
-                WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
-            } else if let Some(base) = self.base_stage_source() {
-                WrapperOpenPlan::Extract(Box::new(WrapperExtract {
-                    base,
-                    entry: entry.clone(),
-                }))
-            } else {
-                let Some(fs) = self.ctl.listing.fs_mut() else {
-                    return self.wrapper_open_failed(name, "source is not open".into());
-                };
-                let mut buf = Vec::new();
-                if let Err(e) = fs.write_file_to(&entry, &mut buf) {
-                    return self.wrapper_open_failed(name, e.to_string());
-                }
-                WrapperOpenPlan::Bytes(buf)
+            let Some(fs) = self.ctl.listing.fs_mut() else {
+                return self.wrapper_open_failed(name, "source is not open".into());
             };
-            self.pending_wrapper = Some(PendingWrapper {
-                node_id: node_id.to_string(),
-                name: name.to_string(),
-                status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
-            });
-            return Some(format!("[{}] opening {name}...", self.side.label()));
-        }
-        let side = self.side.label();
-        self.ctl
-            .wrapper_tree
-            .note(node_id)
-            .map(|n| format!("[{side}] {name}: {n}"))
+            let mut buf = Vec::new();
+            if let Err(e) = fs.write_file_to(&entry, &mut buf) {
+                return self.wrapper_open_failed(name, e.to_string());
+            }
+            WrapperOpenPlan::Bytes(buf)
+        };
+        self.pending_wrapper = Some(PendingWrapper {
+            node_id: node_id.to_string(),
+            epoch: self.ctl.wrapper_epoch(),
+            name: name.to_string(),
+            status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
+        });
+        Some(format!("[{}] opening {name}...", self.side.label()))
     }
 
     /// The reopen handle for this pane's *base* source (ignoring any active
@@ -602,17 +565,13 @@ impl CommanderPane {
     }
 
     /// Render the pane. Returns status + any cross-pane request for the overlay.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> PaneResponse {
-        // Wrapper expansion is scoped to the current directory: any change of
-        // base cwd (navigate / source / partition switch / close) collapses
-        // every expanded wrapper and drops its mounts + tree selection.
-        let cwd_now = self.ctl.listing.cwd_path().to_string();
-        if cwd_now != self.ctl.last_cwd {
-            self.ctl.last_cwd = cwd_now;
-            self.ctl.wrapper_tree.clear();
-            self.ctl.tree_selected.clear();
-            // Abandon any wrapper open still in flight — its target row is gone.
-            self.pending_wrapper = None;
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui, active: bool) -> PaneResponse {
+        self.has_focus = active;
+        // The controller dropped the wrappers this open was for, so abandon it.
+        if let Some(pw) = &self.pending_wrapper {
+            if pw.epoch != self.ctl.wrapper_epoch() {
+                self.pending_wrapper = None;
+            }
         }
         let mut status = self.poll_open(ui.ctx());
         if let Some(s) = self.poll_preflight(ui.ctx()) {
@@ -640,7 +599,9 @@ impl CommanderPane {
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
         }
-        self.path_line(ui);
+        if let Some(s) = self.path_line(ui) {
+            status = Some(s);
+        }
         ui.separator();
 
         // A wrapper being opened off-thread: show a spinner + phase above the
@@ -851,6 +812,7 @@ impl CommanderPane {
             status = Some(s);
         }
 
+        self.key_actions.clear();
         PaneResponse {
             status,
             copy_to_other,
@@ -1369,6 +1331,7 @@ impl CommanderPane {
                     addr: addr.clone(),
                     mode: mode.clone(),
                 });
+                self.ctl.source_changed();
                 self.ctl
                     .listing
                     .load_root(target.fs, target.root, target.entries, false);
@@ -1656,7 +1619,8 @@ impl CommanderPane {
 
     /// Re-read the current directory listing (after an immediate host write).
     pub(crate) fn reload_listing(&mut self) {
-        let _ = self.ctl.listing.reload();
+        self.ctl.apply(CommanderPaneAction::Reload);
+        self.ctl.take_error();
     }
 
     /// Delete this pane's current selection — the middle-column Delete acting on
@@ -1696,6 +1660,74 @@ impl CommanderPane {
             self.toggle_delete(&names);
             format!("[{}] toggled delete on {n} item(s).", self.side.label())
         }
+    }
+
+    /// Queues a keyboard action for this pane; it runs when the listing next renders.
+    pub(crate) fn key_action(&mut self, action: CommanderPaneAction) {
+        self.key_actions.push(action);
+    }
+
+    /// Rows that fit in the listing, the step for Page Up / Page Down.
+    pub(crate) fn page_rows(&self) -> i32 {
+        self.page_rows
+    }
+
+    /// True while one of this pane's dialogs waits for an answer, so shortcuts stand down.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.pending_switch.is_some()
+            || self.pending_host_delete.is_some()
+            || self.rename_dialog.is_some()
+            || self.new_folder_dialog.is_some()
+            || self.connect_dialog.is_some()
+            || self.apply_review.is_some()
+            || self.apply_report.is_some()
+    }
+
+    fn busy(&self) -> bool {
+        self.pending_apply.is_some()
+            || self.pending_preflight.is_some()
+            || self.pending_open.is_some()
+            || self.pending_scan.is_some()
+    }
+
+    fn can_new_folder(&self) -> bool {
+        self.ctl.listing.is_loaded() && !self.busy() && self.resolved_backup.is_none()
+    }
+
+    /// The Apply button, when it is offered and enabled.
+    pub(crate) fn apply_shortcut(&mut self) -> Option<String> {
+        let staging =
+            !self.ctl.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source;
+        (staging && !self.ctl.queue.is_empty() && !self.busy()).then(|| self.apply())
+    }
+
+    /// The New Folder button.
+    pub(crate) fn new_folder_shortcut(&mut self) {
+        if self.can_new_folder() {
+            self.new_folder_dialog = Some(NewFolderDialog {
+                input: String::new(),
+                error: None,
+            });
+        }
+    }
+
+    /// The cursor row's "Rename..." menu item.
+    pub(crate) fn rename_shortcut(&mut self) {
+        if self.pending_apply.is_some() || self.resolved_backup.is_some() {
+            return;
+        }
+        let Some(row) = self.ctl.cursor_index().map(|i| self.ctl.rows()[i].clone()) else {
+            return;
+        };
+        if row.is_tree || row.kind != RowKind::Normal {
+            return;
+        }
+        let mut out = RowActions::default();
+        self.dispatch(
+            CommanderPaneAction::ContextSelect(row.name.clone()),
+            &mut out,
+        );
+        self.open_rename(&row.name);
     }
 
     /// True when at least one row is selected (base listing or a wrapper).
@@ -2080,10 +2112,7 @@ impl CommanderPane {
             if !self.ctl.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source
             {
                 let n = self.ctl.queue.len();
-                let busy = self.pending_apply.is_some()
-                    || self.pending_preflight.is_some()
-                    || self.pending_open.is_some()
-                    || self.pending_scan.is_some();
+                let busy = self.busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
                         status = Some(self.apply());
@@ -2167,12 +2196,7 @@ impl CommanderPane {
                 // New Folder: stages a CreateDirectory on an image pane;
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
-                let busy = self.pending_apply.is_some()
-                    || self.pending_preflight.is_some()
-                    || self.pending_open.is_some()
-                    || self.pending_scan.is_some();
-                if !busy
-                    && self.resolved_backup.is_none()
+                if self.can_new_folder()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
@@ -2235,6 +2259,7 @@ impl CommanderPane {
         self.cache_store.clear();
         self.selected_part = None;
         self.ctl.listing = DirListing::new();
+        self.ctl.source_changed();
         self.session = None;
         self.ctl.queue.clear();
         self.pending_open = None;
@@ -2292,20 +2317,42 @@ impl CommanderPane {
         }
     }
 
-    fn path_line(&mut self, ui: &mut egui::Ui) {
+    /// The partition tag and the cwd as crumbs; clicking a crumb navigates there.
+    fn path_line(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let mut go: Option<String> = None;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             let prefix = if self.ctl.listing.is_host() {
-                "host".to_string()
+                "host ".to_string()
             } else {
                 match self.selected_part {
-                    Some(i) => format!("@{}", i + 1),
-                    None => "-".to_string(),
+                    Some(i) => format!("@{} ", i + 1),
+                    None => "- ".to_string(),
                 }
             };
             ui.monospace(prefix);
-            let path = self.ctl.listing.cwd_path();
-            ui.monospace(if path.is_empty() { "/" } else { path });
+            let crumbs = self.ctl.path_crumbs();
+            if crumbs.is_empty() {
+                ui.monospace("/");
+            }
+            let last = crumbs.len().saturating_sub(1);
+            for (i, (label, target)) in crumbs.into_iter().enumerate() {
+                let text = egui::RichText::new(label).monospace();
+                match target {
+                    Some(t) if i < last => {
+                        if ui.link(text).clicked() {
+                            go = Some(t);
+                        }
+                    }
+                    _ => {
+                        ui.label(text);
+                    }
+                }
+            }
         });
+        let mut out = RowActions::default();
+        self.dispatch(CommanderPaneAction::NavigateTo(go?), &mut out);
+        out.status
     }
 
     // --- opening -----------------------------------------------------------
@@ -2334,6 +2381,7 @@ impl CommanderPane {
         super::super::push_recent(RecentMode::Commander, &path);
         self.recent = super::super::load_recent_merged();
         self.ctl.listing = DirListing::new();
+        self.ctl.source_changed();
         self.resolved_backup = None;
         self.archive_source = false;
         self.optical_source = false;
@@ -2425,6 +2473,7 @@ impl CommanderPane {
         self.fs_type = fs.fs_type().to_string();
         self.archive_source = true;
         let n = entries.len();
+        self.ctl.source_changed();
         self.ctl.listing.load_root(fs, root, entries, false);
         format!(
             "[{}] opened archive {} ({n} item(s)).",
@@ -2462,6 +2511,7 @@ impl CommanderPane {
         self.selected_part = Some(idx);
         self.error = None;
         self.ctl.listing = DirListing::new();
+        self.ctl.source_changed();
         self.ctl.queue.clear();
         let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
 
@@ -2496,6 +2546,7 @@ impl CommanderPane {
         self.total_size = 0;
         self.used_size = 0;
         let n = entries.len();
+        self.ctl.source_changed();
         self.ctl.listing.load_root(fs, root, entries, false);
         format!(
             "[{}] opened {} ({n} item(s)).",
@@ -2511,6 +2562,7 @@ impl CommanderPane {
     fn load_backup_source(&mut self, folder: PathBuf) -> String {
         self.source = Some(folder.clone());
         self.ctl.listing = DirListing::new();
+        self.ctl.source_changed();
         self.resolved_backup = None;
         self.archive_source = false;
         self.reset_optical();
@@ -2566,6 +2618,7 @@ impl CommanderPane {
         self.volume_label.clear();
         self.fs_type.clear();
 
+        self.ctl.source_changed();
         match self.ctl.listing.load_host_root(dir.clone()) {
             Ok(()) => format!(
                 "[{}] opened host folder {} ({} item(s)).",
@@ -2575,6 +2628,7 @@ impl CommanderPane {
             ),
             Err(e) => {
                 self.ctl.listing = DirListing::new();
+                self.ctl.source_changed();
                 self.error = Some(format!("Could not read folder: {e}"));
                 format!(
                     "[{}] failed to open folder {}",
@@ -2598,6 +2652,7 @@ impl CommanderPane {
         self.selected_part = Some(idx);
         self.error = None;
         self.ctl.listing = DirListing::new();
+        self.ctl.source_changed();
         self.ctl.queue.clear();
         self.pending_scan = None;
 
@@ -2788,12 +2843,14 @@ impl CommanderPane {
 
         match (fs, root) {
             (Some(fs), Some(root)) => {
+                self.ctl.source_changed();
                 self.ctl.listing.load_root(fs, root, entries, false);
                 if let Some((edits, cwd)) = self.reopen_restore.take() {
                     for e in edits {
                         self.ctl.queue.push(e);
                     }
-                    let _ = self.ctl.listing.navigate_to(&cwd);
+                    self.ctl.apply(CommanderPaneAction::NavigateTo(cwd));
+                    self.ctl.take_error();
                 }
                 Some(format!(
                     "[{}] opened {} ({} item(s)).",
@@ -3289,13 +3346,24 @@ impl CommanderPane {
                 } else {
                     SortColumn::Type
                 };
-                self.ctl.listing.resort(clicked);
+                self.ctl.apply(CommanderPaneAction::SortBy(clicked));
             }
         }
     }
 
     fn render_rows(&mut self, ui: &mut egui::Ui) -> RowActions {
+        let mut out = RowActions::default();
+        let keyed = !self.key_actions.is_empty();
+        for action in std::mem::take(&mut self.key_actions) {
+            self.dispatch(action, &mut out);
+        }
         let rows = self.display_rows();
+        let cursor = if self.has_focus {
+            self.ctl.cursor_index()
+        } else {
+            None
+        };
+        self.page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
         let busy = self.pending_apply.is_some();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
@@ -3306,11 +3374,8 @@ impl CommanderPane {
         // On a remote *host* pane, a file can be opened as a disk image.
         let remote_host = self.is_remote_host();
 
-        let mut to_enter: Option<String> = None;
-        let mut to_up = false;
-        let mut click: Option<(String, bool, bool)> = None;
-        let mut bg_deselect = false;
-        let mut ctx_rclick: Option<String> = None;
+        // Row clicks this frame, run through the controller in order once drawing is done.
+        let mut acts: Vec<CommanderPaneAction> = Vec::new();
         let mut m_delete = false;
         let mut m_host_delete = false;
         let mut m_copy = false;
@@ -3321,19 +3386,13 @@ impl CommanderPane {
         let mut m_cancel_rename: Option<String> = None;
         let mut m_info: Option<String> = None;
         let mut m_open_image: Option<String> = None;
-        // node_id, name, is_tree, is_wrapper, currently-expanded.
-        let mut m_toggle: Option<(String, String, bool, bool, bool)> = None;
-        // node_id, ctrl-held, shift-held — selecting a row inside an expanded wrapper.
-        let mut tree_click: Option<(String, bool, bool)> = None;
-        // node_id of a right-clicked tree row (selects it if not selected).
-        let mut tree_rclick: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mods = ui.input(|i| i.modifiers);
-                for row in &rows {
+                for (i, row) in rows.iter().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), ROW_H),
                         egui::Sense::click(),
@@ -3358,6 +3417,17 @@ impl CommanderPane {
                             ui.visuals().widgets.hovered.bg_fill,
                         );
                     }
+                    if cursor == Some(i) {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color),
+                            egui::StrokeKind::Inside,
+                        );
+                        if keyed {
+                            ui.scroll_to_rect(rect, None);
+                        }
+                    }
                     paint_row(ui, rect, row);
 
                     // The `+`/`-` disclosure occupies a fixed slot at the row's
@@ -3370,46 +3440,27 @@ impl CommanderPane {
                                 .interact_pointer_pos()
                                 .is_some_and(|p| p.x >= toggle_x0 && p.x < toggle_x0 + TOGGLE_W)
                     };
-                    let toggle_req = || {
-                        (
-                            row.node_id.clone(),
-                            row.name.clone(),
-                            row.is_tree,
-                            row.is_wrapper,
-                            row.expanded,
-                        )
-                    };
-
                     if resp.double_clicked() {
-                        if hit_toggle(&resp) {
-                            m_toggle = Some(toggle_req());
-                        } else if row.is_parent() {
-                            to_up = true;
-                        } else if row.is_tree {
-                            // Inside a wrapper: double-click expands a
-                            // folder/wrapper, or selects a file.
-                            if row.expandable {
-                                m_toggle = Some(toggle_req());
-                            } else {
-                                tree_click = Some((row.node_id.clone(), false, false));
-                            }
-                        } else if row.is_dir {
-                            to_enter = Some(row.name.clone());
-                        } else if row.is_wrapper {
-                            // Double-click a wrapper expands it in place.
-                            m_toggle = Some(toggle_req());
-                        } else if remote_host {
-                            m_open_image = Some(row.name.clone());
+                        acts.push(if hit_toggle(&resp) {
+                            CommanderPaneAction::ToggleWrapper(row.node_id.clone())
                         } else {
-                            m_info = Some(row.name.clone());
-                        }
+                            CommanderPaneAction::Activate(row.node_id.clone())
+                        });
                     } else if resp.clicked() {
                         if hit_toggle(&resp) {
-                            m_toggle = Some(toggle_req());
+                            acts.push(CommanderPaneAction::ToggleWrapper(row.node_id.clone()));
                         } else if row.is_tree {
-                            tree_click = Some((row.node_id.clone(), mods.command, mods.shift));
+                            acts.push(CommanderPaneAction::TreeClick {
+                                node_id: row.node_id.clone(),
+                                ctrl: mods.command,
+                                shift: mods.shift,
+                            });
                         } else if !row.is_parent() {
-                            click = Some((row.name.clone(), mods.command, mods.shift));
+                            acts.push(CommanderPaneAction::Click {
+                                name: row.name.clone(),
+                                ctrl: mods.command,
+                                shift: mods.shift,
+                            });
                         }
                     }
 
@@ -3513,11 +3564,11 @@ impl CommanderPane {
                             }
                         });
                         if menu.is_some() {
-                            if row.is_tree {
-                                tree_rclick = Some(row.node_id.clone());
+                            acts.push(if row.is_tree {
+                                CommanderPaneAction::TreeContextSelect(row.node_id.clone())
                             } else {
-                                ctx_rclick = Some(row.name.clone());
-                            }
+                                CommanderPaneAction::ContextSelect(row.name.clone())
+                            });
                         }
                     }
                 }
@@ -3527,107 +3578,17 @@ impl CommanderPane {
                 if remaining.y > 4.0 {
                     let (_r, bgr) = ui.allocate_exact_size(remaining, egui::Sense::click());
                     if bgr.clicked() {
-                        bg_deselect = true;
+                        acts.push(CommanderPaneAction::ClearSelection);
                     }
                 }
             });
 
         // Any row interaction marks this pane "active" for the middle Delete.
-        let focused = click.is_some()
-            || ctx_rclick.is_some()
-            || to_enter.is_some()
-            || to_up
-            || bg_deselect
-            || tree_click.is_some()
-            || tree_rclick.is_some()
-            || m_toggle.is_some();
-
-        let mut status = None;
-        if to_up {
-            self.ctl.listing.up();
+        out.focused = !acts.is_empty();
+        for action in acts {
+            self.dispatch(action, &mut out);
         }
-        if let Some(name) = to_enter {
-            if let Err(e) = self.ctl.listing.enter(&name) {
-                // A synchronous read that hits an encrypted, still-locked volume
-                // (belt-and-suspenders for the "directly through open" paths —
-                // for APFS the root listing already fails at open, but any FS
-                // that opens then errors deeper on a locked read lands here):
-                // surface the unlock prompt instead of a dead status line.
-                if self.session.is_some()
-                    && rusty_backup::model::browse_session::looks_like_password_error(
-                        &e.to_string(),
-                    )
-                {
-                    self.needs_password = true;
-                    self.error = None;
-                } else {
-                    status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
-                }
-            }
-        }
-        if bg_deselect {
-            self.ctl.listing.clear_selection();
-            self.clear_tree_selection();
-        }
-        if let Some((name, command, shift)) = click {
-            // A base-listing click takes over the selection from any wrapper.
-            self.clear_tree_selection();
-            if shift {
-                self.ctl.listing.shift_click(&name);
-            } else if command {
-                self.ctl.listing.ctrl_click(&name);
-            } else {
-                self.ctl.listing.click(&name);
-            }
-        }
-        // A click on a row inside an expanded wrapper takes over from the base
-        // selection (the two selection contexts are mutually exclusive).
-        if let Some((node_id, ctrl, shift)) = tree_click {
-            self.ctl.listing.clear_selection();
-            let anchor = self
-                .ctl
-                .tree_anchor
-                .clone()
-                .filter(|a| self.ctl.tree_index.contains_key(a));
-            if let (true, Some(anchor)) = (shift, anchor) {
-                let visible: Vec<TreeRow> = rows
-                    .iter()
-                    .filter(|r| r.is_tree)
-                    .filter_map(|r| self.ctl.tree_index.get(&r.node_id).cloned())
-                    .collect();
-                self.ctl.tree_selected = tree_range(&visible, &anchor, &node_id);
-            } else if ctrl {
-                if let Some(pos) = self.ctl.tree_selected.iter().position(|n| *n == node_id) {
-                    self.ctl.tree_selected.remove(pos);
-                } else {
-                    self.ctl.tree_selected.push(node_id.clone());
-                }
-                self.ctl.tree_anchor = Some(node_id);
-            } else {
-                self.ctl.tree_selected = vec![node_id.clone()];
-                self.ctl.tree_anchor = Some(node_id);
-            }
-        }
-        // A right-click on an unselected base row acts on just that row.
-        if let Some(name) = &ctx_rclick {
-            if !self.ctl.listing.is_selected(name) {
-                self.clear_tree_selection();
-                self.ctl.listing.click(name);
-            }
-        }
-        // A right-click on an unselected wrapper row acts on just that row.
-        if let Some(node_id) = &tree_rclick {
-            if !self.ctl.tree_selected.contains(node_id) {
-                self.ctl.listing.clear_selection();
-                self.ctl.tree_selected = vec![node_id.clone()];
-            }
-        }
-        // Expand / collapse a wrapper or inner folder.
-        if let Some((node_id, name, is_tree, is_wrapper, expanded)) = m_toggle {
-            if let Some(s) = self.toggle_wrapper(&node_id, &name, is_tree, is_wrapper, expanded) {
-                status = Some(s);
-            }
-        }
+        let mut status = out.status.take();
         if m_delete {
             let names: Vec<String> = self.ctl.listing.selection().to_vec();
             self.toggle_delete(&names);
@@ -3644,20 +3605,7 @@ impl CommanderPane {
             }
         }
         if let Some(name) = m_rename {
-            if let Some(entry) = self
-                .ctl
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.name == name)
-                .cloned()
-            {
-                self.rename_dialog = Some(RenameDialog {
-                    input: entry.name.clone(),
-                    entry,
-                    error: None,
-                });
-            }
+            self.open_rename(&name);
         }
         if let Some(name) = m_cancel_rename {
             if let Some(path) = self
@@ -3678,9 +3626,62 @@ impl CommanderPane {
             export: m_export,
             export_as: m_export_as,
             checksums: m_checksums,
-            detail: m_info,
-            open_image: m_open_image,
-            focused,
+            detail: m_info.or(out.detail),
+            open_image: m_open_image.or(out.open_image),
+            focused: out.focused,
+        }
+    }
+
+    /// Runs a pane action, turning its error and requests into this frame's row actions.
+    fn dispatch(&mut self, action: CommanderPaneAction, out: &mut RowActions) {
+        self.ctl.apply(action);
+        let side = self.side.label();
+        if let Some(e) = self.ctl.take_error() {
+            // A locked encrypted volume can open and then fail deeper: show the unlock prompt.
+            if self.session.is_some()
+                && rusty_backup::model::browse_session::looks_like_password_error(&e)
+            {
+                self.needs_password = true;
+                self.error = None;
+            } else {
+                out.status = Some(format!("[{side}] {e}"));
+            }
+        }
+        for req in self.ctl.take_requests() {
+            match req {
+                PaneRequest::OpenBaseWrapper { node_id, name } => {
+                    if let Some(s) = self.open_base_wrapper(&node_id, &name) {
+                        out.status = Some(s);
+                    }
+                }
+                PaneRequest::ShowInfo(name) => out.detail = Some(name),
+                PaneRequest::OpenImage(name) => out.open_image = Some(name),
+                PaneRequest::WrapperNote { name, note } => {
+                    out.status = Some(format!("[{side}] {name}: {note}"));
+                }
+                PaneRequest::WrapperFailed { name, detail } => {
+                    if let Some(s) = self.wrapper_open_failed(&name, detail) {
+                        out.status = Some(s);
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_rename(&mut self, name: &str) {
+        if let Some(entry) = self
+            .ctl
+            .listing
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+        {
+            self.rename_dialog = Some(RenameDialog {
+                input: entry.name.clone(),
+                entry,
+                error: None,
+            });
         }
     }
 }
