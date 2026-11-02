@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, TUI Explorer); step 3 (Inspect browse view) open |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); step 3 (Inspect browse view) planned below |
 
 Slice 3 notes, for the slices that follow:
 
@@ -302,7 +302,7 @@ tool), `inspect()` (fixed source, staging, bless / text / import / metadata), an
 
 Step 1 (4a1918a1): the move, `PaneProfile`, `open_fixed`, staging off. Behaviour unchanged.
 
-Step 2 (TUI Explorer):
+Step 2 (639c37e8, TUI Explorer):
 
 - The Explorer is the Commander screen with one pane: `CommanderController::single(services,
   keymap, PaneProfile::explorer())`, opened with `open_fixed(image, partition)` (the Inspect
@@ -335,6 +335,42 @@ Step 2 (TUI Explorer):
   tree takes no marks); the "Blessed:" crumb is gone; the volume opens through the browser
   pane's path (`BrowseSession`) instead of `cli::resolve`. Gained: rename, checksums, the
   session log, sort, wrapper expansion, the staged-edits list and the help window.
+
+Step 3 (Inspect browse view): not started; it is the size of slices 1-8 together.
+`src/gui/browse_view.rs` (7,218 lines, about 100 fields of state on `BrowseView`, lines 55-335)
+needs one decision first and then lands in parts, each green:
+
+- Decision: the browse view is one expandable tree (`render_tree_entry`, :1570, fed by the lazy
+  `FsRead` queue, :2034-2160). Either the Inspect profile turns `folder_tree` on and egui draws
+  tree + list like the TUI Explorer, or the pane grows a tree-only listing style
+  (`PaneProfile::listing: Flat | Tree`). The second keeps the Inspect look; the first is no new
+  controller code.
+- 3a, source and listing: `open_with_session` / `open` / `open_partclone` / `open_streaming`
+  (:647-745) and the password prompt (:225-230) become `open_fixed_session(BrowseSession)` on
+  the pane (partclone and streaming are session constructors in the model); selection and marks
+  (`selected_entry`, `marked`, :63-68, `marked_export_entries` :1776) become pane selection.
+- 3b, staging and apply: `staged_edits`, edit mode, `add_host_paths` / `stage_host_*`
+  (:3954-4106), `perform_delete` (:4512), `create_new_folder` (:6396), staging errors (:5747),
+  `start_apply` / `poll_apply_job` / follow-ups (:4534-4700), the conflict review (:4932) and the
+  unsaved-close dialog (:5013) map onto the pane's `stage_edits`, Apply, review, report and the
+  screen's close guard.
+- 3c, look inside: `select_file` / `render_content_panel` (:2163-2634) and the xattr cache become
+  the screen's File Info (`FileDetail` + its job); the ProDOS / HFS / perms / owner / xattr
+  editors (:175-189) already stage through `MetadataSink`, so they send `StageMetadata`.
+- 3d, take files out: extraction with its overwrite check (:2676-2830), `export_marked`
+  (:1835), archive export (:4337) and tar export (:3225) become the screen's export (ProDOS
+  export modes need a field on the export job).
+- 3e, tools: the text editor (:4758-4930, `load_editor_text` / `save_editor_text` :7153-7230)
+  becomes `EditText` / `SaveText`; fsck / repair (:5834-6170) becomes `Fsck` / `Repair`
+  (`ToolReport` needs the structured `FsckResult` for the debug toggle and the journal view);
+  the tree listing (:6184-6390) and boot blocks (:3920) become new tools.
+- 3f, archives: the Mac archive window (:5307), archive import (:4107-4320, :5106) and tar
+  import (:3476-3670) become wrapper expansion plus an `ImportArchive` tool.
+- 3g, source-level modes stay with the Inspect tab: CHD edit mode (:3001-3224), direct edit
+  (:3330), the SquashFS budget (:3352-3433) and the archive edit context (:763) decide how the
+  session opens for writing; the pane receives the resulting session. `take_nested_open`
+  (:2635) becomes the wrapper tree's open, handed to the host.
+- Then `src/gui/browse_view.rs` joins ENFORCED.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
