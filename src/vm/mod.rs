@@ -18,6 +18,7 @@
 //! - Tier A tests replay `tests/ui_scenarios/*.toml` against view-models (`tests/ui_scenarios.rs`).
 
 pub mod app;
+pub mod commander;
 pub mod log;
 
 /// The shape every view-model shares.
