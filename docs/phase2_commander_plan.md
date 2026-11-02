@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) planned below |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | steps 1-2 done (4a1918a1, 639c37e8); listing styles + quick view done (00835cc5, 55a57f48, b5eb93ac); step 3 (Inspect browse view) mostly done, the source-level modes and archive / tar import remain (see "Step 3 status") |
 
 Slice 3 notes, for the slices that follow:
 
@@ -389,8 +389,7 @@ decisions of 2026-11-02):
 - The Inspect browse view is the first to draw `side_detail` (step 3c); a folder still being
   listed is only a row flag (`loading`), so it draws its own "Loading..." child row.
 
-Step 3 (Inspect browse view): parts 3a, 3c and the editor half of 3e done; 3b and 3d in part
-(see "Step 3 status" below). It is the size of slices 1-8 together.
+Step 3 (Inspect browse view): 3a-3e done, 3f in part, 3g not started (see "Step 3 status" below). It is the size of slices 1-8 together.
 `src/gui/browse_view.rs` (7,218 lines, about 100 fields of state on `BrowseView`, lines 55-335)
 needs one decision first and then lands in parts, each green:
 
@@ -451,36 +450,70 @@ cache upgrade): the pane reopens the same path keeping the queue, folder and exp
   saves into its own folder.
 - 3d, part (81b52913, 8ca88cc1): "Export selected" is the screen's Export; the export drops
   entries inside another selected folder.
+- Marks across levels (e36d6438, user decision of 2026-11-02): in the combined tree a mark or a
+  ctrl-click no longer clears the other level, so the listing's selection and the deep rows'
+  together are the selection (`selected_entries` / `selected_pairs` return both; the wrapper tree's
+  stays exclusive, a Shift range stays in one folder, flat lists are unchanged). `Mark(node_id)`
+  toggles a row without moving the cursor; the Inspect checkboxes send it. Copy, delete, export and
+  checksums act on the mixed selection.
+- Text editing (user decision of 2026-11-02, reversed the same day): unchanged since 63749b6b. The
+  editor needs Edit Mode, Save stages, Apply writes (`the_text_editor_saves_a_file_deep_in_the_tree_back_to_its_folder_on_apply`).
+- 3b (e551ed46): `AddHostPaths { paths, folder }` (Add File, drops, the archive import's staging)
+  stages through `model::commander_ops::stage_host_for` (forks only into HFS, ProDOS `#TTAAAA`
+  names); names are legalised as a Commander copy's, and what cannot be staged is listed by
+  `staging_errors()` until `DismissStagingErrors`. Delete with nothing marked takes the cursor row;
+  `PaneProfile.confirm_folder_delete` (Inspect only) asks before staging the delete of a folder that
+  holds anything or was never listed (`purpose::DELETE_FOLDERS`). `staged_summary()` is the unsaved
+  dialog's summary; its Discard answers the pane's `DISCARD_STAGED`.
+- 3e (76962633): `inspect()` turns on fsck and repair. `ToolReport` carries `CheckSummary` /
+  `RepairSummary` (stats, errors, warnings with the debug flag, orphans by parent, repairable count)
+  beside its lines. `ListTree { ids }` (`take_tree_text`), `ShowJournal` (`take_journal`) and
+  `BootBlocks` (donor picked, read in a job, staged as `WriteBootBlocks`; `boot_blocks_present()`
+  probed in a job) are pane tools (`pane/volume.rs`). Check, tree, journal and the archive reads
+  borrow the reader the combined tree keeps for its folder listings (`take_reader` / `give_reader`).
+- 3d (84015e3b, 13a8f448): `model::extract` + `HostCopyJob::Extract`; `CommanderAction::Extract
+  { from, path, options, dest }` (a picker unless `dest`, which Open as Disk Image uses) runs through
+  the copy job and the shared Overwrite / Skip / Cancel review. `CommanderAction::ExportEntry { from,
+  path, format }` exports one entry or the whole volume (`/`) through the screen's export; a tar
+  export takes its compression from the picked name. `ExportFormat::StuffItHqx` (.sit.hqx) is new.
+- 3f, part (881da65b): `model::mac_archive_read`; `SniffArchive(path)` (own job slot, verdict in
+  `archive_sniff`) and `ReadArchive { path, purpose }` (`take_archive`). The view's second reader
+  (`cached_fs`, `take_or_open_fs`) is gone, so a large HFS+ catalog is read by the pane only.
+- `src/gui/browse_view.rs` 6,661 -> 4,752 lines; shells' engine references 775 -> 724.
 
-Remaining (lines in `src/gui/browse_view.rs` at 8ca88cc1):
+Remaining (lines in `src/gui/browse_view.rs` at 881da65b):
 
-- 3b: host staging `add_host_paths` / `stage_host_file` / `stage_host_directory` (:3800-3960,
-  intercepts tar and Mac archives, so it moves with 3f), `perform_delete` + its non-empty
-  confirmation (:4369, :4508), staging errors (:5380), the unsaved dialog's summary (:4670,
-  could be `edit_lines()`), free-space probe in the toolbar.
-- 3d: extraction with the overwrite check, ProDOS name modes and RS-to-LF
-  (`start_extraction` :2549, dialog :5286, `run_extraction` / `extract_entry` :6156-6300 move to
-  a model job + a screen action); Mac archive bundling `export_selection_as_archive` (:4190);
-  tar export `start_tar_export` (:3058).
-- 3e: check / repair and the fsck popup (:5467-5760, needs the structured `FsckResult` in
-  `ToolReport`), Journal (:1320), tree listing (:5816), boot blocks (:3764) as pane tools.
-- 3f: the Mac archive window (:4964), archive import (:3960, :4763), tar import (:3309), the
-  archive sniff (`ensure_archive_sniff` :920) and `pump_reads` (:2087, now only archive reads).
-- 3g: CHD edit mode (:2850-3060), direct edit (:3163), SquashFS budget (:3185), archive edit
-  (:2703), nested open (:2513) stay in the view; they still open the session themselves
-  (`take_or_open_fs` :6051) for the parts above.
-- The view keeps a second reader of its own (`cached_fs`) for those legacy tools, so a large
-  HFS+ catalog is read by the pane and again by the first legacy tool used.
+- 3f: the Mac archive window and its extract (`render_archive_browse_window` :3849,
+  `run_archive_window_extract` :3985), the Save-as / decode modal (`render_archive_extract_dialog`
+  :4037), archive import (`queue_archive_import_if_applicable` :3152, `apply_archive_import_extract`
+  :3206, `render_archive_import_dialog` :3648; it now stages through `AddHostPaths`), tar import
+  (`start_tar_import_dialog` :2708, `spawn_tar_job` :2735, `poll_tar_job` :2751, `tar_import_step`
+  :4662, `render_tar_add_dialog` :2784). The archive and tar intercepts look at top-level picks and
+  drops only (`add_host_paths`).
+- 3g, source-level modes (they open or rewrite the session themselves): CHD edit mode
+  (`enter_chd_edit_mode` :2395, `start_chd_flatten` :2483, `poll_chd_flatten` :2547), direct edit
+  (`enter_direct_edit_mode` :2599), the SquashFS budget (`open_squashfs_budget_dialog` :2621,
+  `poll_squashfs_measure` :2653), the archive edit context (`set_archive_edit_context` :631,
+  `start_archive_extract` :2249, `start_archive_compress` :2271, `poll_archive_edit` :2310), nested
+  open's free-space check (`start_nested_open` :2154), CHD Info (:1076).
+- Small leftovers: the free-space probe (:3066, opens the session editable in a job of its own),
+  Bless Folder (:2947) and ProDOS Lock / Unlock (:3015) still push onto the pane's queue directly
+  rather than through `Bless` (which asks first) or a pane action; the tree popup's Save writes the
+  file from the view.
+- Then `src/gui/browse_view.rs` joins ENFORCED (it still names the engine for the items above).
 
-Behaviour changes so far: marks are the pane's selection, so top-level rows and rows below an
-expanded folder are not marked together, and a checkbox moves the cursor; the root is a fixed
-`/` row (no collapse); archives and images inside the volume expand in place (wrappers), their
-rows show details only; the shared keys (arrows, Right / Left, Space, F2 rename, F8 delete,
-Ctrl+N, F9, Esc close) work once the tree is clicked; editing text needs Edit Mode and Save
-stages (Apply writes it); after Apply the selection clears and the tree reloads in place
-instead of freezing the window; HFS dates can be edited in the side panel.
+Behaviour changes so far: the root is a fixed `/` row (no collapse); archives and images inside
+the volume expand in place (wrappers), their rows show details only; the shared keys (arrows, Right
+/ Left, Space, F2 rename, F8 delete, Ctrl+N, F9, Esc close) work once the tree is clicked; editing
+text needs Edit Mode and Save stages (Apply writes it); after Apply the selection clears and the
+tree reloads in place instead of freezing the window; HFS dates can be edited in the side panel.
+Since 881da65b: host names a volume cannot hold are legalised (renamed, with a status line) rather
+than refused, and a tar or Mac archive inside a dropped folder is added as a plain file (only
+top-level picks and drops ask); Delete acts on the marks (else the cursor row) and the full-folder
+question is the shared confirmation; Repair needs Edit Mode; the extraction's overwrite question
+gains Skip and its progress is the copy job's window; the single-file BinHex export asks for a
+folder; Check reuses the pane's reader.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
-`scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
-swap `rfd` to `xdg-portal` for the check and swap it back; never commit the swap),
+`scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.
