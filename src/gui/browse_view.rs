@@ -2,37 +2,26 @@
 // info, reader, ctx, logging, etc. — multi-arg by design.
 #![allow(clippy::too_many_arguments)]
 
-use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use disk_core::entry::{EntryType, FileEntry};
-use dsk_clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    ArchiveUse, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue,
-    ExportFormat, ExtractOptions, ForkFormat, ImportChoice, JobRegistry, ListingStyle,
-    MacArchiveKind, PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot,
-    TarChoice,
+    format_size, ArchiveEditContext, ArchiveUse, BrowseSession, BrowserPaneAction, CommanderAction,
+    CommanderController, DisplayRow, EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry,
+    FileEntryTypeDisplay as _, ForkFormat, ImportChoice, JobRegistry, ListingStyle, MacArchiveKind,
+    ModeAction, PaneProfile, PaneServices, PartcloneCache, ResourceForkMode, RowKind, Side,
+    Snapshot, TarChoice, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
 };
-use rusty_backup::controller::Controller as _;
-use rusty_backup::fs::zstd_stream::ZstdStreamCache;
-use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
-use rusty_backup::model::browse_session::BrowseSession;
+use rusty_backup::controller::{Controller as _, Effect};
 use rusty_backup::model::edit_queue::StagedEdit;
-use rusty_backup::rbformats::chd_edit;
 
 use super::commander::pane::PaneView;
 use super::commander::DetailEditors;
 use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
 use super::metadata_editor;
-
-/// Smallest file offered "Open as Disk Image": below this nothing holds a partitioned volume.
-const MIN_NESTED_IMAGE_BYTES: u64 = 16 * 1024;
-/// Free space kept spare beyond the image size when copying it out for "Open as Disk Image".
-const NESTED_FREE_MARGIN: u64 = 64 * 1024 * 1024;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
@@ -53,6 +42,10 @@ fn new_controller() -> CommanderController {
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
+    /// Effects from a host call made outside `show`, run on the next frame.
+    pending_fx: Vec<Effect>,
+    /// The modes' volume generation the panel last followed.
+    generation_seen: u64,
     /// The browser pane (profile `inspect`): source, listing, tree, cursor, selection, queue.
     ctl: CommanderController,
     /// Pickers, confirmations and prompts the controller asks for.
@@ -67,13 +60,8 @@ pub struct BrowseView {
     cursor_seen: Option<String>,
     /// The user moved the cursor since the volume (re)opened; until then it selects nothing.
     cursor_armed: bool,
-    /// The session changed or the volume was written: the pane reopens on the next frame.
-    pane_stale: bool,
     /// The entry the content panel shows: the cursor row, or the root when its row is clicked.
     selected_entry: Option<FileEntry>,
-    /// Edits applied into a compressed CHD's diff that no flatten has
-    /// committed yet; closing on an empty queue deleted that diff silently.
-    chd_diff_dirty: bool,
     /// The side panel's preview and editor widgets, rebuilt when its detail changes.
     side_ed: DetailEditors,
     /// View mode for file content.
@@ -87,50 +75,26 @@ pub struct BrowseView {
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
     volume_used: u64,
-    /// "Full scan" toggle for the synthetic carve view: when off (default)
-    /// only the first `carve::DEFAULT_SCAN_LIMIT` bytes are scanned for
-    /// recoverable text; when on the whole image is scanned. Only shown for
-    /// carve filesystems. Flipping it re-opens the volume.
-    carve_full_scan: bool,
     volume_label: String,
     /// Optional prefix prepended to the volume label in the header (e.g. the
     /// Amiga drive name "DH0"). Set by the caller via `set_label_prefix`
     /// right after `open` so the header reads "Label: DH0 - Workbench". When
     /// the volume label is empty the prefix is shown on its own.
     label_prefix: String,
-    /// Where to open the filesystem from (path / preopen handle / caches).
-    /// `Clone` so background workers can be handed a session value.
-    session: BrowseSession,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
     /// Resource fork handling mode (HFS/HFS+ only).
     resource_fork_mode: ResourceForkMode,
     /// How to encode ProDOS type/aux on extract (ProDOS only).
     prodos_export_mode: ProdosExportMode,
-    /// List deleted entries the filesystem can still read (QNX 2).
-    show_deleted: bool,
     /// Convert RS line separators in text files to LF on extract (QNX 2).
     rs_to_lf: bool,
     /// An extraction runs as the screen's copy job; its status line becomes the result.
     extracting: bool,
     /// Message to show after extraction completes.
     extraction_result: Option<String>,
-    /// Temp dir an "Open as Disk Image" extraction is writing into, until it finishes.
-    nested_open: Option<tempfile::TempDir>,
-    /// A finished "Open as Disk Image" extraction, for the Inspect tab to load.
-    nested_ready: Option<(PathBuf, tempfile::TempDir)>,
-    /// Whether edit mode is enabled (allows adding/deleting files).
-    edit_mode: bool,
-    /// Whether editing is possible for this source (not Clonezilla/streaming).
-    edit_supported: bool,
     /// Status message from last edit operation.
     edit_result: Option<String>,
-    /// Context for backup archive editing (decompress → edit → recompress).
-    archive_edit_ctx: Option<ArchiveEditContext>,
-    /// Progress for archive edit background operations.
-    archive_edit_progress: Option<Arc<Mutex<ArchiveEditProgress>>>,
-    /// Temp file path while editing an archive (cleaned up on close/save).
-    archive_temp_path: Option<PathBuf>,
     /// Blessed (bootable) system folder info (HFS/HFS+ only).
     blessed_folder: Option<(u64, String)>,
     /// Whether the open HFS volume has boot blocks at sector 0 (`'LK'`).
@@ -138,25 +102,12 @@ pub struct BrowseView {
     /// edit mode where the backing bytes are raw. Drives the "Boot blocks:"
     /// status line and the "Boot Blocks…" button's hint.
     boot_blocks_present: Option<bool>,
-    /// CHD info popup text. `Some` while the popup is open.
-    chd_info_text: Option<String>,
     /// HFS+ journal history viewer. `Some` while the window is open.
     journal_view: Option<super::journal_view::JournalView>,
     /// Whether to show debug-level fsck messages.
     show_fsck_debug: bool,
-    /// The repair report on screen was seen, so its follow-ups ran once.
-    repair_seen: bool,
     /// The screen's export of the marked rows is running; its status line is the result.
     exporting: bool,
-    /// Backing up a CHD and opening its edit session, before edit mode starts.
-    chd_open_job: Option<
-        rusty_backup::model::job::Job<(
-            PathBuf,
-            Result<rusty_backup::model::chd_edit_open::ChdEditOpen, String>,
-        )>,
-    >,
-    /// The pane's Apply in flight: what to do once it lands, the queue size, and whether it wrote.
-    apply_follow: Option<(ApplyFollowUp, usize, bool)>,
     /// Cached tree-view text output.
     tree_text: Option<String>,
     /// Whether to show the tree-view popup.
@@ -169,63 +120,15 @@ pub struct BrowseView {
     /// laid-out text every frame and grinds to a halt at multi-MB sizes
     /// (originally hit on a 128 GB Amiga RDB partition).
     show_tree_large_dialog: bool,
-    /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
-    edit_free_space: Option<Option<u64>>,
-    /// The free-space probe in flight (an editable open decodes a whole container).
-    free_space_job: Option<rusty_backup::model::job::Job<Option<u64>>>,
     /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
     /// a SquashFS volume and choosing a ceiling. See
     /// [`super::squashfs_budget_dialog`].
     squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
-    /// Measuring a SquashFS for its budget dialog (walks the whole tree).
-    squashfs_measure_job:
-        Option<rusty_backup::model::job::Job<Result<fs_squashfs::squashfs_edit::SizePlan, String>>>,
-    /// Whether to show the "unsaved changes" confirmation dialog.
-    show_unsaved_dialog: bool,
     /// The text editor window, when open.
     text_editor: Option<GuiTextEditor>,
-    /// When true, a successful Discard/Apply from the unsaved dialog should
-    /// fully close the browse view rather than just leaving edit mode. Set by
-    /// the in-view Close intercept when staged edits force the dialog first.
-    pending_close: bool,
-    /// Live CHD edit-mode state. Present while editing a CHD via
-    /// [`chd_edit::ChdEditSession`] (diff-against-parent for compressed,
-    /// in-place for uncompressed). The `Arc<Mutex<ChdEditSession>>` itself
-    /// lives on `self.session.chd_edit_session`; this struct just holds the
-    /// paths needed to flatten / clean up on exit.
-    chd_edit: Option<ChdEditState>,
-    /// Background flatten progress (compressed CHD apply): merges the diff
-    /// into a fresh compressed CHD that overwrites the parent.
-    chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
-    /// When the CHD being edited is the body of a single-file-chd backup,
-    /// this carries the backup folder path so that on flatten-success we
-    /// can refresh `metadata.json` (per-partition checksums + container
-    /// SHA-1). `None` for plain CHD images that aren't part of a backup.
-    single_file_chd_backup_folder: Option<PathBuf>,
 
     /// User's password input text for the password prompt.
     password_input: String,
-}
-
-/// State carried for the duration of a CHD edit-mode session.
-struct ChdEditState {
-    /// Original CHD file the user is editing (and which `flatten_to_parent`
-    /// will overwrite on exit).
-    parent_path: PathBuf,
-    /// Companion diff file. `Some` for compressed CHDs; `None` when editing
-    /// an uncompressed CHD in place.
-    diff_path: Option<PathBuf>,
-}
-
-/// Background flatten progress for compressed CHD edit-apply. Mirrors
-/// [`ArchiveEditProgress`] but lives in the GUI crate so the worker thread
-/// can update it without pulling chd_edit into model/.
-struct ChdFlattenProgress {
-    current: u64,
-    total: u64,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
 }
 
 /// How to encode ProDOS file type/aux when extracting files to a host
@@ -261,6 +164,8 @@ enum ViewMode {
 impl Default for BrowseView {
     fn default() -> Self {
         Self {
+            pending_fx: Vec::new(),
+            generation_seen: 0,
             ctl: new_controller(),
             effects: EffectHost::default(),
             pane_view: PaneView::new(Side::Left),
@@ -268,57 +173,33 @@ impl Default for BrowseView {
             scroll_cursor: false,
             cursor_seen: None,
             cursor_armed: false,
-            pane_stale: false,
             selected_entry: None,
-            chd_diff_dirty: false,
             side_ed: DetailEditors::default(),
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
             volume_total: 0,
             volume_used: 0,
-            carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
             volume_label: String::new(),
             label_prefix: String::new(),
-            session: BrowseSession::new(),
             active: false,
             resource_fork_mode: ResourceForkMode::AppleDouble,
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
-            show_deleted: false,
             rs_to_lf: false,
             extracting: false,
             extraction_result: None,
-            nested_open: None,
-            nested_ready: None,
-            edit_mode: false,
-            edit_supported: false,
             edit_result: None,
-            archive_edit_ctx: None,
-            archive_edit_progress: None,
-            archive_temp_path: None,
             blessed_folder: None,
             boot_blocks_present: None,
-            chd_info_text: None,
             journal_view: None,
             show_fsck_debug: false,
-            repair_seen: false,
             exporting: false,
-            chd_open_job: None,
-            apply_follow: None,
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
             show_tree_large_dialog: false,
-            edit_free_space: None,
-            free_space_job: None,
-            show_unsaved_dialog: false,
             text_editor: None,
-            pending_close: false,
-            chd_edit: None,
-            chd_flatten_progress: None,
             squashfs_budget_dialog: None,
-            squashfs_measure_job: None,
-            single_file_chd_backup_folder: None,
             password_input: String::new(),
         }
     }
@@ -345,71 +226,38 @@ struct GuiTextEditor {
 }
 
 impl BrowseView {
-    /// The label of a running extract, archive edit, CHD flatten or tar export, if any.
+    /// The label of a running extract, source-level job, export, apply or volume tool, if any.
     pub fn running_job(&self) -> Option<&'static str> {
-        use rusty_backup::model::worker::lock_status;
+        let pane = self.ctl.pane(Side::Left);
         if self.extracting && self.ctl.copy_job().is_some() {
             Some("Extract")
-        } else if self
-            .archive_edit_progress
-            .as_ref()
-            .is_some_and(|p| !lock_status(p).finished)
-        {
-            Some("Archive edit")
-        } else if self
-            .chd_flatten_progress
-            .as_ref()
-            .is_some_and(|p| !lock_status(p).finished)
-        {
-            Some("CHD flatten")
+        } else if self.ctl.mode_working().is_some() {
+            Some("Edit Mode")
         } else if self.exporting && self.ctl.copy_job().is_some() {
             Some("Export")
-        } else if self.apply_follow.is_some() {
+        } else if pane.checking().is_some() || pane.applying().is_some() {
             Some("Apply edits")
-        } else if self.ctl.pane(Side::Left).archive_working().is_some() {
+        } else if pane.archive_working().is_some() {
             Some("Archive")
-        } else if self.ctl.pane(Side::Left).tool_working().is_some() {
+        } else if pane.tool_working().is_some() {
             Some("Volume tool")
         } else {
             None
         }
     }
 
-    /// Initialize the browser for a partition within a source image/device.
-    ///
-    /// `preopen_file` — if provided, this already-elevated file handle is used
-    /// for all filesystem reads instead of re-opening `source_path`.  Pass
-    /// `Some(file)` when browsing a raw device on macOS to avoid a second auth
-    /// prompt; pass `None` for backup files / image files.
-    /// Open the browser from a fully-built [`BrowseSession`]. This is the
-    /// low-level seam every other opener funnels through: it clears prior
-    /// browse state, installs the session, and spawns the async open + initial
-    /// root listing on a worker thread (`show()` drains the result each frame).
-    ///
-    /// It deliberately does **not** decide edit policy — `edit_supported`, the
-    /// WOZ/zstd `archive_edit_ctx`, the CHD-edit flow, and the single-file-chd
-    /// backup folder are layered by the caller after this returns (see `open`,
-    /// and the Inspect tab's resolver-driven routing).
+    /// Open the browser on a session the Inspect tab built; it starts read-only.
     pub fn open_with_session(&mut self, session: BrowseSession) {
         self.close();
-        self.session = session;
-        self.active = true;
-        self.reopen_pane();
-    }
-
-    /// Hand the pane the current session; it lists the volume in a job.
-    fn reopen_pane(&mut self) {
-        self.pane_stale = false;
-        let label = self
-            .session
+        let label = session
             .source_path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "partition".into());
-        self.ctl.open_fixed_session(self.session.clone(), &label);
-        self.cursor_seen = None;
-        self.cursor_armed = false;
+        self.active = true;
+        let fx = self.ctl.open_inspect(session, &label);
+        self.pending_fx.extend(fx);
     }
 
     /// The pane's staged-edit queue.
@@ -417,6 +265,7 @@ impl BrowseView {
         &self.ctl.pane(Side::Left).queue
     }
 
+    /// Open a partition of an image or device (`preopen_file`: an already elevated handle).
     pub fn open(
         &mut self,
         source_path: PathBuf,
@@ -426,7 +275,7 @@ impl BrowseView {
         preopen_file: Option<File>,
     ) {
         let session = BrowseSession {
-            source_path: Some(source_path.clone()),
+            source_path: Some(source_path),
             partition_offset,
             partition_type,
             partition_type_string,
@@ -434,98 +283,37 @@ impl BrowseView {
             ..Default::default()
         };
         self.open_with_session(session);
+        self.ctl.inspect_edit_in_place();
+    }
 
-        // Editing is supported for regular files (not Clonezilla/streaming).
-        self.edit_supported = true;
+    /// Open a Clonezilla partition through its partclone block cache.
+    pub fn open_partclone(&mut self, cache: PartcloneCache, partition_type: u8) {
+        self.open_with_session(BrowseSession::partclone(cache, partition_type));
+    }
 
-        // WOZ images still go through the decompress→edit→recompress
-        // archive flow (no in-place / diff support). CHDs use the lighter
-        // chd_edit path: nothing to set up here — the edit-mode toggle
-        // calls `enter_chd_edit_mode` which opens a `ChdEditSession`
-        // (diff-against-parent for compressed, in-place for uncompressed).
-        let ext = source_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "woz" {
-            let original_size = dsk_apple::woz::WozReader::open(&source_path)
-                .map(|r| r.len())
-                .unwrap_or(0);
-            log::info!(
-                "Container edit context set for {} ({} decoded bytes)",
-                source_path.display(),
-                original_size
-            );
-            self.archive_edit_ctx = Some(ArchiveEditContext {
-                archive_path: source_path.clone(),
-                compression_type: "woz".to_string(),
-                original_size,
-                compacted: false,
-                metadata_path: PathBuf::new(),
-                partition_index: 0,
-                checksum_type: String::new(),
-            });
+    /// Open a native zstd partition image as a stream until its seekable cache is ready.
+    pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
+        match BrowseSession::streaming(&path, ptype, ptype_str) {
+            Ok(session) => self.open_with_session(session),
+            Err(e) => {
+                self.close();
+                self.error = Some(e);
+                self.active = true;
+            }
         }
     }
 
-    /// Open the browser using a partclone block cache (for Clonezilla images).
-    pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
-        self.open_with_session(BrowseSession {
-            partclone_cache: Some(cache),
-            partition_type,
-            partition_offset: 0,
-            ..Default::default()
-        });
-    }
-
-    /// Open the browser by streaming a native zstd-compressed partition image.
-    ///
-    /// The filesystem opens immediately via a `ZstdStreamReader` backed by a
-    /// 256 MB in-memory buffer.  Call `upgrade_to_seekable_cache` once the
-    /// background seekable cache is ready to enable full random access.
-    pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
-        let cache = match ZstdStreamCache::new(&path) {
-            Ok(c) => Arc::new(Mutex::new(c)),
-            Err(e) => {
-                self.close();
-                self.error = Some(format!("Cannot open zstd stream: {e}"));
-                self.active = true;
-                return;
-            }
-        };
-        // Open + initial root listing on a worker thread so the UI can paint
-        // a spinner while a slow first read (NAS, large HFS+ catalog) runs.
-        self.open_with_session(BrowseSession {
-            partition_type: ptype,
-            partition_type_string: ptype_str,
-            partition_offset: 0,
-            zstd_cache: Some(cache),
-            ..Default::default()
-        });
-    }
-
-    /// Set a label prefix shown alongside the volume label in the header.
-    /// Used to surface the Amiga drive name (e.g. "DH0") so users don't lose
-    /// track of which RDB partition they're browsing when several share the
-    /// same volume name (or none have one). Pass an empty string to clear.
+    /// A prefix for the header's volume label, such as the Amiga drive name ("DH0"); empty clears it.
     pub fn set_label_prefix(&mut self, prefix: String) {
         self.label_prefix = prefix;
     }
 
-    /// Mark the open source as editable in place (no archive decompress flow).
-    /// `open` sets this for image/device sources; a resolver-built session
-    /// opened via [`open_with_session`](Self::open_with_session) starts
-    /// read-only, so the caller flips it on for raw / CHD backup partitions
-    /// (the edit-mode toggle then picks direct vs `chd_edit` by sniffing the
-    /// source). Compressed (zstd / woz) backups use
-    /// [`set_archive_edit_context`](Self::set_archive_edit_context) instead.
+    /// The open source may be edited in place (raw or CHD backup partitions, remote images).
     pub fn mark_edit_supported(&mut self) {
-        self.edit_supported = true;
+        self.ctl.inspect_edit_in_place();
     }
 
-    /// Set up archive edit context so that toggling edit mode triggers
-    /// decompress → edit → recompress flow instead of direct editing.
+    /// The open backup partition is edited by decompressing, editing, then recompressing it.
     pub fn set_archive_edit_context(
         &mut self,
         archive_path: PathBuf,
@@ -536,7 +324,7 @@ impl BrowseView {
         partition_index: usize,
         checksum_type: String,
     ) {
-        self.archive_edit_ctx = Some(ArchiveEditContext {
+        self.ctl.inspect_edit_archive(ArchiveEditContext {
             archive_path,
             compression_type,
             original_size,
@@ -545,35 +333,29 @@ impl BrowseView {
             partition_index,
             checksum_type,
         });
-        self.edit_supported = true;
     }
 
-    /// Mark the currently-open CHD as the body of a single-file-chd backup.
-    /// On a successful chd_edit flatten we'll refresh the backup's
-    /// `metadata.json` (per-partition SHA-256 + container SHA-1).
+    /// The open CHD is the body of this single-file-chd backup; a save refreshes its metadata.
     pub fn set_single_file_chd_backup_folder(&mut self, backup_folder: PathBuf) {
-        self.single_file_chd_backup_folder = Some(backup_folder);
+        self.ctl.inspect_backup_folder(backup_folder);
     }
 
-    /// (`zstd_cache` is `Some`).  The directory cache is preserved so the
-    /// user stays in the same place in the tree.
+    /// The streamed backup's seekable cache is ready; the tree stays where it is.
     pub fn upgrade_to_seekable_cache(&mut self, cache_path: PathBuf) {
-        if !self.active || self.session.zstd_cache.is_none() {
-            return;
+        if self.active {
+            let act = CommanderAction::Mode(ModeAction::UpgradeSeekable(cache_path));
+            let fx = self.ctl.apply(act);
+            self.pending_fx.extend(fx);
         }
-        self.session.source_path = Some(cache_path);
-        self.session.zstd_cache = None;
-        self.pane_stale = true;
     }
 
     pub fn close(&mut self) {
-        // A fresh pane drops the old one's readers before any CHD diff below is removed.
-        self.ctl = new_controller();
+        // The old pane's readers go before its CHD diff or archive temp is removed.
+        std::mem::replace(&mut self.ctl, new_controller()).close_inspect();
+        self.pending_fx.clear();
         self.effects = EffectHost::default();
         self.keys_active = false;
         self.cursor_seen = None;
-        self.edit_free_space = None;
-        self.free_space_job = None;
         self.selected_entry = None;
         self.side_ed = DetailEditors::default();
         self.error = None;
@@ -583,11 +365,8 @@ impl BrowseView {
         self.volume_used = 0;
         self.volume_label.clear();
         self.label_prefix.clear();
-        self.session = BrowseSession::new();
         self.extracting = false;
         self.extraction_result = None;
-        self.edit_mode = false;
-        self.edit_supported = false;
         self.edit_result = None;
         self.blessed_folder = None;
         self.journal_view = None;
@@ -595,25 +374,13 @@ impl BrowseView {
         self.show_tree_popup = false;
         self.show_tree_large_dialog = false;
         self.tree_show_ids = false;
-        self.show_unsaved_dialog = false;
-        self.pending_close = false;
         self.password_input.clear();
-        // Clean up archive temp file if present
-        if let Some(temp) = self.archive_temp_path.take() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        self.archive_edit_ctx = None;
-        self.archive_edit_progress = None;
-        // Drop any live CHD edit session and remove its diff. The parent
-        // CHD is left untouched; user's `.chd_backup` is preserved.
-        self.discard_chd_edit_session();
-        self.chd_flatten_progress = None;
-        self.single_file_chd_backup_folder = None;
         // Dialogs and editors that name a file on the volume being closed;
         // left open, their Save/Overwrite acted on the next volume.
         self.text_editor = None;
         self.boot_blocks_present = None;
-        self.pane_stale = false;
+        self.squashfs_budget_dialog = None;
+        self.generation_seen = 0;
     }
 
     pub fn is_active(&self) -> bool {
@@ -625,7 +392,7 @@ impl BrowseView {
     /// a source switch behind its own confirm dialog (see Inspect's deferred
     /// source-switch guard) before calling [`close`](Self::close).
     pub fn has_unsaved_edits(&self) -> bool {
-        self.active && self.edit_mode && (!self.queue().is_empty() || self.chd_diff_dirty)
+        self.active && self.ctl.has_unsaved_edits()
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -695,9 +462,7 @@ impl BrowseView {
                 });
         }
         self.poll_export(ui);
-        self.poll_chd_open_job();
-        if let Some(job) = &self.chd_open_job {
-            let snap = job.snapshot();
+        if let Some(snap) = self.ctl.mode_working() {
             egui::Window::new(snap.label.clone())
                 .collapsible(false)
                 .resizable(false)
@@ -706,14 +471,14 @@ impl BrowseView {
                 });
         }
 
-        if self.pane_stale {
-            self.reopen_pane();
-        }
-        self.ctl.host_pane().set_read_only(!self.edit_mode);
         let ctx = ui.ctx().clone();
-        let fx = self.ctl.tick();
+        let mut fx = std::mem::take(&mut self.pending_fx);
+        fx.extend(self.ctl.tick());
         self.run_effects(&ctx, fx);
-        self.poll_apply();
+        self.poll_modes();
+        if !self.active {
+            return;
+        }
         if self.ctl.is_working() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -766,10 +531,9 @@ impl BrowseView {
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Unlock").clicked() || enter {
                         let secret = self.password_input.clone();
-                        self.session.password = Some(secret.clone());
                         self.error = None;
-                        let act = BrowserPaneAction::SubmitPassword(secret);
-                        self.ctl.apply(CommanderAction::Pane(Side::Left, act));
+                        let act = CommanderAction::Mode(ModeAction::Password(secret));
+                        self.dispatch(&ctx, act);
                     }
                 });
             });
@@ -789,9 +553,9 @@ impl BrowseView {
                 let free = self.volume_total.saturating_sub(self.volume_used);
                 ui.label(format!(
                     "{} used / {} ({} free)",
-                    disk_core::display::format_size(self.volume_used),
-                    disk_core::display::format_size(self.volume_total),
-                    disk_core::display::format_size(free),
+                    format_size(self.volume_used),
+                    format_size(self.volume_total),
+                    format_size(free),
                 ))
                 .on_hover_text("Volume space: used / total (free)");
             }
@@ -809,7 +573,7 @@ impl BrowseView {
             }
             // Boot-block status (edit mode, HFS volumes). A bootable volume
             // needs both a blessed System Folder and boot blocks at sector 0.
-            if self.edit_mode && self.is_hfs_type() {
+            if self.ctl.edit_mode() && self.is_hfs_type() {
                 match self.boot_blocks_present {
                     Some(true) => {
                         ui.label("Boot blocks: present")
@@ -837,95 +601,48 @@ impl BrowseView {
             // image. Flipping it re-opens the volume so the new policy applies.
             if self.fs_type == "Raw carve (no filesystem)" {
                 ui.add_space(8.0);
-                let resp = ui.checkbox(&mut self.carve_full_scan, "Full scan");
-                let limit_mb = rusty_backup::fs::carve::DEFAULT_SCAN_LIMIT / (1024 * 1024);
+                let mut full = self.ctl.carve_full_scan();
+                let resp = ui.checkbox(&mut full, "Full scan");
+                let limit_mb = self.ctl.carve_scan_limit_mb();
                 resp.clone().on_hover_text(format!(
                     "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
                      On: scan the entire image (slower on large disks).\n\
                      'whole-disk.img' is always the full image regardless."
                 ));
                 if resp.changed() {
-                    rusty_backup::fs::carve::set_full_scan(self.carve_full_scan);
                     self.error = None;
-                    self.invalidate_cached_fs();
+                    let act = CommanderAction::Mode(ModeAction::CarveFullScan(full));
+                    self.dispatch(&ctx, act);
                 }
             }
 
             if self.fs_type == "QNX 2" {
                 ui.add_space(8.0);
-                let resp = ui.checkbox(&mut self.show_deleted, "Show deleted");
+                let mut deleted = self.ctl.show_deleted();
+                let resp = ui.checkbox(&mut deleted, "Show deleted");
                 resp.clone().on_hover_text(
                     "List deleted entries whose data can still be read, named 'NAME [deleted]'.",
                 );
                 if resp.changed() {
-                    self.session.show_deleted = self.show_deleted;
-                    self.invalidate_all_caches();
+                    let act = CommanderAction::Mode(ModeAction::ShowDeleted(deleted));
+                    self.dispatch(&ctx, act);
                 }
             }
 
             // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
-            if self.edit_supported && self.fs_type != "Pilot/Cedar" {
-                let busy = self.extracting
-                    || self.archive_edit_progress.is_some()
-                    || self.chd_flatten_progress.is_some();
+            if self.ctl.edit_supported() && self.fs_type != "Pilot/Cedar" {
+                let busy = self.extracting || self.ctl.mode_working().is_some();
                 ui.add_space(8.0);
-                let edit_btn = if self.edit_mode {
+                let edit_btn = if self.ctl.edit_mode() {
                     egui::Button::new("Edit Mode ON")
                 } else {
                     egui::Button::new("Edit Mode")
                 };
                 let btn = ui.add_enabled(!busy, edit_btn);
                 if btn.clicked() {
-                    log::info!(
-                        "Edit Mode clicked: archive_edit_ctx={}, chd_edit={}, edit_mode={}",
-                        self.archive_edit_ctx.is_some(),
-                        self.chd_edit.is_some(),
-                        self.edit_mode
-                    );
-                    if self.is_chd_source() {
-                        // CHD editing: open ChdEditSession on entry; flatten
-                        // the diff back into the parent on exit.
-                        if !self.edit_mode {
-                            self.enter_chd_edit_mode();
-                        } else if !self.ctl.pane(Side::Left).queue.is_empty() {
-                            self.show_unsaved_dialog = true;
-                        } else {
-                            self.exit_edit_mode();
-                        }
-                    } else if self.archive_edit_ctx.is_some() {
-                        // Archive editing: toggle triggers decompress/recompress
-                        if !self.edit_mode {
-                            log::info!("Starting archive extract for editing");
-                            self.start_archive_extract();
-                        } else if !self.ctl.pane(Side::Left).queue.is_empty() {
-                            self.show_unsaved_dialog = true;
-                        } else {
-                            self.start_archive_compress();
-                        }
-                    } else {
-                        // Direct editing (raw image / device)
-                        if self.edit_mode
-                            && (!self.ctl.pane(Side::Left).queue.is_empty() || self.chd_diff_dirty)
-                        {
-                            self.show_unsaved_dialog = true;
-                        } else if !self.edit_mode {
-                            // SquashFS has to declare a size budget before any
-                            // edit is made — it has no free space to consult and
-                            // no in-place write, so "will this still fit?" can
-                            // only be answered as a ceiling chosen up front.
-                            // The dialog answers it and re-runs this entry when
-                            // the user commits. See docs/squashfs_edit.md §2.
-                            if !self.open_squashfs_budget_dialog() {
-                                self.enter_direct_edit_mode();
-                            }
-                        } else {
-                            self.edit_mode = false;
-                            self.edit_result = None;
-                            self.ctl.host_pane().queue.clear();
-                        }
-                    }
+                    self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ToggleEditMode));
                 }
-                if !self.edit_mode && btn.hovered() {
+                if !self.ctl.edit_mode() && btn.hovered() {
                     btn.on_hover_text("Enable editing to add or delete files on this image");
                 }
             }
@@ -934,7 +651,7 @@ impl BrowseView {
             // .tar). Preserves case-sensitive names + real symlinks (data
             // fork only) so a case-insensitive host won't clobber files that
             // differ only in case. Runs on a worker thread.
-            if !self.edit_mode && self.ctl.copy_job().is_none() {
+            if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
                 let btn = ui.button("Export to .tar.gz...");
                 if btn.hovered() {
                     btn.clone().on_hover_text(
@@ -960,17 +677,8 @@ impl BrowseView {
                 self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
             }
 
-            if self.is_chd_source() {
-                if let Some(chd_path) = self.session.source_path.clone() {
-                    if ui.button("CHD Info").clicked() {
-                        match rusty_backup::rbformats::chd::format_chd_info(&chd_path) {
-                            Ok(text) => self.chd_info_text = Some(text),
-                            Err(e) => {
-                                self.error = Some(format!("CHD Info failed: {}", e));
-                            }
-                        }
-                    }
-                }
+            if self.ctl.is_chd_source() && ui.button("CHD Info").clicked() {
+                self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ChdInfo));
             }
 
             if ui.button("Tree").clicked() {
@@ -987,13 +695,7 @@ impl BrowseView {
             });
 
             if ui.button("Close").clicked() {
-                if self.edit_mode
-                    && (!self.ctl.pane(Side::Left).queue.is_empty() || self.chd_diff_dirty)
-                {
-                    self.show_unsaved_dialog = true;
-                } else {
-                    self.close();
-                }
+                self.request_close();
             }
         });
 
@@ -1026,52 +728,17 @@ impl BrowseView {
             });
         }
 
-        // Archive edit progress bar
-        self.poll_archive_edit(ui);
-        if let Some(progress) = &self.archive_edit_progress {
-            if let Ok(p) = progress.lock() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("{}...", p.phase));
-                    if p.total > 0 {
-                        let frac = p.current as f32 / p.total as f32;
-                        ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    }
-                });
-                ui.ctx().request_repaint();
-            }
-        }
-
         // The SquashFS size-budget dialog, and the edit-mode entry it gates.
-        self.poll_squashfs_measure(ui);
         self.poll_squashfs_budget_dialog(ui);
 
-        // Background tar-export progress (Export to .tar.gz...).
-
-        // CHD flatten progress bar (compressed CHD edit-apply)
-        self.poll_chd_flatten(ui);
-        if let Some(progress) = &self.chd_flatten_progress {
-            if let Ok(p) = progress.lock() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Flattening CHD...");
-                    if p.total > 0 {
-                        let frac = p.current as f32 / p.total as f32;
-                        ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    }
-                });
-                ui.ctx().request_repaint();
-            }
-        }
-
         // Info banner while editing an archive
-        if self.edit_mode && self.archive_edit_ctx.is_some() {
+        if self.ctl.editing_archive() {
             ui.colored_label(
                 super::theme::info(ui.visuals()),
                 "Editing temporary copy. Click 'Apply Edits' to write changes.",
             );
         }
-        if self.edit_mode && self.chd_edit.is_some() {
+        if self.ctl.editing_chd() {
             ui.colored_label(
                 super::theme::info(ui.visuals()),
                 "Editing CHD via diff. Click 'Apply Edits' to flush, or exit Edit Mode to merge into the CHD.",
@@ -1079,14 +746,14 @@ impl BrowseView {
         }
 
         // Edit mode toolbar
-        if self.edit_mode {
+        if self.ctl.edit_mode() {
             self.render_edit_toolbar(ui);
         }
 
         ui.separator();
 
         // Show drop target overlay when files are being dragged over
-        if self.edit_mode {
+        if self.ctl.edit_mode() {
             let hovered = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
             if hovered {
                 ui.colored_label(
@@ -1254,7 +921,7 @@ impl BrowseView {
     }
 
     /// Carry out the pane's effects; answers go straight back to it.
-    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<rusty_backup::controller::Effect>) {
+    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<Effect>) {
         let mut messages = Vec::new();
         let replies = self.effects.run(ctx, fx, &mut messages);
         for m in messages {
@@ -1289,10 +956,36 @@ impl BrowseView {
 
     /// Close, after the unsaved-edits dialog when edits wait.
     fn request_close(&mut self) {
-        if self.edit_mode && (!self.queue().is_empty() || self.chd_diff_dirty) {
-            self.pending_close = true;
-            self.show_unsaved_dialog = true;
-        } else {
+        self.ctl
+            .apply(CommanderAction::Mode(ModeAction::RequestClose));
+        if self.ctl.take_close_request() {
+            self.close();
+        }
+    }
+
+    /// What the modes ended with: notices, errors, a close, a size budget to ask for, a write.
+    fn poll_modes(&mut self) {
+        if let Some(said) = self.ctl.take_mode_notice() {
+            self.edit_result = Some(said);
+        }
+        if let Some(e) = self.ctl.take_mode_error() {
+            self.error = Some(e);
+        }
+        if let Some(plan) = self.ctl.take_size_plan() {
+            self.squashfs_budget_dialog = Some(Box::new(
+                super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
+            ));
+        }
+        let generation = self.ctl.volume_generation();
+        if generation != self.generation_seen {
+            // The volume was reopened or written: what the panel showed may be gone.
+            self.generation_seen = generation;
+            self.selected_entry = None;
+            self.side_ed = DetailEditors::default();
+            self.cursor_seen = None;
+            self.cursor_armed = false;
+        }
+        if self.ctl.take_close_request() {
             self.close();
         }
     }
@@ -1708,11 +1401,7 @@ impl BrowseView {
                 (None, Some(c)) => format!("?/{c} "),
                 (None, None) => String::new(),
             };
-            format!(
-                "[{}+rsrc {}]",
-                codes,
-                disk_core::display::format_size(imp.data.len() as u64)
-            )
+            format!("[{}+rsrc {}]", codes, format_size(imp.data.len() as u64))
         });
         let label = if entry.is_directory() {
             format!("+ {}", entry.name)
@@ -1861,7 +1550,14 @@ impl BrowseView {
                         .clicked()
                 {
                     let ctx = ui.ctx().clone();
-                    self.start_nested_open(&ctx, &entry);
+                    self.extracting = true;
+                    self.extraction_result = None;
+                    let act = CommanderAction::Mode(ModeAction::OpenNested(entry.path.clone()));
+                    self.dispatch(&ctx, act);
+                    if self.ctl.copy_job().is_none() {
+                        self.extracting = false;
+                        self.extraction_result = Some(self.ctl.status().to_string());
+                    }
                 }
 
                 // Workflow C: the selection already sniffed as a
@@ -1959,7 +1655,7 @@ impl BrowseView {
         if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
             ui.label(format!(
                 "File too large to preview ({}).",
-                disk_core::display::format_size(entry.size)
+                format_size(entry.size)
             ));
             return;
         }
@@ -1985,7 +1681,7 @@ impl BrowseView {
         // Editing is offered only where it is safe: a text preview means the content decoded cleanly.
         if matches!(self.side_ed.content, Some(FileContent::Text(_)))
             && ui
-                .add_enabled(self.edit_mode, egui::Button::new("Edit as text..."))
+                .add_enabled(self.ctl.edit_mode(), egui::Button::new("Edit as text..."))
                 .on_disabled_hover_text("Turn on Edit Mode to edit this file.")
                 .clicked()
         {
@@ -2039,42 +1735,7 @@ impl BrowseView {
     /// Start extracting the selected entry to a user-chosen folder.
     /// A finished "Open as Disk Image" copy: the image path and the temp dir that owns it.
     pub fn take_nested_open(&mut self) -> Option<(PathBuf, tempfile::TempDir)> {
-        self.nested_ready.take()
-    }
-
-    /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
-    fn start_nested_open(&mut self, ctx: &egui::Context, entry: &FileEntry) {
-        if !self.ctl.pane(Side::Left).queue.is_empty() {
-            self.extraction_result = Some(
-                "Apply or discard the staged edits first: opening a disk image replaces this view."
-                    .to_string(),
-            );
-            return;
-        }
-        let temp = match tempfile::Builder::new().prefix("rb-nested-").tempdir() {
-            Ok(t) => t,
-            Err(e) => {
-                self.extraction_result = Some(format!("Open as disk image failed: {e}"));
-                return;
-            }
-        };
-        let needed = entry.size.saturating_add(NESTED_FREE_MARGIN);
-        if let Some(free) = rusty_backup::os::available_space(temp.path()) {
-            if free < needed {
-                self.extraction_result = Some(format!(
-                    "Not enough free space to open {} as a disk image: it needs {} in {}, \
-                     which has {} free. Point TMPDIR at a larger drive, or extract it instead.",
-                    entry.name,
-                    super::bytes_human(needed),
-                    temp.path().parent().unwrap_or(temp.path()).display(),
-                    super::bytes_human(free),
-                ));
-                return;
-            }
-        }
-        let dest = temp.path().to_path_buf();
-        self.nested_open = Some(temp);
-        self.start_extraction(ctx, entry, Some(dest));
+        self.ctl.take_nested_open()
     }
 
     /// Extract `entry` through the screen (a picker unless `dest` is given; existing files are reviewed).
@@ -2137,442 +1798,6 @@ impl BrowseView {
         pane.entry_at(parent_path).filter(|e| e.is_directory())
     }
 
-    /// Start background extraction of an archive to a temp file for editing.
-    fn start_archive_extract(&mut self) {
-        let Some(ctx) = self.archive_edit_ctx.clone() else {
-            return;
-        };
-
-        // Create temp file next to the archive
-        let parent = ctx
-            .archive_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let temp_path = parent.join(format!(
-            "{}-edit.img",
-            ctx.archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-
-        self.archive_edit_progress = Some(archive_edit::start_extract(&ctx, temp_path));
-    }
-
-    /// Start background recompression of the edited temp file back to the archive.
-    fn start_archive_compress(&mut self) {
-        let Some(ctx) = self.archive_edit_ctx.clone() else {
-            return;
-        };
-        let Some(temp_path) = self.archive_temp_path.clone() else {
-            return;
-        };
-
-        // Disable edit mode immediately
-        self.edit_mode = false;
-        self.edit_free_space = None;
-        self.free_space_job = None;
-        self.edit_result = None;
-
-        // Close the browser while compressing to release the temp file.
-        self.ctl = new_controller();
-        self.selected_entry = None;
-        self.side_ed = DetailEditors::default();
-
-        self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
-    }
-
-    /// Point the session at the extracted temp and enter edit mode; also used
-    /// after a failed recompress so the edits there are saved, not re-extracted over.
-    fn adopt_archive_temp(&mut self, temp: PathBuf) {
-        self.archive_temp_path = Some(temp.clone());
-        self.session.source_path = Some(temp);
-        self.session.zstd_cache = None;
-        self.edit_mode = true;
-        self.edit_free_space = None;
-        self.free_space_job = None;
-
-        // The source bytes changed: the pane reopens on the temp file.
-        self.invalidate_cached_fs();
-        self.selected_entry = None;
-        self.side_ed = DetailEditors::default();
-    }
-
-    /// Poll archive edit background operations for completion.
-    fn poll_archive_edit(&mut self, ui: &egui::Ui) {
-        let progress_arc = match &self.archive_edit_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-
-        let Ok(p) = progress_arc.lock() else {
-            return;
-        };
-
-        if !p.finished {
-            ui.ctx().request_repaint();
-            return;
-        }
-
-        let phase = p.phase.clone();
-        let error = p.error.clone();
-        let temp_path = p.temp_path.clone();
-        drop(p);
-
-        self.archive_edit_progress = None;
-
-        if let Some(err) = error {
-            if phase == "Compressing" {
-                // The temp still holds the applied edits: re-adopt it so Close
-                // or Apply Edits can try the save again, not re-extract over it.
-                if let Some(temp) = self.archive_temp_path.clone() {
-                    self.adopt_archive_temp(temp);
-                }
-                self.edit_result = Some(format!(
-                    "Error saving the archive: {err}. Your edits are still in the temporary \
-                     volume; use Close or Apply Edits to try saving again."
-                ));
-            } else {
-                self.edit_result = Some(format!("Error: {err}"));
-            }
-            return;
-        }
-
-        if phase == "Extracting" {
-            // Extraction done — switch source to temp file, enable editing.
-            // `partition_offset` is preserved: the temp file is byte-identical
-            // to the archive's decompressed content, so a partition that lived
-            // at offset N inside the original (e.g. an HFS volume inside a
-            // whole-disk APM CHD) is at offset N in the temp too. Resetting
-            // it to 0 here used to break edits of any non-single-partition
-            // container.
-            if let Some(temp) = temp_path {
-                self.adopt_archive_temp(temp);
-            }
-        } else {
-            // Compression done — re-open original archive for browsing.
-            // Preserve `partition_offset` for the same reason as above: the
-            // recompressed archive's logical bytes match the temp file, so
-            // the partition is still at the original offset.
-            if let Some(ctx) = &self.archive_edit_ctx {
-                self.session.source_path = Some(ctx.archive_path.clone());
-                self.archive_temp_path = None;
-                self.invalidate_cached_fs();
-                self.selected_entry = None;
-                self.side_ed = DetailEditors::default();
-                self.edit_result = Some("Changes saved successfully.".to_string());
-            }
-        }
-    }
-
-    /// True if the current session is editing a CHD file (extension match —
-    /// the chd_edit path covers both compressed and uncompressed CHDs).
-    fn is_chd_source(&self) -> bool {
-        self.session
-            .source_path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("chd"))
-            .unwrap_or(false)
-    }
-
-    /// Open a [`ChdEditSession`] for the current source CHD and install it
-    /// on `self.session.chd_edit_session` so subsequent reads / writes flow
-    /// through the diff (or in-place for uncompressed). Reloads the
-    /// filesystem from the live session so the browser reflects the
-    /// current state. On failure leaves edit_mode false and reports the
-    /// error via `edit_result`.
-    /// Back up the CHD and open an edit session as a job; the poll enters edit mode.
-    fn enter_chd_edit_mode(&mut self) {
-        if self.chd_open_job.is_some() {
-            return;
-        }
-        let Some(parent_path) = self.session.source_path.clone() else {
-            self.edit_result = Some("Error: no source path".to_string());
-            return;
-        };
-        self.chd_open_job = Some(rusty_backup::model::job::Job::spawn(
-            "Preparing CHD for editing...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                let opened =
-                    rusty_backup::model::chd_edit_open::open_for_editing(&parent_path, job);
-                Ok((parent_path, opened))
-            },
-        ));
-    }
-
-    fn poll_chd_open_job(&mut self) {
-        use rusty_backup::model::job::Status;
-        let Some(job) = &self.chd_open_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        self.chd_open_job = None;
-        let opened = match (snap.status, out) {
-            (Status::Done, Some((parent_path, Ok(opened)))) => (parent_path, opened),
-            (Status::Done, Some((_, Err(message)))) => {
-                self.edit_result = Some(message);
-                return;
-            }
-            (Status::Failed(e), _) => {
-                self.edit_result = Some(format!("Error opening CHD: {e}"));
-                return;
-            }
-            _ => return,
-        };
-        let (parent_path, opened) = opened;
-        let compressed = opened.compressed;
-        let arc = Arc::new(Mutex::new(opened.session));
-        self.session.chd_edit_session = Some(Arc::clone(&arc));
-        self.chd_edit = Some(ChdEditState {
-            parent_path,
-            diff_path: opened.diff_path,
-        });
-        self.edit_mode = true;
-        self.edit_free_space = None;
-        self.free_space_job = None;
-
-        // Reload the filesystem through the session so any pre-existing
-        // diff content is visible.
-        self.invalidate_all_caches();
-        log::info!(
-            "Entered CHD edit mode (compressed={compressed}, diff={})",
-            self.chd_edit
-                .as_ref()
-                .and_then(|s| s.diff_path.as_ref())
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none>".into())
-        );
-    }
-
-    /// Discard the live CHD edit session, deleting the diff (if any). The
-    /// parent CHD is left untouched. Caller is responsible for any UI state
-    /// transitions (clearing `edit_mode`, etc.).
-    fn discard_chd_edit_session(&mut self) {
-        self.chd_diff_dirty = false;
-        self.session.chd_edit_session = None;
-        self.pane_stale = true;
-        if let Some(state) = self.chd_edit.take() {
-            if let Some(diff) = state.diff_path {
-                if diff.exists() {
-                    let _ = std::fs::remove_file(&diff);
-                }
-            }
-        }
-    }
-
-    /// Apply the current CHD edit session by flattening the diff back into
-    /// the parent CHD. For uncompressed CHDs there's no diff — writes were
-    /// already in place — so this just drops the session and reloads.
-    /// Compressed CHDs spawn a background worker that calls
-    /// `flatten_to_parent`; progress is polled by `poll_chd_flatten`.
-    fn start_chd_flatten(&mut self) {
-        // The diff is being committed to the parent; nothing is unsaved now.
-        self.chd_diff_dirty = false;
-        let Some(state) = self.chd_edit.take() else {
-            return;
-        };
-
-        // Drop the session so the diff handle is released before flatten
-        // re-opens it via `reopen_with_diff`.
-        self.session.chd_edit_session = None;
-
-        let Some(diff_path) = state.diff_path else {
-            // Uncompressed: writes already landed in the parent. Just reload.
-            self.invalidate_all_caches();
-            self.edit_result = Some("Changes saved successfully.".to_string());
-            return;
-        };
-
-        let parent_path = state.parent_path;
-        let total = std::fs::metadata(&diff_path).map(|m| m.len()).unwrap_or(0);
-
-        let progress = Arc::new(Mutex::new(ChdFlattenProgress {
-            current: 0,
-            total,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-        }));
-        let progress_thread = Arc::clone(&progress);
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress),
-            "CHD flatten",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
-                let cancel = {
-                    let p = Arc::clone(&progress_thread);
-                    move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-                };
-                let result = chd_edit::flatten_to_parent(
-                    &parent_path,
-                    &diff_path,
-                    None,
-                    &mut |bytes| {
-                        if let Ok(mut p) = progress_thread.lock() {
-                            p.current = bytes;
-                        }
-                    },
-                    &cancel,
-                    &mut |msg| log::info!("{msg}"),
-                );
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.finished = true;
-                    if let Err(e) = result {
-                        p.error = Some(format!("{e:#}"));
-                    }
-                }
-                Ok(())
-            },
-        );
-        self.chd_flatten_progress = Some(progress);
-    }
-
-    /// Poll the background CHD flatten worker. On completion, reload the
-    /// filesystem from the freshly-merged parent CHD.
-    fn poll_chd_flatten(&mut self, ui: &egui::Ui) {
-        let progress_arc = match &self.chd_flatten_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-        let Ok(p) = progress_arc.lock() else { return };
-        if !p.finished {
-            ui.ctx().request_repaint();
-            return;
-        }
-        let error = p.error.clone();
-        drop(p);
-        self.chd_flatten_progress = None;
-
-        if let Some(err) = error {
-            self.edit_result = Some(format!("Error flattening CHD: {err}"));
-            return;
-        }
-        // Re-open the now-replaced parent CHD for browsing.
-        self.invalidate_all_caches();
-
-        // If the CHD is the body of a single-file-chd backup, refresh
-        // metadata.json so per-partition checksums + container SHA-1 stay
-        // in sync with the new container contents. Best-effort: failure
-        // surfaces in the edit result but doesn't roll back the save —
-        // the bytes on disk are already correct.
-        let mut result_msg = String::from("Changes saved successfully.");
-        if let Some(folder) = self.single_file_chd_backup_folder.clone() {
-            let mut log_lines: Vec<String> = Vec::new();
-            let mut log_cb = |s: &str| log_lines.push(s.to_string());
-            match rusty_backup::backup::single_file_chd::refresh_metadata_after_edit(
-                &folder,
-                &mut log_cb,
-            ) {
-                Ok(()) => {
-                    result_msg.push_str(" Backup metadata.json refreshed.");
-                }
-                Err(e) => {
-                    result_msg.push_str(&format!(
-                        " (Warning: failed to refresh backup metadata.json: {e:#})"
-                    ));
-                }
-            }
-        }
-        self.edit_result = Some(result_msg);
-    }
-
-    /// Poll the background tar-export worker: show a spinner while running,
-    /// and surface the result when it finishes.
-    /// Enter Edit Mode on a raw image / device, probing the editable open
-    /// up-front so guards like the journaled-HFS+ refusal surface here rather
-    /// than being deferred to the first edit.
-    fn enter_direct_edit_mode(&mut self) {
-        match self.session.open_editable() {
-            // Probe only: discard the fs + commit guard (no mutation, so a
-            // container is left intact).
-            Ok((_efs, _commit)) => {
-                self.edit_mode = true;
-                self.edit_free_space = None;
-                self.free_space_job = None;
-            }
-            Err(e) => {
-                self.error = Some(format!("Cannot enter edit mode: {e}"));
-            }
-        }
-    }
-
-    /// Open the size-budget dialog when this volume is a SquashFS that hasn't
-    /// been given a budget yet. Returns true when the dialog took over, meaning
-    /// the caller must not enter Edit Mode — [`Self::poll_squashfs_budget_dialog`]
-    /// does that once the user has chosen.
-    ///
-    /// Measuring walks the directory tree for file sizes only (no content is
-    /// decompressed), so this stays cheap even on a distro rootfs.
-    fn open_squashfs_budget_dialog(&mut self) -> bool {
-        if self.fs_type != "SquashFS" || self.session.rebuild_budget.is_some() {
-            return false;
-        }
-        if self.squashfs_measure_job.is_some() {
-            return true;
-        }
-        let session = self.session.clone();
-        // A partition bounds the image; a bare file at byte 0 is the image.
-        let capacity = (self.session.partition_offset != 0)
-            .then_some(self.session.partition_size)
-            .flatten();
-        self.squashfs_measure_job = Some(rusty_backup::model::job::Job::spawn(
-            "Measuring the image...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                let mut fs = match session.open() {
-                    Ok(fs) => fs,
-                    Err(e) => return Ok(Err(format!("Cannot measure this image: {e}"))),
-                };
-                let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
-                Ok(
-                    fs_squashfs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity)
-                        .map_err(|e| format!("Cannot measure this image: {e}")),
-                )
-            },
-        ));
-        true
-    }
-
-    /// Open the budget dialog once the measurement lands.
-    fn poll_squashfs_measure(&mut self, ui: &mut egui::Ui) {
-        let Some(job) = &self.squashfs_measure_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            egui::Window::new(snap.label.clone())
-                .collapsible(false)
-                .resizable(false)
-                .show(ui.ctx(), |ui| {
-                    super::progress::show_job(ui, &snap);
-                });
-            return;
-        }
-        let out = job.take_result();
-        self.squashfs_measure_job = None;
-        match out {
-            Some(Ok(plan)) => {
-                self.squashfs_budget_dialog = Some(Box::new(
-                    super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
-                ));
-            }
-            Some(Err(e)) => self.error = Some(e),
-            None => {
-                if let rusty_backup::model::job::Status::Failed(e) = snap.status {
-                    self.error = Some(format!("Cannot measure this image: {e}"));
-                }
-            }
-        }
-    }
-
     /// Draw the budget dialog and act on its outcome: a chosen budget is
     /// installed on the session and Edit Mode is entered; cancelling just
     /// closes, leaving the volume read-only.
@@ -2584,9 +1809,9 @@ impl BrowseView {
         let outcome = dialog.take_outcome();
         let closed = dialog.is_closed();
         if let Some(budget) = outcome {
-            self.session.rebuild_budget = budget;
             self.squashfs_budget_dialog = None;
-            self.enter_direct_edit_mode();
+            let act = CommanderAction::Mode(ModeAction::SetBudget(Some(budget)));
+            self.dispatch(&ui.ctx().clone(), act);
         } else if closed {
             self.squashfs_budget_dialog = None;
         }
@@ -2739,55 +1964,24 @@ impl BrowseView {
                     .on_disabled_hover_text("Wait for the running extraction or export to finish")
                     .clicked()
                 {
-                    self.start_apply(ApplyFollowUp::RecompressArchive);
+                    self.dispatch(&ui.ctx().clone(), CommanderAction::Mode(ModeAction::Apply));
                 }
             }
 
             ui.add_space(8.0);
 
-            // Free space, probed once per edit session and again after each write:
-            // opening the editable volume decodes a whole container.
-            if self.edit_free_space.is_none() {
-                match &self.free_space_job {
-                    Some(job) if !job.is_running() => {
-                        self.edit_free_space = Some(job.take_result().flatten());
-                        self.free_space_job = None;
-                    }
-                    Some(_) => {}
-                    // Never alongside one of this view's writes.
-                    None if self.running_job().is_none() => {
-                        let session = self.session.clone();
-                        self.free_space_job = Some(rusty_backup::model::job::Job::spawn(
-                            "Free space",
-                            Arc::new(super::ui_logger::EguiWake),
-                            move |_| {
-                                Ok(session
-                                    .open_editable()
-                                    .ok()
-                                    .and_then(|(mut efs, _commit)| efs.free_space().ok()))
-                            },
-                        ));
-                    }
-                    None => {}
-                }
-            }
-            if let Some(Some(free)) = self.edit_free_space {
-                ui.label(format!("Free: {}", disk_core::display::format_size(free)));
-
-                if !self.ctl.pane(Side::Left).queue.is_empty() {
-                    let delta = self.ctl.pane(Side::Left).queue.space_delta();
-                    let projected = free.saturating_add(delta.freed).saturating_sub(delta.added);
-                    let color = if delta.added > free + delta.freed {
-                        super::theme::danger(ui.visuals()) // red — won't fit
-                    } else if projected < free / 10 {
-                        super::theme::warning(ui.visuals()) // yellow — tight
+            // Free space, probed in a job once per edit session and again after each write.
+            if let Some(space) = self.ctl.space() {
+                ui.label(format!("Free: {}", format_size(space.free)));
+                if let Some(after) = space.after {
+                    let color = if space.overflows {
+                        super::theme::danger(ui.visuals())
+                    } else if space.tight {
+                        super::theme::warning(ui.visuals())
                     } else {
-                        super::theme::success(ui.visuals()) // green — ok
+                        super::theme::success(ui.visuals())
                     };
-                    ui.colored_label(
-                        color,
-                        format!("After: {}", disk_core::display::format_size(projected)),
-                    );
+                    ui.colored_label(color, format!("After: {}", format_size(after)));
                 }
             }
         });
@@ -2829,86 +2023,6 @@ impl BrowseView {
         self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
     }
 
-    /// Apply all staged edits to the filesystem in a single batch.
-    /// Returns false when the batch was deferred to the conflict review; the
-    /// callers used to read that as success and dropped the queue.
-    /// Apply the staged edits as a job; `follow_up` runs once they land.
-    /// Apply through the pane (preflight, review, write, reopen); `follow_up` runs once it landed.
-    fn start_apply(&mut self, follow_up: ApplyFollowUp) {
-        if self.apply_follow.is_some() {
-            return;
-        }
-        self.edit_free_space = None;
-        self.free_space_job = None;
-        let total = self.ctl.pane(Side::Left).queue.len();
-        log::info!("Applying {total} staged edit(s)");
-        self.apply_follow = Some((follow_up, total, false));
-        self.ctl
-            .apply(CommanderAction::Pane(Side::Left, BrowserPaneAction::Apply));
-    }
-
-    /// Watch the pane's Apply; once it wrote and reopened, report it and run the follow-up.
-    fn poll_apply(&mut self) {
-        let Some((follow_up, total, wrote)) = self.apply_follow else {
-            return;
-        };
-        let pane = self.ctl.pane(Side::Left);
-        let wrote = wrote || pane.applying().is_some();
-        if pane.is_busy() || pane.apply_review().is_some() {
-            self.apply_follow = Some((follow_up, total, wrote));
-            return;
-        }
-        self.apply_follow = None;
-        if !wrote {
-            // The review was dismissed, or the preflight failed and left a report.
-            self.pending_close = false;
-            return;
-        }
-        self.selected_entry = None;
-        self.cursor_armed = false;
-        let left = self.ctl.pane(Side::Left).queue.len();
-        let applied = total.saturating_sub(left);
-        if applied > 0 && self.chd_edit.is_some() {
-            self.chd_diff_dirty = true;
-        }
-        match self.ctl.pane(Side::Left).apply_report() {
-            Some(r) => {
-                let why = r
-                    .fatal
-                    .clone()
-                    .or_else(|| r.failed.first().map(|f| f.error.clone()))
-                    .unwrap_or_default();
-                self.edit_result = Some(format!(
-                    "Error: {why}. Applied {} of {}; {left} edit(s) remain staged",
-                    r.applied, r.total
-                ));
-            }
-            None => {
-                self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
-            }
-        }
-        self.run_apply_follow_up(follow_up);
-    }
-
-    fn run_apply_follow_up(&mut self, follow_up: ApplyFollowUp) {
-        match follow_up {
-            ApplyFollowUp::RecompressArchive => {
-                if self.archive_edit_ctx.is_some() && !self.has_edit_error() {
-                    self.start_archive_compress();
-                }
-            }
-            ApplyFollowUp::LeaveEditing => {
-                if !self.has_edit_error() {
-                    if self.pending_close {
-                        self.close();
-                    } else {
-                        self.exit_edit_mode();
-                    }
-                }
-            }
-        }
-    }
-
     /// A small window with the pane's running preflight or write.
     fn render_apply_job(&self, ui: &mut egui::Ui) {
         let pane = self.ctl.pane(Side::Left);
@@ -2921,25 +2035,6 @@ impl BrowseView {
             .show(ui.ctx(), |ui| {
                 super::progress::show_job(ui, &snap);
             });
-    }
-
-    fn has_edit_error(&self) -> bool {
-        self.edit_result
-            .as_ref()
-            .map(|r| r.starts_with("Error"))
-            .unwrap_or(false)
-    }
-
-    /// Invalidate all cached directory listings and reload root.
-    ///
-    /// Called after edit-apply / sync_metadata writes. The cached read-only
-    /// filesystem has stale in-memory tables (catalog, bitmap), so drop it
-    /// and re-open against the freshly written disk bytes.
-    fn invalidate_all_caches(&mut self) {
-        self.selected_entry = None;
-        self.side_ed = DetailEditors::default();
-        // The pane's reopen drops marks too: after a write they may name renamed or deleted files.
-        self.invalidate_cached_fs();
     }
 
     /// Render the delete confirmation dialog.
@@ -3086,12 +2181,11 @@ impl BrowseView {
 
     /// Leaving Edit Mode or closing with edits staged: discard, apply or stay.
     fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_unsaved_dialog {
+        if !self.ctl.unsaved_shown() {
             return;
         }
-
         let count = self.ctl.pane(Side::Left).queue.len();
-
+        let mut choice = None;
         egui::Window::new("Unsaved Changes")
             .collapsible(false)
             .resizable(false)
@@ -3099,45 +2193,27 @@ impl BrowseView {
             .show(ui.ctx(), |ui| {
                 ui.label(format!("You have {count} unsaved edit(s)."));
                 ui.add_space(4.0);
-
                 for line in self.ctl.pane(Side::Left).staged_summary() {
                     ui.label(line);
                 }
-
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Discard Edits").clicked() {
-                        // The dialog is the confirmation, so answer the pane's own discard question.
-                        let yes = BrowserPaneAction::Confirmed {
-                            purpose: rusty_backup::controller::commander::purpose::DISCARD_STAGED,
-                            yes: true,
-                        };
-                        self.ctl.apply(CommanderAction::Pane(Side::Left, yes));
-                        self.show_unsaved_dialog = false;
-                        // For CHD edit sessions, "Discard" must also drop
-                        // the diff so prior Apply Edits aren't flattened
-                        // into the parent. Without this, a discard followed
-                        // by exit_edit_mode would still flatten any work
-                        // that was previously written to the diff.
-                        if self.chd_edit.is_some() {
-                            self.discard_chd_edit_session();
-                        }
-                        if self.pending_close {
-                            self.close();
-                        } else {
-                            self.exit_edit_mode();
-                        }
+                        choice = Some(UnsavedChoice::Discard);
                     }
                     if ui.button("Apply Edits").clicked() {
-                        self.show_unsaved_dialog = false;
-                        self.start_apply(ApplyFollowUp::LeaveEditing);
+                        choice = Some(UnsavedChoice::Apply);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.show_unsaved_dialog = false;
-                        self.pending_close = false;
+                        choice = Some(UnsavedChoice::Cancel);
                     }
                 });
             });
+        if let Some(c) = choice {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, CommanderAction::Mode(ModeAction::Unsaved(c)));
+            self.poll_modes();
+        }
     }
 
     /// The pane's Mac archive waiting for its import choice; the buttons depend on its kind.
@@ -3476,20 +2552,6 @@ impl BrowseView {
         }
     }
 
-    fn exit_edit_mode(&mut self) {
-        self.edit_mode = false;
-        self.edit_free_space = None;
-        self.free_space_job = None;
-        self.edit_result = None;
-        self.ctl.host_pane().queue.clear();
-
-        if self.chd_edit.is_some() {
-            self.start_chd_flatten();
-        } else if self.archive_edit_ctx.is_some() {
-            self.start_archive_compress();
-        }
-    }
-
     /// The items that could not be staged: the pane's host staging, then an archive import's failure.
     fn render_staging_errors_dialog(&mut self, ui: &mut egui::Ui) {
         let rows: Vec<(String, String)> = self.ctl.pane(Side::Left).staging_errors().to_vec();
@@ -3552,7 +2614,7 @@ impl BrowseView {
 
     /// Render the filesystem check results popup.
     fn render_chd_info_popup(&mut self, ui: &mut egui::Ui) {
-        let Some(text) = self.chd_info_text.clone() else {
+        let Some(text) = self.ctl.chd_info().map(str::to_string) else {
             return;
         };
         let mut open = true;
@@ -3575,26 +2637,16 @@ impl BrowseView {
                     });
             });
         if !open {
-            self.chd_info_text = None;
+            self.ctl
+                .apply(CommanderAction::Mode(ModeAction::CloseChdInfo));
         }
     }
 
     /// The pane's check or repair report as the browser always showed it.
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
         let Some(report) = self.ctl.pane(Side::Left).tool_report().cloned() else {
-            self.repair_seen = false;
             return;
         };
-        if report.repair.is_some() && !self.repair_seen {
-            // The repair wrote the volume: probes and the legacy reader are stale.
-            self.repair_seen = true;
-            self.edit_free_space = None;
-            self.free_space_job = None;
-            self.invalidate_cached_fs();
-            if self.chd_edit.is_some() {
-                self.chd_diff_dirty = true;
-            }
-        }
         let mut open = true;
         let mut do_repair = false;
         egui::Window::new("Filesystem Check Results")
@@ -3686,10 +2738,10 @@ impl BrowseView {
                 if has_debug {
                     ui.checkbox(&mut self.show_fsck_debug, "Show debug messages");
                 }
-                if check.repairable && self.archive_edit_ctx.is_none() {
+                if check.repairable && !self.ctl.has_archive_flow() {
                     ui.separator();
                     let resp = ui
-                        .add_enabled(self.edit_mode, egui::Button::new("Repair"))
+                        .add_enabled(self.ctl.edit_mode(), egui::Button::new("Repair"))
                         .on_disabled_hover_text("Turn on Edit Mode to repair the volume.");
                     if resp.clicked() {
                         do_repair = true;
@@ -3860,7 +2912,7 @@ impl BrowseView {
 
     /// Handle files dropped from the host OS onto the window.
     fn handle_dropped_files(&mut self, ui: &mut egui::Ui) {
-        if !self.edit_mode {
+        if !self.ctl.edit_mode() {
             return;
         }
 
@@ -3877,19 +2929,7 @@ impl BrowseView {
         }
     }
 
-    /// Drop the cached filesystem so the next read re-opens from disk.
-    /// Call this whenever the underlying volume bytes may have changed
-    /// (after sync_metadata, archive recompress, etc.).
-    fn invalidate_cached_fs(&mut self) {
-        self.pane_stale = true;
-    }
-
-    /// Best-effort: does the open volume have HFS boot blocks at sector 0?
-    /// Reads two bytes from the backing file at the partition offset. Returns
-    /// `None` when unknown — no file-backed source (e.g. a CHD edit session),
-    /// or a read error. Only trustworthy in edit mode, where the backing file
-    /// holds the raw, decompressed image bytes.
-    /// The extraction's progress window, then its status line (or the nested image) as the result.
+    /// The extraction's status line as the result (an "Open as Disk Image" copy reports through the modes).
     fn poll_extraction(&mut self) {
         if !self.extracting || self.ctl.copy_job().is_some() || self.effects.modal_open() {
             return;
@@ -3899,30 +2939,15 @@ impl BrowseView {
         }
         self.extracting = false;
         let said = self.ctl.status().to_string();
-        let Some(temp) = self.nested_open.take() else {
-            if !said.is_empty() {
-                self.extraction_result = Some(said);
-            }
-            return;
-        };
-        let extracted = std::fs::read_dir(temp.path())
-            .ok()
-            .and_then(|mut d| d.find_map(|e| e.ok()))
-            .map(|e| e.path());
-        match extracted {
-            Some(path) => {
-                self.extraction_result =
-                    Some(format!("Opening {} as a disk image...", path.display()));
-                self.nested_ready = Some((path, temp));
-            }
-            None => self.extraction_result = Some(format!("Open as disk image: {said}")),
+        if !said.is_empty() {
+            self.extraction_result = Some(said);
         }
     }
 }
 
 /// Compact byte-count formatter for the Workflow E archive viewer
 /// window. Mirrors `archives_tab::human_size` rather than
-/// `disk_core::display::format_size` (which uses base-1000 GB/MB and is meant
+/// `format_size` (which uses base-1000 GB/MB and is meant
 /// for storage-media advertising units) so the viewer matches the
 /// Archives tab's display.
 fn human_size_b(bytes: u64) -> String {
@@ -3938,15 +2963,4 @@ fn human_size_b(bytes: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[u])
     }
-}
-
-rusty_backup::model::worker::finished_with_error!(ChdFlattenProgress);
-
-/// What to do once a staged-edit Apply lands without an error.
-#[derive(Clone, Copy)]
-enum ApplyFollowUp {
-    /// Re-encode the edited archive (the Apply button and the conflict review).
-    RecompressArchive,
-    /// Close the view or leave edit mode (the unsaved-changes dialog).
-    LeaveEditing,
 }

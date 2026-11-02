@@ -16,7 +16,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
@@ -111,6 +111,31 @@ pub fn looks_like_password_error(msg: &str) -> bool {
 impl BrowseSession {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A Clonezilla partition read through its partclone block cache.
+    pub fn partclone(cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) -> Self {
+        BrowseSession {
+            partclone_cache: Some(cache),
+            partition_type,
+            ..Default::default()
+        }
+    }
+
+    /// A native zstd partition image streamed until its seekable cache is ready.
+    pub fn streaming(
+        path: &Path,
+        partition_type: u8,
+        partition_type_string: Option<String>,
+    ) -> Result<Self, String> {
+        let cache =
+            ZstdStreamCache::new(path).map_err(|e| format!("Cannot open zstd stream: {e}"))?;
+        Ok(BrowseSession {
+            partition_type,
+            partition_type_string,
+            zstd_cache: Some(Arc::new(Mutex::new(cache))),
+            ..Default::default()
+        })
     }
 
     /// Open a read-only filesystem from this session.

@@ -72,6 +72,40 @@ pub fn open_for_editing(parent: &Path, job: &JobCtx) -> Result<ChdEditOpen, Stri
     }
 }
 
+/// Merge a compressed CHD's diff into its parent as a job; a backup's metadata is refreshed after.
+pub fn flatten_in_job(
+    parent: &Path,
+    diff: &Path,
+    backup_folder: Option<&Path>,
+    job: &JobCtx,
+) -> Result<String, String> {
+    let _wake = crate::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
+    job.set_can_cancel(false);
+    let total = std::fs::metadata(diff).map(|m| m.len()).unwrap_or(0);
+    let mut log = |m: &str| log::info!("{m}");
+    crate::rbformats::chd_edit::flatten_to_parent(
+        parent,
+        diff,
+        None,
+        &mut |b| job.set_bytes(b, total),
+        &|| false,
+        &mut log,
+    )
+    .map_err(|e| format!("Error flattening CHD: {e:#}"))?;
+    let mut said = String::from("Changes saved successfully.");
+    // The bytes are already right; a stale metadata.json is a warning, not a rollback.
+    if let Some(folder) = backup_folder {
+        let mut log = |m: &str| log::info!("{m}");
+        match crate::backup::single_file_chd::refresh_metadata_after_edit(folder, &mut log) {
+            Ok(()) => said.push_str(" Backup metadata.json refreshed."),
+            Err(e) => said.push_str(&format!(
+                " (Warning: failed to refresh backup metadata.json: {e:#})"
+            )),
+        }
+    }
+    Ok(said)
+}
+
 /// Copy `from` to `to` in 4 MiB chunks, reporting bytes; a partial copy is removed on failure.
 fn copy_with_progress(from: &Path, to: &Path, job: &JobCtx) -> std::io::Result<()> {
     use std::io::{Read, Write};

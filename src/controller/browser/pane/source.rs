@@ -290,6 +290,7 @@ pub(super) struct SourceState {
     fixed_partition: Option<usize>,
     /// The host handed over a ready session (`open_fixed_session`); a reopen reuses it.
     fixed_session: bool,
+    writes: u64,
 }
 
 impl SourceState {
@@ -316,6 +317,7 @@ impl SourceState {
             reopen_restore: None,
             fixed_partition: None,
             fixed_session: false,
+            writes: 0,
         }
     }
 }
@@ -467,8 +469,19 @@ impl BrowserPaneController {
         )
     }
 
+    /// How many times the volume was written and reopened (apply, repair, tar import).
+    pub fn write_count(&self) -> u64 {
+        self.src.writes
+    }
+
+    /// Drop the source so its files are let go (an archive temp about to be recompressed).
+    pub fn release_source(&mut self) {
+        self.reset_local_source();
+    }
+
     /// Reopen the partition after a write, keeping what is still staged and the current folder.
     pub(super) fn reopen_after_apply(&mut self) -> Vec<Effect> {
+        self.src.writes += 1;
         // A remote apply is all or nothing; a failed one changed nothing and keeps its report.
         if self.is_remote_image() {
             return match self.queue.is_empty() {

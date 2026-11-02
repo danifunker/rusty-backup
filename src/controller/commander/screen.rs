@@ -42,11 +42,13 @@ pub use crate::model::extract::ExtractOptions;
 pub use detail::DetailField;
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
+pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
 
 mod copy;
 mod detail;
 mod extract;
 mod follow;
+mod modes;
 #[cfg(test)]
 mod tests;
 
@@ -127,6 +129,8 @@ impl HashAlgo {
 #[derive(Debug, Clone)]
 pub enum CommanderAction {
     Pane(Side, BrowserPaneAction),
+    /// The Inspect browse view's source-level modes (Edit Mode, CHD, archives, budget).
+    Mode(ModeAction),
     /// The user worked in this pane; it becomes the one keys and the middle Delete act on.
     Focus(Side),
     SwitchPane,
@@ -432,6 +436,8 @@ pub struct CommanderController {
     view_menu: bool,
     /// Each pane's File Info following its cursor (quick view, side panel).
     follow: [follow::Follow; 2],
+    /// The Inspect browse view's source and edit modes (`open_inspect`).
+    modes: modes::Modes,
 }
 
 impl Controller for CommanderController {
@@ -461,6 +467,7 @@ impl Controller for CommanderController {
         self.poll_copy();
         self.poll_checksums();
         self.poll_detail();
+        self.poll_modes();
         self.left.rebuild_rows();
         self.right.rebuild_rows();
         self.sync_follow();
@@ -473,6 +480,7 @@ impl CommanderController {
         use CommanderAction as A;
         match action {
             A::Pane(side, a) => self.forward(side, a),
+            A::Mode(m) => self.apply_mode(m),
             A::Focus(side) => {
                 if !self.single {
                     self.active = side;
@@ -721,6 +729,7 @@ impl CommanderController {
             quick_view: false,
             view_menu: false,
             follow: Default::default(),
+            modes: Default::default(),
         };
         ctl.left.remember_style_as("commander-left");
         ctl.right.remember_style_as("commander-right");
@@ -944,6 +953,7 @@ impl CommanderController {
         };
         let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());
         let busy = self.copy.is_some() || hashing || self.detail_job.is_some();
+        let busy = busy || self.modes_working();
         busy || self.follow_pending() || pane_busy(&self.left) || pane_busy(&self.right)
     }
 

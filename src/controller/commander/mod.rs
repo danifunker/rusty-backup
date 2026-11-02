@@ -21,16 +21,22 @@ pub use crate::controller::browser::{
 pub use screen::{
     default_export_format, export_choices, ChecksumRow, Checksums, CommanderAction,
     CommanderController, DetailField, ExportChoice, ExportFormat, ExtractOptions, FileDetail,
-    HashAlgo, IdNameMap, MetadataEdit, RenameNotice, ResourceForkMode, Side, SizePlan,
-    ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
+    HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice, ResourceForkMode, Side, SizePlan,
+    SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
+    MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
+pub use crate::fs::entry::FileEntryTypeDisplay;
+pub use crate::model::archive_edit::ArchiveEditContext;
 pub use crate::model::browse_session::BrowseSession;
+/// A Clonezilla partition's shared block cache, as the Inspect tab hands it over.
+pub type PartcloneCache =
+    std::sync::Arc<std::sync::Mutex<dsk_clonezilla::block_cache::PartcloneBlockCache>>;
 pub use crate::model::edit_queue::EditQueue;
 pub use crate::model::job::{JobRegistry, Snapshot};
 pub use disk_core::display::format_size;
-pub use disk_core::entry::FileEntry;
+pub use disk_core::entry::{EntryType, FileEntry};
 
 /// A blank 2 MiB FAT volume at `dir/vol.img`, for view tests.
 #[cfg(test)]

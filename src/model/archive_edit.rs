@@ -221,6 +221,67 @@ pub fn start_compress(
     progress
 }
 
+/// A `.woz` image edited through the decode -> edit -> re-encode flow.
+pub fn woz_context(path: &Path) -> ArchiveEditContext {
+    let original_size = dsk_apple::woz::WozReader::open(path)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    ArchiveEditContext {
+        archive_path: path.to_path_buf(),
+        compression_type: "woz".to_string(),
+        original_size,
+        compacted: false,
+        metadata_path: PathBuf::new(),
+        partition_index: 0,
+        checksum_type: String::new(),
+    }
+}
+
+/// Where the decompressed copy being edited lives: `<stem>-edit.img` beside the archive.
+pub fn edit_temp_path(ctx: &ArchiveEditContext) -> PathBuf {
+    let parent = ctx.archive_path.parent().unwrap_or(Path::new("."));
+    let stem = ctx.archive_path.file_stem().unwrap_or_default();
+    parent.join(format!("{}-edit.img", stem.to_string_lossy()))
+}
+
+/// Decompress into `temp_path` as a job; a failure removes the partial temp.
+pub fn extract_for_edit(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    job: &crate::model::job::JobCtx,
+) -> Result<(), String> {
+    let _wake = crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
+    job.set_can_cancel(false);
+    let total = ctx.original_size;
+    let r = extract_partition_sync(ctx, temp_path, &mut |b| job.set_bytes(b, total), &|| false);
+    r.map_err(|e| {
+        let _ = std::fs::remove_file(temp_path);
+        format!("{e:#}")
+    })
+}
+
+/// Recompress `temp_path` back into the archive as a job, then remove it; a failure keeps it.
+pub fn compress_after_edit(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    job: &crate::model::job::JobCtx,
+) -> Result<(), String> {
+    let _wake = crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
+    job.set_can_cancel(false);
+    let total = std::fs::metadata(temp_path).map(|m| m.len()).unwrap_or(0);
+    let mut log = |m: &str| log::info!("{m}");
+    let r = recompress_partition_sync(
+        ctx,
+        temp_path,
+        &mut |b| job.set_bytes(b, total),
+        &|| false,
+        &mut log,
+    );
+    r.map_err(|e| format!("{e:#}"))?;
+    let _ = std::fs::remove_file(temp_path);
+    Ok(())
+}
+
 /// Synchronous decompress of `ctx.archive_path` into `temp_path` (zero-padded
 /// to `original_size` when the partition was compacted). The CLI one-shot path
 /// uses this directly; [`start_extract`] is the GUI's threaded wrapper around
