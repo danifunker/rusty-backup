@@ -1197,10 +1197,7 @@ impl InspectTab {
         }
         if resize_alto {
             match self.ctl.image_path().map(|p| p.to_path_buf()) {
-                Some(path) => match AltoResizeDialog::new(path) {
-                    Ok(dlg) => self.alto_resize_dialog = Some(dlg),
-                    Err(e) => ctx.log.error(format!("Cannot open resize dialog: {e}")),
-                },
+                Some(path) => self.alto_resize_dialog = Some(AltoResizeDialog::new(path)),
                 None => ctx.log.error("Resize: no image file loaded"),
             }
         }

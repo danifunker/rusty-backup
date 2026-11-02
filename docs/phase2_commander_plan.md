@@ -976,3 +976,13 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
 
 1. `src/gui/progress.rs` (7 -> 0): the shared job widget takes `controller::app::Snapshot`,
    and `controller::app` re-exports `RateTracker` and `format_size`. No behaviour change.
+2. `src/gui/alto_resize_dialog.rs` (2 -> 0): `controller::alto_resize::AltoResizeController`
+   (`Open(path)`, `SetTarget`, `SaveAs` -> `Effect::PickFile(purpose::OUTPUT)`, `Picked`, `Close`;
+   `summary_line`, `fit_warning`, `result`, `can_save`, `is_writing`, `wait_idle`) over
+   `model::alto_resize` (`AltoTarget`, `summarize`, `resize_to`, the same clone and PDI write the
+   dialog ran). The shared `controller::job_outcome` reads a finished job.
+   `tests/ui_scenarios/alto_resize.toml` re-lays a blank Diablo 31 pack onto a Diablo 44.
+   Behaviour: the summary is read and the pack written in jobs (both ran on the UI thread); the
+   window opens at once with "Reading the Alto pack..." and closes with the same log line if the
+   file is not a pack; the Save As picker is the shared `EffectHost` one (titled, starting in the
+   home folder on Linux).

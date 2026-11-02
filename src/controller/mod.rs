@@ -18,6 +18,7 @@
 //! - Rust 1.73 and mrustc compile this, like the engine.
 //! - Tier A tests replay `tests/ui_scenarios/*.toml` against controllers (`tests/ui_scenarios.rs`).
 
+pub mod alto_resize;
 pub mod app;
 pub mod backup;
 pub mod browser;
@@ -28,6 +29,19 @@ pub mod keys;
 pub mod log;
 pub mod partition_edit;
 pub mod restore;
+
+/// A job's outcome once it ended: its result, or why it failed or was cancelled.
+pub(crate) fn job_outcome<R: Send + 'static>(
+    job: &crate::model::job::Job<R>,
+) -> Option<Result<R, String>> {
+    use crate::model::job::Status;
+    match job.snapshot().status {
+        Status::Running => None,
+        Status::Done => Some(job.take_result().ok_or_else(|| "no result".to_string())),
+        Status::Failed(e) => Some(Err(e)),
+        Status::Cancelled => Some(Err("cancelled".to_string())),
+    }
+}
 
 /// The shape every controller shares.
 pub trait Controller {

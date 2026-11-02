@@ -823,6 +823,89 @@ impl Target for DiskWriteTarget {
     }
 }
 
+/// `AltoResizeController`. Actions: `Open` (arg: `$diablo31` writes a blank Diablo 31 pack, or a
+/// path), `SetTarget` (`31` or `44`), `SaveAs`, `Pick` (the output, `$out`), `Close`. Probes: `open`,
+/// `summary`, `target`, `fit_warning`, `result`, `out_model` (the written pack's Diablo model).
+struct AltoResizeTarget {
+    ctl: rusty_backup::controller::alto_resize::AltoResizeController,
+    dir: tempfile::TempDir,
+}
+
+impl AltoResizeTarget {
+    fn new() -> Self {
+        AltoResizeTarget {
+            ctl: rusty_backup::controller::alto_resize::AltoResizeController::new(
+                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+            ),
+            dir: tempfile::tempdir().expect("temp dir"),
+        }
+    }
+}
+
+impl Target for AltoResizeTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::alto_resize::{purpose, AltoResizeAction, AltoTarget};
+        let a = match action {
+            "Open" => AltoResizeAction::Open(match arg_str(arg)? {
+                "$diablo31" => {
+                    let p = self.dir.path().join("src.pdi");
+                    let disk = fs_xerox::alto::write::create_blank(AltoTarget::Diablo31.geometry())
+                        .map_err(|e| e.to_string())?;
+                    std::fs::write(&p, fs_xerox::alto::pdi::write(&disk))
+                        .map_err(|e| e.to_string())?;
+                    p
+                }
+                other => PathBuf::from(other),
+            }),
+            "SetTarget" => AltoResizeAction::SetTarget(match arg.and_then(Value::as_integer) {
+                Some(31) => AltoTarget::Diablo31,
+                Some(44) => AltoTarget::Diablo44,
+                _ => return Err("SetTarget needs 31 or 44".into()),
+            }),
+            "SaveAs" => AltoResizeAction::SaveAs,
+            "Pick" => AltoResizeAction::Picked {
+                purpose: purpose::OUTPUT,
+                path: Some(self.dir.path().join("out.pdi")),
+            },
+            "Close" => AltoResizeAction::Close,
+            other => return Err(format!("AltoResizeController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        use rusty_backup::controller::alto_resize::AltoTarget;
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "summary" => Value::String(self.ctl.summary_line().unwrap_or("").to_string()),
+            "target" => Value::Integer(match self.ctl.target() {
+                AltoTarget::Diablo31 => 31,
+                AltoTarget::Diablo44 => 44,
+            }),
+            "fit_warning" => Value::String(self.ctl.fit_warning().unwrap_or_default()),
+            "result" => Value::String(match self.ctl.result() {
+                Some(Ok(m)) => m.clone(),
+                Some(Err(e)) => format!("error: {e}"),
+                None => String::new(),
+            }),
+            "out_model" => {
+                let bytes = std::fs::read(self.dir.path().join("out.pdi")).unwrap_or_default();
+                Value::Integer(
+                    fs_xerox::alto::open_pack(&bytes)
+                        .map(|d| d.geometry.disk_model as i64)
+                        .unwrap_or(0),
+                )
+            }
+            other => return Err(format!("AltoResizeController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.tick()
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
@@ -830,6 +913,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "inspect" => Ok(Box::new(InspectTarget::new())),
         "restore" => Ok(Box::new(RestoreTarget::new())),
         "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
+        "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

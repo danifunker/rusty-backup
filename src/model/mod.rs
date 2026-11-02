@@ -3,6 +3,7 @@
 //! The eventual goal is for every GUI tab to be a renderer over an object in
 //! this tree. See §5 / §10 of `docs/codecleanup.md`.
 
+pub mod alto_resize;
 pub mod archive_edit;
 pub mod archive_import;
 pub mod backup_loader;

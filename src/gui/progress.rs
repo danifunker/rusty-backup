@@ -1,6 +1,6 @@
 use egui::RichText;
 use rusty_backup::controller::app::{format_size, AppController, Snapshot};
-use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::log::{LogLevel, LogStore};
 use rusty_backup::controller::Controller;
 
 // The rate/ETA estimator is shared with the CLI; re-exported for the tabs that use it.
@@ -50,6 +50,17 @@ pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
     for action in actions {
         let effects = app.apply(action);
         super::run_effects(ui.ctx(), effects);
+    }
+}
+
+/// Move a controller's log lines into the log panel.
+pub fn drain_log_lines(lines: Vec<(LogLevel, String)>, log: &mut LogStore) {
+    for (level, msg) in lines {
+        match level {
+            LogLevel::Info => log.info(msg),
+            LogLevel::Warning => log.warn(msg),
+            LogLevel::Error => log.error(msg),
+        }
     }
 }
 
