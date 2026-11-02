@@ -90,7 +90,9 @@ Off by default. It adds `qnx2fs::adapter`, which puts a `Volume` behind the
 `Filesystem` / `EditableFilesystem` traits of the
 [disk-core](https://crates.io/crates/disk-core) crate, as RustyBackup uses it.
 It pulls in `disk-core`, `chrono` and `log`, and reads the host clock and time zone,
-so it is not for the browser build.
+so it is not for the browser build. The `TZ` environment variable sets that
+zone on every platform; on Windows that takes `jiff`, which the feature adds
+there only.
 
 ## Development
 

@@ -106,8 +106,36 @@ impl<R: Read + Write + Seek + Send> Qnx2Filesystem<R> {
     }
 }
 
+/// The zone `TZ` names, on Windows only: chrono's `Local` honours `TZ` everywhere else.
+#[cfg(windows)]
+fn tz_override() -> Option<jiff::tz::TimeZone> {
+    std::env::var_os("TZ")?;
+    jiff::tz::TimeZone::try_system().ok()
+}
+
+/// [`wall_to_unix`] in a jiff zone: a fold takes the earlier instant, a gap the later offset.
+#[cfg(windows)]
+fn wall_to_unix_in(tz: &jiff::tz::TimeZone, wall: i64) -> i64 {
+    jiff::Timestamp::from_second(wall)
+        .map(|t| jiff::tz::TimeZone::UTC.to_datetime(t))
+        .and_then(|dt| tz.to_ambiguous_timestamp(dt).compatible())
+        .map_or(wall, |t| t.as_second())
+}
+
+/// [`unix_to_wall`] in a jiff zone.
+#[cfg(windows)]
+fn unix_to_wall_in(tz: &jiff::tz::TimeZone, unix: i64) -> i64 {
+    jiff::Timestamp::from_second(unix)
+        .and_then(|t| jiff::tz::TimeZone::UTC.to_timestamp(tz.to_datetime(t)))
+        .map_or(unix, |t| t.as_second())
+}
+
 /// ICON wall-clock seconds as a host instant, in the zone rules of that date.
 pub fn wall_to_unix(wall: i64) -> i64 {
+    #[cfg(windows)]
+    if let Some(tz) = tz_override() {
+        return wall_to_unix_in(&tz, wall);
+    }
     let Some(utc) = DateTime::<Utc>::from_timestamp(wall, 0) else {
         return wall;
     };
@@ -128,6 +156,10 @@ pub fn wall_to_unix(wall: i64) -> i64 {
 
 /// A host instant as the wall-clock seconds the ICON would show.
 pub fn unix_to_wall(unix: i64) -> i64 {
+    #[cfg(windows)]
+    if let Some(tz) = tz_override() {
+        return unix_to_wall_in(&tz, unix);
+    }
     match Local.timestamp_opt(unix, 0).single() {
         Some(t) => t.naive_local().and_utc().timestamp(),
         None => unix,
@@ -605,5 +637,43 @@ mod tests {
             .unwrap();
         assert_eq!(d.modified.as_deref(), Some("1985-10-03 23:41:00"));
         assert!(fsck_qnx2(&mut src).unwrap().is_clean());
+    }
+
+    /// Seconds for a UTC calendar time, the same count ICON wall-clock seconds use.
+    #[cfg(windows)]
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .and_then(|x| x.and_hms_opt(h, mi, 0))
+            .unwrap();
+        naive.and_utc().timestamp()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tz_zone_converts_in_the_rules_of_each_date() {
+        let ny = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let pairs = [
+            (utc(2026, 3, 14, 10, 0), utc(2026, 3, 14, 6, 0)),
+            (utc(2024, 2, 29, 9, 0), utc(2024, 2, 29, 4, 0)),
+            (utc(1985, 10, 3, 23, 41), utc(1985, 10, 3, 19, 41)),
+        ];
+        for (instant, wall) in pairs {
+            assert_eq!(unix_to_wall_in(&ny, instant), wall);
+            assert_eq!(wall_to_unix_in(&ny, wall), instant);
+        }
+        // 02:30 on 8 March 2026 never happens in New York; 01:30 on 1 November happens twice.
+        assert_eq!(
+            wall_to_unix_in(&ny, utc(2026, 3, 8, 2, 30)),
+            utc(2026, 3, 8, 7, 30)
+        );
+        assert_eq!(
+            wall_to_unix_in(&ny, utc(2026, 11, 1, 1, 30)),
+            utc(2026, 11, 1, 5, 30)
+        );
+        let utc_zone = jiff::tz::TimeZone::UTC;
+        assert_eq!(
+            unix_to_wall_in(&utc_zone, utc(2026, 3, 14, 10, 0)),
+            utc(2026, 3, 14, 10, 0)
+        );
     }
 }
