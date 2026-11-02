@@ -906,6 +906,86 @@ impl Target for AltoResizeTarget {
     }
 }
 
+/// `ExpandHfsController`. Actions: `Open` (arg: `$hfv` writes and summarises a blank 4 MiB HFS
+/// volume), `SetFlatHfv` (bool), `SetSizeMib` (int), `PickOutput`, `Pick` (the output, in the temp
+/// folder), `Start`, `Close`. Probes: `open`, `flat_hfv`, `size_mib`, `can_start`, `outcome`
+/// (`ok`, an error, or empty), `out_mib` (the output's size in whole MiB, rounded up).
+struct ExpandHfsTarget {
+    ctl: rusty_backup::controller::expand_hfs::ExpandHfsController,
+    dir: tempfile::TempDir,
+}
+
+impl ExpandHfsTarget {
+    fn new() -> Self {
+        ExpandHfsTarget {
+            ctl: rusty_backup::controller::expand_hfs::ExpandHfsController::new(
+                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+            ),
+            dir: tempfile::tempdir().expect("temp dir"),
+        }
+    }
+}
+
+impl Target for ExpandHfsTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::expand_hfs::{purpose, ExpandHfsAction};
+        let a = match action {
+            "Open" => {
+                if arg_str(arg)? != "$hfv" {
+                    return Err("Open takes $hfv".into());
+                }
+                let p = self.dir.path().join("vol.hfv");
+                let bytes = fs_mac::hfs::create_blank_hfs(4 << 20, 4096, "Scenario")
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                let src = rusty_backup::model::hfs_expand_runner::summarize_source(&p, 0, 4 << 20)
+                    .map_err(|e| e.to_string())?;
+                ExpandHfsAction::Open(src)
+            }
+            "SetFlatHfv" => ExpandHfsAction::SetFlatHfv(
+                arg.and_then(Value::as_bool).ok_or("SetFlatHfv needs a bool")?,
+            ),
+            "SetSizeMib" => ExpandHfsAction::SetSizeMib(
+                arg.and_then(Value::as_integer).ok_or("SetSizeMib needs an int")? as u32,
+            ),
+            "PickOutput" => ExpandHfsAction::PickOutput,
+            "Pick" => ExpandHfsAction::Picked {
+                purpose: purpose::OUTPUT,
+                path: Some(self.dir.path().join("out.img")),
+            },
+            "Start" => ExpandHfsAction::Start,
+            "Close" => ExpandHfsAction::Close,
+            other => return Err(format!("ExpandHfsController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "flat_hfv" => Value::Boolean(self.ctl.flat_hfv()),
+            "size_mib" => Value::Integer(self.ctl.size_mib() as i64),
+            "can_start" => Value::Boolean(self.ctl.can_start()),
+            "outcome" => Value::String(match self.ctl.outcome() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "out_mib" => Value::Integer(
+                std::fs::metadata(self.dir.path().join("out.img"))
+                    .map(|m| m.len().div_ceil(1 << 20) as i64)
+                    .unwrap_or(0),
+            ),
+            other => return Err(format!("ExpandHfsController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        self.ctl.tick()
+    }
+}
+
 fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
     match vm {
         "app" => Ok(Box::new(AppController::headless())),
@@ -914,6 +994,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "restore" => Ok(Box::new(RestoreTarget::new())),
         "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
+        "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
         "job_probe" => Ok(Box::new(JobProbeController {
             app: AppController::headless(),
             job: None,

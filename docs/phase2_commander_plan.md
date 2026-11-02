@@ -993,3 +993,13 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    `Start` installs the budget and probes for editing (refused while over capacity), `Cancel`
    drops it. The egui dialog is a function that draws the form and returns the frame's edits.
    `edit_mode_on_squashfs_asks_for_a_size_budget_first` drives it headless. No behaviour change.
+4. `src/gui/expand_hfs_dialog.rs` (4 -> 0): `controller::expand_hfs::ExpandHfsController`
+   (`Open(ExpandSource)` from Inspect's `HostRequest::ExpandHfs`, `SetFlatHfv`, `SetBlockSize`,
+   `SetSizeMib`, `PickOutput` -> `Effect::PickFile(purpose::OUTPUT)` with the dialog's file name
+   and filter, `Picked`, `Start`, `Close`; `size_bounds` (used space up to the block size's ceiling,
+   the HFV cap), `block_choices`, `lines`, `outcome`, `editable`, `can_start`). The expand is a job
+   that waits on `hfs_expand_runner::start_hfs_expand` (unchanged, so the bytes are the same) and
+   mirrors its step and lines. `rb-cli expand` keeps its own flags and output over the same runner.
+   `tests/ui_scenarios/expand_hfs.toml` grows a 4 MiB flat HFV to 12 MiB.
+   Behaviour: the target size is clamped when it is edited rather than every frame (same
+   result); the Save As picker is titled ("Save Expanded Volume").

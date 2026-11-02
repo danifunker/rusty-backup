@@ -24,6 +24,7 @@ pub mod backup;
 pub mod browser;
 pub mod commander;
 pub mod disk_write;
+pub mod expand_hfs;
 pub mod inspect;
 pub mod keys;
 pub mod log;
