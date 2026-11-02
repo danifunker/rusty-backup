@@ -10,7 +10,7 @@ use super::{
     ChecksumRow, Checksums, CommanderController, CopyRun, ExportFormat, PendingConflict,
     PendingExport, RenameNotice, Side,
 };
-use crate::controller::commander::pane::StageOutcome;
+use crate::controller::browser::pane::StageOutcome;
 use crate::controller::commander::OnConflict;
 use crate::controller::{Effect, PickSpec};
 use crate::model::checksum::{self, ChecksumJob, FileChecksum};

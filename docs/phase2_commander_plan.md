@@ -67,7 +67,7 @@ widget, show_log, the metadata editor widgets.
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | done (7f677b11, c3e749c5, 283d6f92) |
-| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | |
+| 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | in progress (see below) |
 
 Slice 3 notes, for the slices that follow:
 
@@ -227,6 +227,76 @@ Slice 9 notes:
   - The GUI Commander still reaches the model through shared egui helpers outside the
     enforced path (`gui::metadata_editor`, `gui::file_detail`, `gui::source_picker`);
     slice 10 and later move those.
+
+## Slice 10: one browser pane
+
+User decision (2026-11-01): one browser-pane controller, configured per use, instead of
+three file browsers. CONTRIBUTING.md § "One controller, many uses" names it the reference
+case.
+
+### What each browser does today
+
+| Feature | Commander pane | TUI Explorer (`tui_app.rs` `Explorer`) | Inspect browse view (`gui/browse_view.rs`) |
+|---|---|---|---|
+| Source | picked by the user: image, folder, backup, archive, disc, remote, drop, recent | fixed: one partition chosen on the Inspect tab, opened through `cli::resolve` | fixed: the Inspect tab's partition (session, partclone cache, streaming, archive edit context, single-file CHD) |
+| Listing | flat list with `..`, sortable columns, wrappers expanded in place | folder tree + the tree folder's list, dirs first | one expandable tree, lazy reads through the `FsRead` queue |
+| Selection | click / ctrl / shift, Space marks per folder | Space marks, kept across folders (tree and list) | checkbox marks across the tree |
+| Writes | staged queue, Apply (preflight, review, report, reopen) | immediate: mkdir, delete, import, metadata, bless, text save, each reopening `rw` | staged queue behind an edit mode, its own review, unsaved-close dialog, staging errors, CHD edit mode (flatten), direct edit, SquashFS budget |
+| Bring files in | copy from the other pane | import one host file (Replace / Skip / Cancel) | add file / folder, drag and drop, archive import (extract / convert / as is), tar import, boot blocks |
+| Take files out | screen export (folder or archive format), host copy | export menu: fork modes, tar, tar.gz, mar | extract (with overwrite check), export marked as archive, tar export, ProDOS export modes |
+| Look inside | File Info window (preview, xattrs, owner names) | preview overlay: text / hex, resource fork toggle | content panel (metadata rows, hex / text), Mac archive window, nested image open |
+| Metadata | File Info: mode / owner / xattr (egui: type / creator, ProDOS, dates) | form: type, creator, modified, created, mode, owner | HFS type row, ProDOS type row |
+| Text editor | - | yes (line endings, encodings) | yes (load / save jobs) |
+| Volume tools | - | fsck, repair, bless, transforms (palette) | fsck, repair, tree listing |
+
+### The profile
+
+`PaneProfile` (`src/controller/browser/profile.rs`) is plain data the pane checks before
+it acts; a capability that is off refuses its action with "<what> is not available in this
+view." (`BrowserPaneController::refused`, one table in `pane.rs`). Views read it only to
+decide what to draw.
+
+- `sources: Sources { image, host, backup, remote }`: what the user may open from the pane.
+  `Sources::NONE` when the host screen fixes the source.
+- `fixed_source`: the host opened the source with `open_fixed(path, partition)`; Close and
+  `SelectPartition` are refused.
+- `staging`: edits wait for Apply (true), or apply at once through the same preflight /
+  review / write / reopen jobs (false; the Explorer's "writes immediately").
+- `read_only`, `rename`, `new_folder`, `delete`: what may be written.
+- `wrappers`: archives and images expand in place (off: they are plain files).
+- `folder_tree`: a folder tree beside the listing (the TUI Explorer's left pane).
+- `tools: Tools { fsck, repair, bless, text_edit, import, metadata, transforms }`.
+
+Constructors: `PaneProfile::commander()` (today's Commander pane exactly: every source,
+staging, wrappers, no tools), `explorer()` (fixed source, no staging, folder tree, every
+tool), `inspect()` (fixed source, staging, bless / text / import / metadata), and
+`.read_only()` on any of them.
+
+### Who owns what
+
+- `controller::browser::BrowserPaneController` (moved from `controller::commander`, which
+  re-exports it as `pane` / `rows` so existing paths keep working): source, listing,
+  selection, cursor, queue, apply, wrappers, remote; behind `tools`, the volume tools that
+  act on the pane's own filesystem (fsck / repair jobs and their report, bless and metadata
+  and imports as staged edits, the text editor's load / save jobs, saved text staged as a
+  replacing `AddFile`); behind `folder_tree`, the tree.
+- Screen controllers own what spans a pane: `CommanderController` (two panes: copy, export,
+  checksums, File Info, log, keys); `ExplorerController` (one pane: preview, export with a
+  format menu, transforms, close, keys); the Inspect browse view's host (partition choice
+  stays with the Inspect tab).
+- View-only: widget state. The text editor's buffer and cursor, scroll offsets, a metadata
+  form's fields while typing (the controller validates on submit), colours and layout.
+
+### Migration order
+
+1. Move the pane to `controller::browser`, rename it `BrowserPaneController` /
+   `BrowserPaneAction`, add `PaneProfile`, `open_fixed` and staging off. Commander keeps
+   `PaneProfile::commander()`; its tests pass unchanged apart from the rename.
+2. TUI Explorer onto `ExplorerController` + the `explorer` profile; delete `Explorer` and its
+   `cli::resolve` write helpers; `tui_app/explorer.rs` joins `ENFORCED`.
+3. Inspect browse view onto the pane with the `inspect` profile: listing / navigation /
+   selection / staging / apply first, then export / extract, the text editor, archive import,
+   tar, CHD edit mode and the SquashFS budget.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,

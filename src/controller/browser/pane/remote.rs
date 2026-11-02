@@ -7,8 +7,8 @@
 //! `edits.rs`), and the image is reopened afterwards because the daemon's browse handle
 //! predates the write. Without the `remote` feature the actions only report that.
 
-use super::{CommanderPaneAction, CommanderPaneController};
-use crate::controller::commander::pane::purpose;
+use super::{BrowserPaneAction, BrowserPaneController};
+use crate::controller::browser::pane::purpose;
 use crate::controller::{Effect, TextSpec};
 use crate::model::commander_ops::StageSource;
 use crate::model::job::Snapshot;
@@ -18,7 +18,7 @@ use super::VolumeInfo;
 #[cfg(feature = "remote")]
 use crate::cli::img_at::PartSelector;
 #[cfg(feature = "remote")]
-use crate::controller::commander::rows::remote_parent_dir;
+use crate::controller::browser::rows::remote_parent_dir;
 #[cfg(feature = "remote")]
 use crate::model::edit_queue::StagedEdit;
 #[cfg(feature = "remote")]
@@ -100,7 +100,7 @@ pub(super) struct RemoteState {
     restore: Option<(Vec<StagedEdit>, String)>,
 }
 
-impl CommanderPaneController {
+impl BrowserPaneController {
     // --- read accessors ---------------------------------------------------
 
     /// True while the pane browses a daemon (its host filesystem or an image on it).
@@ -190,9 +190,9 @@ impl CommanderPaneController {
     /// Handles a remote action, or hands it back.
     pub(super) fn apply_remote(
         &mut self,
-        action: CommanderPaneAction,
-    ) -> Result<Vec<Effect>, CommanderPaneAction> {
-        use CommanderPaneAction as A;
+        action: BrowserPaneAction,
+    ) -> Result<Vec<Effect>, BrowserPaneAction> {
+        use BrowserPaneAction as A;
         let fx = match action {
             #[cfg(feature = "remote")]
             A::Connect => self.ask_connect(),
@@ -542,7 +542,7 @@ mod tests {
     use super::*;
     use crate::controller::Controller;
 
-    type A = CommanderPaneAction;
+    type A = BrowserPaneAction;
 
     fn spec() -> TextSpec {
         TextSpec {
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn remote_actions_without_a_connection_do_nothing_harmful() {
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         assert!(!vm.is_remote() && vm.remote_addr().is_none() && vm.remote_label().is_none());
         assert!(vm.apply(A::Disconnect).is_empty());
         assert!(vm.apply(A::CloseRemoteImage).is_empty() || !cfg!(feature = "remote"));
@@ -595,7 +595,7 @@ mod tests {
     #[cfg(not(feature = "remote"))]
     #[test]
     fn connect_says_it_is_not_built_in() {
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         assert_eq!(vm.apply(A::Connect), msg(NOT_BUILT));
     }
 }

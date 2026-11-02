@@ -20,15 +20,15 @@ use ratatui::Frame;
 
 use super::{centered_rect, App, FilePicker, PickKind, PickResult};
 use crate::controller::commander::{
-    format_size, purpose, CommanderAction, CommanderController, CommanderPaneAction,
-    CommanderPaneController, DetailField, DisplayRow, FileDetail, HashAlgo, OnConflict, RowKind,
+    format_size, purpose, CommanderAction, CommanderController, BrowserPaneAction,
+    BrowserPaneController, DetailField, DisplayRow, FileDetail, HashAlgo, OnConflict, RowKind,
     Side, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
 
 type A = CommanderAction;
-type P = CommanderPaneAction;
+type P = BrowserPaneAction;
 
 /// An effect waiting on the user, drawn over everything else.
 enum Modal {
@@ -660,7 +660,7 @@ impl App {
         self.draw_cmd_modal(frame, area, v);
     }
 
-    fn pane_title(&self, pane: &CommanderPaneController, side: Side) -> String {
+    fn pane_title(&self, pane: &BrowserPaneController, side: Side) -> String {
         let source = if let Some(label) = pane.remote_label() {
             label
         } else if let Some(path) = pane.source_path() {
@@ -783,7 +783,7 @@ impl App {
 
     fn cmd_rows(
         &self,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         focused: bool,
         width: usize,
         visible: usize,

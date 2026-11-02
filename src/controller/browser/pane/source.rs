@@ -5,7 +5,7 @@
 //! opens one (a Clonezilla partition first scans its partclone metadata). A new open abandons the
 //! one in flight, and waits for it to let go of the path if they share one. Leaving a source
 //! that has staged edits asks first with [`Effect::Confirm`]; a locked source waits for a
-//! password through [`CommanderPaneController::needs_password`].
+//! password through [`BrowserPaneController::needs_password`].
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,8 @@ use anyhow::{anyhow, Context as _};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 
-use super::{CommanderPaneAction, CommanderPaneController};
-use crate::controller::commander::rows::{is_mac_archive_path, partition_label};
+use super::{BrowserPaneAction, BrowserPaneController};
+use crate::controller::browser::rows::{is_mac_archive_path, partition_label};
 use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::fs::partition_is_browsable;
 use crate::model::browse_session::{looks_like_password_error, BrowseOpenStatus, BrowseSession};
@@ -248,6 +248,8 @@ pub(super) struct SourceState {
     pending_switch: Option<Switch>,
     /// Edits still staged and the folder to return to once a post-apply reopen lands.
     reopen_restore: Option<(Vec<StagedEdit>, String)>,
+    /// The partition a host-opened image shows instead of the first browsable one.
+    fixed_partition: Option<usize>,
 }
 
 impl SourceState {
@@ -272,6 +274,7 @@ impl SourceState {
             deferred: None,
             pending_switch: None,
             reopen_restore: None,
+            fixed_partition: None,
         }
     }
 }
@@ -306,7 +309,7 @@ fn image_filters() -> Vec<(String, Vec<String>)> {
     ]
 }
 
-impl CommanderPaneController {
+impl BrowserPaneController {
     // --- read accessors ---------------------------------------------------
 
     /// The open image, folder or backup; `None` before one opens or after a failed open.
@@ -453,10 +456,18 @@ impl CommanderPaneController {
         self.src.error = Some(msg);
     }
 
+    /// The host screen opens the source of a fixed-source pane: an image and this partition of it.
+    pub fn open_fixed(&mut self, path: PathBuf, partition: Option<usize>) -> Vec<Effect> {
+        self.src.fixed_partition = partition;
+        let mut fx = self.switch(Switch::Open(OpenRequest::Image(path)));
+        fx.append(&mut self.out);
+        fx
+    }
+
     // --- actions ----------------------------------------------------------
 
-    pub(super) fn apply_source(&mut self, action: CommanderPaneAction) -> Vec<Effect> {
-        use CommanderPaneAction as A;
+    pub(super) fn apply_source(&mut self, action: BrowserPaneAction) -> Vec<Effect> {
+        use BrowserPaneAction as A;
         match action {
             A::OpenImage(p) => self.request_switch(Switch::Open(OpenRequest::Image(p))),
             A::OpenHostFolder(p) => self.request_switch(Switch::Open(OpenRequest::Host(p))),
@@ -849,7 +860,11 @@ impl CommanderPaneController {
                 self.src.kind = Some(SourceKind::Image);
                 self.remember_source();
                 self.src.partitions = parts;
-                match self.first_browsable_partition() {
+                let fixed = self
+                    .src
+                    .fixed_partition
+                    .filter(|&i| i < self.src.partitions.len());
+                match fixed.or_else(|| self.first_browsable_partition()) {
                     Some(i) => self.open_partition(i),
                     None => vec![message(format!("{path} has no browsable partitions."))],
                 }
@@ -1058,15 +1073,15 @@ fn finish_open(session: BrowseSession, mut st: BrowseOpenStatus) -> anyhow::Resu
 }
 
 #[cfg(test)]
-pub(in crate::controller::commander) mod tests {
+pub(in crate::controller) mod tests {
     use super::*;
     use crate::controller::Controller;
     use std::time::{Duration, Instant};
 
-    type A = CommanderPaneAction;
+    type A = BrowserPaneAction;
 
     /// Ticks until no job of the pane runs, returning every effect the ticks produced.
-    pub(crate) fn settle(vm: &mut CommanderPaneController) -> Vec<Effect> {
+    pub(crate) fn settle(vm: &mut BrowserPaneController) -> Vec<Effect> {
         let start = Instant::now();
         let mut fx = vm.tick();
         while vm.is_busy() || vm.wrapper_opening().is_some() {
@@ -1114,7 +1129,7 @@ pub(in crate::controller::commander) mod tests {
         path
     }
 
-    pub(crate) fn names(vm: &CommanderPaneController) -> Vec<String> {
+    pub(crate) fn names(vm: &BrowserPaneController) -> Vec<String> {
         vm.listing
             .entries()
             .iter()
@@ -1126,7 +1141,7 @@ pub(in crate::controller::commander) mod tests {
     fn opening_a_host_folder_runs_as_a_job() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         let fx = vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         assert!(messages(&fx)[0].starts_with("opening "));
         assert!(vm.is_opening());
@@ -1142,7 +1157,7 @@ pub(in crate::controller::commander) mod tests {
     fn opening_an_image_probes_partitions_and_selects_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = mbr_fat16(dir.path());
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenImage(path.clone()));
         let fx = settle(&mut vm);
         assert!(vm.source_error().is_none(), "{:?}", vm.source_error());
@@ -1172,7 +1187,7 @@ pub(in crate::controller::commander) mod tests {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         std::fs::write(second.path().join("b.txt"), b"x").unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenHostFolder(first.path().to_path_buf()));
         settle(&mut vm);
         // An empty queue switches straight away.
@@ -1211,7 +1226,7 @@ pub(in crate::controller::commander) mod tests {
     #[test]
     fn picker_effects_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         let fx = vm.apply(A::PickHostFolder);
         let [Effect::PickFolder(spec)] = fx.as_slice() else {
             panic!("expected PickFolder, got {fx:?}");
@@ -1241,7 +1256,7 @@ pub(in crate::controller::commander) mod tests {
     #[test]
     fn a_failed_open_reports_and_leaves_no_source() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenImage(dir.path().join("missing.img")));
         let fx = settle(&mut vm);
         assert_eq!(messages(&fx), ["open failed."]);
@@ -1254,7 +1269,7 @@ pub(in crate::controller::commander) mod tests {
     #[test]
     fn an_open_waits_for_the_one_it_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         settle(&mut vm);
@@ -1265,7 +1280,7 @@ pub(in crate::controller::commander) mod tests {
     #[test]
     fn close_drops_the_source() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         settle(&mut vm);
         assert_eq!(messages(&vm.apply(A::CloseSource)), ["closed."]);
@@ -1285,7 +1300,7 @@ pub(in crate::controller::commander) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.img");
         std::fs::write(&path, fixture("test_apfs_encrypted.img.zst")).unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenImage(path));
         settle(&mut vm);
         assert!(vm.needs_password(), "error: {:?}", vm.source_error());

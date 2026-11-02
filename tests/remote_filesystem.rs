@@ -2916,7 +2916,7 @@ fn remote_upload_carries_the_resource_fork() {
 mod commander_remote {
     use super::*;
     use rusty_backup::controller::commander::purpose;
-    use rusty_backup::controller::commander::{CommanderPaneAction as A, CommanderPaneController};
+    use rusty_backup::controller::commander::{BrowserPaneAction as A, BrowserPaneController};
     use rusty_backup::controller::{Controller, Effect};
     use std::time::{Duration, Instant};
 
@@ -2936,7 +2936,7 @@ mod commander_remote {
     }
 
     /// Ticks until the pane's jobs finish, returning the messages they produced.
-    fn settle(vm: &mut CommanderPaneController) -> Vec<String> {
+    fn settle(vm: &mut BrowserPaneController) -> Vec<String> {
         let start = Instant::now();
         let mut fx = vm.tick();
         while vm.is_busy() {
@@ -2958,12 +2958,12 @@ mod commander_remote {
         fx.iter().filter_map(text).collect()
     }
 
-    fn names(vm: &CommanderPaneController) -> Vec<String> {
+    fn names(vm: &BrowserPaneController) -> Vec<String> {
         let entries = vm.listing.entries().iter();
         entries.map(|e| e.name.clone()).collect()
     }
 
-    fn connect(vm: &mut CommanderPaneController, addr: &str) -> Vec<String> {
+    fn connect(vm: &mut BrowserPaneController, addr: &str) -> Vec<String> {
         let fx = vm.apply(A::Connect);
         let [Effect::AskText(spec)] = fx.as_slice() else {
             panic!("expected AskText, got {fx:?}");
@@ -2981,7 +2981,7 @@ mod commander_remote {
     #[test]
     fn connect_open_apply_and_close_through_the_pane_controller() {
         let (_dir, addr) = serve();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         let said = connect(&mut vm, &addr);
         assert!(vm.source_error().is_none(), "{:?}", vm.source_error());
         assert_eq!(said, [format!("connected to {addr} (browsing host)")]);
@@ -3041,7 +3041,7 @@ mod commander_remote {
     #[test]
     fn a_conflicting_remote_copy_is_reviewed_and_replace_overwrites_it() {
         let (_dir, addr) = serve();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         connect(&mut vm, &addr);
         vm.apply(A::OpenRemoteImage("disk.img".into()));
         settle(&mut vm);
@@ -3052,7 +3052,7 @@ mod commander_remote {
         let root =
             rusty_backup::model::dir_listing::read_host_root(host.path().to_path_buf()).unwrap();
         let cwd = vm.listing.cwd().unwrap().clone();
-        let stage = |vm: &mut CommanderPaneController| {
+        let stage = |vm: &mut BrowserPaneController| {
             let edits =
                 rusty_backup::model::commander_ops::stage_host_to_image(&root.entries, &cwd);
             vm.stage_edits(edits);
@@ -3067,7 +3067,7 @@ mod commander_remote {
         ));
         settle(&mut vm);
         assert!(vm.queue.is_empty(), "{:?}", vm.apply_report());
-        let seed = |vm: &CommanderPaneController| {
+        let seed = |vm: &BrowserPaneController| {
             let e = vm.listing.entries().iter().find(|e| e.name == "SEED.BIN");
             e.unwrap().size
         };
@@ -3095,7 +3095,7 @@ mod commander_remote {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         drop(listener);
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         let said = connect(&mut vm, &addr);
         assert!(said[0].starts_with("remote connect failed"), "{said:?}");
         assert!(!vm.is_remote() && vm.source_error().is_some());

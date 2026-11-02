@@ -159,7 +159,8 @@ The sketches above are the original plan. Since Phase 2 of
 [native_frontends_plan.md](native_frontends_plan.md) the logic lives in controllers
 every shell shares, and `src/gui/commander/` only draws:
 
-- `controller::commander::CommanderPaneController` (`src/controller/commander/pane*`):
+- `controller::browser::BrowserPaneController` (`src/controller/browser/pane*`, the Commander
+  profile `PaneProfile::commander()`; Phase 2 slice 10 moved it out of `controller::commander`):
   one pane's source, listing, queue, wrapper tree, apply, host writes, remote.
 - `controller::commander::CommanderController` (`src/controller/commander/screen*`):
   both panes, the active side, the status line and session log, the key map, the
@@ -346,7 +347,7 @@ destination's `validate_name`, renames what the destination can't hold (with a
 changes and points at Mac Archive (.mar) export for a lossless copy; "Undo copy"
 drops the batch.
 
-**Apply** is controller work (`CommanderPaneController`, `pane/edits.rs`): a
+**Apply** is controller work (`BrowserPaneController`, `browser/pane/edits.rs`): a
 preflight job runs `commander_ops::preflight_apply` on a fresh read-only
 open. `EditQueue::scan_against` replays the queue over the real listings
 (case-folded where the destination folds case) and reports name conflicts,

@@ -1,6 +1,6 @@
 //! The two-pane Commander screen: both panes, which one is active, and everything that spans them.
 //!
-//! [`CommanderController`] owns the left and right [`CommanderPaneController`]s and forwards
+//! [`CommanderController`] owns the left and right [`BrowserPaneController`]s and forwards
 //! `Pane(side, ..)` actions to them. A pane's pickers, confirmations and prompts leave as effects;
 //! the answer comes back as `Picked` / `Confirmed` / `Answered` and goes to the pane that asked
 //! (matched by `purpose`). A pane's messages and errors become the status line, its log lines the
@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use disk_core::entry::FileEntry;
 
-use super::pane::{CommanderPaneAction, CommanderPaneController, PaneServices, StageOutcome};
 use super::{NoRecent, OnConflict, RecentStore};
+use crate::controller::browser::pane::{
+    BrowserPaneAction, BrowserPaneController, PaneServices, StageOutcome,
+};
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect};
 use crate::model::checksum::FileChecksum;
@@ -118,7 +120,7 @@ impl HashAlgo {
 /// What a user does on the Commander screen.
 #[derive(Debug, Clone)]
 pub enum CommanderAction {
-    Pane(Side, CommanderPaneAction),
+    Pane(Side, BrowserPaneAction),
     /// The user worked in this pane; it becomes the one keys and the middle Delete act on.
     Focus(Side),
     SwitchPane,
@@ -309,8 +311,8 @@ struct PendingExport {
 
 /// Both panes and the operations between them; see the module docs.
 pub struct CommanderController {
-    left: CommanderPaneController,
-    right: CommanderPaneController,
+    left: BrowserPaneController,
+    right: BrowserPaneController,
     active: Side,
     status: String,
     /// Extracted files an image -> image copy staged; kept until the screen closes.
@@ -395,7 +397,7 @@ impl CommanderController {
                 if !self.can_delete() {
                     return Vec::new();
                 }
-                self.forward(self.active, CommanderPaneAction::Delete)
+                self.forward(self.active, BrowserPaneAction::Delete)
             }
             A::Export { from, format } => self.request_export(from, format),
             A::Checksums(from) => {
@@ -486,10 +488,10 @@ impl CommanderController {
                 self.page_rows[side.idx()] = rows.max(1);
                 Vec::new()
             }
-            A::OpenDropped(path) => self.forward(self.active, CommanderPaneAction::OpenPath(path)),
+            A::OpenDropped(path) => self.forward(self.active, BrowserPaneAction::OpenPath(path)),
             A::RecentCleared => {
-                let mut fx = self.forward(Side::Left, CommanderPaneAction::RecentCleared);
-                fx.extend(self.forward(Side::Right, CommanderPaneAction::RecentCleared));
+                let mut fx = self.forward(Side::Left, BrowserPaneAction::RecentCleared);
+                fx.extend(self.forward(Side::Right, BrowserPaneAction::RecentCleared));
                 fx
             }
             A::Picked { purpose, path } if purpose == purpose::EXPORT => {
@@ -498,7 +500,7 @@ impl CommanderController {
             }
             A::Picked { purpose, path } => {
                 let side = self.asker_take(purpose);
-                self.forward(side, CommanderPaneAction::Picked { purpose, path })
+                self.forward(side, BrowserPaneAction::Picked { purpose, path })
             }
             A::Confirmed { purpose, yes }
                 if purpose == purpose::CLOSE_UNSAVED || purpose == purpose::QUIT_UNSAVED =>
@@ -512,14 +514,14 @@ impl CommanderController {
             }
             A::Confirmed { purpose, yes } => {
                 let side = self.asker_take(purpose);
-                self.forward(side, CommanderPaneAction::Confirmed { purpose, yes })
+                self.forward(side, BrowserPaneAction::Confirmed { purpose, yes })
             }
             A::Answered { purpose, text } if DetailField::for_purpose(purpose).is_some() => {
                 self.detail_answered(purpose, text)
             }
             A::Answered { purpose, text } => {
                 let side = self.asker_take(purpose);
-                self.forward(side, CommanderPaneAction::Answered { purpose, text })
+                self.forward(side, BrowserPaneAction::Answered { purpose, text })
             }
         }
     }
@@ -542,7 +544,7 @@ fn log_timestamp() -> String {
 }
 
 /// The sort the Sort command steps to: this column descending, then the next column ascending.
-fn next_sort(pane: &CommanderPaneController) -> SortColumn {
+fn next_sort(pane: &BrowserPaneController) -> SortColumn {
     let col = pane.listing.sort_column();
     if !pane.listing.is_descending() {
         return col;
@@ -571,8 +573,8 @@ impl CommanderController {
         let jobs = left.jobs.clone();
         let notify = Arc::clone(&left.notify);
         Self {
-            left: CommanderPaneController::with_services(left),
-            right: CommanderPaneController::with_services(right),
+            left: BrowserPaneController::with_services(left),
+            right: BrowserPaneController::with_services(right),
             active: Side::Left,
             status: "Commander Mode -- open a disk image in each pane; select files and \
                      use the middle Copy buttons or right-click to stage a copy."
@@ -628,7 +630,7 @@ impl CommanderController {
 
     // --- read accessors ---------------------------------------------------
 
-    pub fn pane(&self, side: Side) -> &CommanderPaneController {
+    pub fn pane(&self, side: Side) -> &BrowserPaneController {
         match side {
             Side::Left => &self.left,
             Side::Right => &self.right,
@@ -717,7 +719,7 @@ impl CommanderController {
 
     /// True while any job runs (an open, apply, copy, export, wrapper or checksum), so a view polls.
     pub fn is_working(&self) -> bool {
-        let pane_busy = |p: &CommanderPaneController| p.is_busy() || p.wrapper_opening().is_some();
+        let pane_busy = |p: &BrowserPaneController| p.is_busy() || p.wrapper_opening().is_some();
         let hashing = self.checksums.as_ref().is_some_and(|c| c.job.is_some());
         let busy = self.copy.is_some() || hashing || self.detail_job.is_some();
         busy || pane_busy(&self.left) || pane_busy(&self.right)
@@ -757,7 +759,7 @@ impl CommanderController {
     /// True while one of the screen's own reviews (or a pane's apply review or report) is up.
     pub fn modal_open(&self) -> bool {
         let pane_modal =
-            |p: &CommanderPaneController| p.apply_review().is_some() || p.apply_report().is_some();
+            |p: &BrowserPaneController| p.apply_review().is_some() || p.apply_report().is_some();
         self.conflict.is_some()
             || self.rename_notice.is_some()
             || pane_modal(&self.left)
@@ -782,15 +784,15 @@ impl CommanderController {
 
     // --- panes ------------------------------------------------------------
 
-    fn pane_mut(&mut self, side: Side) -> &mut CommanderPaneController {
+    fn pane_mut(&mut self, side: Side) -> &mut BrowserPaneController {
         match side {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         }
     }
 
-    fn forward(&mut self, side: Side, action: CommanderPaneAction) -> Vec<Effect> {
-        if matches!(action, CommanderPaneAction::SelectPartition(_)) {
+    fn forward(&mut self, side: Side, action: BrowserPaneAction) -> Vec<Effect> {
+        if matches!(action, BrowserPaneAction::SelectPartition(_)) {
             self.partitions = None;
         }
         let fx = self.pane_mut(side).apply(action);
@@ -844,7 +846,7 @@ impl CommanderController {
     /// Re-read a pane's folder after something wrote into it.
     fn reload(&mut self, side: Side) {
         let pane = self.pane_mut(side);
-        pane.apply(CommanderPaneAction::Reload);
+        pane.apply(BrowserPaneAction::Reload);
         pane.take_error();
     }
 
@@ -876,7 +878,7 @@ impl CommanderController {
 
     /// What a command means here: pane commands go to the active pane, the rest to the buttons.
     fn command(&mut self, cmd: Command) -> Vec<Effect> {
-        use CommanderPaneAction as P;
+        use BrowserPaneAction as P;
         let side = self.active;
         if let Some(was) = self.implicit.take() {
             if self.pane(was).selection_len() == 1 {
@@ -997,7 +999,7 @@ impl CommanderController {
         } else if self.partitions.is_some() {
             self.partitions = None;
         } else if self.pane(active).edits_shown() {
-            return self.forward(active, CommanderPaneAction::ShowEdits(false));
+            return self.forward(active, BrowserPaneAction::ShowEdits(false));
         } else if self.detail.is_some() {
             self.close_detail();
         } else if self.checksums.is_some() {

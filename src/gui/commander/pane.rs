@@ -9,10 +9,10 @@
 
 use eframe::egui;
 
-use rusty_backup::controller::commander::rows::{DisplayRow, RowKind};
+use rusty_backup::controller::browser::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    format_size, CommanderAction, CommanderController, CommanderPaneAction,
-    CommanderPaneController, ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
+    format_size, CommanderAction, CommanderController, BrowserPaneAction,
+    BrowserPaneController, ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
 
 const ROW_H: f32 = 20.0;
@@ -49,7 +49,7 @@ fn read_only_badge_color(v: &egui::Visuals) -> egui::Color32 {
 }
 
 type A = CommanderAction;
-type P = CommanderPaneAction;
+type P = BrowserPaneAction;
 
 pub(crate) struct PaneView {
     side: Side,
@@ -71,7 +71,7 @@ impl PaneView {
         }
     }
 
-    fn pane_action(&self, out: &mut Vec<CommanderAction>, action: CommanderPaneAction) {
+    fn pane_action(&self, out: &mut Vec<CommanderAction>, action: BrowserPaneAction) {
         out.push(A::Pane(self.side, action));
     }
 
@@ -162,7 +162,7 @@ impl PaneView {
     fn unlock_prompt(
         &mut self,
         ui: &mut egui::Ui,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         let is_apfs = pane.volume().fs_type == "APFS";
@@ -201,7 +201,7 @@ impl PaneView {
     fn source_bar(
         &self,
         ui: &mut egui::Ui,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         let mut source_action = None;
@@ -428,7 +428,7 @@ impl PaneView {
     fn render_edits_popup(
         &self,
         ctx: &egui::Context,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         if !pane.edits_shown() {
@@ -472,7 +472,7 @@ impl PaneView {
     fn path_line(
         &self,
         ui: &mut egui::Ui,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         ui.horizontal(|ui| {
@@ -512,7 +512,7 @@ impl PaneView {
     fn render_apply_review(
         &mut self,
         ctx: &egui::Context,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         let Some(p) = pane.apply_review() else {
@@ -592,7 +592,7 @@ impl PaneView {
     fn render_apply_report(
         &self,
         ctx: &egui::Context,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         let Some(report) = pane.apply_report() else {
@@ -674,7 +674,7 @@ impl PaneView {
     fn render_header(
         &self,
         ui: &mut egui::Ui,
-        pane: &CommanderPaneController,
+        pane: &BrowserPaneController,
         out: &mut Vec<CommanderAction>,
     ) {
         let (rect, resp) = ui.allocate_exact_size(
@@ -784,7 +784,7 @@ impl PaneView {
         let remote_host = pane.is_remote_host();
 
         // Row clicks this frame, run through the controller in order once drawing is done.
-        let mut acts: Vec<CommanderPaneAction> = Vec::new();
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
         let mut after: Vec<CommanderAction> = Vec::new();
 
         egui::ScrollArea::vertical()

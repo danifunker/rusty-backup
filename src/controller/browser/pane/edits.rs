@@ -16,8 +16,8 @@ use std::path::PathBuf;
 
 use disk_core::entry::FileEntry;
 
-use super::{CommanderPaneAction, CommanderPaneController};
-use crate::controller::commander::pane::purpose;
+use super::{BrowserPaneAction, BrowserPaneController};
+use crate::controller::browser::pane::purpose;
 use crate::controller::{ConfirmSpec, Effect, TextSpec};
 use crate::fs::replace::OnConflict;
 use crate::model::browse_session::BrowseSession;
@@ -76,7 +76,7 @@ impl ApplyTarget {
     }
 }
 
-/// What one [`CommanderPaneController::stage_edits`] batch did.
+/// What one [`BrowserPaneController::stage_edits`] batch did.
 #[derive(Debug, Clone)]
 pub struct StageOutcome {
     pub staged: usize,
@@ -205,7 +205,7 @@ fn msg(text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Message(text.into())]
 }
 
-impl CommanderPaneController {
+impl BrowserPaneController {
     // --- read accessors ---------------------------------------------------
 
     /// True while the "Pending edits" list is open (it closes itself once the queue empties).
@@ -279,19 +279,24 @@ impl CommanderPaneController {
     }
 
     pub fn can_new_folder(&self) -> bool {
-        self.can_edit_names() && !self.is_remote_host()
+        self.profile.can_new_folder() && self.can_edit_names() && !self.is_remote_host()
     }
 
     /// True when a copy can land here (a host folder writes now, an image stages).
     pub fn can_receive(&self) -> bool {
-        self.listing.is_loaded() && !self.is_busy() && !self.is_backup() && !self.is_archive()
+        !self.profile.read_only
+            && self.listing.is_loaded()
+            && !self.is_busy()
+            && !self.is_backup()
+            && !self.is_archive()
     }
 
     /// True for read-only media (archive, optical disc, backup), for the "Read-only" badge.
     pub fn is_read_only(&self) -> bool {
         self.listing.is_loaded()
-            && !self.listing.is_host()
-            && (self.is_archive() || self.is_optical() || self.is_backup())
+            && (self.profile.read_only
+                || (!self.listing.is_host()
+                    && (self.is_archive() || self.is_optical() || self.is_backup())))
     }
 
     /// Why a copy into this pane is refused, for the copy button's hover.
@@ -437,8 +442,15 @@ impl CommanderPaneController {
             None => (LegalizeReport::default(), String::new()),
         };
         let staged = edits.len();
+        if self.profile.read_only {
+            edits.clear();
+        }
+        let staged = staged.min(edits.len());
         for e in edits {
             self.queue.push(e);
+        }
+        if staged > 0 {
+            self.auto_apply();
         }
         StageOutcome {
             staged,
@@ -473,9 +485,9 @@ impl CommanderPaneController {
     /// Handles an editing action, or hands it back for the source actions.
     pub(super) fn apply_edit(
         &mut self,
-        action: CommanderPaneAction,
-    ) -> Result<Vec<Effect>, CommanderPaneAction> {
-        use CommanderPaneAction as A;
+        action: BrowserPaneAction,
+    ) -> Result<Vec<Effect>, BrowserPaneAction> {
+        use BrowserPaneAction as A;
         let fx = match action {
             A::Delete => self.delete(),
             A::CancelRename(name) => {
@@ -911,7 +923,7 @@ impl CommanderPaneController {
         self.session().cloned().map(ApplyTarget::Session)
     }
 
-    fn start_check(&mut self) -> Vec<Effect> {
+    pub(super) fn start_check(&mut self) -> Vec<Effect> {
         if !self.can_apply() {
             return Vec::new();
         }
@@ -1161,17 +1173,17 @@ mod tests {
     use super::*;
     use crate::controller::Controller;
 
-    type A = CommanderPaneAction;
+    type A = BrowserPaneAction;
 
-    fn image_pane(dir: &std::path::Path) -> CommanderPaneController {
-        let mut vm = CommanderPaneController::new();
+    fn image_pane(dir: &std::path::Path) -> BrowserPaneController {
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenImage(mbr_fat16(dir)));
         settle(&mut vm);
         assert!(vm.listing.is_loaded(), "{:?}", vm.source_error());
         vm
     }
 
-    fn files(vm: &CommanderPaneController) -> Vec<String> {
+    fn files(vm: &BrowserPaneController) -> Vec<String> {
         let entries = vm.listing.entries().iter();
         entries
             .filter(|e| e.is_file())
@@ -1179,7 +1191,7 @@ mod tests {
             .collect()
     }
 
-    fn select(vm: &mut CommanderPaneController, name: &str) {
+    fn select(vm: &mut BrowserPaneController, name: &str) {
         vm.apply(A::Click {
             name: name.into(),
             ctrl: false,
@@ -1378,7 +1390,7 @@ mod tests {
     fn host_writes_run_as_jobs_and_delete_only_after_yes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         settle(&mut vm);
 
@@ -1425,7 +1437,7 @@ mod tests {
         assert_eq!(vm.take_log().len(), 3);
     }
 
-    fn queue_untouched(vm: &CommanderPaneController) -> bool {
+    fn queue_untouched(vm: &BrowserPaneController) -> bool {
         vm.queue.is_empty()
     }
 }

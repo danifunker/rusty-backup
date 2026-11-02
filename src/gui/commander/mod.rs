@@ -21,7 +21,7 @@ use eframe::egui;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, CommanderAction, CommanderController, CommanderPaneAction, EditQueue,
+    format_size, CommanderAction, CommanderController, BrowserPaneAction, EditQueue,
     ExportFormat, FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices,
     ResourceForkMode, Side,
 };
@@ -620,7 +620,7 @@ impl CommanderMode {
                 for (i, label) in pane.partition_labels().iter().enumerate() {
                     let on = pane.selected_partition() == Some(i);
                     if ui.selectable_label(on, label).clicked() {
-                        acts.push(A::Pane(side, CommanderPaneAction::SelectPartition(i)));
+                        acts.push(A::Pane(side, BrowserPaneAction::SelectPartition(i)));
                     }
                 }
             });

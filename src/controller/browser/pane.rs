@@ -1,4 +1,4 @@
-//! One Commander pane's state: source, listing, staged-edit queue, expanded wrappers, selection and cursor.
+//! One browser pane's state: source, listing, staged-edit queue, expanded wrappers, selection and cursor.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,12 +8,13 @@ use crate::model::dir_listing::DirListing;
 use crate::model::edit_queue::EditQueue;
 use crate::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
 
+use super::profile::PaneProfile;
 use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
 mod edits;
 mod remote;
-pub(in crate::controller::commander) mod source;
+pub(in crate::controller) mod source;
 
 pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
@@ -24,7 +25,7 @@ pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, Volum
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommanderPaneAction {
+pub enum BrowserPaneAction {
     /// Enter the child directory with this name.
     Enter(String),
     Up,
@@ -129,7 +130,7 @@ pub enum CommanderPaneAction {
 }
 
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
-pub struct CommanderPaneController {
+pub struct BrowserPaneController {
     pub listing: DirListing,
     /// Edits staged against this pane's volume until Apply.
     pub queue: EditQueue,
@@ -160,37 +161,43 @@ pub struct CommanderPaneController {
     ed: edits::EditState,
     /// The `rb-cli serve` connection and its open / close job.
     remote: remote::RemoteState,
+    /// What this use of the pane may do; checked before every action.
+    profile: PaneProfile,
 }
 
-impl Default for CommanderPaneController {
+impl Default for BrowserPaneController {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Controller for CommanderPaneController {
-    type Action = CommanderPaneAction;
+impl Controller for BrowserPaneController {
+    type Action = BrowserPaneAction;
 
-    fn apply(&mut self, action: CommanderPaneAction) -> Vec<Effect> {
+    fn apply(&mut self, action: BrowserPaneAction) -> Vec<Effect> {
         self.error = None;
+        if let Some(why) = self.refused(&action) {
+            return vec![Effect::Message(why)];
+        }
         self.rebuild_rows();
+        let staged_before = self.queue.len();
         let mut fx = Vec::new();
         match action {
-            CommanderPaneAction::Enter(name) => self.enter(&name),
-            CommanderPaneAction::Up => self.up(),
-            CommanderPaneAction::NavigateTo(path) => {
+            BrowserPaneAction::Enter(name) => self.enter(&name),
+            BrowserPaneAction::Up => self.up(),
+            BrowserPaneAction::NavigateTo(path) => {
                 let before = self.listing.cwd_path().to_string();
                 if let Err(e) = self.listing.navigate_to(&path) {
                     self.error = Some(format!("cannot open '{path}': {e}"));
                 }
                 self.navigated(&before, None);
             }
-            CommanderPaneAction::Reload => {
+            BrowserPaneAction::Reload => {
                 if let Err(e) = self.listing.reload() {
                     self.error = Some(format!("cannot refresh: {e}"));
                 }
             }
-            CommanderPaneAction::Click { name, ctrl, shift } => {
+            BrowserPaneAction::Click { name, ctrl, shift } => {
                 self.tree_selected.clear();
                 if shift {
                     self.listing.shift_click(&name);
@@ -201,39 +208,39 @@ impl Controller for CommanderPaneController {
                 }
                 self.cursor_to_base(&name);
             }
-            CommanderPaneAction::TreeClick {
+            BrowserPaneAction::TreeClick {
                 node_id,
                 ctrl,
                 shift,
             } => self.tree_click(node_id, ctrl, shift),
-            CommanderPaneAction::ContextSelect(name) => self.context_select(&name),
-            CommanderPaneAction::TreeContextSelect(node_id) => self.tree_context_select(node_id),
-            CommanderPaneAction::ToggleMark => self.toggle_mark(),
-            CommanderPaneAction::ClearSelection => {
+            BrowserPaneAction::ContextSelect(name) => self.context_select(&name),
+            BrowserPaneAction::TreeContextSelect(node_id) => self.tree_context_select(node_id),
+            BrowserPaneAction::ToggleMark => self.toggle_mark(),
+            BrowserPaneAction::ClearSelection => {
                 self.listing.clear_selection();
                 self.tree_selected.clear();
             }
-            CommanderPaneAction::SortBy(col) => self.listing.resort(col),
-            CommanderPaneAction::CursorUp => self.move_cursor(-1),
-            CommanderPaneAction::CursorDown => self.move_cursor(1),
-            CommanderPaneAction::CursorPage(n) => self.move_cursor(i64::from(n)),
-            CommanderPaneAction::CursorHome => self.set_cursor_index(0),
-            CommanderPaneAction::CursorEnd => {
+            BrowserPaneAction::SortBy(col) => self.listing.resort(col),
+            BrowserPaneAction::CursorUp => self.move_cursor(-1),
+            BrowserPaneAction::CursorDown => self.move_cursor(1),
+            BrowserPaneAction::CursorPage(n) => self.move_cursor(i64::from(n)),
+            BrowserPaneAction::CursorHome => self.set_cursor_index(0),
+            BrowserPaneAction::CursorEnd => {
                 let last = self.rows.len().saturating_sub(1);
                 self.set_cursor_index(last);
             }
-            CommanderPaneAction::ActivateCursor => {
+            BrowserPaneAction::ActivateCursor => {
                 if let Some(row) = self.cursor_row() {
                     self.activate(row);
                 }
             }
-            CommanderPaneAction::Activate(node_id) => {
+            BrowserPaneAction::Activate(node_id) => {
                 if let Some(row) = self.rows.iter().find(|r| r.node_id == node_id).cloned() {
                     self.activate(row);
                 }
             }
-            CommanderPaneAction::InfoAtCursor => self.info_at_cursor(),
-            CommanderPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
+            BrowserPaneAction::InfoAtCursor => self.info_at_cursor(),
+            BrowserPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
             other => {
                 fx = match self.apply_remote(other).or_else(|a| self.apply_edit(a)) {
                     Ok(fx) => fx,
@@ -242,6 +249,9 @@ impl Controller for CommanderPaneController {
             }
         }
         self.password_error_locks();
+        if self.queue.len() > staged_before {
+            self.auto_apply();
+        }
         self.rebuild_rows();
         fx.append(&mut self.out);
         fx
@@ -257,14 +267,19 @@ impl Controller for CommanderPaneController {
     }
 }
 
-impl CommanderPaneController {
+impl BrowserPaneController {
     /// A pane with no recent files, its own job registry and no wake: for tests and the CLI.
     pub fn new() -> Self {
         Self::with_services(PaneServices::headless())
     }
 
-    /// A pane whose jobs register in `services.jobs` and wake the shell through `services.notify`.
+    /// A Commander pane whose jobs register in `services.jobs` and wake the shell through `services.notify`.
     pub fn with_services(services: PaneServices) -> Self {
+        Self::with_profile(services, PaneProfile::commander())
+    }
+
+    /// A pane configured for one use (Commander, the TUI Explorer, the Inspect browse view).
+    pub fn with_profile(services: PaneServices, profile: PaneProfile) -> Self {
         Self {
             listing: DirListing::new(),
             queue: EditQueue::new(),
@@ -283,6 +298,39 @@ impl CommanderPaneController {
             src: source::SourceState::new(services),
             ed: edits::EditState::new(),
             remote: remote::RemoteState::default(),
+            profile,
+        }
+    }
+
+    pub fn profile(&self) -> &PaneProfile {
+        &self.profile
+    }
+
+    /// Why the profile refuses `action`, or `None` when it may run.
+    fn refused(&self, action: &BrowserPaneAction) -> Option<String> {
+        use BrowserPaneAction as A;
+        let p = &self.profile;
+        let (allowed, what) = match action {
+            A::OpenImage(_) | A::PickImage => (p.sources.image, "opening an image"),
+            A::OpenHostFolder(_) | A::PickHostFolder => (p.sources.host, "opening a folder"),
+            A::OpenBackupFolder(_) | A::PickBackupFolder => (p.sources.backup, "opening a backup"),
+            A::OpenPath(_) => (p.sources.image || p.sources.host, "opening another source"),
+            A::Connect | A::OpenRemoteImage(_) => (p.sources.remote, "remote browsing"),
+            A::SelectPartition(_) | A::CloseSource => (!p.fixed_source, "changing the source"),
+            A::Delete => (p.can_delete(), "delete"),
+            A::RequestRename(_) | A::RenameAtCursor => (p.can_rename(), "rename"),
+            A::RequestNewFolder => (p.can_new_folder(), "new folder"),
+            A::ToggleWrapper(_) => (p.wrappers, "expanding archives and images"),
+            _ => (true, ""),
+        };
+        (!allowed).then(|| p.refusal(what))
+    }
+
+    /// Without staging, what was just staged applies at once (through the same preflight and review).
+    fn auto_apply(&mut self) {
+        if !self.profile.staging {
+            let fx = self.start_check();
+            self.out.extend(fx);
         }
     }
 
@@ -318,7 +366,7 @@ impl CommanderPaneController {
         self.error.take()
     }
 
-    pub(in crate::controller::commander) fn take_info_request(&mut self) -> Option<String> {
+    pub(in crate::controller) fn take_info_request(&mut self) -> Option<String> {
         self.info_request.take()
     }
 
@@ -372,7 +420,7 @@ impl CommanderPaneController {
         out
     }
 
-    pub(in crate::controller::commander) fn rebuild_rows(&mut self) {
+    pub(in crate::controller) fn rebuild_rows(&mut self) {
         // A remote host listing tints images and never expands wrappers.
         self.remote_host = self.is_remote_host();
         self.rows = build_display_rows(
@@ -382,6 +430,12 @@ impl CommanderPaneController {
             &mut self.tree_index,
             self.remote_host,
         );
+        if !self.profile.wrappers {
+            for r in &mut self.rows {
+                r.is_wrapper = false;
+                r.expandable = false;
+            }
+        }
     }
 
     fn collapse_wrappers(&mut self) {
@@ -553,10 +607,7 @@ impl CommanderPaneController {
     }
 
     /// Select the cursor row for a key command when nothing is selected; true when it did.
-    pub(in crate::controller::commander) fn select_cursor_if_none(
-        &mut self,
-        pending_ok: bool,
-    ) -> bool {
+    pub(in crate::controller) fn select_cursor_if_none(&mut self, pending_ok: bool) -> bool {
         let Some(row) = self.cursor_row().filter(|_| !self.has_selection()) else {
             return false;
         };
@@ -572,7 +623,7 @@ impl CommanderPaneController {
     }
 
     /// The number of selected rows, listing or wrapper tree.
-    pub(in crate::controller::commander) fn selection_len(&self) -> usize {
+    pub(in crate::controller) fn selection_len(&self) -> usize {
         self.tree_selected.len() + self.listing.selection().len()
     }
 
@@ -613,7 +664,7 @@ mod tests {
     use crate::controller::commander::RowKind;
     use crate::model::edit_queue::StagedEdit;
 
-    fn host_pane(files: &[&str], dirs: &[&str]) -> (tempfile::TempDir, CommanderPaneController) {
+    fn host_pane(files: &[&str], dirs: &[&str]) -> (tempfile::TempDir, BrowserPaneController) {
         let dir = tempfile::tempdir().unwrap();
         for f in files {
             std::fs::write(dir.path().join(f), b"x").unwrap();
@@ -621,7 +672,7 @@ mod tests {
         for d in dirs {
             std::fs::create_dir(dir.path().join(d)).unwrap();
         }
-        let mut vm = CommanderPaneController::new();
+        let mut vm = BrowserPaneController::new();
         vm.listing.load_host_root(dir.path().to_path_buf()).unwrap();
         (dir, vm)
     }
@@ -683,19 +734,19 @@ mod tests {
         assert!(!row(&rows, "notes.txt").is_image);
     }
 
-    fn names_selected(vm: &CommanderPaneController) -> Vec<String> {
+    fn names_selected(vm: &BrowserPaneController) -> Vec<String> {
         vm.listing.selection().to_vec()
     }
 
-    fn click(name: &str, ctrl: bool, shift: bool) -> CommanderPaneAction {
-        CommanderPaneAction::Click {
+    fn click(name: &str, ctrl: bool, shift: bool) -> BrowserPaneAction {
+        BrowserPaneAction::Click {
             name: name.into(),
             ctrl,
             shift,
         }
     }
 
-    fn cursor_name(vm: &CommanderPaneController) -> String {
+    fn cursor_name(vm: &BrowserPaneController) -> String {
         vm.rows()[vm.cursor_index().unwrap()].name.clone()
     }
 
@@ -704,15 +755,15 @@ mod tests {
         let (d, mut vm) = host_pane(&[], &["sub"]);
         std::fs::create_dir(d.path().join("sub").join("deeper")).unwrap();
         let root = vm.listing.cwd_path().to_string();
-        vm.apply(CommanderPaneAction::Enter("sub".into()));
+        vm.apply(BrowserPaneAction::Enter("sub".into()));
         assert!(vm.listing.cwd_path().ends_with("sub"));
         assert!(vm.error().is_none());
-        vm.apply(CommanderPaneAction::Up);
+        vm.apply(BrowserPaneAction::Up);
         assert_eq!(vm.listing.cwd_path(), root);
         // The cursor lands on the folder just left.
         assert_eq!(cursor_name(&vm), "sub");
         let deeper = d.path().join("sub").join("deeper");
-        vm.apply(CommanderPaneAction::NavigateTo(
+        vm.apply(BrowserPaneAction::NavigateTo(
             deeper.to_string_lossy().to_string(),
         ));
         assert!(
@@ -726,7 +777,7 @@ mod tests {
     fn a_failed_enter_keeps_the_cwd_and_reports() {
         let (_d, mut vm) = host_pane(&["file.txt"], &[]);
         let root = vm.listing.cwd_path().to_string();
-        vm.apply(CommanderPaneAction::Enter("nope".into()));
+        vm.apply(BrowserPaneAction::Enter("nope".into()));
         assert_eq!(vm.listing.cwd_path(), root);
         assert!(vm.error().unwrap().contains("nope"));
         assert!(vm.take_error().is_some());
@@ -743,11 +794,11 @@ mod tests {
         assert_eq!(names_selected(&vm), ["b", "c", "d"]);
         vm.apply(click("c", true, false));
         assert_eq!(names_selected(&vm), ["b", "d"]);
-        vm.apply(CommanderPaneAction::ContextSelect("d".into()));
+        vm.apply(BrowserPaneAction::ContextSelect("d".into()));
         assert_eq!(names_selected(&vm), ["b", "d"], "already selected stays");
-        vm.apply(CommanderPaneAction::ContextSelect("a".into()));
+        vm.apply(BrowserPaneAction::ContextSelect("a".into()));
         assert_eq!(names_selected(&vm), ["a"]);
-        vm.apply(CommanderPaneAction::ClearSelection);
+        vm.apply(BrowserPaneAction::ClearSelection);
         assert!(names_selected(&vm).is_empty());
     }
 
@@ -755,14 +806,14 @@ mod tests {
     fn toggle_mark_marks_and_moves_down() {
         let (_d, mut vm) = host_pane(&["a", "b"], &[]);
         // A host pane starts with `..` at the top, which cannot be marked.
-        vm.apply(CommanderPaneAction::ToggleMark);
+        vm.apply(BrowserPaneAction::ToggleMark);
         assert!(names_selected(&vm).is_empty());
         assert_eq!(cursor_name(&vm), "a");
-        vm.apply(CommanderPaneAction::ToggleMark);
-        vm.apply(CommanderPaneAction::ToggleMark);
+        vm.apply(BrowserPaneAction::ToggleMark);
+        vm.apply(BrowserPaneAction::ToggleMark);
         assert_eq!(names_selected(&vm), ["a", "b"]);
-        vm.apply(CommanderPaneAction::CursorUp);
-        vm.apply(CommanderPaneAction::ToggleMark);
+        vm.apply(BrowserPaneAction::CursorUp);
+        vm.apply(BrowserPaneAction::ToggleMark);
         assert_eq!(names_selected(&vm), ["b"]);
     }
 
@@ -771,9 +822,9 @@ mod tests {
         let (d, mut vm) = host_pane(&[], &[]);
         std::fs::write(d.path().join("big"), vec![0u8; 100]).unwrap();
         std::fs::write(d.path().join("small"), b"x").unwrap();
-        vm.apply(CommanderPaneAction::Reload);
+        vm.apply(BrowserPaneAction::Reload);
         vm.apply(click("small", false, false));
-        vm.apply(CommanderPaneAction::SortBy(SortColumn::Size));
+        vm.apply(BrowserPaneAction::SortBy(SortColumn::Size));
         let order: Vec<_> = vm
             .listing
             .entries()
@@ -781,7 +832,7 @@ mod tests {
             .map(|e| e.name.clone())
             .collect();
         assert_eq!(order, ["small", "big"]);
-        vm.apply(CommanderPaneAction::SortBy(SortColumn::Size));
+        vm.apply(BrowserPaneAction::SortBy(SortColumn::Size));
         assert!(vm.listing.is_descending());
         assert_eq!(vm.listing.entries()[0].name, "big");
         assert_eq!(cursor_name(&vm), "small");
@@ -792,19 +843,19 @@ mod tests {
         let (_d, mut vm) = host_pane(&["a", "b", "c"], &[]);
         vm.display_rows();
         assert_eq!(vm.cursor_index(), Some(0));
-        vm.apply(CommanderPaneAction::CursorUp);
+        vm.apply(BrowserPaneAction::CursorUp);
         assert_eq!(vm.cursor_index(), Some(0));
-        vm.apply(CommanderPaneAction::CursorDown);
+        vm.apply(BrowserPaneAction::CursorDown);
         assert_eq!(cursor_name(&vm), "a");
-        vm.apply(CommanderPaneAction::CursorPage(10));
+        vm.apply(BrowserPaneAction::CursorPage(10));
         assert_eq!(cursor_name(&vm), "c");
-        vm.apply(CommanderPaneAction::CursorDown);
+        vm.apply(BrowserPaneAction::CursorDown);
         assert_eq!(cursor_name(&vm), "c");
-        vm.apply(CommanderPaneAction::CursorPage(-2));
+        vm.apply(BrowserPaneAction::CursorPage(-2));
         assert_eq!(cursor_name(&vm), "a");
-        vm.apply(CommanderPaneAction::CursorEnd);
+        vm.apply(BrowserPaneAction::CursorEnd);
         assert_eq!(cursor_name(&vm), "c");
-        vm.apply(CommanderPaneAction::CursorHome);
+        vm.apply(BrowserPaneAction::CursorHome);
         assert_eq!(cursor_name(&vm), "..");
     }
 
@@ -812,15 +863,15 @@ mod tests {
     fn activate_cursor_enters_a_dir_goes_up_and_asks_for_file_info() {
         let (_d, mut vm) = host_pane(&["f.txt"], &["sub"]);
         let root = vm.listing.cwd_path().to_string();
-        vm.apply(CommanderPaneAction::CursorDown);
+        vm.apply(BrowserPaneAction::CursorDown);
         assert_eq!(cursor_name(&vm), "sub");
-        vm.apply(CommanderPaneAction::ActivateCursor);
+        vm.apply(BrowserPaneAction::ActivateCursor);
         assert!(vm.listing.cwd_path().ends_with("sub"));
         assert_eq!(cursor_name(&vm), "..");
-        vm.apply(CommanderPaneAction::ActivateCursor);
+        vm.apply(BrowserPaneAction::ActivateCursor);
         assert_eq!(vm.listing.cwd_path(), root);
-        vm.apply(CommanderPaneAction::CursorEnd);
-        vm.apply(CommanderPaneAction::ActivateCursor);
+        vm.apply(BrowserPaneAction::CursorEnd);
+        vm.apply(BrowserPaneAction::ActivateCursor);
         assert_eq!(vm.take_info_request().as_deref(), Some("f.txt"));
         assert_eq!(names_selected(&vm), ["f.txt"]);
     }
@@ -854,10 +905,10 @@ mod tests {
     }
 
     /// A host pane with `a.sit` expanded in place, plus a `sub` folder.
-    fn wrapped_pane() -> (tempfile::TempDir, CommanderPaneController, String) {
+    fn wrapped_pane() -> (tempfile::TempDir, BrowserPaneController, String) {
         let (d, mut vm) = host_pane(&[], &["sub"]);
         std::fs::write(d.path().join("a.sit"), sit_bytes()).unwrap();
-        vm.apply(CommanderPaneAction::Reload);
+        vm.apply(BrowserPaneAction::Reload);
         let id = vm
             .listing
             .entries()
@@ -866,7 +917,7 @@ mod tests {
             .unwrap()
             .path
             .clone();
-        vm.apply(CommanderPaneAction::ToggleWrapper(id.clone()));
+        vm.apply(BrowserPaneAction::ToggleWrapper(id.clone()));
         assert!(
             vm.wrapper_opening().is_some(),
             "a base wrapper opens as a job"
@@ -887,7 +938,7 @@ mod tests {
         (d, vm, id)
     }
 
-    fn tree_id(vm: &CommanderPaneController, name: &str) -> String {
+    fn tree_id(vm: &BrowserPaneController, name: &str) -> String {
         vm.rows()
             .iter()
             .find(|r| r.is_tree && r.name == name)
@@ -902,20 +953,20 @@ mod tests {
         let one = tree_id(&vm, "one.txt");
         let two = tree_id(&vm, "two.txt");
         vm.apply(click("sub", false, false));
-        vm.apply(CommanderPaneAction::TreeClick {
+        vm.apply(BrowserPaneAction::TreeClick {
             node_id: one.clone(),
             ctrl: false,
             shift: false,
         });
         assert!(names_selected(&vm).is_empty());
         assert_eq!(vm.tree_selected, std::slice::from_ref(&one));
-        vm.apply(CommanderPaneAction::TreeClick {
+        vm.apply(BrowserPaneAction::TreeClick {
             node_id: two.clone(),
             ctrl: false,
             shift: true,
         });
         assert_eq!(vm.tree_selected.len(), 2);
-        vm.apply(CommanderPaneAction::TreeClick {
+        vm.apply(BrowserPaneAction::TreeClick {
             node_id: one.clone(),
             ctrl: true,
             shift: false,
@@ -930,18 +981,18 @@ mod tests {
     fn inner_folders_toggle_and_leaving_the_folder_collapses_wrappers() {
         let (_d, mut vm, id) = wrapped_pane();
         let inner = tree_id(&vm, "Inner");
-        vm.apply(CommanderPaneAction::Activate(inner.clone()));
+        vm.apply(BrowserPaneAction::Activate(inner.clone()));
         assert!(vm.rows().iter().any(|r| r.name == "deep.txt"));
-        vm.apply(CommanderPaneAction::ToggleWrapper(inner));
+        vm.apply(BrowserPaneAction::ToggleWrapper(inner));
         assert!(!vm.rows().iter().any(|r| r.name == "deep.txt"));
-        vm.apply(CommanderPaneAction::TreeClick {
+        vm.apply(BrowserPaneAction::TreeClick {
             node_id: tree_id(&vm, "one.txt"),
             ctrl: false,
             shift: false,
         });
         let epoch = vm.wrapper_epoch();
-        vm.apply(CommanderPaneAction::Enter("sub".into()));
-        vm.apply(CommanderPaneAction::Up);
+        vm.apply(BrowserPaneAction::Enter("sub".into()));
+        vm.apply(BrowserPaneAction::Up);
         assert!(!vm.wrapper_tree.is_expanded(&id));
         assert!(vm.tree_selected.is_empty());
         assert!(vm.wrapper_epoch() > epoch);
@@ -951,7 +1002,7 @@ mod tests {
     #[test]
     fn path_crumbs_navigate_within_the_root_only() {
         let (d, mut vm) = host_pane(&[], &["sub"]);
-        vm.apply(CommanderPaneAction::Enter("sub".into()));
+        vm.apply(BrowserPaneAction::Enter("sub".into()));
         let root = d.path().to_string_lossy().to_string();
         let crumbs = vm.path_crumbs();
         let joined: String = crumbs.iter().map(|(l, _)| l.as_str()).collect();
@@ -959,7 +1010,94 @@ mod tests {
         let targets: Vec<&str> = crumbs.iter().filter_map(|(_, t)| t.as_deref()).collect();
         assert_eq!(targets.len(), 2, "{crumbs:?}");
         assert_eq!(targets[0], root);
-        vm.apply(CommanderPaneAction::NavigateTo(targets[0].to_string()));
+        vm.apply(BrowserPaneAction::NavigateTo(targets[0].to_string()));
         assert_eq!(vm.listing.cwd_path(), root);
+    }
+
+    fn refused(fx: &[Effect]) -> bool {
+        matches!(fx, [Effect::Message(m)] if m.ends_with("is not available in this view."))
+    }
+
+    #[test]
+    fn a_capability_the_profile_turns_off_refuses_its_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm =
+            BrowserPaneController::with_profile(PaneServices::headless(), PaneProfile::explorer());
+        type A = BrowserPaneAction;
+        for a in [
+            A::OpenHostFolder(dir.path().to_path_buf()),
+            A::OpenImage(dir.path().join("x.img")),
+            A::OpenPath(dir.path().to_path_buf()),
+            A::PickImage,
+            A::PickBackupFolder,
+            A::CloseSource,
+            A::SelectPartition(0),
+            A::Connect,
+        ] {
+            let fx = vm.apply(a.clone());
+            assert!(refused(&fx), "{a:?}: {fx:?}");
+        }
+        assert!(vm.source_path().is_none() && !vm.is_opening());
+
+        let (_d, mut ro) = host_pane(&["a"], &[]);
+        ro.profile = PaneProfile::commander().read_only();
+        ro.apply(click("a", false, false));
+        for a in [
+            A::Delete,
+            A::RequestNewFolder,
+            A::RequestRename("a".into()),
+            A::RenameAtCursor,
+        ] {
+            assert!(refused(&ro.apply(a.clone())), "{a:?}");
+        }
+        assert!(!ro.can_receive() && !ro.can_new_folder() && ro.is_read_only());
+        let out = ro.stage_edits(vec![StagedEdit::CreateDirectory {
+            parent: ro.listing.cwd().unwrap().clone(),
+            name: "n".into(),
+            qnx2_attrs: None,
+        }]);
+        assert_eq!(out.staged, 0);
+        assert!(ro.queue.is_empty());
+    }
+
+    #[test]
+    fn without_wrappers_an_archive_row_is_a_plain_file() {
+        let (d, mut vm) = host_pane(&[], &[]);
+        std::fs::write(d.path().join("a.sit"), sit_bytes()).unwrap();
+        vm.profile.wrappers = false;
+        vm.apply(BrowserPaneAction::Reload);
+        let r = row(vm.rows(), "a.sit").clone();
+        assert!(!r.is_wrapper && !r.expandable);
+        assert!(refused(
+            &vm.apply(BrowserPaneAction::ToggleWrapper(r.node_id.clone()))
+        ));
+        vm.apply(BrowserPaneAction::Activate(r.node_id));
+        assert!(vm.wrapper_opening().is_none());
+        assert_eq!(vm.take_info_request().as_deref(), Some("a.sit"));
+    }
+
+    #[test]
+    fn a_fixed_source_pane_opens_its_partition_and_writes_without_staging() {
+        use super::source::tests::{mbr_fat16, names, settle};
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm =
+            BrowserPaneController::with_profile(PaneServices::headless(), PaneProfile::explorer());
+        vm.open_fixed(mbr_fat16(dir.path()), Some(0));
+        settle(&mut vm);
+        assert!(vm.listing.is_loaded(), "{:?}", vm.source_error());
+        assert_eq!(vm.selected_partition(), Some(0));
+        vm.apply(BrowserPaneAction::RequestNewFolder);
+        let fx = vm.apply(BrowserPaneAction::Answered {
+            purpose: purpose::NEW_FOLDER,
+            text: Some("NEWDIR".into()),
+        });
+        assert!(vm.is_busy(), "the new folder applies at once: {fx:?}");
+        settle(&mut vm);
+        assert!(vm.queue.is_empty());
+        assert!(
+            names(&vm).contains(&"NEWDIR".to_string()),
+            "{:?}",
+            names(&vm)
+        );
     }
 }

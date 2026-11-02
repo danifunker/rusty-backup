@@ -2,11 +2,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::controller::commander::pane::source::tests::mbr_fat16;
+use crate::controller::browser::pane::source::tests::mbr_fat16;
 use crate::controller::keys::{Key, Mods};
 
 type A = CommanderAction;
-type P = CommanderPaneAction;
+type P = BrowserPaneAction;
 
 /// Ticks until neither pane nor the screen has a job running.
 fn settle(ctl: &mut CommanderController) -> Vec<Effect> {
