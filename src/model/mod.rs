@@ -26,6 +26,7 @@ pub mod export_runner;
 pub mod file_types;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
+pub mod host_ops;
 pub mod image_prep;
 pub mod job;
 pub mod min_size_runner;
