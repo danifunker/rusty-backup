@@ -310,7 +310,8 @@ destination's `validate_name`, renames what the destination can't hold (with a
 changes and points at Mac Archive (.mar) export for a lossless copy; "Undo copy"
 drops the batch.
 
-**Apply** first runs `commander_ops::spawn_apply_preflight` on a fresh read-only
+**Apply** is controller work (`CommanderPaneController`, `pane/edits.rs`): a
+preflight job runs `commander_ops::preflight_apply` on a fresh read-only
 open. `EditQueue::scan_against` replays the queue over the real listings
 (case-folded where the destination folds case) and reports name conflicts,
 folders blocked by a file of the same name, and parent folders that neither
@@ -325,6 +326,9 @@ failed to be created are reported, not tried; 25 failures in a row stop the run
 (the volume is likely full or failing). Afterwards the pane drops the edits
 that landed, reopens the volume, restores the rest of the queue, returns to the
 same folder, and shows the report with **Retry / Discard remaining / Close**.
+Discard (the button or "Discard remaining") asks first. Rename and New Folder ask
+through `Effect::AskText` with a validator the view runs as the user types; host
+delete / rename / new folder run as jobs through `model::host_ops`.
 The TUI keeps the stop-at-first-failure `apply_edits` contract.
 
 ### 5.5 Temp-file lifetime

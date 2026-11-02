@@ -61,7 +61,7 @@ widget, show_log, the metadata editor widgets.
 | - | Rename `vm` -> `controller`; key map (`controller::keys`) | done (d2ab1e1e, 6aecd207) |
 | 2 | Navigation, selection and cursor as `CommanderPaneAction`s (`Enter`, `Up`, `NavigateTo`, `Click{ctrl,shift}`, `TreeClick`, `ToggleMark`, `SortBy`, cursor moves, `ActivateCursor`); collapse wrappers on cwd change inside the controller; the egui pane dispatches actions; egui keyboard through `KeyMap` | done (dc13fc05) |
 | 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` answered by a per-view `gui::effects::EffectHost` | done (ad0950b4, 49fdb34b) |
-| 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | |
+| 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | done (52b691de, eddb9dee) |
 | 5 | Remote (cfg `remote`): connect, open / close image, remote apply | |
 | 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | |
 | 7 | Full key map wired in egui (help overlay listing the bindings) | |
@@ -78,9 +78,28 @@ Slice 3 notes, for the slices that follow:
 - An open job holds its path as a `Resource` only while it runs. A new open
   abandons the running one (cancel) and, if they share a path, waits for it to
   let go; another job holding the path fails the open with "in use by".
-- Transitional: `CommanderPaneController::reopen_after_apply` (slice 4 makes
-  apply controller work) and `install_remote` plus `PaneRequest::SourceReset`
-  (slice 5 moves remote in).
+- Transitional: `install_remote` plus `PaneRequest::SourceReset` (slice 5 moves
+  remote in).
+
+Slice 4 notes:
+
+- `TextSpec.validator` is `fn(&TextSpec, &str) -> Result<(), String>`; its context
+  (taken names, refused characters, case folding, the "unchanged" value) is data
+  in the spec. An empty error disables OK silently. The controller re-runs it on
+  `Answered`, then the filesystem's `validate_name`, and re-asks with the error
+  (the rejected text pre-filled) on a refusal.
+- Edit state lives in `controller/commander/pane/edits.rs`. A source change drops
+  in-flight edit work (`EditState::reset`); a partition reopen keeps the report.
+- Messages from navigation helpers (wrapper expansion) go through the
+  controller's `out` buffer, returned by the next `apply` / `tick`.
+- Transitional for slice 5: `set_remote_source` (wrapper extraction and copy
+  from a remote image) and `report_apply_failure` (the GUI's remote apply);
+  the GUI keeps `spawn_remote_apply` and its `ApplyStatus` progress.
+- For slice 6: `stage_edits` / `unstage_since` are still methods the two-pane
+  copy calls, and the Close guard clears `queue` directly.
+- Behaviour changes: Discard asks first; the edits list can remove one edit;
+  New Folder and Rename are refused on an archive pane; a taken name is
+  refused in the prompt (it used to fail at Apply).
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
