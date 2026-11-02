@@ -342,13 +342,13 @@ impl InspectTab {
 
             // A remote image: switch images on the same connection, back it up, or close it.
             #[cfg(feature = "remote")]
-            if let Some((conn, _)) = self.ctl.remote().cloned() {
+            if let Some(image) = self.ctl.remote().cloned() {
                 if ui
                     .button("Pick Another Image")
                     .on_hover_text("Browse the daemon for another image (no reconnect)")
                     .clicked()
                 {
-                    self.remote_browser.browse_on(conn);
+                    self.remote_browser.browse_on(image);
                 }
                 let backing_up = self.ctl.remote_backup_running();
                 if ui

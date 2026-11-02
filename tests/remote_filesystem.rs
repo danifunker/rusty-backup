@@ -3101,3 +3101,79 @@ mod commander_remote {
         assert!(!vm.is_remote() && vm.source_error().is_some());
     }
 }
+
+/// The Inspect tab's remote picker (`controller::remote_pick`) against a loopback daemon.
+mod inspect_remote_pick {
+    use super::*;
+    use rusty_backup::controller::remote_pick::{
+        purpose, RemotePickAction as A, RemotePickController,
+    };
+    use rusty_backup::controller::{Controller, Effect};
+
+    #[test]
+    fn connect_enter_a_folder_pick_an_image_and_browse_on_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        make_fat_image(
+            &root.join("sub").join("disk.img"),
+            "PICKVOL",
+            "SEED.BIN",
+            0x01,
+            512,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = serve_on(listener, root, None, true);
+        });
+
+        let mut ctl =
+            RemotePickController::new(std::sync::Arc::new(rusty_backup::model::job::NoNotify));
+        let fx = ctl.apply(A::Connect);
+        let [Effect::AskText(spec)] = fx.as_slice() else {
+            panic!("expected AskText, got {fx:?}");
+        };
+        assert!(spec.validate("bad host/x").is_err());
+        let again = ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(":7341".into()),
+        });
+        assert!(matches!(&again[..], [Effect::AskText(s)] if s.error.is_some()));
+        ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(addr.clone()),
+        });
+        ctl.wait_idle();
+        assert!(ctl.is_active() && ctl.is_loaded(), "{:?}", ctl.error());
+        assert!(ctl.take_log().iter().any(|l| l.contains("browsing host")));
+        let sub = ctl
+            .rows()
+            .into_iter()
+            .find(|r| r.name == "sub")
+            .expect("sub row");
+        assert!(sub.is_dir && !sub.openable);
+        ctl.apply(A::Enter("sub".into()));
+        ctl.wait_idle();
+        let img = ctl
+            .rows()
+            .into_iter()
+            .find(|r| r.name == "disk.img")
+            .expect("image row");
+        assert!(img.openable, "{img:?}");
+        ctl.apply(A::OpenImage(img.path.clone()));
+        let (conn, path) = ctl.take_request().expect("a request for the host");
+        assert!(path.ends_with("disk.img"));
+        assert!(!ctl.is_active(), "the picker collapses after the hand-off");
+
+        ctl.apply(A::BrowseOn((conn, path)));
+        ctl.wait_idle();
+        assert!(ctl.is_loaded() && ctl.addr() == addr.as_str());
+        ctl.apply(A::Disconnect);
+        assert!(!ctl.is_active());
+        assert!(ctl
+            .take_log()
+            .iter()
+            .any(|l| l.starts_with("disconnected from")));
+    }
+}

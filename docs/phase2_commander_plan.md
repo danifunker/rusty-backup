@@ -1016,3 +1016,16 @@ dialog per step, smallest first; each joins `ENFORCED` in its own commit.
    conversion runs (closing it then used to drop the dialog with the worker still writing, and a
    new source reset the form under it); the result shows the "Wrote N bytes" line under the
    summary instead of in a scroll list; the pickers are titled.
+6. `src/gui/remote_browser.rs` (12 -> 0): `controller::remote_pick::RemotePickController` (cfg
+   `remote`, which every GUI build has): `Connect` -> `Effect::AskText(purpose::CONNECT)` with the
+   browser pane's `validate_remote_addr` (re-asked with the error on a bad answer; the default port
+   is added as before), the connect and the "Pick Another Image" reopen (`BrowseOn`) as jobs, each
+   folder read as a job (`Enter`), `Up`, `OpenImage` (hands the host a `RemoteImage` through
+   `take_request()` and collapses), `Disconnect`; `rows()` (`PickRow`: openable images tinted only
+   while browsing the host), `hint`, `working`, `error`, `take_log` (the same "connected to ..."
+   lines). `tests/remote_filesystem.rs` `inspect_remote_pick` drives it against a loopback
+   daemon (the ui scenarios have no daemon).
+   Behaviour: the connect prompt is the shared text prompt and validates the address as you type
+   (a port outside 1..65535, spaces or a slash are refused; it accepted anything non-empty and
+   failed at connect); a connect or reopen shows the shared job widget instead of a spinner;
+   Disconnect is ignored while a connect is still running (its button was already disabled).
