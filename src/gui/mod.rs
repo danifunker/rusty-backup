@@ -182,6 +182,12 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
             Effect::AskPassword(spec) => {
                 log::error!("no egui handler yet for password {:?}", spec.purpose)
             }
+            Effect::AskText(spec) => {
+                log::error!(
+                    "text prompt {:?} has no EffectHost to answer it",
+                    spec.purpose
+                )
+            }
         }
     }
 }

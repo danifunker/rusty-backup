@@ -40,6 +40,10 @@ pub mod purpose {
     pub const OPEN_HOST_FOLDER: &str = "commander.open_host_folder";
     pub const OPEN_BACKUP_FOLDER: &str = "commander.open_backup_folder";
     pub const DISCARD_EDITS: &str = "commander.discard_edits";
+    pub const DISCARD_STAGED: &str = "commander.discard_staged";
+    pub const HOST_DELETE: &str = "commander.host_delete";
+    pub const RENAME: &str = "commander.rename";
+    pub const NEW_FOLDER: &str = "commander.new_folder";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,10 +404,16 @@ impl CommanderPaneController {
         Some(StageSource::Reopen(recipe))
     }
 
-    // --- transitional entry points for the view (slices 4 and 5) ----------
+    /// The registry and wake every pane job uses.
+    pub(super) fn job_services(&self) -> (&JobRegistry, Arc<dyn Notify>) {
+        (
+            &self.src.services.jobs,
+            Arc::clone(&self.src.services.notify),
+        )
+    }
 
     /// Reopen the partition after a write, keeping what is still staged and the current folder.
-    pub fn reopen_after_apply(&mut self) -> Vec<Effect> {
+    pub(super) fn reopen_after_apply(&mut self) -> Vec<Effect> {
         let Some(i) = self.src.selected else {
             return Vec::new();
         };
@@ -413,6 +423,8 @@ impl CommanderPaneController {
         self.src.reopen_restore = Some((keep, cwd));
         fx
     }
+
+    // --- transitional entry points for the view (slice 5) -----------------
 
     /// Show a remote listing the view opened, dropping any local source.
     pub fn install_remote(
@@ -560,6 +572,7 @@ impl CommanderPaneController {
         s.needs_password = false;
         s.error = None;
         s.reopen_restore = None;
+        self.ed.reset();
         self.listing = DirListing::new();
         self.source_changed();
         self.queue.clear();
@@ -586,6 +599,7 @@ impl CommanderPaneController {
         self.src.error = None;
         self.src.needs_password = false;
         self.src.session = None;
+        self.ed.drop_in_flight();
         self.listing = DirListing::new();
         self.source_changed();
         self.queue.clear();
@@ -1024,21 +1038,21 @@ fn finish_open(session: BrowseSession, mut st: BrowseOpenStatus) -> anyhow::Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::controller::Controller;
     use std::time::{Duration, Instant};
 
     type A = CommanderPaneAction;
 
-    /// Ticks until no open runs, returning every effect the ticks produced.
-    fn settle(vm: &mut CommanderPaneController) -> Vec<Effect> {
+    /// Ticks until no job of the pane runs, returning every effect the ticks produced.
+    pub(crate) fn settle(vm: &mut CommanderPaneController) -> Vec<Effect> {
         let start = Instant::now();
         let mut fx = vm.tick();
-        while vm.is_opening() {
+        while vm.is_busy() || vm.wrapper_opening().is_some() {
             assert!(
                 start.elapsed() < Duration::from_secs(60),
-                "open never finished"
+                "a job never finished"
             );
             std::thread::sleep(Duration::from_millis(5));
             fx.extend(vm.tick());
@@ -1046,7 +1060,7 @@ mod tests {
         fx
     }
 
-    fn messages(fx: &[Effect]) -> Vec<String> {
+    pub(crate) fn messages(fx: &[Effect]) -> Vec<String> {
         let text = |e: &Effect| match e {
             Effect::Message(m) => Some(m.clone()),
             _ => None,
@@ -1054,7 +1068,7 @@ mod tests {
         fx.iter().filter_map(text).collect()
     }
 
-    fn fixture(name: &str) -> Vec<u8> {
+    pub(crate) fn fixture(name: &str) -> Vec<u8> {
         use std::io::Read as _;
         let compressed = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
         let mut raw = Vec::new();
@@ -1065,7 +1079,7 @@ mod tests {
     }
 
     /// The FAT16 fixture behind an MBR whose one partition starts at LBA 2048.
-    fn mbr_fat16(dir: &Path) -> PathBuf {
+    pub(crate) fn mbr_fat16(dir: &Path) -> PathBuf {
         let fat = fixture("test_fat16.img.zst");
         let mut img = vec![0u8; 2048 * 512];
         let entry = &mut img[446..462];
@@ -1080,7 +1094,7 @@ mod tests {
         path
     }
 
-    fn names(vm: &CommanderPaneController) -> Vec<String> {
+    pub(crate) fn names(vm: &CommanderPaneController) -> Vec<String> {
         vm.listing
             .entries()
             .iter()

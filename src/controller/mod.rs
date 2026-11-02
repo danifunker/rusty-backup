@@ -41,6 +41,8 @@ pub enum Effect {
     PickFolder(PickSpec),
     Confirm(ConfirmSpec),
     AskPassword(PasswordSpec),
+    /// A one-line text prompt; answer with the controller's `Answered`-style action.
+    AskText(TextSpec),
     /// A transient message for the user (status line, toast or alert).
     Message(String),
     OpenUrl(String),
@@ -70,4 +72,55 @@ pub struct ConfirmSpec {
 pub struct PasswordSpec {
     pub purpose: &'static str,
     pub prompt: String,
+}
+
+/// A one-line text prompt whose rule the controller defines and the view runs as the user types.
+///
+/// The validator is a plain fn pointer so the spec stays comparable; the context it needs
+/// (names already taken, characters it refuses) travels in the spec as data. An `Err` with an
+/// empty message disables OK without showing anything (an untouched or empty field).
+#[derive(Debug, Clone)]
+pub struct TextSpec {
+    pub purpose: &'static str,
+    pub title: String,
+    pub prompt: String,
+    pub initial: String,
+    pub ok_label: String,
+    /// The answer that counts as no change (a rename's current name).
+    pub unchanged: String,
+    /// Names the answer may not take, for the validator.
+    pub taken: Vec<String>,
+    /// Compare with `taken` ignoring case.
+    pub fold_case: bool,
+    /// Characters the answer may not contain.
+    pub forbidden: String,
+    /// Why the controller refused the last answer; shown until the user edits.
+    pub error: Option<String>,
+    pub validator: fn(&TextSpec, &str) -> Result<(), String>,
+}
+
+// Spelled out because comparing fn pointers directly trips rustc's unpredictable-comparison lint.
+impl PartialEq for TextSpec {
+    fn eq(&self, o: &Self) -> bool {
+        self.purpose == o.purpose
+            && self.title == o.title
+            && self.prompt == o.prompt
+            && self.initial == o.initial
+            && self.ok_label == o.ok_label
+            && self.unchanged == o.unchanged
+            && self.taken == o.taken
+            && self.fold_case == o.fold_case
+            && self.forbidden == o.forbidden
+            && self.error == o.error
+            && self.validator as usize == o.validator as usize
+    }
+}
+
+impl Eq for TextSpec {}
+
+impl TextSpec {
+    /// Run the controller's rule on `text`.
+    pub fn validate(&self, text: &str) -> Result<(), String> {
+        (self.validator)(self, text)
+    }
 }

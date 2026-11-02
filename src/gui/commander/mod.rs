@@ -44,8 +44,9 @@ use super::metadata_editor::{
 mod pane;
 mod progress;
 
-use pane::{CommanderPane, StageOutcome};
+use pane::CommanderPane;
 use progress::{ProgressAction, ProgressSnapshot, ProgressWindow};
+use rusty_backup::controller::commander::StageOutcome;
 
 /// Upper bound on bytes read off a volume to preview the selected file in the
 /// File Info window (matches the classic browse view's cap).
@@ -476,10 +477,8 @@ impl CommanderMode {
         let del_enabled = self.can_delete();
         let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
         if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
-            status = Some(match active {
-                Side::Left => self.left.delete_selection(),
-                Side::Right => self.right.delete_selection(),
-            });
+            let ctx = ui.ctx().clone();
+            status = Some(self.pane_mut(active).delete_selection(&ctx));
         }
         ui.add_space(12.0);
         icon_button(
@@ -614,13 +613,20 @@ impl CommanderMode {
         });
         let mut close = false;
         for cmd in commands {
-            close |= self.run_command(cmd);
+            close |= self.run_command(ctx, cmd);
         }
         close
     }
 
+    /// A pane command's status line, when it said anything.
+    fn note_command(&mut self, status: String) {
+        if !status.is_empty() {
+            self.status = status;
+        }
+    }
+
     /// Does what `cmd` means here: pane commands go to the active pane, the rest to the buttons.
-    fn run_command(&mut self, cmd: Command) -> bool {
+    fn run_command(&mut self, ctx: &egui::Context, cmd: Command) -> bool {
         let side = self.active;
         let page = self.pane_mut(side).page_rows();
         let pane_action = match cmd {
@@ -659,15 +665,24 @@ impl CommanderMode {
             }
             Command::Delete => {
                 if self.can_delete() {
-                    self.status = self.pane_mut(side).delete_selection();
+                    self.status = self.pane_mut(side).delete_selection(ctx);
                 }
             }
-            Command::Rename => self.pane_mut(side).rename_shortcut(),
-            Command::NewFolder => self.pane_mut(side).new_folder_shortcut(),
+            Command::Rename => {
+                let s = self
+                    .pane_mut(side)
+                    .command(ctx, CommanderPaneAction::RenameAtCursor);
+                self.note_command(s);
+            }
+            Command::NewFolder => {
+                let s = self
+                    .pane_mut(side)
+                    .command(ctx, CommanderPaneAction::RequestNewFolder);
+                self.note_command(s);
+            }
             Command::Apply => {
-                if let Some(s) = self.pane_mut(side).apply_shortcut() {
-                    self.status = s;
-                }
+                let s = self.pane_mut(side).apply_now(ctx);
+                self.note_command(s);
             }
             Command::Close => return self.close_shortcut(),
             // No GUI edit operation exists yet.
@@ -1343,6 +1358,17 @@ impl CommanderMode {
             if let Some(snap) = snap {
                 let _ = self.progress_window.show(ctx, &snap);
             }
+            return;
+        }
+        for side in [Side::Left, Side::Right] {
+            let Some(snap) = self.pane_mut(side).apply_job() else {
+                continue;
+            };
+            egui::Window::new(format!("Applying {} pane edits", side.label()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| super::progress::show_job(ui, &snap));
             return;
         }
     }

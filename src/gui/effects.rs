@@ -1,13 +1,15 @@
-//! egui's side of controller effects that answer back: file pickers and confirmations.
+//! egui's side of controller effects that answer back: file pickers, confirmations and text prompts.
 //!
 //! A view that owns a controller keeps one [`EffectHost`], hands it the controller's effects,
 //! and maps each [`Reply`] to the controller's own answer action, so an answer always returns
 //! to the controller that asked. Pickers are blocking rfd dialogs on the UI thread, as the
-//! source picker's were; a confirmation is a modal window drawn by [`EffectHost::show`].
+//! source picker's were; a confirmation or a text prompt is a modal window drawn by
+//! [`EffectHost::show`]. A text prompt runs the controller's validator on every edit: its
+//! message shows inline and OK (or Enter) works only while it passes.
 
 use std::path::PathBuf;
 
-use rusty_backup::controller::{ConfirmSpec, Effect, PickSpec};
+use rusty_backup::controller::{ConfirmSpec, Effect, PickSpec, TextSpec};
 
 /// An answer to an effect, for the view to turn into its controller's action.
 pub(crate) enum Reply {
@@ -19,11 +21,24 @@ pub(crate) enum Reply {
         purpose: &'static str,
         yes: bool,
     },
+    Answered {
+        purpose: &'static str,
+        text: Option<String>,
+    },
+}
+
+/// A text prompt on screen: its spec, the field's text, and whether the user has typed yet.
+struct TextPrompt {
+    spec: TextSpec,
+    input: String,
+    edited: bool,
+    focused: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct EffectHost {
     confirm: Option<ConfirmSpec>,
+    text: Option<TextPrompt>,
 }
 
 impl EffectHost {
@@ -47,6 +62,14 @@ impl EffectHost {
                     path: pick(&spec, true),
                 }),
                 Effect::Confirm(spec) => self.confirm = Some(spec),
+                Effect::AskText(spec) => {
+                    self.text = Some(TextPrompt {
+                        input: spec.initial.clone(),
+                        spec,
+                        edited: false,
+                        focused: false,
+                    })
+                }
                 Effect::AskPassword(spec) => {
                     log::error!("no egui handler yet for password {:?}", spec.purpose)
                 }
@@ -57,21 +80,23 @@ impl EffectHost {
         replies
     }
 
-    /// True while a confirmation waits for an answer.
+    /// True while a confirmation or text prompt waits for an answer.
     pub(crate) fn modal_open(&self) -> bool {
-        self.confirm.is_some()
+        self.confirm.is_some() || self.text.is_some()
     }
 
-    /// Draw the pending confirmation; `whose` tells two hosts' windows apart.
+    /// Draw the pending confirmation or prompt; `whose` tells two hosts' windows apart.
     pub(crate) fn show(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {
+        if self.confirm.is_some() {
+            return self.show_confirm(ctx, whose);
+        }
+        self.show_text(ctx, whose)
+    }
+
+    fn show_confirm(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {
         let spec = self.confirm.as_ref()?;
         let mut answer = None;
-        let title = if whose.is_empty() {
-            spec.title.clone()
-        } else {
-            format!("{} ({whose})", spec.title)
-        };
-        egui::Window::new(title)
+        egui::Window::new(titled(&spec.title, whose))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -97,6 +122,67 @@ impl EffectHost {
             purpose: spec.purpose,
             yes,
         })
+    }
+
+    fn show_text(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {
+        let p = self.text.as_mut()?;
+        let mut answer: Option<Option<String>> = None;
+        egui::Window::new(titled(&p.spec.title, whose))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(&p.spec.prompt);
+                let resp = ui.text_edit_singleline(&mut p.input);
+                if !p.focused {
+                    resp.request_focus();
+                    p.focused = true;
+                }
+                if resp.changed() {
+                    p.edited = true;
+                }
+                let check = p.spec.validate(&p.input);
+                // The controller's refusal stands until the user edits; then the live rule speaks.
+                let shown = match (&p.spec.error, p.edited) {
+                    (Some(e), false) => Some(e.clone()),
+                    _ => check.as_ref().err().filter(|e| !e.is_empty()).cloned(),
+                };
+                if let Some(e) = shown {
+                    ui.colored_label(super::theme::danger_muted(ui.visuals()), e);
+                }
+                let valid = check.is_ok();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok = egui::Button::new(p.spec.ok_label.as_str());
+                    if ui.add_enabled(valid, ok).clicked() {
+                        answer = Some(Some(p.input.clone()));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(None);
+                    }
+                });
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if valid && enter {
+                    answer = Some(Some(p.input.clone()));
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    answer = Some(None);
+                }
+            });
+        let text = answer?;
+        let p = self.text.take()?;
+        Some(Reply::Answered {
+            purpose: p.spec.purpose,
+            text,
+        })
+    }
+}
+
+fn titled(title: &str, whose: &str) -> String {
+    if whose.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} ({whose})")
     }
 }
 

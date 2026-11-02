@@ -4,8 +4,8 @@
 //! [`EditQueue`](crate::model::edit_queue::EditQueue) (delete + copy-in);
 //! nothing touches disk until Apply. [`apply_edits`] is the leaf that opens the
 //! pane's source read-write, replays the queue, syncs, and commits the container
-//! — the same shape as the browse view's `apply_staged_edits`; [`spawn_apply`]
-//! threads it behind an [`ApplyStatus`] so a slow write never blocks the frame.
+//! — the same shape as the browse view's `apply_staged_edits`; [`apply_in_job`]
+//! runs it as a job so a slow write never blocks the frame.
 //!
 //! The cross-pane copy has four backends by source/destination kind:
 //! [`stage_copy`] (image->image, extract to temp + stage) and
@@ -283,31 +283,6 @@ pub fn preflight_apply(session: &BrowseSession, edits: &[StagedEdit]) -> Result<
     })
 }
 
-/// Shared state for a [`spawn_apply_preflight`] worker.
-#[derive(Default)]
-pub struct PreflightStatus {
-    pub finished: bool,
-    pub result: Option<std::result::Result<ApplyPreflight, String>>,
-}
-
-/// Run [`preflight_apply`] off the UI thread; a big queue walks many folders.
-pub fn spawn_apply_preflight(
-    session: BrowseSession,
-    edits: Vec<StagedEdit>,
-) -> Arc<Mutex<PreflightStatus>> {
-    let status = Arc::new(Mutex::new(PreflightStatus::default()));
-    let worker = Arc::clone(&status);
-    crate::model::worker::spawn_guarded(Arc::clone(&status), "apply preflight", move || {
-        let result = preflight_apply(&session, &edits).map_err(|e| format!("{e:#}"));
-        if let Ok(mut g) = worker.lock() {
-            g.result = Some(result);
-            g.finished = true;
-        }
-        Ok(())
-    });
-    status
-}
-
 /// Destination folder of a copy-in edit (the only edits that nest under staged folders).
 fn copy_parent(edit: &StagedEdit) -> Option<&str> {
     match edit {
@@ -443,6 +418,7 @@ pub struct StageCopyStatus {
 ///
 /// A live wrapper-mount fs can't be reopened this way, so those copies stay on
 /// the synchronous [`stage_copy`] path (they're small, local sources).
+#[derive(Clone)]
 pub enum StageSource {
     /// Reopen a local image through its browse session.
     Session(BrowseSession),
@@ -485,7 +461,7 @@ impl StageSource {
 
 /// How a wrapper-open worker gets the wrapper file's bytes to mount. Materializing
 /// a large `.toast` / `.chd` / `.iso` and probing it can take seconds, so the
-/// pane runs this off the UI thread behind a spinner ([`spawn_wrapper_open`]).
+/// pane runs this as a job behind a spinner ([`prepare_wrapper`]).
 pub enum WrapperOpenPlan {
     /// A host file — opened by its real path (no extraction; also the only form
     /// multi-file optical formats like bin/cue can use).
@@ -505,76 +481,42 @@ pub struct WrapperExtract {
     pub entry: FileEntry,
 }
 
-/// Progress + result of an off-thread wrapper open. `result` carries a
-/// [`PreparedMount`] to install, or a short error string.
-#[derive(Default)]
-pub struct WrapperOpenStatus {
-    pub phase: String,
-    pub finished: bool,
-    pub result: Option<std::result::Result<PreparedMount, String>>,
-}
-
-/// Open a wrapper (`file_name`, classified as `kind`) off the UI thread. The
-/// pane polls the returned handle each frame, shows a spinner with `phase`, and
-/// installs the [`PreparedMount`] via `WrapperTree::install_prepared` on finish.
-pub fn spawn_wrapper_open(
+/// Mount a wrapper (`file_name`, classified as `kind`) for `WrapperTree::install_prepared`; meant to run as a job.
+pub fn prepare_wrapper(
     plan: WrapperOpenPlan,
     kind: DescendKind,
-    file_name: String,
-) -> Arc<Mutex<WrapperOpenStatus>> {
-    let status = Arc::new(Mutex::new(WrapperOpenStatus {
-        phase: "Reading...".to_string(),
-        finished: false,
-        result: None,
-    }));
-    let st = Arc::clone(&status);
-    crate::model::worker::spawn_guarded(Arc::clone(&status), "wrapper open", move || {
-        let result = run_wrapper_open(plan, kind, file_name, &st);
-        if let Ok(mut g) = st.lock() {
-            g.result = Some(result);
-            g.finished = true;
-        }
-        Ok(())
-    });
-    status
-}
-
-fn run_wrapper_open(
-    plan: WrapperOpenPlan,
-    kind: DescendKind,
-    file_name: String,
-    status: &Arc<Mutex<WrapperOpenStatus>>,
-) -> std::result::Result<PreparedMount, String> {
+    file_name: &str,
+    job: &crate::model::job::JobCtx,
+) -> Result<PreparedMount> {
+    job.set_phase("Reading...");
     let source = match plan {
         WrapperOpenPlan::HostPath(path) => WrapperSource::Path(path),
         WrapperOpenPlan::Bytes(bytes) => WrapperSource::Bytes(bytes),
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
-            let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
+            let mut fs = base.open()?;
             let large = entry.size > fs_tar::mem_archive::INLINE_MAX;
             if large || matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
                 // Stream to disk so a multi-GB image or archive never sits in RAM.
                 let (dir, path) =
-                    crate::model::commander_descend::materialize_streamed(&file_name, |f| {
+                    crate::model::commander_descend::materialize_streamed(file_name, |f| {
                         let mut w = std::io::BufWriter::new(f);
                         fs.write_file_to(&entry, &mut w)?;
                         std::io::Write::flush(&mut w)?;
                         Ok(())
                     })
-                    .map_err(|e| format!("reading '{}': {e:#}", entry.name))?;
+                    .with_context(|| format!("reading '{}'", entry.name))?;
                 WrapperSource::TempFile(dir, path)
             } else {
                 let mut buf = Vec::new();
                 fs.write_file_to(&entry, &mut buf)
-                    .map_err(|e| format!("reading '{}': {e}", entry.name))?;
+                    .map_err(|e| anyhow::anyhow!("reading '{}': {e}", entry.name))?;
                 WrapperSource::Bytes(buf)
             }
         }
     };
-    if let Ok(mut g) = status.lock() {
-        g.phase = "Opening...".to_string();
-    }
-    WrapperTree::prepare(source, &file_name, kind).map_err(|e| format!("{e:#}"))
+    job.set_phase("Opening...");
+    WrapperTree::prepare(source, file_name, kind)
 }
 
 /// Off-thread [`stage_copy`]: reopens the source on a worker, extracts each file
@@ -1637,7 +1579,7 @@ pub fn upload_fs_entries_to_remote(
     upload_image_entries_to_remote_host(fs, entries, &mut conn, dest_parent, fork_mode, &status)
 }
 
-/// Shared state between the GUI and the [`spawn_apply`] worker.
+/// Shared state between the GUI and the [`spawn_remote_apply`] worker.
 ///
 /// Byte/file counters drive the same Commander progress modal
 /// [`HostCopyStatus`] does; `bytes_total` is the sum of every `AddFile` edit
@@ -1662,41 +1604,30 @@ pub struct ApplyStatus {
     pub outcome: Option<ApplyOutcome>,
 }
 
-/// Run [`apply_edits`] on a worker thread. The returned status flips `finished`
-/// when done, with `error` set on failure, and updates per-edit counters live
-/// so the Commander progress modal can render percent + rate + ETA.
-pub fn spawn_apply(
-    session: BrowseSession,
-    edits: Vec<StagedEdit>,
-    keep_going: bool,
-) -> Arc<Mutex<ApplyStatus>> {
-    let status = Arc::new(Mutex::new(ApplyStatus::default()));
-    if let Ok(mut g) = status.lock() {
-        g.edits_total = edits.len();
-        g.bytes_total = edits_total_bytes(&edits);
-    }
-    let status_thread = Arc::clone(&status);
-    crate::model::worker::spawn_guarded(Arc::clone(&status), "apply", move || {
-        let status_cb = Arc::clone(&status_thread);
-        let result = apply_edits_reporting(&session, &edits, keep_going, move |p| {
-            if let Ok(mut g) = status_cb.lock() {
-                g.edits_done = p.index + 1;
-                g.current_edit = edit_label(p.edit);
-                if let StagedEdit::AddFile { size, .. } = p.edit {
-                    g.bytes_done = g.bytes_done.saturating_add(*size);
-                }
-            }
-        });
-        if let Ok(mut g) = status_thread.lock() {
-            match result {
-                Ok(outcome) => g.outcome = Some(outcome),
-                Err(e) => g.error = Some(format!("{e:#}")),
-            }
-            g.finished = true;
+/// Write the queue as a job, continuing past failed items; progress counts bytes (or edits when none).
+pub fn apply_in_job(
+    session: &BrowseSession,
+    edits: &[StagedEdit],
+    job: &crate::model::job::JobCtx,
+) -> Result<ApplyOutcome> {
+    use crate::model::job::{Progress, Unit};
+    job.set_can_cancel(false);
+    job.set_phase("Writing...");
+    let bytes_total = edits_total_bytes(edits);
+    let total = edits.len() as u64;
+    let mut bytes_done = 0u64;
+    apply_edits_reporting(session, edits, true, |p| {
+        if let StagedEdit::AddFile { size, .. } = p.edit {
+            bytes_done = bytes_done.saturating_add(*size);
         }
-        Ok(())
-    });
-    status
+        job.set_phase(format!("Writing {}", edit_label(p.edit)));
+        let (done, total, unit) = if bytes_total > 0 {
+            (bytes_done, bytes_total, Unit::Bytes)
+        } else {
+            (p.index as u64 + 1, total, Unit::Items)
+        };
+        job.set_progress(Progress::Determinate { done, total, unit });
+    })
 }
 
 /// A 4-byte HFS OSType as the string the daemon's `StageUpload` carries. Lossy
@@ -1849,20 +1780,6 @@ pub fn spawn_remote_apply(
 }
 
 crate::model::worker::finished_with_error!(ApplyStatus, HostCopyStatus, StageCopyStatus);
-
-impl crate::model::worker::WorkerStatus for PreflightStatus {
-    fn fail(&mut self, message: String) {
-        self.result = Some(Err(message));
-        self.finished = true;
-    }
-}
-
-impl crate::model::worker::WorkerStatus for WrapperOpenStatus {
-    fn fail(&mut self, message: String) {
-        self.result = Some(Err(message));
-        self.finished = true;
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -53,6 +53,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::PickFolder(_) => "PickFolder",
         Effect::Confirm(_) => "Confirm",
         Effect::AskPassword(_) => "AskPassword",
+        Effect::AskText(_) => "AskText",
         Effect::Message(_) => "Message",
         Effect::OpenUrl(_) => "OpenUrl",
         Effect::CopyToClipboard(_) => "CopyToClipboard",

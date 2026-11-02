@@ -6,8 +6,9 @@
 //! What the pane shows and how it opens (host folder, disk image, backup folder,
 //! Mac archive, optical disc, as jobs) lives in [`CommanderPaneController`]; this
 //! file draws it, maps input to its actions, and answers its pickers and
-//! confirmations through an [`EffectHost`]. The remote connection, applying
-//! staged edits and the host-write dialogs still live here until later slices.
+//! confirmations and text prompts through an [`EffectHost`]. Staging, Apply, the
+//! review and report, host writes and wrapper expansion are controller state this
+//! file draws; the remote connection and the remote apply stay here until slice 5.
 //!
 //! Image panes stage edits (Apply writes through); host panes take immediate
 //! writes and never stage; backup panes are read-only (browse + copy-out only).
@@ -23,50 +24,21 @@ use disk_core::display::format_size;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::replace::OnConflict;
-use rusty_backup::model::commander_descend::classify_entry;
-use rusty_backup::model::commander_ops::{
-    self, ApplyPreflight, ApplyStatus, FailedEdit, PreflightStatus, WrapperExtract,
-    WrapperOpenPlan, WrapperOpenStatus,
-};
+use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
-use rusty_backup::model::job::JobRegistry;
+use rusty_backup::model::job::{JobRegistry, Snapshot};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
-use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::rows::{remote_parent_dir, DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    CommanderPaneAction, CommanderPaneController, PaneRequest, PaneServices, SortColumn, VolumeInfo,
+    CommanderPaneAction, CommanderPaneController, OnConflict, PaneRequest, PaneServices,
+    SortColumn, StageOutcome, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 use rusty_backup::controller::Controller;
 
 use super::super::effects::{EffectHost, Reply};
 use super::Side;
-
-/// Preflight findings shown before an apply that needs a decision.
-struct ApplyReview {
-    preflight: ApplyPreflight,
-    on_conflict: OnConflict,
-}
-
-/// A finished apply that did not land everything; the rest stays staged.
-struct ApplyReport {
-    total: usize,
-    applied: usize,
-    failed: Vec<FailedEdit>,
-    not_tried: usize,
-    fatal: Option<String>,
-}
-
-/// What one `stage_edits` batch did, for the status line and the rename notice.
-pub(crate) struct StageOutcome {
-    pub staged: usize,
-    pub queue_start: usize,
-    pub fs_type: String,
-    pub renamed: Vec<NameChange>,
-    pub dropped: Vec<(String, String)>,
-}
 
 const ROW_H: f32 = 20.0;
 /// Per-depth indent for tree rows, and the width reserved for the `+`/`-`
@@ -160,16 +132,10 @@ pub(crate) struct CommanderPane {
     /// Status lines from the controller's messages, shown at the end of the frame.
     statuses: Vec<String>,
     side: Side,
-    /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
-    pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
-    /// In-flight Apply preflight; a clean verdict starts the apply, anything else opens the review.
-    pending_preflight: Option<Arc<Mutex<PreflightStatus>>>,
-    apply_review: Option<ApplyReview>,
-    apply_report: Option<ApplyReport>,
-    /// In-flight async wrapper expansion (a large `.toast`/`.chd`/`.iso` being
-    /// materialized + probed off the UI thread). `poll_wrapper` installs the
-    /// mount when it finishes; a spinner shows meanwhile.
-    pending_wrapper: Option<PendingWrapper>,
+    /// In-flight upload of the staged queue to a remote image (`commander_ops::spawn_remote_apply`).
+    pending_remote_apply: Option<Arc<Mutex<ApplyStatus>>>,
+    /// The review window's conflict choice until the user presses Apply.
+    review_choice: OnConflict,
     /// Phase text shown next to the spinner while a remote transition runs.
     open_phase: String,
     /// Remote volume readout; a local source's lives in the controller.
@@ -178,15 +144,6 @@ pub(crate) struct CommanderPane {
     error: Option<String>,
     /// The user's in-progress password / passphrase entry for the unlock prompt.
     password_input: String,
-    /// Host-pane only: entry names the user asked to delete, held until they
-    /// confirm the (immediate, irreversible) host removal.
-    pending_host_delete: Option<Vec<String>>,
-    /// The open "Rename..." dialog, if any (single entry at a time).
-    rename_dialog: Option<RenameDialog>,
-    /// The open "New Folder..." dialog, if any.
-    new_folder_dialog: Option<NewFolderDialog>,
-    /// Whether the "Pending edits" review popup is open for this pane.
-    show_edits_popup: bool,
     /// Data-changing operations completed this frame, drained into the
     /// `PaneResponse` at the end of `show()` for the session log.
     log_events: Vec<String>,
@@ -247,34 +204,6 @@ struct ConnectDialog {
     error: Option<String>,
 }
 
-/// State for the modal "Rename..." dialog.
-struct RenameDialog {
-    /// The live entry being renamed.
-    entry: FileEntry,
-    /// The editable new-name buffer (seeded with the current name).
-    input: String,
-    /// Last validation error, shown inline; cleared as the user types.
-    error: Option<String>,
-}
-
-/// State for the modal "New Folder..." dialog.
-struct NewFolderDialog {
-    /// The editable folder-name buffer.
-    input: String,
-    /// Last validation error, shown inline; cleared as the user types.
-    error: Option<String>,
-}
-
-/// An in-flight async wrapper expansion: the node being opened, its display
-/// name (for the spinner + status), and the worker's shared status handle.
-struct PendingWrapper {
-    node_id: String,
-    /// The controller's wrapper epoch at spawn; a different one means the row is gone.
-    epoch: u64,
-    name: String,
-    status: Arc<Mutex<WrapperOpenStatus>>,
-}
-
 impl CommanderPane {
     /// The rows to draw, from the view-model; a remote-host pane never expands wrappers.
     fn display_rows(&mut self) -> Vec<DisplayRow> {
@@ -293,19 +222,12 @@ impl CommanderPane {
             ctl: CommanderPaneController::with_services(services),
             effects: EffectHost::default(),
             statuses: Vec::new(),
-            pending_apply: None,
-            pending_preflight: None,
-            apply_review: None,
-            apply_report: None,
-            pending_wrapper: None,
+            pending_remote_apply: None,
+            review_choice: OnConflict::Skip,
             open_phase: String::new(),
             remote_volume: VolumeInfo::default(),
             error: None,
             password_input: String::new(),
-            pending_host_delete: None,
-            rename_dialog: None,
-            new_folder_dialog: None,
-            show_edits_popup: false,
             log_events: Vec::new(),
             browser: None,
             remote: None,
@@ -339,6 +261,7 @@ impl CommanderPane {
         let action = match reply {
             Reply::Picked { purpose, path } => CommanderPaneAction::Picked { purpose, path },
             Reply::Confirmed { purpose, yes } => CommanderPaneAction::Confirmed { purpose, yes },
+            Reply::Answered { purpose, text } => CommanderPaneAction::Answered { purpose, text },
         };
         self.act(ctx, action);
     }
@@ -363,10 +286,7 @@ impl CommanderPane {
 
     /// Forget the remote connection and anything in flight against the old source.
     fn drop_remote(&mut self) {
-        self.pending_apply = None;
-        self.pending_preflight = None;
-        self.pending_host_delete = None;
-        self.rename_dialog = None;
+        self.pending_remote_apply = None;
         self.error = None;
         self.open_phase.clear();
         // Dropping the browser drops the last Arc to the shared connection (the daemon reaps its handles).
@@ -395,105 +315,14 @@ impl CommanderPane {
         self.ctl.tree_active()
     }
 
-    /// The mount key and selected entries for the active tree selection, all
-    /// sharing the first selected row's mount (a selection can't span mounts).
     fn tree_selection(&self) -> Option<(String, Vec<FileEntry>)> {
-        let first = self.ctl.tree_selected.first()?;
-        let mount = self.ctl.tree_index.get(first)?.mount.clone();
-        let entries = self
-            .ctl
-            .tree_selected
-            .iter()
-            .filter_map(|id| self.ctl.tree_index.get(id))
-            .filter(|r| r.mount == mount)
-            .map(|r| r.entry.clone())
-            .collect();
-        Some((mount, entries))
+        self.ctl.tree_selection()
     }
 
     /// Drop this pane's in-memory recent-files mirror (the Settings dialog
     /// cleared the persisted lists).
     pub(crate) fn clear_recent_files(&mut self) {
         self.ctl.apply(CommanderPaneAction::RecentCleared);
-    }
-
-    /// Open a base-row wrapper off the UI thread with a spinner; only one opens at a time.
-    fn open_base_wrapper(&mut self, node_id: &str, name: &str) -> Option<String> {
-        if self.pending_wrapper.is_some() {
-            let side = self.side.label();
-            return Some(format!(
-                "[{side}] a wrapper is already opening; wait for it."
-            ));
-        }
-        let entry = self
-            .ctl
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.path == node_id)
-            .cloned()?;
-        let kind = classify_entry(&entry)?;
-        // A host file opens by its real path — cheaper than reading it all,
-        // and required for multi-file optical formats (bin/cue, mdf/mds)
-        // whose sibling data file sits next to it. A wrapper inside an image
-        // pane is extracted on the worker from a fresh reopen of the base
-        // source; a non-reopenable base (rare) extracts synchronously here.
-        let plan = if self.ctl.listing.is_host() {
-            WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
-        } else if let Some(base) = self.base_stage_source() {
-            WrapperOpenPlan::Extract(Box::new(WrapperExtract {
-                base,
-                entry: entry.clone(),
-            }))
-        } else {
-            let Some(fs) = self.ctl.listing.fs_mut() else {
-                return self.wrapper_open_failed(name, "source is not open".into());
-            };
-            let mut buf = Vec::new();
-            if let Err(e) = fs.write_file_to(&entry, &mut buf) {
-                return self.wrapper_open_failed(name, e.to_string());
-            }
-            WrapperOpenPlan::Bytes(buf)
-        };
-        self.pending_wrapper = Some(PendingWrapper {
-            node_id: node_id.to_string(),
-            epoch: self.ctl.wrapper_epoch(),
-            name: name.to_string(),
-            status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
-        });
-        Some(format!("[{}] opening {name}...", self.side.label()))
-    }
-
-    /// The reopen handle for this pane's *base* source (ignoring any active
-    /// wrapper-tree selection) — a local image session, a remote image, or a Mac
-    /// archive by path. Used to extract a base wrapper's bytes on a worker so a
-    /// large expand doesn't freeze the UI. `None` for a host base (opened by
-    /// path instead) or a source with no reopenable handle.
-    fn base_stage_source(&self) -> Option<commander_ops::StageSource> {
-        #[cfg(feature = "remote")]
-        if let Some(RemoteConn {
-            addr,
-            mode: BrowseMode::Image { path, partition },
-        }) = &self.remote
-        {
-            return Some(commander_ops::StageSource::Remote {
-                addr: addr.clone(),
-                path: path.clone(),
-                partition: partition.clone(),
-            });
-        }
-        self.ctl.local_stage_source()
-    }
-
-    /// Record a failed wrapper expansion in the session log (where the full
-    /// detail belongs) and return a short, one-line status — a long error chain
-    /// in the status bar otherwise overflows it and makes the pane unusable. The
-    /// row simply stays collapsed.
-    fn wrapper_open_failed(&mut self, name: &str, detail: String) -> Option<String> {
-        let side = self.side.label();
-        self.log_events
-            .push(format!("[{side}] couldn't open '{name}': {detail}"));
-        Some(format!("[{side}] couldn't open '{name}' (see Log)"))
     }
 
     /// Number of staged (unapplied) edits on this pane.
@@ -509,22 +338,10 @@ impl CommanderPane {
     /// Render the pane. Returns status + any cross-pane request for the overlay.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, active: bool) -> PaneResponse {
         self.has_focus = active;
-        // The controller dropped the wrappers this open was for, so abandon it.
-        if let Some(pw) = &self.pending_wrapper {
-            if pw.epoch != self.ctl.wrapper_epoch() {
-                self.pending_wrapper = None;
-            }
-        }
         let fx = self.ctl.tick();
         self.run_effects(ui.ctx(), fx);
         let mut status = None;
-        if let Some(s) = self.poll_preflight(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_apply(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_wrapper(ui.ctx()) {
+        if let Some(s) = self.poll_remote_apply(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.poll_remote(ui.ctx()) {
@@ -546,28 +363,21 @@ impl CommanderPane {
         }
         ui.separator();
 
-        // A wrapper being opened off-thread: show a spinner + phase above the
-        // still-visible listing (the expand is inline, so the base rows stay).
-        if let Some(pw) = &self.pending_wrapper {
-            let phase = pw
-                .status
-                .lock()
-                .ok()
-                .map(|g| g.phase.clone())
-                .unwrap_or_default();
+        // A wrapper expanding as a job: a spinner and its phase above the still-visible listing.
+        if let Some((name, snap)) = self.ctl.wrapper_opening() {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
-                ui.label(if phase.is_empty() {
-                    format!("Opening {}...", pw.name)
+                ui.label(if snap.phase.is_empty() {
+                    format!("Opening {name}...")
                 } else {
-                    format!("{}: {}", pw.name, phase)
+                    format!("{name}: {}", snap.phase)
                 });
             });
             ui.ctx().request_repaint();
         }
 
-        if self.pending_preflight.is_some() {
+        if self.ctl.checking().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -576,7 +386,13 @@ impl CommanderPane {
             });
             ui.ctx().request_repaint();
         }
-        if self.pending_apply.is_some() {
+        if let Some(snap) = self.ctl.host_writing() {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                super::super::progress::show_job(ui, &snap);
+            });
+        }
+        if self.ctl.applying().is_some() || self.pending_remote_apply.is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -687,22 +503,11 @@ impl CommanderPane {
         if let Some(reply) = self.effects.show(ui.ctx(), side) {
             self.answer(ui.ctx(), reply);
         }
-        if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
-            status = Some(s);
-        }
         if let Some(s) = self.render_connect_dialog(ui.ctx()) {
             status = Some(s);
         }
-        if let Some(s) = self.render_new_folder_dialog(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_rename_dialog(ui.ctx()) {
-            status = Some(s);
-        }
         self.render_edits_popup(ui.ctx());
-        if let Some(s) = self.render_apply_review(ui.ctx()) {
-            status = Some(s);
-        }
+        self.render_apply_review(ui.ctx());
         if let Some(s) = self.render_apply_report(ui.ctx()) {
             status = Some(s);
         }
@@ -710,6 +515,9 @@ impl CommanderPane {
         self.key_actions.clear();
         if let Some(s) = self.take_status() {
             status = Some(s);
+        }
+        for line in self.ctl.take_log() {
+            self.log_events.push(format!("[{side}] {line}"));
         }
         PaneResponse {
             status,
@@ -720,291 +528,6 @@ impl CommanderPane {
             detail,
             focused,
             log_events: std::mem::take(&mut self.log_events),
-        }
-    }
-
-    /// Confirm (and perform) an immediate host delete. No-op when nothing is
-    /// pending. Host writes can't be staged/undone, so this is a hard confirm.
-    fn render_host_delete_guard(&mut self, ctx: &egui::Context) -> Option<String> {
-        let count = self.pending_host_delete.as_ref()?.len();
-        let mut confirm = false;
-        let mut cancel = false;
-        egui::Window::new(format!("Delete from host folder? ({})", self.side.label()))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "Permanently delete {count} item(s) from the host folder?"
-                ));
-                ui.label("This is immediate and cannot be undone.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if confirm {
-            let names = self.pending_host_delete.take().unwrap_or_default();
-            return Some(self.delete_host_entries(&names));
-        }
-        if cancel {
-            self.pending_host_delete = None;
-        }
-        None
-    }
-
-    /// Immediately remove `names` from the host folder, then re-list.
-    fn delete_host_entries(&mut self, names: &[String]) -> String {
-        let targets: Vec<FileEntry> = self
-            .ctl
-            .listing
-            .entries()
-            .iter()
-            .filter(|e| names.iter().any(|n| n == &e.name))
-            .cloned()
-            .collect();
-        let (mut removed, mut failed) = (0, 0);
-        for e in targets {
-            let res = if e.is_directory() {
-                std::fs::remove_dir_all(&e.path)
-            } else {
-                std::fs::remove_file(&e.path)
-            };
-            match res {
-                Ok(()) => removed += 1,
-                Err(_) => failed += 1,
-            }
-        }
-        self.reload_listing();
-        let msg = if failed > 0 {
-            format!(
-                "[{}] deleted {removed} item(s); {failed} could not be removed.",
-                self.side.label()
-            )
-        } else {
-            format!(
-                "[{}] deleted {removed} item(s) from the host folder.",
-                self.side.label()
-            )
-        };
-        if removed > 0 {
-            self.log_events.push(msg.clone());
-        }
-        msg
-    }
-
-    /// The modal "Rename..." dialog. Image panes stage a `Rename` edit (applied
-    /// on Apply); host panes rename immediately via `std::fs::rename`. No-op
-    /// when nothing is pending.
-    fn render_rename_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.rename_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_rename = false;
-        let mut cancel = false;
-        {
-            let d = self.rename_dialog.as_mut().unwrap();
-            let old_name = d.entry.name.clone();
-            let input = &mut d.input;
-            let err = d.error.clone();
-            egui::Window::new(format!("Rename ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("Rename \"{old_name}\" to:"));
-                    let resp = ui.text_edit_singleline(input);
-                    if let Some(e) = &err {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !input.trim().is_empty() && *input != old_name;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
-                            do_rename = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    // Enter confirms when the name is valid.
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_rename = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.rename_dialog = None;
-            return None;
-        }
-        if do_rename {
-            let new_name = self
-                .rename_dialog
-                .as_ref()
-                .unwrap()
-                .input
-                .trim()
-                .to_string();
-            // Validate against the filesystem's name rules (image panes only;
-            // host names are validated by the OS at rename time).
-            if let Some(Err(e)) = self
-                .ctl
-                .listing
-                .fs_mut()
-                .map(|fs| fs.validate_name(&new_name))
-            {
-                if let Some(d) = self.rename_dialog.as_mut() {
-                    d.error = Some(format!("{e}"));
-                }
-                return None;
-            }
-            let entry = self.rename_dialog.take().unwrap().entry;
-            return Some(self.perform_rename(entry, new_name));
-        }
-        None
-    }
-
-    /// Carry out a confirmed rename: stage it (image pane) or apply it now
-    /// (host pane), then refresh.
-    fn perform_rename(&mut self, entry: FileEntry, new_name: String) -> String {
-        let side = self.side.label();
-        if self.ctl.listing.is_host() {
-            let old_path = PathBuf::from(&entry.path);
-            let new_path = old_path.with_file_name(&new_name);
-            if new_path.exists() {
-                return format!("[{side}] '{new_name}' already exists.");
-            }
-            match std::fs::rename(&old_path, &new_path) {
-                Ok(()) => {
-                    self.reload_listing();
-                    let msg = format!("[{side}] renamed '{}' to '{new_name}'.", entry.name);
-                    self.log_events.push(msg.clone());
-                    msg
-                }
-                Err(e) => format!("[{side}] rename failed: {e}"),
-            }
-        } else {
-            let Some(cwd) = self.ctl.listing.cwd().cloned() else {
-                return format!("[{side}] no directory to rename in.");
-            };
-            // Replace any prior staged rename of the same entry.
-            self.ctl.queue.remove_pending_rename(&entry.path);
-            self.ctl.queue.push(StagedEdit::Rename {
-                parent: cwd,
-                entry,
-                new_name: new_name.clone(),
-            });
-            format!("[{side}] staged rename to '{new_name}'. Apply to write.")
-        }
-    }
-
-    /// The "New Folder..." modal: a name field staged as a CreateDirectory on
-    /// an image pane, or created immediately on a host pane.
-    fn render_new_folder_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.new_folder_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_create = false;
-        let mut cancel = false;
-        {
-            let d = self.new_folder_dialog.as_mut().unwrap();
-            let input = &mut d.input;
-            let err = d.error.clone();
-            egui::Window::new(format!("New Folder ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Folder name:");
-                    let resp = ui.text_edit_singleline(input);
-                    if let Some(e) = &err {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !input.trim().is_empty();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new("Create")).clicked() {
-                            do_create = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_create = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.new_folder_dialog = None;
-            return None;
-        }
-        if do_create {
-            let name = self
-                .new_folder_dialog
-                .as_ref()
-                .unwrap()
-                .input
-                .trim()
-                .to_string();
-            // Name validity (image panes; host names are validated by the OS).
-            if let Some(Err(e)) = self.ctl.listing.fs_mut().map(|fs| fs.validate_name(&name)) {
-                if let Some(d) = self.new_folder_dialog.as_mut() {
-                    d.error = Some(format!("{e}"));
-                }
-                return None;
-            }
-            // Reject a name already present (on disk or staged here).
-            let cwd_path = self.ctl.listing.cwd_path().to_string();
-            let dup = self.ctl.listing.entries().iter().any(|e| e.name == name)
-                || self
-                    .ctl
-                    .queue
-                    .pending_adds_for(&cwd_path)
-                    .iter()
-                    .any(|e| e.name == name);
-            if dup {
-                if let Some(d) = self.new_folder_dialog.as_mut() {
-                    d.error = Some(format!("'{name}' already exists here"));
-                }
-                return None;
-            }
-            self.new_folder_dialog = None;
-            return Some(self.perform_new_folder(name));
-        }
-        None
-    }
-
-    /// Create the folder: immediate `std::fs::create_dir` on a host pane, or a
-    /// staged `CreateDirectory` on an image pane.
-    fn perform_new_folder(&mut self, name: String) -> String {
-        let side = self.side.label();
-        if self.ctl.listing.is_host() {
-            let dir = PathBuf::from(self.ctl.listing.cwd_path()).join(&name);
-            match std::fs::create_dir(&dir) {
-                Ok(()) => {
-                    self.reload_listing();
-                    let msg = format!("[{side}] created folder '{name}'.");
-                    self.log_events.push(msg.clone());
-                    msg
-                }
-                Err(e) => format!("[{side}] create folder failed: {e}"),
-            }
-        } else {
-            let Some(cwd) = self.ctl.listing.cwd().cloned() else {
-                return format!("[{side}] no directory open.");
-            };
-            self.ctl.queue.push(StagedEdit::CreateDirectory {
-                parent: cwd,
-                name: name.clone(),
-                qnx2_attrs: None,
-            });
-            format!("[{side}] staged new folder '{name}'. Apply to write.")
         }
     }
 
@@ -1221,6 +744,15 @@ impl CommanderPane {
                 self.error = None;
                 self.ctl
                     .install_remote(target.fs, target.root, target.entries, volume);
+                #[cfg(feature = "remote")]
+                if let BrowseMode::Image { path, partition } = &mode {
+                    self.ctl
+                        .set_remote_source(Some(commander_ops::StageSource::Remote {
+                            addr: addr.clone(),
+                            path: path.clone(),
+                            partition: partition.clone(),
+                        }));
+                }
                 match mode {
                     BrowseMode::Host => Some(format!(
                         "[{}] connected to {addr} (browsing host)",
@@ -1286,47 +818,19 @@ impl CommanderPane {
 
     // --- accessors used by CommanderMode for cross-pane copy ---------------
 
-    /// True when this pane can receive a copy: a volume/folder is open and the
-    /// pane isn't mid-operation. (A host destination takes an immediate write;
-    /// an image destination takes a staged copy.) A read-only backup pane can
-    /// never receive a copy.
+    /// True when this pane can receive a copy: something is open, nothing runs, and it is writable.
     pub(crate) fn can_receive(&self) -> bool {
-        self.ctl.listing.is_loaded()
-            && self.pending_apply.is_none()
-            && self.pending_preflight.is_none()
-            && !self.ctl.is_opening()
-            && self.pending_remote.is_none()
-            && !self.ctl.is_backup()
-            && !self.ctl.is_archive()
-        // Both remote destinations can now receive: a remote image via the
-        // daemon's OpenSession/StageUpload/Apply path, and a remote host folder
-        // via MkdirHost/WriteHostFile. A read-only daemon refuses the write with
-        // a clear error at copy time (the client can't know its policy up front).
+        self.ctl.can_receive() && self.pending_remote.is_none() && !self.remote_applying()
     }
 
-    /// True when this pane's source is read-only media that can never receive a
-    /// copy — a Mac archive, an optical disc, or a backup folder. Distinct from
-    /// `can_receive`, which is also false for transient states (mid-open/apply);
-    /// this reflects the *medium*, so the pane header can show a "Read-only"
-    /// badge. Host folders, writable image volumes, and remote panes (host or
-    /// image — both writable, subject to the daemon's read-only policy) are not
-    /// read-only.
+    /// Read-only media (archive, optical disc, backup), for the header's "Read-only" badge.
     pub(crate) fn is_read_only(&self) -> bool {
-        self.ctl.listing.is_loaded()
-            && !self.ctl.listing.is_host()
-            && (self.ctl.is_archive() || self.ctl.is_optical() || self.ctl.is_backup())
+        self.ctl.is_read_only()
     }
 
-    /// A short reason a copy into this pane is refused, for the copy button's
-    /// disabled hover. `None` when the pane can receive.
+    /// Why a copy into this pane is refused, for the copy button's hover.
     pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
-        if self.ctl.is_archive() {
-            Some("the archive is read-only")
-        } else if self.ctl.is_backup() {
-            Some("the backup is read-only")
-        } else {
-            None
-        }
+        self.ctl.readonly_reason()
     }
 
     /// True when this pane lists a host-OS folder rather than a disk image.
@@ -1352,33 +856,23 @@ impl CommanderPane {
         self.ctl.is_archive()
     }
 
-    /// How an async copy / checksum worker should reopen this pane's image source
-    /// off the UI thread. Covers every image source with a way to reopen fresh:
-    /// a local browse session, a remote connection, an inline-expanded
-    /// disk-image / optical wrapper mount, or a Mac archive (by file path).
-    /// `None` only for a source with no reopenable handle — an archive-in-a-
-    /// container wrapper (read from an in-memory buffer) — where the caller falls
-    /// back to a synchronous extraction over its live `fs_mut()`.
+    /// How a copy or checksum worker reopens this pane's selection source.
     pub(crate) fn copy_stage_source(&self) -> Option<commander_ops::StageSource> {
-        // A wrapper-tree mount is the effective source when a tree selection is
-        // active; reopen it from its recipe (None for archive mounts -> sync).
-        if let Some((mount_key, _)) = self.tree_selection() {
-            return self
-                .ctl
-                .wrapper_tree
-                .mount_reopen(&mount_key)
-                .map(commander_ops::StageSource::Reopen);
-        }
-        if self.tree_active() {
-            return None;
-        }
-        self.base_stage_source()
+        self.ctl.copy_stage_source()
     }
 
-    /// A clone of the pending-apply status handle for the progress modal.
-    /// `None` when nothing is in flight on this pane.
+    /// The remote upload's status for the progress modal, while one runs.
     pub(crate) fn pending_apply_status(&self) -> Option<Arc<Mutex<commander_ops::ApplyStatus>>> {
-        self.pending_apply.clone()
+        self.pending_remote_apply.clone()
+    }
+
+    /// The local apply job, for the progress modal.
+    pub(crate) fn apply_job(&self) -> Option<Snapshot> {
+        self.ctl.applying()
+    }
+
+    fn remote_applying(&self) -> bool {
+        self.pending_remote_apply.is_some()
     }
 
     /// Re-read the current directory listing (after an immediate host write).
@@ -1387,43 +881,18 @@ impl CommanderPane {
         self.ctl.take_error();
     }
 
-    /// Delete this pane's current selection — the middle-column Delete acting on
-    /// the active pane. Mirrors the row right-click delete: an image pane toggles
-    /// a staged delete (Apply writes through); a host pane queues a confirm.
-    pub(crate) fn delete_selection(&mut self) -> String {
-        if self.tree_active() {
-            return format!(
-                "[{}] wrapper contents are read-only (copy out, don't edit).",
-                self.side.label()
-            );
-        }
-        if self.is_backup_pane() {
-            return format!("[{}] backup panes are read-only.", self.side.label());
-        }
-        if self.ctl.is_archive() {
-            return format!("[{}] archive panes are read-only.", self.side.label());
-        }
+    /// Delete the selection (the middle-column Delete): staged on an image, confirmed then immediate on a host.
+    pub(crate) fn delete_selection(&mut self, ctx: &egui::Context) -> String {
         if self.remote.is_some() {
-            // The remote write path carries copies only; delete / rename over the
-            // wire is a follow-up. Keep remote panes copy-in-only for now.
+            // The remote write path carries copies only; delete over the wire is a follow-up.
             return format!(
                 "[{}] remote panes accept copied files/folders only; delete over \
                  the wire isn't supported yet.",
                 self.side.label()
             );
         }
-        let names: Vec<String> = self.ctl.listing.selection().to_vec();
-        if names.is_empty() {
-            return format!("[{}] nothing selected to delete.", self.side.label());
-        }
-        if self.ctl.listing.is_host() {
-            self.pending_host_delete = Some(names);
-            format!("[{}] confirm host delete...", self.side.label())
-        } else {
-            let n = names.len();
-            self.toggle_delete(&names);
-            format!("[{}] toggled delete on {n} item(s).", self.side.label())
-        }
+        self.act(ctx, CommanderPaneAction::Delete);
+        self.take_status().unwrap_or_default()
     }
 
     /// Queues a keyboard action for this pane; it runs when the listing next renders.
@@ -1439,56 +908,34 @@ impl CommanderPane {
     /// True while one of this pane's dialogs waits for an answer, so shortcuts stand down.
     pub(crate) fn modal_open(&self) -> bool {
         self.effects.modal_open()
-            || self.pending_host_delete.is_some()
-            || self.rename_dialog.is_some()
-            || self.new_folder_dialog.is_some()
             || self.connect_dialog.is_some()
-            || self.apply_review.is_some()
-            || self.apply_report.is_some()
+            || self.ctl.apply_review().is_some()
+            || self.ctl.apply_report().is_some()
     }
 
     fn busy(&self) -> bool {
-        self.pending_apply.is_some() || self.pending_preflight.is_some() || self.ctl.is_opening()
+        self.ctl.is_busy() || self.remote_applying()
     }
 
-    fn can_new_folder(&self) -> bool {
-        self.ctl.listing.is_loaded() && !self.busy() && !self.ctl.is_backup()
-    }
-
-    /// The Apply button, when it is offered and enabled.
-    pub(crate) fn apply_shortcut(&mut self) -> Option<String> {
-        let staging =
-            !self.ctl.listing.is_host() && !self.ctl.is_backup() && !self.ctl.is_archive();
-        (staging && !self.ctl.queue.is_empty() && !self.busy()).then(|| self.apply())
-    }
-
-    /// The New Folder button.
-    pub(crate) fn new_folder_shortcut(&mut self) {
-        if self.can_new_folder() {
-            self.new_folder_dialog = Some(NewFolderDialog {
-                input: String::new(),
-                error: None,
-            });
+    /// The Apply button and F10: a remote image uploads here, anything else applies in the controller.
+    pub(crate) fn apply_now(&mut self, ctx: &egui::Context) -> String {
+        if self.ctl.queue.is_empty() || self.busy() {
+            return String::new();
         }
+        if self.is_remote_image() {
+            return self.apply_remote();
+        }
+        self.act(ctx, CommanderPaneAction::Apply);
+        self.take_status().unwrap_or_default()
     }
 
-    /// The cursor row's "Rename..." menu item.
-    pub(crate) fn rename_shortcut(&mut self) {
-        if self.pending_apply.is_some() || self.ctl.is_backup() {
-            return;
+    /// A pane action from the keyboard or a button whose effects must run now (prompts, confirms).
+    pub(crate) fn command(&mut self, ctx: &egui::Context, action: CommanderPaneAction) -> String {
+        if self.remote_applying() {
+            return String::new();
         }
-        let Some(row) = self.ctl.cursor_index().map(|i| self.ctl.rows()[i].clone()) else {
-            return;
-        };
-        if row.is_tree || row.kind != RowKind::Normal {
-            return;
-        }
-        let mut out = RowActions::default();
-        self.dispatch(
-            CommanderPaneAction::ContextSelect(row.name.clone()),
-            &mut out,
-        );
-        self.open_rename(&row.name);
+        self.act(ctx, action);
+        self.take_status().unwrap_or_default()
     }
 
     /// True when at least one row is selected (base listing or a wrapper).
@@ -1634,62 +1081,13 @@ impl CommanderPane {
     }
 
     /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
-    pub(crate) fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
-        let queue_start = self.ctl.queue.len();
-        let cwd_path = self.ctl.listing.cwd_path().to_string();
-        let cwd_names: Vec<String> = self
-            .ctl
-            .listing
-            .entries()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
-        let queue = &self.ctl.queue;
-        let mut existing = |path: &str| {
-            let mut names: Vec<String> = queue
-                .pending_adds_for(path)
-                .into_iter()
-                .map(|e| e.name)
-                .collect();
-            if path == cwd_path {
-                names.extend(cwd_names.iter().cloned());
-            }
-            names
-        };
-        // A remote image has no local fs here; the daemon reports bad names at apply.
-        let (report, fs_type) = match self.ctl.listing.fs_mut() {
-            Some(fs) => {
-                let fold = fs.case_insensitive_lookup();
-                let fs_type = fs.fs_type().to_string();
-                let validate = |n: &str| fs.validate_name(n);
-                (
-                    legalize_staged_names(&mut edits, &validate, fold, &mut existing),
-                    fs_type,
-                )
-            }
-            None => (LegalizeReport::default(), String::new()),
-        };
-        let staged = edits.len();
-        for e in edits {
-            self.ctl.queue.push(e);
-        }
-        StageOutcome {
-            staged,
-            queue_start,
-            fs_type,
-            renamed: report.renamed,
-            dropped: report.dropped,
-        }
+    pub(crate) fn stage_edits(&mut self, edits: Vec<StagedEdit>) -> StageOutcome {
+        self.ctl.stage_edits(edits)
     }
 
     /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
     pub(crate) fn unstage_since(&mut self, queue_start: usize) -> bool {
-        // An apply in flight holds queue indices; trimming under it would misalign them.
-        if self.pending_apply.is_some() || self.pending_preflight.is_some() {
-            return false;
-        }
-        self.ctl.queue.truncate(queue_start);
-        true
+        !self.remote_applying() && self.ctl.unstage_since(queue_start)
     }
 
     // --- source bar --------------------------------------------------------
@@ -1698,6 +1096,7 @@ impl CommanderPane {
         use CommanderPaneAction as A;
         let mut status = None;
         let mut source_action = None;
+        let mut apply = false;
 
         // Row 1: source selection + pane lifecycle (Close / Apply / Discard).
         // Wrapped so the picker + lifecycle buttons flow onto a second line on a
@@ -1851,18 +1250,17 @@ impl CommanderPane {
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups / archives are
             // read-only).
-            if !self.ctl.listing.is_host() && !is_backup && !self.ctl.is_archive() {
+            if self.ctl.stages_edits() {
                 let n = self.ctl.queue.len();
                 let busy = self.busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
-                        status = Some(self.apply());
+                        apply = true;
                     }
                 });
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button("Discard").clicked() {
-                        self.ctl.queue.clear();
-                        status = Some(format!("[{}] discarded staged edits.", self.side.label()));
+                        source_action = Some(A::Discard);
                     }
                 });
                 if n > 0
@@ -1871,7 +1269,7 @@ impl CommanderPane {
                         .on_hover_text("Review the pending staged edits")
                         .clicked()
                 {
-                    self.show_edits_popup = !self.show_edits_popup;
+                    source_action = Some(A::ShowEdits(!self.ctl.edits_shown()));
                 }
             }
         });
@@ -1916,16 +1314,14 @@ impl CommanderPane {
                 // New Folder: stages a CreateDirectory on an image pane;
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
-                if self.can_new_folder()
+                if self.ctl.can_new_folder()
+                    && !self.remote_applying()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
                         .clicked()
                 {
-                    self.new_folder_dialog = Some(NewFolderDialog {
-                        input: String::new(),
-                        error: None,
-                    });
+                    source_action = Some(A::RequestNewFolder);
                 }
 
                 // Volume label + free space. Rendered inline (not right-aligned)
@@ -1962,22 +1358,21 @@ impl CommanderPane {
         if let Some(action) = source_action {
             self.act(ui.ctx(), action);
         }
+        if apply {
+            status = Some(self.apply_now(ui.ctx()));
+        }
         status
     }
 
-    /// The "Pending edits" review popup: a plain-language list of every staged
-    /// edit on this pane, in apply order. Opened by the "Edits (N)" button.
+    /// The "Pending edits" list: every staged edit in plain words, in apply order, each removable.
     fn render_edits_popup(&mut self, ctx: &egui::Context) {
-        if !self.show_edits_popup {
-            return;
-        }
-        // Auto-close once the queue empties (Apply / Discard).
-        if self.ctl.queue.is_empty() {
-            self.show_edits_popup = false;
+        if !self.ctl.edits_shown() {
             return;
         }
         let mut open = true;
-        let lines = self.ctl.queue.describe();
+        let mut unstage = None;
+        let busy = self.busy();
+        let lines = self.ctl.edit_lines();
         egui::Window::new(format!("Pending edits ({})", self.side.label()))
             .open(&mut open)
             .resizable(true)
@@ -1990,12 +1385,25 @@ impl CommanderPane {
                     .max_height(320.0)
                     .show(ui, |ui| {
                         for (i, line) in lines.iter().enumerate() {
-                            ui.label(format!("{}. {line}", i + 1));
+                            ui.horizontal(|ui| {
+                                let remove = egui::Button::new("X").small();
+                                if ui
+                                    .add_enabled(!busy, remove)
+                                    .on_hover_text("Remove this edit from the queue")
+                                    .clicked()
+                                {
+                                    unstage = Some(i);
+                                }
+                                ui.label(format!("{}. {line}", i + 1));
+                            });
                         }
                     });
             });
+        if let Some(i) = unstage {
+            self.act(ctx, CommanderPaneAction::Unstage(i));
+        }
         if !open {
-            self.show_edits_popup = false;
+            self.act(ctx, CommanderPaneAction::ShowEdits(false));
         }
     }
 
@@ -2033,110 +1441,20 @@ impl CommanderPane {
             }
         });
         let mut out = RowActions::default();
-        self.dispatch(CommanderPaneAction::NavigateTo(go?), &mut out);
+        let ctx = ui.ctx().clone();
+        self.dispatch(&ctx, CommanderPaneAction::NavigateTo(go?), &mut out);
         out.status
     }
 
-    /// Poll an in-flight async wrapper expansion; on completion, install the
-    /// prepared mount (or record the failure) and drop the spinner.
-    fn poll_wrapper(&mut self, ctx: &egui::Context) -> Option<String> {
-        let finished = {
-            let pw = self.pending_wrapper.as_ref()?;
-            ctx.request_repaint();
-            pw.status.lock().ok().map(|g| g.finished).unwrap_or(false)
+    // --- apply: the review and report are views over controller state ------
+
+    fn render_apply_review(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.ctl.apply_review() else {
+            self.review_choice = OnConflict::Skip;
+            return;
         };
-        if !finished {
-            return None;
-        }
-        let pw = self.pending_wrapper.take()?;
-        let result = pw.status.lock().ok().and_then(|mut g| g.result.take());
-        match result {
-            Some(Ok(prepared)) => {
-                let note = self
-                    .ctl
-                    .wrapper_tree
-                    .install_prepared(&pw.node_id, prepared);
-                let side = self.side.label();
-                Some(match note {
-                    Some(n) => format!("[{side}] {}: {n}", pw.name),
-                    None => format!("[{side}] opened {}.", pw.name),
-                })
-            }
-            Some(Err(e)) => self.wrapper_open_failed(&pw.name, e),
-            None => None,
-        }
-    }
-
-    // --- staging -----------------------------------------------------------
-
-    /// Check the staged queue against this pane's volume, then apply (see `poll_preflight`).
-    fn apply(&mut self) -> String {
-        if self.ctl.queue.is_empty() {
-            return String::new();
-        }
-        // A remote image pane has no local BrowseSession — apply over the wire.
-        if self.is_remote_image() {
-            return self.apply_remote();
-        }
-        let Some(session) = self.ctl.session().cloned() else {
-            return format!("[{}] no source to apply to.", self.side.label());
-        };
-        let n = self.ctl.queue.len();
-        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
-        self.pending_preflight = Some(commander_ops::spawn_apply_preflight(session, edits));
-        self.apply_report = None;
-        format!("[{}] checking {n} staged edit(s)...", self.side.label())
-    }
-
-    /// Write the queue, continuing past failed items so one bad file can't strand the batch.
-    fn start_apply(&mut self) -> String {
-        let Some(session) = self.ctl.session().cloned() else {
-            return format!("[{}] no source to apply to.", self.side.label());
-        };
-        let n = self.ctl.queue.len();
-        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
-        self.pending_apply = Some(commander_ops::spawn_apply(session, edits, true));
-        self.error = None;
-        format!("[{}] applying {n} edit(s)...", self.side.label())
-    }
-
-    fn poll_preflight(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_preflight.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        let result = guard.result.take();
-        drop(guard);
-        self.pending_preflight = None;
-        let side = self.side.label();
-        match result? {
-            Ok(p) if p.is_clean() => Some(self.start_apply()),
-            Ok(p) => {
-                self.apply_review = Some(ApplyReview {
-                    preflight: p,
-                    on_conflict: OnConflict::Skip,
-                });
-                Some(format!("[{side}] review the staged edits before applying."))
-            }
-            Err(e) => {
-                self.apply_report = Some(ApplyReport {
-                    total: self.ctl.queue.len(),
-                    applied: 0,
-                    failed: Vec::new(),
-                    not_tried: 0,
-                    fatal: Some(format!("Could not check the staged edits: {e}")),
-                });
-                Some(format!("[{side}] could not check the staged edits."))
-            }
-        }
-    }
-
-    fn render_apply_review(&mut self, ctx: &egui::Context) -> Option<String> {
-        let review = self.apply_review.as_mut()?;
-        let p = &review.preflight;
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
+        let choice = &mut self.review_choice;
         let mut go = None;
         egui::Window::new(format!("Before applying ({})", self.side.label()))
             .collapsible(false)
@@ -2164,8 +1482,8 @@ impl CommanderPane {
                     ));
                     path_list(ui, "review_conflicts", p.scan.conflicts.iter().map(|c| &c.0));
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut review.on_conflict, OnConflict::Skip, "Skip existing");
-                        ui.radio_value(&mut review.on_conflict, OnConflict::Replace, "Overwrite");
+                        ui.radio_value(choice, OnConflict::Skip, "Skip existing");
+                        ui.radio_value(choice, OnConflict::Replace, "Overwrite");
                     });
                     ui.add_space(4.0);
                 }
@@ -2198,22 +1516,16 @@ impl CommanderPane {
                     }
                 });
             });
-        let go = go?;
-        let review = self.apply_review.take()?;
-        if !go {
-            return Some(format!(
-                "[{}] apply cancelled; nothing was written.",
-                self.side.label()
-            ));
-        }
-        if !review.preflight.scan.conflicts.is_empty() {
-            self.ctl.queue.set_all_conflicts(review.on_conflict);
-        }
-        Some(self.start_apply())
+        let action = match go {
+            Some(true) => CommanderPaneAction::ApplyReviewed(self.review_choice),
+            Some(false) => CommanderPaneAction::DismissReview,
+            None => return,
+        };
+        self.act(ctx, action);
     }
 
     fn render_apply_report(&mut self, ctx: &egui::Context) -> Option<String> {
-        let report = self.apply_report.as_ref()?;
+        let report = self.ctl.apply_report()?;
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
         let still = self.ctl.queue.len();
         let mut action = None;
@@ -2253,8 +1565,7 @@ impl CommanderPane {
                     ui.add_space(4.0);
                     ui.label(format!(
                         "Stopped after {} failures in a row; {} edit(s) were not tried.",
-                        commander_ops::MAX_CONSECUTIVE_FAILURES,
-                        report.not_tried
+                        MAX_CONSECUTIVE_FAILURES, report.not_tried
                     ));
                 }
                 ui.add_space(6.0);
@@ -2276,26 +1587,15 @@ impl CommanderPane {
                 });
             });
         let action = action?;
-        self.apply_report = None;
+        self.act(ctx, CommanderPaneAction::DismissReport);
         match action {
-            0 => Some(self.apply()),
-            1 => {
-                self.ctl.queue.clear();
-                Some(format!(
-                    "[{}] discarded the remaining staged edits.",
-                    self.side.label()
-                ))
-            }
+            0 => Some(self.apply_now(ctx)),
+            1 => Some(self.command(ctx, CommanderPaneAction::Discard)),
             _ => None,
         }
     }
 
-    /// Apply the staged queue to a remote image over the Family-F write path
-    /// (`OpenSession` → `StageUpload`/`StageMkdir` → `Apply`), bound to the same
-    /// `(image_path, partition)` the pane is browsing so the daemon resolves the
-    /// partition exactly as it did for the browse. Only copy-in edits travel
-    /// over the wire, so a queue containing anything else is refused here (before
-    /// spawning) rather than half-applied.
+    /// Upload the staged copy-ins to the remote image (Family-F write path); other edits are refused up front.
     fn apply_remote(&mut self) -> String {
         let (addr, path, partition) = match &self.remote {
             Some(RemoteConn {
@@ -2318,7 +1618,7 @@ impl CommanderPane {
         }
         let n = self.ctl.queue.len();
         let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
-        self.pending_apply = Some(commander_ops::spawn_remote_apply(
+        self.pending_remote_apply = Some(commander_ops::spawn_remote_apply(
             addr, path, partition, edits,
         ));
         self.error = None;
@@ -2328,69 +1628,25 @@ impl CommanderPane {
         )
     }
 
-    /// Poll an in-flight apply: drop what landed from the queue, reopen the
-    /// volume (its cached catalog predates the write), and report any failures.
-    fn poll_apply(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_apply.clone()?;
+    /// Poll the remote upload; a remote apply is all-or-nothing, so the queue empties on success.
+    fn poll_remote_apply(&mut self, ctx: &egui::Context) -> Option<String> {
+        let arc = self.pending_remote_apply.clone()?;
         ctx.request_repaint();
         let mut guard = arc.lock().ok()?;
         if !guard.finished {
             return None;
         }
-        self.pending_apply = None;
+        self.pending_remote_apply = None;
         let fatal = guard.error.take();
-        let outcome = guard.outcome.take().unwrap_or_default();
         drop(guard);
-        let side = self.side.label();
-        if self.is_remote_image() {
-            return Some(self.finish_remote_apply(fatal));
-        }
-        let total = self.ctl.queue.len();
-        self.ctl.queue.remove_indices(&outcome.applied_indices);
-        let applied = outcome.applied();
-        for f in &outcome.failed {
-            self.log_events
-                .push(format!("[{side}] failed: {}: {}", f.label, f.error));
-        }
-        let clean = fatal.is_none() && outcome.failed.is_empty();
-        if !clean {
-            self.apply_report = Some(ApplyReport {
-                total,
-                applied,
-                not_tried: outcome.stopped_at.map_or(0, |at| total.saturating_sub(at)),
-                failed: outcome.failed,
-                fatal: fatal.map(|e| format!("Apply stopped: {e}")),
-            });
-        }
-        let msg = if clean {
-            format!("[{side}] applied {applied} edit(s).")
-        } else {
-            format!(
-                "[{side}] applied {applied} of {total} edit(s); {} still staged.",
-                self.ctl.queue.len()
-            )
-        };
-        self.reopen_after_apply(ctx);
-        self.log_events.push(msg.clone());
-        Some(msg)
-    }
-
-    /// Reopen the partition after a write, keeping what is still staged and the current folder.
-    fn reopen_after_apply(&mut self, ctx: &egui::Context) {
-        let fx = self.ctl.reopen_after_apply();
-        self.run_effects(ctx, fx);
+        Some(self.finish_remote_apply(fatal))
     }
 
     /// Remote applies are all-or-nothing on the daemon; reopen on success so the copy shows.
     fn finish_remote_apply(&mut self, fatal: Option<String>) -> String {
         if let Some(err) = fatal {
-            self.apply_report = Some(ApplyReport {
-                total: self.ctl.queue.len(),
-                applied: 0,
-                failed: Vec::new(),
-                not_tried: 0,
-                fatal: Some(format!("Apply failed: {err}")),
-            });
+            self.ctl
+                .report_apply_failure(format!("Apply failed: {err}"));
             return format!("[{}] apply failed.", self.side.label());
         }
         let n = self.ctl.queue.len();
@@ -2411,54 +1667,6 @@ impl CommanderPane {
         let msg = format!("[{}] applied {n} edit(s).", self.side.label());
         self.log_events.push(msg.clone());
         msg
-    }
-
-    /// Toggle the staged-delete state of `names` in the current directory:
-    /// stage a delete on a normal entry, undelete a pending delete, or un-stage
-    /// a pending copy / new folder.
-    fn toggle_delete(&mut self, names: &[String]) {
-        let Some(cwd) = self.ctl.listing.cwd().cloned() else {
-            return;
-        };
-        let pending_adds = self.ctl.queue.pending_adds_for(&cwd.path);
-        for name in names {
-            if let Some(add) = pending_adds.iter().find(|e| &e.name == name) {
-                if add.is_directory() {
-                    self.ctl.queue.remove_pending_subtree(&add.path);
-                } else {
-                    self.ctl.queue.remove_pending_add(&add.path);
-                }
-                continue;
-            }
-            let Some(entry) = self
-                .ctl
-                .listing
-                .entries()
-                .iter()
-                .find(|e| &e.name == name)
-                .cloned()
-            else {
-                continue;
-            };
-            if self.ctl.queue.is_pending_delete(&entry.path) {
-                self.ctl.queue.remove_pending_delete(&entry.path);
-            } else {
-                // Deleting supersedes a staged rename of the same entry (else
-                // apply would rename it, then fail to delete the old name).
-                self.ctl.queue.remove_pending_rename(&entry.path);
-                if entry.is_directory() {
-                    self.ctl.queue.push(StagedEdit::DeleteRecursive {
-                        parent: cwd.clone(),
-                        entry,
-                    });
-                } else {
-                    self.ctl.queue.push(StagedEdit::DeleteEntry {
-                        parent: cwd.clone(),
-                        entry,
-                    });
-                }
-            }
-        }
     }
 
     // --- listing grid ------------------------------------------------------
@@ -2545,9 +1753,10 @@ impl CommanderPane {
 
     fn render_rows(&mut self, ui: &mut egui::Ui) -> RowActions {
         let mut out = RowActions::default();
+        let ctx = ui.ctx().clone();
         let keyed = !self.key_actions.is_empty();
         for action in std::mem::take(&mut self.key_actions) {
-            self.dispatch(action, &mut out);
+            self.dispatch(&ctx, action, &mut out);
         }
         let rows = self.display_rows();
         let cursor = if self.has_focus {
@@ -2556,7 +1765,7 @@ impl CommanderPane {
             None
         };
         self.page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
-        let busy = self.pending_apply.is_some();
+        let busy = self.ctl.applying().is_some() || self.remote_applying();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.ctl.listing.is_host();
@@ -2569,7 +1778,6 @@ impl CommanderPane {
         // Row clicks this frame, run through the controller in order once drawing is done.
         let mut acts: Vec<CommanderPaneAction> = Vec::new();
         let mut m_delete = false;
-        let mut m_host_delete = false;
         let mut m_copy = false;
         let mut m_export = false;
         let mut m_export_as: Option<ExportFormat> = None;
@@ -2739,7 +1947,7 @@ impl CommanderPane {
                                     // browse / copy-out only
                                 } else if host_pane {
                                     if ui.button("Delete (immediate)").clicked() {
-                                        m_host_delete = true;
+                                        m_delete = true;
                                         ui.close();
                                     }
                                 } else {
@@ -2777,41 +1985,19 @@ impl CommanderPane {
 
         // Any row interaction marks this pane "active" for the middle Delete.
         out.focused = !acts.is_empty();
-        for action in acts {
-            self.dispatch(action, &mut out);
-        }
-        let mut status = out.status.take();
         if m_delete {
-            let names: Vec<String> = self.ctl.listing.selection().to_vec();
-            self.toggle_delete(&names);
-            status = Some(format!(
-                "[{}] toggled delete on {} item(s).",
-                self.side.label(),
-                names.len()
-            ));
-        }
-        if m_host_delete {
-            let names: Vec<String> = self.ctl.listing.selection().to_vec();
-            if !names.is_empty() {
-                self.pending_host_delete = Some(names);
-            }
+            acts.push(CommanderPaneAction::Delete);
         }
         if let Some(name) = m_rename {
-            self.open_rename(&name);
+            acts.push(CommanderPaneAction::RequestRename(name));
         }
         if let Some(name) = m_cancel_rename {
-            if let Some(path) = self
-                .ctl
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.name == name)
-                .map(|e| e.path.clone())
-            {
-                self.ctl.queue.remove_pending_rename(&path);
-                status = Some(format!("[{}] cancelled staged rename.", self.side.label()));
-            }
+            acts.push(CommanderPaneAction::CancelRename(name));
         }
+        for action in acts {
+            self.dispatch(&ctx, action, &mut out);
+        }
+        let status = out.status.take();
         RowActions {
             status,
             copy: m_copy,
@@ -2825,54 +2011,23 @@ impl CommanderPane {
     }
 
     /// Runs a pane action, turning its error and requests into this frame's row actions.
-    fn dispatch(&mut self, action: CommanderPaneAction, out: &mut RowActions) {
-        // Navigation and selection actions emit no effects; source actions go through `act`.
-        let _ = self.ctl.apply(action);
+    fn dispatch(&mut self, ctx: &egui::Context, action: CommanderPaneAction, out: &mut RowActions) {
+        let fx = self.ctl.apply(action);
         if let Some(e) = self.ctl.take_error() {
             out.status = Some(format!("[{}] {e}", self.side.label()));
         }
         let reqs = self.ctl.take_requests();
         self.handle_row_requests(reqs, out);
+        self.run_effects(ctx, fx);
     }
 
     fn handle_row_requests(&mut self, reqs: Vec<PaneRequest>, out: &mut RowActions) {
-        let side = self.side.label();
         for req in reqs {
             match req {
-                PaneRequest::OpenBaseWrapper { node_id, name } => {
-                    if let Some(s) = self.open_base_wrapper(&node_id, &name) {
-                        out.status = Some(s);
-                    }
-                }
                 PaneRequest::ShowInfo(name) => out.detail = Some(name),
                 PaneRequest::OpenImage(name) => out.open_image = Some(name),
-                PaneRequest::WrapperNote { name, note } => {
-                    out.status = Some(format!("[{side}] {name}: {note}"));
-                }
-                PaneRequest::WrapperFailed { name, detail } => {
-                    if let Some(s) = self.wrapper_open_failed(&name, detail) {
-                        out.status = Some(s);
-                    }
-                }
                 PaneRequest::SourceReset => self.drop_remote(),
             }
-        }
-    }
-
-    fn open_rename(&mut self, name: &str) {
-        if let Some(entry) = self
-            .ctl
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.name == name)
-            .cloned()
-        {
-            self.rename_dialog = Some(RenameDialog {
-                input: entry.name.clone(),
-                entry,
-                error: None,
-            });
         }
     }
 }

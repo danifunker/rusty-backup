@@ -11,7 +11,8 @@ pub mod pane;
 pub mod rows;
 
 pub use pane::{
-    purpose, CommanderPaneAction, CommanderPaneController, NoRecent, PaneRequest, PaneServices,
-    RecentStore, SortColumn, SourceKind, VolumeInfo,
+    purpose, validate_entry_name, ApplyPreflight, ApplyReport, CommanderPaneAction,
+    CommanderPaneController, FailedEdit, NoRecent, OnConflict, PaneRequest, PaneServices,
+    RecentStore, SortColumn, SourceKind, StageOutcome, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 pub use rows::{DisplayRow, RowKind};

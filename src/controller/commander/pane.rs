@@ -11,12 +11,16 @@ use crate::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
 use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
+mod edits;
 mod source;
 
+pub use crate::fs::replace::OnConflict;
+pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
+pub use edits::{validate_entry_name, ApplyReport, StageOutcome};
 pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, VolumeInfo};
 
-/// What a user does to one pane: navigation, selection, sort and the keyboard cursor.
+/// What a user does to one pane: navigation, selection, sort, sources and edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommanderPaneAction {
     /// Enter the child directory with this name.
@@ -87,21 +91,40 @@ pub enum CommanderPaneAction {
     },
     /// The persisted recent lists were cleared elsewhere.
     RecentCleared,
+    /// Toggle a staged delete on the selection; a host pane asks, then deletes now.
+    Delete,
+    /// Drop the staged rename of the entry with this name.
+    CancelRename(String),
+    /// Ask for a new name for the entry with this name.
+    RequestRename(String),
+    /// Select the cursor row and ask for its new name.
+    RenameAtCursor,
+    RequestNewFolder,
+    /// The answer to an `AskText` this pane asked for; `None` is cancel.
+    Answered {
+        purpose: &'static str,
+        text: Option<String>,
+    },
+    /// Drop every staged edit, after a confirmation.
+    Discard,
+    /// Drop the staged edit at this queue index.
+    Unstage(usize),
+    ShowEdits(bool),
+    /// Check the staged edits, then write them; a review comes first if anything needs a decision.
+    Apply,
+    /// Write after the review, settling name conflicts this way.
+    ApplyReviewed(OnConflict),
+    DismissReview,
+    DismissReport,
 }
 
 /// Work the view still does for the pane until later slices turn it into jobs and effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneRequest {
-    /// A base-row wrapper to open off the UI thread.
-    OpenBaseWrapper { node_id: String, name: String },
     /// Show File Info for this entry name (resolved against the active selection).
     ShowInfo(String),
     /// Open this remote-host file as a disk image.
     OpenImage(String),
-    /// A wrapper expanded with a note to show (e.g. only the first volume of a set).
-    WrapperNote { name: String, note: String },
-    /// Expanding a nested wrapper failed.
-    WrapperFailed { name: String, detail: String },
     /// A local source replaced or closed the old one; the view drops any remote connection.
     SourceReset,
 }
@@ -129,8 +152,12 @@ pub struct CommanderPaneController {
     wrapper_epoch: u64,
     error: Option<String>,
     requests: Vec<PaneRequest>,
+    /// Effects raised inside navigation helpers, returned at the end of `apply` / `tick`.
+    out: Vec<Effect>,
     /// What is open and how: path, partitions, session, open job, pending switch.
     src: source::SourceState,
+    /// Staged-edit review, apply, host writes, prompts and the wrapper job.
+    ed: edits::EditState,
 }
 
 impl Default for CommanderPaneController {
@@ -205,16 +232,24 @@ impl Controller for CommanderPaneController {
             }
             CommanderPaneAction::InfoAtCursor => self.info_at_cursor(),
             CommanderPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
-            other => fx = self.apply_source(other),
+            other => {
+                fx = match self.apply_edit(other) {
+                    Ok(fx) => fx,
+                    Err(other) => self.apply_source(other),
+                }
+            }
         }
         self.password_error_locks();
         self.rebuild_rows();
+        fx.append(&mut self.out);
         fx
     }
 
     fn tick(&mut self) -> Vec<Effect> {
-        let fx = self.poll_open();
+        let mut fx = self.poll_open();
+        fx.extend(self.poll_edits());
         self.rebuild_rows();
+        fx.append(&mut self.out);
         fx
     }
 }
@@ -241,7 +276,9 @@ impl CommanderPaneController {
             wrapper_epoch: 0,
             error: None,
             requests: Vec::new(),
+            out: Vec::new(),
             src: source::SourceState::new(services),
+            ed: edits::EditState::new(),
         }
     }
 
@@ -348,6 +385,7 @@ impl CommanderPaneController {
         self.tree_anchor = None;
         self.tree_index.clear();
         self.wrapper_epoch += 1;
+        self.ed.cancel_wrapper();
     }
 
     /// Wrappers are scoped to one directory, so leaving it collapses them.
@@ -481,13 +519,9 @@ impl CommanderPaneController {
             return;
         }
         let Some(row) = self.tree_index.get(node_id).cloned() else {
-            // A base row: opening it can take seconds, so the view runs it off-thread.
-            let entry = self.listing.entries().iter().find(|e| e.path == node_id);
-            if let Some(e) = entry.filter(|e| !self.remote_host && classify_entry(e).is_some()) {
-                self.requests.push(PaneRequest::OpenBaseWrapper {
-                    node_id: node_id.to_string(),
-                    name: e.name.clone(),
-                });
+            // A base row: opening it can take seconds, so it runs as a job.
+            if !self.remote_host {
+                self.open_base_wrapper(node_id);
             }
             return;
         };
@@ -501,17 +535,14 @@ impl CommanderPaneController {
                 .read_wrapper_source(&row)
                 .and_then(|src| self.wrapper_tree.expand_wrapper(node_id, &name, kind, src));
             if let Err(e) = opened {
-                let detail = format!("{e:#}");
-                self.requests
-                    .push(PaneRequest::WrapperFailed { name, detail });
+                self.wrapper_failed(&name, format!("{e:#}"));
                 return;
             }
         } else {
             self.wrapper_tree.expand_folder(node_id);
         }
         if let Some(note) = self.wrapper_tree.note(node_id) {
-            let note = note.to_string();
-            self.requests.push(PaneRequest::WrapperNote { name, note });
+            self.out.push(Effect::Message(format!("{name}: {note}")));
         }
     }
 
@@ -811,23 +842,22 @@ mod tests {
             .path
             .clone();
         vm.apply(CommanderPaneAction::ToggleWrapper(id.clone()));
-        let open = vm.take_requests();
-        assert_eq!(
-            open,
-            [PaneRequest::OpenBaseWrapper {
-                node_id: id.clone(),
-                name: "a.sit".into()
-            }]
+        assert!(
+            vm.wrapper_opening().is_some(),
+            "a base wrapper opens as a job"
         );
-        // The view opens a base wrapper off-thread; here it is installed directly.
-        vm.wrapper_tree
-            .expand_wrapper(
-                &id,
-                "a.sit",
-                crate::model::commander_descend::DescendKind::Archive,
-                crate::model::wrapper_tree::WrapperSource::Bytes(sit_bytes()),
-            )
-            .unwrap();
+        let start = std::time::Instant::now();
+        let mut fx = Vec::new();
+        while vm.wrapper_opening().is_some() {
+            assert!(start.elapsed().as_secs() < 60, "wrapper never opened");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            fx.extend(vm.tick());
+        }
+        assert!(vm.wrapper_tree.is_expanded(&id), "{fx:?}");
+        assert!(
+            fx.contains(&Effect::Message("opened a.sit.".into())),
+            "{fx:?}"
+        );
         vm.display_rows(false);
         (d, vm, id)
     }
