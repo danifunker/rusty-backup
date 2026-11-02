@@ -29,6 +29,8 @@ pub mod floppy_convert;
 pub mod inspect;
 pub mod keys;
 pub mod log;
+#[cfg(feature = "optical")]
+pub mod optical;
 pub mod partition_edit;
 #[cfg(feature = "remote")]
 pub mod remote_pick;

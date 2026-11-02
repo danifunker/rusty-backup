@@ -13,6 +13,8 @@ pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
 pub mod cache_runner;
+#[cfg(feature = "audio")]
+pub mod cd_audio_player;
 #[cfg(feature = "chd")]
 pub mod chd_edit_open;
 #[cfg(feature = "chd")]
@@ -41,7 +43,11 @@ pub mod mac_archive_read;
 pub mod min_size_runner;
 pub mod multi_volume_fs;
 #[cfg(feature = "optical")]
+pub mod optical_browse;
+#[cfg(feature = "optical")]
 pub mod optical_devices;
+#[cfg(feature = "optical")]
+pub mod optical_ops;
 pub mod partition_editor;
 pub mod partition_resize;
 pub mod physical_write_runner;
