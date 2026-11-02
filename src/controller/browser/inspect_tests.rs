@@ -526,3 +526,99 @@ fn host_paths_stage_into_a_folder_and_list_what_could_not_be_staged() {
     pane(&mut ctl, A::DismissStagingErrors);
     assert!(ctl.pane(Side::Left).staging_errors().is_empty());
 }
+
+#[test]
+fn check_tree_and_journal_run_as_jobs_and_hand_over_plain_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let sub = row(&ctl, "SUB").node_id;
+    pane(&mut ctl, A::ToggleExpand(sub));
+    settle(&mut ctl);
+    pane(&mut ctl, A::Fsck);
+    assert!(ctl.pane(Side::Left).tool_working().is_some());
+    settle(&mut ctl);
+    let report = ctl
+        .pane(Side::Left)
+        .tool_report()
+        .expect("a report")
+        .clone();
+    let check = report.check.expect("the check as data");
+    assert!(check.clean && check.errors.is_empty(), "{check:?}");
+    assert!(
+        check.stats_line.starts_with("Files: "),
+        "{}",
+        check.stats_line
+    );
+    assert!(report.repair.is_none());
+    pane(&mut ctl, A::DismissToolReport);
+
+    pane(&mut ctl, A::ListTree { ids: false });
+    settle(&mut ctl);
+    let tree = ctl.host_pane().take_tree_text().expect("the tree");
+    assert!(
+        tree.text.contains("HELLO.TXT") && tree.text.contains("DEEP"),
+        "{}",
+        tree.text
+    );
+    assert!(!tree.ids);
+    assert!(
+        ctl.host_pane().take_tree_text().is_none(),
+        "handed over once"
+    );
+
+    pane(&mut ctl, A::ShowJournal);
+    settle(&mut ctl);
+    assert!(ctl.host_pane().take_journal().is_none());
+    assert!(ctl.status().contains("not journaled"), "{}", ctl.status());
+}
+
+#[test]
+fn repair_needs_edit_mode_and_reports_what_it_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    ctl.host_pane().set_read_only(true);
+    pane(&mut ctl, A::Repair);
+    assert!(ctl.status().contains("not available"), "{}", ctl.status());
+    ctl.host_pane().set_read_only(false);
+    let fx = pane(&mut ctl, A::Repair);
+    assert!(matches!(&fx[..], [Effect::Confirm(c)] if c.purpose == purpose::REPAIR));
+    pane(
+        &mut ctl,
+        A::Confirmed {
+            purpose: purpose::REPAIR,
+            yes: true,
+        },
+    );
+    settle(&mut ctl);
+    let report = ctl
+        .pane(Side::Left)
+        .tool_report()
+        .expect("a report")
+        .clone();
+    assert!(report.repair.is_some(), "{:?}", report.lines);
+    assert!(report.check.is_some_and(|c| c.clean), "{:?}", report.lines);
+    assert!(
+        ctl.pane(Side::Left).listing.is_loaded(),
+        "reopened after the repair"
+    );
+}
+
+#[test]
+fn boot_blocks_pick_a_donor_and_report_one_without_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = fat_volume(dir.path());
+    let mut ctl = inspect(&img);
+    let fx = pane(&mut ctl, A::BootBlocks);
+    assert!(matches!(&fx[..], [Effect::PickFile(p)] if p.purpose == purpose::BOOT_DONOR));
+    pane(
+        &mut ctl,
+        A::Picked {
+            purpose: purpose::BOOT_DONOR,
+            path: Some(img),
+        },
+    );
+    settle(&mut ctl);
+    assert!(ctl.pane(Side::Left).queue.is_empty());
+    assert!(ctl.status().contains("boot blocks:"), "{}", ctl.status());
+    assert_eq!(ctl.pane(Side::Left).boot_blocks_present(), None, "not HFS");
+}

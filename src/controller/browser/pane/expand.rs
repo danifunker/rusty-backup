@@ -412,6 +412,19 @@ impl BrowserPaneController {
         }
         self.dirs.invalidate();
         self.clear_folder_selection();
+        self.volume_changed();
+    }
+
+    /// The volume's reader for a reading tool, with the generation it belongs to.
+    pub(super) fn take_reader(&mut self) -> (Option<Box<dyn Filesystem>>, u64) {
+        (self.dirs.reader.take(), self.dirs.generation)
+    }
+
+    /// A reading tool is done with the reader; kept unless the volume changed meanwhile.
+    pub(super) fn give_reader(&mut self, reader: Option<Box<dyn Filesystem>>, generation: u64) {
+        if generation == self.dirs.generation && self.dirs.reader.is_none() {
+            self.dirs.reader = reader;
+        }
     }
 
     /// The listing was re-read in place: list expanded folders again.

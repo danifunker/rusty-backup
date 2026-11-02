@@ -50,6 +50,7 @@ pub mod purpose {
     pub const IMPORT: &str = "browser.import";
     pub const DELETE_NOW: &str = "browser.delete";
     pub const DELETE_FOLDERS: &str = "browser.delete_folders";
+    pub const BOOT_DONOR: &str = "browser.boot_donor";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -205,8 +205,8 @@ impl PaneProfile {
             styles: &ListingStyle::ALL,
             detail: DetailPlacement::SidePanel,
             tools: Tools {
-                fsck: false,
-                repair: false,
+                fsck: true,
+                repair: true,
                 bless: true,
                 text_edit: true,
                 import: true,

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use disk_core::entry::FileEntry;
 
 use super::source::purpose;
+use super::volume::{CheckSummary, Found, ReadOut, RepairSummary, Want};
 use super::{BrowserPaneAction, BrowserPaneController};
 use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::model::browse_session::BrowseSession;
@@ -26,11 +27,14 @@ pub const MAX_TEXT_EDIT: usize = 1024 * 1024;
 /// Seconds between the Mac (1904) and Unix (1970) epochs.
 const MAC_EPOCH_OFFSET: i64 = 2_082_844_800;
 
-/// A check or repair result, as lines for a scrolling window.
+/// A check or repair result, as lines for a scrolling window and as data for a richer one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolReport {
     pub title: String,
     pub lines: Vec<String>,
+    /// The check (after a repair, the re-check); `None` when it could not run.
+    pub check: Option<CheckSummary>,
+    pub repair: Option<RepairSummary>,
 }
 
 /// A file read for the text editor: UTF-8 with LF endings, and how to write it back.
@@ -66,15 +70,22 @@ pub struct MetadataForm {
 }
 
 enum ToolJob {
-    Check {
+    /// A check, tree listing or journal read on the shared reader.
+    Volume {
         title: String,
-        job: Job<Vec<String>>,
+        job: Job<ReadOut>,
     },
     Repair {
         title: String,
-        job: Job<Vec<String>>,
+        job: Job<Repaired>,
     },
     Read(Job<TextDoc>),
+}
+
+struct Repaired {
+    lines: Vec<String>,
+    repair: RepairSummary,
+    check: Option<CheckSummary>,
 }
 
 #[derive(Default)]
@@ -306,14 +317,21 @@ fn repair_lines(report: &crate::fs::RepairReport) -> Vec<String> {
     lines
 }
 
-fn check_source(source: StageSource) -> Vec<String> {
+fn check_source(source: StageSource) -> (Vec<String>, Option<CheckSummary>) {
     match source.open() {
-        Ok(mut fs) => fsck_lines(fs.fsck().map(|r| r.map_err(|e| e.to_string()))),
-        Err(e) => vec![format!("Check failed: {e:#}")],
+        Ok(mut fs) => {
+            let result = fs.fsck().map(|r| r.map_err(|e| e.to_string()));
+            let summary = match &result {
+                Some(Ok(r)) => Some(CheckSummary::of(r)),
+                _ => None,
+            };
+            (fsck_lines(result), summary)
+        }
+        Err(e) => (vec![format!("Check failed: {e:#}")], None),
     }
 }
 
-fn repair_session(session: &BrowseSession) -> anyhow::Result<Vec<String>> {
+fn repair_session(session: &BrowseSession) -> anyhow::Result<Repaired> {
     use anyhow::Context as _;
     let (mut efs, commit) = session
         .open_editable()
@@ -326,8 +344,13 @@ fn repair_session(session: &BrowseSession) -> anyhow::Result<Vec<String>> {
     let mut lines = repair_lines(&report);
     lines.push(String::new());
     lines.push("--- re-check after repair ---".to_string());
-    lines.extend(check_source(StageSource::Session(session.clone())));
-    Ok(lines)
+    let (check_lines, check) = check_source(StageSource::Session(session.clone()));
+    lines.extend(check_lines);
+    Ok(Repaired {
+        lines,
+        repair: RepairSummary::of(&report),
+        check,
+    })
 }
 
 impl BrowserPaneController {
@@ -341,7 +364,8 @@ impl BrowserPaneController {
     /// The check, repair or editor read in progress.
     pub fn tool_working(&self) -> Option<crate::model::job::Snapshot> {
         match self.tl.job.as_ref()? {
-            ToolJob::Check { job, .. } | ToolJob::Repair { job, .. } => Some(job.snapshot()),
+            ToolJob::Volume { job, .. } => Some(job.snapshot()),
+            ToolJob::Repair { job, .. } => Some(job.snapshot()),
             ToolJob::Read(job) => Some(job.snapshot()),
         }
     }
@@ -425,6 +449,19 @@ impl BrowserPaneController {
                     _ => Vec::new(),
                 }
             }
+            A::ListTree { ids } => {
+                let title = format!("tree - {}", self.volume().name());
+                self.start_volume_read(title, "Listing the tree", Want::Tree(ids))
+            }
+            A::ShowJournal => {
+                let title = format!("journal - {}", self.volume().name());
+                self.start_volume_read(title, "Reading the journal", Want::Journal)
+            }
+            A::BootBlocks => self.pick_boot_donor(),
+            A::Picked { purpose, path } if purpose == purpose::BOOT_DONOR => match path {
+                Some(p) => self.read_boot_donor(p),
+                None => Vec::new(),
+            },
             A::EditText => self.start_read(),
             A::SaveText {
                 name,
@@ -473,7 +510,7 @@ impl BrowserPaneController {
         }
     }
 
-    fn writable_volume(&self) -> Result<(), Vec<Effect>> {
+    pub(super) fn writable_volume(&self) -> Result<(), Vec<Effect>> {
         if !self.stages_edits() || self.is_read_only() || self.is_remote() {
             return Err(msg("this volume is read-only here."));
         }
@@ -483,7 +520,7 @@ impl BrowserPaneController {
         Ok(())
     }
 
-    fn stage_tool(&mut self, edit: StagedEdit) -> Vec<Effect> {
+    pub(super) fn stage_tool(&mut self, edit: StagedEdit) -> Vec<Effect> {
         let label = crate::model::commander_ops::edit_label(&edit);
         self.queue.push(edit);
         self.auto_apply();
@@ -496,25 +533,31 @@ impl BrowserPaneController {
     }
 
     fn start_fsck(&mut self) -> Vec<Effect> {
+        let title = format!("fsck - {}", self.volume().name());
+        self.start_volume_read(title, "Checking the filesystem", Want::Check)
+    }
+
+    /// Start a check, tree listing or journal read on the volume's reader.
+    pub(super) fn start_volume_read(
+        &mut self,
+        title: String,
+        label: &str,
+        what: Want,
+    ) -> Vec<Effect> {
         if self.is_busy() {
             return msg("wait for the current operation to finish.");
         }
-        let Some(source) = self.local_stage_source() else {
-            return msg("no volume is open.");
+        let said = match what {
+            Want::Check => "checking the filesystem...",
+            Want::Tree(_) => "listing the tree...",
+            Want::Journal => "reading the journal...",
         };
-        let title = format!("fsck - {}", self.volume().name());
-        let resources = self.apply_resources();
-        let (jobs, notify) = self.job_services();
-        let spawned = jobs.spawn("Checking the filesystem", resources, notify, move |ctx| {
-            ctx.set_can_cancel(false);
-            Ok(check_source(source))
-        });
-        match spawned {
+        match self.spawn_read(label, what) {
             Ok(job) => {
-                self.tl.job = Some(ToolJob::Check { title, job });
-                msg("checking the filesystem...")
+                self.tl.job = Some(ToolJob::Volume { title, job });
+                msg(said)
             }
-            Err(busy) => msg(format!("cannot check: {busy}")),
+            Err(why) => msg(format!("cannot read the volume: {why}")),
         }
     }
 
@@ -849,7 +892,8 @@ impl BrowserPaneController {
     /// Installs a finished tool job; called from `tick`.
     pub(super) fn poll_tools(&mut self) -> Vec<Effect> {
         let done = match &self.tl.job {
-            Some(ToolJob::Check { job, .. } | ToolJob::Repair { job, .. }) => !job.is_running(),
+            Some(ToolJob::Volume { job, .. }) => !job.is_running(),
+            Some(ToolJob::Repair { job, .. }) => !job.is_running(),
             Some(ToolJob::Read(job)) => !job.is_running(),
             None => false,
         };
@@ -857,19 +901,47 @@ impl BrowserPaneController {
             return Vec::new();
         }
         match self.tl.job.take() {
-            Some(ToolJob::Check { title, job }) => {
-                let lines = job.take_result().unwrap_or_default();
-                self.tl.report = Some(ToolReport { title, lines });
-                Vec::new()
-            }
+            Some(ToolJob::Volume { title, job }) => match self.read_done(job) {
+                Ok(Found::Check(result)) => {
+                    let check = match &result {
+                        Some(Ok(r)) => Some(CheckSummary::of(r)),
+                        _ => None,
+                    };
+                    let lines = fsck_lines(result);
+                    self.tl.report = Some(ToolReport {
+                        title,
+                        lines,
+                        check,
+                        repair: None,
+                    });
+                    Vec::new()
+                }
+                Ok(Found::Tree(tree)) => {
+                    self.found_tree(tree);
+                    Vec::new()
+                }
+                Ok(Found::Journal(j)) => self.found_journal(j),
+                Err(e) => msg(e),
+            },
             Some(ToolJob::Repair { title, job }) => {
-                let lines = match (job.snapshot().status, job.take_result()) {
-                    (Status::Done, Some(lines)) => lines,
-                    (Status::Failed(e), _) => vec![format!("Repair failed: {e}")],
-                    _ => vec!["Repair stopped.".to_string()],
+                let done = match (job.snapshot().status, job.take_result()) {
+                    (Status::Done, Some(done)) => done,
+                    (status, _) => Repaired {
+                        lines: vec![match status {
+                            Status::Failed(e) => format!("Repair failed: {e}"),
+                            _ => "Repair stopped.".to_string(),
+                        }],
+                        repair: RepairSummary::default(),
+                        check: None,
+                    },
                 };
-                self.ed_log(format!("{title}: {}", lines[0]));
-                self.tl.report = Some(ToolReport { title, lines });
+                self.ed_log(format!("{title}: {}", done.lines[0]));
+                self.tl.report = Some(ToolReport {
+                    title,
+                    lines: done.lines,
+                    check: done.check,
+                    repair: Some(done.repair),
+                });
                 let mut fx = msg("repair finished.");
                 fx.extend(self.reopen_after_apply());
                 fx

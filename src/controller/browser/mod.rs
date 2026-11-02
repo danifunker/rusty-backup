@@ -13,10 +13,10 @@ pub mod rows;
 
 pub use pane::{
     format_mac_date, parse_mac_date, purpose, validate_entry_name, ApplyPreflight, ApplyReport,
-    BrowserPaneAction, BrowserPaneController, CursorDetail, FailedEdit, LineEnding, MetadataFields,
-    MetadataForm, NoRecent, OnConflict, PaneServices, RecentStore, SortColumn, SourceKind,
-    StageOutcome, TextDoc, TextEncoding, TextShape, ToolReport, TreeNode, VolumeInfo,
-    MAX_CONSECUTIVE_FAILURES, MAX_TEXT_EDIT,
+    BrowserPaneAction, BrowserPaneController, CheckSummary, CursorDetail, FailedEdit,
+    JournalDetail, LineEnding, MetadataFields, MetadataForm, NoRecent, OnConflict, PaneServices,
+    RecentStore, RepairSummary, SortColumn, SourceKind, StageOutcome, TextDoc, TextEncoding,
+    TextShape, ToolReport, TreeNode, TreeText, VolumeInfo, MAX_CONSECUTIVE_FAILURES, MAX_TEXT_EDIT,
 };
 pub use profile::{DetailPlacement, ListingStyle, PaneProfile, Sources};
 pub use rows::{DisplayRow, RowKind};

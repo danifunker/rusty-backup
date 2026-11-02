@@ -18,6 +18,7 @@ mod remote;
 pub(in crate::controller) mod source;
 mod tools;
 mod tree;
+mod volume;
 
 pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
@@ -31,6 +32,7 @@ pub use tools::{
     MAX_TEXT_EDIT,
 };
 pub use tree::TreeNode;
+pub use volume::{CheckSummary, JournalDetail, RepairSummary, TreeText};
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +161,14 @@ pub enum BrowserPaneAction {
     /// Repair the open filesystem in place, after a confirmation.
     Repair,
     DismissToolReport,
+    /// List the whole volume as a text tree in a job (with filesystem ids when `ids`).
+    ListTree {
+        ids: bool,
+    },
+    /// Read the HFS+ journal in a job; it waits in `take_journal`.
+    ShowJournal,
+    /// Pick a bootable donor disk and stage its HFS boot blocks.
+    BootBlocks,
     /// Bless the cursor folder (or the current one) as the System Folder, after a confirmation.
     Bless,
     /// Read the cursor file for the text editor in a job; it waits in `take_text_doc`.
@@ -228,6 +238,8 @@ pub struct BrowserPaneController {
     style_key: Option<String>,
     /// The combined tree's expanded folders.
     dirs: expand::Folders,
+    /// The tree listing, journal and boot-block tools.
+    vol: volume::VolumeState,
 }
 
 impl Default for BrowserPaneController {
@@ -360,6 +372,7 @@ impl Controller for BrowserPaneController {
         fx.extend(self.poll_remote());
         fx.extend(self.poll_edits());
         fx.extend(self.poll_tools());
+        fx.extend(self.poll_volume());
         self.poll_folders();
         self.sync_tree();
         self.rebuild_rows();
@@ -406,6 +419,7 @@ impl BrowserPaneController {
             style: profile.listing,
             style_key: None,
             dirs: expand::Folders::default(),
+            vol: volume::VolumeState::default(),
         }
     }
 
@@ -433,7 +447,8 @@ impl BrowserPaneController {
             }
             A::Fsck => (p.tools.fsck, "checking the filesystem"),
             A::Repair => (p.tools.repair && !p.read_only, "repair"),
-            A::Bless => (p.tools.bless && !p.read_only, "bless"),
+            A::Bless | A::BootBlocks => (p.tools.bless && !p.read_only, "bless"),
+            A::ShowJournal => (p.tools.fsck, "the journal"),
             A::EditText | A::SaveText { .. } => (p.tools.text_edit && !p.read_only, "editing text"),
             A::Import | A::AddHostPaths { .. } => (p.tools.import && !p.read_only, "import"),
             A::EditMetadata | A::SubmitMetadata(_) => {

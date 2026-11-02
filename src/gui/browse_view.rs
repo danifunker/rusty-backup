@@ -156,22 +156,14 @@ pub struct BrowseView {
     /// edit mode where the backing bytes are raw. Drives the "Boot blocks:"
     /// status line and the "Boot Blocks…" button's hint.
     boot_blocks_present: Option<bool>,
-    /// Last filesystem check result (for popup display).
-    fsck_result: Option<rusty_backup::fs::FsckResult>,
-    /// Whether to show the fsck results popup.
-    show_fsck_popup: bool,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
     /// HFS+ journal history viewer. `Some` while the window is open.
     journal_view: Option<super::journal_view::JournalView>,
     /// Whether to show debug-level fsck messages.
     show_fsck_debug: bool,
-    /// Whether to show the repair confirmation dialog.
-    show_repair_confirm: bool,
-    /// Result of a repair operation.
-    repair_report: Option<rusty_backup::fs::RepairReport>,
-    /// A running Check or Repair on this volume.
-    fsck_job: Option<rusty_backup::model::job::Job<BrowseFsck>>,
+    /// The repair report on screen was seen, so its follow-ups ran once.
+    repair_seen: bool,
     /// Folder listings and previews waiting for the reader, one at a time.
     read_queue: std::collections::VecDeque<FsRead>,
     /// The read in flight, and the filesystem generation it borrowed from.
@@ -201,10 +193,6 @@ pub struct BrowseView {
     /// laid-out text every frame and grinds to a halt at multi-MB sizes
     /// (originally hit on a 128 GB Amiga RDB partition).
     show_tree_large_dialog: bool,
-    /// Set while a worker thread is running `format_tree`. The thread takes
-    /// ownership of the cached filesystem; we poll the status each frame and
-    /// hand the fs back to `cached_fs` once the walk completes.
-    pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
     edit_free_space: Option<Option<u64>>,
     /// The free-space probe in flight (an editable open decodes a whole container).
@@ -267,8 +255,6 @@ pub struct BrowseView {
     cached_fs: Option<Box<dyn Filesystem>>,
     /// Bumped on every invalidation; a worker's handle is only cached if it matches.
     fs_generation: u64,
-    /// `fs_generation` when the pending tree walk borrowed its filesystem.
-    pending_tree_generation: u64,
 
     /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
     /// `.sea.hqx`) that the user picked via Add File... — each waits on a
@@ -470,14 +456,10 @@ impl Default for BrowseView {
             archive_temp_path: None,
             blessed_folder: None,
             boot_blocks_present: None,
-            fsck_result: None,
-            show_fsck_popup: false,
             chd_info_text: None,
             journal_view: None,
             show_fsck_debug: false,
-            show_repair_confirm: false,
-            repair_report: None,
-            fsck_job: None,
+            repair_seen: false,
             read_queue: std::collections::VecDeque::new(),
             read_job: None,
             exporting: false,
@@ -507,8 +489,6 @@ impl Default for BrowseView {
             password_input: String::new(),
             cached_fs: None,
             fs_generation: 0,
-            pending_tree_generation: 0,
-            pending_tree: None,
             pending_archive_imports: Vec::new(),
             archive_import_tempdir: None,
             pending_archive_extract: None,
@@ -517,18 +497,6 @@ impl Default for BrowseView {
             archive_sniff_job: None,
         }
     }
-}
-
-/// Shared state between the GUI and the worker thread that runs
-/// `format_tree`. The walk can take seconds on large HFS+ volumes, so it
-/// runs off the UI thread and the GUI polls this struct each frame. The
-/// `fs` slot lets us hand the filesystem back to `cached_fs` after the
-/// walk so subsequent reads don't re-open.
-pub struct TreeStatus {
-    pub finished: bool,
-    pub text: Option<String>,
-    pub error: Option<String>,
-    pub fs: Option<Box<dyn Filesystem>>,
 }
 
 /// A text file open for editing in the GUI.
@@ -579,14 +547,12 @@ impl BrowseView {
             .is_some_and(|p| !lock_status(p).finished)
         {
             Some("Tar export")
-        } else if self.fsck_job.is_some() {
-            Some("Check / repair")
         } else if self.apply_follow.is_some() {
             Some("Apply edits")
         } else if self.tar_job.is_some() {
             Some("Tar import")
         } else if self.ctl.pane(Side::Left).tool_working().is_some() {
-            Some("Text editor")
+            Some("Volume tool")
         } else {
             None
         }
@@ -807,16 +773,11 @@ impl BrowseView {
         self.edit_supported = false;
         self.edit_result = None;
         self.blessed_folder = None;
-        self.fsck_result = None;
-        self.show_fsck_popup = false;
         self.journal_view = None;
-        self.show_repair_confirm = false;
-        self.repair_report = None;
         self.tree_text = None;
         self.show_tree_popup = false;
         self.show_tree_large_dialog = false;
         self.tree_show_ids = false;
-        self.pending_tree = None;
         self.show_unsaved_dialog = false;
         self.pending_close = false;
         self.pending_archive_imports.clear();
@@ -970,8 +931,7 @@ impl BrowseView {
         if !self.active {
             return;
         }
-        self.poll_fsck_job();
-        self.render_fsck_job(ui);
+        self.render_tool_job(ui);
         self.poll_editor();
         if let Some(snap) = self.ctl.pane(Side::Left).tool_working() {
             egui::Window::new(snap.label.clone())
@@ -1035,10 +995,19 @@ impl BrowseView {
 
         // Poll background tree-view generation. Only renders a spinner here;
         // the rest of the UI stays interactive while the walk runs.
-        if self.pending_tree.is_some() {
-            self.poll_pending_tree(ui);
+        if let Some(tree) = self.ctl.host_pane().take_tree_text() {
+            self.tree_show_ids = tree.ids;
+            let oversized = tree.text.len() > TREE_INLINE_RENDER_LIMIT;
+            self.tree_text = Some(tree.text);
+            if oversized {
+                self.show_tree_large_dialog = true;
+            } else {
+                self.show_tree_popup = true;
+            }
         }
-
+        if let Some(detail) = self.ctl.host_pane().take_journal() {
+            self.journal_view = Some(super::journal_view::JournalView::new(detail));
+        }
         // Poll extraction progress
         self.poll_extraction(ui);
 
@@ -1080,12 +1049,7 @@ impl BrowseView {
         // Handle drag-and-drop from host OS
         self.handle_dropped_files(ui);
 
-        // Lazily compute boot-block presence for the status line + the
-        // "Boot Blocks..." button. Only read in edit mode, where the backing
-        // file holds the raw (decompressed) image bytes.
-        if self.edit_mode && self.is_hfs_type() && self.boot_blocks_present.is_none() {
-            self.boot_blocks_present = self.detect_boot_blocks_present();
-        }
+        self.boot_blocks_present = self.ctl.pane(Side::Left).boot_blocks_present();
 
         // Header
         ui.horizontal(|ui| {
@@ -1255,64 +1219,17 @@ impl BrowseView {
                 }
             }
 
-            // Check filesystem button. HFS has always been here; Alto BFS/TFS
-            // packs open through the container path (BrowseSession -> open_pack)
-            // rather than the block factory the inspect-grid Check button uses,
-            // so the browse view is where their check/repair lives. Both are
-            // small volumes, so the synchronous fsck below is fine.
+            // HFS and Alto BFS packs check here; the Inspect grid's Check covers the rest.
+            let tool_free = self.ctl.pane(Side::Left).tool_working().is_none();
             if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
-                && self.fsck_job.is_none()
+                && tool_free
                 && ui.button("Check").clicked()
             {
-                match self.take_or_open_fs() {
-                    Some(mut fs) => {
-                        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
-                            "Checking the filesystem...",
-                            Arc::new(super::ui_logger::EguiWake),
-                            move |job| {
-                                job.set_can_cancel(false);
-                                let result = fs.fsck().map(|r| r.map_err(|e| e.to_string()));
-                                Ok(BrowseFsck::Check { fs, result })
-                            },
-                        ));
-                    }
-                    None => {
-                        self.error = Some("Failed to open filesystem".into());
-                    }
-                }
+                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Fsck);
             }
-
-            // Journal history viewer (HFS+/HFSX only). Opening reports whether
-            // the volume is actually journaled.
             if (self.fs_type == "HFS+" || self.fs_type == "HFSX") && ui.button("Journal").clicked()
             {
-                match self.take_or_open_fs() {
-                    Some(mut fs) => {
-                        match fs.journal_detail() {
-                            Ok(Some(any)) => {
-                                match any.downcast::<fs_mac::hfsplus_journal::JournalDetail>() {
-                                    Ok(detail) => {
-                                        self.journal_view =
-                                            Some(super::journal_view::JournalView::new(*detail));
-                                    }
-                                    Err(_) => {
-                                        self.error = Some("Unsupported journal format.".into());
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                self.error = Some("This volume is not journaled.".into());
-                            }
-                            Err(e) => {
-                                self.error = Some(format!("Could not read journal: {e}"));
-                            }
-                        }
-                        self.return_fs(fs);
-                    }
-                    None => {
-                        self.error = Some("Failed to open filesystem".into());
-                    }
-                }
+                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
             }
 
             if self.is_chd_source() {
@@ -1329,7 +1246,8 @@ impl BrowseView {
             }
 
             if ui.button("Tree").clicked() {
-                self.generate_tree_text();
+                let ids = self.tree_show_ids;
+                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
             }
 
             ui.menu_button("View", |ui| {
@@ -1636,6 +1554,10 @@ impl BrowseView {
     fn dispatch(&mut self, ctx: &egui::Context, action: CommanderAction) {
         let fx = self.ctl.apply(action);
         self.run_effects(ctx, fx);
+    }
+
+    fn pane_act(&mut self, ctx: &egui::Context, action: BrowserPaneAction) {
+        self.dispatch(ctx, CommanderAction::Pane(Side::Left, action));
     }
 
     /// Close, after the unsaved-edits dialog when edits wait.
@@ -3556,7 +3478,7 @@ impl BrowseView {
                     .on_hover_text(boot_hint)
                     .clicked()
                 {
-                    self.boot_blocks_dialog();
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::BootBlocks);
                 }
             }
 
@@ -3674,41 +3596,6 @@ impl BrowseView {
 
         if let Some(paths) = files {
             self.add_host_paths(&paths);
-        }
-    }
-
-    /// Pick a bootable donor disk and stage copying its 1024-byte boot-block
-    /// region into sector 0 of the current volume. Together with "Bless
-    /// Folder" this makes a bare classic-HFS volume (e.g. an edited
-    /// infinite-mac data disk) bootable. The donor's HFS volume is
-    /// auto-located and its `'LK'` signature validated before staging.
-    fn boot_blocks_dialog(&mut self) {
-        let donor = match rfd::FileDialog::new()
-            .set_title("Select a bootable donor disk to copy boot blocks from")
-            .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-
-        match rusty_backup::fs::hfs_boot::read_donor_boot_blocks_from_image(&donor) {
-            Ok(d) => {
-                self.ctl
-                    .host_pane()
-                    .queue
-                    .push(StagedEdit::WriteBootBlocks { blocks: d.blocks });
-                let donor_name = donor
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("donor");
-                self.edit_result = Some(format!(
-                    "Staged boot blocks from '{donor_name}'. Apply Edits to write them."
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Boot blocks: {e}"));
-            }
         }
     }
 
@@ -5086,9 +4973,21 @@ impl BrowseView {
         }
     }
 
+    /// The pane's check or repair report as the browser always showed it.
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
-        if !self.show_fsck_popup {
+        let Some(report) = self.ctl.pane(Side::Left).tool_report().cloned() else {
+            self.repair_seen = false;
             return;
+        };
+        if report.repair.is_some() && !self.repair_seen {
+            // The repair wrote the volume: probes and the legacy reader are stale.
+            self.repair_seen = true;
+            self.edit_free_space = None;
+            self.free_space_job = None;
+            self.invalidate_cached_fs();
+            if self.chd_edit.is_some() {
+                self.chd_diff_dirty = true;
+            }
         }
         let mut open = true;
         let mut do_repair = false;
@@ -5097,420 +4996,139 @@ impl BrowseView {
             .resizable(true)
             .default_width(500.0)
             .show(ui.ctx(), |ui| {
-                if let Some(result) = &self.fsck_result {
-                    if result.is_clean() {
-                        ui.colored_label(
-                            super::theme::success(ui.visuals()),
-                            "Filesystem is clean.",
-                        );
-                    } else {
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!("{} error(s) found.", result.errors.len()),
-                        );
+                let Some(check) = &report.check else {
+                    for line in &report.lines {
+                        ui.label(line);
                     }
-
-                    ui.separator();
-
-                    // Stats
-                    let mut stats_line = format!(
-                        "Files: {}  Directories: {}",
-                        result.stats.files_checked,
-                        result.stats.directories_checked,
+                    return;
+                };
+                if check.clean {
+                    ui.colored_label(super::theme::success(ui.visuals()), "Filesystem is clean.");
+                } else {
+                    ui.colored_label(
+                        super::theme::danger(ui.visuals()),
+                        format!("{} error(s) found.", check.errors.len()),
                     );
-                    for (label, value) in &result.stats.extra {
-                        stats_line.push_str(&format!("  {}: {}", label, value));
-                    }
-                    ui.label(stats_line);
-
-                    // Errors
-                    if !result.errors.is_empty() {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Errors:").strong());
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_errors")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for issue in &result.errors {
-                                    ui.colored_label(
-                                        super::theme::danger(ui.visuals()),
-                                        format!("[{}] {}", issue.code, issue.message),
-                                    );
+                }
+                ui.separator();
+                ui.label(&check.stats_line);
+                if !check.errors.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Errors:").strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_errors")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for e in &check.errors {
+                                ui.colored_label(super::theme::danger(ui.visuals()), e);
+                            }
+                        });
+                }
+                if !check.orphans.is_empty() {
+                    ui.separator();
+                    let total: usize = check.orphans.iter().map(|(_, v)| v.len()).sum();
+                    let parents = check.orphans.len();
+                    ui.colored_label(
+                        super::theme::danger(ui.visuals()),
+                        format!(
+                            "{total} file(s)/folder(s) reference {parents} missing parent director{} - not repairable.",
+                            if parents == 1 { "y" } else { "ies" },
+                        ),
+                    );
+                    ui.label(
+                        "These entries exist in the catalog but their parent directory is gone. \
+                         This typically indicates severe directory corruption.",
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_orphans")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (parent, entries) in &check.orphans {
+                                ui.colored_label(
+                                    super::theme::warning(ui.visuals()),
+                                    format!("Missing parent ID {parent}:"),
+                                );
+                                for e in entries {
+                                    ui.label(format!("    {e}"));
                                 }
-                            });
+                            }
+                        });
+                }
+                let shown: Vec<_> = check
+                    .warnings
+                    .iter()
+                    .filter(|(_, debug)| !debug || self.show_fsck_debug)
+                    .collect();
+                let has_debug = check.warnings.iter().any(|(_, debug)| *debug);
+                if !shown.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Warnings:").strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_warnings")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (text, debug) in shown {
+                                let color = if *debug {
+                                    super::theme::muted(ui.visuals())
+                                } else {
+                                    super::theme::warning(ui.visuals())
+                                };
+                                ui.colored_label(color, text);
+                            }
+                        });
+                }
+                if has_debug {
+                    ui.checkbox(&mut self.show_fsck_debug, "Show debug messages");
+                }
+                if check.repairable && self.archive_edit_ctx.is_none() {
+                    ui.separator();
+                    let resp = ui
+                        .add_enabled(self.edit_mode, egui::Button::new("Repair"))
+                        .on_disabled_hover_text("Turn on Edit Mode to repair the volume.");
+                    if resp.clicked() {
+                        do_repair = true;
                     }
-
-                    // Orphaned entries (files/dirs with missing parents)
-                    if !result.orphaned_entries.is_empty() {
-                        ui.separator();
-                        // Group by missing parent CNID
-                        let mut by_parent: std::collections::BTreeMap<u64, Vec<&rusty_backup::fs::OrphanedEntry>> =
-                            std::collections::BTreeMap::new();
-                        for entry in &result.orphaned_entries {
-                            by_parent
-                                .entry(entry.missing_parent_id)
-                                .or_default()
-                                .push(entry);
-                        }
+                }
+                if let Some(repair) = &report.repair {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Repair Report:").strong());
+                    for fix in &repair.applied {
+                        ui.colored_label(super::theme::success(ui.visuals()), format!("  {fix}"));
+                    }
+                    for fail in &repair.failed {
+                        ui.colored_label(super::theme::danger(ui.visuals()), format!("  {fail}"));
+                    }
+                    if repair.unrepairable > 0 {
                         ui.colored_label(
-                            super::theme::danger(ui.visuals()),
+                            super::theme::warning(ui.visuals()),
                             format!(
-                                "{} file(s)/folder(s) reference {} missing parent director{} - not repairable.",
-                                result.orphaned_entries.len(),
-                                by_parent.len(),
-                                if by_parent.len() == 1 { "y" } else { "ies" },
+                                "{} error(s) could not be repaired (missing parent directories).",
+                                repair.unrepairable
                             ),
                         );
-                        ui.label("These entries exist in the catalog but their parent directory is gone. \
-                                  This typically indicates severe directory corruption.");
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_orphans")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for (parent_cnid, entries) in &by_parent {
-                                    ui.colored_label(
-                                        super::theme::warning(ui.visuals()),
-                                        format!("Missing parent ID {}:", parent_cnid),
-                                    );
-                                    for entry in entries {
-                                        let kind = if entry.is_directory { "dir" } else { "file" };
-                                        ui.label(format!(
-                                            "    {} \"{}\" (ID {})",
-                                            kind, entry.name, entry.id
-                                        ));
-                                    }
-                                }
-                            });
-                    }
-
-                    // Warnings (filter out debug-level unless toggled)
-                    let visible_warnings: Vec<_> = result
-                        .warnings
-                        .iter()
-                        .filter(|w| !w.debug || self.show_fsck_debug)
-                        .collect();
-                    let has_debug = result.warnings.iter().any(|w| w.debug);
-                    if !visible_warnings.is_empty() {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Warnings:").strong());
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_warnings")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for issue in &visible_warnings {
-                                    if issue.debug {
-                                        ui.colored_label(
-                                            super::theme::muted(ui.visuals()),
-                                            format!("[DEBUG] {}", issue.message),
-                                        );
-                                    } else {
-                                        ui.colored_label(
-                                            super::theme::warning(ui.visuals()),
-                                            format!("[{}] {}", issue.code, issue.message),
-                                        );
-                                    }
-                                }
-                            });
-                    }
-                    if has_debug {
-                        ui.checkbox(
-                            &mut self.show_fsck_debug,
-                            "Show debug messages",
-                        );
-                    }
-
-                    // Repair button — only for repairable errors on non-archive sources
-                    if result.repairable && self.archive_edit_ctx.is_none() {
-                        ui.separator();
-                        if ui.button("Repair").clicked() {
-                            do_repair = true;
-                        }
-                    }
-
-                    // Repair report
-                    if let Some(ref report) = self.repair_report {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Repair Report:").strong());
-                        if !report.fixes_applied.is_empty() {
-                            for fix in &report.fixes_applied {
-                                ui.colored_label(
-                                    super::theme::success(ui.visuals()),
-                                    format!("  {}", fix),
-                                );
-                            }
-                        }
-                        if !report.fixes_failed.is_empty() {
-                            for fail in &report.fixes_failed {
-                                ui.colored_label(
-                                    super::theme::danger(ui.visuals()),
-                                    format!("  {}", fail),
-                                );
-                            }
-                        }
-                        if report.unrepairable_count > 0 {
-                            ui.colored_label(
-                                super::theme::warning(ui.visuals()),
-                                format!(
-                                    "{} error(s) could not be repaired (missing parent directories).",
-                                    report.unrepairable_count
-                                ),
-                            );
-                        }
                     }
                 }
             });
+        let ctx = ui.ctx().clone();
         if !open {
-            self.show_fsck_popup = false;
+            self.pane_act(&ctx, BrowserPaneAction::DismissToolReport);
         }
         if do_repair {
-            self.show_repair_confirm = true;
-        }
-
-        // Repair confirmation dialog
-        self.render_repair_confirm(ui);
-    }
-
-    /// Render the repair confirmation dialog and execute repair if confirmed.
-    fn render_repair_confirm(&mut self, ui: &mut egui::Ui) {
-        if !self.show_repair_confirm {
-            return;
-        }
-        let repairable_count = self
-            .fsck_result
-            .as_ref()
-            .map(|r| r.errors.iter().filter(|e| e.repairable).count())
-            .unwrap_or(0);
-
-        let mut confirmed = false;
-        let mut cancelled = false;
-        egui::Window::new("Repair Filesystem?")
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "This will attempt to fix {} repairable error(s). \
-                     Unrepairable issues (B-tree structural damage) will be skipped.\n\n\
-                     Continue?",
-                    repairable_count
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        confirmed = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
-                    }
-                });
-            });
-
-        if cancelled {
-            self.show_repair_confirm = false;
-        }
-        if confirmed {
-            self.show_repair_confirm = false;
-            self.run_repair();
+            self.pane_act(&ctx, BrowserPaneAction::Repair);
         }
     }
 
-    /// Execute repair on the filesystem and re-run check.
-    fn run_repair(&mut self) {
-        self.edit_free_space = None;
-        self.free_space_job = None;
-        if self.fsck_job.is_some() {
-            return;
-        }
-        let session = self.session.clone();
-        let show_deleted = self.show_deleted;
-        self.fsck_job = Some(rusty_backup::model::job::Job::spawn(
-            "Repairing the filesystem...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                job.set_can_cancel(false);
-                let (mut efs, commit) = session
-                    .open_editable()
-                    .map_err(|e| anyhow::anyhow!("Failed to open filesystem for repair: {e}"))?;
-                let report = efs
-                    .repair()
-                    .map_err(|e| anyhow::anyhow!("Repair failed: {e}"))?;
-                // Repair wrote to disk; drop the editable fs before re-encoding the container.
-                drop(efs);
-                if let Err(e) = commit.commit() {
-                    return Ok(BrowseFsck::Repair {
-                        report,
-                        commit_error: Some(e.to_string()),
-                        recheck: None,
-                    });
-                }
-                job.set_phase("Checking the repaired filesystem...");
-                let recheck = session.open().ok().map(|mut fs| {
-                    if show_deleted {
-                        fs.set_show_deleted(true);
-                    }
-                    let result = fs.fsck().and_then(|r| r.ok());
-                    (fs, result)
-                });
-                Ok(BrowseFsck::Repair {
-                    report,
-                    commit_error: None,
-                    recheck,
-                })
-            },
-        ));
-    }
-
-    /// Apply a finished Check or Repair.
-    fn poll_fsck_job(&mut self) {
-        use rusty_backup::model::job::Status;
-        let Some(job) = &self.fsck_job else {
+    /// The running check, repair, tree listing or journal read.
+    fn render_tool_job(&self, ui: &mut egui::Ui) {
+        let Some(snap) = self.ctl.pane(Side::Left).tool_working() else {
             return;
         };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        self.fsck_job = None;
-        match (snap.status, out) {
-            (Status::Done, Some(BrowseFsck::Check { fs, result })) => {
-                match result {
-                    Some(Ok(result)) => {
-                        self.fsck_result = Some(result);
-                        self.show_fsck_popup = true;
-                    }
-                    Some(Err(e)) => {
-                        self.error = Some(format!("Filesystem check failed: {}", e));
-                    }
-                    None => {
-                        self.error = Some("Filesystem check not supported for this type".into());
-                    }
-                }
-                if self.cached_fs.is_none() {
-                    self.return_fs(fs);
-                }
-            }
-            (
-                Status::Done,
-                Some(BrowseFsck::Repair {
-                    report,
-                    commit_error,
-                    recheck,
-                }),
-            ) => {
-                self.repair_report = Some(report);
-                if let Some(e) = commit_error {
-                    self.error = Some(format!(
-                        "Repair succeeded but writing container failed: {e}"
-                    ));
-                    return;
-                }
-                self.invalidate_cached_fs();
-                match recheck {
-                    Some((fs, result)) => {
-                        if let Some(result) = result {
-                            self.fsck_result = Some(result);
-                        }
-                        self.return_fs(fs);
-                    }
-                    None => {
-                        self.error = Some("Failed to re-check after repair".into());
-                    }
-                }
-            }
-            (Status::Failed(e), _) => self.error = Some(e),
-            _ => {}
-        }
-    }
-
-    /// A small window with the running Check or Repair.
-    fn render_fsck_job(&self, ui: &mut egui::Ui) {
-        let Some(job) = &self.fsck_job else {
-            return;
-        };
-        let snap = job.snapshot();
         egui::Window::new(snap.label.clone())
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
                 super::progress::show_job(ui, &snap);
             });
-    }
-
-    fn generate_tree_text(&mut self) {
-        if self.pending_tree.is_some() {
-            return;
-        }
-        let Some(fs) = self.take_or_open_fs() else {
-            self.error = Some("Failed to open filesystem".into());
-            return;
-        };
-        let show_ids = self.tree_show_ids;
-        let status = Arc::new(Mutex::new(TreeStatus {
-            finished: false,
-            text: None,
-            error: None,
-            fs: None,
-        }));
-        let status_thread = Arc::clone(&status);
-        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "tree", move || {
-            let mut fs = fs;
-            let result = if show_ids {
-                rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
-            } else {
-                rusty_backup::fs::tree::format_tree(&mut *fs)
-            };
-            if let Ok(mut g) = status_thread.lock() {
-                match result {
-                    Ok(text) => g.text = Some(text),
-                    Err(e) => g.error = Some(format!("Failed to generate tree: {e}")),
-                }
-                g.fs = Some(fs);
-                g.finished = true;
-            }
-            Ok(())
-        });
-        self.pending_tree_generation = self.fs_generation;
-        self.pending_tree = Some(status);
-    }
-
-    fn poll_pending_tree(&mut self, ui: &mut egui::Ui) {
-        let mut take_now = false;
-        if let Some(arc) = &self.pending_tree {
-            if let Ok(g) = arc.lock() {
-                if g.finished {
-                    take_now = true;
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label("Generating tree view...");
-                    });
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-        if take_now {
-            if let Some(arc) = self.pending_tree.take() {
-                if let Ok(mut g) = arc.lock() {
-                    if let Some(fs) = g.fs.take() {
-                        // A write since the walk began makes this handle stale.
-                        if self.pending_tree_generation == self.fs_generation {
-                            self.cached_fs = Some(fs);
-                        }
-                    }
-                    if let Some(text) = g.text.take() {
-                        let oversized = text.len() > TREE_INLINE_RENDER_LIMIT;
-                        self.tree_text = Some(text);
-                        if oversized {
-                            self.show_tree_large_dialog = true;
-                        } else {
-                            self.show_tree_popup = true;
-                        }
-                    }
-                    if let Some(err) = g.error.take() {
-                        self.error = Some(err);
-                    }
-                }
-            }
-        }
     }
 
     fn render_tree_popup(&mut self, ui: &mut egui::Ui) {
@@ -5557,7 +5175,8 @@ impl BrowseView {
             self.show_tree_popup = false;
         }
         if regenerate {
-            self.generate_tree_text();
+            let ids = self.tree_show_ids;
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
         }
         if save_requested {
             if let Some(text) = &self.tree_text {
@@ -5715,12 +5334,6 @@ impl BrowseView {
     /// `None` when unknown — no file-backed source (e.g. a CHD edit session),
     /// or a read error. Only trustworthy in edit mode, where the backing file
     /// holds the raw, decompressed image bytes.
-    fn detect_boot_blocks_present(&self) -> Option<bool> {
-        let path = self.session.source_path.as_ref()?;
-        let mut f = std::fs::File::open(path).ok()?;
-        fs_mac::hfs_boot::has_boot_blocks(&mut f, self.session.partition_offset).ok()
-    }
-
     fn poll_extraction(&mut self, ui: &egui::Ui) {
         let finished_msg = if let Some(progress) = &self.extraction_progress {
             if let Ok(p) = progress.lock() {
@@ -6076,24 +5689,7 @@ fn walk_fs_to_input_nodes(
     }
 }
 
-rusty_backup::model::worker::finished_with_error!(
-    ChdFlattenProgress,
-    TarExportProgress,
-    TreeStatus
-);
-
-/// What a browse-view Check or Repair job hands back; the checked filesystem returns to the cache.
-enum BrowseFsck {
-    Check {
-        fs: Box<dyn Filesystem>,
-        result: Option<Result<rusty_backup::fs::FsckResult, String>>,
-    },
-    Repair {
-        report: rusty_backup::fs::RepairReport,
-        commit_error: Option<String>,
-        recheck: Option<(Box<dyn Filesystem>, Option<rusty_backup::fs::FsckResult>)>,
-    },
-}
+rusty_backup::model::worker::finished_with_error!(ChdFlattenProgress, TarExportProgress);
 
 /// What to do once a staged-edit Apply lands without an error.
 #[derive(Clone, Copy)]
