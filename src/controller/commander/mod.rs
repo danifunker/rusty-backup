@@ -18,7 +18,7 @@ pub use crate::controller::browser::{
     SourceKind, StageOutcome, TarChoice, TarPreview, ToolReport, TreeText, VolumeInfo,
     MAX_CONSECUTIVE_FAILURES,
 };
-pub use crate::controller::browser::{pane, rows};
+pub use crate::controller::browser::{metadata, pane, rows};
 pub use screen::{
     default_export_format, export_choices, BudgetAction, BudgetForm, BudgetMode, ChecksumRow,
     Checksums, CommanderAction, CommanderController, DetailField, ExportChoice, ExportFormat,

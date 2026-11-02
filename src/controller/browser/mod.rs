@@ -7,6 +7,7 @@
 //! the profile turns off refuses its action with a message instead of acting. See
 //! docs/phase2_commander_plan.md § "Slice 10: one browser pane".
 
+pub mod metadata;
 pub mod pane;
 pub mod profile;
 pub mod rows;
