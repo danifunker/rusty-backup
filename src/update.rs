@@ -196,8 +196,7 @@ impl UpdateConfig {
     pub fn user_config_dir() -> Option<PathBuf> {
         // Unit tests must never write the real user's config.json (recent lists, CHD choice).
         if cfg!(test) {
-            let dir = format!("rusty-backup-test-{}", std::process::id());
-            return Some(std::env::temp_dir().join(dir.as_str()));
+            return Some(std::env::temp_dir().join("rusty-backup-test-config"));
         }
         #[cfg(target_os = "linux")]
         let config_dir = crate::os::linux::real_user_home().map(|h| h.join(".config"));
