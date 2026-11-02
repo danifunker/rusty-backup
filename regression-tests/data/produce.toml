@@ -201,6 +201,27 @@ ext = "img"
 args = ["new", "hd", "sgi-dklabel", "--size", "60135936", "--heads", "7", "--sectors", "17",
         "--partition", "9139200:root", "--partition", "9078272:swap", "--partition", "rest:slice", "{out}"]
 
+[[recipe]]
+id = "part.next"
+ext = "img"
+args = ["new", "hd", "next", "--size", "16M", "--partition", "rest:4.3BSD:/", "{out}"]
+
+[[recipe]]
+id = "part.solaris-x86"
+ext = "img"
+args = ["new", "hd", "solaris-x86", "--size", "64M", "--partition", "16M:root", "--partition", "rest:swap", "{out}"]
+
+# 72M is the smallest BFS rb-cli writes: nine allocation groups of 1024-byte blocks.
+[[recipe]]
+id = "fs.bfs"
+ext = "img"
+args = ["new", "volume", "bfs", "--size", "72M", "{out}"]
+
+[[recipe]]
+id = "fs.ofs"
+ext = "img"
+args = ["new", "volume", "ofs", "--size", "8M", "{out}"]
+
 # --- Containers --------------------------------------------------------------
 #
 # These convert rather than format, so each needs a source image first. The
