@@ -1,7 +1,8 @@
 //! What the disc browser writes, pinned: extraction (every fork mode), the export of the
 //! marked entries (every format), the tree listing and the preview, on every filesystem
 //! choice of five discs. `GOLDEN` was captured from the Optical tab's own browser
-//! (`DiscBrowseController`, slice 16) before slice 18 moved the tab onto the browser pane.
+//! (`DiscBrowseController`, slice 16, fd5944fd) before slice 18 moved the tab onto the browser
+//! pane; the pane must still produce it.
 //!
 //! Discs: `hybrid_rsrc.iso` (ISO 9660 + HFS+, a forked file), the same disc as BIN/CUE and as
 //! CHD, `rock_ridge.iso` and that disc with a PReP boot partition patched into sector 0.
@@ -18,12 +19,48 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::controller::optical::browse::{
-    purpose as bpurpose, DiscBrowseAction, ExportFormat, FileContent, FileEntry, ResourceForkMode,
-};
-use crate::controller::optical::{OpticalAction, OpticalController};
 use crate::controller::Controller;
-use crate::model::job::NoNotify;
+use crate::fs::export_selection::ExportFormat;
+use fs_mac::resource_fork::ResourceForkMode;
+
+/// Files larger than this were not read for the old browser's preview.
+const MAX_PREVIEW_SIZE: u64 = 1024 * 1024;
+
+/// The old preview's classification: text when the bytes read as text, else binary.
+enum FileContent {
+    Binary(Vec<u8>),
+    Text(String),
+}
+
+fn detect_content_type(data: &[u8]) -> FileContent {
+    if data.is_empty() {
+        return FileContent::Text(String::new());
+    }
+    if let Ok(text) = std::str::from_utf8(data) {
+        let odd = text
+            .chars()
+            .filter(|c| !c.is_ascii_graphic() && !c.is_ascii_whitespace())
+            .count();
+        if odd * 10 < text.len() {
+            return FileContent::Text(text.to_string());
+        }
+    }
+    let printable = data
+        .iter()
+        .filter(|&&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        .count();
+    if printable * 10 >= data.len() * 8 {
+        let text = data
+            .iter()
+            .map(|&b| match b.is_ascii_graphic() || b.is_ascii_whitespace() {
+                true => b as char,
+                false => '.',
+            })
+            .collect();
+        return FileContent::Text(text);
+    }
+    FileContent::Binary(data.to_vec())
+}
 
 fn unpack(name: &str, dir: &Path, out: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -110,7 +147,7 @@ pub(super) fn sha(data: &[u8]) -> String {
 }
 
 /// The old preview's rendering of `data`, so a raw read compares with it.
-pub(super) fn preview_text(c: &FileContent) -> String {
+fn preview_text(c: &FileContent) -> String {
     match c {
         FileContent::Text(t) => format!("text {}", sha(t.as_bytes())),
         FileContent::Binary(d) => format!("binary {}", sha(d.as_slice())),
@@ -253,135 +290,6 @@ pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
         bad.len(),
         bad.join("\n")
     );
-}
-
-/// The Optical tab's slice-16 disc browser.
-struct OldBrowser {
-    ctl: OpticalController,
-}
-
-impl OldBrowser {
-    fn act(&mut self, a: DiscBrowseAction) -> Vec<crate::controller::Effect> {
-        let fx = self.ctl.apply(OpticalAction::Browse(a));
-        self.ctl.wait_idle();
-        fx
-    }
-
-    fn entry(&mut self, path: &str) -> FileEntry {
-        let mut cur = self.ctl.browse().root().unwrap().clone();
-        let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
-        for name in names {
-            if self.ctl.browse().children(cur.path.as_str()).is_none() {
-                self.act(DiscBrowseAction::Expand(cur.clone()));
-            }
-            let kids = self.ctl.browse().children(cur.path.as_str()).unwrap();
-            cur = kids.iter().find(|e| e.name == name).unwrap().clone();
-        }
-        cur
-    }
-
-    fn picked(&mut self, purpose: &'static str, path: &Path) {
-        self.ctl.apply(OpticalAction::Picked {
-            purpose,
-            path: Some(path.to_path_buf()),
-        });
-        self.ctl.wait_idle();
-    }
-}
-
-impl DiscBrowser for OldBrowser {
-    fn open(&mut self, disc: &Path) {
-        self.ctl.apply(OpticalAction::OpenImage(disc.to_path_buf()));
-        self.ctl.wait_idle();
-        self.ctl.apply(OpticalAction::BrowseContents);
-        self.ctl.wait_idle();
-    }
-
-    fn choices(&self) -> Vec<String> {
-        self.ctl.browse().fs_choices().to_vec()
-    }
-
-    fn select_fs(&mut self, i: usize) {
-        self.act(DiscBrowseAction::SelectFs(i));
-    }
-
-    fn children(&mut self, folder: &str) -> Vec<(String, bool)> {
-        let e = self.entry(folder);
-        if self.ctl.browse().children(e.path.as_str()).is_none() {
-            self.act(DiscBrowseAction::Expand(e.clone()));
-        }
-        let kids = self.ctl.browse().children(e.path.as_str()).unwrap();
-        kids.iter()
-            .map(|k| (k.path.clone(), k.is_directory()))
-            .collect()
-    }
-
-    fn tree(&mut self) -> String {
-        self.act(DiscBrowseAction::Tree);
-        let t = self.ctl.browse().tree_text().unwrap_or("").to_string();
-        self.act(DiscBrowseAction::CloseTree);
-        t
-    }
-
-    fn extract(&mut self, path: &str, mode: ResourceForkMode, dest: &Path) -> Result<(), ()> {
-        let e = self.entry(path);
-        self.act(DiscBrowseAction::SetForkMode(mode));
-        self.act(DiscBrowseAction::Select(e));
-        self.act(DiscBrowseAction::Extract);
-        self.picked(bpurpose::EXTRACT_TO, dest);
-        let r = self.ctl.browse().result().unwrap_or("");
-        match r.starts_with("Extraction complete") {
-            true => Ok(()),
-            false => Err(()),
-        }
-    }
-
-    fn export_all(
-        &mut self,
-        format: ExportFormat,
-        mode: ResourceForkMode,
-        dest: &Path,
-    ) -> Result<(), ()> {
-        self.act(DiscBrowseAction::ClearMarks);
-        let root = self.entry("/");
-        let kids = self
-            .ctl
-            .browse()
-            .children(root.path.as_str())
-            .unwrap()
-            .to_vec();
-        for k in kids {
-            self.act(DiscBrowseAction::SetMarked {
-                entry: k,
-                marked: true,
-            });
-        }
-        self.act(DiscBrowseAction::SetForkMode(mode));
-        self.act(DiscBrowseAction::SetExportFormat(format));
-        self.act(DiscBrowseAction::Export);
-        let purpose = match format.is_single_file() {
-            true => bpurpose::EXPORT_FILE,
-            false => bpurpose::EXPORT_FOLDER,
-        };
-        self.picked(purpose, dest);
-        let b = self.ctl.browse();
-        match (b.error(), b.result()) {
-            (None, Some(r)) if r.starts_with("Exported") => Ok(()),
-            _ => Err(()),
-        }
-    }
-
-    fn preview(&mut self, path: &str) -> String {
-        let e = self.entry(path);
-        if e.size > crate::model::optical_browse::MAX_PREVIEW_SIZE as u64 {
-            return "too large".to_string();
-        }
-        self.act(DiscBrowseAction::Select(e));
-        match self.ctl.browse().content() {
-            Some(c) => preview_text(c),
-            None => "none".to_string(),
-        }
-    }
 }
 
 /// The browser pane under `PaneProfile::optical`, as the Optical tab hosts it since slice 18.
@@ -536,7 +444,7 @@ impl DiscBrowser for PaneBrowser {
         use crate::controller::browser::BrowserPaneAction as A;
         use crate::controller::commander::Side;
         let size = self.pane().entry_at(path).map(|e| e.size).unwrap_or(0);
-        if size > crate::model::optical_browse::MAX_PREVIEW_SIZE as u64 {
+        if size > MAX_PREVIEW_SIZE {
             return "too large".to_string();
         }
         let Some((id, _)) = self.node(path) else {
@@ -545,7 +453,7 @@ impl DiscBrowser for PaneBrowser {
         self.pane_act(A::CursorTo(id));
         let ctl = self.ctl.as_ref().expect("open first");
         match ctl.side_detail(Side::Left).and_then(|d| d.preview.as_ref()) {
-            Some(data) => preview_text(&crate::model::optical_browse::detect_content_type(data)),
+            Some(data) => preview_text(&detect_content_type(data)),
             None => "none".to_string(),
         }
     }
@@ -556,15 +464,6 @@ fn the_browser_pane_writes_the_disc_browsers_golden_bytes() {
     let mut b = PaneBrowser { ctl: None };
     let got = run_cases(&mut b);
     check(&got, PANE_DIFFERS);
-}
-
-#[test]
-fn the_slice_16_disc_browser_writes_the_golden_bytes() {
-    let mut b = OldBrowser {
-        ctl: OpticalController::new(Arc::new(NoNotify)),
-    };
-    let got = run_cases(&mut b);
-    check(&got, &[]);
 }
 
 /// Case -> sha256 of its manifest (or of the tree text / choice count / preview).

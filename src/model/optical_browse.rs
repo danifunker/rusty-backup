@@ -1,12 +1,11 @@
-//! The Optical tab's disc browser: open a disc image or a drive, list folders, preview a file,
-//! extract, export the marked entries and build the tree listing.
+//! A disc as a browser-pane source: open an image or a drive, offer its filesystems (hybrid
+//! sides, HP LIF / PReP boot areas), and the two bodies kept from the Optical tab's old disc
+//! browser so their bytes stay the same: the extraction walker and the tree listing.
 //!
-//! These are the bodies the egui widget (`optical::browse_view`) ran inline or on its own
-//! thread, moved here unchanged so the files they write are the same;
-//! `controller::optical::browse` runs each as a `model::job`. The disc is reopened for every
-//! operation (nothing is cached across calls), honouring the hybrid / boot-area choice.
+//! The pane lists and exports through [`DiscChoice::filesystem`]; extraction and the tree go
+//! through [`DiscChoice::extract_path`] and [`DiscChoice::tree_listing`] (docs/phase2_commander_plan.md
+//! § "Slice 18"). The disc is reopened for every operation, honouring the choice.
 
-use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -15,17 +14,12 @@ use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
 use opticaldiscs::detect::DiscImageInfo;
 use opticaldiscs::formats::FilesystemType;
 
-use crate::model::job::{JobCtx, Progress, Unit};
 use crate::optical::boot_area::{self, BootArea};
 use disk_core::filesystem::Filesystem as RbFilesystem;
 use fs_mac::resource_fork;
 
-pub use crate::fs::export_selection::ExportFormat;
 pub use fs_mac::resource_fork::ResourceForkMode;
 pub use opticaldiscs::browse::entry::{EntryType, FileEntry};
-
-/// Files larger than this are not read for the preview.
-pub const MAX_PREVIEW_SIZE: usize = 1024 * 1024;
 
 pub use crate::model::commander_descend::DiscSource;
 
@@ -112,101 +106,6 @@ fn entry_at(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, Filesystem
     }
 }
 
-/// What opening a disc found; `error` is shown above the tree.
-pub struct OpenedDisc {
-    pub info: Option<DiscImageInfo>,
-    pub boot_areas: Vec<BootArea>,
-    pub root: RootRead,
-}
-
-/// The selected filesystem's root and its listing.
-#[derive(Default)]
-pub struct RootRead {
-    pub root: Option<FileEntry>,
-    pub entries: Option<Vec<FileEntry>>,
-    pub error: Option<String>,
-}
-
-/// A previewed file's content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileContent {
-    Binary(Vec<u8>),
-    Text(String),
-}
-
-/// Display order for a disc listing: directories first, then files, each case-insensitive by name.
-fn sort_for_display(entries: &mut [FileEntry]) {
-    entries.sort_by_cached_key(|e| (!e.is_directory(), e.name.to_lowercase()));
-}
-
-/// Open `src`: probe it, open its primary filesystem and list the root.
-pub fn open_disc(src: &DiscSource) -> OpenedDisc {
-    let path = src.path.as_path();
-    let mut out = OpenedDisc {
-        info: None,
-        boot_areas: Vec::new(),
-        root: RootRead::default(),
-    };
-    if src.physical {
-        if let Err(e) = crate::os::ensure_physical_enabled() {
-            out.root.error = Some(e.to_string());
-            return out;
-        }
-    }
-    // A drive is not a file: its raw node is read as flat cooked sectors (EBUSY on macOS otherwise).
-    let probe = if src.physical {
-        DiscImageInfo::open_physical(path)
-    } else {
-        DiscImageInfo::open(path)
-    };
-    let info = match probe {
-        Ok(info) => info,
-        Err(e) => {
-            out.root.error = Some(format!("Failed to open disc image: {e}"));
-            return out;
-        }
-    };
-    let opened = if src.physical {
-        opticaldiscs::browse::open_physical_filesystem(path)
-    } else {
-        open_disc_filesystem(&info)
-    };
-    match opened {
-        Ok(mut fs) => out.root = list_root(&mut *fs),
-        Err(e) => {
-            // An NKit image that reaches here could not be reconstructed: add the convert-it hint.
-            let msg = crate::cli::optical_hint::with_nkit_hint(
-                anyhow::anyhow!("Cannot open filesystem: {e}"),
-                path,
-            );
-            out.root.error = Some(format!("{msg:#}"));
-        }
-    }
-    if !src.physical {
-        out.boot_areas = boot_area::detect(path);
-    }
-    out.info = Some(info);
-    out
-}
-
-fn list_root(fs: &mut dyn Filesystem) -> RootRead {
-    let mut out = RootRead::default();
-    match fs.root() {
-        Ok(root) => {
-            match fs.list_directory(&root) {
-                Ok(mut entries) => {
-                    sort_for_display(&mut entries);
-                    out.entries = Some(entries);
-                }
-                Err(e) => out.error = Some(format!("Failed to read root directory: {e}")),
-            }
-            out.root = Some(root);
-        }
-        Err(e) => out.error = Some(format!("Failed to get root: {e}")),
-    }
-    out
-}
-
 /// The disc opened on picker choice `selected`, plus what it was opened with.
 #[derive(Clone)]
 pub struct DiscChoice {
@@ -225,39 +124,6 @@ impl DiscChoice {
             self.selected,
             self.boot_areas.as_slice(),
         )
-    }
-
-    /// The root of this choice (a hybrid side or boot area switched to).
-    pub fn read_root(&self) -> RootRead {
-        match self.open() {
-            Ok(mut fs) => list_root(&mut *fs),
-            Err(e) => RootRead {
-                error: Some(format!("Cannot open filesystem: {e}")),
-                ..RootRead::default()
-            },
-        }
-    }
-
-    /// One folder's entries, sorted for display.
-    pub fn list_dir(&self, entry: &FileEntry) -> Result<Vec<FileEntry>, String> {
-        let mut fs = self
-            .open()
-            .map_err(|e| format!("Failed to reopen disc for {}: {e}", entry.path))?;
-        let mut entries = fs
-            .list_directory(entry)
-            .map_err(|e| format!("Failed to read {}: {e}", entry.path))?;
-        sort_for_display(&mut entries);
-        Ok(entries)
-    }
-
-    /// A file's content for the preview (the caller skips files over `MAX_PREVIEW_SIZE`).
-    pub fn preview(&self, entry: &FileEntry) -> Result<FileContent, String> {
-        let mut fs = self
-            .open()
-            .map_err(|e| format!("Cannot open filesystem: {e}"))?;
-        fs.read_file(entry)
-            .map(|data| detect_content_type(data.as_slice()))
-            .map_err(|e| format!("Failed to read file: {e}"))
     }
 
     /// The GNU tree-style listing of the whole volume.
@@ -367,105 +233,6 @@ impl DiscChoice {
             }
         }
     }
-
-    /// Extract `entry` (a file or a folder) into `dest`; the number of files written.
-    pub fn extract(
-        &self,
-        entry: &FileEntry,
-        dest: &Path,
-        mode: ResourceForkMode,
-        ctx: &JobCtx,
-    ) -> Result<u32, String> {
-        let src = &self.src;
-        let mut tally = Tally::default();
-        let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            // Re-probe as the extraction always has: a file-based reopen of a drive is EBUSY.
-            let info = if src.physical {
-                DiscImageInfo::open_physical(src.path.as_path())?
-            } else {
-                DiscImageInfo::open(src.path.as_path())?
-            };
-            let reopen = || {
-                open_choice(
-                    &info,
-                    src.path.as_path(),
-                    src.physical,
-                    self.selected,
-                    self.boot_areas.as_slice(),
-                )
-            };
-            let mut counting_fs = reopen()?;
-            let (total_files, total_bytes) = count_entry(&mut *counting_fs, entry)?;
-            tally.total_files = total_files;
-            tally.total_bytes = total_bytes;
-            drop(counting_fs);
-            let mut fs = reopen()?;
-            extract_entry(&mut *fs, entry, dest, mode, &mut tally, ctx)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Ok(tally.files_extracted),
-            Err(e) => {
-                let msg = crate::cli::optical_hint::with_nkit_hint(
-                    anyhow::anyhow!("{e}"),
-                    src.path.as_path(),
-                );
-                Err(format!("{msg:#}"))
-            }
-        }
-    }
-
-    /// Export `entries` together as one `format` output at `dest` (a folder for loose formats).
-    pub fn export(
-        &self,
-        entries: &[FileEntry],
-        dest: &Path,
-        format: ExportFormat,
-        fork_mode: ResourceForkMode,
-    ) -> Result<usize, String> {
-        use crate::fs::export_selection::{export_to_file, export_to_folder};
-        let rb_entries: Vec<disk_core::entry::FileEntry> = entries
-            .iter()
-            .map(crate::fs::optical_fs::translate)
-            .collect();
-        let fs_type = self.fs_type().map(|t| format!("{t:?}")).unwrap_or_default();
-        let noop = |_: &str, _: usize, _: u64| {};
-        let nocancel = || false;
-        let inner = self.open().map_err(|e| e.to_string())?;
-        let mut rb_fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, fs_type, None)
-            .map_err(|e| e.to_string())?;
-        let summary = if format.is_single_file() {
-            export_to_file(&mut rb_fs, &rb_entries, dest, format, &noop, &nocancel)
-        } else {
-            export_to_folder(
-                &mut rb_fs,
-                &rb_entries,
-                dest,
-                format,
-                fork_mode,
-                &noop,
-                &nocancel,
-            )
-        };
-        summary.map(|s| s.files).map_err(|e| e.to_string())
-    }
-}
-
-/// Picker labels: the primary filesystem, then the hybrid sides, then the boot areas.
-pub fn fs_choice_labels(info: &DiscImageInfo, boot_areas: &[BootArea]) -> Vec<String> {
-    let mut out = vec![match &info.volume_label {
-        Some(l) => format!("{} ({l})", info.filesystem.display_name()),
-        None => info.filesystem.display_name().to_string(),
-    }];
-    for h in &info.hybrid_filesystems {
-        let name = h.filesystem.display_name();
-        out.push(match &h.volume_label {
-            Some(l) => format!("{name} ({l})"),
-            None => name.to_string(),
-        });
-    }
-    out.extend(boot_areas.iter().map(|a| a.label.clone()));
-    out
 }
 
 /// The filesystem type of picker choice `selected`; a boot area has none.
@@ -479,34 +246,6 @@ pub fn selected_fs_type(info: &DiscImageInfo, selected: usize) -> Option<Filesys
     }
 }
 
-/// Marked entries to export, without any that live under another marked folder.
-pub fn marked_export_entries(marked: &BTreeMap<String, FileEntry>) -> Vec<FileEntry> {
-    fn is_ancestor(a: &str, p: &str) -> bool {
-        if a == p {
-            return false;
-        }
-        if a == "/" {
-            return p.len() > 1 && p.starts_with('/');
-        }
-        p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
-    }
-    let marked_paths: Vec<&str> = marked.keys().map(String::as_str).collect();
-    marked
-        .iter()
-        .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
-        .map(|(_, e)| e.clone())
-        .collect()
-}
-
-/// User-facing name: opticaldiscs names the disc root "" (empty), shown as "/".
-pub fn display_name(entry: &FileEntry) -> &str {
-    if entry.name.is_empty() && entry.path == "/" {
-        "/"
-    } else {
-        entry.name.as_str()
-    }
-}
-
 /// Human-friendly size string.
 pub fn format_size(bytes: u64) -> String {
     match bytes {
@@ -515,79 +254,6 @@ pub fn format_size(bytes: u64) -> String {
         s if s < 1_024 * 1_024 * 1_024 => format!("{:.1} MB", s as f64 / (1_024.0 * 1_024.0)),
         s => format!("{:.2} GB", s as f64 / (1_024.0 * 1_024.0 * 1_024.0)),
     }
-}
-
-/// Text when the bytes read as text (UTF-8 or 80% printable), else binary.
-pub fn detect_content_type(data: &[u8]) -> FileContent {
-    if data.is_empty() {
-        return FileContent::Text(String::new());
-    }
-    if let Ok(text) = std::str::from_utf8(data) {
-        let non_printable = text
-            .chars()
-            .filter(|c| !c.is_ascii_graphic() && !c.is_ascii_whitespace())
-            .count();
-        if non_printable * 10 < text.len() {
-            return FileContent::Text(text.to_string());
-        }
-    }
-    let printable = data
-        .iter()
-        .filter(|&&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-        .count();
-    if printable * 10 >= data.len() * 8 {
-        let text: String = data
-            .iter()
-            .map(|&b| {
-                if b.is_ascii_graphic() || b.is_ascii_whitespace() {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        return FileContent::Text(text);
-    }
-    FileContent::Binary(data.to_vec())
-}
-
-/// The hex view's text: 16 bytes a line, at most 256 lines.
-pub fn hex_dump(data: &[u8]) -> String {
-    let bytes_per_line = 16;
-    let lines = data.len().div_ceil(bytes_per_line);
-    let max_lines = 256;
-    let display_lines = lines.min(max_lines);
-    let mut hex_text = String::new();
-    for i in 0..display_lines {
-        let offset = i * bytes_per_line;
-        hex_text.push_str(&format!("{offset:08X}  "));
-        for j in 0..bytes_per_line {
-            if offset + j < data.len() {
-                hex_text.push_str(&format!("{:02X} ", data[offset + j]));
-            } else {
-                hex_text.push_str("   ");
-            }
-            if j == 7 {
-                hex_text.push(' ');
-            }
-        }
-        hex_text.push_str(" |");
-        for j in 0..bytes_per_line {
-            if offset + j < data.len() {
-                let b = data[offset + j];
-                hex_text.push(if b.is_ascii_graphic() || b == b' ' {
-                    b as char
-                } else {
-                    '.'
-                });
-            }
-        }
-        hex_text.push_str("|\n");
-    }
-    if lines > max_lines {
-        hex_text.push_str(&format!("... ({} more lines)\n", lines - max_lines));
-    }
-    hex_text
 }
 
 /// Open picker choice `selected`: 0 the primary, then the hybrid volumes, then the boot areas.
@@ -714,40 +380,12 @@ struct Tally {
     total_files: u32,
 }
 
-/// Where an extraction reports its counts and learns it was cancelled.
-trait ExtractReport {
-    fn report(&self, tally: &Tally, current_file: &str);
-    fn cancelled(&self) -> bool;
-}
-
-impl ExtractReport for JobCtx {
-    fn report(&self, tally: &Tally, current_file: &str) {
-        self.set_phase(format!(
-            "Extracting {}/{} files: {}",
-            tally.files_extracted, tally.total_files, current_file
-        ));
-        if tally.total_bytes > 0 {
-            self.set_bytes(tally.current_bytes, tally.total_bytes);
-        } else {
-            self.set_progress(Progress::Determinate {
-                done: u64::from(tally.files_extracted),
-                total: u64::from(tally.total_files),
-                unit: Unit::Items,
-            });
-        }
-    }
-
-    fn cancelled(&self) -> bool {
-        self.is_cancelled()
-    }
-}
-
 /// The browser pane's copy job reads an extraction's progress from its host-copy status.
 struct StatusReport<'a>(
     &'a std::sync::Arc<std::sync::Mutex<crate::model::commander_ops::HostCopyStatus>>,
 );
 
-impl ExtractReport for StatusReport<'_> {
+impl StatusReport<'_> {
     fn report(&self, tally: &Tally, current_file: &str) {
         if let Ok(mut g) = self.0.lock() {
             g.current_file = current_file.to_string();
@@ -768,7 +406,7 @@ fn extract_entry(
     dest: &Path,
     resource_fork_mode: ResourceForkMode,
     tally: &mut Tally,
-    ctx: &dyn ExtractReport,
+    ctx: &StatusReport,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if ctx.cancelled() {
         return Err("Extraction cancelled".into());

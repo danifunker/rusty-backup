@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::*;
-use crate::controller::optical::browse::{purpose as bpurpose, FileContent, FileEntry};
 use crate::model::job::NoNotify;
 
 fn controller() -> OpticalController {
@@ -18,16 +17,6 @@ fn hybrid_disc(dir: &Path) -> PathBuf {
     let path = dir.join("disc.iso");
     std::fs::write(&path, iso).unwrap();
     path
-}
-
-fn child(ctl: &OpticalController, folder: &str, name: &str) -> FileEntry {
-    ctl.browse()
-        .children(folder)
-        .unwrap_or_else(|| panic!("{folder} not listed"))
-        .iter()
-        .find(|e| e.name == name)
-        .unwrap_or_else(|| panic!("{name} not in {folder}"))
-        .clone()
 }
 
 #[test]
@@ -100,102 +89,180 @@ fn an_iso_converts_to_bin_cue_with_the_engines_bytes() {
 
 #[cfg(feature = "native-zstd")]
 #[test]
-fn the_browser_reads_the_hfs_side_and_extracts_a_forked_file() {
+fn browse_contents_asks_the_shell_for_the_disc_browser_and_a_new_disc_reopens_it() {
     let dir = tempfile::tempdir().unwrap();
     let iso = hybrid_disc(dir.path());
     let mut ctl = controller();
-    ctl.apply(OpticalAction::OpenImage(iso));
-    ctl.wait_idle();
     ctl.apply(OpticalAction::BrowseContents);
-    assert!(ctl.browse().is_active());
+    assert!(!ctl.is_browsing(), "no disc yet");
+    ctl.apply(OpticalAction::OpenImage(iso.clone()));
     ctl.wait_idle();
-    assert_eq!(ctl.browse().error(), None);
-    let hfs = ctl
-        .browse()
-        .fs_choices()
-        .iter()
-        .position(|l| l.contains("HFS"))
-        .expect("an HFS side");
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::SelectFs(hfs)));
-    ctl.wait_idle();
-    assert!(ctl.browse().is_hfs());
-    let root = ctl.browse().root().unwrap().path.clone();
-    let apps = child(&ctl, root.as_str(), "Apps");
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::Expand(
-        apps.clone(),
-    )));
-    ctl.wait_idle();
-    let app = child(&ctl, apps.path.as_str(), "GameApp");
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::Select(app.clone())));
-    ctl.wait_idle();
+    ctl.take_requests();
+    ctl.apply(OpticalAction::BrowseContents);
+    let src = DiscSource {
+        path: iso.clone(),
+        physical: false,
+    };
     assert_eq!(
-        ctl.browse().content(),
-        Some(&FileContent::Text("data fork bytes".into()))
+        ctl.take_requests(),
+        vec![HostRequest::OpenBrowser(src.clone())]
+    );
+    assert!(ctl.is_browsing());
+    ctl.apply(OpticalAction::BrowseContents);
+    assert!(ctl.take_requests().is_empty(), "already open");
+
+    let other = dir.path().join("copy.iso");
+    std::fs::copy(&iso, &other).unwrap();
+    ctl.apply(OpticalAction::OpenImage(other.clone()));
+    assert_eq!(
+        ctl.take_requests(),
+        vec![
+            HostRequest::RememberRecent(other.clone()),
+            HostRequest::CloseBrowser
+        ]
+    );
+    ctl.wait_idle();
+    let reopened = DiscSource {
+        path: other,
+        physical: false,
+    };
+    assert_eq!(
+        ctl.take_requests(),
+        vec![HostRequest::OpenBrowser(reopened)]
     );
 
-    let fx = ctl.apply(OpticalAction::Browse(DiscBrowseAction::Extract));
-    assert!(matches!(&fx[..], [Effect::PickFolder(s)] if s.purpose == bpurpose::EXTRACT_TO));
+    ctl.apply(OpticalAction::BrowserClosed);
+    assert!(!ctl.is_browsing());
+    ctl.apply(OpticalAction::BrowseContents);
+    ctl.apply(OpticalAction::CloseDisc);
+    let reqs = ctl.take_requests();
+    assert_eq!(reqs.last(), Some(&HostRequest::CloseBrowser));
+    assert!(!ctl.is_browsing() && ctl.disc().is_none() && ctl.image().is_none());
+}
+
+/// The disc browser a shell opens on `HostRequest::OpenBrowser`, settled.
+fn browser(src: DiscSource) -> crate::controller::commander::CommanderController {
+    let services = crate::controller::browser::PaneServices::headless();
+    let keys = crate::controller::keys::KeyMap::for_this_platform();
+    let mut b = disc_browser(services, keys);
+    b.open_disc(src);
+    settle(&mut b);
+    b
+}
+
+fn settle(b: &mut crate::controller::commander::CommanderController) -> Vec<Effect> {
+    let start = std::time::Instant::now();
+    let mut fx = b.tick();
+    while b.is_working() {
+        assert!(start.elapsed().as_secs() < 60, "a job never ended");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fx.extend(b.tick());
+    }
+    fx
+}
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn the_disc_browser_reads_the_hfs_side_and_extracts_a_forked_file() {
+    use crate::controller::browser::{purpose as ppurpose, BrowserPaneAction as P};
+    use crate::controller::commander::screen::purpose as spurpose;
+    use crate::controller::commander::{CommanderAction as C, ExportFormat, ExtractOptions, Side};
+    let dir = tempfile::tempdir().unwrap();
+    let iso = hybrid_disc(dir.path());
+    let mut b = browser(DiscSource {
+        path: iso,
+        physical: false,
+    });
+    let pane = b.pane(Side::Left);
+    assert_eq!(pane.source_error(), None);
+    assert!(pane.is_optical() && pane.profile().read_only);
+    let hfs = pane
+        .partition_labels()
+        .iter()
+        .position(|l| l.contains("HFS"));
+    b.apply(C::Pane(
+        Side::Left,
+        P::SelectPartition(hfs.expect("an HFS side")),
+    ));
+    settle(&mut b);
+    assert_eq!(b.pane(Side::Left).volume().fs_type, "HFS+");
+    let node = |b: &crate::controller::commander::CommanderController, path: &str| {
+        let p = b.pane(Side::Left);
+        let row = p
+            .rows()
+            .iter()
+            .find(|r| p.row_entry(r).is_some_and(|e| e.path == path));
+        row.map(|r| r.node_id.clone()).expect(path)
+    };
+    let apps = node(&b, "/Apps");
+    b.apply(C::Pane(Side::Left, P::ToggleExpand(apps)));
+    settle(&mut b);
+    let app = node(&b, "/Apps/GameApp");
+    b.apply(C::Pane(Side::Left, P::CursorTo(app.clone())));
+    settle(&mut b);
+    let detail = b.side_detail(Side::Left).expect("the side panel");
+    assert_eq!(detail.preview.as_deref(), Some(&b"data fork bytes"[..]));
+
+    let fx = b.apply(C::Extract {
+        from: Side::Left,
+        path: "/Apps/GameApp".into(),
+        options: ExtractOptions::default(),
+        dest: None,
+    });
+    assert!(matches!(&fx[..], [Effect::PickFolder(s)] if s.purpose == spurpose::EXTRACT));
     let out = dir.path().join("out");
     std::fs::create_dir(&out).unwrap();
-    ctl.apply(OpticalAction::Picked {
-        purpose: bpurpose::EXTRACT_TO,
+    b.apply(C::Picked {
+        purpose: spurpose::EXTRACT,
         path: Some(out.clone()),
     });
-    ctl.wait_idle();
-    assert_eq!(
-        ctl.browse().result(),
-        Some("Extraction complete: 1 files extracted.")
-    );
-    assert_eq!(
-        std::fs::read(out.join("GameApp")).unwrap(),
-        b"data fork bytes"
-    );
+    settle(&mut b);
+    assert!(b.status().starts_with("Copied 1 file(s)"), "{}", b.status());
+    let data = std::fs::read(out.join("GameApp")).unwrap();
+    assert_eq!(data, b"data fork bytes");
     let ad = std::fs::read(out.join("._GameApp")).unwrap();
     assert!(ad.len() > 5000, "AppleDouble carries the 5000-byte fork");
 
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::Tree));
-    ctl.wait_idle();
-    assert!(ctl.browse().tree_text().unwrap().contains("GameApp"));
-    let fx = ctl.apply(OpticalAction::Browse(DiscBrowseAction::SaveTree));
-    assert!(matches!(&fx[..], [Effect::PickFile(s)] if s.file_name == "tree.txt"));
-    let tree = dir.path().join("tree.txt");
-    ctl.apply(OpticalAction::Picked {
-        purpose: bpurpose::SAVE_TREE,
-        path: Some(tree.clone()),
-    });
-    ctl.wait_idle();
-    assert!(std::fs::read_to_string(tree).unwrap().contains("GameApp"));
+    b.apply(C::Pane(Side::Left, P::ListTree { ids: false }));
+    settle(&mut b);
+    let tree = b.host_pane().take_tree_text().expect("a tree");
+    assert!(tree.text.contains("GameApp") && tree.text.contains("APPL/PLAY"));
+    let fx = b.apply(C::Pane(Side::Left, P::SaveTree));
+    assert!(matches!(&fx[..], [Effect::PickFile(s)] if s.purpose == ppurpose::TREE_SAVE));
+    let saved = dir.path().join("tree.txt");
+    b.apply(C::Pane(
+        Side::Left,
+        P::Picked {
+            purpose: ppurpose::TREE_SAVE,
+            path: Some(saved.clone()),
+        },
+    ));
+    settle(&mut b);
+    assert_eq!(std::fs::read_to_string(saved).unwrap(), tree.text);
 
-    let fx = ctl.apply(OpticalAction::Browse(DiscBrowseAction::Export));
-    assert!(fx.is_empty());
-    assert_eq!(ctl.browse().error(), Some("Nothing selected to export."));
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::SetMarked {
-        entry: app,
-        marked: true,
-    }));
-    ctl.apply(OpticalAction::Browse(DiscBrowseAction::SetExportFormat(
-        browse::ExportFormat::LooseFiles,
-    )));
-    let fx = ctl.apply(OpticalAction::Browse(DiscBrowseAction::Export));
-    assert!(matches!(&fx[..], [Effect::PickFolder(s)] if s.purpose == bpurpose::EXPORT_FOLDER));
+    let fx = b.apply(C::Export {
+        from: Side::Left,
+        format: Some(ExportFormat::LooseFiles),
+    });
+    assert!(fx.is_empty(), "nothing selected");
+    b.apply(C::Pane(Side::Left, P::Mark(app)));
+    let fx = b.apply(C::Export {
+        from: Side::Left,
+        format: Some(ExportFormat::LooseFiles),
+    });
+    assert!(matches!(&fx[..], [Effect::PickFolder(s)] if s.purpose == spurpose::EXPORT));
     let exported = dir.path().join("exported");
     std::fs::create_dir(&exported).unwrap();
-    ctl.apply(OpticalAction::Picked {
-        purpose: bpurpose::EXPORT_FOLDER,
+    b.apply(C::Picked {
+        purpose: spurpose::EXPORT,
         path: Some(exported.clone()),
     });
-    ctl.wait_idle();
-    assert!(
-        ctl.browse()
-            .result()
-            .is_some_and(|r| r.starts_with("Exported 1 item(s) to ")),
-        "{:?} {:?}",
-        ctl.browse().result(),
-        ctl.browse().error()
-    );
+    settle(&mut b);
+    assert!(b.status().starts_with("Copied 1 file(s)"), "{}", b.status());
+    assert!(exported.join("GameApp").exists() && exported.join("._GameApp").exists());
 
-    ctl.apply(OpticalAction::CloseDisc);
-    assert!(!ctl.browse().is_active() && ctl.disc().is_none() && ctl.image().is_none());
+    b.apply(C::Pane(Side::Left, P::Delete));
+    assert!(b.status().contains("not available"), "{}", b.status());
 }
 
 /// An NKit image that cannot be reconstructed shows the convert-it-back hint, not a bare reader error.
@@ -207,16 +274,32 @@ fn an_unreconstructable_nkit_iso_shows_the_actionable_hint() {
     buf[0x1C..0x20].copy_from_slice(&[0xC2, 0x33, 0x9F, 0x3D]);
     buf[0x200..0x204].copy_from_slice(b"NKIT");
     std::fs::write(&path, &buf).unwrap();
-    let mut ctl = controller();
-    ctl.browse.open(crate::model::optical_browse::DiscSource {
+    let b = browser(DiscSource {
         path,
         physical: false,
     });
-    ctl.wait_idle();
-    let err = ctl.browse().error().expect("an error");
+    let pane = b.pane(crate::controller::commander::Side::Left);
+    let err = pane.source_error().expect("an error");
     assert!(
         err.contains("NKit v1"),
         "expected the NKit hint, got: {err}"
     );
     assert!(err.contains("Convert it back"), "{err}");
+}
+
+/// A drive that cannot be opened (unelevated, or gone) shows why where the listing would be.
+#[test]
+fn a_drive_the_browser_cannot_open_shows_the_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = browser(DiscSource {
+        path: dir.path().join("no-such-drive"),
+        physical: true,
+    });
+    let pane = b.pane(crate::controller::commander::Side::Left);
+    let err = pane.source_error().expect("an error");
+    assert!(
+        err.starts_with("Failed to open disc image") || err.contains("compiled without"),
+        "{err}"
+    );
+    assert!(!pane.listing.is_loaded());
 }

@@ -1544,15 +1544,19 @@ impl Target for ResizeTarget {
     }
 }
 
-/// `OpticalController` on an image file. Actions: `OpenImage` (arg `$hybrid`: the committed
-/// hybrid ISO 9660 + HFS+ disc), `SetOutputFormat` (`iso`, `bincue`, `chd`), `PickOutput`, `Pick`
-/// (the output, `out.<ext>`), `Start`, `BrowseContents`, `SelectFs` (a label substring),
-/// `Expand` / `Select` (a `/`-separated path from the root), `Extract`, `PickExtract`, `Tree`,
-/// `CloseDisc`. Probes: `format`, `can_start`, `result`, `bin_bytes`, `browsing`, `choices`,
-/// `error`, `content`, `extract_result`, `extracted`, `tree`, `source`.
+/// `OpticalController` on an image file, hosting the disc browser (`disc_browser`, the browser
+/// pane under `PaneProfile::optical`) the way a shell does on `HostRequest::OpenBrowser`.
+/// Actions: `OpenImage` (arg `$hybrid`: the committed hybrid ISO 9660 + HFS+ disc),
+/// `SetOutputFormat` (`iso`, `bincue`, `chd`), `PickOutput`, `Pick` (the output, `out.<ext>`),
+/// `Start`, `BrowseContents`, `SelectFs` (a label substring), `Expand` / `Select` (a path),
+/// `Extract`, `PickExtract`, `Tree`, `CloseDisc`. Probes: `format`, `can_start`, `result`,
+/// `bin_bytes`, `browsing`, `choices`, `error`, `content`, `extract_result`, `extracted`, `tree`,
+/// `source`.
 #[cfg(all(feature = "optical", feature = "native-zstd"))]
 struct OpticalTarget {
     ctl: rusty_backup::controller::optical::OpticalController,
+    browser: Option<rusty_backup::controller::commander::CommanderController>,
+    tree: String,
     dir: tempfile::TempDir,
 }
 
@@ -1563,6 +1567,8 @@ impl OpticalTarget {
             ctl: rusty_backup::controller::optical::OpticalController::new(std::sync::Arc::new(
                 rusty_backup::controller::optical::NoNotify,
             )),
+            browser: None,
+            tree: String::new(),
             dir: tempfile::tempdir().expect("temp dir"),
         }
     }
@@ -1577,35 +1583,65 @@ impl OpticalTarget {
         self.dir.path().join("extract")
     }
 
-    /// The entry at `path` (`/`-separated names from the root), from the folders listed so far.
-    fn entry(
-        &self,
-        path: &str,
-    ) -> Result<rusty_backup::controller::optical::browse::FileEntry, String> {
-        let b = self.ctl.browse();
-        let mut cur = b.root().ok_or("no root")?.clone();
-        for name in path.split('/').filter(|n| !n.is_empty()) {
-            let kids = b
-                .children(cur.path.as_str())
-                .ok_or_else(|| format!("{} is not listed", cur.path))?;
-            cur = kids
-                .iter()
-                .find(|e| e.name == name)
-                .ok_or_else(|| format!("no {name} in {}", cur.path))?
-                .clone();
+    /// Open or close the disc browser as the controller asks, as a shell does.
+    fn host(&mut self) {
+        use rusty_backup::controller::optical::HostRequest;
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(_) => {}
+                HostRequest::OpenBrowser(src) => {
+                    let mut b = rusty_backup::controller::optical::disc_browser(
+                        rusty_backup::controller::browser::PaneServices::headless(),
+                        rusty_backup::controller::keys::KeyMap::for_this_platform(),
+                    );
+                    b.open_disc(src);
+                    self.browser = Some(b);
+                }
+                HostRequest::CloseBrowser => self.browser = None,
+            }
         }
-        Ok(cur)
+    }
+
+    fn browser(
+        &mut self,
+    ) -> Result<&mut rusty_backup::controller::commander::CommanderController, String> {
+        self.browser
+            .as_mut()
+            .ok_or_else(|| "the disc browser is not open".to_string())
+    }
+
+    fn pane(&self) -> Option<&rusty_backup::controller::browser::BrowserPaneController> {
+        let b = self.browser.as_ref()?;
+        Some(b.pane(rusty_backup::controller::commander::Side::Left))
+    }
+
+    /// The node id of the browser row showing `path`.
+    fn node(&self, path: &str) -> Result<String, String> {
+        let p = self.pane().ok_or("the disc browser is not open")?;
+        let row = p
+            .rows()
+            .iter()
+            .find(|r| p.row_entry(r).is_some_and(|e| e.path == path));
+        row.map(|r| r.node_id.clone())
+            .ok_or_else(|| format!("no row {path}"))
+    }
+
+    fn pane_act(
+        &mut self,
+        a: rusty_backup::controller::browser::BrowserPaneAction,
+    ) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::commander::{CommanderAction, Side};
+        Ok(self.browser()?.apply(CommanderAction::Pane(Side::Left, a)))
     }
 }
 
 #[cfg(all(feature = "optical", feature = "native-zstd"))]
 impl Target for OpticalTarget {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
-        use rusty_backup::controller::optical::browse::purpose as bpurpose;
-        use rusty_backup::controller::optical::{
-            purpose, DiscBrowseAction, OpticalAction, OutputFormat,
-        };
-        let browse = OpticalAction::Browse;
+        use rusty_backup::controller::browser::BrowserPaneAction as P;
+        use rusty_backup::controller::commander::screen::purpose as spurpose;
+        use rusty_backup::controller::commander::{CommanderAction, ExtractOptions, Side};
+        use rusty_backup::controller::optical::{purpose, OpticalAction, OutputFormat};
         let a = match action {
             "OpenImage" => OpticalAction::OpenImage(match arg_str(arg)? {
                 "$hybrid" => {
@@ -1636,36 +1672,61 @@ impl Target for OpticalTarget {
             "BrowseContents" => OpticalAction::BrowseContents,
             "SelectFs" => {
                 let want = arg_str(arg)?;
-                let idx = self
-                    .ctl
-                    .browse()
-                    .fs_choices()
+                let labels = self
+                    .pane()
+                    .map(|p| p.partition_labels())
+                    .unwrap_or_default();
+                let idx = labels
                     .iter()
                     .position(|l| l.contains(want))
                     .ok_or_else(|| format!("no filesystem choice like {want:?}"))?;
-                browse(DiscBrowseAction::SelectFs(idx))
+                return self.pane_act(P::SelectPartition(idx));
             }
-            "Expand" => browse(DiscBrowseAction::Expand(self.entry(arg_str(arg)?)?)),
-            "Select" => browse(DiscBrowseAction::Select(self.entry(arg_str(arg)?)?)),
-            "Extract" => browse(DiscBrowseAction::Extract),
+            "Expand" => {
+                let id = self.node(arg_str(arg)?)?;
+                return self.pane_act(P::ToggleExpand(id));
+            }
+            "Select" => {
+                let id = self.node(arg_str(arg)?)?;
+                return self.pane_act(P::CursorTo(id));
+            }
+            "Extract" => {
+                let p = self.pane().ok_or("the disc browser is not open")?;
+                let path = p
+                    .cursor_index()
+                    .and_then(|i| p.row_entry(&p.rows()[i]))
+                    .map(|e| e.path)
+                    .ok_or("no cursor row")?;
+                return Ok(self.browser()?.apply(CommanderAction::Extract {
+                    from: Side::Left,
+                    path,
+                    options: ExtractOptions::default(),
+                    dest: None,
+                }));
+            }
             "PickExtract" => {
                 let dir = self.extract_dir();
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                OpticalAction::Picked {
-                    purpose: bpurpose::EXTRACT_TO,
+                return Ok(self.browser()?.apply(CommanderAction::Picked {
+                    purpose: spurpose::EXTRACT,
                     path: Some(dir),
-                }
+                }));
             }
-            "Tree" => browse(DiscBrowseAction::Tree),
+            "Tree" => return self.pane_act(P::ListTree { ids: false }),
             "CloseDisc" => OpticalAction::CloseDisc,
             other => return Err(format!("OpticalController has no action {other:?}")),
         };
-        Ok(self.ctl.apply(a))
+        let fx = self.ctl.apply(a);
+        self.host();
+        Ok(fx)
     }
 
     fn probe(&self, name: &str) -> Result<Value, String> {
-        use rusty_backup::controller::optical::browse::FileContent;
-        let b = self.ctl.browse();
+        use rusty_backup::controller::commander::Side;
+        let detail = self
+            .browser
+            .as_ref()
+            .and_then(|b| b.side_detail(Side::Left));
         Ok(match name {
             "format" => Value::String(self.ctl.disc().map(|d| d.format).unwrap_or_default()),
             "source" => Value::String(
@@ -1685,15 +1746,30 @@ impl Target for OpticalTarget {
                     .map(|m| m.len() as i64)
                     .unwrap_or(0),
             ),
-            "browsing" => Value::Boolean(b.is_active()),
-            "choices" => Value::Integer(b.fs_choices().len() as i64),
-            "error" => Value::String(b.error().unwrap_or("").to_string()),
-            "content" => Value::String(match b.content() {
-                Some(FileContent::Text(t)) => t.clone(),
-                Some(FileContent::Binary(d)) => format!("{} bytes", d.len()),
-                None => String::new(),
-            }),
-            "extract_result" => Value::String(b.result().unwrap_or("").to_string()),
+            "browsing" => Value::Boolean(self.ctl.is_browsing() && self.browser.is_some()),
+            "choices" => Value::Integer(
+                self.pane()
+                    .map(|p| p.partition_labels().len() as i64)
+                    .unwrap_or(0),
+            ),
+            "error" => Value::String(
+                self.pane()
+                    .and_then(|p| p.source_error())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "content" => Value::String(
+                detail
+                    .and_then(|d| d.preview.as_ref())
+                    .map(|b| String::from_utf8_lossy(b.as_slice()).into_owned())
+                    .unwrap_or_default(),
+            ),
+            "extract_result" => Value::String(
+                self.browser
+                    .as_ref()
+                    .map(|b| b.status().to_string())
+                    .unwrap_or_default(),
+            ),
             "extracted" => Value::String({
                 let mut names: Vec<String> = std::fs::read_dir(self.extract_dir())
                     .map(|rd| {
@@ -1705,14 +1781,27 @@ impl Target for OpticalTarget {
                 names.sort();
                 names.join(",")
             }),
-            "tree" => Value::String(b.tree_text().unwrap_or("").to_string()),
+            "tree" => Value::String(self.tree.clone()),
             other => return Err(format!("OpticalController has no probe {other:?}")),
         })
     }
 
     fn settle(&mut self) -> Vec<Effect> {
         self.ctl.wait_idle();
-        self.ctl.tick()
+        let mut fx = self.ctl.tick();
+        self.host();
+        if let Some(b) = self.browser.as_mut() {
+            let start = std::time::Instant::now();
+            fx.extend(b.tick());
+            while b.is_working() && start.elapsed().as_secs() < 60 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                fx.extend(b.tick());
+            }
+            if let Some(t) = b.host_pane().take_tree_text() {
+                self.tree = t.text;
+            }
+        }
+        fx
     }
 }
 

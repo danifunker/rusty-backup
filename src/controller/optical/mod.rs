@@ -3,13 +3,13 @@
 //!
 //! [`OpticalController`] owns the source (drive list, remote daemons, the image file), the
 //! detected disc, the output form, and every job: the drive scan, the detect, Eject, CHD Info, the
-//! remote connect and the rip / conversion. It hosts [`browse::DiscBrowseController`] and
-//! [`audio::AudioPlayerController`]. The operation bodies are `model::optical_ops`. Shells: the
-//! egui tab (`src/gui/optical_tab.rs`) and the TUI's rip screen. See
-//! docs/phase2_commander_plan.md § "Slice 16".
+//! remote connect and the rip / conversion. It hosts [`audio::AudioPlayerController`]; the disc
+//! browser is the shared browser pane ([`disc_browser`], `PaneProfile::optical`), which the shell
+//! opens and closes on [`HostRequest`]s. The operation bodies are `model::optical_ops`. Shells:
+//! the egui tab (`src/gui/optical_tab.rs`) and the TUI's rip screen. See
+//! docs/phase2_commander_plan.md § "Slice 16" and § "Slice 18".
 
 pub mod audio;
-pub mod browse;
 #[cfg(feature = "remote")]
 mod remote;
 mod run;
@@ -31,13 +31,26 @@ use crate::model::optical_devices::RipDevice;
 use crate::model::optical_ops;
 
 pub use crate::controller::backup::ChdChoice;
+pub use crate::controller::browser::DiscSource;
 pub use crate::model::job::NoNotify;
 pub use crate::model::optical_ops::OutputFormat;
 pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 pub use audio::{AudioAction, PlayState};
-pub use browse::{DiscBrowseAction, DiscBrowseController};
 
-/// The `purpose` of each picker this controller asks for (the browser's are `browse::purpose`).
+/// The Optical tab's disc browser: the browser pane, one pane, under `PaneProfile::optical`.
+pub fn disc_browser(
+    services: crate::controller::browser::PaneServices,
+    keymap: crate::controller::keys::KeyMap,
+) -> crate::controller::commander::CommanderController {
+    use crate::controller::commander::{CommanderAction, CommanderController, ResourceForkMode};
+    let profile = crate::controller::browser::PaneProfile::optical();
+    let mut ctl = CommanderController::single(services, keymap, profile);
+    // Exports keep resource forks as AppleDouble, as the disc browser always did.
+    ctl.apply(CommanderAction::SetForkMode(ResourceForkMode::AppleDouble));
+    ctl
+}
+
+/// The `purpose` of each picker this controller asks for.
 pub mod purpose {
     pub const IMAGE: &str = "optical.image";
     pub const OUTPUT: &str = "optical.output";
@@ -103,6 +116,10 @@ pub struct OpticalBar {
 pub enum HostRequest {
     /// An image was opened: put it at the top of the Optical recent list.
     RememberRecent(PathBuf),
+    /// Show the disc browser (`disc_browser`) on this disc.
+    OpenBrowser(DiscSource),
+    /// The disc changed or closed: close the disc browser.
+    CloseBrowser,
 }
 
 /// User intents.
@@ -125,6 +142,8 @@ pub enum OpticalAction {
     /// Connect to the daemon at this `host:port`.
     ConnectRemote(String),
     BrowseContents,
+    /// The user closed the disc browser.
+    BrowserClosed,
     CloseDisc,
     ChdInfo,
     CloseChdInfo,
@@ -139,7 +158,6 @@ pub enum OpticalAction {
         purpose: &'static str,
         path: Option<PathBuf>,
     },
-    Browse(DiscBrowseAction),
     Audio(AudioAction),
 }
 
@@ -173,7 +191,8 @@ pub struct OpticalController {
     run: run::RunState,
     #[cfg(feature = "remote")]
     remote: remote::RemoteState,
-    browse: DiscBrowseController,
+    /// The shell shows the disc browser.
+    browsing: bool,
     #[cfg(feature = "audio")]
     audio: audio::AudioPlayerController,
 }
@@ -200,7 +219,7 @@ impl OpticalController {
             run: run::RunState::default(),
             #[cfg(feature = "remote")]
             remote: remote::RemoteState::load(),
-            browse: DiscBrowseController::new(Arc::clone(&notify)),
+            browsing: false,
             #[cfg(feature = "audio")]
             audio: audio::AudioPlayerController::new(Arc::clone(&notify)),
             notify,
@@ -373,8 +392,9 @@ impl OpticalController {
         !self.is_running() && self.output.is_some() && self.has_valid_source()
     }
 
-    pub fn browse(&self) -> &DiscBrowseController {
-        &self.browse
+    /// The disc browser is open (`HostRequest::OpenBrowser` was the last word on it).
+    pub fn is_browsing(&self) -> bool {
+        self.browsing
     }
 
     #[cfg(feature = "audio")]
@@ -416,8 +436,8 @@ impl OpticalController {
 
     /// The source changed: close the browser, detect the new disc, reload the player.
     fn source_changed(&mut self) {
-        let was_browsing = self.browse.is_active();
-        self.browse.close();
+        let was_browsing = self.browsing;
+        self.close_browser();
         self.detect(was_browsing);
         #[cfg(feature = "audio")]
         match self.browsable() {
@@ -449,13 +469,21 @@ impl OpticalController {
     fn open_browse(&mut self) {
         if let Some(path) = self.browsable() {
             let physical = self.mode == SourceMode::PhysicalDrive;
-            self.browse
-                .open(crate::model::optical_browse::DiscSource { path, physical });
+            self.browsing = true;
+            let src = DiscSource { path, physical };
+            self.requests.push(HostRequest::OpenBrowser(src));
+        }
+    }
+
+    fn close_browser(&mut self) {
+        if self.browsing {
+            self.browsing = false;
+            self.requests.push(HostRequest::CloseBrowser);
         }
     }
 
     fn close_disc(&mut self) {
-        self.browse.close();
+        self.close_browser();
         self.disc = None;
         self.disc_error = None;
         self.detecting = None;
@@ -630,7 +658,6 @@ impl OpticalController {
         #[cfg(feature = "remote")]
         self.poll_remote();
         self.poll_run();
-        self.browse.tick();
         #[cfg(feature = "audio")]
         self.audio.tick();
     }
@@ -655,7 +682,6 @@ impl OpticalController {
                 && !self.run.running()
                 && !remote_busy
             {
-                self.browse.wait_idle();
                 #[cfg(feature = "audio")]
                 self.audio.wait_loaded();
                 return;
@@ -704,10 +730,11 @@ impl Controller for OpticalController {
                 }
             }
             OpticalAction::BrowseContents => {
-                if self.disc.is_some() && !self.browse.is_active() {
+                if self.disc.is_some() && !self.browsing {
                     self.open_browse();
                 }
             }
+            OpticalAction::BrowserClosed => self.browsing = false,
             OpticalAction::CloseDisc => self.close_disc(),
             OpticalAction::ChdInfo => self.start_chd_info(),
             OpticalAction::CloseChdInfo => self.chd_info = None,
@@ -723,14 +750,8 @@ impl Controller for OpticalController {
             OpticalAction::Picked { purpose, path } => match (purpose, path) {
                 (purpose::IMAGE, Some(path)) if !running => self.open_image(path),
                 (purpose::OUTPUT, Some(path)) if !running => self.output = Some(path),
-                (p, path) if p.starts_with("optical_browse.") => {
-                    return self
-                        .browse
-                        .apply(DiscBrowseAction::Picked { purpose: p, path })
-                }
                 _ => {}
             },
-            OpticalAction::Browse(a) => return self.browse.apply(a),
             OpticalAction::Audio(a) => {
                 #[cfg(feature = "audio")]
                 self.audio.apply(a);

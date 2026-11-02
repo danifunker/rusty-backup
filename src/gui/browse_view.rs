@@ -8,11 +8,11 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
     format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveUse,
-    BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DisplayRow, EditQueue,
-    EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _, ForkFormat,
-    ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction, PaneProfile,
-    PaneServices, ResourceForkMode, RowKind, Side, Snapshot, TarChoice, TextShape, UnsavedChoice,
-    MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
+    BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DiscSource, DisplayRow,
+    EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _,
+    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
+    PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot, TarChoice, TextShape,
+    UnsavedChoice, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
 use rusty_backup::controller::{Controller as _, Effect};
@@ -29,19 +29,25 @@ const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 /// frame), so a larger listing offers Save first.
 const TREE_INLINE_RENDER_LIMIT: usize = 1024 * 1024;
 
-/// The browser pane behind the view: the Inspect profile, its listing style remembered as `inspect`.
-fn new_controller() -> CommanderController {
+/// The browser pane behind the view: the Inspect profile (style remembered as `inspect`), or the
+/// Optical tab's disc browser (`optical`).
+fn new_controller(optical: bool) -> CommanderController {
     let services = PaneServices {
         jobs: JobRegistry::new(),
         notify: Arc::new(super::ui_logger::EguiWake),
         recent: Box::new(CommanderRecent(UserConfig)),
     };
     let keymap = super::commander::load_keymap();
+    if optical {
+        return rusty_backup::controller::optical::disc_browser(services, keymap);
+    }
     CommanderController::single(services, keymap, PaneProfile::inspect())
 }
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
+    /// The Optical tab's disc browser (read-only, its own header), not the Inspect browse view.
+    optical: bool,
     /// Effects from a host call made outside `show`, run on the next frame.
     pending_fx: Vec<Effect>,
     /// The modes' volume generation the panel last followed.
@@ -160,9 +166,10 @@ enum ViewMode {
 impl Default for BrowseView {
     fn default() -> Self {
         Self {
+            optical: false,
             pending_fx: Vec::new(),
             generation_seen: 0,
-            ctl: new_controller(),
+            ctl: new_controller(false),
             effects: EffectHost::default(),
             pane_view: PaneView::new(Side::Left),
             keys_active: false,
@@ -221,6 +228,23 @@ struct GuiTextEditor {
 }
 
 impl BrowseView {
+    /// The Optical tab's disc browser: the same view over `PaneProfile::optical`.
+    pub fn optical() -> Self {
+        BrowseView {
+            optical: true,
+            ctl: new_controller(true),
+            ..Self::default()
+        }
+    }
+
+    /// Browse a disc image or the disc in a drive (the Optical tab's Browse Contents).
+    pub fn open_disc(&mut self, src: DiscSource) {
+        self.close();
+        self.active = true;
+        let fx = self.ctl.open_disc(src);
+        self.pending_fx.extend(fx);
+    }
+
     /// The label of a running extract, source-level job, export, apply or volume tool, if any.
     pub fn running_job(&self) -> Option<&'static str> {
         let pane = self.ctl.pane(Side::Left);
@@ -293,7 +317,7 @@ impl BrowseView {
 
     pub fn close(&mut self) {
         // The old pane's readers go before its CHD diff or archive temp is removed.
-        std::mem::replace(&mut self.ctl, new_controller()).close_inspect();
+        std::mem::replace(&mut self.ctl, new_controller(self.optical)).close_inspect();
         self.pending_fx.clear();
         self.effects = EffectHost::default();
         self.keys_active = false;
@@ -487,158 +511,165 @@ impl BrowseView {
         self.boot_blocks_present = self.ctl.pane(Side::Left).boot_blocks_present();
 
         // Header
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Filesystem Browser").strong());
-            ui.label(format!("[{}]", self.fs_type));
-            if self.volume_total > 0 {
-                let free = self.volume_total.saturating_sub(self.volume_used);
-                ui.label(format!(
-                    "{} used / {} ({} free)",
-                    format_size(self.volume_used),
-                    format_size(self.volume_total),
-                    format_size(free),
-                ))
-                .on_hover_text("Volume space: used / total (free)");
-            }
-            let display_label = match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
-                (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
-                (false, true) => self.label_prefix.clone(),
-                (true, false) => self.volume_label.clone(),
-                (true, true) => String::new(),
-            };
-            if !display_label.is_empty() {
-                ui.label(format!("Label: {}", display_label));
-            }
-            if let Some((_, ref name)) = self.blessed_folder {
-                ui.label(format!("Blessed: {}", name));
-            }
-            // Boot-block status (edit mode, HFS volumes). A bootable volume
-            // needs both a blessed System Folder and boot blocks at sector 0.
-            if self.ctl.edit_mode() && self.is_hfs_type() {
-                match self.boot_blocks_present {
-                    Some(true) => {
-                        ui.label("Boot blocks: present")
-                            .on_hover_text("The volume's first sector has the 'LK' boot loader.");
-                    }
-                    Some(false) => {
-                        ui.label(
-                            egui::RichText::new("Boot blocks: absent")
-                                .color(super::theme::warning(ui.visuals())),
-                        )
-                        .on_hover_text(
-                            "This volume has no boot loader. Use 'Boot Blocks...' to copy \
+        if self.optical {
+            self.render_disc_header(ui);
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Filesystem Browser").strong());
+                ui.label(format!("[{}]", self.fs_type));
+                if self.volume_total > 0 {
+                    let free = self.volume_total.saturating_sub(self.volume_used);
+                    ui.label(format!(
+                        "{} used / {} ({} free)",
+                        format_size(self.volume_used),
+                        format_size(self.volume_total),
+                        format_size(free),
+                    ))
+                    .on_hover_text("Volume space: used / total (free)");
+                }
+                let display_label =
+                    match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
+                        (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
+                        (false, true) => self.label_prefix.clone(),
+                        (true, false) => self.volume_label.clone(),
+                        (true, true) => String::new(),
+                    };
+                if !display_label.is_empty() {
+                    ui.label(format!("Label: {}", display_label));
+                }
+                if let Some((_, ref name)) = self.blessed_folder {
+                    ui.label(format!("Blessed: {}", name));
+                }
+                // Boot-block status (edit mode, HFS volumes). A bootable volume
+                // needs both a blessed System Folder and boot blocks at sector 0.
+                if self.ctl.edit_mode() && self.is_hfs_type() {
+                    match self.boot_blocks_present {
+                        Some(true) => {
+                            ui.label("Boot blocks: present").on_hover_text(
+                                "The volume's first sector has the 'LK' boot loader.",
+                            );
+                        }
+                        Some(false) => {
+                            ui.label(
+                                egui::RichText::new("Boot blocks: absent")
+                                    .color(super::theme::warning(ui.visuals())),
+                            )
+                            .on_hover_text(
+                                "This volume has no boot loader. Use 'Boot Blocks...' to copy \
                              them from a bootable donor disk (e.g. a matching stock System \
                              disk), then bless the System Folder. Works on a flat HFV and on \
                              the HFS partition of a full (APM) disk alike.",
-                        );
+                            );
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
-            }
 
-            // Carve view: "Full scan" toggle. By default the synthetic carve
-            // view only scans the first 10 MB of an image for recoverable
-            // text (fast on large devices); turning this on scans the whole
-            // image. Flipping it re-opens the volume so the new policy applies.
-            if self.fs_type == "Raw carve (no filesystem)" {
-                ui.add_space(8.0);
-                let mut full = self.ctl.carve_full_scan();
-                let resp = ui.checkbox(&mut full, "Full scan");
-                let limit_mb = self.ctl.carve_scan_limit_mb();
-                resp.clone().on_hover_text(format!(
-                    "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
+                // Carve view: "Full scan" toggle. By default the synthetic carve
+                // view only scans the first 10 MB of an image for recoverable
+                // text (fast on large devices); turning this on scans the whole
+                // image. Flipping it re-opens the volume so the new policy applies.
+                if self.fs_type == "Raw carve (no filesystem)" {
+                    ui.add_space(8.0);
+                    let mut full = self.ctl.carve_full_scan();
+                    let resp = ui.checkbox(&mut full, "Full scan");
+                    let limit_mb = self.ctl.carve_scan_limit_mb();
+                    resp.clone().on_hover_text(format!(
+                        "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
                      On: scan the entire image (slower on large disks).\n\
                      'whole-disk.img' is always the full image regardless."
-                ));
-                if resp.changed() {
-                    self.error = None;
-                    let act = CommanderAction::Mode(ModeAction::CarveFullScan(full));
-                    self.dispatch(&ctx, act);
+                    ));
+                    if resp.changed() {
+                        self.error = None;
+                        let act = CommanderAction::Mode(ModeAction::CarveFullScan(full));
+                        self.dispatch(&ctx, act);
+                    }
                 }
-            }
 
-            if self.fs_type == "QNX 2" {
-                ui.add_space(8.0);
-                let mut deleted = self.ctl.show_deleted();
-                let resp = ui.checkbox(&mut deleted, "Show deleted");
-                resp.clone().on_hover_text(
+                if self.fs_type == "QNX 2" {
+                    ui.add_space(8.0);
+                    let mut deleted = self.ctl.show_deleted();
+                    let resp = ui.checkbox(&mut deleted, "Show deleted");
+                    resp.clone().on_hover_text(
                     "List deleted entries whose data can still be read, named 'NAME [deleted]'.",
                 );
-                if resp.changed() {
-                    let act = CommanderAction::Mode(ModeAction::ShowDeleted(deleted));
-                    self.dispatch(&ctx, act);
+                    if resp.changed() {
+                        let act = CommanderAction::Mode(ModeAction::ShowDeleted(deleted));
+                        self.dispatch(&ctx, act);
+                    }
                 }
-            }
 
-            // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
-            if self.ctl.edit_supported() && self.fs_type != "Pilot/Cedar" {
-                let busy = self.extracting || self.ctl.mode_working().is_some();
-                ui.add_space(8.0);
-                let edit_btn = if self.ctl.edit_mode() {
-                    egui::Button::new("Edit Mode ON")
-                } else {
-                    egui::Button::new("Edit Mode")
-                };
-                let btn = ui.add_enabled(!busy, edit_btn);
-                if btn.clicked() {
-                    self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ToggleEditMode));
+                // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
+                if self.ctl.edit_supported() && self.fs_type != "Pilot/Cedar" {
+                    let busy = self.extracting || self.ctl.mode_working().is_some();
+                    ui.add_space(8.0);
+                    let edit_btn = if self.ctl.edit_mode() {
+                        egui::Button::new("Edit Mode ON")
+                    } else {
+                        egui::Button::new("Edit Mode")
+                    };
+                    let btn = ui.add_enabled(!busy, edit_btn);
+                    if btn.clicked() {
+                        self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ToggleEditMode));
+                    }
+                    if !self.ctl.edit_mode() && btn.hovered() {
+                        btn.on_hover_text("Enable editing to add or delete files on this image");
+                    }
                 }
-                if !self.ctl.edit_mode() && btn.hovered() {
-                    btn.on_hover_text("Enable editing to add or delete files on this image");
-                }
-            }
 
-            // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
-            // .tar). Preserves case-sensitive names + real symlinks (data
-            // fork only) so a case-insensitive host won't clobber files that
-            // differ only in case. Runs on a worker thread.
-            if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
-                let btn = ui.button("Export to .tar.gz...");
-                if btn.hovered() {
-                    btn.clone().on_hover_text(
-                        "Archive the whole volume to .tar.gz / .tar.zst / .tar \
+                // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
+                // .tar). Preserves case-sensitive names + real symlinks (data
+                // fork only) so a case-insensitive host won't clobber files that
+                // differ only in case. Runs on a worker thread.
+                if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
+                    let btn = ui.button("Export to .tar.gz...");
+                    if btn.hovered() {
+                        btn.clone().on_hover_text(
+                            "Archive the whole volume to .tar.gz / .tar.zst / .tar \
                          (preserves case + symlinks; choose the extension in the save dialog)",
-                    );
+                        );
+                    }
+                    if btn.clicked() {
+                        self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
+                    }
                 }
-                if btn.clicked() {
-                    self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
+
+                // HFS and Alto BFS packs check here; the Inspect grid's Check covers the rest.
+                let tool_free = self.ctl.pane(Side::Left).tool_working().is_none();
+                if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
+                    && tool_free
+                    && ui.button("Check").clicked()
+                {
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Fsck);
                 }
-            }
+                if (self.fs_type == "HFS+" || self.fs_type == "HFSX")
+                    && ui.button("Journal").clicked()
+                {
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
+                }
 
-            // HFS and Alto BFS packs check here; the Inspect grid's Check covers the rest.
-            let tool_free = self.ctl.pane(Side::Left).tool_working().is_none();
-            if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
-                && tool_free
-                && ui.button("Check").clicked()
-            {
-                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Fsck);
-            }
-            if (self.fs_type == "HFS+" || self.fs_type == "HFSX") && ui.button("Journal").clicked()
-            {
-                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
-            }
+                if self.ctl.is_chd_source() && ui.button("CHD Info").clicked() {
+                    self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ChdInfo));
+                }
 
-            if self.ctl.is_chd_source() && ui.button("CHD Info").clicked() {
-                self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ChdInfo));
-            }
+                if ui.button("Tree").clicked() {
+                    let ids = self.tree_show_ids;
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
+                }
 
-            if ui.button("Tree").clicked() {
-                let ids = self.tree_show_ids;
-                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
-            }
+                ui.menu_button("View", |ui| {
+                    let items = self.ctl.view_menu();
+                    if let Some(action) = super::commander::view_menu_body(ui, &items) {
+                        self.ctl.apply(action);
+                        ui.close();
+                    }
+                });
 
-            ui.menu_button("View", |ui| {
-                let items = self.ctl.view_menu();
-                if let Some(action) = super::commander::view_menu_body(ui, &items) {
-                    self.ctl.apply(action);
-                    ui.close();
+                if ui.button("Close").clicked() {
+                    self.request_close();
                 }
             });
-
-            if ui.button("Close").clicked() {
-                self.request_close();
-            }
-        });
+        }
 
         if let Some(err) = &self.error {
             ui.colored_label(super::theme::danger(ui.visuals()), err);
@@ -829,7 +860,8 @@ impl BrowseView {
             ui.spinner();
             return true;
         }
-        if let Some(err) = pane.source_error() {
+        // A disc keeps its header, so another of its filesystems can be picked.
+        if let Some(err) = pane.source_error().filter(|_| !self.optical) {
             if !pane.listing.is_loaded() && !pane.needs_password() {
                 ui.colored_label(super::theme::danger(ui.visuals()), err);
                 if ui.button("Close").clicked() {
@@ -839,6 +871,57 @@ impl BrowseView {
             }
         }
         false
+    }
+
+    /// The disc browser's header: the filesystem picker (hybrid sides, boot areas), the game, Tree.
+    fn render_disc_header(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let pane = self.ctl.pane(Side::Left);
+        let labels = pane.partition_labels();
+        let selected = pane.selected_partition().unwrap_or(0);
+        let game = pane.disc_game().map(|g| g.to_string());
+        let mut acts = Vec::new();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Disc Browser").strong());
+            if labels.len() > 1 {
+                ui.label("Filesystem:");
+                egui::ComboBox::from_id_salt("optical_fs_picker")
+                    .selected_text(labels.get(selected).cloned().unwrap_or_default())
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in labels.iter().enumerate() {
+                            if ui.selectable_label(idx == selected, label).clicked() {
+                                acts.push(BrowserPaneAction::SelectPartition(idx));
+                            }
+                        }
+                    });
+            } else if let Some(label) = labels.first() {
+                ui.label(format!("[{label}]"));
+            }
+            if let Some(g) = &game {
+                ui.label(format!("Game: {g}"));
+            }
+            if ui.button("Tree").clicked() {
+                acts.push(BrowserPaneAction::ListTree { ids: false });
+            }
+            ui.menu_button("View", |ui| {
+                let items = self.ctl.view_menu();
+                if let Some(action) = super::commander::view_menu_body(ui, &items) {
+                    self.ctl.apply(action);
+                    ui.close();
+                }
+            });
+            if ui.button("Close").clicked() {
+                self.request_close();
+            }
+        });
+        for a in acts {
+            if matches!(a, BrowserPaneAction::SelectPartition(_)) {
+                self.selected_entry = None;
+                self.side_ed = DetailEditors::default();
+                self.error = None;
+            }
+            self.pane_act(&ctx, a);
+        }
     }
 
     /// The header's volume readout, from the volume the pane opened.
@@ -1393,7 +1476,9 @@ impl BrowseView {
         // files that are actually archives (preflight, not
         // error-on-click). The bundling row needs only the
         // filesystem gate — you can wrap any file/folder.
-        let is_mac_fs = self.is_mac_filesystem();
+        // The disc browser offers only Extract, as the Optical tab always did.
+        let extras = !self.optical;
+        let is_mac_fs = extras && self.is_mac_filesystem();
         let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
 
         if is_extractable && !extraction_running {
@@ -1459,7 +1544,8 @@ impl BrowseView {
                 } else {
                     "Export File to .tgz..."
                 };
-                if ui
+                if extras
+                    && ui
                     .add_enabled(
                         self.ctl.copy_job().is_none(),
                         egui::Button::new(tgz_label),
@@ -1474,7 +1560,8 @@ impl BrowseView {
                     self.export_entry(ui.ctx(), &entry, ExportFormat::TarGz);
                 }
 
-                if entry.is_file()
+                if extras
+                    && entry.is_file()
                     && entry.size >= MIN_NESTED_IMAGE_BYTES
                     && ui
                         .button("Open as Disk Image")
@@ -1615,7 +1702,8 @@ impl BrowseView {
             return;
         }
         // Editing is offered only where it is safe: a text preview means the content decoded cleanly.
-        if matches!(self.side_ed.content, Some(FileContent::Text(_)))
+        if extras
+            && matches!(self.side_ed.content, Some(FileContent::Text(_)))
             && ui
                 .add_enabled(self.ctl.edit_mode(), egui::Button::new("Edit as text..."))
                 .on_disabled_hover_text("Turn on Edit Mode to edit this file.")
@@ -2710,7 +2798,8 @@ impl BrowseView {
                         save_requested = true;
                     }
                     ui.add_space(16.0);
-                    if ui.checkbox(&mut self.tree_show_ids, "Show IDs").changed() {
+                    // A disc's tree has no filesystem ids.
+                    if !self.optical && ui.checkbox(&mut self.tree_show_ids, "Show IDs").changed() {
                         regenerate = true;
                     }
                 });

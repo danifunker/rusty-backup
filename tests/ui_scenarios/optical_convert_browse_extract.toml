@@ -1,5 +1,6 @@
 # The Optical tab on an image file: a hybrid ISO 9660 + HFS+ disc converted to BIN/CUE, then
-# browsed on its HFS side, a forked file previewed and extracted (AppleDouble), the tree listed.
+# browsed on its HFS side in the browser pane (PaneProfile::optical), a forked file previewed and
+# extracted (AppleDouble, the disc walker), the tree listed.
 name = "Optical: convert, browse, extract"
 vm = "optical"
 requires = ["optical"]
@@ -59,7 +60,7 @@ effects = ["PickFolder"]
 [[step]]
 action = "PickExtract"
 settle = true
-expect = { extract_result = "Extraction complete: 1 files extracted.", extracted = "._GameApp,GameApp" }
+expect = { extract_result = "Copied 1 file(s) to the extract folder.", extracted = "._GameApp,GameApp" }
 
 [[step]]
 action = "Tree"

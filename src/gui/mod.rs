@@ -17,7 +17,6 @@ mod journal_view;
 mod metadata_editor;
 #[cfg(feature = "audio")]
 mod optical_audio;
-mod optical_browse_view;
 mod optical_tab;
 mod partition_bar;
 mod partition_editor_modal;

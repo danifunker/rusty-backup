@@ -3,7 +3,8 @@
 //! Draws the source (drive or image file), the disc info, the output form and Start / Cancel,
 //! maps them to [`OpticalAction`]s, answers pickers through an [`EffectHost`] and mirrors the
 //! run into the shared progress bar. Widget state only: the CHD options control, the remote
-//! address being typed, and the recent-files mirror.
+//! address being typed, and the recent-files mirror. The disc browser is the Inspect tab's
+//! browse view over the browser pane's optical profile, opened on `HostRequest::OpenBrowser`.
 
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::optical::{
@@ -27,6 +28,8 @@ pub struct OpticalTab {
     add_remote_addr: String,
     /// This tab drives the shared progress bar.
     showing_bar: bool,
+    /// The disc browser: the shared browse view, `PaneProfile::optical`.
+    browser: super::browse_view::BrowseView,
 }
 
 impl Default for OpticalTab {
@@ -41,6 +44,7 @@ impl Default for OpticalTab {
             chd_cd_control: chd,
             add_remote_addr: String::new(),
             showing_bar: false,
+            browser: super::browse_view::BrowseView::optical(),
         }
     }
 }
@@ -58,7 +62,7 @@ impl OpticalTab {
 
     /// True while a disc's contents are browsed, so a drop does not replace the open disc.
     pub fn is_browsing(&self) -> bool {
-        self.ctl.browse().is_active()
+        self.ctl.is_browsing()
     }
 
     /// Open `path` as the image-file source (a drop, or Inspect's hand-off).
@@ -90,6 +94,8 @@ impl OpticalTab {
                     self.recent_files =
                         super::push_recent(rusty_backup::update::RecentMode::Optical, &path);
                 }
+                HostRequest::OpenBrowser(src) => self.browser.open_disc(src),
+                HostRequest::CloseBrowser => self.browser.close(),
             }
         }
         match self.ctl.progress() {
@@ -172,7 +178,7 @@ impl OpticalTab {
         if self.ctl.disc().is_some() {
             ui.horizontal(|ui| {
                 ui.add_space(60.0);
-                if !self.ctl.browse().is_active() && ui.button("Browse Contents").clicked() {
+                if !self.ctl.is_browsing() && ui.button("Browse Contents").clicked() {
                     actions.push(OpticalAction::BrowseContents);
                 }
                 if ui.button("Close Disc").clicked() {
@@ -237,7 +243,10 @@ impl OpticalTab {
 
         ui.separator();
 
-        super::optical_browse_view::show(ui, self.ctl.browse(), &mut actions);
+        self.browser.show(ui);
+        if self.ctl.is_browsing() && !self.browser.is_active() {
+            actions.push(OpticalAction::BrowserClosed);
+        }
 
         for a in actions {
             self.act(a);
