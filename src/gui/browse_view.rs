@@ -178,8 +178,8 @@ pub struct BrowseView {
     read_queue: std::collections::VecDeque<FsRead>,
     /// The read in flight, and the filesystem generation it borrowed from.
     read_job: Option<(rusty_backup::model::job::Job<FsReadOut>, u64)>,
-    /// A running "Export selection": the filesystem comes back with the summary, plus the destination.
-    export_job: Option<(rusty_backup::model::job::Job<ExportRun>, PathBuf)>,
+    /// The screen's export of the marked rows is running; its status line is the result.
+    exporting: bool,
     /// A running tar import (its preflight, or the import itself).
     tar_job: Option<rusty_backup::model::job::Job<TarStep>>,
     /// Backing up a CHD and opening its edit session, before edit mode starts.
@@ -483,7 +483,7 @@ impl Default for BrowseView {
             fsck_job: None,
             read_queue: std::collections::VecDeque::new(),
             read_job: None,
-            export_job: None,
+            exporting: false,
             tar_job: None,
             chd_open_job: None,
             apply_follow: None,
@@ -1027,26 +1027,16 @@ impl BrowseView {
         }
         self.poll_archive_sniff();
         self.render_apply_job(ui);
-        self.poll_export_job();
         self.poll_tar_job();
-        let running = [
-            self.export_job.as_ref().map(|(j, _)| j.snapshot()),
-            self.tar_job.as_ref().map(|j| j.snapshot()),
-        ];
-        for snap in running.into_iter().flatten() {
-            let mut cancel = false;
+        if let Some(snap) = self.tar_job.as_ref().map(|j| j.snapshot()) {
             egui::Window::new(snap.label.clone())
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    cancel = super::progress::show_job(ui, &snap);
+                    super::progress::show_job(ui, &snap);
                 });
-            if cancel {
-                if let Some((j, _)) = &self.export_job {
-                    j.cancel();
-                }
-            }
         }
+        self.poll_export(ui);
         self.poll_chd_open_job();
         if let Some(job) = &self.chd_open_job {
             let snap = job.snapshot();
@@ -2009,115 +1999,55 @@ impl BrowseView {
             self.ctl.apply(act);
         }
         if do_export {
-            self.export_marked(fmt);
+            self.export_marked(&ui.ctx().clone(), fmt);
         }
     }
 
-    /// Export the checkbox-marked entries together as one `format` output, reusing
-    /// the shared multi-entry engine (the same path Commander uses). Foreground
-    /// execution; classic-Mac payloads are typically small.
-    fn export_marked(&mut self, format: rusty_backup::fs::export_selection::ExportFormat) {
-        use rusty_backup::fs::export_selection::{export_to_file, export_to_folder};
-        if self.export_job.is_some() {
-            return;
-        }
-        let entries = self.marked_export_entries();
-        if entries.is_empty() {
-            self.edit_result = Some("Nothing selected to export.".into());
-            return;
-        }
-        let fork_mode = self.resource_fork_mode;
-        let (dest, to_file) = if format.is_single_file() {
-            let ext = format
-                .file_extension()
-                .map(|e| format!(".{e}"))
-                .unwrap_or_default();
-            let default_name = format!("selection{ext}");
-            let Some(path) = super::file_dialog()
-                .set_title("Export selection")
-                .set_file_name(&default_name)
-                .save_file()
-            else {
-                return;
-            };
-            (path, true)
-        } else {
-            let Some(dir) = super::file_dialog()
-                .set_title("Export selection to folder")
-                .pick_folder()
-            else {
-                return;
-            };
-            (dir, false)
-        };
-        let Some(mut fs) = self.take_or_open_fs() else {
-            self.edit_result = Some("Filesystem not open.".into());
-            return;
-        };
-        let target = dest.clone();
-        let job = rusty_backup::model::job::Job::spawn(
-            "Exporting the selection...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                let progress = |name: &str, done: usize, bytes: u64| {
-                    job.set_phase(format!("Exporting {name} ({done} done)"));
-                    job.set_bytes_so_far(bytes);
-                };
-                let cancelled = || job.is_cancelled();
-                let res = if to_file {
-                    export_to_file(&mut *fs, &entries, &target, format, &progress, &cancelled)
-                } else {
-                    export_to_folder(
-                        &mut *fs, &entries, &target, format, fork_mode, &progress, &cancelled,
-                    )
-                };
-                Ok((fs, res.map_err(|e| e.to_string())))
-            },
-        );
-        self.export_job = Some((job, dest));
-    }
-
-    fn poll_export_job(&mut self) {
-        use rusty_backup::model::job::Status;
-        let Some((job, _)) = &self.export_job else {
-            return;
-        };
-        let snap = job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let out = job.take_result();
-        let Some((_, dest)) = self.export_job.take() else {
-            return;
-        };
-        match (snap.status, out) {
-            (Status::Done, Some((fs, res))) => {
-                if self.cached_fs.is_none() {
-                    self.return_fs(fs);
-                }
-                self.report_export(res.map_err(|e| anyhow::anyhow!(e)), &dest);
-            }
-            (Status::Cancelled, _) => self.edit_result = Some("Export cancelled.".into()),
-            (Status::Failed(e), _) => self.edit_result = Some(format!("Export failed: {e}")),
-            _ => {}
-        }
-    }
-
-    /// Fold an export result into the status line.
-    fn report_export(
+    /// Export the marked rows as one `format` output through the screen's export (picker, job).
+    fn export_marked(
         &mut self,
-        res: anyhow::Result<rusty_backup::fs::export_selection::ExportSummary>,
-        path: &Path,
+        ctx: &egui::Context,
+        format: rusty_backup::fs::export_selection::ExportFormat,
     ) {
-        self.edit_result = Some(match res {
-            Ok(s) => format!(
-                "Exported {} item(s), {} to {}",
-                s.files,
-                disk_core::display::format_size(s.bytes),
-                path.display()
-            ),
-            Err(e) => format!("Export failed: {e}"),
-        });
+        if self.ctl.copy_job().is_some() {
+            return;
+        }
+        let fork = CommanderAction::SetForkMode(self.resource_fork_mode);
+        self.ctl.apply(fork);
+        let export = CommanderAction::Export {
+            from: Side::Left,
+            format: Some(format),
+        };
+        self.exporting = true;
+        self.dispatch(ctx, export);
+    }
+
+    /// The export's progress window, then its status line as the result.
+    fn poll_export(&mut self, ui: &mut egui::Ui) {
+        if !self.exporting {
+            return;
+        }
+        let Some((title, snap)) = self.ctl.copy_job() else {
+            // Not started (cancelled picker, nothing marked) or finished.
+            if !self.effects.modal_open() {
+                self.exporting = false;
+                let said = self.ctl.status();
+                if !said.is_empty() {
+                    self.edit_result = Some(said.to_string());
+                }
+            }
+            return;
+        };
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                cancel = super::progress::show_job(ui, &snap);
+            });
+        if cancel {
+            self.ctl.apply(CommanderAction::CancelCopy);
+        }
     }
 
     /// A staged add's label: green, blue when its type is unresolved, with its fork badge.
@@ -6573,12 +6503,6 @@ enum ApplyFollowUp {
 
 /// A sniff's result: the filesystem to put back (when there was one), and the archive kind found.
 type ArchiveSniff = (Option<Box<dyn Filesystem>>, Option<MacArchiveKind>);
-
-/// An "Export selection" job's result: the filesystem to put back, and the summary or error.
-type ExportRun = (
-    Box<dyn Filesystem>,
-    Result<rusty_backup::fs::export_selection::ExportSummary, String>,
-);
 
 /// What a tar-import job ended with.
 enum TarStep {

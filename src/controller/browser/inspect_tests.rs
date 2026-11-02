@@ -296,3 +296,36 @@ fn the_text_editor_saves_a_file_deep_in_the_tree_back_to_its_folder_on_apply() {
     assert_eq!(fs.read_file(&note, 64).unwrap(), b"two\r\n");
     assert!(crate::controller::browser::explorer_tests::root_file(&img, "NOTE.TXT").is_none());
 }
+
+#[test]
+fn marked_rows_from_an_expanded_folder_export_through_the_screen() {
+    use crate::controller::commander::screen::purpose as screen_purpose;
+    use crate::controller::commander::ExportFormat;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let sub = row(&ctl, "SUB").node_id;
+    pane(&mut ctl, A::ToggleExpand(sub));
+    settle(&mut ctl);
+    let deep = row(&ctl, "DEEP").node_id;
+    pane(
+        &mut ctl,
+        A::TreeClick {
+            node_id: deep,
+            ctrl: true,
+            shift: false,
+        },
+    );
+    let fx = ctl.apply(CommanderAction::Export {
+        from: Side::Left,
+        format: Some(ExportFormat::LooseFiles),
+    });
+    assert!(matches!(&fx[..], [Effect::PickFolder(p)] if p.purpose == screen_purpose::EXPORT));
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    ctl.apply(CommanderAction::Picked {
+        purpose: screen_purpose::EXPORT,
+        path: Some(out.clone()),
+    });
+    settle(&mut ctl);
+    assert!(out.join("DEEP").is_dir(), "{}", ctl.status());
+}
