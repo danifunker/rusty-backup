@@ -26,7 +26,7 @@ use super::context::TabContext;
 use super::effects::{EffectHost, Reply};
 use super::expand_hfs_dialog::ExpandHfsDialog;
 use super::floppy_convert_dialog::FloppyConvertDialog;
-use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
+use super::physical_disk_export::PhysicalDiskExport;
 
 fn new_controller() -> InspectController {
     InspectController::new(InspectServices {
@@ -164,6 +164,7 @@ impl InspectTab {
         self.pending_fx.extend(fx);
         self.carry_out_requests();
         self.drain_log(ctx);
+        self.physical_disk_export.poll(ctx);
     }
 
     fn drain_log(&mut self, ctx: &mut TabContext) {
@@ -484,9 +485,7 @@ impl InspectTab {
             self.act(InspectAction::DiskChanged);
         }
 
-        if self.physical_disk_export.open {
-            let _ = self.physical_disk_export.show(ui.ctx(), ctx);
-        }
+        self.physical_disk_export.show(ui.ctx(), ctx);
 
         ui.add_space(12.0);
 
@@ -947,15 +946,7 @@ impl InspectTab {
         } else if physical {
             if let Some(src) = self.ctl.physical_source() {
                 self.act(InspectAction::CloseExport);
-                self.physical_disk_export.open_for(
-                    PhysicalDiskExportSource {
-                        path: src.path,
-                        size_bytes: src.size_bytes,
-                        fs_hint: src.fs_hint,
-                        has_partition_table: src.has_partition_table,
-                    },
-                    self.ctl.table(),
-                );
+                self.physical_disk_export.open_for(src);
             }
         } else if cancel {
             self.act(InspectAction::CloseExport);

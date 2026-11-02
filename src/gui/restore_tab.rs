@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusty_backup::controller::disk_write::WriteOpen;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
     format_size, AlignmentChoice, HostRequest, LayoutFit, NewTableType, RestoreAction,
@@ -19,7 +20,7 @@ use rusty_backup::controller::{Controller as _, Effect};
 use super::context::TabContext;
 use super::effects::{EffectHost, Reply};
 use super::partition_bar::{PartitionBar, Segment, SegmentKind};
-use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
+use super::physical_disk_export::PhysicalDiskExport;
 use super::progress::ProgressState;
 use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 
@@ -106,6 +107,7 @@ impl RestoreTab {
     /// Drain the controller while another tab shows, so a job keeps reporting and its end is seen.
     pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
         self.poll(ctx, progress);
+        self.image_write.poll(ctx);
     }
 
     /// Send an action; its effects run on the next frame.
@@ -123,13 +125,7 @@ impl RestoreTab {
                         super::push_recent(rusty_backup::update::RecentMode::Restore, &path)
                 }
                 HostRequest::WriteImage { path, size } => {
-                    let source = PhysicalDiskExportSource {
-                        path,
-                        size_bytes: size,
-                        fs_hint: "image".to_string(),
-                        has_partition_table: true,
-                    };
-                    self.image_write.open_for(source, None);
+                    self.image_write.open_for(WriteOpen::image(path, size));
                 }
             }
         }
@@ -251,9 +247,7 @@ impl RestoreTab {
             RestoreMode::BuildDisk => self.show_build_disk_mode(ui, ctx, controls_enabled),
         }
 
-        if self.image_write.open {
-            let _ = self.image_write.show(ui.ctx(), ctx);
-        }
+        self.image_write.show(ui.ctx(), ctx);
         if self.ctl.builder_open() {
             self.show_build_disk_modal(ui);
         }

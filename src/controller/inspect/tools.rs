@@ -117,15 +117,6 @@ pub struct ResizePlan {
     pub path: PathBuf,
 }
 
-/// The Physical Disk Export window's source.
-pub struct PhysicalSource {
-    pub path: PathBuf,
-    /// The decoded disk size (a container's file size is not its disk size).
-    pub size_bytes: u64,
-    pub fs_hint: String,
-    pub has_partition_table: bool,
-}
-
 fn finished<R>(job: &Job<R>) -> Option<Result<R, String>> {
     match job.snapshot().status {
         Status::Running => None,
@@ -612,24 +603,20 @@ impl InspectController {
         }
     }
 
-    pub fn physical_source(&self) -> Option<PhysicalSource> {
+    /// What the Physical Disk Export window writes; the disk writer measures its decoded size.
+    pub fn physical_source(&self) -> Option<crate::controller::disk_write::WriteOpen> {
         let path = self.image_path()?.to_path_buf();
-        let size_bytes = crate::model::source_reader::decoded_image_size(path.as_path())
-            .unwrap_or_else(|| {
-                std::fs::metadata(path.as_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            });
-        let (fs_hint, has_partition_table) = match &self.found.table {
-            Some(PartitionTable::None { fs_hint, .. }) => (fs_hint.clone(), false),
-            Some(_) => ("partitioned".to_string(), true),
-            None => ("Unknown".to_string(), false),
+        let (fs_hint, has_partition_table, superfloppy) = match &self.found.table {
+            Some(PartitionTable::None { fs_hint, .. }) => (fs_hint.clone(), false, true),
+            Some(_) => ("partitioned".to_string(), true, false),
+            None => ("Unknown".to_string(), false, false),
         };
-        Some(PhysicalSource {
+        Some(crate::controller::disk_write::WriteOpen {
             path,
-            size_bytes,
+            size_bytes: None,
             fs_hint,
             has_partition_table,
+            superfloppy,
         })
     }
 
