@@ -19,5 +19,21 @@ pub use pane::{
 pub use rows::{DisplayRow, RowKind};
 pub use screen::{
     ChecksumRow, Checksums, CommanderAction, CommanderController, DetailField, ExportFormat,
-    FileDetail, HashAlgo, MetadataEdit, RenameNotice, ResourceForkMode, Side,
+    FileDetail, HashAlgo, IdNameMap, MetadataEdit, RenameNotice, ResourceForkMode, Side, SizePlan,
+    Xattr,
 };
+
+// Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
+pub use crate::model::edit_queue::EditQueue;
+pub use crate::model::job::JobRegistry;
+pub use disk_core::display::format_size;
+pub use disk_core::entry::FileEntry;
+
+/// A blank 2 MiB FAT volume at `dir/vol.img`, for view tests.
+#[cfg(test)]
+pub(crate) fn blank_fat_image(dir: &std::path::Path) -> std::path::PathBuf {
+    let img = dir.join("vol.img");
+    let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+    std::fs::write(&img, bytes).unwrap();
+    img
+}

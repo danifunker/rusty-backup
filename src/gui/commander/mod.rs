@@ -21,12 +21,12 @@ use eframe::egui;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    CommanderAction, CommanderController, CommanderPaneAction, ExportFormat, FileDetail, HashAlgo,
-    MetadataEdit, OnConflict, PaneServices, ResourceForkMode, Side,
+    format_size, CommanderAction, CommanderController, CommanderPaneAction, EditQueue,
+    ExportFormat, FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices,
+    ResourceForkMode, Side,
 };
 use rusty_backup::controller::keys::{Key, KeyMap, Mods};
 use rusty_backup::controller::Controller;
-use rusty_backup::model::edit_queue::EditQueue;
 
 use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
@@ -85,7 +85,7 @@ pub struct CommanderMode {
 
 impl CommanderMode {
     /// Both panes' jobs register in `jobs`, the app's registry.
-    pub fn new(jobs: rusty_backup::model::job::JobRegistry) -> Self {
+    pub fn new(jobs: JobRegistry) -> Self {
         let services = || PaneServices {
             jobs: jobs.clone(),
             notify: Arc::new(super::ui_logger::EguiWake),
@@ -455,11 +455,7 @@ impl CommanderMode {
                                 ui.add_space(6.0);
                                 ui.separator();
                             }
-                            ui.strong(format!(
-                                "{}  ({})",
-                                row.name,
-                                disk_core::display::format_size(row.size)
-                            ));
+                            ui.strong(format!("{}  ({})", row.name, format_size(row.size)));
                             if let Some(err) = &row.error {
                                 ui.colored_label(
                                     super::theme::danger_muted(ui.visuals()),

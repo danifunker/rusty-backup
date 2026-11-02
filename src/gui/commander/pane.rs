@@ -9,11 +9,10 @@
 
 use eframe::egui;
 
-use disk_core::display::format_size;
 use rusty_backup::controller::commander::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    CommanderAction, CommanderController, CommanderPaneAction, CommanderPaneController,
-    ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
+    format_size, CommanderAction, CommanderController, CommanderPaneAction,
+    CommanderPaneController, ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
 
 const ROW_H: f32 = 20.0;

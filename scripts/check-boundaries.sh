@@ -6,6 +6,8 @@
 #   - src/controller spawns no raw threads; slow work goes through model::job::Job.
 #   - shells (src/gui, the TUI, the optical browser) spawn no raw threads: use Job,
 #     worker::spawn_guarded or worker::spawn_detached, which catch panics (Phase 1).
+#   - views in ENFORCED (the Commander views, Phase 2 slice 9) name neither the engine/model
+#     nor a split crate: they use what src/controller re-exports.
 # Reported only (warn mode until Phase 2 makes the shells pure view):
 #   - shells reaching past the view-models into the engine or model.
 #
@@ -17,6 +19,7 @@ VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
 SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app src/optical/browse_view.rs)
+ENFORCED=(src/gui/commander src/cli/verbs/tui_app/commander.rs)
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'
@@ -36,6 +39,13 @@ if hits=$(grep -rnE "\b($TOOLKITS)::|extern crate ($TOOLKITS)\b" src/controller)
 fi
 if hits=$(grep -rnE "thread::spawn|std::thread::Builder" src/controller); then
   error "src/controller spawns threads; use model::job::Job:"; echo "$hits"
+fi
+
+# --- enforced: views that reach the model only through src/controller ---------
+ENGINE_REF="\b(rusty_backup|crate)::(\{[^}]*)?\b($ENGINE_MODS)\b|\b($SPLIT_CRATES)::"
+if hits=$(grep -rnE "$ENGINE_REF" "${ENFORCED[@]}"); then
+  error "an enforced view references the engine/model; re-export it from src/controller:"
+  echo "$hits"
 fi
 
 # --- reported: shells reaching past the view-models --------------------------
@@ -58,5 +68,5 @@ if [ "$VERBOSE" = 1 ]; then
   printf '%s\n' "$spawns" | cut -d: -f1 | sort | uniq -c | sort -rn
 fi
 
-[ "$fail" = 0 ] && echo "boundaries: src/controller is clean and shells spawn no raw threads"
+[ "$fail" = 0 ] && echo "boundaries: src/controller is clean, shells spawn no raw threads, ${ENFORCED[*]} reach the model only through src/controller"
 exit "$fail"

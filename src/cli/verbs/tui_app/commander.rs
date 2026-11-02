@@ -18,11 +18,11 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::{centered_rect, format_size, App, FilePicker, PickKind, PickResult};
+use super::{centered_rect, App, FilePicker, PickKind, PickResult};
 use crate::controller::commander::{
-    purpose, CommanderAction, CommanderController, CommanderPaneAction, CommanderPaneController,
-    DetailField, DisplayRow, FileDetail, HashAlgo, OnConflict, RowKind, Side,
-    MAX_CONSECUTIVE_FAILURES,
+    format_size, purpose, CommanderAction, CommanderController, CommanderPaneAction,
+    CommanderPaneController, DetailField, DisplayRow, FileDetail, HashAlgo, OnConflict, RowKind,
+    Side, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
@@ -1378,13 +1378,6 @@ mod tests {
         panic!("no row {name}");
     }
 
-    fn blank_fat(dir: &Path) -> std::path::PathBuf {
-        let img = dir.join("vol.img");
-        let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
-        std::fs::write(&img, bytes).unwrap();
-        img
-    }
-
     /// Left: a host folder holding `files`; right: a blank FAT image. The left pane is active.
     fn host_and_image(files: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, App) {
         let host = tempfile::tempdir().unwrap();
@@ -1392,7 +1385,7 @@ mod tests {
             std::fs::write(host.path().join(f), f.as_bytes()).unwrap();
         }
         let img = tempfile::tempdir().unwrap();
-        let path = blank_fat(img.path());
+        let path = crate::controller::commander::blank_fat_image(img.path());
         let mut app = commander_app();
         open_folder(&mut app, host.path());
         app.on_key(key(KeyCode::Tab));
