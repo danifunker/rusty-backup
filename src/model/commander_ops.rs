@@ -754,6 +754,49 @@ pub fn stage_host_to_image(entries: &[FileEntry], dest_parent: &FileEntry) -> Ve
     edits
 }
 
+/// Stage host files for a volume of `fs_type`: forks only into HFS / HFS+, and ProDOS takes
+/// CiderPress `#TTAAAA` name suffixes as the file's type and aux (what the Inspect tab always did).
+pub fn stage_host_for(
+    entries: &[FileEntry],
+    dest_parent: &FileEntry,
+    fs_type: &str,
+) -> Vec<StagedEdit> {
+    let mut edits = stage_host_to_image(entries, dest_parent);
+    let forks = matches!(fs_type, "HFS" | "HFS+" | "HFSX");
+    for edit in edits.iter_mut() {
+        let StagedEdit::AddFile {
+            name,
+            host_path,
+            size,
+            prodos_type,
+            prodos_aux,
+            resource_fork,
+            ..
+        } = edit
+        else {
+            continue;
+        };
+        if !forks && resource_fork.take().is_some() {
+            *name = host_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            *size = std::fs::metadata(&*host_path)
+                .map(|m| m.len())
+                .unwrap_or(*size);
+        }
+        if fs_type == "ProDOS" {
+            if let Some((stem, tt, aa)) = fs_apple2::prodos_types::decode_cp_suffix(name) {
+                let stem = stem.to_string();
+                *name = stem;
+                *prodos_type = Some(tt);
+                *prodos_aux = Some(aa);
+            }
+        }
+    }
+    edits
+}
+
 fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut Vec<StagedEdit>) {
     for entry in entries {
         if entry.is_directory() {
@@ -1818,6 +1861,26 @@ crate::model::worker::finished_with_error!(HostCopyStatus, StageCopyStatus);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_host_for_reads_prodos_suffixes_and_keeps_forks_to_hfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("PROG#060800");
+        std::fs::write(&file, b"x").unwrap();
+        let host = FileEntry::new_file("PROG#060800".into(), file.display().to_string(), 1, 0);
+        let root = FileEntry::root();
+        let named = |fs: &str| match &stage_host_for(std::slice::from_ref(&host), &root, fs)[0] {
+            StagedEdit::AddFile {
+                name,
+                prodos_type,
+                prodos_aux,
+                ..
+            } => (name.clone(), *prodos_type, *prodos_aux),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(named("ProDOS"), ("PROG".into(), Some(0x06), Some(0x0800)));
+        assert_eq!(named("FAT16"), ("PROG#060800".into(), None, None));
+    }
     use disk_core::entry::FileEntry;
 
     /// X12: a host copy wrote over existing files without asking. The

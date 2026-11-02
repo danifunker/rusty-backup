@@ -172,6 +172,13 @@ pub enum BrowserPaneAction {
     },
     /// Pick a host file and stage it into the current folder.
     Import,
+    /// Stage these host files and folders into `folder` (a path), or the target folder when `None`.
+    AddHostPaths {
+        paths: Vec<PathBuf>,
+        folder: Option<String>,
+    },
+    /// Close the list of host items that could not be staged.
+    DismissStagingErrors,
     /// Open the metadata form for the cursor row.
     EditMetadata,
     SubmitMetadata(Box<MetadataFields>),
@@ -428,7 +435,7 @@ impl BrowserPaneController {
             A::Repair => (p.tools.repair && !p.read_only, "repair"),
             A::Bless => (p.tools.bless && !p.read_only, "bless"),
             A::EditText | A::SaveText { .. } => (p.tools.text_edit && !p.read_only, "editing text"),
-            A::Import => (p.tools.import && !p.read_only, "import"),
+            A::Import | A::AddHostPaths { .. } => (p.tools.import && !p.read_only, "import"),
             A::EditMetadata | A::SubmitMetadata(_) => {
                 (p.tools.metadata && !p.read_only, "editing metadata")
             }

@@ -143,8 +143,6 @@ pub struct BrowseView {
     edit_supported: bool,
     /// Status message from last edit operation.
     edit_result: Option<String>,
-    /// Entry pending deletion (for confirmation dialog).
-    pending_delete: Option<(FileEntry, FileEntry, bool)>, // (parent, entry, recursive)
     /// Context for backup archive editing (decompress → edit → recompress).
     archive_edit_ctx: Option<ArchiveEditContext>,
     /// Progress for archive edit background operations.
@@ -467,7 +465,6 @@ impl Default for BrowseView {
             edit_mode: false,
             edit_supported: false,
             edit_result: None,
-            pending_delete: None,
             archive_edit_ctx: None,
             archive_edit_progress: None,
             archive_temp_path: None,
@@ -809,7 +806,6 @@ impl BrowseView {
         self.edit_mode = false;
         self.edit_supported = false;
         self.edit_result = None;
-        self.pending_delete = None;
         self.blessed_folder = None;
         self.fsck_result = None;
         self.show_fsck_popup = false;
@@ -968,17 +964,6 @@ impl BrowseView {
         }
         // A failed open or read caches "not an archive" for this path instead of retrying every frame.
         self.archive_sniff = Some((path, kind));
-    }
-
-    /// Validate a filename against the current filesystem's rules at
-    /// staging time, so invalid names are rejected before apply.
-    fn validate_staged_name(&self, name: &str) -> Result<(), String> {
-        // A naming-rule check: the open filesystem answers it without reopening the volume.
-        if let Some(fs) = &self.cached_fs {
-            return fs.validate_name(name).map_err(|e| e.to_string());
-        }
-        let fs = self.session.open().map_err(|e| e.to_string())?;
-        fs.validate_name(name).map_err(|e| e.to_string())
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -1242,7 +1227,6 @@ impl BrowseView {
                         } else {
                             self.edit_mode = false;
                             self.edit_result = None;
-                            self.pending_delete = None;
                             self.ctl.host_pane().queue.clear();
                             self.pending_archive_imports.clear();
                             self.archive_import_tempdir = None;
@@ -1469,7 +1453,6 @@ impl BrowseView {
         }
 
         // Delete confirmation dialog
-        self.render_delete_dialog(ui);
 
         // Unsaved changes dialog
         self.render_unsaved_dialog(ui);
@@ -2718,7 +2701,6 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
         self.edit_result = None;
-        self.pending_delete = None;
 
         // Close the browser while compressing to release the temp file.
         self.ctl = new_controller();
@@ -3411,11 +3393,8 @@ impl BrowseView {
             }
             Some(1) => {
                 self.pending_tar_add = None;
-                let parent = self.current_parent_entry();
-                match self.add_host_file(&path, &parent) {
-                    Ok(()) => self.edit_result = Some(format!("Staged \"{name}\" as a file")),
-                    Err(e) => self.edit_result = Some(format!("Could not add \"{name}\": {e}")),
-                }
+                let folder = Some(self.current_parent_entry().path);
+                self.stage_paths(vec![path.clone()], folder);
             }
             Some(_) => self.pending_tar_add = None, // cancel / window closed
             None => {}
@@ -3519,56 +3498,15 @@ impl BrowseView {
                 self.run_effects(&ui.ctx().clone(), fx);
             }
 
-            // Delete button (enabled when something is selected)
-            let has_selection = self.selected_entry.is_some()
-                && self
-                    .selected_entry
-                    .as_ref()
-                    .map(|e| e.path != "/")
-                    .unwrap_or(false);
+            // Delete acts on the marks, else the cursor row; a full folder asks first.
+            let has_selection = self.selected_entry.as_ref().is_some_and(|e| e.path != "/");
+            let deletable = has_selection || self.ctl.pane(Side::Left).has_selection();
             if ui
-                .add_enabled(has_selection, egui::Button::new("Delete"))
+                .add_enabled(deletable, egui::Button::new("Delete"))
                 .clicked()
             {
-                if let Some(ref sel) = self.selected_entry.clone() {
-                    // If it's a pending-add, just remove it from staged_edits.
-                    // For pending directories, also drop every nested staged
-                    // edit so we don't leave AddFile orphans whose parent.path
-                    // no longer resolves at apply time.
-                    if self.ctl.pane(Side::Left).queue.is_pending_add(&sel.path) {
-                        let removed = if sel.is_directory() {
-                            self.ctl.host_pane().queue.remove_pending_subtree(&sel.path)
-                        } else {
-                            self.ctl.host_pane().queue.remove_pending_add(&sel.path) as usize
-                        };
-                        self.edit_result = if sel.is_directory() && removed > 1 {
-                            Some(format!(
-                                "Unstaged '{}' and {} nested edit(s)",
-                                sel.name,
-                                removed - 1
-                            ))
-                        } else {
-                            Some(format!("Unstaged '{}'", sel.name))
-                        };
-                        self.selected_entry = None;
-                        self.side_ed = DetailEditors::default();
-                    } else {
-                        // The selection's own parent: a selected directory is
-                        // not its own parent.
-                        let parent = self
-                            .parent_entry_of_path(&sel.path)
-                            .unwrap_or_else(|| self.root_entry());
-                        // Not listed yet counts as non-empty.
-                        let is_non_empty_dir = sel.is_directory()
-                            && self
-                                .ctl
-                                .pane(Side::Left)
-                                .folder_children(&sel.path)
-                                .map(|c| !c.is_empty())
-                                .unwrap_or(true);
-                        self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
-                    }
-                }
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::Delete);
+                self.dispatch(&ui.ctx().clone(), act);
             }
 
             // Set ProDOS Type… button (ProDOS only, file selected)
@@ -3774,161 +3712,34 @@ impl BrowseView {
         }
     }
 
-    /// Stage files/folders from host paths for adding to the current directory.
-    ///
-    /// Individual failures (invalid filename, IO error, …) are collected into
-    /// `staging_errors` and surfaced via the staging-errors modal dialog. The
-    /// rest of the batch is still staged so the user does not lose successful
-    /// items just because one file had a bad name.
+    /// Stage host paths through the pane; a tar or (on HFS) a Mac archive asks how to import it first.
     fn add_host_paths(&mut self, paths: &[PathBuf]) {
         let parent = self.current_parent_entry();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        let mut staged_count = 0usize;
-
+        let mut plain = Vec::new();
         for path in paths {
-            if path.is_dir() {
-                staged_count += self.stage_host_directory(path, &parent, &mut errors);
-            } else if path.is_file() {
-                staged_count += self.stage_host_file(path, &parent, &mut errors);
+            if path.is_file() && fs_tar::tar_import::looks_like_tar_archive(path) {
+                self.pending_tar_add = Some(path.clone());
+            } else if !(path.is_file()
+                && self.is_hfs_type()
+                && self.queue_archive_import_if_applicable(path, &parent))
+            {
+                plain.push(path.clone());
             }
         }
-
-        if !errors.is_empty() {
-            self.staging_errors = errors;
-            self.show_staging_errors = true;
-            self.edit_result = Some(format!(
-                "Staged {staged_count} item(s); {} failed - see dialog",
-                self.staging_errors.len()
-            ));
-        } else if staged_count > 0 {
-            self.edit_result = Some(format!("Staged {staged_count} item(s)"));
-        }
+        self.stage_paths(plain, None);
     }
 
-    /// Try to stage a single host file, pushing any error into `errors`.
-    /// Returns 1 on success, 0 on failure/skip.
-    fn stage_host_file(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-        errors: &mut Vec<(PathBuf, String)>,
-    ) -> usize {
-        // Tar archives (.tar / .tar.gz / .tar.zst), content-sniffed so a gzip
-        // disk image isn't mistaken for one: intercept before staging and let
-        // the modal ask whether to import the contents into the image or add
-        // the archive as a plain file. Works on any editable filesystem.
-        if fs_tar::tar_import::looks_like_tar_archive(host_path) {
-            self.pending_tar_add = Some(host_path.to_path_buf());
-            return 1;
+    /// Stage host files and folders into `folder` (the pane's target folder when `None`).
+    fn stage_paths(&mut self, paths: Vec<PathBuf>, folder: Option<String>) {
+        if paths.is_empty() {
+            return;
         }
-
-        // Workflow A: if the target FS is HFS/HFS+ and the file's bytes
-        // sniff as a Mac archive, intercept before staging — the modal
-        // asks the user whether to convert/expand the archive or add it
-        // as-is. Non-HFS targets don't have a resource-fork story so
-        // they fall through to the existing add-as-binary path.
-        if self.is_hfs_type() && self.queue_archive_import_if_applicable(host_path, parent) {
-            return 1;
+        let act = BrowserPaneAction::AddHostPaths { paths, folder };
+        // A staging pane answers with status lines only; nothing here asks the user.
+        for fx in self.ctl.apply(CommanderAction::Pane(Side::Left, act)) {
+            log::debug!("staging: {fx:?}");
         }
-        // Silently skip resource fork sidecars — they'll be consumed
-        // with their primary file.
-        if resource_fork::is_resource_fork_sidecar(host_path) {
-            return 0;
-        }
-        match self.add_host_file(host_path, parent) {
-            Ok(()) => 1,
-            Err(e) => {
-                errors.push((host_path.to_path_buf(), e));
-                0
-            }
-        }
-    }
-
-    /// Try to stage a host directory (and its contents), continuing past
-    /// individual child failures so one bad file does not abort the whole
-    /// tree. Returns the number of items that were successfully staged.
-    fn stage_host_directory(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-        errors: &mut Vec<(PathBuf, String)>,
-    ) -> usize {
-        let name = match host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-        {
-            Some(n) => n,
-            None => {
-                errors.push((host_path.to_path_buf(), "invalid directory name".into()));
-                return 0;
-            }
-        };
-
-        // Validate the directory name against the target filesystem's rules
-        // before staging the CreateDirectory edit.
-        if let Err(e) = self.validate_staged_name(&name) {
-            errors.push((host_path.to_path_buf(), e));
-            return 0;
-        }
-
-        // Duplicate-name check against pending adds in this parent.
-        let pending = self
-            .ctl
-            .pane(Side::Left)
-            .queue
-            .pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            errors.push((
-                host_path.to_path_buf(),
-                format!("'{name}' is already staged in this directory"),
-            ));
-            return 0;
-        }
-
-        self.ctl
-            .host_pane()
-            .queue
-            .push(StagedEdit::CreateDirectory {
-                parent: parent.clone(),
-                name: name.clone(),
-                qnx2_attrs: None,
-            });
-
-        // Build a synthetic FileEntry for children to reference as parent.
-        let dir_path = if parent.path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        let new_dir = FileEntry::new_directory(name, dir_path, 0);
-
-        let mut count = 1usize; // count the directory itself
-
-        let entries = match std::fs::read_dir(host_path) {
-            Ok(e) => e,
-            Err(e) => {
-                errors.push((host_path.to_path_buf(), e.to_string()));
-                return count;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    errors.push((host_path.to_path_buf(), e.to_string()));
-                    continue;
-                }
-            };
-            let child_path = entry.path();
-            if child_path.is_dir() {
-                count += self.stage_host_directory(&child_path, &new_dir, errors);
-            } else if child_path.is_file() {
-                count += self.stage_host_file(&child_path, &new_dir, errors);
-            }
-        }
-
-        count
+        self.edit_result = Some(self.ctl.status().to_string());
     }
 
     /// Workflow A: sniff the picked host file for a Mac archive kind.
@@ -4030,21 +3841,7 @@ impl BrowseView {
             .filter_map(|r| r.ok())
             .map(|e| e.path())
             .collect();
-        let parent = pending.parent.clone();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        for p in &children {
-            if p.is_dir() {
-                self.stage_host_directory(p, &parent, &mut errors);
-            } else if p.is_file() {
-                self.stage_host_file(p, &parent, &mut errors);
-            }
-        }
-        if !errors.is_empty() {
-            // Surface partial-failure detail through the standard
-            // staging-errors dialog.
-            self.staging_errors.extend(errors);
-            self.show_staging_errors = true;
-        }
+        self.stage_paths(children, Some(pending.parent.path.clone()));
         Ok(())
     }
 
@@ -4068,13 +3865,7 @@ impl BrowseView {
         let inner_path = subdir.join(&inner_name);
         std::fs::write(&inner_path, &bh.data_fork)
             .map_err(|e| format!("write inner archive: {e}"))?;
-        let parent = pending.parent.clone();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        self.stage_host_file(&inner_path, &parent, &mut errors);
-        if !errors.is_empty() {
-            self.staging_errors.extend(errors);
-            self.show_staging_errors = true;
-        }
+        self.stage_paths(vec![inner_path], Some(pending.parent.path.clone()));
         Ok(())
     }
 
@@ -4082,11 +3873,9 @@ impl BrowseView {
     /// picked file unchanged through the regular add-host-file path.
     /// Direct call (bypasses queue_archive_import_if_applicable).
     fn apply_archive_import_as_is(&mut self, pending: &PendingArchiveImport) -> Result<(), String> {
-        let parent = pending.parent.clone();
-        match self.add_host_file(&pending.host_path, &parent) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
-        }
+        let folder = Some(pending.parent.path.clone());
+        self.stage_paths(vec![pending.host_path.clone()], folder);
+        Ok(())
     }
 
     /// Workflow E trigger: read the selected file's bytes off the disk
@@ -4265,111 +4054,6 @@ impl BrowseView {
         }
     }
 
-    /// Add a single host file to a parent directory on the image.
-    fn add_host_file(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-    ) -> Result<(), String> {
-        let raw_name = host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("invalid filename")?
-            .to_string();
-
-        // ProDOS targets: strip any trailing CiderPress `#TTAAAA` suffix from
-        // the host filename and use the decoded (type, aux) as staged
-        // overrides so the round-trip `drag-out → drag-back-in` is lossless.
-        let (name, prodos_type, prodos_aux) = if self.is_prodos_type() {
-            match fs_apple2::prodos_types::decode_cp_suffix(&raw_name) {
-                Some((stem, tt, aa)) => (stem.to_string(), Some(tt), Some(aa)),
-                None => (raw_name, None, None),
-            }
-        } else {
-            (raw_name, None, None)
-        };
-
-        // Detect resource fork from host (native, AppleDouble, MacBinary, .rsrc)
-        let rsrc_import = if self.is_hfs_type() {
-            resource_fork::detect_resource_fork(host_path)
-        } else {
-            None
-        };
-
-        // For MacBinary imports the "file" is a container — use the data fork
-        // size from inside the container, not the container's file size.
-        let (effective_path, size) = if let Some(ref imp) = rsrc_import {
-            if let Some(ref data_fork) = imp.data_fork {
-                // MacBinary: we'll write the extracted data fork, not the .bin file
-                (host_path.to_path_buf(), data_fork.len() as u64)
-            } else {
-                let sz = std::fs::metadata(host_path)
-                    .map_err(|e| e.to_string())?
-                    .len();
-                (host_path.to_path_buf(), sz)
-            }
-        } else {
-            let sz = std::fs::metadata(host_path)
-                .map_err(|e| e.to_string())?
-                .len();
-            (host_path.to_path_buf(), sz)
-        };
-
-        // Validate the name against the target filesystem's rules before
-        // staging so that clearly-bad names are rejected up-front.
-        self.validate_staged_name(&name)
-            .map_err(|e| format!("'{name}': {e}"))?;
-
-        // Check for duplicate name in pending adds for this parent
-        let pending = self
-            .ctl
-            .pane(Side::Left)
-            .queue
-            .pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            return Err(format!("'{name}' is already staged in this directory"));
-        }
-
-        self.ctl.host_pane().queue.push(StagedEdit::AddFile {
-            parent: parent.clone(),
-            name,
-            host_path: effective_path,
-            size,
-            prodos_type,
-            prodos_aux,
-            resource_fork: rsrc_import,
-            hfs_type_override: None,
-            hfs_creator_override: None,
-            dates: None,
-            // Set from the conflict review shown before Apply; staging one is
-            // not the moment to decide, because the user has not been asked yet.
-            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
-        });
-        Ok(())
-    }
-
-    /// Stage a delete operation.
-    fn perform_delete(&mut self, parent: &FileEntry, entry: &FileEntry, recursive: bool) {
-        let entry_name = entry.name.clone();
-
-        if recursive {
-            self.ctl
-                .host_pane()
-                .queue
-                .push(StagedEdit::DeleteRecursive {
-                    parent: parent.clone(),
-                    entry: entry.clone(),
-                });
-        } else {
-            self.ctl.host_pane().queue.push(StagedEdit::DeleteEntry {
-                parent: parent.clone(),
-                entry: entry.clone(),
-            });
-        }
-
-        self.edit_result = Some(format!("Staged delete of '{entry_name}'"));
-    }
-
     /// Apply all staged edits to the filesystem in a single batch.
     /// Returns false when the batch was deferred to the conflict review; the
     /// callers used to read that as success and dropped the queue.
@@ -4488,26 +4172,6 @@ impl BrowseView {
     }
 
     /// Render the delete confirmation dialog.
-    fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
-        if let Some((parent, entry, is_non_empty)) = self.pending_delete.clone() {
-            let title = if is_non_empty {
-                format!("Delete '{}' and all its contents?", entry.name)
-            } else {
-                format!("Delete '{}'?", entry.name)
-            };
-            ui.horizontal(|ui| {
-                ui.colored_label(super::theme::warning(ui.visuals()), &title);
-                if ui.button("Yes, delete").clicked() {
-                    self.pending_delete = None;
-                    self.perform_delete(&parent, &entry, is_non_empty);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.pending_delete = None;
-                }
-            });
-        }
-    }
-
     /// Render the unsaved changes confirmation dialog.
     /// Open a text file in the editor window, decoding it the way the CLI and
     /// TUI editors do.
@@ -4665,48 +4329,19 @@ impl BrowseView {
                 ui.label(format!("You have {count} unsaved edit(s)."));
                 ui.add_space(4.0);
 
-                // Summary
-                let mut files_added = 0usize;
-                let mut dirs_added = 0usize;
-                let mut entries_deleted = 0usize;
-                let mut bytes_added: u64 = 0;
-                for edit in self.ctl.pane(Side::Left).queue.iter() {
-                    match edit {
-                        StagedEdit::AddFile { size, .. } => {
-                            files_added += 1;
-                            bytes_added += size;
-                        }
-                        StagedEdit::CreateDirectory { .. } => dirs_added += 1,
-                        StagedEdit::DeleteEntry { .. } | StagedEdit::DeleteRecursive { .. } => {
-                            entries_deleted += 1
-                        }
-                        _ => {}
-                    }
-                }
-                let mut parts = Vec::new();
-                if files_added > 0 {
-                    parts.push(format!("{files_added} file(s) added"));
-                }
-                if dirs_added > 0 {
-                    parts.push(format!("{dirs_added} folder(s) added"));
-                }
-                if entries_deleted > 0 {
-                    parts.push(format!("{entries_deleted} item(s) deleted"));
-                }
-                if !parts.is_empty() {
-                    ui.label(parts.join(", "));
-                }
-                if bytes_added > 0 {
-                    ui.label(format!(
-                        "Net data: +{}",
-                        disk_core::display::format_size(bytes_added)
-                    ));
+                for line in self.ctl.pane(Side::Left).staged_summary() {
+                    ui.label(line);
                 }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Discard Edits").clicked() {
-                        self.ctl.host_pane().queue.clear();
+                        // The dialog is the confirmation, so answer the pane's own discard question.
+                        let yes = BrowserPaneAction::Confirmed {
+                            purpose: rusty_backup::controller::commander::purpose::DISCARD_STAGED,
+                            yes: true,
+                        };
+                        self.ctl.apply(CommanderAction::Pane(Side::Left, yes));
                         self.pending_archive_imports.clear();
                         self.archive_import_tempdir = None;
                         self.show_unsaved_dialog = false;
@@ -5345,7 +4980,6 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
         self.edit_result = None;
-        self.pending_delete = None;
         self.ctl.host_pane().queue.clear();
         self.pending_archive_imports.clear();
         self.archive_import_tempdir = None;
@@ -5357,11 +4991,14 @@ impl BrowseView {
         }
     }
 
-    /// Render a modal listing files that failed to stage, with the reason
-    /// for each failure. The list is built by `add_host_paths` and persists
-    /// until the user dismisses the dialog.
+    /// The items that could not be staged: the pane's host staging, then an archive import's failure.
     fn render_staging_errors_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_staging_errors {
+        let mut rows: Vec<(String, String)> = self.ctl.pane(Side::Left).staging_errors().to_vec();
+        if self.show_staging_errors {
+            let own = self.staging_errors.iter();
+            rows.extend(own.map(|(p, why)| (p.display().to_string(), why.clone())));
+        }
+        if rows.is_empty() {
             return;
         }
         let mut open = true;
@@ -5377,7 +5014,7 @@ impl BrowseView {
                     super::theme::warning(ui.visuals()),
                     format!(
                         "{} item(s) could not be staged for the [{}] filesystem:",
-                        self.staging_errors.len(),
+                        rows.len(),
                         self.fs_type
                     ),
                 );
@@ -5387,18 +5024,18 @@ impl BrowseView {
                     .auto_shrink([false, false])
                     .max_height(220.0)
                     .show(ui, |ui| {
-                        for (path, reason) in &self.staging_errors {
-                            let label = path
+                        for (path, reason) in &rows {
+                            let label = Path::new(path)
                                 .file_name()
                                 .and_then(|n| n.to_str())
-                                .unwrap_or_else(|| path.to_str().unwrap_or("?"));
+                                .unwrap_or(path);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(label).strong());
                                 ui.label("-");
                                 ui.colored_label(super::theme::danger(ui.visuals()), reason);
                             });
                             ui.label(
-                                egui::RichText::new(path.display().to_string())
+                                egui::RichText::new(path)
                                     .small()
                                     .color(super::theme::muted(ui.visuals())),
                             );
@@ -5415,6 +5052,8 @@ impl BrowseView {
         if !open || dismiss {
             self.show_staging_errors = false;
             self.staging_errors.clear();
+            let act = BrowserPaneAction::DismissStagingErrors;
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
         }
     }
 

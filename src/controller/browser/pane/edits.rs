@@ -237,6 +237,43 @@ impl BrowserPaneController {
         self.queue.describe()
     }
 
+    /// The staged edits in one or two lines: adds, folders and deletes, then the data added.
+    pub fn staged_summary(&self) -> Vec<String> {
+        let (mut files, mut dirs, mut deleted, mut bytes) = (0usize, 0usize, 0usize, 0u64);
+        for edit in self.queue.iter() {
+            match edit {
+                StagedEdit::AddFile { size, .. } => {
+                    files += 1;
+                    bytes += size;
+                }
+                StagedEdit::CreateDirectory { .. } => dirs += 1,
+                StagedEdit::DeleteEntry { .. } | StagedEdit::DeleteRecursive { .. } => deleted += 1,
+                _ => {}
+            }
+        }
+        let counts = [
+            (files, "file(s) added"),
+            (dirs, "folder(s) added"),
+            (deleted, "item(s) deleted"),
+        ];
+        let parts: Vec<String> = counts
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{n} {what}"))
+            .collect();
+        let mut out = Vec::new();
+        if !parts.is_empty() {
+            out.push(parts.join(", "));
+        }
+        if bytes > 0 {
+            out.push(format!(
+                "Net data: +{}",
+                disk_core::display::format_size(bytes)
+            ));
+        }
+        out
+    }
+
     /// The preflight findings waiting for `ApplyReviewed` or `DismissReview`.
     pub fn apply_review(&self) -> Option<&ApplyPreflight> {
         match &self.ed.apply {
@@ -621,6 +658,15 @@ impl BrowserPaneController {
                     _ => Vec::new(),
                 }
             }
+            A::Confirmed { purpose, yes } if purpose == purpose::DELETE_FOLDERS => {
+                match self.ed.image_delete.take() {
+                    Some(pairs) if yes && !self.is_busy() => {
+                        self.toggle_delete(&pairs);
+                        msg(format!("toggled delete on {} item(s).", pairs.len()))
+                    }
+                    _ => Vec::new(),
+                }
+            }
             A::Confirmed { purpose, yes } if purpose == purpose::DISCARD_STAGED => {
                 if !yes || self.is_busy() {
                     return Ok(Vec::new());
@@ -639,6 +685,7 @@ impl BrowserPaneController {
     }
 
     fn delete(&mut self) -> Vec<Effect> {
+        self.select_cursor_if_none(true);
         if self.tree_active() {
             return msg("wrapper contents are read-only (copy out, don't edit).");
         }
@@ -673,6 +720,27 @@ impl BrowserPaneController {
                 destructive: true,
             })];
         }
+        if !self.listing.is_host() && self.profile.confirm_folder_delete {
+            let full: Vec<String> = pairs
+                .iter()
+                .filter(|(_, e)| self.holds_anything(e))
+                .map(|(_, e)| e.name.clone())
+                .collect();
+            if !full.is_empty() {
+                self.ed.image_delete = Some(pairs);
+                let what = match full.as_slice() {
+                    [one] => format!("'{one}' and all its contents"),
+                    _ => format!("{} folders and all their contents", full.len()),
+                };
+                return vec![Effect::Confirm(ConfirmSpec {
+                    purpose: purpose::DELETE_FOLDERS,
+                    title: "Delete folder?".into(),
+                    message: format!("Stage the delete of {what}?"),
+                    confirm_label: "Delete".into(),
+                    destructive: true,
+                })];
+            }
+        }
         if !self.listing.is_host() {
             self.toggle_delete(&pairs);
             return msg(format!("toggled delete on {} item(s).", pairs.len()));
@@ -694,6 +762,13 @@ impl BrowserPaneController {
             confirm_label: "Delete".into(),
             destructive: true,
         })]
+    }
+
+    /// A real folder about to be staged for delete that holds something (or is not listed yet).
+    fn holds_anything(&self, e: &FileEntry) -> bool {
+        let staged = self.queue.is_pending_add(&e.path) || self.queue.is_pending_delete(&e.path);
+        let listed = self.folder_children(&e.path).map(|c| !c.is_empty());
+        e.is_directory() && !staged && listed.unwrap_or(true)
     }
 
     /// The selection as (folder, entry) pairs: the listing's (with its staged adds), then the deep rows.

@@ -119,6 +119,8 @@ pub struct PaneProfile {
     pub rename: bool,
     pub new_folder: bool,
     pub delete: bool,
+    /// Ask before staging the delete of a folder that holds anything.
+    pub confirm_folder_delete: bool,
     /// Archives and disk images expand in place under their row.
     pub wrappers: bool,
     /// The listing style a new pane starts in (a remembered choice replaces it).
@@ -141,6 +143,7 @@ impl PaneProfile {
             rename: true,
             new_folder: true,
             delete: true,
+            confirm_folder_delete: false,
             wrappers: true,
             listing: ListingStyle::FlatList,
             styles: &ListingStyle::ALL,
@@ -168,6 +171,7 @@ impl PaneProfile {
             rename: true,
             new_folder: true,
             delete: true,
+            confirm_folder_delete: false,
             wrappers: true,
             listing: ListingStyle::TreeAndList,
             styles: &ListingStyle::ALL,
@@ -195,6 +199,7 @@ impl PaneProfile {
             rename: true,
             new_folder: true,
             delete: true,
+            confirm_folder_delete: true,
             wrappers: true,
             listing: ListingStyle::CombinedTree,
             styles: &ListingStyle::ALL,

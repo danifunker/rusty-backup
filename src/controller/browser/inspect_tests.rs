@@ -384,7 +384,16 @@ fn marks_mix_levels_and_delete_and_export_act_on_all_of_them() {
     assert!(out.join("SUB").join("DEEP").is_dir(), "{}", ctl.status());
     assert_eq!(std::fs::read(out.join("HELLO.TXT")).unwrap(), b"hello\r\n");
 
-    pane(&mut ctl, A::Delete);
+    // DEEP was never listed, so it may hold something: the delete asks first.
+    let fx = pane(&mut ctl, A::Delete);
+    assert!(matches!(&fx[..], [Effect::Confirm(c)] if c.purpose == purpose::DELETE_FOLDERS));
+    pane(
+        &mut ctl,
+        A::Confirmed {
+            purpose: purpose::DELETE_FOLDERS,
+            yes: true,
+        },
+    );
     let p = ctl.pane(Side::Left);
     let staged: Vec<(String, String)> = p
         .queue
@@ -431,4 +440,89 @@ fn marks_from_both_levels_copy_and_checksum_together() {
     let sums = ctl.checksums().expect("the checksum window");
     let rows: Vec<&str> = sums.rows.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(rows, ["HELLO.TXT"], "folders are skipped");
+}
+
+#[test]
+fn delete_asks_before_a_full_folder_and_takes_the_cursor_row_when_nothing_is_marked() {
+    use crate::model::edit_queue::StagedEdit;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = inspect(&fat_volume(dir.path()));
+    let id = row(&ctl, "HELLO.TXT").node_id;
+    pane(&mut ctl, A::CursorTo(id));
+    let fx = pane(&mut ctl, A::Delete);
+    assert!(fx.is_empty(), "a file needs no question: {fx:?}");
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1);
+    pane(&mut ctl, A::ClearSelection);
+    let id = row(&ctl, "SUB").node_id;
+    pane(&mut ctl, A::CursorTo(id));
+    let fx = pane(&mut ctl, A::Delete);
+    let Some(Effect::Confirm(spec)) = fx.first() else {
+        panic!("{fx:?}");
+    };
+    assert_eq!(spec.purpose, purpose::DELETE_FOLDERS);
+    assert!(
+        spec.message.contains("'SUB' and all its contents"),
+        "{}",
+        spec.message
+    );
+    pane(
+        &mut ctl,
+        A::Confirmed {
+            purpose: purpose::DELETE_FOLDERS,
+            yes: false,
+        },
+    );
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1, "no stages nothing");
+    pane(&mut ctl, A::Delete);
+    pane(
+        &mut ctl,
+        A::Confirmed {
+            purpose: purpose::DELETE_FOLDERS,
+            yes: true,
+        },
+    );
+    let p = ctl.pane(Side::Left);
+    assert!(matches!(
+        p.queue.iter().last(),
+        Some(StagedEdit::DeleteRecursive { entry, .. }) if entry.name == "SUB"
+    ));
+    assert_eq!(p.staged_summary(), ["2 item(s) deleted"]);
+}
+
+#[test]
+fn host_paths_stage_into_a_folder_and_list_what_could_not_be_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = fat_volume(dir.path());
+    let host = dir.path().join("TREE");
+    std::fs::create_dir(&host).unwrap();
+    std::fs::write(host.join("A.TXT"), b"aaa").unwrap();
+    let missing = dir.path().join("GONE.TXT");
+    let mut ctl = inspect(&img);
+    let add = A::AddHostPaths {
+        paths: vec![host.clone(), missing.clone()],
+        folder: Some("/SUB".into()),
+    };
+    ctl.host_pane().set_read_only(true);
+    pane(&mut ctl, add.clone());
+    assert!(ctl.pane(Side::Left).queue.is_empty(), "Edit Mode off");
+    ctl.host_pane().set_read_only(false);
+    pane(&mut ctl, add);
+    let p = ctl.pane(Side::Left);
+    let adds = p.queue.pending_adds_for("/SUB");
+    assert_eq!(adds.len(), 1, "{:?}", p.edit_lines());
+    assert_eq!(p.queue.pending_adds_for("/SUB/TREE")[0].name, "A.TXT");
+    assert_eq!(
+        p.staged_summary(),
+        ["1 file(s) added, 1 folder(s) added", "Net data: +3 B"]
+    );
+    let errors = p.staging_errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, missing.display().to_string());
+    assert!(
+        ctl.status().contains("1 could not be staged"),
+        "{}",
+        ctl.status()
+    );
+    pane(&mut ctl, A::DismissStagingErrors);
+    assert!(ctl.pane(Side::Left).staging_errors().is_empty());
 }

@@ -15,7 +15,7 @@ use super::source::purpose;
 use super::{BrowserPaneAction, BrowserPaneController};
 use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::model::browse_session::BrowseSession;
-use crate::model::commander_ops::{stage_host_to_image, StageSource};
+use crate::model::commander_ops::{stage_host_for, stage_host_to_image, StageSource};
 use crate::model::edit_queue::{MetadataEdit, StagedEdit};
 use crate::model::job::{Job, Status};
 use crate::model::text_edit::{decode_for_edit, encode_after_edit, TextEditError, TextShape};
@@ -86,6 +86,8 @@ pub(super) struct ToolState {
     bless: Option<FileEntry>,
     /// Saved editor texts wait here until their apply has read them.
     temp: Option<tempfile::TempDir>,
+    /// Host items an `AddHostPaths` could not stage: (path, why).
+    staging_errors: Vec<(String, String)>,
 }
 
 fn msg(text: impl Into<String>) -> Vec<Effect> {
@@ -353,6 +355,11 @@ impl BrowserPaneController {
         self.tl.text.take()
     }
 
+    /// Host items the last host staging could not stage, as (path, why), until dismissed.
+    pub fn staging_errors(&self) -> &[(String, String)] {
+        &self.tl.staging_errors
+    }
+
     /// The open metadata form.
     pub fn metadata_form(&self) -> Option<&MetadataForm> {
         self.tl.form.as_ref()
@@ -430,6 +437,11 @@ impl BrowserPaneController {
                 Some(p) => self.import(p),
                 None => Vec::new(),
             },
+            A::AddHostPaths { paths, folder } => self.add_host_paths(&paths, folder.as_deref()),
+            A::DismissStagingErrors => {
+                self.tl.staging_errors.clear();
+                Vec::new()
+            }
             A::EditMetadata => self.open_form(),
             A::SubmitMetadata(fields) => self.submit_form(&fields),
             A::CancelMetadata => {
@@ -722,6 +734,63 @@ impl BrowserPaneController {
         let mut said = msg(format!("staged import of {}.", path.display()));
         said.extend(fx);
         said
+    }
+
+    /// Stage host files and folders into the target folder; names the volume cannot hold are listed.
+    fn add_host_paths(&mut self, paths: &[PathBuf], folder: Option<&str>) -> Vec<Effect> {
+        if let Err(fx) = self.writable_volume() {
+            return fx;
+        }
+        let parent = match folder {
+            Some(path) => self.entry_at(path).or_else(|| self.staged_folder(path)),
+            None => self.target_folder(),
+        };
+        let Some(parent) = parent else {
+            return msg("no folder open.");
+        };
+        let mut errors = Vec::new();
+        let mut hosts = Vec::new();
+        for path in paths {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let full = path.display().to_string();
+            match (name, std::fs::metadata(path)) {
+                (Some(name), Ok(m)) if m.is_dir() => {
+                    hosts.push(FileEntry::new_directory(name, full, 0))
+                }
+                (Some(name), Ok(m)) if m.is_file() => {
+                    hosts.push(FileEntry::new_file(name, full, m.len(), 0))
+                }
+                (_, Err(e)) => errors.push((full, e.to_string())),
+                _ => errors.push((full, "not a file or folder".to_string())),
+            }
+        }
+        let fs_type = self.volume().fs_type.clone();
+        let out = self.stage_edits(stage_host_for(&hosts, &parent, &fs_type));
+        errors.extend(out.dropped.iter().cloned());
+        let mut said = vec![match (out.staged, errors.len()) {
+            (n, 0) => format!("staged {n} item(s)."),
+            (n, bad) => format!("staged {n} item(s); {bad} could not be staged."),
+        }];
+        for r in &out.renamed {
+            said.push(format!(
+                "renamed '{}' to '{}' for this volume.",
+                r.from, r.to
+            ));
+        }
+        self.tl.staging_errors = errors;
+        let mut fx: Vec<Effect> = said.into_iter().map(Effect::Message).collect();
+        fx.append(&mut self.out);
+        fx
+    }
+
+    /// A folder that exists only as a staged add.
+    fn staged_folder(&self, path: &str) -> Option<FileEntry> {
+        let parent = match path.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((p, _)) => p,
+        };
+        let mut adds = self.queue.pending_adds_for(parent).into_iter();
+        adds.find(|e| e.path == path && e.is_directory())
     }
 
     fn open_form(&mut self) -> Vec<Effect> {
