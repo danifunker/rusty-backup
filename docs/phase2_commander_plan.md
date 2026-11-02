@@ -1169,7 +1169,9 @@ decision for later (below).
   tab's job runs is detected at once (it waited for the controls to re-enable).
 - GUI: a drive the browser cannot open unelevated shows the error (the browser stayed hidden with
   it set); a file whose disc cannot be reopened for the preview shows "Cannot open filesystem:
-  ..." (the preview spun "Loading..." for good).
+  ..." (the preview spun "Loading..." for good); a folder whose read fails shows the error and is
+  not read again until the filesystem is switched or reopened (the view re-read it every frame on
+  the UI thread).
 - GUI: the image and output pickers are the shared `EffectHost` ones, titled ("Open Disc Image",
   "Save Output As"); the browser's extract, export and tree-save pickers keep their titles and now
   start in the home folder on Linux like the others.

@@ -7,7 +7,7 @@
 //! `OpticalAction::Browse`. Why this is not the shared browser pane: docs/phase2_commander_plan.md
 //! § "Slice 16".
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,6 +89,8 @@ pub struct DiscBrowseController {
     root: Option<FileEntry>,
     dirs: HashMap<String, Vec<FileEntry>>,
     listing: Vec<(String, Listing)>,
+    /// Folders whose read failed; not retried until the filesystem changes.
+    failed: HashSet<String>,
     selected: Option<FileEntry>,
     content: Option<FileContent>,
     preview: Option<(String, Job<Result<FileContent, String>>)>,
@@ -117,6 +119,7 @@ impl DiscBrowseController {
             root: None,
             dirs: HashMap::new(),
             listing: Vec::new(),
+            failed: HashSet::new(),
             selected: None,
             content: None,
             preview: None,
@@ -304,7 +307,10 @@ impl DiscBrowseController {
                         Ok(entries) => {
                             self.dirs.insert(path, entries);
                         }
-                        Err(e) => self.error = Some(e),
+                        Err(e) => {
+                            self.failed.insert(path);
+                            self.error = Some(e);
+                        }
                     }
                 }
             }
@@ -368,6 +374,7 @@ impl DiscBrowseController {
         let choice = disc.clone();
         self.dirs.clear();
         self.listing.clear();
+        self.failed.clear();
         self.root = None;
         self.selected = None;
         self.marked.clear();
@@ -385,7 +392,10 @@ impl DiscBrowseController {
             return;
         };
         let path = entry.path.clone();
-        if self.dirs.contains_key(&path) || self.listing.iter().any(|(p, _)| *p == path) {
+        if self.dirs.contains_key(&path)
+            || self.failed.contains(&path)
+            || self.listing.iter().any(|(p, _)| *p == path)
+        {
             return;
         }
         let job = self.spawn("Reading the folder...", move |ctx| {
