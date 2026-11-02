@@ -25,6 +25,7 @@ pub mod commander;
 pub mod inspect;
 pub mod keys;
 pub mod log;
+pub mod restore;
 
 /// The shape every controller shares.
 pub trait Controller {
