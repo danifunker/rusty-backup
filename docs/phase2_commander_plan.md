@@ -964,3 +964,15 @@ Shells' engine references 263 -> 238 (`partition_editor_modal.rs` 25 -> 0).
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.
+
+## Slice 15: the Inspect tab's other dialogs
+
+The dialogs the Inspect tab (and its browse view) host that still reached the engine:
+`resize_popup.rs` (22), `remote_browser.rs` (12), `floppy_convert_dialog.rs` (8), `progress.rs` (7),
+`expand_hfs_dialog.rs` (4), `alto_resize_dialog.rs` (2), `squashfs_budget_dialog.rs` (2). One
+dialog per step, smallest first; each joins `ENFORCED` in its own commit.
+
+### Steps
+
+1. `src/gui/progress.rs` (7 -> 0): the shared job widget takes `controller::app::Snapshot`,
+   and `controller::app` re-exports `RateTracker` and `format_size`. No behaviour change.

@@ -1,11 +1,10 @@
 use egui::RichText;
-use rusty_backup::controller::app::AppController;
+use rusty_backup::controller::app::{format_size, AppController, Snapshot};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::Controller;
 
-// The rate/ETA estimator lives in the (non-GUI) model layer so the CLI shares
-// it; re-exported here for the tabs that refer to `progress::RateTracker`.
-pub use rusty_backup::model::rate_tracker::RateTracker;
+// The rate/ETA estimator is shared with the CLI; re-exported for the tabs that use it.
+pub use rusty_backup::controller::app::RateTracker;
 
 /// Draw the log panel at the bottom of the window from the app view-model.
 pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
@@ -56,7 +55,7 @@ pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
 
 /// Draw a running job: its step, a bar (an activity bar when the total is unknown),
 /// speed and time, and Cancel when offered; returns true when Cancel is clicked.
-pub fn show_job(ui: &mut egui::Ui, snap: &rusty_backup::model::job::Snapshot) -> bool {
+pub fn show_job(ui: &mut egui::Ui, snap: &Snapshot) -> bool {
     let mut cancel = false;
     let phase = if snap.phase.is_empty() {
         snap.label.as_str()
@@ -123,17 +122,17 @@ impl ProgressState {
                 let text = if self.full_size_bytes > self.total_bytes {
                     format!(
                         "{} / {} to image of {} total ({:.0}%){}",
-                        disk_core::display::format_size(self.current_bytes),
-                        disk_core::display::format_size(self.total_bytes),
-                        disk_core::display::format_size(self.full_size_bytes),
+                        format_size(self.current_bytes),
+                        format_size(self.total_bytes),
+                        format_size(self.full_size_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )
                 } else {
                     format!(
                         "{} / {} ({:.0}%){}",
-                        disk_core::display::format_size(self.current_bytes),
-                        disk_core::display::format_size(self.total_bytes),
+                        format_size(self.current_bytes),
+                        format_size(self.total_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )

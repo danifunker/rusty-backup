@@ -10,6 +10,11 @@ use super::log::{capture, LogStore};
 use super::{Controller, Effect};
 use crate::model::job::{JobRegistry, NoNotify, Notify};
 
+// What the shared progress widgets draw, so views never name the model (CONTRIBUTING.md MVC).
+pub use crate::model::job::Snapshot;
+pub use crate::model::rate_tracker::RateTracker;
+pub use disk_core::display::format_size;
+
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
     pub const LOG_COPY: &str = "log.copy";
