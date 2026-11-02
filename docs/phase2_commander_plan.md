@@ -60,7 +60,7 @@ widget, show_log, the metadata editor widgets.
 | 1 | `controller::commander` skeleton: `CommanderPaneController` owns listing, queue, wrapper tree; display rows move there | done (b940c5f8) |
 | - | Rename `vm` -> `controller`; key map (`controller::keys`) | done (d2ab1e1e, 6aecd207) |
 | 2 | Navigation, selection and cursor as `CommanderPaneAction`s (`Enter`, `Up`, `NavigateTo`, `Click{ctrl,shift}`, `TreeClick`, `ToggleMark`, `SortBy`, cursor moves, `ActivateCursor`); collapse wrappers on cwd change inside the controller; the egui pane dispatches actions; egui keyboard through `KeyMap` | done (dc13fc05) |
-| 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` implemented in `gui::run_effects` | |
+| 3 | Sources as jobs: open image / host / backup / archive / optical, partition select, partclone scan, unlock; `Confirm` / `Pick*` answered by a per-view `gui::effects::EffectHost` | done (ad0950b4, 49fdb34b) |
 | 4 | Queue, preflight, apply, report, reopen, wrappers; host delete / rename / mkdir as jobs; `AskText` with validators | |
 | 5 | Remote (cfg `remote`): connect, open / close image, remote apply | |
 | 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | |
@@ -68,6 +68,19 @@ widget, show_log, the metadata editor widgets.
 | 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | |
 | 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | |
+
+Slice 3 notes, for the slices that follow:
+
+- Effects that answer back go through the asking controller's view: each egui
+  Commander pane owns an `EffectHost` and turns its `Reply`s into that pane's
+  `Picked` / `Confirmed`. `gui::run_effects` stays for `AppController`, which
+  asks nothing. Pickers are still blocking rfd dialogs on the UI thread.
+- An open job holds its path as a `Resource` only while it runs. A new open
+  abandons the running one (cancel) and, if they share a path, waits for it to
+  let go; another job holding the path fails the open with "in use by".
+- Transitional: `CommanderPaneController::reopen_after_apply` (slice 4 makes
+  apply controller work) and `install_remote` plus `PaneRequest::SourceReset`
+  (slice 5 moves remote in).
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
