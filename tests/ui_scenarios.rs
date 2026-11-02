@@ -1084,6 +1084,129 @@ impl Target for FloppyConvertTarget {
     }
 }
 
+/// `BulkConvertController`. Actions: `Open`, `PickSource` / `PickOutput` (answered with the
+/// scenario's folders: the source holds `a.img` and `b.img`, the output an `a.img` already),
+/// `SetFormat` (an output extension, e.g. `img`, `vhd`), `Scan`, `SelectNone`, `SelectAll`,
+/// `SetExtension`, `Start`, `Skip` / `Overwrite` / `Back` (the conflict answer), `Close`. Probes:
+/// `open`, `phase`, `files`, `selected`, `extension`, `can_start`, `problem`, `conflicts`,
+/// `running`, `result`, `log`, `outputs` (the output folder's names, comma-joined).
+struct BulkConvertTarget {
+    ctl: rusty_backup::controller::bulk_convert::BulkConvertController,
+    src: tempfile::TempDir,
+    out: tempfile::TempDir,
+    log: Vec<String>,
+}
+
+impl BulkConvertTarget {
+    fn new() -> Self {
+        let src = tempfile::tempdir().expect("temp dir");
+        let out = tempfile::tempdir().expect("temp dir");
+        for n in ["a.img", "b.img"] {
+            std::fs::write(src.path().join(n), vec![0u8; 8192]).expect("source file");
+        }
+        std::fs::write(out.path().join("a.img"), b"keep").expect("output file");
+        BulkConvertTarget {
+            ctl: rusty_backup::controller::bulk_convert::BulkConvertController::new(
+                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+            ),
+            src,
+            out,
+            log: Vec::new(),
+        }
+    }
+}
+
+impl Target for BulkConvertTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::bulk_convert::{
+            purpose, BulkConvertAction as A, ConflictChoice, FORMATS,
+        };
+        let a = match action {
+            "Open" => A::Open,
+            "PickSource" => A::PickSource,
+            "PickOutput" => A::PickOutput,
+            "AnswerSource" => A::Picked {
+                purpose: purpose::SOURCE,
+                path: Some(self.src.path().to_path_buf()),
+            },
+            "AnswerOutput" => A::Picked {
+                purpose: purpose::OUTPUT,
+                path: Some(self.out.path().to_path_buf()),
+            },
+            "SetFormat" => {
+                let want = arg_str(arg)?;
+                A::SetFormat(
+                    *FORMATS
+                        .iter()
+                        .find(|f| f.extension() == want)
+                        .ok_or("SetFormat takes an output extension")?,
+                )
+            }
+            "Scan" => A::Scan,
+            "SelectNone" => A::SelectNone,
+            "SelectAll" => A::SelectAll,
+            "SetExtension" => A::SetExtension(arg_str(arg)?.to_string()),
+            "Start" => A::Start(None),
+            "Skip" => A::ResolveConflicts(ConflictChoice::SkipConflicting),
+            "Overwrite" => A::ResolveConflicts(ConflictChoice::Overwrite),
+            "Back" => A::ResolveConflicts(ConflictChoice::Back),
+            "Close" => A::Close,
+            other => return Err(format!("BulkConvertController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        use rusty_backup::controller::bulk_convert::BulkPhase;
+        Ok(match name {
+            "open" => Value::Boolean(self.ctl.is_open()),
+            "phase" => Value::String(
+                match self.ctl.phase() {
+                    BulkPhase::Setup => "setup",
+                    BulkPhase::Review => "review",
+                }
+                .to_string(),
+            ),
+            "files" => Value::Integer(self.ctl.files().len() as i64),
+            "selected" => Value::Integer(self.ctl.selected_count() as i64),
+            "extension" => Value::String(self.ctl.extension().to_string()),
+            "can_start" => Value::Boolean(self.ctl.can_start()),
+            "problem" => Value::String(self.ctl.start_problem().unwrap_or("").to_string()),
+            "conflicts" => Value::Integer(self.ctl.conflicts().map_or(0, |c| c.len()) as i64),
+            "running" => Value::Boolean(self.ctl.is_running()),
+            "result" => Value::String(match self.ctl.last_result() {
+                Some(Ok(r)) => format!("{} ok, {} failed", r.succeeded, r.failed),
+                Some(Err(e)) => format!("error: {e}"),
+                None => String::new(),
+            }),
+            "log" => Value::String(self.log.join("\n")),
+            "outputs" => {
+                let mut names: Vec<String> = std::fs::read_dir(self.out.path())
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| {
+                                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                                format!("{}:{len}", e.file_name().to_string_lossy())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                Value::String(names.join(","))
+            }
+            other => return Err(format!("BulkConvertController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        let fx = self.ctl.tick();
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, line)| line));
+        fx
+    }
+}
+
 /// `ResizeController`, opened from Inspect's plan. Actions: `Open` (arg: `$sgi` writes a 64 MiB
 /// SGI volume header + EFS disk image and inspects it), `Custom` / `Original` (the EFS row's
 /// mode), `SetSize` (MiB as a string), `Preview`, `Apply`, `Close`. Probes: `open`, `rows`,
@@ -1396,6 +1519,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
         "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
+        "bulk_convert" => Ok(Box::new(BulkConvertTarget::new())),
         "resize" => Ok(Box::new(ResizeTarget::new())),
         #[cfg(all(feature = "optical", feature = "native-zstd"))]
         "optical" => Ok(Box::new(OpticalTarget::new())),

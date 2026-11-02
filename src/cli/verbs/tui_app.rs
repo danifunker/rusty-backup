@@ -1473,79 +1473,95 @@ enum BulkStep {
 
 /// Output formats offered for bulk convert (the general whole-disk formats;
 /// CD/floppy-specific ones with input constraints are left to the CLI).
-const BULK_FORMATS: &[(&str, crate::rbformats::export::ExportFormat)] = &[
-    ("Raw (.img)", crate::rbformats::export::ExportFormat::Raw),
-    ("VHD", crate::rbformats::export::ExportFormat::Vhd),
-    (
-        "VHD Dynamic",
-        crate::rbformats::export::ExportFormat::VhdDynamic,
-    ),
-    ("QCOW2", crate::rbformats::export::ExportFormat::Qcow2),
-    (
-        "VMDK Flat",
-        crate::rbformats::export::ExportFormat::VmdkFlat,
-    ),
-    (
-        "VMDK Sparse",
-        crate::rbformats::export::ExportFormat::VmdkSparse,
-    ),
-    (
-        "CHD (hard disk)",
-        crate::rbformats::export::ExportFormat::Chd,
-    ),
-    ("DVD CHD", crate::rbformats::export::ExportFormat::ChdDvd),
-];
+const BULK_FORMATS: &[(&str, crate::controller::bulk_convert::ExportFormat)] = {
+    use crate::controller::bulk_convert::ExportFormat as F;
+    &[
+        ("Raw (.img)", F::Raw),
+        ("VHD", F::Vhd),
+        ("VHD Dynamic", F::VhdDynamic),
+        ("QCOW2", F::Qcow2),
+        ("VMDK Flat", F::VmdkFlat),
+        ("VMDK Sparse", F::VmdkSparse),
+        ("CHD (hard disk)", F::Chd),
+        ("DVD CHD", F::ChdDvd),
+    ]
+};
 
+/// The screen's widget state around a headless `BulkConvertController`.
 struct BulkState {
     step: BulkStep,
+    ctl: crate::controller::bulk_convert::BulkConvertController,
     source: String,
     out_dir: String,
-    files: Vec<crate::model::bulk_convert_runner::ScannedFile>,
     format_sel: usize,
     /// Flat cursor over the config rows: 0 = Format, 1 = Output, then one row per
     /// scanned file, and a final "Start" row.
     field: usize,
     picker: Option<FilePicker>,
     picker_target: bool,
-    run: Option<Arc<Mutex<crate::model::status::BulkConvertStatus>>>,
     op: String,
     result: Option<String>,
     is_error: bool,
+    /// A conversion was started and its result is not shown yet.
+    awaiting: bool,
 }
 
 impl Default for BulkState {
     fn default() -> Self {
+        use crate::controller::bulk_convert::{BulkConvertAction, BulkConvertController, NoNotify};
+        use crate::controller::Controller as _;
+        let mut ctl = BulkConvertController::new(Arc::new(NoNotify));
+        ctl.apply(BulkConvertAction::Open);
+        ctl.apply(BulkConvertAction::SetFormat(BULK_FORMATS[0].1));
         BulkState {
             step: BulkStep::Source,
+            ctl,
             source: String::new(),
             out_dir: String::new(),
-            files: Vec::new(),
             format_sel: 0,
             field: 0,
             picker: None,
             picker_target: false,
-            run: None,
             op: String::new(),
             result: None,
             is_error: false,
+            awaiting: false,
         }
     }
 }
 
 impl BulkState {
-    fn format(&self) -> crate::rbformats::export::ExportFormat {
-        BULK_FORMATS[self.format_sel.min(BULK_FORMATS.len() - 1)].1
+    fn files(&self) -> &[crate::controller::bulk_convert::ScannedFile] {
+        self.ctl.files()
     }
     fn start_row(&self) -> usize {
-        2 + self.files.len()
+        2 + self.files().len()
     }
     /// The file index at the current cursor, if the cursor is on a file row.
     fn file_at_cursor(&self) -> Option<usize> {
-        if self.field >= 2 && self.field < 2 + self.files.len() {
+        if self.field >= 2 && self.field < 2 + self.files().len() {
             Some(self.field - 2)
         } else {
             None
         }
+    }
+    fn act(&mut self, action: crate::controller::bulk_convert::BulkConvertAction) {
+        use crate::controller::Controller as _;
+        let _ = self.ctl.apply(action);
+    }
+    /// Hand the typed output folder to the controller (the source when it is blank, for a scan).
+    fn send_output(&mut self, for_scan: bool) {
+        use crate::controller::bulk_convert::{purpose, BulkConvertAction};
+        let typed = self.out_dir.trim();
+        let path = if typed.is_empty() && for_scan {
+            expand_tilde(self.source.trim())
+        } else {
+            expand_tilde(typed)
+        };
+        self.act(BulkConvertAction::Picked {
+            purpose: purpose::OUTPUT,
+            path: Some(path),
+        });
     }
 }
 
@@ -2365,9 +2381,9 @@ impl App {
                 r.act(crate::controller::restore::RestoreAction::Cancel);
             }
         }
-        if let Some(run) = self.bulk.as_ref().and_then(|b| b.run.clone()) {
-            if let Ok(mut s) = run.lock() {
-                s.cancel_requested = true;
+        if let Some(b) = self.bulk.as_mut() {
+            if b.ctl.is_running() {
+                b.act(crate::controller::bulk_convert::BulkConvertAction::Cancel);
             }
         }
         #[cfg(feature = "optical")]
@@ -3785,6 +3801,7 @@ impl App {
                         b.out_dir = path.to_string_lossy().into_owned();
                         b.picker = None;
                     } else {
+                        use crate::controller::bulk_convert::{purpose, BulkConvertAction};
                         let b = self.bulk.as_mut().unwrap();
                         b.picker = None;
                         b.source = path.to_string_lossy().into_owned();
@@ -3793,6 +3810,11 @@ impl App {
                         }
                         b.step = BulkStep::Config;
                         b.field = 0;
+                        b.act(BulkConvertAction::Back);
+                        b.act(BulkConvertAction::Picked {
+                            purpose: purpose::SOURCE,
+                            path: Some(expand_tilde(b.source.trim())),
+                        });
                         self.bulk_rescan();
                     }
                 }
@@ -3802,6 +3824,22 @@ impl App {
         }
 
         let step = self.bulk.as_ref().unwrap().step;
+        // Outputs that already exist: Skip / Overwrite / Esc back to the list.
+        if step == BulkStep::Config && self.bulk.as_ref().unwrap().ctl.conflicts().is_some() {
+            use crate::controller::bulk_convert::{BulkConvertAction, ConflictChoice};
+            let choice = match code {
+                KeyCode::Char('s') => ConflictChoice::SkipConflicting,
+                KeyCode::Char('o') => ConflictChoice::Overwrite,
+                KeyCode::Esc => ConflictChoice::Back,
+                _ => return true,
+            };
+            self.bulk
+                .as_mut()
+                .unwrap()
+                .act(BulkConvertAction::ResolveConflicts(choice));
+            self.after_bulk_start();
+            return true;
+        }
         // Start handled outside the borrow.
         if step == BulkStep::Config
             && code == KeyCode::Enter
@@ -3826,6 +3864,8 @@ impl App {
                 } else {
                     (b.format_sel + 1) % n
                 };
+                let format = BULK_FORMATS[b.format_sel].1;
+                b.act(crate::controller::bulk_convert::BulkConvertAction::SetFormat(format));
             }
             self.bulk_rescan();
             return true;
@@ -3856,7 +3896,10 @@ impl App {
                 }
                 KeyCode::Char(' ') => {
                     if let Some(i) = b.file_at_cursor() {
-                        b.files[i].selected = !b.files[i].selected;
+                        let on = !b.files()[i].selected;
+                        b.act(
+                            crate::controller::bulk_convert::BulkConvertAction::SetSelected(i, on),
+                        );
                     }
                     true
                 }
@@ -3883,7 +3926,7 @@ impl App {
             },
             BulkStep::Run => match code {
                 KeyCode::Esc => {
-                    let running = b.result.is_none();
+                    let running = b.ctl.is_running();
                     if running {
                         self.cancel_progress();
                         if let Some(b) = self.bulk.as_mut() {
@@ -3893,7 +3936,6 @@ impl App {
                     } else {
                         self.progress = None;
                         if let Some(b) = self.bulk.as_mut() {
-                            b.run = None;
                             b.result = None;
                             b.step = BulkStep::Config;
                         }
@@ -3906,55 +3948,49 @@ impl App {
     }
 
     /// Rescan the source folder for the currently-chosen format (the filter
-    /// depends on the format), resetting the review list.
+    /// depends on the format); the list is replaced when the scan job ends.
     fn bulk_rescan(&mut self) {
+        use crate::controller::bulk_convert::{BulkConvertAction, BulkPhase};
         let Some(b) = self.bulk.as_mut() else {
             return;
         };
-        let src = expand_tilde(b.source.trim());
-        let format = b.format();
-        b.files =
-            crate::model::bulk_convert_runner::scan_source_folder(&src, format).unwrap_or_default();
+        // In Review a format change already rescans; otherwise ask for the first scan.
+        if b.ctl.phase() == BulkPhase::Setup || !b.ctl.is_scanning() {
+            b.send_output(true);
+            b.act(BulkConvertAction::Scan);
+        }
         // Keep the cursor on the Format row after a rescan.
         b.field = b.field.min(b.start_row());
     }
 
-    /// Start the bulk conversion of the selected files. `start_bulk_convert`
-    /// spawns its own worker thread and returns the shared status handle.
+    /// Start the bulk conversion of the selected files through the controller.
     fn start_bulk(&mut self) {
-        let Some(b) = self.bulk.as_ref() else {
+        use crate::controller::bulk_convert::BulkConvertAction;
+        let Some(b) = self.bulk.as_mut() else {
             return;
         };
-        let files: Vec<std::path::PathBuf> = b
-            .files
-            .iter()
-            .filter(|f| f.selected)
-            .map(|f| f.path.clone())
-            .collect();
-        if files.is_empty() {
-            let b = self.bulk.as_mut().unwrap();
-            b.result = Some("No files selected to convert.".to_string());
+        b.send_output(false);
+        if let Some(problem) = b.ctl.start_problem() {
+            b.result = Some(problem.to_string());
             b.is_error = true;
             b.step = BulkStep::Run;
             return;
         }
-        let out_dir = expand_tilde(b.out_dir.trim());
-        if out_dir.as_os_str().is_empty() {
-            let b = self.bulk.as_mut().unwrap();
-            b.result = Some("Enter an output folder.".to_string());
-            b.is_error = true;
-            b.step = BulkStep::Run;
+        b.act(BulkConvertAction::Start(None));
+        self.after_bulk_start();
+    }
+
+    /// Move to the Run step once the controller started a conversion.
+    fn after_bulk_start(&mut self) {
+        let Some(b) = self.bulk.as_mut() else {
+            return;
+        };
+        if !b.ctl.is_running() {
             return;
         }
-        let format = b.format();
-        let extension = format.extension().to_string();
-        let run = crate::model::bulk_convert_runner::start_bulk_convert(
-            files, out_dir, format, extension, None, false,
-        );
-        let b = self.bulk.as_mut().unwrap();
-        b.run = Some(run);
         b.result = None;
         b.is_error = false;
+        b.awaiting = true;
         b.op = "Starting...".to_string();
         b.step = BulkStep::Run;
         self.progress = Some(Progress {
@@ -4512,33 +4548,38 @@ impl App {
                 }
             }
         }
-        // Mirror a running bulk convert (file-count + per-file byte progress).
-        if let Some(run) = self.bulk.as_ref().and_then(|b| b.run.clone()) {
-            let snap = run.lock().ok().map(|s| {
-                (
-                    s.current_bytes,
-                    s.current_total_bytes,
-                    s.finished,
-                    s.current_index,
-                    s.total_files,
-                    s.current_file.clone(),
-                    s.succeeded,
-                    s.failed,
-                )
-            });
-            if let Some((cur, total, done, idx, n, file, ok, fail)) = snap {
+        // Drive the bulk-convert controller and mirror its file count and bytes.
+        if let Some(b) = self.bulk.as_mut() {
+            use crate::controller::Controller as _;
+            let _ = b.ctl.tick();
+            let _ = b.ctl.take_log();
+            b.field = b.field.min(b.start_row());
+            if let Some(p) = b.ctl.progress() {
+                b.op = format!("{}/{}  {}", p.index, p.total_files, basename(&p.file));
                 if let Some(prog) = self.progress.as_ref() {
                     if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = cur;
-                        sh.total = total;
-                        sh.done = done;
+                        sh.current = p.bytes;
+                        sh.total = p.total_bytes;
                     }
                 }
-                if let Some(b) = self.bulk.as_mut() {
-                    b.op = format!("{idx}/{n}  {}", basename(&file));
-                    if done && b.result.is_none() {
-                        b.result = Some(format!("Converted {ok} ok, {fail} failed."));
-                        b.is_error = fail > 0;
+            }
+            if b.awaiting && !b.ctl.is_running() {
+                let done = match b.ctl.last_result() {
+                    Some(Ok(r)) => Some((
+                        format!("Converted {} ok, {} failed.", r.succeeded, r.failed),
+                        r.failed > 0,
+                    )),
+                    Some(Err(e)) => Some((format!("Bulk convert failed: {e}"), true)),
+                    None => None,
+                };
+                if let Some((text, err)) = done {
+                    b.awaiting = false;
+                    b.result = Some(text);
+                    b.is_error = err;
+                    if let Some(prog) = self.progress.as_ref() {
+                        if let Ok(mut sh) = prog.shared.lock() {
+                            sh.done = true;
+                        }
                     }
                 }
             }
@@ -5827,6 +5868,12 @@ impl App {
                     ),
                     Span::raw(format!("< {} >", BULK_FORMATS[b.format_sel].0)),
                 ]));
+                if b.ctl.is_scanning() {
+                    lines.push(Line::styled(
+                        "  Scanning the source folder...",
+                        self.palette.dim(),
+                    ));
+                }
                 // Output row (1).
                 let out_cursor = if b.field == 1 {
                     Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
@@ -5843,16 +5890,31 @@ impl App {
                 ]));
                 lines.push(Line::raw(""));
                 // File review list.
-                let selected = b.files.iter().filter(|f| f.selected).count();
+                let selected = b.ctl.selected_count();
                 lines.push(Line::styled(
                     format!(
                         "Files ({} of {} selected)  -  Space toggles:",
                         selected,
-                        b.files.len()
+                        b.files().len()
                     ),
                     self.palette.accent(),
                 ));
-                if b.files.is_empty() {
+                if let Some(conflicts) = b.ctl.conflicts() {
+                    lines.push(Line::styled(
+                        format!(
+                            "  {} output file(s) already exist:  s Skip them   o Overwrite   Esc Back",
+                            conflicts.len()
+                        ),
+                        self.palette.warn(),
+                    ));
+                    for c in conflicts.iter().take(5) {
+                        lines.push(Line::styled(
+                            format!("    - {}", basename(&c.dest.to_string_lossy())),
+                            self.palette.warn(),
+                        ));
+                    }
+                }
+                if b.files().is_empty() {
                     lines.push(Line::styled(
                         "  (no matching files in this folder for this format)",
                         self.palette.dim(),
@@ -5862,7 +5924,7 @@ impl App {
                     let avail = (area.height as usize).saturating_sub(12).max(3);
                     let cur_file = b.file_at_cursor().unwrap_or(0);
                     let start = cur_file.saturating_sub(avail.saturating_sub(1));
-                    for (i, f) in b.files.iter().enumerate().skip(start).take(avail) {
+                    for (i, f) in b.files().iter().enumerate().skip(start).take(avail) {
                         let on_row = b.field == i + 2;
                         let box_ = if f.selected { "[x]" } else { "[ ]" };
                         let name = basename(&f.path.to_string_lossy());
@@ -7480,6 +7542,41 @@ mod tests {
             o.ctl.output_format(),
             crate::controller::optical::OutputFormat::BinCue
         );
+    }
+
+    #[test]
+    fn the_bulk_screen_converts_through_the_controller() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("tempdir");
+        for n in ["a.img", "b.img"] {
+            std::fs::write(src.path().join(n), vec![0u8; 4096]).unwrap();
+        }
+        std::fs::write(out.path().join("a.img"), b"keep").unwrap();
+        let mut app = App::new_on(BACKUP_TAB);
+        app.bulk = Some(BulkState::default());
+        let b = app.bulk.as_mut().unwrap();
+        b.source = src.path().display().to_string();
+        b.out_dir = out.path().display().to_string();
+        b.step = BulkStep::Config;
+        b.act(crate::controller::bulk_convert::BulkConvertAction::Picked {
+            purpose: crate::controller::bulk_convert::purpose::SOURCE,
+            path: Some(src.path().to_path_buf()),
+        });
+        app.bulk_rescan();
+        app.bulk.as_mut().unwrap().ctl.wait_idle();
+        app.tick();
+        assert_eq!(app.bulk.as_ref().unwrap().files().len(), 2);
+        app.start_bulk();
+        assert!(app.bulk.as_ref().unwrap().ctl.conflicts().is_some());
+        app.handle_bulk_key(KeyCode::Char('s'));
+        let b = app.bulk.as_mut().unwrap();
+        assert!(b.step == BulkStep::Run);
+        b.ctl.wait_idle();
+        app.tick();
+        let b = app.bulk.as_ref().unwrap();
+        assert_eq!(b.result.as_deref(), Some("Converted 1 ok, 0 failed."));
+        assert_eq!(std::fs::read(out.path().join("a.img")).unwrap(), b"keep");
+        assert!(out.path().join("b.img").exists());
     }
 
     #[test]

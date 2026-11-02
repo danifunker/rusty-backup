@@ -37,7 +37,7 @@ pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
 use backup_tab::BackupTab;
-use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
+use bulk_convert_dialog::BulkConvertDialog;
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
 use progress::ProgressState;
@@ -45,7 +45,6 @@ use restore_tab::RestoreTab;
 use rusty_backup::controller::app::AppController;
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller, Effect};
-use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
@@ -60,21 +59,6 @@ use std::sync::{Arc, Mutex};
 /// Create an `rfd::FileDialog` pre-configured to start in the real user's home
 /// directory. This ensures file dialogs open in the right place even when the
 /// app is running elevated via pkexec.
-fn bytes_human(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if n >= GB {
-        format!("{:.2} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{} B", n)
-    }
-}
-
 /// Hint shown in a device dropdown when no physical devices are listed. On
 /// Windows the empty list usually means the process isn't elevated yet, so we
 /// point the user at the top-bar gate; when already elevated (or on other
@@ -342,10 +326,8 @@ pub struct RustyBackupApp {
     shield_texture: Option<egui::TextureHandle>,
     /// Shared backup folder path between restore and inspect tabs
     loaded_backup_folder: Option<PathBuf>,
-    /// Bulk Convert dialog state (None = closed).
-    bulk_convert_dialog: Option<BulkConvertDialog>,
-    /// Background bulk-convert worker progress (None = idle).
-    bulk_convert_status: Option<Arc<Mutex<BulkConvertStatus>>>,
+    /// The Bulk Convert dialog and its running conversion.
+    bulk_convert: BulkConvertDialog,
     /// File path passed on the command line (Windows file-association
     /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
     /// launch). Taken on the first `logic()` tick, routed into the
@@ -433,8 +415,7 @@ impl Default for RustyBackupApp {
             elevation_dialog,
             shield_texture: None,
             loaded_backup_folder: None,
-            bulk_convert_dialog: None,
-            bulk_convert_status: None,
+            bulk_convert: BulkConvertDialog::default(),
             pending_initial_image: None,
             commander: None,
         }
@@ -545,29 +526,6 @@ impl RustyBackupApp {
         tex
     }
 
-    /// Drain bulk-convert worker log messages into the GUI log panel and
-    /// clear the status handle when the worker finishes.
-    fn poll_bulk_convert(&mut self) {
-        let status_arc = match &self.bulk_convert_status {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-        let Ok(mut status) = status_arc.lock() else {
-            return;
-        };
-        for (level, msg) in status.log_messages.drain(..) {
-            match level {
-                BulkConvertLogLevel::Info => self.app.log.info(msg),
-                BulkConvertLogLevel::Warn => self.app.log.warn(msg),
-                BulkConvertLogLevel::Error => self.app.log.error(msg),
-            }
-        }
-        if status.finished {
-            drop(status);
-            self.bulk_convert_status = None;
-        }
-    }
-
     /// Render the update-banner action buttons. On Windows with a matched
     /// release asset this offers in-app "Download & Install Update" (download
     /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
@@ -664,7 +622,7 @@ impl RustyBackupApp {
         jobs.iter()
             .find(|(owner, running, _)| *running && *owner != tab)
             .map(|(_, _, name)| *name)
-            .or(if self.bulk_convert_status.is_some() {
+            .or(if self.bulk_convert.is_running() {
                 Some("Bulk Convert")
             } else {
                 None
@@ -684,7 +642,7 @@ impl eframe::App for RustyBackupApp {
             || self.backup_tab.is_running()
             || self.restore_tab.is_running()
             || self.optical_tab.is_running()
-            || self.bulk_convert_status.is_some()
+            || self.bulk_convert.is_running()
         {
             ctx.request_repaint();
         }
@@ -771,8 +729,8 @@ impl eframe::App for RustyBackupApp {
         let effects = self.app.tick();
         run_effects(ctx, effects);
 
-        // Drain bulk-convert worker logs into the panel and clear when done.
-        self.poll_bulk_convert();
+        // Drain bulk-convert worker logs into the panel.
+        self.bulk_convert.poll(&mut self.app.log);
     }
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -879,7 +837,7 @@ impl eframe::App for RustyBackupApp {
                     ui.separator();
 
                     // Bulk Convert — convert every disk image in a folder.
-                    let bulk_running = self.bulk_convert_status.is_some();
+                    let bulk_running = self.bulk_convert.is_running();
                     if ui
                         .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
                         .on_hover_text(
@@ -888,85 +846,23 @@ impl eframe::App for RustyBackupApp {
                         )
                         .clicked()
                     {
-                        self.bulk_convert_dialog = Some(BulkConvertDialog::default());
+                        self.bulk_convert.open();
                     }
                     if bulk_running && ui.button("Cancel Bulk").clicked() {
-                        if let Some(ref s) = self.bulk_convert_status {
-                            if let Ok(mut g) = s.lock() {
-                                g.cancel_requested = true;
-                            }
-                        }
-                        self.app.log.warn("Bulk convert cancellation requested...");
+                        self.bulk_convert.cancel();
                     }
                 });
             });
         });
 
         // Bulk Convert dialog (modal-ish window, always reachable).
-        if let Some(ref mut dlg) = self.bulk_convert_dialog {
-            match dlg.show(ctx) {
-                BulkConvertAction::Start {
-                    files,
-                    extension,
-                    chd_options,
-                    bincue_multi_bin,
-                } => {
-                    if let Some(out) = dlg.output_folder.clone() {
-                        let format = dlg.format;
-                        let count = files.len();
-                        self.bulk_convert_dialog = None;
-                        self.app.log.info(format!(
-                            "Starting bulk convert: {count} file(s) -> {} ({}, .{extension})",
-                            out.display(),
-                            format.description(),
-                        ));
-                        self.bulk_convert_status = Some(bulk_convert_dialog::start_bulk_convert(
-                            files,
-                            out,
-                            format,
-                            extension,
-                            chd_options,
-                            bincue_multi_bin,
-                        ));
-                    }
-                }
-                BulkConvertAction::Cancel => {
-                    self.bulk_convert_dialog = None;
-                }
-                BulkConvertAction::None => {}
-            }
-        }
+        self.bulk_convert.show(ctx, &mut self.app.log);
 
-        // Bulk Convert progress strip — visible from any tab while running.
-        if let Some(ref status_arc) = self.bulk_convert_status {
-            if let Ok(s) = status_arc.lock() {
-                if !s.finished {
-                    let frac = if s.current_total_bytes > 0 {
-                        (s.current_bytes as f32 / s.current_total_bytes as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let text = if s.current_total_bytes > 0 {
-                        format!(
-                            "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
-                            s.current_index,
-                            s.total_files,
-                            s.current_file,
-                            bytes_human(s.current_bytes),
-                            bytes_human(s.current_total_bytes),
-                            frac * 100.0,
-                        )
-                    } else {
-                        format!(
-                            "Bulk Convert: [{}/{}] {} - preparing...",
-                            s.current_index, s.total_files, s.current_file,
-                        )
-                    };
-                    egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
-                        ui.add(egui::ProgressBar::new(frac).text(text));
-                    });
-                }
-            }
+        // Bulk Convert progress strip, visible from any tab while running.
+        if let Some((frac, text)) = self.bulk_convert.strip() {
+            egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
+                ui.add(egui::ProgressBar::new(frac).text(text));
+            });
         }
 
         // Update notification banner (if update available and not dismissed).

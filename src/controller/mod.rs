@@ -21,6 +21,7 @@
 pub mod alto_resize;
 pub mod app;
 pub mod backup;
+pub mod bulk_convert;
 pub mod browser;
 pub mod commander;
 pub mod disk_write;
