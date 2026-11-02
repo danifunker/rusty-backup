@@ -1,0 +1,27 @@
+# Archives: open a two-file StuffIt archive, untick one entry, extract the other as raw forks.
+name = "Archives: open, untick, extract selected"
+vm = "archives"
+
+[[step]]
+action = "Open"
+arg = "$sit"
+settle = true
+expect = { loaded = true, files = 2, selected = 2, error = "" }
+
+[[step]]
+action = "Untick"
+arg = 0
+expect = { selected = 1 }
+
+[[step]]
+action = "SetFormat"
+arg = "raw"
+
+[[step]]
+action = "ExtractSelected"
+effects = ["PickFolder"]
+
+[[step]]
+action = "Pick"
+settle = true
+expect = { extracted = 1, outputs = "two,two.rsrc", log = "~Extraction complete: 1 files" }

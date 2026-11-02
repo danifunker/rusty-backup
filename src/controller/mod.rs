@@ -19,6 +19,7 @@
 //! - Tier A tests replay `tests/ui_scenarios/*.toml` against controllers (`tests/ui_scenarios.rs`).
 
 pub mod alto_resize;
+pub mod archives;
 pub mod app;
 pub mod backup;
 pub mod bulk_convert;

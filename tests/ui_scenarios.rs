@@ -1207,6 +1207,128 @@ impl Target for BulkConvertTarget {
     }
 }
 
+/// `ArchivesController`. Actions: `Open` (arg: `$sit` writes a two-file StuffIt archive, or a
+/// path), `Untick` (an entry index), `SetFormat` (`raw`, `binhex`, `macbinary`, `appledouble`),
+/// `ExtractSelected`, `ExtractAll`, `Pick` (answers the folder picker with `out/`), `Close`.
+/// Probes: `loaded`, `files`, `selected`, `error`, `extracted`, `log`, `outputs`.
+struct ArchivesTarget {
+    ctl: rusty_backup::controller::archives::ArchivesController,
+    dir: tempfile::TempDir,
+    asked: Option<&'static str>,
+    log: Vec<String>,
+}
+
+impl ArchivesTarget {
+    fn new() -> Self {
+        ArchivesTarget {
+            ctl: rusty_backup::controller::archives::ArchivesController::new(std::sync::Arc::new(
+                rusty_backup::controller::archives::NoNotify,
+            )),
+            dir: tempfile::tempdir().expect("temp dir"),
+            asked: None,
+            log: Vec::new(),
+        }
+    }
+}
+
+impl Target for ArchivesTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::archives::{ArchivesAction as A, ForkFormat};
+        let a = match action {
+            "Open" => A::Open(match arg_str(arg)? {
+                "$sit" => {
+                    use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
+                    let file = |name: &str, data: &[u8]| StuffItInput {
+                        name: name.into(),
+                        type_code: *b"TEXT",
+                        creator_code: *b"ttxt",
+                        finder_flags: 0,
+                        create_date: 0,
+                        mod_date: 0,
+                        data_fork: data.to_vec(),
+                        resource_fork: b"rsrc".to_vec(),
+                    };
+                    let bytes = build_archive(
+                        &[file("one", b"first"), file("two", b"second")],
+                        WriteMethod::Store,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let p = self.dir.path().join("a.sit");
+                    std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                    p
+                }
+                other => PathBuf::from(other),
+            }),
+            "Untick" => A::SetSelected(
+                arg.and_then(Value::as_integer)
+                    .ok_or("Untick needs an index")? as usize,
+                false,
+            ),
+            "SetFormat" => A::SetFormat(match arg_str(arg)? {
+                "raw" => ForkFormat::Raw,
+                "binhex" => ForkFormat::BinHex,
+                "macbinary" => ForkFormat::MacBinary,
+                "appledouble" => ForkFormat::AppleDouble,
+                _ => return Err("SetFormat takes raw, binhex, macbinary or appledouble".into()),
+            }),
+            "ExtractSelected" => A::ExtractSelected,
+            "ExtractAll" => A::ExtractAll,
+            "Pick" => A::Picked {
+                purpose: self.asked.take().ok_or("no folder picker is open")?,
+                path: Some(self.dir.path().join("out")),
+            },
+            "Close" => A::Close,
+            other => return Err(format!("ArchivesController has no action {other:?}")),
+        };
+        let fx = self.ctl.apply(a);
+        for e in &fx {
+            if let Effect::PickFolder(spec) = e {
+                self.asked = Some(spec.purpose);
+            }
+        }
+        Ok(fx)
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "loaded" => Value::Boolean(self.ctl.is_loaded()),
+            "files" => Value::Integer(self.ctl.file_count() as i64),
+            "selected" => Value::Integer(self.ctl.selected_file_count() as i64),
+            "error" => Value::String(
+                self.ctl
+                    .load_error()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_default(),
+            ),
+            "extracted" => Value::Integer(match self.ctl.last_extract() {
+                Some(Ok((stats, _))) => stats.files as i64,
+                _ => -1,
+            }),
+            "log" => Value::String(self.log.join("\n")),
+            "outputs" => {
+                let mut names: Vec<String> = std::fs::read_dir(self.dir.path().join("out"))
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                Value::String(names.join(","))
+            }
+            other => return Err(format!("ArchivesController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait_idle();
+        let fx = self.ctl.tick();
+        self.log
+            .extend(self.ctl.take_log().into_iter().map(|(_, line)| line));
+        fx
+    }
+}
+
 /// `ResizeController`, opened from Inspect's plan. Actions: `Open` (arg: `$sgi` writes a 64 MiB
 /// SGI volume header + EFS disk image and inspects it), `Custom` / `Original` (the EFS row's
 /// mode), `SetSize` (MiB as a string), `Preview`, `Apply`, `Close`. Probes: `open`, `rows`,
@@ -1520,6 +1642,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
         "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
         "bulk_convert" => Ok(Box::new(BulkConvertTarget::new())),
+        "archives" => Ok(Box::new(ArchivesTarget::new())),
         "resize" => Ok(Box::new(ResizeTarget::new())),
         #[cfg(all(feature = "optical", feature = "native-zstd"))]
         "optical" => Ok(Box::new(OpticalTarget::new())),
