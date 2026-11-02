@@ -63,7 +63,7 @@ pub struct AltoSummary {
 /// Read the pack's geometry and used-page count.
 pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let disk = open_pack(&bytes).map_err(|e| format!("{e}"))?;
+    let disk = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
     let g = &disk.geometry;
     let total = g.total_sectors();
     let free = Bfs::new(&disk)
@@ -88,7 +88,7 @@ pub fn summarize(path: &Path) -> Result<AltoSummary, String> {
 /// Clone the pack at `source` onto `target` and write it to `out` as a PDI; "Saved ... (N pages).".
 pub fn resize_to(source: &Path, target: AltoTarget, out: &Path) -> Result<String, String> {
     let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
-    let src = open_pack(&bytes).map_err(|e| format!("{e}"))?;
+    let src = open_pack(bytes.as_slice()).map_err(|e| format!("{e}"))?;
     let resized = write::clone_to(&src, target.geometry()).map_err(|e| format!("{e}"))?;
     std::fs::write(out, pdi::write(&resized)).map_err(|e| e.to_string())?;
     Ok(format!(

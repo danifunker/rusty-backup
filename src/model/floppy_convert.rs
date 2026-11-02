@@ -77,7 +77,7 @@ pub struct FloppySource {
 pub fn probe_source(path: &Path) -> Result<FloppySource, String> {
     let head =
         crate::compat::read_head(path, 256).map_err(|e| format!("Cannot read source: {e}"))?;
-    let kind = containers::detect_container_kind(&head, Some(path));
+    let kind = containers::detect_container_kind(head.as_slice(), Some(path));
     let too_big =
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > containers::FLOPPY_CONTAINER_MAX;
     match FloppyTarget::from_container(kind) {

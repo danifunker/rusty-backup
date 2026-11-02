@@ -18,7 +18,7 @@ pub struct ResizePopup {
 impl ResizePopup {
     pub fn new(plan: ResizePlan) -> Self {
         let mut ctl = ResizeController::new(std::sync::Arc::new(super::ui_logger::EguiWake));
-        ctl.apply(ResizeAction::Open(plan));
+        ctl.apply(ResizeAction::Open(Box::new(plan)));
         ResizePopup { ctl }
     }
 

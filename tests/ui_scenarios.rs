@@ -1142,7 +1142,7 @@ impl Target for ResizeTarget {
                 if arg_str(arg)? != "$sgi" {
                     return Err("Open takes $sgi".into());
                 }
-                ResizeAction::Open(self.open_sgi()?)
+                ResizeAction::Open(Box::new(self.open_sgi()?))
             }
             "Custom" => ResizeAction::SetMode {
                 index,

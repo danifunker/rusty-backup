@@ -323,7 +323,7 @@ fn the_resize_controller_writes_the_same_bytes_as_the_engine() {
         .unwrap();
 
     let mut ctl = ResizeController::new(Arc::new(NoNotify));
-    ctl.apply(ResizeAction::Open(plan));
+    ctl.apply(ResizeAction::Open(Box::new(plan)));
     ctl.apply(ResizeAction::SetMode {
         index: efs,
         mode: SizeMode::Custom,

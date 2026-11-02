@@ -36,7 +36,7 @@ pub mod ids {
 
 /// User intents.
 pub enum ResizeAction {
-    Open(ResizePlan),
+    Open(Box<ResizePlan>),
     Close,
     /// Original / Minimum stamp the row's size field; Custom leaves it editable.
     SetMode {
@@ -498,7 +498,7 @@ impl Controller for ResizeController {
             return Vec::new();
         }
         match action {
-            ResizeAction::Open(plan) => self.open(plan),
+            ResizeAction::Open(plan) => self.open(*plan),
             ResizeAction::Close => {
                 if self.job.is_none() {
                     self.plan = None;
