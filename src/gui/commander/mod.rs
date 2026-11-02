@@ -198,17 +198,12 @@ pub struct CommanderMode {
     show_help: bool,
 }
 
-impl Default for CommanderMode {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CommanderMode {
-    pub fn new() -> Self {
+    /// Both panes' open jobs register in `jobs`, the app's registry.
+    pub fn new(jobs: rusty_backup::model::job::JobRegistry) -> Self {
         Self {
-            left: CommanderPane::new(Side::Left),
-            right: CommanderPane::new(Side::Right),
+            left: CommanderPane::new(Side::Left, jobs.clone()),
+            right: CommanderPane::new(Side::Right, jobs),
             status: "Commander Mode -- open a disk image in each pane; select files and \
                      use the middle Copy buttons or right-click to stage a copy."
                 .into(),
@@ -235,10 +230,10 @@ impl CommanderMode {
     /// Open a drag-and-dropped path in the active pane (the drag-and-drop router
     /// in `RustyBackupApp::update` calls this while the Commander overlay is up).
     /// A directory opens as a host folder, a file as an image source.
-    pub fn open_dropped_path(&mut self, path: PathBuf) {
+    pub fn open_dropped_path(&mut self, ctx: &egui::Context, path: PathBuf) {
         let msg = match self.active {
-            Side::Left => self.left.open_dropped(path),
-            Side::Right => self.right.open_dropped(path),
+            Side::Left => self.left.open_dropped(ctx, path),
+            Side::Right => self.right.open_dropped(ctx, path),
         };
         if !msg.is_empty() {
             self.status = msg;

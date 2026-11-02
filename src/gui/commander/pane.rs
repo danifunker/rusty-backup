@@ -3,22 +3,16 @@
 //! sortable columns, multi-selection, `..` / double-click navigation, and a
 //! per-pane staged-edit queue (delete + copy-in, shown in the virtual overlay).
 //!
-//! A pane lists one of three sources: a **disk-image volume** (partition probe +
-//! `BrowseSession`, opened off-thread via [`BrowseSession::spawn_open`]), a
-//! **host-OS folder** (`std::fs`), or a **backup folder** — native rusty-backup
-//! or Clonezilla (read-only; partitions + opener come from the shared
-//! [`commander_source::resolve_backup`] resolver). All listing state lives in
-//! the [`DirListing`] model
-//! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
-//! it. Applying staged edits runs off-thread via
-//! [`rusty_backup::model::commander_ops::spawn_apply`].
+//! What the pane shows and how it opens (host folder, disk image, backup folder,
+//! Mac archive, optical disc, as jobs) lives in [`CommanderPaneController`]; this
+//! file draws it, maps input to its actions, and answers its pickers and
+//! confirmations through an [`EffectHost`]. The remote connection, applying
+//! staged edits and the host-write dialogs still live here until later slices.
 //!
 //! Image panes stage edits (Apply writes through); host panes take immediate
 //! writes and never stage; backup panes are read-only (browse + copy-out only).
 //! The cross-pane copy itself lives in [`super::CommanderMode`] (it spans both
 //! panes).
-//!
-//! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,35 +23,25 @@ use disk_core::display::format_size;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::fs::replace::OnConflict;
-use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
-use rusty_backup::model::cache_runner;
-use rusty_backup::model::commander_descend::{
-    classify, classify_entry, open_archive, open_optical, open_optical_hybrid, optical_filesystems,
-    DescendKind, OpticalFsChoice, ReopenRecipe,
-};
+use rusty_backup::model::commander_descend::classify_entry;
 use rusty_backup::model::commander_ops::{
     self, ApplyPreflight, ApplyStatus, FailedEdit, PreflightStatus, WrapperExtract,
     WrapperOpenPlan, WrapperOpenStatus,
 };
-use rusty_backup::model::commander_source;
-use rusty_backup::model::dir_listing::DirListing;
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
+use rusty_backup::model::job::JobRegistry;
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
-use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::partition::PartitionInfo;
-use rusty_backup::update::RecentMode;
 
-use rusty_backup::controller::commander::rows::{
-    is_mac_archive_path, partition_label, remote_parent_dir, DisplayRow, RowKind,
-};
+use rusty_backup::controller::app::{CommanderRecent, UserConfig};
+use rusty_backup::controller::commander::rows::{remote_parent_dir, DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
-    CommanderPaneAction, CommanderPaneController, PaneRequest, SortColumn,
+    CommanderPaneAction, CommanderPaneController, PaneRequest, PaneServices, SortColumn, VolumeInfo,
 };
 use rusty_backup::controller::Controller;
 
+use super::super::effects::{EffectHost, Reply};
 use super::Side;
 
 /// Preflight findings shown before an apply that needs a decision.
@@ -169,67 +153,31 @@ struct RowActions {
 }
 
 pub(crate) struct CommanderPane {
-    /// Listing, staged edits and wrapper tree, shared with every shell.
+    /// Source, listing, staged edits and wrapper tree, shared with every shell.
     ctl: CommanderPaneController,
+    /// Pickers and confirmations the controller asks for, answered back to it.
+    effects: EffectHost,
+    /// Status lines from the controller's messages, shown at the end of the frame.
+    statuses: Vec<String>,
     side: Side,
-    /// Loaded source path (image / container). `None` until the user opens one.
-    source: Option<PathBuf>,
-    /// Partitions parsed from the source; drives the partition dropdown.
-    partitions: Vec<PartitionInfo>,
-    /// When the source is a backup folder (native rusty-backup *or* Clonezilla),
-    /// the resolved backup — `open_partition` routes through it to build the
-    /// right session. `None` for an image / host source.
-    resolved_backup: Option<commander_source::ResolvedBackup>,
-    /// Index into `partitions` currently being browsed.
-    selected_part: Option<usize>,
-    /// The session that opened the current partition, kept so Apply can
-    /// re-open it read-write. `None` until a partition is opened.
-    session: Option<BrowseSession>,
-    /// In-flight async open (spinner) from `BrowseSession::spawn_open`.
-    pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
     /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
     pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
     /// In-flight Apply preflight; a clean verdict starts the apply, anything else opens the review.
     pending_preflight: Option<Arc<Mutex<PreflightStatus>>>,
     apply_review: Option<ApplyReview>,
     apply_report: Option<ApplyReport>,
-    /// Still-staged edits and the folder to return to once the post-apply reopen lands.
-    reopen_restore: Option<(Vec<StagedEdit>, String)>,
-    /// In-flight Clonezilla metadata scan (spinner) from
-    /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
-    /// partclone-cache session and hands off to `pending_open`.
-    pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
     /// In-flight async wrapper expansion (a large `.toast`/`.chd`/`.iso` being
     /// materialized + probed off the UI thread). `poll_wrapper` installs the
     /// mount when it finishes; a spinner shows meanwhile.
     pending_wrapper: Option<PendingWrapper>,
-    /// Scanned Clonezilla block caches reused across opens this session. The
-    /// shared store also holds the in-memory/on-disk/scan decision tree so this
-    /// pane and the Inspect tab agree (see `commander_source::PartcloneCacheStore`).
-    cache_store: commander_source::PartcloneCacheStore,
-    /// Phase text shown next to the spinner while `pending_open` is live.
+    /// Phase text shown next to the spinner while a remote transition runs.
     open_phase: String,
-    /// Rate / ETA estimator for the open-progress bar when the underlying open
-    /// is a synthetic carve scan (large ISO or full-disk scan). Reset on each
-    /// open so a fresh scan doesn't inherit the previous window.
-    open_rate: super::super::progress::RateTracker,
-    /// Volume metadata captured on open, for the source-bar readout.
-    volume_label: String,
-    fs_type: String,
-    total_size: u64,
-    used_size: u64,
-    /// Last open / navigation / apply error, shown in the pane body.
+    /// Remote volume readout; a local source's lives in the controller.
+    remote_volume: VolumeInfo,
+    /// Last remote connect error, shown in the pane body.
     error: Option<String>,
-    /// True when the current source needs a password / passphrase to open
-    /// (encrypted container, or a locked APFS FileVault volume). Renders the
-    /// unlock prompt in the pane body; on submit the secret is stashed on
-    /// `session.password` and the open is re-spawned.
-    needs_password: bool,
     /// The user's in-progress password / passphrase entry for the unlock prompt.
     password_input: String,
-    /// A source/partition switch the user requested while the queue was
-    /// non-empty; held until they confirm discarding the staged edits.
-    pending_switch: Option<PendingSwitch>,
     /// Host-pane only: entry names the user asked to delete, held until they
     /// confirm the (immediate, irreversible) host removal.
     pending_host_delete: Option<Vec<String>>,
@@ -258,22 +206,6 @@ pub(crate) struct CommanderPane {
     pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
     /// The open "Connect to remote..." dialog, if any.
     connect_dialog: Option<ConnectDialog>,
-    /// In-memory mirror of the merged recent list (newest 3 per mode across
-    /// Inspect/Restore/Optical/Archives/Commander). Seeded at construction and
-    /// refreshed on each open; drives this pane's "Recent" dropdown.
-    recent: Vec<String>,
-    /// True when the source is a Mac archive opened in-pane (`ArchiveFilesystem`,
-    /// read-only). Copy-OUT works via the session-less path; the pane rejects
-    /// edits and receiving copies, like a wrapper mount or backup.
-    archive_source: bool,
-    /// True when the source is an optical disc image opened in-pane
-    /// (`OpticalFilesystem`, read-only). Like `archive_source`, but the pane's
-    /// partition picker instead lists this disc's filesystems (`optical_choices`)
-    /// — e.g. the ISO 9660 and HFS sides of a hybrid Mac/PC disc.
-    optical_source: bool,
-    /// The optical disc's selectable filesystems (primary + any hybrid Mac side);
-    /// drives the picker when `optical_source`. `selected_part` indexes into it.
-    optical_choices: Vec<OpticalFsChoice>,
     /// Keyboard actions for this pane, run at the start of the next row render.
     key_actions: Vec<CommanderPaneAction>,
     /// This is the active pane, so it draws the keyboard cursor.
@@ -333,17 +265,6 @@ struct NewFolderDialog {
     error: Option<String>,
 }
 
-/// A deferred source change awaiting the unsaved-edits confirmation.
-enum PendingSwitch {
-    Source(PathBuf),
-    HostRoot(PathBuf),
-    /// Open a native rusty-backup folder as the source.
-    Backup(PathBuf),
-    Partition(usize),
-    /// Close (unload) the pane entirely.
-    Close,
-}
-
 /// An in-flight async wrapper expansion: the node being opened, its display
 /// name (for the spinner + status), and the worker's shared status handle.
 struct PendingWrapper {
@@ -361,34 +282,26 @@ impl CommanderPane {
         self.ctl.display_rows(remote_host)
     }
 
-    pub(crate) fn new(side: Side) -> Self {
+    pub(crate) fn new(side: Side, jobs: JobRegistry) -> Self {
+        let services = PaneServices {
+            jobs,
+            notify: Arc::new(super::super::ui_logger::EguiWake),
+            recent: Box::new(CommanderRecent(UserConfig)),
+        };
         Self {
             side,
-            source: None,
-            partitions: Vec::new(),
-            resolved_backup: None,
-            selected_part: None,
-            ctl: CommanderPaneController::new(),
-            session: None,
-            pending_open: None,
+            ctl: CommanderPaneController::with_services(services),
+            effects: EffectHost::default(),
+            statuses: Vec::new(),
             pending_apply: None,
             pending_preflight: None,
             apply_review: None,
             apply_report: None,
-            reopen_restore: None,
-            pending_scan: None,
             pending_wrapper: None,
-            cache_store: commander_source::PartcloneCacheStore::new(),
             open_phase: String::new(),
-            open_rate: super::super::progress::RateTracker::default(),
-            volume_label: String::new(),
-            fs_type: String::new(),
-            total_size: 0,
-            used_size: 0,
+            remote_volume: VolumeInfo::default(),
             error: None,
-            needs_password: false,
             password_input: String::new(),
-            pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
             new_folder_dialog: None,
@@ -398,13 +311,78 @@ impl CommanderPane {
             remote: None,
             pending_remote: None,
             connect_dialog: None,
-            recent: super::super::load_recent_merged(),
-            archive_source: false,
-            optical_source: false,
-            optical_choices: Vec::new(),
             key_actions: Vec::new(),
             has_focus: false,
             page_rows: 1,
+        }
+    }
+
+    /// Run a source action and its effects, answering pickers straight back to the controller.
+    fn act(&mut self, ctx: &egui::Context, action: CommanderPaneAction) {
+        let fx = self.ctl.apply(action);
+        self.run_effects(ctx, fx);
+    }
+
+    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<rusty_backup::controller::Effect>) {
+        let mut messages = Vec::new();
+        let replies = self.effects.run(ctx, fx, &mut messages);
+        let side = self.side.label();
+        self.statuses
+            .extend(messages.into_iter().map(|m| format!("[{side}] {m}")));
+        self.handle_requests();
+        for reply in replies {
+            self.answer(ctx, reply);
+        }
+    }
+
+    fn answer(&mut self, ctx: &egui::Context, reply: Reply) {
+        let action = match reply {
+            Reply::Picked { purpose, path } => CommanderPaneAction::Picked { purpose, path },
+            Reply::Confirmed { purpose, yes } => CommanderPaneAction::Confirmed { purpose, yes },
+        };
+        self.act(ctx, action);
+    }
+
+    /// Source-level requests: a new local source or a close drops the remote connection.
+    fn handle_requests(&mut self) {
+        let mut rest = Vec::new();
+        for req in self.ctl.take_requests() {
+            match req {
+                PaneRequest::SourceReset => self.drop_remote(),
+                other => rest.push(other),
+            }
+        }
+        if !rest.is_empty() {
+            let mut out = RowActions::default();
+            self.handle_row_requests(rest, &mut out);
+            if let Some(s) = out.status {
+                self.statuses.push(s);
+            }
+        }
+    }
+
+    /// Forget the remote connection and anything in flight against the old source.
+    fn drop_remote(&mut self) {
+        self.pending_apply = None;
+        self.pending_preflight = None;
+        self.pending_host_delete = None;
+        self.rename_dialog = None;
+        self.error = None;
+        self.open_phase.clear();
+        // Dropping the browser drops the last Arc to the shared connection (the daemon reaps its handles).
+        self.browser = None;
+        self.remote = None;
+        self.remote_volume = VolumeInfo::default();
+        self.pending_remote = None;
+        self.connect_dialog = None;
+    }
+
+    /// The volume readout: the remote one while remote, else the controller's.
+    fn volume(&self) -> &VolumeInfo {
+        if self.remote.is_some() {
+            &self.remote_volume
+        } else {
+            self.ctl.volume()
         }
     }
 
@@ -436,7 +414,7 @@ impl CommanderPane {
     /// Drop this pane's in-memory recent-files mirror (the Settings dialog
     /// cleared the persisted lists).
     pub(crate) fn clear_recent_files(&mut self) {
-        self.recent.clear();
+        self.ctl.apply(CommanderPaneAction::RecentCleared);
     }
 
     /// Open a base-row wrapper off the UI thread with a spinner; only one opens at a time.
@@ -492,9 +470,6 @@ impl CommanderPane {
     /// large expand doesn't freeze the UI. `None` for a host base (opened by
     /// path instead) or a source with no reopenable handle.
     fn base_stage_source(&self) -> Option<commander_ops::StageSource> {
-        if let Some(session) = self.session.clone() {
-            return Some(commander_ops::StageSource::Session(session));
-        }
         #[cfg(feature = "remote")]
         if let Some(RemoteConn {
             addr,
@@ -507,40 +482,7 @@ impl CommanderPane {
                 partition: partition.clone(),
             });
         }
-        if self.archive_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
-                    path: path.clone(),
-                    label,
-                }));
-            }
-        }
-        // An optical disc reopens by path + the selected filesystem (the primary
-        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
-        // the same tree the pane shows.
-        if self.optical_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                let hybrid = self
-                    .selected_part
-                    .and_then(|i| self.optical_choices.get(i))
-                    .and_then(|c| c.hybrid_index);
-                let recipe = match hybrid {
-                    Some(index) => ReopenRecipe::OpticalHybrid {
-                        path: path.clone(),
-                        index,
-                        label,
-                    },
-                    None => ReopenRecipe::Optical {
-                        path: path.clone(),
-                        label,
-                    },
-                };
-                return Some(commander_ops::StageSource::Reopen(recipe));
-            }
-        }
-        None
+        self.ctl.local_stage_source()
     }
 
     /// Record a failed wrapper expansion in the session log (where the full
@@ -573,14 +515,13 @@ impl CommanderPane {
                 self.pending_wrapper = None;
             }
         }
-        let mut status = self.poll_open(ui.ctx());
+        let fx = self.ctl.tick();
+        self.run_effects(ui.ctx(), fx);
+        let mut status = None;
         if let Some(s) = self.poll_preflight(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.poll_apply(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_scan(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.poll_wrapper(ui.ctx()) {
@@ -589,6 +530,7 @@ impl CommanderPane {
         if let Some(s) = self.poll_remote(ui.ctx()) {
             status = Some(s);
         }
+        let mut cancel_open = false;
         let mut copy_to_other = false;
         let mut export_to_host = false;
         let mut export_as: Option<ExportFormat> = None;
@@ -641,63 +583,21 @@ impl CommanderPane {
                 ui.spinner();
                 ui.label("Applying staged edits...");
             });
-        } else if self.pending_scan.is_some() {
+        } else if let Some(snap) = self.ctl.opening() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if super::super::progress::show_job(ui, &snap) {
+                    cancel_open = true;
+                }
+            });
+        } else if self.ctl.is_opening() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
-                ui.label("Scanning Clonezilla metadata (first open of this partition)...");
+                ui.label("Opening...");
             });
-        } else if let Some(arc) = self.pending_open.clone() {
-            // Match the main browse view: when the underlying open is a
-            // synthetic carve scan (large ISO / full-disk scan), render a real
-            // progress bar with % + rate + ETA; otherwise just a spinner +
-            // phase text (metadata reads have no byte counter to bind to).
-            let snap = arc
-                .lock()
-                .ok()
-                .map(|g| (g.phase.clone(), g.scan_done, g.scan_total));
-            ui.add_space(20.0);
-            match snap {
-                Some((phase, done, total)) if total > 0 => {
-                    self.open_rate.record(done, "Opening");
-                    let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-                    let suffix = self.open_rate.suffix(done, total);
-                    let text = format!(
-                        "{} / {} ({:.0}%){}",
-                        disk_core::display::format_size(done),
-                        disk_core::display::format_size(total),
-                        frac * 100.0,
-                        suffix,
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label(if phase.is_empty() { "Opening" } else { &phase });
-                    });
-                    ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
-                    ui.ctx().request_repaint();
-                }
-                Some((phase, _, _)) => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label(if phase.is_empty() {
-                            "Opening...".to_string()
-                        } else {
-                            phase
-                        });
-                    });
-                    ui.ctx().request_repaint();
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label("Opening...");
-                    });
-                }
-            }
         } else if self.pending_remote.is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
@@ -709,13 +609,9 @@ impl CommanderPane {
                     self.open_phase.clone()
                 });
             });
-        } else if self.needs_password && self.session.is_some() {
-            // Unlock prompt for an encrypted source — reuses the same
-            // stash-secret-and-re-spawn retry as the Inspect BrowseView. Adapts
-            // its copy for a locked APFS FileVault volume vs. a container image.
-            // Gated on `session.is_some()` so switching away to a session-less
-            // source (host folder, closed pane) drops a stale prompt.
-            let is_apfs = self.fs_type == "APFS";
+        } else if self.ctl.needs_password() {
+            // Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
+            let is_apfs = self.ctl.volume().fs_type == "APFS";
             let mut submit = false;
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
@@ -741,17 +637,12 @@ impl CommanderPane {
                 });
             });
             if submit {
-                let secret = self.password_input.clone();
-                let spawned = self.session.as_mut().map(|session| {
-                    session.password = Some(secret);
-                    session.spawn_open()
-                });
-                if let Some(arc) = spawned {
-                    self.pending_open = Some(arc);
-                    self.needs_password = false;
-                    self.error = None;
-                }
+                let secret = std::mem::take(&mut self.password_input);
+                self.act(ui.ctx(), CommanderPaneAction::SubmitPassword(secret));
             }
+        } else if let Some(err) = self.ctl.source_error().map(str::to_string) {
+            ui.add_space(12.0);
+            ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
         } else if let Some(err) = &self.error {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
@@ -789,8 +680,12 @@ impl CommanderPane {
             });
         }
 
-        if let Some(s) = self.render_switch_guard(ui.ctx()) {
-            status = Some(s);
+        if cancel_open {
+            self.act(ui.ctx(), CommanderPaneAction::CancelOpen);
+        }
+        let side = self.side.label();
+        if let Some(reply) = self.effects.show(ui.ctx(), side) {
+            self.answer(ui.ctx(), reply);
         }
         if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
             status = Some(s);
@@ -813,6 +708,9 @@ impl CommanderPane {
         }
 
         self.key_actions.clear();
+        if let Some(s) = self.take_status() {
+            status = Some(s);
+        }
         PaneResponse {
             status,
             copy_to_other,
@@ -1282,19 +1180,6 @@ impl CommanderPane {
         msg
     }
 
-    /// Reset local-source state when this pane becomes (or re-targets) remote.
-    fn reset_for_remote(&mut self) {
-        self.source = None;
-        self.partitions = Vec::new();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.selected_part = None;
-        self.session = None;
-        self.ctl.queue.clear();
-        self.error = None;
-    }
-
     /// Poll an in-flight remote transition; when done, re-install the browser and
     /// swap the new target (the host file browser, or an opened image) into the
     /// listing.
@@ -1322,19 +1207,20 @@ impl CommanderPane {
         match result {
             Ok(target) => {
                 let mode = target.mode.clone();
-                self.reset_for_remote();
-                self.fs_type = target.fs_type.clone();
-                self.volume_label = target.volume_label.clone();
-                self.total_size = target.total_size;
-                self.used_size = target.used_size;
+                let volume = VolumeInfo {
+                    label: target.volume_label.clone(),
+                    fs_type: target.fs_type.clone(),
+                    total_size: target.total_size,
+                    used_size: target.used_size,
+                };
+                self.remote_volume = volume.clone();
                 self.remote = Some(RemoteConn {
                     addr: addr.clone(),
                     mode: mode.clone(),
                 });
-                self.ctl.source_changed();
+                self.error = None;
                 self.ctl
-                    .listing
-                    .load_root(target.fs, target.root, target.entries, false);
+                    .install_remote(target.fs, target.root, target.entries, volume);
                 match mode {
                     BrowseMode::Host => Some(format!(
                         "[{}] connected to {addr} (browsing host)",
@@ -1398,48 +1284,6 @@ impl CommanderPane {
         self.remote.as_ref().map(|r| r.addr.clone())
     }
 
-    fn render_switch_guard(&mut self, ctx: &egui::Context) -> Option<String> {
-        // Short-circuit when nothing is pending.
-        self.pending_switch.as_ref()?;
-        let n = self.ctl.queue.len();
-        let mut confirm = false;
-        let mut cancel = false;
-        egui::Window::new(format!("Discard staged edits? ({})", self.side.label()))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "The {} pane has {n} staged edit(s) that have not been applied.",
-                    self.side.label()
-                ));
-                ui.label("Switching the source will discard them.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Discard & switch").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if confirm {
-            // `load_source` / `open_partition` reset the queue themselves.
-            return self.pending_switch.take().map(|req| match req {
-                PendingSwitch::Source(path) => self.load_source(path),
-                PendingSwitch::HostRoot(path) => self.load_host(path),
-                PendingSwitch::Backup(path) => self.load_backup_source(path),
-                PendingSwitch::Partition(idx) => self.open_partition(idx),
-                PendingSwitch::Close => self.close_source(),
-            });
-        }
-        if cancel {
-            self.pending_switch = None;
-        }
-        None
-    }
-
     // --- accessors used by CommanderMode for cross-pane copy ---------------
 
     /// True when this pane can receive a copy: a volume/folder is open and the
@@ -1450,10 +1294,10 @@ impl CommanderPane {
         self.ctl.listing.is_loaded()
             && self.pending_apply.is_none()
             && self.pending_preflight.is_none()
-            && self.pending_open.is_none()
+            && !self.ctl.is_opening()
             && self.pending_remote.is_none()
-            && self.resolved_backup.is_none()
-            && !self.archive_source
+            && !self.ctl.is_backup()
+            && !self.ctl.is_archive()
         // Both remote destinations can now receive: a remote image via the
         // daemon's OpenSession/StageUpload/Apply path, and a remote host folder
         // via MkdirHost/WriteHostFile. A read-only daemon refuses the write with
@@ -1470,15 +1314,15 @@ impl CommanderPane {
     pub(crate) fn is_read_only(&self) -> bool {
         self.ctl.listing.is_loaded()
             && !self.ctl.listing.is_host()
-            && (self.archive_source || self.optical_source || self.resolved_backup.is_some())
+            && (self.ctl.is_archive() || self.ctl.is_optical() || self.ctl.is_backup())
     }
 
     /// A short reason a copy into this pane is refused, for the copy button's
     /// disabled hover. `None` when the pane can receive.
     pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
-        if self.archive_source {
+        if self.ctl.is_archive() {
             Some("the archive is read-only")
-        } else if self.resolved_backup.is_some() {
+        } else if self.ctl.is_backup() {
             Some("the backup is read-only")
         } else {
             None
@@ -1498,57 +1342,19 @@ impl CommanderPane {
     /// desync its `metadata.json` checksum, zstd backups have no in-place
     /// editable session, and Clonezilla images are read-through a block cache.
     pub(crate) fn is_backup_pane(&self) -> bool {
-        self.resolved_backup.is_some()
+        self.ctl.is_backup()
     }
 
     /// True when this pane's source is a read-only Mac archive
     /// (`ArchiveFilesystem`). Like a backup pane, it can be browsed and copied
     /// out of, but not edited or copied into.
     pub(crate) fn is_archive_pane(&self) -> bool {
-        self.archive_source
-    }
-
-    /// A clone of the session that opened this image pane (to re-open the source
-    /// read-only on a worker thread for an image->host extraction). `None` for a
-    /// host pane or before a source is opened.
-    pub(crate) fn session(&self) -> Option<BrowseSession> {
-        // A wrapper mount has no BrowseSession; force the session-less
-        // image->host extraction path.
-        if self.tree_active() {
-            return None;
-        }
-        self.session.clone()
-    }
-
-    /// If this pane's *source* is a remote image (no local session — its fs lives
-    /// over the wire), the `(addr, path, partition)` needed to reopen it fresh on
-    /// a copy worker, so an image->image copy out of it runs async with progress
-    /// instead of blocking the UI. `None` for local sources, remote *host* panes,
-    /// and while a wrapper mount is the active source (that stays on the sync
-    /// [`commander_ops::stage_copy`] path — a small, local temp fs).
-    #[cfg(feature = "remote")]
-    pub(crate) fn remote_image_source(
-        &self,
-    ) -> Option<(
-        String,
-        String,
-        Option<rusty_backup::cli::img_at::PartSelector>,
-    )> {
-        if self.tree_active() {
-            return None;
-        }
-        match &self.remote {
-            Some(RemoteConn {
-                addr,
-                mode: BrowseMode::Image { path, partition },
-            }) => Some((addr.clone(), path.clone(), partition.clone())),
-            _ => None,
-        }
+        self.ctl.is_archive()
     }
 
     /// How an async copy / checksum worker should reopen this pane's image source
     /// off the UI thread. Covers every image source with a way to reopen fresh:
-    /// a local [`BrowseSession`], a remote connection, an inline-expanded
+    /// a local browse session, a remote connection, an inline-expanded
     /// disk-image / optical wrapper mount, or a Mac archive (by file path).
     /// `None` only for a source with no reopenable handle — an archive-in-a-
     /// container wrapper (read from an in-memory buffer) — where the caller falls
@@ -1563,52 +1369,10 @@ impl CommanderPane {
                 .mount_reopen(&mount_key)
                 .map(commander_ops::StageSource::Reopen);
         }
-        if let Some(session) = self.session() {
-            return Some(commander_ops::StageSource::Session(session));
+        if self.tree_active() {
+            return None;
         }
-        #[cfg(feature = "remote")]
-        if let Some((addr, path, partition)) = self.remote_image_source() {
-            return Some(commander_ops::StageSource::Remote {
-                addr,
-                path,
-                partition,
-            });
-        }
-        // A Mac archive opened in-pane has no session — reopen it by file path.
-        if self.archive_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
-                    path: path.clone(),
-                    label,
-                }));
-            }
-        }
-        // An optical disc reopens by path + the selected filesystem (the primary
-        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
-        // the same tree the pane shows.
-        if self.optical_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                let hybrid = self
-                    .selected_part
-                    .and_then(|i| self.optical_choices.get(i))
-                    .and_then(|c| c.hybrid_index);
-                let recipe = match hybrid {
-                    Some(index) => ReopenRecipe::OpticalHybrid {
-                        path: path.clone(),
-                        index,
-                        label,
-                    },
-                    None => ReopenRecipe::Optical {
-                        path: path.clone(),
-                        label,
-                    },
-                };
-                return Some(commander_ops::StageSource::Reopen(recipe));
-            }
-        }
-        None
+        self.base_stage_source()
     }
 
     /// A clone of the pending-apply status handle for the progress modal.
@@ -1636,7 +1400,7 @@ impl CommanderPane {
         if self.is_backup_pane() {
             return format!("[{}] backup panes are read-only.", self.side.label());
         }
-        if self.archive_source {
+        if self.ctl.is_archive() {
             return format!("[{}] archive panes are read-only.", self.side.label());
         }
         if self.remote.is_some() {
@@ -1674,7 +1438,7 @@ impl CommanderPane {
 
     /// True while one of this pane's dialogs waits for an answer, so shortcuts stand down.
     pub(crate) fn modal_open(&self) -> bool {
-        self.pending_switch.is_some()
+        self.effects.modal_open()
             || self.pending_host_delete.is_some()
             || self.rename_dialog.is_some()
             || self.new_folder_dialog.is_some()
@@ -1684,20 +1448,17 @@ impl CommanderPane {
     }
 
     fn busy(&self) -> bool {
-        self.pending_apply.is_some()
-            || self.pending_preflight.is_some()
-            || self.pending_open.is_some()
-            || self.pending_scan.is_some()
+        self.pending_apply.is_some() || self.pending_preflight.is_some() || self.ctl.is_opening()
     }
 
     fn can_new_folder(&self) -> bool {
-        self.ctl.listing.is_loaded() && !self.busy() && self.resolved_backup.is_none()
+        self.ctl.listing.is_loaded() && !self.busy() && !self.ctl.is_backup()
     }
 
     /// The Apply button, when it is offered and enabled.
     pub(crate) fn apply_shortcut(&mut self) -> Option<String> {
         let staging =
-            !self.ctl.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source;
+            !self.ctl.listing.is_host() && !self.ctl.is_backup() && !self.ctl.is_archive();
         (staging && !self.ctl.queue.is_empty() && !self.busy()).then(|| self.apply())
     }
 
@@ -1713,7 +1474,7 @@ impl CommanderPane {
 
     /// The cursor row's "Rename..." menu item.
     pub(crate) fn rename_shortcut(&mut self) {
-        if self.pending_apply.is_some() || self.resolved_backup.is_some() {
+        if self.pending_apply.is_some() || self.ctl.is_backup() {
             return;
         }
         let Some(row) = self.ctl.cursor_index().map(|i| self.ctl.rows()[i].clone()) else {
@@ -1772,7 +1533,7 @@ impl CommanderPane {
     /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
     /// for a host pane or before a source is opened.
     pub(crate) fn fs_type(&self) -> &str {
-        &self.fs_type
+        &self.volume().fs_type
     }
 
     /// Look up an entry by name in the current directory and read up to `max`
@@ -1854,24 +1615,22 @@ impl CommanderPane {
     /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
     /// A directory opens as a host folder, a file as an image; staged edits defer
     /// the switch behind the discard-confirmation, mirroring the source picker.
-    pub(crate) fn open_dropped(&mut self, path: PathBuf) -> String {
-        let is_dir = path.is_dir();
-        if !self.ctl.queue.is_empty() {
-            self.pending_switch = Some(if is_dir {
-                PendingSwitch::HostRoot(path)
-            } else {
-                PendingSwitch::Source(path)
-            });
+    pub(crate) fn open_dropped(&mut self, ctx: &egui::Context, path: PathBuf) -> String {
+        self.act(ctx, CommanderPaneAction::OpenPath(path));
+        if self.effects.modal_open() {
             return format!(
                 "[{}] discard staged edits to open a new source.",
                 self.side.label()
             );
         }
-        if is_dir {
-            self.load_host(path)
-        } else {
-            self.load_source(path)
-        }
+        self.take_status().unwrap_or_default()
+    }
+
+    /// The newest controller message, dropping older ones from the same frame.
+    fn take_status(&mut self) -> Option<String> {
+        let last = self.statuses.pop();
+        self.statuses.clear();
+        last
     }
 
     /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
@@ -1936,7 +1695,9 @@ impl CommanderPane {
     // --- source bar --------------------------------------------------------
 
     fn source_bar(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        use CommanderPaneAction as A;
         let mut status = None;
+        let mut source_action = None;
 
         // Row 1: source selection + pane lifecycle (Close / Apply / Discard).
         // Wrapped so the picker + lifecycle buttons flow onto a second line on a
@@ -1945,7 +1706,8 @@ impl CommanderPane {
             // Shared source picker (R1): the same ComboBox widget the Inspect
             // tab uses, here offering an image file or a host folder. Image
             // opens are not materialized (BrowseSession peels the container).
-            let is_backup = self.resolved_backup.is_some();
+            let is_backup = self.ctl.is_backup();
+            let source = self.ctl.source_path().map(|p| p.to_path_buf());
             let current_label = if let Some(r) = &self.remote {
                 match &r.mode {
                     BrowseMode::Host => format!("Remote {} (host)", r.addr),
@@ -1966,16 +1728,16 @@ impl CommanderPane {
             } else if self.ctl.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
-                match &self.source {
+                match &source {
                     Some(p) => format!(
                         "Backup: {}",
                         p.file_name().unwrap_or_default().to_string_lossy()
                     ),
                     None => "Backup folder".to_string(),
                 }
-            } else if let Some(p) = &self.source {
+            } else if let Some(p) = &source {
                 let base = p.file_name().unwrap_or_default().to_string_lossy();
-                if self.archive_source {
+                if self.ctl.is_archive() {
                     format!("Archive: {base}")
                 } else {
                     format!("Image: {base}")
@@ -1999,16 +1761,17 @@ impl CommanderPane {
                 // Variable-length recent group: the merged list is already short
                 // (newest 3 per mode) and rarely changes mid-session.
                 recent_slots: 0,
+                run_dialogs: false,
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
-                image_active: self.source.is_some() && !self.ctl.listing.is_host() && !is_backup,
+                image_active: source.is_some() && !self.ctl.listing.is_host() && !is_backup,
                 host_active: self.ctl.listing.is_host(),
                 backup_active: is_backup,
                 devices: &[],
                 // Merged recent list (newest 3 per mode) shown as a group inside
                 // this same dropdown — no extra combo crowding the source bar.
-                recent: &self.recent,
+                recent: self.ctl.recent(),
             };
             let id = format!("commander_source_{}", self.side.idx());
             if let Some(ev) =
@@ -2016,33 +1779,16 @@ impl CommanderPane {
             {
                 use super::super::source_picker::SourceEvent;
                 match ev {
-                    // A recent pick opens like a drag-and-drop: file→image/archive,
-                    // dir→host folder (deferred behind the discard prompt if edits
-                    // are staged).
-                    SourceEvent::Recent(path) => {
-                        status = Some(self.open_dropped(path));
+                    // A recent pick opens like a drag-and-drop: a folder as a host folder, a file as an image.
+                    SourceEvent::Recent(path) => source_action = Some(A::OpenPath(path)),
+                    SourceEvent::Image { path, .. } => source_action = Some(A::OpenImage(path)),
+                    SourceEvent::HostFolder(dir) => source_action = Some(A::OpenHostFolder(dir)),
+                    SourceEvent::BackupFolder(dir) => {
+                        source_action = Some(A::OpenBackupFolder(dir))
                     }
-                    SourceEvent::Image { path, .. } => {
-                        if self.ctl.queue.is_empty() {
-                            status = Some(self.load_source(path));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::Source(path));
-                        }
-                    }
-                    SourceEvent::HostFolder(dir) => {
-                        if self.ctl.queue.is_empty() {
-                            status = Some(self.load_host(dir));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::HostRoot(dir));
-                        }
-                    }
-                    SourceEvent::BackupFolder(folder) => {
-                        if self.ctl.queue.is_empty() {
-                            status = Some(self.load_backup_source(folder));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::Backup(folder));
-                        }
-                    }
+                    SourceEvent::PickImage => source_action = Some(A::PickImage),
+                    SourceEvent::PickHostFolder => source_action = Some(A::PickHostFolder),
+                    SourceEvent::PickBackupFolder => source_action = Some(A::PickBackupFolder),
                     SourceEvent::Device(_) => {}
                     // "Connect to Remote..." opens the host:port dialog. Like the
                     // other switch events it's blocked while edits are staged
@@ -2093,24 +1839,19 @@ impl CommanderPane {
             }
 
             // Close (unload) this pane — guarded by unsaved staged edits.
-            if (self.source.is_some() || self.ctl.listing.is_loaded())
+            if (source.is_some() || self.ctl.listing.is_loaded())
                 && ui
                     .button("Close")
                     .on_hover_text("Unload this pane / disconnect")
                     .clicked()
             {
-                if self.ctl.queue.is_empty() {
-                    status = Some(self.close_source());
-                } else {
-                    self.pending_switch = Some(PendingSwitch::Close);
-                }
+                source_action = Some(A::CloseSource);
             }
 
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups / archives are
             // read-only).
-            if !self.ctl.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source
-            {
+            if !self.ctl.listing.is_host() && !is_backup && !self.ctl.is_archive() {
                 let n = self.ctl.queue.len();
                 let busy = self.busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
@@ -2145,32 +1886,18 @@ impl CommanderPane {
                 // (ISO 9660 + any hybrid Mac side); every other image lists its
                 // partition-table entries.
                 if !self.ctl.listing.is_host() {
-                    // (label per index, empty-state text) for the active list.
-                    let labels: Vec<String> = if self.optical_source {
-                        self.optical_choices
-                            .iter()
-                            .map(|c| c.label.clone())
-                            .collect()
-                    } else {
-                        self.partitions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| partition_label(i, p))
-                            .collect()
-                    };
-                    let empty_text = if self.optical_source {
+                    let labels = self.ctl.partition_labels();
+                    let empty_text = if self.ctl.is_optical() {
                         "(no filesystems)"
                     } else {
                         "(no partitions)"
                     };
-                    let current = self
-                        .selected_part
+                    let selected = self.ctl.selected_partition();
+                    let current = selected
                         .and_then(|i| labels.get(i).cloned())
                         .unwrap_or_else(|| empty_text.to_string());
-                    let mut chosen = self.selected_part;
-                    // Cap the width so a long label (e.g. a raw-carve "Amiga
-                    // NDOS (no filesystem)") can't overflow into the volume
-                    // readout on the right.
+                    let mut chosen = selected;
+                    // Capped so a long label (a raw-carve "Amiga NDOS (no filesystem)") can't push the readout.
                     egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
                         .selected_text(current)
                         .width(210.0)
@@ -2179,16 +1906,9 @@ impl CommanderPane {
                                 ui.selectable_value(&mut chosen, Some(i), label);
                             }
                         });
-                    if chosen != self.selected_part {
+                    if chosen != selected {
                         if let Some(i) = chosen {
-                            if self.optical_source {
-                                // Optical panes are read-only — no queue to guard.
-                                status = Some(self.open_optical_choice(i));
-                            } else if self.ctl.queue.is_empty() {
-                                status = Some(self.open_partition(i));
-                            } else {
-                                self.pending_switch = Some(PendingSwitch::Partition(i));
-                            }
+                            source_action = Some(A::SelectPartition(i));
                         }
                     }
                 }
@@ -2215,14 +1935,15 @@ impl CommanderPane {
                 if self.ctl.listing.is_host() {
                     ui.strong("local folder");
                 } else {
-                    let label = if self.volume_label.is_empty() {
-                        self.fs_type.clone()
+                    let vol = self.volume().clone();
+                    let label = if vol.label.is_empty() {
+                        vol.fs_type.clone()
                     } else {
-                        format!("{} ({})", self.volume_label, self.fs_type)
+                        format!("{} ({})", vol.label, vol.fs_type)
                     };
                     ui.strong(label);
                     ui.separator();
-                    let free = self.total_size.saturating_sub(self.used_size);
+                    let free = vol.total_size.saturating_sub(vol.used_size);
                     ui.label(format!("free: {}", format_size(free)));
                     // Read-only media (archive / backup / remote host): flag it so
                     // the greyed copy-into button reads as "by design", and edits
@@ -2238,49 +1959,10 @@ impl CommanderPane {
                 }
             });
         }
+        if let Some(action) = source_action {
+            self.act(ui.ctx(), action);
+        }
         status
-    }
-
-    /// Unload the pane back to the empty state (the "Close" button). The caller
-    /// guards this behind the unsaved-edits check; here we just reset.
-    /// Clear the optical-source state. Called wherever a pane switches to a
-    /// non-optical source so a stale `optical_choices` picker can't linger.
-    fn reset_optical(&mut self) {
-        self.optical_source = false;
-        self.optical_choices.clear();
-    }
-
-    fn close_source(&mut self) -> String {
-        self.source = None;
-        self.partitions.clear();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.selected_part = None;
-        self.ctl.listing = DirListing::new();
-        self.ctl.source_changed();
-        self.session = None;
-        self.ctl.queue.clear();
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.pending_scan = None;
-        self.pending_wrapper = None;
-        self.open_phase.clear();
-        self.volume_label.clear();
-        self.fs_type.clear();
-        self.total_size = 0;
-        self.used_size = 0;
-        self.error = None;
-        self.pending_host_delete = None;
-        self.rename_dialog = None;
-        // Disconnect any remote session: dropping the browser drops the last
-        // Arc to the shared connection (the daemon reaps its handles).
-        self.browser = None;
-        self.remote = None;
-        self.pending_remote = None;
-        self.connect_dialog = None;
-        format!("[{}] closed.", self.side.label())
     }
 
     /// The "Pending edits" review popup: a plain-language list of every staged
@@ -2325,7 +2007,7 @@ impl CommanderPane {
             let prefix = if self.ctl.listing.is_host() {
                 "host ".to_string()
             } else {
-                match self.selected_part {
+                match self.ctl.selected_partition() {
                     Some(i) => format!("@{} ", i + 1),
                     None => "- ".to_string(),
                 }
@@ -2353,411 +2035,6 @@ impl CommanderPane {
         let mut out = RowActions::default();
         self.dispatch(CommanderPaneAction::NavigateTo(go?), &mut out);
         out.status
-    }
-
-    // --- opening -----------------------------------------------------------
-
-    /// Index of the first partition the browser can actually open — skips
-    /// extended containers *and* non-filesystem partitions (APM driver /
-    /// partition-map entries, EFI system partitions, ...). Uses the shared
-    /// engine gate so Commander, the Inspect grid, and the CLI agree.
-    fn first_browsable_partition(&self) -> Option<usize> {
-        self.partitions.iter().position(|p| {
-            !p.is_extended_container
-                && partition_is_browsable(
-                    p.partition_type_byte,
-                    p.partition_type_string.as_deref(),
-                    &p.type_name,
-                )
-        })
-    }
-
-    /// Probe a freshly-picked file and start browsing its first real partition.
-    fn load_source(&mut self, path: PathBuf) -> String {
-        self.source = Some(path.clone());
-        // Record in the Commander recent MRU (single choke point for local image
-        // opens: picker, recent quick-pick, drag-and-drop, deferred switch), then
-        // refresh this pane's merged view.
-        super::super::push_recent(RecentMode::Commander, &path);
-        self.recent = super::super::load_recent_merged();
-        self.ctl.listing = DirListing::new();
-        self.ctl.source_changed();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.optical_source = false;
-        self.optical_choices.clear();
-        self.cache_store.clear();
-        self.pending_open = None;
-        self.error = None;
-        self.selected_part = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        // A Mac archive (.sit / .hqx / .sea / .cpt / .mar) isn't a disk image —
-        // open it read-only in-pane as an ArchiveFilesystem instead of parsing a
-        // (nonexistent) partition table.
-        if is_mac_archive_path(&path) {
-            return self.load_archive(path);
-        }
-
-        // An optical disc image (.iso / .cue / .toast / .cdr / …) is browsed
-        // through `opticaldiscs`, not the partition table: a hybrid Mac/PC disc
-        // carries an ISO 9660 volume *and* an HFS side that a plain APM parse
-        // (which sees only the Apple_HFS partition) hides. Route it to the
-        // optical opener so the picker lists both. Content-confirmed: an empty
-        // list (not really an optical disc) falls through to `probe_partitions`.
-        let is_optical_ext = path.file_name().and_then(|n| n.to_str()).and_then(classify)
-            == Some(DescendKind::Optical);
-        if is_optical_ext {
-            let choices = optical_filesystems(&path);
-            if !choices.is_empty() {
-                return self.load_optical(choices);
-            }
-        }
-
-        match commander_source::probe_partitions(&path) {
-            Ok(parts) => {
-                self.partitions = parts;
-                // Auto-open the first *browsable* partition (skips APM driver /
-                // partition-map entries and other non-filesystem partitions).
-                match self.first_browsable_partition() {
-                    Some(i) => self.open_partition(i),
-                    None => format!(
-                        "[{}] {} has no browsable partitions.",
-                        self.side.label(),
-                        path.display()
-                    ),
-                }
-            }
-            Err(e) => {
-                self.partitions.clear();
-                self.error = Some(format!("Could not read partitions: {e:#}"));
-                format!("[{}] failed to open {}", self.side.label(), path.display())
-            }
-        }
-    }
-
-    /// Open a Mac archive as a read-only in-pane source (`ArchiveFilesystem`).
-    /// Synchronous — archives decode fully in memory, so there's no worker
-    /// thread; this is the same install `poll_open` does, minus the partition
-    /// machinery. Copy-OUT (both forks) flows through the session-less path.
-    fn load_archive(&mut self, path: PathBuf) -> String {
-        self.partitions.clear();
-        self.reset_optical();
-        self.selected_part = None;
-        self.session = None;
-        self.ctl.queue.clear();
-        let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let mut fs = match open_archive(&path, label) {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("Could not open archive: {e:#}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
-        };
-        let root = match fs.root() {
-            Ok(r) => r,
-            Err(e) => {
-                self.error = Some(format!("Could not read archive root: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
-        };
-        let entries = match fs.list_directory(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error = Some(format!("Could not list archive: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
-        };
-        self.volume_label = fs.volume_label().unwrap_or_default().to_string();
-        self.fs_type = fs.fs_type().to_string();
-        self.archive_source = true;
-        let n = entries.len();
-        self.ctl.source_changed();
-        self.ctl.listing.load_root(fs, root, entries, false);
-        format!(
-            "[{}] opened archive {} ({n} item(s)).",
-            self.side.label(),
-            path.display()
-        )
-    }
-
-    /// Open an optical disc image (`.iso` / `.cue` / `.toast` / …) as a
-    /// read-only in-pane source. `choices` are the disc's filesystems (primary
-    /// ISO 9660 + any hybrid Mac side); the picker lists them and
-    /// `open_optical_choice` opens the selected one. Sessionless, like a Mac
-    /// archive — copy-OUT flows through the session-less path.
-    fn load_optical(&mut self, choices: Vec<OpticalFsChoice>) -> String {
-        self.partitions.clear();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.optical_source = true;
-        self.optical_choices = choices;
-        self.session = None;
-        self.ctl.queue.clear();
-        // Auto-open the first filesystem (the primary — usually ISO 9660).
-        self.open_optical_choice(0)
-    }
-
-    /// Open the optical filesystem at `optical_choices[idx]` (primary or a
-    /// hybrid Mac side) and load its root. Read-only and sessionless.
-    fn open_optical_choice(&mut self, idx: usize) -> String {
-        let Some(path) = self.source.clone() else {
-            return String::new();
-        };
-        let Some(choice) = self.optical_choices.get(idx).cloned() else {
-            return String::new();
-        };
-        self.selected_part = Some(idx);
-        self.error = None;
-        self.ctl.listing = DirListing::new();
-        self.ctl.source_changed();
-        self.ctl.queue.clear();
-        let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-
-        let opened = match choice.hybrid_index {
-            None => open_optical(&path, label),
-            Some(h) => open_optical_hybrid(&path, h, label),
-        };
-        let mut fs = match opened {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("{e:#}"));
-                return format!("[{}] cannot open {}: {e}", self.side.label(), choice.label);
-            }
-        };
-        let root = match fs.root() {
-            Ok(r) => r,
-            Err(e) => {
-                self.error = Some(format!("Could not read disc root: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), choice.label);
-            }
-        };
-        let entries = match fs.list_directory(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error = Some(format!("Could not list disc: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), choice.label);
-            }
-        };
-        self.volume_label = fs.volume_label().unwrap_or_default().to_string();
-        self.fs_type = fs.fs_type().to_string();
-        // Optical discs report no usable free-space figure; zero the readout.
-        self.total_size = 0;
-        self.used_size = 0;
-        let n = entries.len();
-        self.ctl.source_changed();
-        self.ctl.listing.load_root(fs, root, entries, false);
-        format!(
-            "[{}] opened {} ({n} item(s)).",
-            self.side.label(),
-            choice.label
-        )
-    }
-
-    /// Open a backup folder — native rusty-backup *or* Clonezilla (the shared
-    /// resolver detects which) — and start browsing its first browsable
-    /// partition. The partition dropdown lists the backed-up partitions;
-    /// `open_partition` routes through the resolver to build the right session.
-    fn load_backup_source(&mut self, folder: PathBuf) -> String {
-        self.source = Some(folder.clone());
-        self.ctl.listing = DirListing::new();
-        self.ctl.source_changed();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.partitions.clear();
-        self.session = None;
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.ctl.queue.clear();
-        self.error = None;
-        self.selected_part = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        match commander_source::resolve_backup(&folder) {
-            Ok(resolved) => {
-                self.partitions = resolved.partitions().to_vec();
-                self.resolved_backup = Some(resolved);
-                match self.first_browsable_partition() {
-                    Some(i) => self.open_partition(i),
-                    None => format!(
-                        "[{}] backup has no browsable partitions.",
-                        self.side.label()
-                    ),
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Could not read backup: {e:#}"));
-                format!(
-                    "[{}] failed to open backup {}",
-                    self.side.label(),
-                    folder.display()
-                )
-            }
-        }
-    }
-
-    /// Open a host-OS folder as this pane's source (synchronous `std::fs` read;
-    /// writes to a host pane are immediate, never staged).
-    fn load_host(&mut self, dir: PathBuf) -> String {
-        self.source = Some(dir.clone());
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.partitions.clear();
-        self.selected_part = None;
-        self.session = None;
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.ctl.queue.clear();
-        self.error = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        self.ctl.source_changed();
-        match self.ctl.listing.load_host_root(dir.clone()) {
-            Ok(()) => format!(
-                "[{}] opened host folder {} ({} item(s)).",
-                self.side.label(),
-                dir.display(),
-                self.ctl.listing.entries().len()
-            ),
-            Err(e) => {
-                self.ctl.listing = DirListing::new();
-                self.ctl.source_changed();
-                self.error = Some(format!("Could not read folder: {e}"));
-                format!(
-                    "[{}] failed to open folder {}",
-                    self.side.label(),
-                    dir.display()
-                )
-            }
-        }
-    }
-
-    /// Begin an async open of partition `idx`. Builds a backup-data session
-    /// (per compression) when the source is a backup folder, otherwise a
-    /// raw-image session.
-    fn open_partition(&mut self, idx: usize) -> String {
-        let Some(path) = self.source.clone() else {
-            return String::new();
-        };
-        let Some(part) = self.partitions.get(idx).cloned() else {
-            return String::new();
-        };
-        self.selected_part = Some(idx);
-        self.error = None;
-        self.ctl.listing = DirListing::new();
-        self.ctl.source_changed();
-        self.ctl.queue.clear();
-        self.pending_scan = None;
-
-        // Non-filesystem partitions (APM driver / partition-map entries, EFI,
-        // ...) can't be browsed — surface a clear message instead of letting
-        // `open_filesystem` fail with a raw "unsupported partition type" error.
-        if !partition_is_browsable(
-            part.partition_type_byte,
-            part.partition_type_string.as_deref(),
-            &part.type_name,
-        ) {
-            let msg = format!("{} has no browsable filesystem.", part.type_name);
-            self.error = Some(msg.clone());
-            return format!("[{}] {msg}", self.side.label());
-        }
-
-        // Resolve the session. A backup folder routes through the shared
-        // resolver (native -> per-compression session; Clonezilla -> a partclone
-        // block cache from a prior scan); a plain image builds a raw session.
-        // `open_partition` returns owned data, so the `resolved_backup` borrow is
-        // released before we mutate the pane on the error paths below.
-        use commander_source::BackupPartitionOpen;
-        let open_result = self
-            .resolved_backup
-            .as_ref()
-            .map(|r| r.open_partition(part.index));
-        let session = match open_result {
-            Some(Ok(BackupPartitionOpen::Session(s))) => s,
-            Some(Ok(BackupPartitionOpen::Clonezilla(open))) => {
-                // Shared decision tree: a cache scanned earlier this session is
-                // reused in memory; else a prior on-disk scan loads; else a
-                // background scan builds one (`poll_scan` memoizes + opens it).
-                match self.cache_store.resolve(part.index, &open) {
-                    commander_source::PartcloneLookup::Ready(cache) => {
-                        commander_source::session_for_partclone_cache(cache, open.partition_type)
-                    }
-                    commander_source::PartcloneLookup::NeedsScan { cache, cache_path } => {
-                        self.pending_scan = Some(cache_runner::spawn_partclone_scan(
-                            cache,
-                            part.index,
-                            open.partition_type,
-                            cache_path,
-                        ));
-                        self.open_phase = "Scanning Clonezilla metadata...".to_string();
-                        return format!(
-                            "[{}] scanning Clonezilla metadata for {} ...",
-                            self.side.label(),
-                            partition_label(idx, &part)
-                        );
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                self.error = Some(format!("{e:#}"));
-                return format!(
-                    "[{}] cannot browse {}: {e}",
-                    self.side.label(),
-                    partition_label(idx, &part)
-                );
-            }
-            None => commander_source::session_for(&path, &part),
-        };
-        self.open_rate = super::super::progress::RateTracker::default();
-        self.pending_open = Some(session.spawn_open());
-        self.session = Some(session);
-        self.open_phase = "Opening...".to_string();
-        format!(
-            "[{}] opening {} ...",
-            self.side.label(),
-            partition_label(idx, &part)
-        )
-    }
-
-    /// Poll an in-flight Clonezilla metadata scan; on completion, build a
-    /// partclone-cache session and hand off to the normal async-open path (so
-    /// `poll_open` loads the root listing). Returns a status line on completion.
-    fn poll_scan(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_scan.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        self.pending_scan = None;
-        if let Some(err) = guard.error.take() {
-            drop(guard);
-            self.error = Some(format!("Clonezilla metadata scan failed: {err}"));
-            return Some(format!("[{}] Clonezilla scan failed.", self.side.label()));
-        }
-        let cache = Arc::clone(&guard.cache);
-        let partition_type = guard.partition_type;
-        let part_index = guard.partition_index;
-        drop(guard);
-        // Memoize the freshly-scanned cache so re-opening this partition reuses
-        // it in memory instead of re-loading the persisted scan from disk.
-        self.cache_store.insert(part_index, Arc::clone(&cache));
-        let session = commander_source::session_for_partclone_cache(cache, partition_type);
-        self.open_phase = "Opening...".to_string();
-        self.open_rate = super::super::progress::RateTracker::default();
-        self.pending_open = Some(session.spawn_open());
-        self.session = Some(session);
-        Some(format!(
-            "[{}] metadata ready; opening...",
-            self.side.label()
-        ))
     }
 
     /// Poll an in-flight async wrapper expansion; on completion, install the
@@ -2790,86 +2067,6 @@ impl CommanderPane {
         }
     }
 
-    /// Poll an in-flight open; on completion, hand the filesystem + root listing
-    /// to the model or record the error. Returns a status line on completion.
-    fn poll_open(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_open.clone()?;
-        ctx.request_repaint(); // keep polling until the worker finishes
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            self.open_phase = guard.phase.clone();
-            return None;
-        }
-        // Finished — detach the pending handle either way.
-        self.pending_open = None;
-
-        // Encrypted source: the worker flags `needs_password` for a locked
-        // container OR a locked APFS FileVault volume (which opens fine but
-        // fails at the root listing). Show the unlock prompt instead of a dead
-        // error; the (locked) fs is dropped. Capture the label/fs_type first so
-        // the prompt can adapt (APFS) and the source bar still reads the volume.
-        if guard.needs_password {
-            self.volume_label = guard.volume_label.clone();
-            self.fs_type = guard.fs_type.clone();
-            self.needs_password = true;
-            self.error = None;
-            return None;
-        }
-        // The open completed without needing a secret — clear any prior prompt
-        // (e.g. a successful unlock, or switching to an unencrypted source) and
-        // drop the entered secret from memory.
-        self.needs_password = false;
-        self.password_input.clear();
-
-        if let Some(err) = guard.error.take() {
-            // A failed post-apply reopen must not lose what is still staged.
-            if let Some((edits, _)) = self.reopen_restore.take() {
-                for e in edits {
-                    self.ctl.queue.push(e);
-                }
-            }
-            self.error = Some(err);
-            return Some(format!("[{}] open failed.", self.side.label()));
-        }
-
-        let fs = guard.fs.take();
-        let root = guard.root.take();
-        let entries = guard.root_entries.take().unwrap_or_default();
-        self.volume_label = guard.volume_label.clone();
-        self.fs_type = guard.fs_type.clone();
-        self.total_size = guard.total_size;
-        self.used_size = guard.used_size;
-        drop(guard);
-
-        match (fs, root) {
-            (Some(fs), Some(root)) => {
-                self.ctl.source_changed();
-                self.ctl.listing.load_root(fs, root, entries, false);
-                if let Some((edits, cwd)) = self.reopen_restore.take() {
-                    for e in edits {
-                        self.ctl.queue.push(e);
-                    }
-                    self.ctl.apply(CommanderPaneAction::NavigateTo(cwd));
-                    self.ctl.take_error();
-                }
-                Some(format!(
-                    "[{}] opened {} ({} item(s)).",
-                    self.side.label(),
-                    if self.volume_label.is_empty() {
-                        self.fs_type.clone()
-                    } else {
-                        self.volume_label.clone()
-                    },
-                    self.ctl.listing.entries().len()
-                ))
-            }
-            _ => {
-                self.error = Some("Filesystem opened but no root directory was returned.".into());
-                None
-            }
-        }
-    }
-
     // --- staging -----------------------------------------------------------
 
     /// Check the staged queue against this pane's volume, then apply (see `poll_preflight`).
@@ -2881,7 +2078,7 @@ impl CommanderPane {
         if self.is_remote_image() {
             return self.apply_remote();
         }
-        let Some(session) = self.session.clone() else {
+        let Some(session) = self.ctl.session().cloned() else {
             return format!("[{}] no source to apply to.", self.side.label());
         };
         let n = self.ctl.queue.len();
@@ -2893,7 +2090,7 @@ impl CommanderPane {
 
     /// Write the queue, continuing past failed items so one bad file can't strand the batch.
     fn start_apply(&mut self) -> String {
-        let Some(session) = self.session.clone() else {
+        let Some(session) = self.ctl.session().cloned() else {
             return format!("[{}] no source to apply to.", self.side.label());
         };
         let n = self.ctl.queue.len();
@@ -3173,20 +2370,15 @@ impl CommanderPane {
                 self.ctl.queue.len()
             )
         };
-        self.reopen_after_apply();
+        self.reopen_after_apply(ctx);
         self.log_events.push(msg.clone());
         Some(msg)
     }
 
     /// Reopen the partition after a write, keeping what is still staged and the current folder.
-    fn reopen_after_apply(&mut self) {
-        let Some(i) = self.selected_part else {
-            return;
-        };
-        let keep: Vec<StagedEdit> = self.ctl.queue.drain().collect();
-        let cwd = self.ctl.listing.cwd_path().to_string();
-        self.open_partition(i);
-        self.reopen_restore = Some((keep, cwd));
+    fn reopen_after_apply(&mut self, ctx: &egui::Context) {
+        let fx = self.ctl.reopen_after_apply();
+        self.run_effects(ctx, fx);
     }
 
     /// Remote applies are all-or-nothing on the daemon; reopen on success so the copy shows.
@@ -3370,7 +2562,7 @@ impl CommanderPane {
         let host_pane = self.ctl.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
         // delete or rename (both would mutate the backup).
-        let read_only = self.resolved_backup.is_some();
+        let read_only = self.ctl.is_backup();
         // On a remote *host* pane, a file can be opened as a disk image.
         let remote_host = self.is_remote_host();
 
@@ -3634,20 +2826,18 @@ impl CommanderPane {
 
     /// Runs a pane action, turning its error and requests into this frame's row actions.
     fn dispatch(&mut self, action: CommanderPaneAction, out: &mut RowActions) {
-        self.ctl.apply(action);
-        let side = self.side.label();
+        // Navigation and selection actions emit no effects; source actions go through `act`.
+        let _ = self.ctl.apply(action);
         if let Some(e) = self.ctl.take_error() {
-            // A locked encrypted volume can open and then fail deeper: show the unlock prompt.
-            if self.session.is_some()
-                && rusty_backup::model::browse_session::looks_like_password_error(&e)
-            {
-                self.needs_password = true;
-                self.error = None;
-            } else {
-                out.status = Some(format!("[{side}] {e}"));
-            }
+            out.status = Some(format!("[{}] {e}", self.side.label()));
         }
-        for req in self.ctl.take_requests() {
+        let reqs = self.ctl.take_requests();
+        self.handle_row_requests(reqs, out);
+    }
+
+    fn handle_row_requests(&mut self, reqs: Vec<PaneRequest>, out: &mut RowActions) {
+        let side = self.side.label();
+        for req in reqs {
             match req {
                 PaneRequest::OpenBaseWrapper { node_id, name } => {
                     if let Some(s) = self.open_base_wrapper(&node_id, &name) {
@@ -3664,6 +2854,7 @@ impl CommanderPane {
                         out.status = Some(s);
                     }
                 }
+                PaneRequest::SourceReset => self.drop_remote(),
             }
         }
     }

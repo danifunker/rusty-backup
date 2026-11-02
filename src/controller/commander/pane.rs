@@ -1,6 +1,7 @@
-//! One Commander pane's state: listing, staged-edit queue, expanded wrappers, selection and cursor.
+//! One Commander pane's state: source, listing, staged-edit queue, expanded wrappers, selection and cursor.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::model::commander_descend::classify_entry;
 use crate::model::dir_listing::DirListing;
@@ -10,7 +11,10 @@ use crate::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
 use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
+mod source;
+
 pub use crate::model::dir_listing::SortColumn;
+pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, VolumeInfo};
 
 /// What a user does to one pane: navigation, selection, sort and the keyboard cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +58,35 @@ pub enum CommanderPaneAction {
     InfoAtCursor,
     /// Expand or collapse the wrapper or inner folder with this node id.
     ToggleWrapper(String),
+    /// Open a disk image, Mac archive or optical disc image.
+    OpenImage(PathBuf),
+    OpenHostFolder(PathBuf),
+    /// Open a native rusty-backup or Clonezilla backup folder.
+    OpenBackupFolder(PathBuf),
+    /// A dropped or recent path: a folder opens as a host folder, a file as an image.
+    OpenPath(PathBuf),
+    PickImage,
+    PickHostFolder,
+    PickBackupFolder,
+    /// The answer to a `PickFile` / `PickFolder` this pane asked for; `None` is cancel.
+    Picked {
+        purpose: &'static str,
+        path: Option<PathBuf>,
+    },
+    /// Browse this partition (or this filesystem of an optical disc).
+    SelectPartition(usize),
+    CloseSource,
+    /// Stop the open in progress.
+    CancelOpen,
+    /// Retry a locked source's open with this password or passphrase.
+    SubmitPassword(String),
+    /// The answer to a `Confirm` this pane asked for.
+    Confirmed {
+        purpose: &'static str,
+        yes: bool,
+    },
+    /// The persisted recent lists were cleared elsewhere.
+    RecentCleared,
 }
 
 /// Work the view still does for the pane until later slices turn it into jobs and effects.
@@ -69,6 +102,8 @@ pub enum PaneRequest {
     WrapperNote { name: String, note: String },
     /// Expanding a nested wrapper failed.
     WrapperFailed { name: String, detail: String },
+    /// A local source replaced or closed the old one; the view drops any remote connection.
+    SourceReset,
 }
 
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
@@ -94,6 +129,8 @@ pub struct CommanderPaneController {
     wrapper_epoch: u64,
     error: Option<String>,
     requests: Vec<PaneRequest>,
+    /// What is open and how: path, partitions, session, open job, pending switch.
+    src: source::SourceState,
 }
 
 impl Default for CommanderPaneController {
@@ -108,6 +145,7 @@ impl Controller for CommanderPaneController {
     fn apply(&mut self, action: CommanderPaneAction) -> Vec<Effect> {
         self.error = None;
         self.rebuild_rows();
+        let mut fx = Vec::new();
         match action {
             CommanderPaneAction::Enter(name) => self.enter(&name),
             CommanderPaneAction::Up => self.up(),
@@ -167,18 +205,28 @@ impl Controller for CommanderPaneController {
             }
             CommanderPaneAction::InfoAtCursor => self.info_at_cursor(),
             CommanderPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
+            other => fx = self.apply_source(other),
         }
+        self.password_error_locks();
         self.rebuild_rows();
-        Vec::new()
+        fx
     }
 
     fn tick(&mut self) -> Vec<Effect> {
-        Vec::new()
+        let fx = self.poll_open();
+        self.rebuild_rows();
+        fx
     }
 }
 
 impl CommanderPaneController {
+    /// A pane with no recent files, its own job registry and no wake: for tests and the CLI.
     pub fn new() -> Self {
+        Self::with_services(PaneServices::headless())
+    }
+
+    /// A pane whose jobs register in `services.jobs` and wake the shell through `services.notify`.
+    pub fn with_services(services: PaneServices) -> Self {
         Self {
             listing: DirListing::new(),
             queue: EditQueue::new(),
@@ -193,6 +241,7 @@ impl CommanderPaneController {
             wrapper_epoch: 0,
             error: None,
             requests: Vec::new(),
+            src: source::SourceState::new(services),
         }
     }
 

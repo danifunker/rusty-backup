@@ -6,6 +6,7 @@ mod bulk_convert_dialog;
 mod chd_options_ui;
 mod commander;
 mod context;
+mod effects;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod file_detail;
@@ -171,11 +172,12 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
             Effect::CopyToClipboard(text) => ctx.copy_text(text),
             Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Effect::Message(text) => log::info!("{text}"),
+            // Answered effects go through the asking controller's `effects::EffectHost`.
             Effect::PickFile(spec) | Effect::PickFolder(spec) => {
-                log::error!("no egui handler yet for picker {:?}", spec.purpose)
+                log::error!("picker {:?} has no EffectHost to answer it", spec.purpose)
             }
             Effect::Confirm(spec) => {
-                log::error!("no egui handler yet for confirm {:?}", spec.purpose)
+                log::error!("confirm {:?} has no EffectHost to answer it", spec.purpose)
             }
             Effect::AskPassword(spec) => {
                 log::error!("no egui handler yet for password {:?}", spec.purpose)
@@ -198,31 +200,6 @@ pub(crate) fn push_recent(mode: RecentMode, path: &std::path::Path) -> Vec<Strin
 /// tab's in-memory mirror at construction.
 pub(crate) fn load_recent(mode: RecentMode) -> Vec<String> {
     rusty_backup::update::load_recent(mode)
-}
-
-/// A merged recent list for Commander: the newest 3 entries from each mode's
-/// list (deduped, category order Inspect→Restore→Optical→Archives→Commander).
-/// Commander opens any of them (image / backup folder), so one combined
-/// quick-pick beats five separate ones.
-pub(crate) fn load_recent_merged() -> Vec<String> {
-    let cfg = UpdateConfig::load();
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for mode in [
-        RecentMode::Inspect,
-        RecentMode::Restore,
-        RecentMode::Optical,
-        RecentMode::Archives,
-        RecentMode::Commander,
-        RecentMode::Backup,
-    ] {
-        for p in cfg.recent_files.list(mode).iter().take(3) {
-            if seen.insert(p.clone()) {
-                out.push(p.clone());
-            }
-        }
-    }
-    out
 }
 
 /// A dedicated "Recent" dropdown (its own popup, so it never gets clipped inside
@@ -737,7 +714,7 @@ impl eframe::App for RustyBackupApp {
             if let Some(cmd) = self.commander.as_mut() {
                 // Commander overlay takes over the frame; hand the drop to the
                 // active pane (opens it as an image / host folder there).
-                cmd.open_dropped_path(path);
+                cmd.open_dropped_path(ctx, path);
             } else {
                 match self.active_tab {
                     // Inspect: only steal the drop to open a NEW source when
@@ -807,7 +784,7 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Archives, "Archives");
                 ui.separator();
                 if ui.button("Commander Mode").clicked() {
-                    self.commander = Some(commander::CommanderMode::new());
+                    self.commander = Some(commander::CommanderMode::new(self.app.jobs().clone()));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

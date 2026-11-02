@@ -10,5 +10,8 @@ pub mod ids;
 pub mod pane;
 pub mod rows;
 
-pub use pane::{CommanderPaneAction, CommanderPaneController, PaneRequest, SortColumn};
+pub use pane::{
+    purpose, CommanderPaneAction, CommanderPaneController, NoRecent, PaneRequest, PaneServices,
+    RecentStore, SortColumn, SourceKind, VolumeInfo,
+};
 pub use rows::{DisplayRow, RowKind};

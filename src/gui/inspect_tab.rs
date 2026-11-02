@@ -622,6 +622,7 @@ impl InspectTab {
                 // Fixed 5-row "Recent" group: constant popup height as files are
                 // opened, so egui's cached-popup-size bug never bites here.
                 recent_slots: 5,
+                run_dialogs: true,
             };
             let state = super::source_picker::PickerState {
                 selected_device_idx: self.selected_device_idx,
@@ -2848,6 +2849,10 @@ impl InspectTab {
             // A recent pick is translated to `Image` at the call site before
             // reaching here (materialized), so this arm is unreachable.
             SourceEvent::Recent(_) => {}
+            // Inspect runs the dialogs itself, so these never arrive.
+            SourceEvent::PickImage
+            | SourceEvent::PickHostFolder
+            | SourceEvent::PickBackupFolder => {}
         }
     }
 

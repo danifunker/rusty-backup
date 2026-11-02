@@ -97,7 +97,7 @@ impl Controller for AppController {
 }
 
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
-pub use recent::{ConfigStore, MemoryConfig, UserConfig};
+pub use recent::{CommanderRecent, ConfigStore, MemoryConfig, UserConfig};
 
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 mod recent {
@@ -136,6 +136,21 @@ mod recent {
 
         fn save(&mut self, config: &UpdateConfig) {
             self.0 = Some(config.clone());
+        }
+    }
+
+    /// Commander's recent files in a config store: lists the merged view, records under Commander.
+    pub struct CommanderRecent<S: ConfigStore>(pub S);
+
+    impl<S: ConfigStore> crate::controller::commander::RecentStore for CommanderRecent<S> {
+        fn list(&self) -> Vec<String> {
+            crate::update::merged_recent(&self.0.load())
+        }
+
+        fn remember(&mut self, path: &str) {
+            let mut cfg = self.0.load();
+            cfg.remember_file(RecentMode::Commander, path);
+            self.0.save(&cfg);
         }
     }
 
@@ -199,5 +214,23 @@ mod tests {
         assert!(app.recent(RecentMode::Optical).is_empty());
         app.clear_recent();
         assert!(app.recent(RecentMode::Inspect).is_empty());
+    }
+
+    #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+    #[test]
+    fn commander_recent_merges_modes_and_records_under_commander() {
+        use crate::controller::commander::RecentStore;
+        let mut cfg = MemoryConfig::default();
+        let mut seeded = cfg.load();
+        seeded.remember_file(crate::update::RecentMode::Inspect, "/inspected.img");
+        cfg.save(&seeded);
+        let mut recent = CommanderRecent(cfg);
+        recent.remember("/opened.img");
+        assert_eq!(recent.list(), ["/inspected.img", "/opened.img"]);
+        let saved = recent.0.load();
+        let commander = saved
+            .recent_files
+            .list(crate::update::RecentMode::Commander);
+        assert_eq!(commander, ["/opened.img"]);
     }
 }

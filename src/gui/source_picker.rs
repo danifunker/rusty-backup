@@ -37,6 +37,12 @@ pub enum SourceEvent {
     /// The user chose "Connect to Remote..." — open the remote file-browser
     /// window. The connection details are gathered by that window, not here.
     Remote,
+    /// "Open File..." with `run_dialogs` off: the caller runs the picker.
+    PickImage,
+    /// "Open Local Folder..." with `run_dialogs` off.
+    PickHostFolder,
+    /// "Open Backup Folder..." with `run_dialogs` off.
+    PickBackupFolder,
     /// A recently-opened path was picked from the "Recent" group. The raw path
     /// is returned un-materialized; the caller routes it (image / archive /
     /// backup folder) exactly as it would a drag-and-drop, so a mixed recent
@@ -75,6 +81,8 @@ pub struct PickerConfig {
     /// (emilk/egui#5225, #5138). `0` keeps the old behavior: show every recent
     /// entry, variable height (used by Commander, whose merged list is short).
     pub recent_slots: usize,
+    /// Run the file / folder dialogs here; off, the entries emit `Pick*` for a controller.
+    pub run_dialogs: bool,
 }
 
 /// Current selection highlight state, so the open entries render "active" and
@@ -217,7 +225,9 @@ pub fn show(
                     .selectable_label(state.image_active, "Open File...")
                     .clicked()
             {
-                if let Some((path, tempdir)) =
+                if !cfg.run_dialogs {
+                    event = Some(SourceEvent::PickImage);
+                } else if let Some((path, tempdir)) =
                     pick_image_file(cfg.materialize_image, cfg.include_mac_archives)
                 {
                     event = Some(SourceEvent::Image { path, tempdir });
@@ -229,7 +239,9 @@ pub fn show(
                     .on_hover_text("Browse a folder on this computer (not a backup)")
                     .clicked()
             {
-                if let Some(dir) = super::file_dialog().pick_folder() {
+                if !cfg.run_dialogs {
+                    event = Some(SourceEvent::PickHostFolder);
+                } else if let Some(dir) = super::file_dialog().pick_folder() {
                     event = Some(SourceEvent::HostFolder(dir));
                 }
             }
@@ -238,7 +250,9 @@ pub fn show(
                     .selectable_label(state.backup_active, "Open Backup Folder...")
                     .clicked()
             {
-                if let Some(dir) = super::file_dialog().pick_folder() {
+                if !cfg.run_dialogs {
+                    event = Some(SourceEvent::PickBackupFolder);
+                } else if let Some(dir) = super::file_dialog().pick_folder() {
                     event = Some(SourceEvent::BackupFolder(dir));
                 }
             }
