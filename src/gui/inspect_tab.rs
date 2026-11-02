@@ -432,9 +432,9 @@ impl InspectTab {
         if let Some(conn) = self.remote_browser.take_inspect_request() {
             self.act(InspectAction::Load(InspectSource::Remote { conn }));
         }
-        self.run_effects(ui, ctx);
-        self.drain_log(ctx);
         if remote_active {
+            self.run_effects(ui, ctx);
+            self.drain_log(ctx);
             return;
         }
 

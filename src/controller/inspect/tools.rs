@@ -652,10 +652,10 @@ impl InspectController {
         let sink = Arc::clone(&self.log);
         self.tools.expand_chd = is_chd;
         self.tools.expand = Some(self.spawn("Expanding the image...", move |job| {
+            job.set_can_cancel(false);
             if is_chd {
                 expand_chd_in_job(path, add_bytes, &sink, job)
             } else {
-                job.set_can_cancel(false);
                 let mut log = |m: &str| push_log(&sink, LogLevel::Info, m);
                 Ok(crate::partition::resize::expand_image_file(
                     path.as_path(),

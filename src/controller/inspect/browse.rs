@@ -285,6 +285,7 @@ impl InspectController {
         let target = cache_path.clone();
         let label = format!("Building seekable zstd index for partition {index}");
         let job = self.spawn(label.as_str(), move |job| {
+            job.set_can_cancel(false);
             let _wake = crate::os::wakelock::acquire("Rusty Backup: build zstd seekable cache");
             crate::model::cache_runner::build_seekable_zstd(data.as_path(), target.as_path(), job)
         });
@@ -335,6 +336,7 @@ fn scan_in_job(
     cache_path: PathBuf,
     job: &JobCtx,
 ) -> anyhow::Result<()> {
+    job.set_can_cancel(false);
     let status = crate::model::cache_runner::spawn_partclone_scan(cache, index, ptype, cache_path);
     let mut err = None;
     crate::model::worker::wait_spawned(job, &status, |s, ctx| {
