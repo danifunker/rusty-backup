@@ -65,7 +65,7 @@ widget, show_log, the metadata editor widgets.
 | 5 | Remote (cfg `remote`): connect, open / close image, remote apply | done (1718ee44) |
 | 6 | `CommanderController`: both panes, active side, copy, export, checksums, detail data, conflicts, rename notice, session log, unsaved close (`Effect::CloseScreen`) | done (4b807866, 665f7573) |
 | 7 | Full key map wired in egui (help overlay listing the bindings) | covered by slices 2 + 6 |
-| 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | |
+| 8 | TUI Commander rebuilt on the controllers (8a open / navigate / copy, 8b queue / apply / unlock / wrappers); delete `CmdPane` / `CommanderState` | done (4e7e75c6) |
 | 9 | Enforce the boundary for `src/gui/commander` and the TUI Commander in `scripts/check-boundaries.sh` | |
 | 10 | One browser-pane controller with profiles; Inspect browse view and TUI explorer move onto it | |
 
@@ -158,6 +158,42 @@ Slice 6 notes:
   stage copy runs (before only host copies blocked it); metadata edits are refused
   while the pane applies; a copy/export from a `.sit` expanded inside an image now
   runs as a job with progress; the unsaved-close dialog is the shared confirmation.
+
+Slice 8 notes:
+
+- One code commit: the old TUI Commander could not be removed in halves. `CmdPane`,
+  `CommanderState`, `InfoView`, the `cmd_*` helpers, the connect / checksum /
+  host-copy polling in `tick` and the old `handle_commander_key` / `draw_commander*`
+  are gone (about 2,300 lines of `tui_app.rs`); the view is
+  `src/cli/verbs/tui_app/commander.rs`, which `scripts/check-boundaries.sh` now
+  counts as a shell (it reaches the engine 0 times).
+- Key map additions (`controller::keys`): `open-image` Primary+O, `open-folder`
+  Primary+D, `open-backup` Primary+B, `connect` Primary+K, `partition` Primary+P,
+  `sort` Primary+S, `checksums` Primary+G, `export` Primary+E, `edits` Primary+U,
+  `log` Primary+L. `KeyMap::for_terminal` / `load_terminal` use the PC chords on
+  every platform.
+- Controller additions: `ShowPartitions` + `partitions_shown()` (the egui view draws
+  a chooser window for it too), `EditDetail(DetailField)` (mode / owner / xattr
+  through `AskText` with validators, staged with `MetadataEdit`), `is_working()`,
+  `key_hint()`, `CommanderController::polled` (shared registry, no wake), and
+  Parent at a remote image's root closes the image. Both panes' rows are rebuilt
+  after every `apply` / `tick`, so a copy's staged add shows at once.
+- The TUI has no wake: the event loop polls every 50 ms while `is_working()` (200
+  ms otherwise) and calls `tick`. Stderr is muted while a job runs so engine
+  advisories cannot scribble on the screen.
+- Behaviour changes (TUI): edits are staged and written by F10 after the preflight
+  (no more immediate writes into images); keys follow the shared map (F5 refresh,
+  F6 copy, F8 delete, F2 rename, F3 info, Ctrl+N new folder, Ctrl+O / Ctrl+D open,
+  Ctrl+K connect instead of `R`, Ctrl+S sort, Ctrl+G checksums, F1 or `?` help);
+  the vim `h/j/k/l` and letter keys (`o i c x n v r s S p # R`) are gone; Left /
+  Right switch tabs as on every other tab; Esc closes the topmost window, then
+  Commander (asking first while edits are staged) and returns to the previous tab.
+  The TUI also gains backup / partclone / archive sources, wrapper expansion,
+  unlock, rename, export, the conflict review, the rename notice and the session
+  log. Behaviour change (both views): F6 / F8 / Ctrl+G / Ctrl+E act on the cursor
+  row when nothing is selected.
+- Not carried over: the old File Info's SquashFS size budget and uid/gid names
+  (FileDetail does not carry them yet).
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,
