@@ -386,11 +386,11 @@ decisions of 2026-11-02):
 - View menu: `view_menu()` returns `ViewMenuItem`s (styles, Quick view, Session log,
   Keyboard shortcuts) that egui draws as its "View" menu / F9 window and the TUI as its F9
   popup; `ShowViewMenu(bool)` and Esc close it.
-- Left for the Inspect migration: no view draws `side_detail` yet (no Commander or Explorer
-  profile places details beside the list); a folder still being listed is only a row flag
-  (`loading`), so a view that wants a "Loading..." child row draws it itself.
+- The Inspect browse view is the first to draw `side_detail` (step 3c); a folder still being
+  listed is only a row flag (`loading`), so it draws its own "Loading..." child row.
 
-Step 3 (Inspect browse view): not started; it is the size of slices 1-8 together.
+Step 3 (Inspect browse view): parts 3a, 3c and the editor half of 3e done; 3b and 3d in part
+(see "Step 3 status" below). It is the size of slices 1-8 together.
 `src/gui/browse_view.rs` (7,218 lines, about 100 fields of state on `BrowseView`, lines 55-335)
 needs one decision first and then lands in parts, each green:
 
@@ -423,6 +423,62 @@ needs one decision first and then lands in parts, each green:
   session opens for writing; the pane receives the resulting session. `take_nested_open`
   (:2635) becomes the wrapper tree's open, handed to the host.
 - Then `src/gui/browse_view.rs` joins ENFORCED.
+
+### Step 3 status
+
+The browse view hosts `CommanderController::single(.., PaneProfile::inspect())` (keys from
+`keybindings.toml`, style remembered as `inspect`). The Inspect tab still builds the
+`BrowseSession`; the view hands it over with `open_fixed_session` and hands it again whenever
+it changes (Edit Mode on a CHD or a compressed backup, Show deleted, Full scan, the seekable
+cache upgrade): the pane reopens the same path keeping the queue, folder and expanded set.
+`src/gui/browse_view.rs` 7,218 -> 6,661 lines; shells' engine references 808 -> 775.
+
+- 3a (c70214dd): listing, expansion, cursor, marks (the pane's selection, checkbox = ctrl-click),
+  the queue (the pane's), the open and the password prompt through the pane. The tree is drawn
+  from `rows()` with the old look; a fixed `/` row shows the volume. View menu = `view_menu()`
+  (other styles drawn by Commander's `PaneView::show_listing`). Controller additions:
+  `open_fixed_session`, `CursorTo`, `row_entry`, `entry_at`, `folder_children`,
+  `set_read_only` (Edit Mode, set every frame), `VolumeInfo.blessed`,
+  `BrowseSession.show_deleted`, staged folders' staged contents in the combined tree.
+- 3c (16370cc6): the right panel is `side_detail()` drawn with Commander's `detail_meta` /
+  `detail_preview` (editors stage through `StageMetadata`); a staged add has details; a side
+  panel is editable only while the pane is writable. Preview reads, xattr cache and id-name map
+  are gone from the view.
+- 3b, part (3379b8bd): Apply (button and unsaved dialog) is the pane's Apply with PaneView's
+  review / report; the view watches it land for its follow-ups (recompress, leave Edit Mode,
+  close, CHD diff dirty). New Folder is the pane's prompt.
+- 3e, editor (63749b6b): EditText / SaveText; `TextDoc.folder` + `SaveText.folder` so a deep file
+  saves into its own folder.
+- 3d, part (81b52913, 8ca88cc1): "Export selected" is the screen's Export; the export drops
+  entries inside another selected folder.
+
+Remaining (lines in `src/gui/browse_view.rs` at 8ca88cc1):
+
+- 3b: host staging `add_host_paths` / `stage_host_file` / `stage_host_directory` (:3800-3960,
+  intercepts tar and Mac archives, so it moves with 3f), `perform_delete` + its non-empty
+  confirmation (:4369, :4508), staging errors (:5380), the unsaved dialog's summary (:4670,
+  could be `edit_lines()`), free-space probe in the toolbar.
+- 3d: extraction with the overwrite check, ProDOS name modes and RS-to-LF
+  (`start_extraction` :2549, dialog :5286, `run_extraction` / `extract_entry` :6156-6300 move to
+  a model job + a screen action); Mac archive bundling `export_selection_as_archive` (:4190);
+  tar export `start_tar_export` (:3058).
+- 3e: check / repair and the fsck popup (:5467-5760, needs the structured `FsckResult` in
+  `ToolReport`), Journal (:1320), tree listing (:5816), boot blocks (:3764) as pane tools.
+- 3f: the Mac archive window (:4964), archive import (:3960, :4763), tar import (:3309), the
+  archive sniff (`ensure_archive_sniff` :920) and `pump_reads` (:2087, now only archive reads).
+- 3g: CHD edit mode (:2850-3060), direct edit (:3163), SquashFS budget (:3185), archive edit
+  (:2703), nested open (:2513) stay in the view; they still open the session themselves
+  (`take_or_open_fs` :6051) for the parts above.
+- The view keeps a second reader of its own (`cached_fs`) for those legacy tools, so a large
+  HFS+ catalog is read by the pane and again by the first legacy tool used.
+
+Behaviour changes so far: marks are the pane's selection, so top-level rows and rows below an
+expanded folder are not marked together, and a checkbox moves the cursor; the root is a fixed
+`/` row (no collapse); archives and images inside the volume expand in place (wrappers), their
+rows show details only; the shared keys (arrows, Right / Left, Space, F2 rename, F8 delete,
+Ctrl+N, F9, Esc close) work once the tree is clicked; editing text needs Edit Mode and Save
+stages (Apply writes it); after Apply the selection clears and the tree reloads in place
+instead of freezing the window; HFS dates can be edited in the side panel.
 
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (on a machine without GTK headers,

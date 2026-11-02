@@ -379,6 +379,12 @@ The app has five tabs:
     (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
     Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
     run the same `export_selection` engine.
+    The browse view is the same file browser as Commander's panes: its
+    **View** menu switches between one expandable tree (the default), a flat
+    folder list and a folder tree beside the list, archives and disk images
+    inside the volume expand in place, the File Info panel follows the cursor,
+    and the file-manager keys (arrows, Space, F2, F8, Ctrl+N, F9) work once the
+    tree has been clicked.
     On QNX 2 volumes a **Show deleted** checkbox lists deleted entries as
     `NAME [deleted]`, and the **Text: RS to LF** extract option turns the
     ICON's RS (0x1E) line ends into LF (the preview converts too).
