@@ -22,6 +22,7 @@ pub mod app;
 pub mod backup;
 pub mod browser;
 pub mod commander;
+pub mod disk_write;
 pub mod inspect;
 pub mod keys;
 pub mod log;
