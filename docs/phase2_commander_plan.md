@@ -913,6 +913,54 @@ system-disk and mount preflight (`cli::device_safety`) runs before the write.
   `alto_resize_dialog.rs` (2).
 - Pickers are still blocking rfd calls on the UI thread (`EffectHost`).
 
+## Slice 14b: the partition window
+
+`src/gui/partition_editor_modal.rs` (998 lines, 25 engine references) drew and edited two model
+objects by `&mut`: Inspect's `PartitionEditor` (Edit Partition Table) and Restore's `DiskBuilder`
+(Build Disk). The size-mode stamping, the Apply rule (validate, then apply only with no errors and
+some edits), the layout bars' placement, the type catalog lookups and a Build Disk row's source
+pick (an `rfd` call and a decoded-size read on the UI thread) were all in the view.
+
+### Steps
+
+1. (099ed965) `controller::partition_edit` (`mod.rs`, `table.rs`, `build.rs`). The editing state
+   stays in the model objects the hosts own, because their apply jobs consume them; the module is
+   the rules over them, shared by both hosts:
+   - `TableEditAction` (`SetType`, `SetSizeMode` (Original / Minimum stamp the size field),
+     `SetSizeText`, `SetBootable`, `Delete`, `Undo`, `FillGap`, the Add fields, `Add`, `Validate`)
+     through `apply_table_edit`; `TableEditView` (rows, `BootStyle`, gaps, the Add fields, the next
+     slot, the Current / After `LayoutBar`s as `BarSegment`s, errors, status, `can_apply`).
+     `InspectAction::Table` forwards to it and `InspectController::table_editor()` serves the view;
+     `ApplyTableEdits` validates first and refuses a backup folder.
+   - `BuildAction` (`SetKind`, `SetAlign`, `SetHeads`, `SetSectorsPerTrack`, the row fields,
+     `PickRowSource`, `ClearRowSource`, `MoveRow`, `RemoveRow` (never the last row), `AddRow`,
+     `Validate`) through `apply_build`; `BuildView` (kinds, alignment hint, geometry, names, rows
+     with their planned start, slots, the planned `LayoutBar` or why it cannot be placed,
+     `can_create`). `RestoreAction::Build` forwards to it; `PickRowSource` is an `Effect::PickFile`
+     (`purpose::BUILD_SOURCE`), and the picked image's decoded size is measured in a job
+     (`build_source_probing()`); `BuildApply` validates first.
+   - `type_choices` / `describe_type` (the catalog), `TableKind` and `SizeMode` re-exported.
+   The egui window draws the views and returns each frame's edits (`show_table`, `show_build`); its
+   render test feeds plain views. `tests/ui_scenarios/restore_build_disk.toml` plans a disk (a
+   layout that cannot be placed, a fixed one, a second row) and builds it onto an image file.
+2. (this commit) `src/gui/partition_editor_modal.rs` joins `ENFORCED`.
+
+Shells' engine references 263 -> 238 (`partition_editor_modal.rs` 25 -> 0).
+
+### Behaviour changes
+
+- GUI: a Build Disk row's source image is measured in a job after the pick ("Measuring the source
+  image..." beside Add Partition; Choose... and Create Disk wait for it); it was read on the UI
+  thread. The picker is the tab's `EffectHost` picker (same filters and title).
+- TUI, CLI: none.
+
+### Left
+
+- The TUI has no table editor or Build Disk; both would drive the same actions.
+- Inspect's other dialogs: `resize_popup.rs` (22), `remote_browser.rs` (12),
+  `floppy_convert_dialog.rs` (8), `progress.rs` (7), `expand_hfs_dialog.rs` (4),
+  `alto_resize_dialog.rs` (2).
+
 Each slice: `cargo test` for what it touched, `tests/ui_scenarios.rs`,
 `scripts/check-boundaries.sh`, the GUI build (`cargo check` / `clippy --bin rusty-backup`),
 and the vintage proxy build from CONTRIBUTING.md § Rust 1.73 floor.
