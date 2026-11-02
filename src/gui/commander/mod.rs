@@ -1336,30 +1336,7 @@ impl CommanderMode {
             }
             return;
         }
-        // 3) Apply queue on either pane (only one is in flight at a time — the
-        // pane refuses staging until the previous apply finishes).
-        for (side, arc_opt) in [
-            (Side::Left, self.left.pending_apply_status()),
-            (Side::Right, self.right.pending_apply_status()),
-        ] {
-            let Some(arc) = arc_opt else { continue };
-            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
-                title: format!("Applying {} pane edits", side.label()),
-                current: g.current_edit.clone(),
-                items_done: g.edits_done,
-                items_total: g.edits_total,
-                bytes_done: g.bytes_done,
-                bytes_total: g.bytes_total,
-                finished: g.finished,
-                error: g.error.clone(),
-                can_cancel: false,
-                cancel_requested: false,
-            });
-            if let Some(snap) = snap {
-                let _ = self.progress_window.show(ctx, &snap);
-            }
-            return;
-        }
+        // 3) Apply on either pane (local or remote), as a job.
         for side in [Side::Left, Side::Right] {
             let Some(snap) = self.pane_mut(side).apply_job() else {
                 continue;

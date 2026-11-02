@@ -7,8 +7,8 @@
 //! Mac archive, optical disc, as jobs) lives in [`CommanderPaneController`]; this
 //! file draws it, maps input to its actions, and answers its pickers and
 //! confirmations and text prompts through an [`EffectHost`]. Staging, Apply, the
-//! review and report, host writes and wrapper expansion are controller state this
-//! file draws; the remote connection and the remote apply stay here until slice 5.
+//! review and report, host writes, wrapper expansion and the remote connection are
+//! controller state this file draws.
 //!
 //! Image panes stage edits (Apply writes through); host panes take immediate
 //! writes and never stage; backup panes are read-only (browse + copy-out only).
@@ -16,7 +16,7 @@
 //! panes).
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use eframe::egui;
 
@@ -24,16 +24,15 @@ use disk_core::display::format_size;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::model::commander_ops::{self, ApplyStatus};
+use rusty_backup::model::commander_ops;
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::job::{JobRegistry, Snapshot};
-use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
-use rusty_backup::controller::commander::rows::{remote_parent_dir, DisplayRow, RowKind};
+use rusty_backup::controller::commander::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
     CommanderPaneAction, CommanderPaneController, OnConflict, PaneRequest, PaneServices,
-    SortColumn, StageOutcome, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
+    SortColumn, StageOutcome, MAX_CONSECUTIVE_FAILURES,
 };
 use rusty_backup::controller::Controller;
 
@@ -118,8 +117,6 @@ struct RowActions {
     checksums: bool,
     /// Open the File Info window for this entry (by name).
     detail: Option<String>,
-    /// Open this entry (a file on a remote-host pane) as a disk image (by name).
-    open_image: Option<String>,
     /// A row in this pane was clicked/navigated this frame (focus signal).
     focused: bool,
 }
@@ -132,37 +129,13 @@ pub(crate) struct CommanderPane {
     /// Status lines from the controller's messages, shown at the end of the frame.
     statuses: Vec<String>,
     side: Side,
-    /// In-flight upload of the staged queue to a remote image (`commander_ops::spawn_remote_apply`).
-    pending_remote_apply: Option<Arc<Mutex<ApplyStatus>>>,
     /// The review window's conflict choice until the user presses Apply.
     review_choice: OnConflict,
-    /// Phase text shown next to the spinner while a remote transition runs.
-    open_phase: String,
-    /// Remote volume readout; a local source's lives in the controller.
-    remote_volume: VolumeInfo,
-    /// Last remote connect error, shown in the pane body.
-    error: Option<String>,
     /// The user's in-progress password / passphrase entry for the unlock prompt.
     password_input: String,
     /// Data-changing operations completed this frame, drained into the
     /// `PaneResponse` at the end of `show()` for the session log.
     log_events: Vec<String>,
-    /// The remote file-browser session driving this pane when it browses a
-    /// daemon — the shared-connection engine (`model::remote_browser`). One
-    /// connection holds every image the user opens, so switching images never
-    /// reconnects. `None` when local, or *transiently* while a blocking
-    /// transition runs on a worker thread (the browser is moved into the worker
-    /// and re-installed on completion).
-    browser: Option<RemoteBrowser>,
-    /// Display cache mirroring the browser's identity (addr + mode). Stays set
-    /// across an in-flight transition so the source bar's label holds steady
-    /// while `browser` is on the worker thread. Also the marker that this is a
-    /// remote pane. `None` for local.
-    remote: Option<RemoteConn>,
-    /// In-flight async remote transition (connect / open image / close image).
-    pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
-    /// The open "Connect to remote..." dialog, if any.
-    connect_dialog: Option<ConnectDialog>,
     /// Keyboard actions for this pane, run at the start of the next row render.
     key_actions: Vec<CommanderPaneAction>,
     /// This is the active pane, so it draws the keyboard cursor.
@@ -171,44 +144,10 @@ pub(crate) struct CommanderPane {
     page_rows: i32,
 }
 
-/// Display cache for a remote pane (addr + what it's browsing). The live engine
-/// is [`CommanderPane::browser`]; this mirror lets the source bar render even
-/// while the browser is moved onto a worker thread for a blocking transition.
-struct RemoteConn {
-    addr: String,
-    mode: BrowseMode,
-}
-
-/// Async status for a remote transition (connect / open image / close image)
-/// running on a worker thread. Both the `RemoteBrowser` and the produced
-/// `BrowseTarget` are `Send`, so they move back to the UI thread here.
-#[derive(Default)]
-struct RemoteTransition {
-    done: bool,
-    addr: String,
-    /// The browser, returned so the UI thread re-installs it. `Some` after any
-    /// op on an existing browser (success *or* failure — the browser survives a
-    /// failed open/close), and after a successful fresh connect. `None` only
-    /// when a fresh connect failed (no browser was created).
-    browser: Option<RemoteBrowser>,
-    /// The new listing target, or an error message.
-    result: Option<Result<BrowseTarget, String>>,
-}
-
-/// State for the modal "Connect to remote..." dialog (host only — you browse the
-/// remote machine and open an image you find, rather than naming it up front).
-struct ConnectDialog {
-    /// `host` or `host:port` of the daemon.
-    host: String,
-    /// Last validation / connect error, shown inline.
-    error: Option<String>,
-}
-
 impl CommanderPane {
-    /// The rows to draw, from the view-model; a remote-host pane never expands wrappers.
+    /// The rows to draw, from the controller.
     fn display_rows(&mut self) -> Vec<DisplayRow> {
-        let remote_host = self.is_remote_host();
-        self.ctl.display_rows(remote_host)
+        self.ctl.display_rows()
     }
 
     pub(crate) fn new(side: Side, jobs: JobRegistry) -> Self {
@@ -222,17 +161,9 @@ impl CommanderPane {
             ctl: CommanderPaneController::with_services(services),
             effects: EffectHost::default(),
             statuses: Vec::new(),
-            pending_remote_apply: None,
             review_choice: OnConflict::Skip,
-            open_phase: String::new(),
-            remote_volume: VolumeInfo::default(),
-            error: None,
             password_input: String::new(),
             log_events: Vec::new(),
-            browser: None,
-            remote: None,
-            pending_remote: None,
-            connect_dialog: None,
             key_actions: Vec::new(),
             has_focus: false,
             page_rows: 1,
@@ -266,43 +197,15 @@ impl CommanderPane {
         self.act(ctx, action);
     }
 
-    /// Source-level requests: a new local source or a close drops the remote connection.
+    /// Requests the controller leaves to the view (File Info).
     fn handle_requests(&mut self) {
-        let mut rest = Vec::new();
-        for req in self.ctl.take_requests() {
-            match req {
-                PaneRequest::SourceReset => self.drop_remote(),
-                other => rest.push(other),
-            }
-        }
+        let rest = self.ctl.take_requests();
         if !rest.is_empty() {
             let mut out = RowActions::default();
             self.handle_row_requests(rest, &mut out);
             if let Some(s) = out.status {
                 self.statuses.push(s);
             }
-        }
-    }
-
-    /// Forget the remote connection and anything in flight against the old source.
-    fn drop_remote(&mut self) {
-        self.pending_remote_apply = None;
-        self.error = None;
-        self.open_phase.clear();
-        // Dropping the browser drops the last Arc to the shared connection (the daemon reaps its handles).
-        self.browser = None;
-        self.remote = None;
-        self.remote_volume = VolumeInfo::default();
-        self.pending_remote = None;
-        self.connect_dialog = None;
-    }
-
-    /// The volume readout: the remote one while remote, else the controller's.
-    fn volume(&self) -> &VolumeInfo {
-        if self.remote.is_some() {
-            &self.remote_volume
-        } else {
-            self.ctl.volume()
         }
     }
 
@@ -341,12 +244,6 @@ impl CommanderPane {
         let fx = self.ctl.tick();
         self.run_effects(ui.ctx(), fx);
         let mut status = None;
-        if let Some(s) = self.poll_remote_apply(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_remote(ui.ctx()) {
-            status = Some(s);
-        }
         let mut cancel_open = false;
         let mut copy_to_other = false;
         let mut export_to_host = false;
@@ -392,7 +289,7 @@ impl CommanderPane {
                 super::super::progress::show_job(ui, &snap);
             });
         }
-        if self.ctl.applying().is_some() || self.pending_remote_apply.is_some() {
+        if self.ctl.applying().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -413,17 +310,6 @@ impl CommanderPane {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label("Opening...");
-            });
-        } else if self.pending_remote.is_some() {
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.spinner();
-                ui.label(if self.open_phase.is_empty() {
-                    "Connecting...".to_string()
-                } else {
-                    self.open_phase.clone()
-                });
             });
         } else if self.ctl.needs_password() {
             // Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
@@ -459,9 +345,6 @@ impl CommanderPane {
         } else if let Some(err) = self.ctl.source_error().map(str::to_string) {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
-        } else if let Some(err) = &self.error {
-            ui.add_space(12.0);
-            ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
         } else if self.ctl.listing.is_loaded() {
             self.render_header(ui);
             let actions = self.render_rows(ui);
@@ -474,22 +357,6 @@ impl CommanderPane {
             checksums = actions.checksums;
             detail = actions.detail;
             focused = actions.focused;
-            // Open a file on a remote-host pane as a disk image, on the same
-            // connection. The browser remembers the host folder it came from so
-            // "Close Image" returns there.
-            if let Some(name) = actions.open_image {
-                let path = self
-                    .ctl
-                    .listing
-                    .entries()
-                    .iter()
-                    .find(|e| e.name == name)
-                    .map(|e| e.path.clone());
-                if let Some(path) = path {
-                    let opened_from = self.ctl.listing.cwd_path().to_string();
-                    status = Some(self.spawn_open_image(path, None, opened_from));
-                }
-            }
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -502,9 +369,6 @@ impl CommanderPane {
         let side = self.side.label();
         if let Some(reply) = self.effects.show(ui.ctx(), side) {
             self.answer(ui.ctx(), reply);
-        }
-        if let Some(s) = self.render_connect_dialog(ui.ctx()) {
-            status = Some(s);
         }
         self.render_edits_popup(ui.ctx());
         self.render_apply_review(ui.ctx());
@@ -531,296 +395,23 @@ impl CommanderPane {
         }
     }
 
-    /// Render the modal "Connect to remote..." dialog (host:port only). On
-    /// Connect it opens the daemon's host filesystem (the file browser); the
-    /// listing swaps in when `poll_remote` sees it finish. You then open an
-    /// image you find by double-clicking it (or right-click -> Open Image).
-    fn render_connect_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.connect_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_connect = false;
-        let mut cancel = false;
-        {
-            let d = self.connect_dialog.as_mut().unwrap();
-            egui::Window::new(format!("Connect to remote ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Host (rb-cli serve daemon):");
-                    let resp = ui.text_edit_singleline(&mut d.host);
-                    ui.label(
-                        egui::RichText::new("e.g. 192.168.1.42:7341  (port 7341 if omitted)")
-                            .weak()
-                            .small(),
-                    );
-                    if let Some(e) = &d.error {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !d.host.trim().is_empty();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(valid, egui::Button::new("Connect"))
-                            .clicked()
-                        {
-                            do_connect = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_connect = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.connect_dialog = None;
-            return None;
-        }
-        if do_connect {
-            let host_raw = self
-                .connect_dialog
-                .as_ref()
-                .unwrap()
-                .host
-                .trim()
-                .to_string();
-            let addr = if host_raw.contains(':') {
-                host_raw
-            } else {
-                format!(
-                    "{host_raw}:{}",
-                    rusty_backup::remote::protocol::DEFAULT_PORT
-                )
-            };
-            self.connect_dialog = None;
-            return Some(self.spawn_connect(addr, "/".to_string()));
-        }
-        None
-    }
-
-    /// Connect and open the daemon's host filesystem (the file browser) at
-    /// `root_path` on a worker thread — a connect can block on an unreachable
-    /// host. Used for the initial connect (`/`) and for "Close Image" (back to
-    /// the folder the image was opened from).
-    fn spawn_connect(&mut self, addr: String, root_path: String) -> String {
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr: addr.clone(),
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        // A fresh connect drops any previous browser (a new connection replaces
-        // the old). Disconnect happens when the old browser's Arc drops.
-        self.browser = None;
-        self.open_phase = format!("Connecting to {addr}...");
-        let msg = format!("[{}] connecting to {addr}...", self.side.label());
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&status),
-            "remote connect",
-            move || {
-                let outcome = RemoteBrowser::connect(&addr, &root_path);
-                if let Ok(mut s) = status.lock() {
-                    match outcome {
-                        Ok((browser, target)) => {
-                            s.browser = Some(browser);
-                            s.result = Some(Ok(target));
-                        }
-                        Err(e) => s.result = Some(Err(format!("{e:#}"))),
-                    }
-                    s.done = true;
-                }
-                Ok(())
-            },
-        );
-        msg
-    }
-
-    /// Open an image found while browsing the remote host FS as a new handle on
-    /// the **same** connection (no reconnect), on a worker thread. `opened_from`
-    /// is the host directory it was found in, so "Close Image" returns there.
-    fn spawn_open_image(
-        &mut self,
-        path: String,
-        partition: Option<rusty_backup::cli::img_at::PartSelector>,
-        opened_from: String,
-    ) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return format!("[{}] not connected to a remote.", self.side.label());
-        };
-        let addr = browser.addr().to_string();
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr,
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        self.open_phase = format!("Opening {path}...");
-        let msg = format!("[{}] opening {path}...", self.side.label());
-        rusty_backup::model::worker::spawn_guarded(Arc::clone(&status), "remote open", move || {
-            let result = browser
-                .open_image(&path, partition, &opened_from)
-                .map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
-                s.done = true;
-            }
-            Ok(())
-        });
-        msg
-    }
-
-    /// Step back out of an open image to the host file browser (at the directory
-    /// the image was opened from), reusing the same connection, on a worker
-    /// thread.
-    fn spawn_close_image(&mut self) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return format!("[{}] not connected to a remote.", self.side.label());
-        };
-        let addr = browser.addr().to_string();
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr,
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        self.open_phase = "Returning to host browser...".to_string();
-        let msg = format!("[{}] closing image...", self.side.label());
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&status),
-            "remote close",
-            move || {
-                let result = browser.close_image().map_err(|e| format!("{e:#}"));
-                if let Ok(mut s) = status.lock() {
-                    s.browser = Some(browser);
-                    s.result = Some(result);
-                    s.done = true;
-                }
-                Ok(())
-            },
-        );
-        msg
-    }
-
-    /// Poll an in-flight remote transition; when done, re-install the browser and
-    /// swap the new target (the host file browser, or an opened image) into the
-    /// listing.
-    fn poll_remote(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = {
-            let s = self.pending_remote.as_ref()?;
-            s.lock().ok().map(|g| g.done).unwrap_or(false)
-        };
-        if !done {
-            ctx.request_repaint();
-            return None;
-        }
-        let (addr, browser, result) = {
-            let arc = self.pending_remote.take()?;
-            let mut g = arc.lock().ok()?;
-            (g.addr.clone(), g.browser.take(), g.result.take()?)
-        };
-        self.open_phase.clear();
-        // Re-install the browser (absent only when a fresh connect failed).
-        let had_browser = browser.is_some();
-        if let Some(b) = browser {
-            self.browser = Some(b);
-        }
-
-        match result {
-            Ok(target) => {
-                let mode = target.mode.clone();
-                let volume = VolumeInfo {
-                    label: target.volume_label.clone(),
-                    fs_type: target.fs_type.clone(),
-                    total_size: target.total_size,
-                    used_size: target.used_size,
-                };
-                self.remote_volume = volume.clone();
-                self.remote = Some(RemoteConn {
-                    addr: addr.clone(),
-                    mode: mode.clone(),
-                });
-                self.error = None;
-                self.ctl
-                    .install_remote(target.fs, target.root, target.entries, volume);
-                #[cfg(feature = "remote")]
-                if let BrowseMode::Image { path, partition } = &mode {
-                    self.ctl
-                        .set_remote_source(Some(commander_ops::StageSource::Remote {
-                            addr: addr.clone(),
-                            path: path.clone(),
-                            partition: partition.clone(),
-                        }));
-                }
-                match mode {
-                    BrowseMode::Host => Some(format!(
-                        "[{}] connected to {addr} (browsing host)",
-                        self.side.label()
-                    )),
-                    BrowseMode::Image { path, .. } => {
-                        Some(format!("[{}] opened rb://{addr}{path}", self.side.label()))
-                    }
-                }
-            }
-            Err(e) => {
-                if had_browser {
-                    // The connection survived a failed open / close — keep the
-                    // current listing, just report it.
-                    Some(format!(
-                        "[{}] remote operation failed: {e}",
-                        self.side.label()
-                    ))
-                } else {
-                    // A fresh connect failed — nothing to show but the error.
-                    self.error = Some(e.clone());
-                    self.remote = None;
-                    Some(format!(
-                        "[{}] remote connect failed: {e}",
-                        self.side.label()
-                    ))
-                }
-            }
-        }
-    }
-
     /// True when this pane is browsing a remote daemon's *host* filesystem (the
     /// file browser), where a file can be opened as an image.
     pub(crate) fn is_remote_host(&self) -> bool {
-        matches!(
-            self.remote,
-            Some(RemoteConn {
-                mode: BrowseMode::Host,
-                ..
-            })
-        )
-    }
-
-    /// True when this pane is browsing a disk image on a remote daemon. Such a
-    /// pane receives a copy over the daemon's Family-F image write path
-    /// (OpenSession/StageUpload/Apply); a remote *host* pane receives over the
-    /// host-write path (MkdirHost/WriteHostFile) instead.
-    fn is_remote_image(&self) -> bool {
-        matches!(
-            self.remote,
-            Some(RemoteConn {
-                mode: BrowseMode::Image { .. },
-                ..
-            })
-        )
+        self.ctl.is_remote_host()
     }
 
     /// The daemon address (`host:port`) this pane is connected to, if remote.
     /// Used to open a fresh connection for an upload worker.
     pub(crate) fn remote_addr(&self) -> Option<String> {
-        self.remote.as_ref().map(|r| r.addr.clone())
+        self.ctl.remote_addr()
     }
 
     // --- accessors used by CommanderMode for cross-pane copy ---------------
 
     /// True when this pane can receive a copy: something is open, nothing runs, and it is writable.
     pub(crate) fn can_receive(&self) -> bool {
-        self.ctl.can_receive() && self.pending_remote.is_none() && !self.remote_applying()
+        self.ctl.can_receive()
     }
 
     /// Read-only media (archive, optical disc, backup), for the header's "Read-only" badge.
@@ -861,18 +452,9 @@ impl CommanderPane {
         self.ctl.copy_stage_source()
     }
 
-    /// The remote upload's status for the progress modal, while one runs.
-    pub(crate) fn pending_apply_status(&self) -> Option<Arc<Mutex<commander_ops::ApplyStatus>>> {
-        self.pending_remote_apply.clone()
-    }
-
     /// The local apply job, for the progress modal.
     pub(crate) fn apply_job(&self) -> Option<Snapshot> {
         self.ctl.applying()
-    }
-
-    fn remote_applying(&self) -> bool {
-        self.pending_remote_apply.is_some()
     }
 
     /// Re-read the current directory listing (after an immediate host write).
@@ -883,14 +465,6 @@ impl CommanderPane {
 
     /// Delete the selection (the middle-column Delete): staged on an image, confirmed then immediate on a host.
     pub(crate) fn delete_selection(&mut self, ctx: &egui::Context) -> String {
-        if self.remote.is_some() {
-            // The remote write path carries copies only; delete over the wire is a follow-up.
-            return format!(
-                "[{}] remote panes accept copied files/folders only; delete over \
-                 the wire isn't supported yet.",
-                self.side.label()
-            );
-        }
         self.act(ctx, CommanderPaneAction::Delete);
         self.take_status().unwrap_or_default()
     }
@@ -908,22 +482,14 @@ impl CommanderPane {
     /// True while one of this pane's dialogs waits for an answer, so shortcuts stand down.
     pub(crate) fn modal_open(&self) -> bool {
         self.effects.modal_open()
-            || self.connect_dialog.is_some()
             || self.ctl.apply_review().is_some()
             || self.ctl.apply_report().is_some()
     }
 
-    fn busy(&self) -> bool {
-        self.ctl.is_busy() || self.remote_applying()
-    }
-
-    /// The Apply button and F10: a remote image uploads here, anything else applies in the controller.
+    /// The Apply button and F10.
     pub(crate) fn apply_now(&mut self, ctx: &egui::Context) -> String {
-        if self.ctl.queue.is_empty() || self.busy() {
+        if !self.ctl.can_apply() {
             return String::new();
-        }
-        if self.is_remote_image() {
-            return self.apply_remote();
         }
         self.act(ctx, CommanderPaneAction::Apply);
         self.take_status().unwrap_or_default()
@@ -931,9 +497,6 @@ impl CommanderPane {
 
     /// A pane action from the keyboard or a button whose effects must run now (prompts, confirms).
     pub(crate) fn command(&mut self, ctx: &egui::Context, action: CommanderPaneAction) -> String {
-        if self.remote_applying() {
-            return String::new();
-        }
         self.act(ctx, action);
         self.take_status().unwrap_or_default()
     }
@@ -980,7 +543,7 @@ impl CommanderPane {
     /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
     /// for a host pane or before a source is opened.
     pub(crate) fn fs_type(&self) -> &str {
-        &self.volume().fs_type
+        &self.ctl.volume().fs_type
     }
 
     /// Look up an entry by name in the current directory and read up to `max`
@@ -1056,7 +619,7 @@ impl CommanderPane {
     /// it). Cross-pane callers use this to gate in-place edits that the remote
     /// write path doesn't carry yet (delete / rename over the wire).
     pub(crate) fn is_remote(&self) -> bool {
-        self.remote.is_some()
+        self.ctl.is_remote()
     }
 
     /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
@@ -1087,7 +650,7 @@ impl CommanderPane {
 
     /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
     pub(crate) fn unstage_since(&mut self, queue_start: usize) -> bool {
-        !self.remote_applying() && self.ctl.unstage_since(queue_start)
+        self.ctl.unstage_since(queue_start)
     }
 
     // --- source bar --------------------------------------------------------
@@ -1107,23 +670,8 @@ impl CommanderPane {
             // opens are not materialized (BrowseSession peels the container).
             let is_backup = self.ctl.is_backup();
             let source = self.ctl.source_path().map(|p| p.to_path_buf());
-            let current_label = if let Some(r) = &self.remote {
-                match &r.mode {
-                    BrowseMode::Host => format!("Remote {} (host)", r.addr),
-                    BrowseMode::Image { path, partition } => {
-                        // Host + image basename only — the full remote path is
-                        // long and the in-image position shows in the breadcrumb.
-                        let base = path
-                            .rsplit('/')
-                            .find(|s| !s.is_empty())
-                            .unwrap_or(path.as_str());
-                        let part = partition
-                            .as_ref()
-                            .map(|n| format!("{n}"))
-                            .unwrap_or_default();
-                        format!("Remote {}: {base}{part}", r.addr)
-                    }
-                }
+            let current_label = if let Some(label) = self.ctl.remote_label() {
+                label
             } else if self.ctl.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
@@ -1189,40 +737,14 @@ impl CommanderPane {
                     SourceEvent::PickHostFolder => source_action = Some(A::PickHostFolder),
                     SourceEvent::PickBackupFolder => source_action = Some(A::PickBackupFolder),
                     SourceEvent::Device(_) => {}
-                    // "Connect to Remote..." opens the host:port dialog. Like the
-                    // other switch events it's blocked while edits are staged
-                    // (connecting replaces the listing), so we hint instead of
-                    // silently doing nothing.
-                    SourceEvent::Remote => {
-                        if self.ctl.queue.is_empty() {
-                            self.connect_dialog = Some(ConnectDialog {
-                                host: self
-                                    .remote
-                                    .as_ref()
-                                    .map(|r| r.addr.clone())
-                                    .unwrap_or_default(),
-                                error: None,
-                            });
-                        } else {
-                            status = Some(
-                                "Apply or discard staged edits before connecting to a remote."
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    SourceEvent::Remote => source_action = Some(A::Connect),
                 }
             }
 
             // When inside a remote image, "Close Image" steps back to the host
             // browser (the folder it was opened from) — distinct from "Close",
             // which unloads the whole connection.
-            if matches!(
-                &self.remote,
-                Some(RemoteConn {
-                    mode: BrowseMode::Image { .. },
-                    ..
-                })
-            ) {
+            if self.ctl.is_remote_image() {
                 let btn = egui::Button::new(
                     egui::RichText::new("Close Image").color(close_image_color(ui.visuals())),
                 );
@@ -1231,9 +753,7 @@ impl CommanderPane {
                     .on_hover_text("Back to browsing the remote host filesystem")
                     .clicked()
                 {
-                    // Reuses the live connection (the browser remembers the host
-                    // folder the image was opened from) — no reconnect.
-                    status = Some(self.spawn_close_image());
+                    source_action = Some(A::CloseRemoteImage);
                 }
             }
 
@@ -1252,7 +772,7 @@ impl CommanderPane {
             // read-only).
             if self.ctl.stages_edits() {
                 let n = self.ctl.queue.len();
-                let busy = self.busy();
+                let busy = self.ctl.is_busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
                         apply = true;
@@ -1315,7 +835,6 @@ impl CommanderPane {
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
                 if self.ctl.can_new_folder()
-                    && !self.remote_applying()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
@@ -1331,7 +850,7 @@ impl CommanderPane {
                 if self.ctl.listing.is_host() {
                     ui.strong("local folder");
                 } else {
-                    let vol = self.volume().clone();
+                    let vol = self.ctl.volume().clone();
                     let label = if vol.label.is_empty() {
                         vol.fs_type.clone()
                     } else {
@@ -1371,7 +890,7 @@ impl CommanderPane {
         }
         let mut open = true;
         let mut unstage = None;
-        let busy = self.busy();
+        let busy = self.ctl.is_busy();
         let lines = self.ctl.edit_lines();
         egui::Window::new(format!("Pending edits ({})", self.side.label()))
             .open(&mut open)
@@ -1595,80 +1114,6 @@ impl CommanderPane {
         }
     }
 
-    /// Upload the staged copy-ins to the remote image (Family-F write path); other edits are refused up front.
-    fn apply_remote(&mut self) -> String {
-        let (addr, path, partition) = match &self.remote {
-            Some(RemoteConn {
-                addr,
-                mode: BrowseMode::Image { path, partition },
-            }) => (addr.clone(), path.clone(), partition.clone()),
-            _ => return format!("[{}] no remote image to apply to.", self.side.label()),
-        };
-        if self.ctl.queue.iter().any(|e| {
-            !matches!(
-                e,
-                StagedEdit::AddFile { .. } | StagedEdit::CreateDirectory { .. }
-            )
-        }) {
-            return format!(
-                "[{}] remote panes accept copied files/folders only; delete / \
-                 rename over the wire isn't supported yet.",
-                self.side.label()
-            );
-        }
-        let n = self.ctl.queue.len();
-        let edits: Vec<StagedEdit> = self.ctl.queue.iter().cloned().collect();
-        self.pending_remote_apply = Some(commander_ops::spawn_remote_apply(
-            addr, path, partition, edits,
-        ));
-        self.error = None;
-        format!(
-            "[{}] uploading {n} item(s) to the remote image...",
-            self.side.label()
-        )
-    }
-
-    /// Poll the remote upload; a remote apply is all-or-nothing, so the queue empties on success.
-    fn poll_remote_apply(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_remote_apply.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        self.pending_remote_apply = None;
-        let fatal = guard.error.take();
-        drop(guard);
-        Some(self.finish_remote_apply(fatal))
-    }
-
-    /// Remote applies are all-or-nothing on the daemon; reopen on success so the copy shows.
-    fn finish_remote_apply(&mut self, fatal: Option<String>) -> String {
-        if let Some(err) = fatal {
-            self.ctl
-                .report_apply_failure(format!("Apply failed: {err}"));
-            return format!("[{}] apply failed.", self.side.label());
-        }
-        let n = self.ctl.queue.len();
-        self.ctl.queue.clear();
-        // The daemon's browse handle snapshotted the catalog before the write
-        // session committed; a fresh handle shows the copied files.
-        let reopen = match &self.remote {
-            Some(RemoteConn {
-                mode: BrowseMode::Image { path, partition },
-                ..
-            }) => Some((path.clone(), partition.clone())),
-            _ => None,
-        };
-        if let Some((path, partition)) = reopen {
-            let from = remote_parent_dir(&path);
-            let _ = self.spawn_open_image(path, partition, from);
-        }
-        let msg = format!("[{}] applied {n} edit(s).", self.side.label());
-        self.log_events.push(msg.clone());
-        msg
-    }
-
     // --- listing grid ------------------------------------------------------
 
     fn render_header(&mut self, ui: &mut egui::Ui) {
@@ -1765,7 +1210,7 @@ impl CommanderPane {
             None
         };
         self.page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
-        let busy = self.ctl.applying().is_some() || self.remote_applying();
+        let busy = self.ctl.applying().is_some();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.ctl.listing.is_host();
@@ -1994,6 +1439,9 @@ impl CommanderPane {
         if let Some(name) = m_cancel_rename {
             acts.push(CommanderPaneAction::CancelRename(name));
         }
+        if let Some(name) = m_open_image {
+            acts.push(CommanderPaneAction::OpenRemoteImage(name));
+        }
         for action in acts {
             self.dispatch(&ctx, action, &mut out);
         }
@@ -2005,7 +1453,6 @@ impl CommanderPane {
             export_as: m_export_as,
             checksums: m_checksums,
             detail: m_info.or(out.detail),
-            open_image: m_open_image.or(out.open_image),
             focused: out.focused,
         }
     }
@@ -2025,8 +1472,6 @@ impl CommanderPane {
         for req in reqs {
             match req {
                 PaneRequest::ShowInfo(name) => out.detail = Some(name),
-                PaneRequest::OpenImage(name) => out.open_image = Some(name),
-                PaneRequest::SourceReset => self.drop_remote(),
             }
         }
     }
@@ -2209,11 +1654,4 @@ fn path_list<'a>(ui: &mut egui::Ui, id: &str, paths: impl Iterator<Item = &'a St
                 ui.monospace(p);
             }
         });
-}
-
-impl rusty_backup::model::worker::WorkerStatus for RemoteTransition {
-    fn fail(&mut self, message: String) {
-        self.result = Some(Err(message));
-        self.done = true;
-    }
 }

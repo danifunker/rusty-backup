@@ -269,18 +269,35 @@ pub fn preflight_apply(session: &BrowseSession, edits: &[StagedEdit]) -> Result<
     let mut fs = session
         .open()
         .context("opening the destination to check the staged edits")?;
+    Ok(preflight_fs(fs.as_mut(), edits))
+}
+
+/// [`preflight_apply`] for a remote image, read through a fresh daemon connection.
+#[cfg(feature = "remote")]
+pub fn preflight_remote_apply(
+    addr: &str,
+    image_path: &str,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    edits: &[StagedEdit],
+) -> Result<ApplyPreflight> {
+    let (mut fs, _, _) = crate::remote::fs::RemoteFilesystem::open(addr, image_path, partition)
+        .context("opening the remote image to check the staged edits")?;
+    Ok(preflight_fs(&mut fs, edits))
+}
+
+fn preflight_fs(fs: &mut dyn Filesystem, edits: &[StagedEdit]) -> ApplyPreflight {
     let mut queue = EditQueue::new();
     for e in edits {
         queue.push(e.clone());
     }
-    let scan = queue.scan_against(fs.as_mut());
+    let scan = queue.scan_against(fs);
     let unit = fs.allocation_unit().unwrap_or(512);
-    Ok(ApplyPreflight {
+    ApplyPreflight {
         fs_type: fs.fs_type().to_string(),
         scan,
         bytes_needed: queue.bytes_needed(unit),
         bytes_free: fs.total_size().saturating_sub(fs.used_size()),
-    })
+    }
 }
 
 /// Destination folder of a copy-in edit (the only edits that nest under staged folders).
@@ -317,7 +334,7 @@ pub struct EditProgress<'a> {
 
 /// Total bytes that will actually be written for an edit queue: the sum of
 /// every `AddFile.size` (deletes / renames / mkdir contribute nothing). This
-/// is what the ApplyStatus progress bar tracks against.
+/// is what an apply job's progress bar tracks against.
 fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
     edits
         .iter()
@@ -1579,44 +1596,27 @@ pub fn upload_fs_entries_to_remote(
     upload_image_entries_to_remote_host(fs, entries, &mut conn, dest_parent, fork_mode, &status)
 }
 
-/// Shared state between the GUI and the [`spawn_remote_apply`] worker.
-///
-/// Byte/file counters drive the same Commander progress modal
-/// [`HostCopyStatus`] does; `bytes_total` is the sum of every `AddFile` edit
-/// in the queue (deletes / renames / mkdir contribute nothing) so the bar
-/// reflects the actual write cost, not the raw edit count.
-#[derive(Default)]
-pub struct ApplyStatus {
-    pub finished: bool,
-    /// Set when the apply failed; the pane surfaces it and keeps the queue.
-    pub error: Option<String>,
-    /// Edits completed so far (any kind).
-    pub edits_done: usize,
-    /// Total edits in the queue, from a pre-scan.
-    pub edits_total: usize,
-    /// Bytes written so far (only `AddFile` edits contribute).
-    pub bytes_done: u64,
-    /// Total bytes to write, summed over every `AddFile` edit's `size`.
-    pub bytes_total: u64,
-    /// The edit currently being applied, for the modal's "Writing X" line.
-    pub current_edit: String,
-    /// Per-edit result of a local apply, set when it finishes without a fatal error.
-    pub outcome: Option<ApplyOutcome>,
-}
-
 /// Write the queue as a job, continuing past failed items; progress counts bytes (or edits when none).
 pub fn apply_in_job(
     session: &BrowseSession,
     edits: &[StagedEdit],
     job: &crate::model::job::JobCtx,
 ) -> Result<ApplyOutcome> {
-    use crate::model::job::{Progress, Unit};
     job.set_can_cancel(false);
     job.set_phase("Writing...");
+    apply_edits_reporting(session, edits, true, job_progress(edits, job))
+}
+
+/// A per-edit callback that reports bytes written (or edits done when none carry bytes).
+fn job_progress<'a>(
+    edits: &[StagedEdit],
+    job: &'a crate::model::job::JobCtx,
+) -> impl FnMut(EditProgress<'_>) + 'a {
+    use crate::model::job::{Progress, Unit};
     let bytes_total = edits_total_bytes(edits);
-    let total = edits.len() as u64;
+    let count = edits.len() as u64;
     let mut bytes_done = 0u64;
-    apply_edits_reporting(session, edits, true, |p| {
+    move |p: EditProgress<'_>| {
         if let StagedEdit::AddFile { size, .. } = p.edit {
             bytes_done = bytes_done.saturating_add(*size);
         }
@@ -1624,9 +1624,28 @@ pub fn apply_in_job(
         let (done, total, unit) = if bytes_total > 0 {
             (bytes_done, bytes_total, Unit::Bytes)
         } else {
-            (p.index as u64 + 1, total, Unit::Items)
+            (p.index as u64 + 1, count, Unit::Items)
         };
         job.set_progress(Progress::Determinate { done, total, unit });
+    }
+}
+
+/// Upload a remote image's staged copies as a job; the daemon applies all of them or none.
+#[cfg(feature = "remote")]
+pub fn remote_apply_in_job(
+    addr: &str,
+    image_path: &str,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    edits: &[StagedEdit],
+    job: &crate::model::job::JobCtx,
+) -> Result<ApplyOutcome> {
+    job.set_can_cancel(false);
+    job.set_phase("Uploading...");
+    remote_apply(addr, image_path, partition, edits, job_progress(edits, job))?;
+    Ok(ApplyOutcome {
+        applied_indices: (0..edits.len()).collect(),
+        failed: Vec::new(),
+        stopped_at: None,
     })
 }
 
@@ -1672,8 +1691,10 @@ fn remote_apply(
                     resource_fork,
                     hfs_type_override,
                     hfs_creator_override,
+                    on_conflict,
                     ..
                 } => {
+                    let force = matches!(on_conflict, OnConflict::Replace);
                     let type_code = hfs_type_override
                         .as_ref()
                         .or_else(|| resource_fork.as_ref().and_then(|r| r.type_code.as_ref()))
@@ -1693,7 +1714,7 @@ fn remote_apply(
                             &wire_parent_path(&parent.path),
                             name,
                             host_path,
-                            false,
+                            force,
                             type_code,
                             creator_code,
                             fork_bytes,
@@ -1731,7 +1752,7 @@ fn wire_parent_path(path: &str) -> String {
 /// Synchronously apply `edits` (AddFile / CreateDirectory) to the remote image
 /// at `(image_path, partition)` on the daemon at `addr`, over the Family-F
 /// stage->apply path. The blocking entry point the TUI uses; the GUI drives the
-/// worker-threaded [`spawn_remote_apply`] instead.
+/// [`remote_apply_in_job`] instead.
 #[cfg(feature = "remote")]
 pub fn apply_edits_to_remote_image(
     addr: &str,
@@ -1742,44 +1763,7 @@ pub fn apply_edits_to_remote_image(
     remote_apply(addr, image_path, partition, edits, |_| {})
 }
 
-/// Run [`remote_apply`] on a worker thread, reusing [`ApplyStatus`] so the pane
-/// polls it exactly like a local apply.
-#[cfg(feature = "remote")]
-pub fn spawn_remote_apply(
-    addr: String,
-    image_path: String,
-    partition: Option<crate::cli::img_at::PartSelector>,
-    edits: Vec<StagedEdit>,
-) -> Arc<Mutex<ApplyStatus>> {
-    let status = Arc::new(Mutex::new(ApplyStatus::default()));
-    if let Ok(mut g) = status.lock() {
-        g.edits_total = edits.len();
-        g.bytes_total = edits_total_bytes(&edits);
-    }
-    let status_thread = Arc::clone(&status);
-    crate::model::worker::spawn_guarded(Arc::clone(&status), "remote apply", move || {
-        let status_cb = Arc::clone(&status_thread);
-        let result = remote_apply(&addr, &image_path, partition, &edits, move |p| {
-            if let Ok(mut g) = status_cb.lock() {
-                g.edits_done = p.index + 1;
-                g.current_edit = edit_label(p.edit);
-                if let StagedEdit::AddFile { size, .. } = p.edit {
-                    g.bytes_done = g.bytes_done.saturating_add(*size);
-                }
-            }
-        });
-        if let Ok(mut g) = status_thread.lock() {
-            if let Err(e) = result {
-                g.error = Some(format!("{e:#}"));
-            }
-            g.finished = true;
-        }
-        Ok(())
-    });
-    status
-}
-
-crate::model::worker::finished_with_error!(ApplyStatus, HostCopyStatus, StageCopyStatus);
+crate::model::worker::finished_with_error!(HostCopyStatus, StageCopyStatus);
 
 #[cfg(test)]
 mod tests {

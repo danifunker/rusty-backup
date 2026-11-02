@@ -5,7 +5,8 @@
 //! then (straight away when clean, or after the user answers the review) the write. What
 //! landed leaves the queue, the rest stays staged, and a run that did not land everything
 //! leaves a report. The partition is reopened afterwards because its cached catalog
-//! predates the write. A host pane writes immediately instead: delete (after a
+//! predates the write. A remote image takes the same flow through the daemon, copies
+//! and new folders only (`remote.rs`). A host pane writes immediately instead: delete (after a
 //! confirmation), rename and new folder run as jobs through [`crate::model::host_ops`].
 //! Rename and new folder ask for the name with [`Effect::AskText`]; its validator
 //! ([`validate_entry_name`]) runs in the view as the user types and again here on the
@@ -19,13 +20,14 @@ use super::{CommanderPaneAction, CommanderPaneController};
 use crate::controller::commander::pane::purpose;
 use crate::controller::{ConfirmSpec, Effect, TextSpec};
 use crate::fs::replace::OnConflict;
+use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::classify_entry;
 use crate::model::commander_ops::{
     self, ApplyOutcome, ApplyPreflight, FailedEdit, StageSource, WrapperExtract, WrapperOpenPlan,
 };
 use crate::model::edit_queue::StagedEdit;
 use crate::model::host_ops::{self, DeleteOutcome};
-use crate::model::job::{Job, Resource, Snapshot, Status};
+use crate::model::job::{Job, JobCtx, Resource, Snapshot, Status};
 use crate::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
 use crate::model::wrapper_tree::PreparedMount;
 
@@ -38,6 +40,39 @@ pub struct ApplyReport {
     /// Edits never tried because the run stopped early.
     pub not_tried: usize,
     pub fatal: Option<String>,
+}
+
+/// Where an apply's preflight reads and its write lands.
+enum ApplyTarget {
+    Session(BrowseSession),
+    #[cfg(feature = "remote")]
+    Remote(super::remote::RemoteImage),
+}
+
+impl ApplyTarget {
+    fn preflight(&self, edits: &[StagedEdit]) -> anyhow::Result<ApplyPreflight> {
+        match self {
+            ApplyTarget::Session(s) => commander_ops::preflight_apply(s, edits),
+            #[cfg(feature = "remote")]
+            ApplyTarget::Remote(r) => {
+                commander_ops::preflight_remote_apply(&r.addr, &r.path, r.partition.clone(), edits)
+            }
+        }
+    }
+
+    fn write(&self, edits: &[StagedEdit], ctx: &JobCtx) -> anyhow::Result<ApplyOutcome> {
+        match self {
+            ApplyTarget::Session(s) => commander_ops::apply_in_job(s, edits, ctx),
+            #[cfg(feature = "remote")]
+            ApplyTarget::Remote(r) => commander_ops::remote_apply_in_job(
+                &r.addr,
+                &r.path,
+                r.partition.clone(),
+                edits,
+                ctx,
+            ),
+        }
+    }
 }
 
 /// What one [`CommanderPaneController::stage_edits`] batch did.
@@ -97,8 +132,6 @@ pub(super) struct EditState {
     report: Option<ApplyReport>,
     host_job: Option<HostJob>,
     wrapper: Option<WrapperOpening>,
-    /// How to reopen a remote image the view is browsing (slice 5 moves remote here).
-    remote_source: Option<StageSource>,
     log: Vec<String>,
 }
 
@@ -112,7 +145,6 @@ impl EditState {
             report: None,
             host_job: None,
             wrapper: None,
-            remote_source: None,
             log: Vec::new(),
         }
     }
@@ -163,6 +195,10 @@ pub fn validate_entry_name(spec: &TextSpec, text: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Why a remote pane refuses an edit the daemon's write path does not carry.
+const REMOTE_COPIES_ONLY: &str =
+    "remote panes take copied files and new folders only; this edit is not supported over the wire yet.";
 
 fn msg(text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Message(text.into())]
@@ -230,7 +266,7 @@ impl CommanderPaneController {
 
     /// True for a pane whose edits are staged (an image volume, not a host folder or read-only source).
     pub fn stages_edits(&self) -> bool {
-        !self.listing.is_host() && !self.is_backup() && !self.is_archive()
+        !self.listing.is_host() && !self.is_backup() && !self.is_archive() && !self.is_remote_host()
     }
 
     pub fn can_apply(&self) -> bool {
@@ -242,7 +278,7 @@ impl CommanderPaneController {
     }
 
     pub fn can_new_folder(&self) -> bool {
-        self.listing.is_loaded() && !self.is_busy() && !self.is_backup() && !self.is_archive()
+        self.can_edit_names() && !self.is_remote_host()
     }
 
     /// True when a copy can land here (a host folder writes now, an image stages).
@@ -298,9 +334,7 @@ impl CommanderPaneController {
 
     /// How a worker reopens the pane's base source (a remote image, a session, an archive or disc).
     pub fn base_stage_source(&self) -> Option<StageSource> {
-        self.ed
-            .remote_source
-            .clone()
+        self.remote_stage_source()
             .or_else(|| self.local_stage_source())
     }
 
@@ -309,7 +343,7 @@ impl CommanderPaneController {
         std::mem::take(&mut self.ed.log)
     }
 
-    // --- entry points for the two-pane copy (slice 6) and remote (slice 5) --
+    // --- entry points for the two-pane copy (slice 6) ------------------------
 
     /// Push a copy batch onto the queue, renaming names this volume cannot hold.
     pub fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
@@ -368,13 +402,7 @@ impl CommanderPaneController {
         true
     }
 
-    /// Set how to reopen the remote image the view is browsing; `None` when not remote.
-    pub fn set_remote_source(&mut self, source: Option<StageSource>) {
-        self.ed.remote_source = source;
-    }
-
-    /// Show a report for an apply the view ran itself (remote images).
-    pub fn report_apply_failure(&mut self, fatal: String) {
+    fn report_apply_failure(&mut self, fatal: String) {
         self.ed.report = Some(ApplyReport {
             total: self.queue.len(),
             applied: 0,
@@ -463,6 +491,9 @@ impl CommanderPaneController {
         }
         if self.is_archive() {
             return msg("archive panes are read-only.");
+        }
+        if self.is_remote() {
+            return msg(REMOTE_COPIES_ONLY);
         }
         if self.is_busy() {
             return msg("wait for the current operation to finish.");
@@ -589,6 +620,9 @@ impl CommanderPaneController {
     }
 
     fn request_rename(&mut self, name: &str) -> Vec<Effect> {
+        if self.is_remote() {
+            return msg(REMOTE_COPIES_ONLY);
+        }
         if !self.can_edit_names() {
             return Vec::new();
         }
@@ -803,25 +837,47 @@ impl CommanderPaneController {
 
     /// The source the apply jobs hold while they run.
     fn apply_resources(&self) -> Vec<Resource> {
+        #[cfg(feature = "remote")]
+        if let Some(image) = self.remote_image() {
+            return vec![image.resource()];
+        }
         self.source_path()
             .map(|p| vec![Resource::Image(p.to_path_buf())])
             .unwrap_or_default()
+    }
+
+    /// Where Apply writes: the open session, or the remote image on a fresh connection.
+    fn apply_target(&self) -> Option<ApplyTarget> {
+        #[cfg(feature = "remote")]
+        if let Some(image) = self.remote_image() {
+            return Some(ApplyTarget::Remote(image));
+        }
+        self.session().cloned().map(ApplyTarget::Session)
     }
 
     fn start_check(&mut self) -> Vec<Effect> {
         if !self.can_apply() {
             return Vec::new();
         }
-        let Some(session) = self.session().cloned() else {
+        let Some(target) = self.apply_target() else {
             return msg("no source to apply to.");
         };
+        let copies_only = |e: &StagedEdit| {
+            matches!(
+                e,
+                StagedEdit::AddFile { .. } | StagedEdit::CreateDirectory { .. }
+            )
+        };
+        if self.is_remote() && !self.queue.iter().all(copies_only) {
+            return msg(REMOTE_COPIES_ONLY);
+        }
         let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
         let n = edits.len();
         let resources = self.apply_resources();
         let (jobs, notify) = self.job_services();
         let spawned = jobs.spawn("Checking staged edits", resources, notify, move |ctx| {
             ctx.set_phase("Checking staged edits...");
-            commander_ops::preflight_apply(&session, &edits)
+            target.preflight(&edits)
         });
         match spawned {
             Ok(job) => {
@@ -838,13 +894,23 @@ impl CommanderPaneController {
             return Vec::new();
         };
         if !p.scan.conflicts.is_empty() {
-            self.queue.set_all_conflicts(on);
+            // The daemon cannot skip an existing file, so a remote skip leaves those copies out.
+            if self.is_remote() && on == OnConflict::Skip {
+                for (path, _) in &p.scan.conflicts {
+                    self.queue.remove_pending_add(path);
+                }
+                if self.queue.is_empty() {
+                    return msg("every staged copy already exists; nothing to apply.");
+                }
+            } else {
+                self.queue.set_all_conflicts(on);
+            }
         }
         self.start_write()
     }
 
     fn start_write(&mut self) -> Vec<Effect> {
-        let Some(session) = self.session().cloned() else {
+        let Some(target) = self.apply_target() else {
             return msg("no source to apply to.");
         };
         let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
@@ -852,7 +918,7 @@ impl CommanderPaneController {
         let resources = self.apply_resources();
         let (jobs, notify) = self.job_services();
         let spawned = jobs.spawn("Applying staged edits", resources, notify, move |ctx| {
-            commander_ops::apply_in_job(&session, &edits, ctx)
+            target.write(&edits, ctx)
         });
         match spawned {
             Ok(job) => {

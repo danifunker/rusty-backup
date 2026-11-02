@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context as _};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 
-use super::{CommanderPaneAction, CommanderPaneController, PaneRequest};
+use super::{CommanderPaneAction, CommanderPaneController};
 use crate::controller::commander::rows::{is_mac_archive_path, partition_label};
 use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::fs::partition_is_browsable;
@@ -44,6 +44,7 @@ pub mod purpose {
     pub const HOST_DELETE: &str = "commander.host_delete";
     pub const RENAME: &str = "commander.rename";
     pub const NEW_FOLDER: &str = "commander.new_folder";
+    pub const CONNECT: &str = "commander.connect";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,14 +365,15 @@ impl CommanderPaneController {
         self.src.error.as_deref()
     }
 
-    /// The open in progress, for a progress display.
+    /// The open in progress (a remote connect, open or close included), for a progress display.
     pub fn opening(&self) -> Option<Snapshot> {
-        self.src.opening.as_ref().map(|o| o.job.snapshot())
+        let local = self.src.opening.as_ref().map(|o| o.job.snapshot());
+        local.or_else(|| self.remote_working())
     }
 
     /// True while an open runs or waits to start.
     pub fn is_opening(&self) -> bool {
-        self.src.opening.is_some() || self.src.deferred.is_some()
+        self.src.opening.is_some() || self.src.deferred.is_some() || self.remote_working().is_some()
     }
 
     /// Recently opened paths, newest first.
@@ -414,6 +416,13 @@ impl CommanderPaneController {
 
     /// Reopen the partition after a write, keeping what is still staged and the current folder.
     pub(super) fn reopen_after_apply(&mut self) -> Vec<Effect> {
+        // A remote apply is all or nothing; a failed one changed nothing and keeps its report.
+        if self.is_remote_image() {
+            return match self.queue.is_empty() {
+                true => self.reopen_remote_image(),
+                false => Vec::new(),
+            };
+        }
         let Some(i) = self.src.selected else {
             return Vec::new();
         };
@@ -424,20 +433,24 @@ impl CommanderPaneController {
         fx
     }
 
-    // --- transitional entry points for the view (slice 5) -----------------
-
-    /// Show a remote listing the view opened, dropping any local source.
-    pub fn install_remote(
+    /// Show a remote listing in place of any local source; the connection stays.
+    #[cfg(feature = "remote")]
+    pub(super) fn show_remote_listing(
         &mut self,
         fs: Box<dyn Filesystem>,
         root: FileEntry,
         entries: Vec<FileEntry>,
         volume: VolumeInfo,
     ) {
-        self.reset_source();
+        self.reset_local_source();
         self.src.volume = volume;
         self.listing.load_root(fs, root, entries, false);
-        self.rebuild_rows();
+    }
+
+    /// Why the remote connection failed, shown where a source error goes.
+    #[cfg(feature = "remote")]
+    pub(super) fn set_source_error(&mut self, msg: String) {
+        self.src.error = Some(msg);
     }
 
     // --- actions ----------------------------------------------------------
@@ -543,7 +556,6 @@ impl CommanderPaneController {
             Switch::Partition(i) => self.open_partition(i),
             Switch::Close => {
                 self.reset_source();
-                self.requests.push(PaneRequest::SourceReset);
                 vec![message("closed.".into())]
             }
         }
@@ -557,7 +569,13 @@ impl CommanderPaneController {
         self.src.deferred = None;
     }
 
-    fn reset_source(&mut self) {
+    /// Drop the source, the remote connection included.
+    pub(super) fn reset_source(&mut self) {
+        self.drop_remote();
+        self.reset_local_source();
+    }
+
+    fn reset_local_source(&mut self) {
         self.abandon_open();
         let s = &mut self.src;
         s.path = None;
@@ -580,7 +598,6 @@ impl CommanderPaneController {
 
     fn start_source(&mut self, req: OpenRequest) -> Vec<Effect> {
         self.reset_source();
-        self.requests.push(PaneRequest::SourceReset);
         let path = req.path().to_path_buf();
         self.src.kind = match req {
             OpenRequest::Host(_) => Some(SourceKind::Host),
@@ -1108,7 +1125,6 @@ pub(super) mod tests {
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
         let mut vm = CommanderPaneController::new();
         let fx = vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
-        assert_eq!(vm.take_requests(), [PaneRequest::SourceReset]);
         assert!(messages(&fx)[0].starts_with("opening "));
         assert!(vm.is_opening());
         let fx = settle(&mut vm);
@@ -1249,9 +1265,7 @@ pub(super) mod tests {
         let mut vm = CommanderPaneController::new();
         vm.apply(A::OpenHostFolder(dir.path().to_path_buf()));
         settle(&mut vm);
-        vm.take_requests();
         assert_eq!(messages(&vm.apply(A::CloseSource)), ["closed."]);
-        assert_eq!(vm.take_requests(), [PaneRequest::SourceReset]);
         assert!(vm.source_path().is_none() && !vm.listing.is_loaded());
     }
 

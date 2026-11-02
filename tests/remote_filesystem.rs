@@ -2910,3 +2910,194 @@ fn remote_upload_carries_the_resource_fork() {
     );
     assert_eq!(rsrc_back, rsrc_fork, "resource fork is byte-exact");
 }
+
+// --- Commander pane controller over a loopback daemon ---------------------
+
+mod commander_remote {
+    use super::*;
+    use rusty_backup::controller::commander::purpose;
+    use rusty_backup::controller::commander::{CommanderPaneAction as A, CommanderPaneController};
+    use rusty_backup::controller::{Controller, Effect};
+    use std::time::{Duration, Instant};
+
+    /// A daemon serving a temp folder holding `disk.img` (FAT with `SEED.BIN`).
+    fn serve() -> ((tempfile::TempDir, tempfile::TempDir), String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        make_fat_image(&root.join("disk.img"), "DESTVOL", "SEED.BIN", 0x01, 512);
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = staging_dir.path().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = serve_on(listener, root, Some(staging), true);
+        });
+        ((dir, staging_dir), addr)
+    }
+
+    /// Ticks until the pane's jobs finish, returning the messages they produced.
+    fn settle(vm: &mut CommanderPaneController) -> Vec<String> {
+        let start = Instant::now();
+        let mut fx = vm.tick();
+        while vm.is_busy() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "a job never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            fx.extend(vm.tick());
+        }
+        messages(&fx)
+    }
+
+    fn messages(fx: &[Effect]) -> Vec<String> {
+        let text = |e: &Effect| match e {
+            Effect::Message(m) => Some(m.clone()),
+            _ => None,
+        };
+        fx.iter().filter_map(text).collect()
+    }
+
+    fn names(vm: &CommanderPaneController) -> Vec<String> {
+        let entries = vm.listing.entries().iter();
+        entries.map(|e| e.name.clone()).collect()
+    }
+
+    fn connect(vm: &mut CommanderPaneController, addr: &str) -> Vec<String> {
+        let fx = vm.apply(A::Connect);
+        let [Effect::AskText(spec)] = fx.as_slice() else {
+            panic!("expected AskText, got {fx:?}");
+        };
+        assert_eq!(spec.purpose, purpose::CONNECT);
+        assert!(spec.validate(addr).is_ok());
+        vm.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(addr.into()),
+        });
+        assert!(vm.is_opening(), "a connect runs as a job");
+        settle(vm)
+    }
+
+    #[test]
+    fn connect_open_apply_and_close_through_the_pane_controller() {
+        let (_dir, addr) = serve();
+        let mut vm = CommanderPaneController::new();
+        let said = connect(&mut vm, &addr);
+        assert!(vm.source_error().is_none(), "{:?}", vm.source_error());
+        assert_eq!(said, [format!("connected to {addr} (browsing host)")]);
+        assert!(vm.is_remote_host() && !vm.stages_edits() && !vm.can_new_folder());
+        assert_eq!(vm.remote_label(), Some(format!("Remote {addr} (host)")));
+        let rows = vm.display_rows();
+        let disk = rows.iter().find(|r| r.name == "disk.img").unwrap().clone();
+        assert!(disk.is_image && !disk.expandable);
+
+        // Double-clicking an image on the host listing opens it on the same connection.
+        vm.apply(A::Activate(disk.node_id));
+        let said = settle(&mut vm);
+        assert_eq!(said, [format!("opened rb://{addr}/disk.img")]);
+        assert!(vm.is_remote_image(), "{:?}", vm.source_error());
+        assert_eq!(vm.volume().label, "DESTVOL");
+        assert!(vm.base_stage_source().is_some());
+
+        // Delete and rename do not travel over the wire; a new folder does.
+        vm.apply(A::Click {
+            name: "SEED.BIN".into(),
+            ctrl: false,
+            shift: false,
+        });
+        assert!(messages(&vm.apply(A::Delete))[0].contains("not supported"));
+        assert!(
+            messages(&vm.apply(A::RequestRename("SEED.BIN".into())))[0].contains("not supported")
+        );
+        assert!(vm.queue.is_empty());
+        vm.apply(A::RequestNewFolder);
+        vm.apply(A::Answered {
+            purpose: purpose::NEW_FOLDER,
+            text: Some("NEWDIR".into()),
+        });
+        assert_eq!(vm.queue.len(), 1);
+        let fx = vm.apply(A::Apply);
+        assert!(messages(&fx)[0].starts_with("checking 1"), "{fx:?}");
+        let said = settle(&mut vm);
+        assert!(said.iter().any(|m| m == "applied 1 edit(s)."), "{said:?}");
+        assert!(vm.apply_report().is_none(), "{:?}", vm.apply_report());
+        assert!(vm.queue.is_empty() && vm.is_remote_image());
+        assert!(
+            names(&vm).contains(&"NEWDIR".to_string()),
+            "{:?}",
+            names(&vm)
+        );
+        assert!(vm.take_log().iter().any(|l| l == "applied 1 edit(s)."));
+
+        // Close Image returns to the host listing; Disconnect drops the connection.
+        vm.apply(A::CloseRemoteImage);
+        settle(&mut vm);
+        assert!(vm.is_remote_host());
+        assert!(names(&vm).contains(&"disk.img".to_string()));
+        assert_eq!(messages(&vm.apply(A::Disconnect)), ["closed."]);
+        assert!(!vm.is_remote() && !vm.listing.is_loaded());
+    }
+
+    #[test]
+    fn a_conflicting_remote_copy_is_reviewed_and_replace_overwrites_it() {
+        let (_dir, addr) = serve();
+        let mut vm = CommanderPaneController::new();
+        connect(&mut vm, &addr);
+        vm.apply(A::OpenRemoteImage("disk.img".into()));
+        settle(&mut vm);
+        assert!(vm.is_remote_image(), "{:?}", vm.source_error());
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("SEED.BIN"), b"replacement").unwrap();
+        std::fs::write(host.path().join("NEW.BIN"), b"new").unwrap();
+        let root =
+            rusty_backup::model::dir_listing::read_host_root(host.path().to_path_buf()).unwrap();
+        let cwd = vm.listing.cwd().unwrap().clone();
+        let stage = |vm: &mut CommanderPaneController| {
+            let edits =
+                rusty_backup::model::commander_ops::stage_host_to_image(&root.entries, &cwd);
+            vm.stage_edits(edits);
+        };
+        stage(&mut vm);
+        vm.apply(A::Apply);
+        settle(&mut vm);
+        assert_eq!(vm.apply_review().map(|p| p.scan.conflicts.len()), Some(1));
+        // Skip leaves the existing file out of the upload.
+        vm.apply(A::ApplyReviewed(
+            rusty_backup::fs::replace::OnConflict::Skip,
+        ));
+        settle(&mut vm);
+        assert!(vm.queue.is_empty(), "{:?}", vm.apply_report());
+        let seed = |vm: &CommanderPaneController| {
+            let e = vm.listing.entries().iter().find(|e| e.name == "SEED.BIN");
+            e.unwrap().size
+        };
+        assert_eq!(seed(&vm), 512);
+        assert!(
+            names(&vm).contains(&"NEW.BIN".to_string()),
+            "{:?}",
+            names(&vm)
+        );
+        // Replace overwrites it.
+        stage(&mut vm);
+        vm.apply(A::Apply);
+        settle(&mut vm);
+        assert!(vm.apply_review().is_some());
+        vm.apply(A::ApplyReviewed(
+            rusty_backup::fs::replace::OnConflict::Replace,
+        ));
+        settle(&mut vm);
+        assert!(vm.queue.is_empty(), "{:?}", vm.apply_report());
+        assert_eq!(seed(&vm), b"replacement".len() as u64);
+    }
+
+    #[test]
+    fn a_refused_connect_reports_and_leaves_no_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut vm = CommanderPaneController::new();
+        let said = connect(&mut vm, &addr);
+        assert!(said[0].starts_with("remote connect failed"), "{said:?}");
+        assert!(!vm.is_remote() && vm.source_error().is_some());
+    }
+}

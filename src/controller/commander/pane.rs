@@ -12,12 +12,14 @@ use super::rows::{build_display_rows, DisplayRow, RowKind};
 use crate::controller::{Controller, Effect};
 
 mod edits;
+mod remote;
 mod source;
 
 pub use crate::fs::replace::OnConflict;
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
 pub use edits::{validate_entry_name, ApplyReport, StageOutcome};
+pub use remote::validate_remote_addr;
 pub use source::{purpose, NoRecent, PaneServices, RecentStore, SourceKind, VolumeInfo};
 
 /// What a user does to one pane: navigation, selection, sort, sources and edits.
@@ -116,6 +118,14 @@ pub enum CommanderPaneAction {
     ApplyReviewed(OnConflict),
     DismissReview,
     DismissReport,
+    /// Ask for an `rb-cli serve` daemon's address, then browse its host filesystem.
+    Connect,
+    /// Open this file of the remote host listing (by name) as a disk image, on the same connection.
+    OpenRemoteImage(String),
+    /// Leave the remote image for the host folder it was opened from.
+    CloseRemoteImage,
+    /// Drop the remote connection (asks first when edits are staged).
+    Disconnect,
 }
 
 /// Work the view still does for the pane until later slices turn it into jobs and effects.
@@ -123,10 +133,6 @@ pub enum CommanderPaneAction {
 pub enum PaneRequest {
     /// Show File Info for this entry name (resolved against the active selection).
     ShowInfo(String),
-    /// Open this remote-host file as a disk image.
-    OpenImage(String),
-    /// A local source replaced or closed the old one; the view drops any remote connection.
-    SourceReset,
 }
 
 /// A pane's model state. Fields stay public while the shells move onto actions slice by slice.
@@ -158,6 +164,8 @@ pub struct CommanderPaneController {
     src: source::SourceState,
     /// Staged-edit review, apply, host writes, prompts and the wrapper job.
     ed: edits::EditState,
+    /// The `rb-cli serve` connection and its open / close job.
+    remote: remote::RemoteState,
 }
 
 impl Default for CommanderPaneController {
@@ -233,7 +241,7 @@ impl Controller for CommanderPaneController {
             CommanderPaneAction::InfoAtCursor => self.info_at_cursor(),
             CommanderPaneAction::ToggleWrapper(node_id) => self.toggle_wrapper(&node_id),
             other => {
-                fx = match self.apply_edit(other) {
+                fx = match self.apply_remote(other).or_else(|a| self.apply_edit(a)) {
                     Ok(fx) => fx,
                     Err(other) => self.apply_source(other),
                 }
@@ -247,6 +255,7 @@ impl Controller for CommanderPaneController {
 
     fn tick(&mut self) -> Vec<Effect> {
         let mut fx = self.poll_open();
+        fx.extend(self.poll_remote());
         fx.extend(self.poll_edits());
         self.rebuild_rows();
         fx.append(&mut self.out);
@@ -279,12 +288,12 @@ impl CommanderPaneController {
             out: Vec::new(),
             src: source::SourceState::new(services),
             ed: edits::EditState::new(),
+            remote: remote::RemoteState::default(),
         }
     }
 
-    /// The rows to draw, rebuilding [`Self::tree_index`]; `remote_host` disables wrapper descent.
-    pub fn display_rows(&mut self, remote_host: bool) -> Vec<DisplayRow> {
-        self.remote_host = remote_host;
+    /// The rows to draw, rebuilding [`Self::tree_index`].
+    pub fn display_rows(&mut self) -> Vec<DisplayRow> {
         self.rebuild_rows();
         self.rows.clone()
     }
@@ -370,6 +379,8 @@ impl CommanderPaneController {
     }
 
     fn rebuild_rows(&mut self) {
+        // A remote host listing tints images and never expands wrappers.
+        self.remote_host = self.is_remote_host();
         self.rows = build_display_rows(
             &self.listing,
             &self.queue,
@@ -505,7 +516,8 @@ impl CommanderPaneController {
         } else if row.is_wrapper {
             self.toggle_wrapper(&row.node_id);
         } else if self.remote_host {
-            self.requests.push(PaneRequest::OpenImage(row.name));
+            let fx = self.open_remote_image(&row.name);
+            self.out.extend(fx);
         } else {
             self.context_select(&row.name);
             self.requests.push(PaneRequest::ShowInfo(row.name));
@@ -603,7 +615,7 @@ mod tests {
     #[test]
     fn rows_list_the_directory() {
         let (_d, mut vm) = host_pane(&["a.txt", "b.txt"], &["sub"]);
-        let rows = vm.display_rows(false);
+        let rows = vm.display_rows();
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         for n in ["a.txt", "b.txt", "sub"] {
             assert!(names.contains(&n), "{names:?}");
@@ -632,16 +644,22 @@ mod tests {
             name: "new-dir".into(),
             qnx2_attrs: None,
         });
-        let rows = vm.display_rows(false);
+        let rows = vm.display_rows();
         assert_eq!(row(&rows, "gone.txt").kind, RowKind::PendingDelete);
         assert_eq!(row(&rows, "keep.txt").kind, RowKind::Normal);
         assert_eq!(row(&rows, "new-dir").kind, RowKind::PendingAdd);
     }
 
     #[test]
-    fn a_remote_host_pane_tints_images_and_never_wraps() {
+    fn a_remote_host_listing_tints_images_and_never_wraps() {
         let (_d, mut vm) = host_pane(&["disk.img", "notes.txt"], &[]);
-        let rows = vm.display_rows(true);
+        let rows = build_display_rows(
+            &vm.listing,
+            &vm.queue,
+            &mut vm.wrapper_tree,
+            &mut vm.tree_index,
+            true,
+        );
         let img = row(&rows, "disk.img");
         assert!(img.is_image && !img.is_wrapper && !img.expandable);
         assert!(!row(&rows, "notes.txt").is_image);
@@ -754,7 +772,7 @@ mod tests {
     #[test]
     fn cursor_moves_and_clamps() {
         let (_d, mut vm) = host_pane(&["a", "b", "c"], &[]);
-        vm.display_rows(false);
+        vm.display_rows();
         assert_eq!(vm.cursor_index(), Some(0));
         vm.apply(CommanderPaneAction::CursorUp);
         assert_eq!(vm.cursor_index(), Some(0));
@@ -787,17 +805,6 @@ mod tests {
         vm.apply(CommanderPaneAction::ActivateCursor);
         assert_eq!(vm.take_requests(), [PaneRequest::ShowInfo("f.txt".into())]);
         assert_eq!(names_selected(&vm), ["f.txt"]);
-    }
-
-    #[test]
-    fn a_remote_host_file_activates_as_an_image() {
-        let (_d, mut vm) = host_pane(&["disk.img"], &[]);
-        vm.display_rows(true);
-        vm.apply(CommanderPaneAction::Activate(vm.rows()[1].node_id.clone()));
-        assert_eq!(
-            vm.take_requests(),
-            [PaneRequest::OpenImage("disk.img".into())]
-        );
     }
 
     fn sit_bytes() -> Vec<u8> {
@@ -858,7 +865,7 @@ mod tests {
             fx.contains(&Effect::Message("opened a.sit.".into())),
             "{fx:?}"
         );
-        vm.display_rows(false);
+        vm.display_rows();
         (d, vm, id)
     }
 
