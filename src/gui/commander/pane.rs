@@ -530,7 +530,7 @@ impl PaneView {
 
     // --- apply: the review and report are views over controller state ------
 
-    fn render_apply_review(
+    pub(crate) fn render_apply_review(
         &mut self,
         ctx: &egui::Context,
         pane: &BrowserPaneController,
@@ -610,7 +610,7 @@ impl PaneView {
         }
     }
 
-    fn render_apply_report(
+    pub(crate) fn render_apply_report(
         &self,
         ctx: &egui::Context,
         pane: &BrowserPaneController,

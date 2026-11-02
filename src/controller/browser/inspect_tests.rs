@@ -195,3 +195,43 @@ fn the_side_panel_takes_edits_only_while_writable_and_covers_staged_adds() {
     assert_eq!(d.entry.name, "NEWDIR");
     assert!(d.preview.is_none() && !d.loading);
 }
+
+#[test]
+fn staged_host_files_wait_for_apply_then_land_and_the_tree_reopens() {
+    use super::explorer_tests::root_file;
+    let dir = tempfile::tempdir().unwrap();
+    let img = fat_volume(dir.path());
+    let host = dir.path().join("A.TXT");
+    std::fs::write(&host, b"from host").unwrap();
+    let mut ctl = inspect(&img);
+    let sub = row(&ctl, "SUB").node_id;
+    pane(&mut ctl, A::ToggleExpand(sub));
+    settle(&mut ctl);
+    let picked = A::Picked {
+        purpose: purpose::IMPORT,
+        path: Some(host.clone()),
+    };
+    ctl.host_pane().set_read_only(true);
+    pane(&mut ctl, picked.clone());
+    assert!(
+        ctl.pane(Side::Left).queue.is_empty(),
+        "Edit Mode off stages nothing"
+    );
+    ctl.host_pane().set_read_only(false);
+    pane(&mut ctl, picked);
+    settle(&mut ctl);
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 1, "staged, not written");
+    assert!(root_file(&img, "A.TXT").is_none());
+    assert_eq!(row(&ctl, "A.TXT").kind, RowKind::PendingAdd);
+    pane(&mut ctl, A::Apply);
+    settle(&mut ctl);
+    let p = ctl.pane(Side::Left);
+    assert!(
+        p.queue.is_empty() && p.apply_report().is_none(),
+        "{:?}",
+        p.apply_report()
+    );
+    assert_eq!(root_file(&img, "A.TXT").unwrap(), b"from host");
+    assert_eq!(row(&ctl, "A.TXT").kind, RowKind::Normal);
+    assert!(row(&ctl, "SUB").expanded, "the reopen keeps the tree");
+}

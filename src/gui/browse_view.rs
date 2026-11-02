@@ -145,10 +145,6 @@ pub struct BrowseView {
     edit_supported: bool,
     /// Status message from last edit operation.
     edit_result: Option<String>,
-    /// Pending "new folder" name input.
-    new_folder_name: String,
-    /// Whether the "new folder" dialog is open.
-    show_new_folder_dialog: bool,
     /// Entry pending deletion (for confirmation dialog).
     pending_delete: Option<(FileEntry, FileEntry, bool)>, // (parent, entry, recursive)
     /// Context for backup archive editing (decompress → edit → recompress).
@@ -197,11 +193,8 @@ pub struct BrowseView {
             Result<rusty_backup::model::chd_edit_open::ChdEditOpen, String>,
         )>,
     >,
-    /// A running Apply of the staged edits, and what to do once it lands.
-    apply_job: Option<(
-        rusty_backup::model::job::Job<rusty_backup::model::commander_ops::QueueApply>,
-        ApplyFollowUp,
-    )>,
+    /// The pane's Apply in flight: what to do once it lands, the queue size, and whether it wrote.
+    apply_follow: Option<(ApplyFollowUp, usize, bool)>,
     /// Cached tree-view text output.
     tree_text: Option<String>,
     /// Whether to show the tree-view popup.
@@ -231,9 +224,6 @@ pub struct BrowseView {
         Option<rusty_backup::model::job::Job<Result<fs_squashfs::squashfs_edit::SizePlan, String>>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
-    /// Staged additions whose destination already exists, awaiting one review
-    /// before anything is written: `(full path, name, decision)`.
-    conflict_review: Option<Vec<(String, String, rusty_backup::fs::replace::OnConflict)>>,
     /// The text editor window, when open.
     text_editor: Option<GuiTextEditor>,
     /// When true, a successful Discard/Apply from the unsaved dialog should
@@ -482,8 +472,6 @@ impl Default for BrowseView {
             edit_mode: false,
             edit_supported: false,
             edit_result: None,
-            new_folder_name: String::new(),
-            show_new_folder_dialog: false,
             pending_delete: None,
             archive_edit_ctx: None,
             archive_edit_progress: None,
@@ -504,7 +492,7 @@ impl Default for BrowseView {
             export_job: None,
             tar_job: None,
             chd_open_job: None,
-            apply_job: None,
+            apply_follow: None,
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
@@ -512,7 +500,6 @@ impl Default for BrowseView {
             edit_free_space: None,
             free_space_job: None,
             show_unsaved_dialog: false,
-            conflict_review: None,
             text_editor: None,
             pending_close: false,
             staging_errors: Vec::new(),
@@ -620,7 +607,7 @@ impl BrowseView {
             Some("Tar export")
         } else if self.fsck_job.is_some() {
             Some("Check / repair")
-        } else if self.apply_job.is_some() {
+        } else if self.apply_follow.is_some() {
             Some("Apply edits")
         } else if self.tar_job.is_some() {
             Some("Tar import")
@@ -845,8 +832,6 @@ impl BrowseView {
         self.edit_mode = false;
         self.edit_supported = false;
         self.edit_result = None;
-        self.new_folder_name.clear();
-        self.show_new_folder_dialog = false;
         self.pending_delete = None;
         self.blessed_folder = None;
         self.fsck_result = None;
@@ -1048,7 +1033,6 @@ impl BrowseView {
             }
         }
         self.poll_archive_sniff();
-        self.poll_apply_job();
         self.render_apply_job(ui);
         self.poll_export_job();
         self.poll_tar_job();
@@ -1088,6 +1072,7 @@ impl BrowseView {
         let ctx = ui.ctx().clone();
         let fx = self.ctl.tick();
         self.run_effects(&ctx, fx);
+        self.poll_apply();
         if self.ctl.is_working() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -1291,7 +1276,6 @@ impl BrowseView {
                         } else {
                             self.edit_mode = false;
                             self.edit_result = None;
-                            self.show_new_folder_dialog = false;
                             self.pending_delete = None;
                             self.ctl.host_pane().queue.clear();
                             self.pending_archive_imports.clear();
@@ -1524,14 +1508,19 @@ impl BrowseView {
         // Unsaved changes dialog
         self.render_unsaved_dialog(ui);
 
-        // File-exists review, shown once before anything is written
-        self.render_conflict_review(ui);
+        // The pane's apply review (names already taken) and its report
+        let mut review_acts = Vec::new();
+        let pane = self.ctl.pane(Side::Left);
+        self.pane_view
+            .render_apply_review(ui.ctx(), pane, &mut review_acts);
+        self.pane_view
+            .render_apply_report(ui.ctx(), pane, &mut review_acts);
+        for a in review_acts {
+            self.dispatch(&ctx, a);
+        }
 
         // Text editor window
         self.render_text_editor(ui);
-
-        // New folder dialog
-        self.render_new_folder_dialog(ui);
 
         // Tar archive added/dropped: import contents vs add as file
         self.render_tar_add_dialog(ui);
@@ -2853,7 +2842,6 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
         self.edit_result = None;
-        self.show_new_folder_dialog = false;
         self.pending_delete = None;
 
         // Close the browser while compressing to release the temp file.
@@ -3650,8 +3638,9 @@ impl BrowseView {
 
             // Alto BFS has a flat namespace — no subdirectories to create.
             if self.fs_type != "Alto BFS" && ui.button("New Folder...").clicked() {
-                self.new_folder_name.clear();
-                self.show_new_folder_dialog = true;
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::RequestNewFolder);
+                let fx = self.ctl.apply(act);
+                self.run_effects(&ui.ctx().clone(), fx);
             }
 
             // Delete button (enabled when something is selected)
@@ -4509,137 +4498,64 @@ impl BrowseView {
     /// Returns false when the batch was deferred to the conflict review; the
     /// callers used to read that as success and dropped the queue.
     /// Apply the staged edits as a job; `follow_up` runs once they land.
+    /// Apply through the pane (preflight, review, write, reopen); `follow_up` runs once it landed.
     fn start_apply(&mut self, follow_up: ApplyFollowUp) {
-        if self.apply_job.is_some() {
+        if self.apply_follow.is_some() {
             return;
         }
         self.edit_free_space = None;
         self.free_space_job = None;
-        log::info!(
-            "Applying {} staged edit(s) to {}",
-            self.ctl.pane(Side::Left).queue.len(),
-            self.session
-                .source_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        );
-        // Collisions are found before anything is written, so the questions are asked once.
-        let check_conflicts = self.conflict_review.is_none();
-        let edits: Vec<StagedEdit> = self.ctl.host_pane().queue.drain().collect();
-        let session = self.session.clone();
-        let job = rusty_backup::model::job::Job::spawn(
-            "Applying edits...",
-            Arc::new(super::ui_logger::EguiWake),
-            move |job| {
-                Ok(rusty_backup::model::commander_ops::apply_queue(
-                    &session,
-                    edits,
-                    check_conflicts,
-                    job,
-                ))
-            },
-        );
-        self.apply_job = Some((job, follow_up));
+        let total = self.ctl.pane(Side::Left).queue.len();
+        log::info!("Applying {total} staged edit(s)");
+        self.apply_follow = Some((follow_up, total, false));
+        self.ctl
+            .apply(CommanderAction::Pane(Side::Left, BrowserPaneAction::Apply));
     }
 
-    /// Put edits back at the front of the queue, ahead of any staged while the job ran.
-    fn restage(&mut self, edits: impl IntoIterator<Item = StagedEdit>) {
-        let newer: Vec<StagedEdit> = self.ctl.host_pane().queue.drain().collect();
-        for e in edits.into_iter().chain(newer) {
-            self.ctl.host_pane().queue.push(e);
-        }
-    }
-
-    /// Take a finished Apply: report it, restage what didn't land, then run the follow-up.
-    fn poll_apply_job(&mut self) {
-        use rusty_backup::model::commander_ops::QueueApply;
-        use rusty_backup::model::job::Status;
-        let Some((job, _)) = &self.apply_job else {
+    /// Watch the pane's Apply; once it wrote and reopened, report it and run the follow-up.
+    fn poll_apply(&mut self) {
+        let Some((follow_up, total, wrote)) = self.apply_follow else {
             return;
         };
-        let snap = job.snapshot();
-        if snap.is_running() {
+        let pane = self.ctl.pane(Side::Left);
+        let wrote = wrote || pane.applying().is_some();
+        if pane.is_busy() || pane.apply_review().is_some() {
+            self.apply_follow = Some((follow_up, total, wrote));
             return;
         }
-        let run = job.take_result();
-        let Some((_, follow_up)) = self.apply_job.take() else {
+        self.apply_follow = None;
+        if !wrote {
+            // The review was dismissed, or the preflight failed and left a report.
+            self.pending_close = false;
             return;
-        };
-        match (snap.status, run) {
-            (Status::Done, Some(QueueApply::Conflicts { edits, conflicts })) => {
-                self.restage(edits);
-                // Default to Replace: the review shows exactly what will happen before any write.
-                self.conflict_review = Some(
-                    conflicts
-                        .into_iter()
-                        .map(|(path, name)| {
-                            (path, name, rusty_backup::fs::replace::OnConflict::Replace)
-                        })
-                        .collect(),
-                );
-                return;
-            }
-            (
-                Status::Done,
-                Some(QueueApply::Applied {
-                    edits,
-                    outcome,
-                    volume,
-                }),
-            ) => {
-                let total = edits.len();
-                let applied = outcome.applied();
-                if applied > 0 && self.chd_edit.is_some() {
-                    self.chd_diff_dirty = true;
-                }
-                match outcome.failed.first() {
-                    Some(f) => {
-                        let left = total - applied;
-                        self.edit_result = Some(format!(
-                            "Error on edit {}/{total}: {}. Applied {applied} of {total}; {left} edit(s) remain staged",
-                            f.index + 1,
-                            f.error
-                        ));
-                        let index = f.index;
-                        self.restage(edits.into_iter().skip(index));
-                        self.invalidate_all_caches();
-                        self.invalidate_cached_fs();
-                    }
-                    None => {
-                        self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
-                        // The archive-import tempdir backed the AddFile host paths; the bytes are on the image now.
-                        self.archive_import_tempdir = None;
-                        self.invalidate_all_caches();
-                        self.invalidate_cached_fs();
-                        if let Some(v) = volume {
-                            self.blessed_folder = v.blessed;
-                            self.volume_total = v.total;
-                            self.volume_used = v.used;
-                        }
-                    }
-                }
-            }
-            (
-                Status::Done,
-                Some(QueueApply::Failed {
-                    edits,
-                    message,
-                    restage,
-                }),
-            ) => {
-                log::error!("{message}");
-                if restage {
-                    self.restage(edits);
-                }
-                self.edit_result = Some(message);
-            }
-            (Status::Failed(e), _) => {
-                self.edit_result = Some(format!("Error: {e}"));
-            }
-            _ => {}
         }
-        self.conflict_review = None;
+        // The pane reopened the volume itself; only this view's reader is stale.
+        self.forget_cached_fs();
+        self.selected_entry = None;
+        self.cursor_armed = false;
+        let left = self.ctl.pane(Side::Left).queue.len();
+        let applied = total.saturating_sub(left);
+        if applied > 0 && self.chd_edit.is_some() {
+            self.chd_diff_dirty = true;
+        }
+        match self.ctl.pane(Side::Left).apply_report() {
+            Some(r) => {
+                let why = r
+                    .fatal
+                    .clone()
+                    .or_else(|| r.failed.first().map(|f| f.error.clone()))
+                    .unwrap_or_default();
+                self.edit_result = Some(format!(
+                    "Error: {why}. Applied {} of {}; {left} edit(s) remain staged",
+                    r.applied, r.total
+                ));
+            }
+            None => {
+                self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
+                // The archive-import tempdir backed the AddFile host paths; the bytes are on the image now.
+                self.archive_import_tempdir = None;
+            }
+        }
         self.run_apply_follow_up(follow_up);
     }
 
@@ -4662,12 +4578,12 @@ impl BrowseView {
         }
     }
 
-    /// A small window with the running Apply.
+    /// A small window with the pane's running preflight or write.
     fn render_apply_job(&self, ui: &mut egui::Ui) {
-        let Some((job, _)) = &self.apply_job else {
+        let pane = self.ctl.pane(Side::Left);
+        let Some(snap) = pane.checking().or_else(|| pane.applying()) else {
             return;
         };
-        let snap = job.snapshot();
         egui::Window::new(snap.label.clone())
             .collapsible(false)
             .resizable(false)
@@ -4888,93 +4804,7 @@ impl BrowseView {
         }
     }
 
-    /// One review of every name collision, before any write happens.
-    ///
-    /// Each row is decided individually because a batch rarely has one answer:
-    /// overwriting a config file you meant to fix and overwriting a document
-    /// you forgot you had are different things, and a single blanket prompt
-    /// makes the user guess which files it covers.
-    fn render_conflict_review(&mut self, ui: &mut egui::Ui) {
-        use rusty_backup::fs::replace::OnConflict;
-        let Some(mut rows) = self.conflict_review.clone() else {
-            return;
-        };
-
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Window::new("Some files already exist")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "{} of the staged file(s) would overwrite something already on the image.",
-                    rows.len()
-                ));
-                ui.label("Replacing keeps the existing file's permissions, dates and type.");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Replace all").clicked() {
-                        for r in rows.iter_mut() {
-                            r.2 = OnConflict::Replace;
-                        }
-                    }
-                    if ui.button("Skip all").clicked() {
-                        for r in rows.iter_mut() {
-                            r.2 = OnConflict::Skip;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        for (path, _name, decision) in rows.iter_mut() {
-                            ui.horizontal(|ui| {
-                                ui.radio_value(decision, OnConflict::Replace, "Replace");
-                                ui.radio_value(decision, OnConflict::Skip, "Skip");
-                                ui.label(path.as_str());
-                            });
-                        }
-                    });
-
-                ui.add_space(6.0);
-                let replacing = rows.iter().filter(|r| r.2 == OnConflict::Replace).count();
-                ui.label(format!(
-                    "{replacing} to replace, {} to skip",
-                    rows.len() - replacing
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("Continue").clicked() {
-                        apply = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-
-        if cancel {
-            // Nothing has been written, and the queue is untouched, so the user
-            // still has every staged edit to reconsider.
-            self.conflict_review = None;
-            self.edit_result = Some("Save cancelled - nothing was written".to_string());
-            return;
-        }
-        if apply {
-            for (path, _name, decision) in &rows {
-                self.ctl.host_pane().queue.set_conflict_for(path, *decision);
-            }
-            // Keep the review non-None so the apply does not ask again; the poll clears it.
-            self.conflict_review = Some(rows);
-            self.start_apply(ApplyFollowUp::RecompressArchive);
-            return;
-        }
-        self.conflict_review = Some(rows);
-    }
-
+    /// Leaving Edit Mode or closing with edits staged: discard, apply or stay.
     fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
         if !self.show_unsaved_dialog {
             return;
@@ -5670,7 +5500,6 @@ impl BrowseView {
         self.edit_free_space = None;
         self.free_space_job = None;
         self.edit_result = None;
-        self.show_new_folder_dialog = false;
         self.pending_delete = None;
         self.ctl.host_pane().queue.clear();
         self.pending_archive_imports.clear();
@@ -5681,29 +5510,6 @@ impl BrowseView {
         } else if self.archive_edit_ctx.is_some() {
             self.start_archive_compress();
         }
-    }
-
-    /// Render the new folder name dialog.
-    fn render_new_folder_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_new_folder_dialog {
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Folder name:");
-            let response = ui.text_edit_singleline(&mut self.new_folder_name);
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.create_new_folder();
-                return;
-            }
-            if ui.button("Create").clicked() {
-                self.create_new_folder();
-                return;
-            }
-            if ui.button("Cancel").clicked() {
-                self.show_new_folder_dialog = false;
-            }
-        });
     }
 
     /// Render a modal listing files that failed to stage, with the reason
@@ -6356,48 +6162,6 @@ impl BrowseView {
         }
     }
 
-    /// Create a new folder with the name from the dialog.
-    fn create_new_folder(&mut self) {
-        let name = self.new_folder_name.trim().to_string();
-        self.show_new_folder_dialog = false;
-
-        if name.is_empty() {
-            self.edit_result = Some("Error: folder name cannot be empty".into());
-            return;
-        }
-
-        if let Err(e) = self.validate_staged_name(&name) {
-            self.edit_result = Some(format!("Error: {e}"));
-            return;
-        }
-
-        let parent = self.current_parent_entry();
-
-        // Check for duplicate name in pending adds
-        let pending = self
-            .ctl
-            .pane(Side::Left)
-            .queue
-            .pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            self.edit_result = Some(format!(
-                "Error: '{name}' is already staged in this directory"
-            ));
-            return;
-        }
-
-        self.ctl
-            .host_pane()
-            .queue
-            .push(StagedEdit::CreateDirectory {
-                parent,
-                name: name.clone(),
-                qnx2_attrs: None,
-            });
-
-        self.edit_result = Some(format!("Staged folder '{name}'"));
-    }
-
     /// Handle files dropped from the host OS onto the window.
     fn handle_dropped_files(&mut self, ui: &mut egui::Ui) {
         if !self.edit_mode {
@@ -6449,8 +6213,13 @@ impl BrowseView {
     /// Call this whenever the underlying volume bytes may have changed
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
-        self.cached_fs = None;
         self.pane_stale = true;
+        self.forget_cached_fs();
+    }
+
+    /// Drop this view's own reader (the pane reopened by itself after its Apply).
+    fn forget_cached_fs(&mut self) {
+        self.cached_fs = None;
         self.fs_generation = self.fs_generation.wrapping_add(1);
         // Boot-block status is recomputed lazily from the (now possibly
         // changed) backing bytes the next time the header renders.
