@@ -29,6 +29,7 @@ use crate::model::optical_devices::RipDevice;
 use crate::model::optical_ops;
 
 pub use crate::controller::backup::ChdChoice;
+pub use crate::model::job::NoNotify;
 pub use crate::model::optical_ops::OutputFormat;
 pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 pub use audio::{AudioAction, PlayState};

@@ -1550,7 +1550,7 @@ impl BulkState {
 }
 
 /// The Optical screen (rip): choose a drive -> config (output / format / eject)
-/// -> run `optical::rip::run_rip` on a worker thread.
+/// -> run, through a headless `controller::optical::OpticalController`.
 #[cfg(feature = "optical")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpticalStep {
@@ -1561,9 +1561,12 @@ enum OpticalStep {
 
 /// Rip output formats.
 #[cfg(feature = "optical")]
-const RIP_FORMATS: &[(&str, crate::optical::rip::RipFormat)] = &[
-    ("ISO (data)", crate::optical::rip::RipFormat::Iso),
-    ("BIN/CUE (raw)", crate::optical::rip::RipFormat::BinCue),
+const RIP_FORMATS: &[(&str, crate::controller::optical::OutputFormat)] = &[
+    ("ISO (data)", crate::controller::optical::OutputFormat::Iso),
+    (
+        "BIN/CUE (raw)",
+        crate::controller::optical::OutputFormat::BinCue,
+    ),
 ];
 /// Config-form rows: 0 output, 1 format, 2 eject, 3 "Start".
 #[cfg(feature = "optical")]
@@ -1608,7 +1611,8 @@ const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
 #[cfg(feature = "optical")]
 struct OpticalState {
     step: OpticalStep,
-    drives: Vec<crate::model::optical_devices::RipDevice>,
+    /// The drive list, the detect and the rip job.
+    ctl: crate::controller::optical::OpticalController,
     drive_sel: usize,
     device_path: String,
     device_name: String,
@@ -1617,10 +1621,11 @@ struct OpticalState {
     eject: bool,
     field: usize,
     picker: Option<FilePicker>,
-    run: Option<Arc<Mutex<crate::optical::rip::RipProgress>>>,
     op: String,
     result: Option<String>,
     is_error: bool,
+    /// Esc asked the running rip to stop; the final result replaces the note.
+    cancel_note: bool,
     /// The optical-image-operations launcher menu (selected index), when open.
     image_menu: Option<usize>,
 }
@@ -1628,9 +1633,13 @@ struct OpticalState {
 #[cfg(feature = "optical")]
 impl Default for OpticalState {
     fn default() -> Self {
+        use crate::controller::optical::{OpticalAction, OpticalController, SourceMode};
+        use crate::controller::Controller as _;
+        let mut ctl = OpticalController::new(Arc::new(crate::controller::optical::NoNotify));
+        ctl.apply(OpticalAction::SetSourceMode(SourceMode::PhysicalDrive));
         OpticalState {
             step: OpticalStep::Drives,
-            drives: Vec::new(),
+            ctl,
             drive_sel: 0,
             device_path: String::new(),
             device_name: String::new(),
@@ -1639,12 +1648,24 @@ impl Default for OpticalState {
             eject: false,
             field: 0,
             picker: None,
-            run: None,
             op: String::new(),
             result: None,
             is_error: false,
+            cancel_note: false,
             image_menu: None,
         }
+    }
+}
+
+#[cfg(feature = "optical")]
+impl OpticalState {
+    /// A fresh screen whose drive scan has started.
+    fn scanned() -> Self {
+        use crate::controller::Controller as _;
+        let mut o = OpticalState::default();
+        o.ctl
+            .apply(crate::controller::optical::OpticalAction::FindDrives);
+        o
     }
 }
 
@@ -2350,9 +2371,12 @@ impl App {
             }
         }
         #[cfg(feature = "optical")]
-        if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
-            if let Ok(mut p) = run.lock() {
-                p.cancel_requested = true;
+        if let Some(o) = self.optical.as_mut() {
+            if o.ctl.is_running() {
+                use crate::controller::Controller as _;
+                o.ctl
+                    .apply(crate::controller::optical::OpticalAction::Cancel);
+                o.cancel_note = true;
             }
         }
         self.progress = None;
@@ -2387,10 +2411,7 @@ impl App {
         }
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.optical.is_none() {
-            self.optical = Some(OpticalState {
-                drives: crate::model::optical_devices::list_local_rip_devices(),
-                ..OpticalState::default()
-            });
+            self.optical = Some(OpticalState::scanned());
         }
         if self.current() == TabId::Archives && self.archive.is_none() {
             self.archive = Some(ArchiveState::default());
@@ -3947,10 +3968,7 @@ impl App {
     #[cfg(feature = "optical")]
     fn handle_optical_key(&mut self, code: KeyCode) -> bool {
         if self.optical.is_none() {
-            self.optical = Some(OpticalState {
-                drives: crate::model::optical_devices::list_local_rip_devices(),
-                ..OpticalState::default()
-            });
+            self.optical = Some(OpticalState::scanned());
         }
         // Output-path picker (modal).
         if self
@@ -4032,18 +4050,25 @@ impl App {
                     true
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    o.drive_sel = (o.drive_sel + 1).min(o.drives.len().saturating_sub(1));
+                    o.drive_sel = (o.drive_sel + 1).min(o.ctl.drive_count().saturating_sub(1));
                     true
                 }
                 KeyCode::Char('r') => {
-                    o.drives = crate::model::optical_devices::list_local_rip_devices();
+                    use crate::controller::Controller as _;
+                    o.ctl
+                        .apply(crate::controller::optical::OpticalAction::RefreshDrives);
                     o.drive_sel = 0;
                     true
                 }
                 KeyCode::Enter => {
-                    if let Some(d) = o.drives.get(o.drive_sel) {
-                        o.device_path = d.device_path.clone();
-                        o.device_name = d.display_name.clone();
+                    if let Some((name, path)) = o.ctl.drive_names().get(o.drive_sel).cloned() {
+                        use crate::controller::Controller as _;
+                        o.ctl
+                            .apply(crate::controller::optical::OpticalAction::SelectDrive(
+                                Some(o.drive_sel),
+                            ));
+                        o.device_path = path;
+                        o.device_name = name;
                         if o.output.is_empty() {
                             let ext = if o.format_sel == 1 { "cue" } else { "iso" };
                             let home = dirs::home_dir().unwrap_or_default();
@@ -4104,7 +4129,7 @@ impl App {
             },
             OpticalStep::Run => match code {
                 KeyCode::Esc => {
-                    let running = o.result.is_none();
+                    let running = o.ctl.is_running();
                     if running {
                         self.cancel_progress();
                         if let Some(o) = self.optical.as_mut() {
@@ -4114,8 +4139,8 @@ impl App {
                     } else {
                         self.progress = None;
                         if let Some(o) = self.optical.as_mut() {
-                            o.run = None;
                             o.result = None;
+                            o.cancel_note = false;
                             o.step = OpticalStep::Config;
                         }
                     }
@@ -4126,67 +4151,43 @@ impl App {
         }
     }
 
-    /// Start `optical::rip::run_rip` on a worker thread for the selected drive.
+    /// Hand the form to the controller and start the rip.
     #[cfg(feature = "optical")]
     fn start_optical_rip(&mut self) {
-        let Some(o) = self.optical.as_ref() else {
+        use crate::controller::optical::OpticalAction;
+        use crate::controller::Controller as _;
+        let Some(o) = self.optical.as_mut() else {
             return;
         };
         let output = expand_tilde(o.output.trim());
         if output.as_os_str().is_empty() {
-            let o = self.optical.as_mut().unwrap();
             o.result = Some("Enter an output path.".to_string());
             o.is_error = true;
             o.step = OpticalStep::Run;
             return;
         }
-        let device = match crate::optical::rip::OpticalTarget::resolve(&o.device_path) {
-            Ok(t) => t,
-            Err(e) => {
-                let o = self.optical.as_mut().unwrap();
-                o.result = Some(format!("Cannot open drive: {e:#}"));
-                o.is_error = true;
-                o.step = OpticalStep::Run;
-                return;
-            }
-        };
         let format = RIP_FORMATS[o.format_sel.min(RIP_FORMATS.len() - 1)].1;
-        let config = crate::optical::rip::RipConfig {
-            device,
-            output_path: output,
-            format,
-            eject_after: o.eject,
-        };
-        let progress = Arc::new(Mutex::new(crate::optical::rip::RipProgress::new()));
-        let worker = Arc::clone(&progress);
-        crate::model::worker::spawn_guarded(Arc::clone(&progress), "rip", move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::optical::rip::run_rip(config, Arc::clone(&worker))
-            }));
-            if let Ok(mut p) = worker.lock() {
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        if p.error.is_none() {
-                            p.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    Err(_) => {
-                        if p.error.is_none() {
-                            p.error = Some("rip thread panicked".to_string());
-                        }
-                    }
-                }
-                p.finished = true;
-            }
-            Ok(())
-        });
-        let o = self.optical.as_mut().unwrap();
-        o.run = Some(progress);
+        o.ctl.apply(OpticalAction::SetOutputFormat(format));
+        o.ctl.apply(OpticalAction::SetEjectAfter(o.eject));
+        o.ctl.set_output_path(output);
+        o.ctl.apply(OpticalAction::Start(None));
         o.result = None;
         o.is_error = false;
-        o.op = "Starting...".to_string();
+        o.cancel_note = false;
         o.step = OpticalStep::Run;
+        if !o.ctl.is_running() {
+            let why = o
+                .ctl
+                .take_log()
+                .into_iter()
+                .last()
+                .map(|(_, m)| m)
+                .unwrap_or_else(|| "No drive selected".to_string());
+            o.result = Some(format!("Cannot start the rip: {why}"));
+            o.is_error = true;
+            return;
+        }
+        o.op = "Starting...".to_string();
         self.progress = Some(Progress {
             shared: Arc::new(Mutex::new(ProgressShared::default())),
             tracker: RateTracker::default(),
@@ -4542,40 +4543,41 @@ impl App {
                 }
             }
         }
-        // Mirror a running optical rip's progress into the visual bar.
+        // Drive the Optical controller and mirror its rip into the visual bar.
         #[cfg(feature = "optical")]
-        if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
-            let snap = run.lock().ok().map(|p| {
-                (
-                    p.current_bytes,
-                    p.total_bytes,
-                    p.finished,
-                    p.error.clone(),
-                    p.operation.clone(),
-                )
-            });
-            if let Some((cur, total, done, err, op)) = snap {
+        if let Some(o) = self.optical.as_mut() {
+            use crate::controller::Controller as _;
+            let _ = o.ctl.tick();
+            let _ = o.ctl.take_log();
+            let running = o.ctl.is_running();
+            if let Some(bar) = o.ctl.progress() {
+                o.op = bar.operation.clone();
                 if let Some(prog) = self.progress.as_ref() {
                     if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = cur;
-                        sh.total = total;
-                        sh.done = done;
+                        sh.current = bar.current_bytes;
+                        sh.total = bar.total_bytes;
+                        sh.done = false;
                     }
                 }
-                if let Some(o) = self.optical.as_mut() {
-                    o.op = op;
-                    if done && o.result.is_none() {
-                        match err {
-                            Some(e) => {
-                                o.result = Some(format!("Rip failed: {e}"));
-                                o.is_error = true;
-                            }
-                            None => {
-                                o.result = Some("Rip complete.".to_string());
-                                o.is_error = false;
-                            }
+            }
+            if o.step == OpticalStep::Run && !running && (o.result.is_none() || o.cancel_note) {
+                if let Some(last) = o.ctl.last_result() {
+                    if let Some(prog) = self.progress.as_ref() {
+                        if let Ok(mut sh) = prog.shared.lock() {
+                            sh.done = true;
                         }
                     }
+                    match last {
+                        Err(e) => {
+                            o.result = Some(format!("Rip failed: {e}"));
+                            o.is_error = true;
+                        }
+                        Ok(()) => {
+                            o.result = Some("Rip complete.".to_string());
+                            o.is_error = false;
+                        }
+                    }
+                    o.cancel_note = false;
                 }
             }
         }
@@ -6040,13 +6042,19 @@ impl App {
                     self.palette.accent(),
                 ));
                 lines.push(Line::raw(""));
-                if o.drives.is_empty() {
+                let drives = o.ctl.drive_names();
+                if o.ctl.scanning_drives() {
+                    lines.push(Line::styled(
+                        "  Looking for optical drives...",
+                        self.palette.dim(),
+                    ));
+                } else if drives.is_empty() {
                     lines.push(Line::styled(
                         "  No optical drives detected. Press `r` to rescan.",
                         self.palette.dim(),
                     ));
                 } else {
-                    for (i, d) in o.drives.iter().enumerate() {
+                    for (i, (name, path)) in drives.iter().enumerate() {
                         let sel = i == o.drive_sel;
                         let marker = if sel { "> " } else { "  " };
                         let style = if sel {
@@ -6056,10 +6064,7 @@ impl App {
                         } else {
                             self.palette.accent()
                         };
-                        lines.push(Line::styled(
-                            format!("{marker}{}  ({})", d.display_name, d.device_path),
-                            style,
-                        ));
+                        lines.push(Line::styled(format!("{marker}{name}  ({path})"), style));
                     }
                 }
                 lines.push(Line::raw(""));
@@ -6077,6 +6082,19 @@ impl App {
                     Span::styled("Drive: ", self.palette.dim()),
                     Span::raw(format!("{} ({})", o.device_name, o.device_path)),
                 ]));
+                if let Some(d) = o.ctl.disc() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Disc:  ", self.palette.dim()),
+                        Span::raw(format!(
+                            "{} / {} {}",
+                            d.format,
+                            d.filesystem,
+                            d.volume.unwrap_or_default()
+                        )),
+                    ]));
+                } else if o.ctl.detecting().is_some() {
+                    lines.push(Line::styled("Disc:  reading...", self.palette.dim()));
+                }
                 lines.push(Line::raw(""));
                 let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
                     let active = o.field == idx;
@@ -7432,6 +7450,35 @@ mod tests {
         assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
         let folder = out.path().join(b.ctl.name());
         assert!(folder.join("metadata.json").exists());
+    }
+
+    #[cfg(feature = "optical")]
+    #[test]
+    fn the_optical_screen_starts_the_rip_through_the_controller() {
+        let mut app = App::new_on(BACKUP_TAB);
+        let mut o = OpticalState::default();
+        o.step = OpticalStep::Config;
+        o.field = 3;
+        app.optical = Some(o);
+        app.start_optical_rip();
+        let o = app.optical.as_ref().unwrap();
+        assert_eq!(o.result.as_deref(), Some("Enter an output path."));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let o = app.optical.as_mut().unwrap();
+        o.output = dir.path().join("disc.iso").display().to_string();
+        o.format_sel = 1;
+        app.start_optical_rip();
+        app.tick();
+        let o = app.optical.as_ref().unwrap();
+        assert_eq!(
+            o.result.as_deref(),
+            Some("Cannot start the rip: No drive selected")
+        );
+        assert!(o.is_error && !o.ctl.is_running() && app.progress.is_none());
+        assert_eq!(
+            o.ctl.output_format(),
+            crate::controller::optical::OutputFormat::BinCue
+        );
     }
 
     #[test]
