@@ -213,19 +213,24 @@ impl InspectController {
         self.tools.editor_open
     }
 
-    /// The editor, with the partitions and table it edits, for the editor window.
-    pub fn editor_parts(
-        &mut self,
-    ) -> (
-        &mut PartitionEditor,
-        &[PartitionInfo],
-        Option<&PartitionTable>,
-    ) {
-        (
+    pub(super) fn table_edit(&mut self, edit: crate::controller::partition_edit::TableEditAction) {
+        crate::controller::partition_edit::apply_table_edit(
             &mut self.tools.editor,
-            self.found.partitions.as_slice(),
             self.found.table.as_ref(),
-        )
+            edit,
+        );
+    }
+
+    /// The partition-table window's content, while it is open.
+    pub fn table_editor(&self) -> Option<crate::controller::partition_edit::TableEditView> {
+        self.tools.editor_open.then(|| {
+            crate::controller::partition_edit::table_view(
+                &self.tools.editor,
+                self.found.partitions.as_slice(),
+                self.found.table.as_ref(),
+                self.backup_folder().is_none(),
+            )
+        })
     }
 
     // --- Check / Repair -----------------------------------------------------------------
@@ -507,7 +512,11 @@ impl InspectController {
             self.error("No source path for editing");
             return;
         };
-        if self.tools.table_apply.is_some() {
+        if self.tools.table_apply.is_some() || self.backup_folder().is_some() {
+            return;
+        }
+        self.tools.editor.build_and_validate(&table);
+        if !self.tools.editor.errors.is_empty() || self.tools.editor.edits.is_empty() {
             return;
         }
         let edits = self.tools.editor.edits.clone();

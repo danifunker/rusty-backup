@@ -1141,14 +1141,14 @@ impl RestoreTab {
     }
 
     fn show_build_disk_modal(&mut self, ui: &mut egui::Ui) {
-        let Some(builder) = self.ctl.builder() else {
+        let Some(view) = self.ctl.build_view() else {
             return;
         };
-        let action = super::partition_editor_modal::show(
-            ui,
-            super::partition_editor_modal::Mode::BuildNew { builder },
-            true,
-        );
+        let probing = self.ctl.build_source_probing().is_some();
+        let (edits, action) = super::partition_editor_modal::show_build(ui, &view, probing);
+        for edit in edits {
+            self.act(RestoreAction::Build(edit));
+        }
         match action {
             super::partition_editor_modal::Action::Stay => {}
             super::partition_editor_modal::Action::Close => self.act(RestoreAction::BuildClose),

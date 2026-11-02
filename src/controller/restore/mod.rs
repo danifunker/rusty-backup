@@ -52,6 +52,7 @@ pub mod purpose {
     pub const WRITE_IMAGE: &str = "restore.write_image";
     pub const RESTORE: &str = "restore.confirm";
     pub const BUILD: &str = "restore.build_confirm";
+    pub const BUILD_SOURCE: &str = "restore.build_source";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -154,6 +155,8 @@ pub enum RestoreAction {
     /// "Define Partitions...": open the partition plan.
     BuildDefine,
     BuildClose,
+    /// An edit in the plan's window.
+    Build(crate::controller::partition_edit::BuildAction),
     /// The plan's Apply: an image target builds at once, a device asks for its name first.
     BuildApply,
     BuildCancel,
@@ -510,6 +513,7 @@ impl Controller for RestoreController {
             RestoreAction::SetBuildSize(text) => self.targets.build_size_text = text,
             RestoreAction::BuildDefine => self.build_define(),
             RestoreAction::BuildClose => self.targets.builder = None,
+            RestoreAction::Build(edit) => return self.build_edit(edit),
             RestoreAction::BuildApply => return self.build_apply(),
             RestoreAction::BuildCancel => self.run.cancel_build(),
             RestoreAction::Start => return self.start(),
@@ -540,6 +544,7 @@ impl Controller for RestoreController {
         self.poll_decode();
         self.poll_write_probe();
         self.poll_scan();
+        self.poll_build_source();
         self.poll_remote();
         self.poll_run();
         Vec::new()
@@ -558,6 +563,7 @@ impl RestoreController {
             purpose::NEW_DISK_IMAGE => self.targets.new_disk.image = Some(path),
             purpose::BUILD_IMAGE => self.targets.build.image = Some(path),
             purpose::WRITE_IMAGE => self.open_write_image(path),
+            purpose::BUILD_SOURCE => self.build_source_picked(path),
             _ => {}
         }
     }
@@ -584,7 +590,8 @@ impl RestoreController {
     pub fn wait_idle(&mut self) {
         loop {
             self.tick();
-            if !self.src.busy() && !self.targets.scanning() && !self.remote.busy() {
+            let probing = self.targets.build_source.is_some();
+            if !self.src.busy() && !self.targets.scanning() && !self.remote.busy() && !probing {
                 self.tick();
                 return;
             }

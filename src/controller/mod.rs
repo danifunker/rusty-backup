@@ -26,6 +26,7 @@ pub mod disk_write;
 pub mod inspect;
 pub mod keys;
 pub mod log;
+pub mod partition_edit;
 pub mod restore;
 
 /// The shape every controller shares.

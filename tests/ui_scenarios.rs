@@ -436,10 +436,13 @@ impl Target for BackupTarget {
 /// The Restore tab's controller. Actions: `OpenBackup` (a path, `$backup` for a fresh zstd backup
 /// of a blank FAT image, or `$empty` for an empty folder), `SetMode` (`full`, `single`, `new`,
 /// `write`, `build`), `SetTargetIsDevice` (bool), `SetTargetImage` (a path, or `$out`),
-/// `SetSize` (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`.
+/// `SetSize` (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`, and
+/// Build Disk's `BuildTarget` (an image target of this size), `BuildDefine`, `BuildRowSize`
+/// (`row:size`), `BuildAddRow`, `BuildApply`.
 /// Probes: `backup` (one is loaded), `partitions`, `error` (why Start is refused, empty when it is
 /// not), `load_error`, `result` (`ok`, the failure, or empty), `output` (the restored image equals
-/// the image backed up), `log` (every line so far).
+/// the image backed up), `log` (every line so far), `build_rows` (-1 with no plan open),
+/// `build_layout` (`ok` or why it cannot be placed), `build_result`, `built_mbr`.
 struct RestoreTarget {
     ctl: rusty_backup::controller::restore::RestoreController,
     dir: tempfile::TempDir,
@@ -563,6 +566,35 @@ impl Target for RestoreTarget {
                 yes: true,
             },
             "ClearBackup" => RestoreAction::ClearBackup,
+            "BuildTarget" => {
+                self.ctl
+                    .apply(RestoreAction::SetMode(RestoreMode::BuildDisk));
+                self.ctl.apply(RestoreAction::SetTargetIsDevice(
+                    TargetSlot::BuildDisk,
+                    false,
+                ));
+                self.ctl.apply(RestoreAction::SetTargetImage(
+                    TargetSlot::BuildDisk,
+                    Some(self.dir.path().join("built.img")),
+                ));
+                RestoreAction::SetBuildSize(arg_str(arg)?.to_string())
+            }
+            "BuildDefine" => RestoreAction::BuildDefine,
+            "BuildRowSize" => {
+                use rusty_backup::controller::partition_edit::BuildAction;
+                let text = arg_str(arg)?;
+                let (row, text) = text
+                    .split_once(':')
+                    .ok_or("BuildRowSize wants `row:size`")?;
+                RestoreAction::Build(BuildAction::SetRowSize {
+                    row: row.parse().map_err(|_| "bad row".to_string())?,
+                    text: text.to_string(),
+                })
+            }
+            "BuildAddRow" => {
+                RestoreAction::Build(rusty_backup::controller::partition_edit::BuildAction::AddRow)
+            }
+            "BuildApply" => RestoreAction::BuildApply,
             other => return Err(format!("RestoreController has no action {other:?}")),
         };
         let fx = self.ctl.apply(a);
@@ -587,6 +619,24 @@ impl Target for RestoreTarget {
                 )
             }
             "log" => Value::String(self.log.join("\n")),
+            "build_rows" => {
+                Value::Integer(self.ctl.build_view().map_or(-1, |v| v.rows.len() as i64))
+            }
+            "build_layout" => Value::String(match self.ctl.build_view().map(|v| v.layout) {
+                Some(Ok(_)) => "ok".to_string(),
+                Some(Err(e)) => e,
+                None => String::new(),
+            }),
+            "build_result" => Value::String(match self.ctl.build_result() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "built_mbr" => Value::Boolean(
+                std::fs::read(self.dir.path().join("built.img"))
+                    .map(|d| d.len() > 512 && d[510..512] == [0x55, 0xAA])
+                    .unwrap_or(false),
+            ),
             other => return Err(format!("RestoreController has no probe {other:?}")),
         })
     }

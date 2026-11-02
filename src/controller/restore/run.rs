@@ -429,7 +429,16 @@ impl RestoreController {
 
     /// The plan's Apply: an image target builds now; erasing a device asks for its name first.
     pub(super) fn build_apply(&mut self) -> Vec<Effect> {
-        if self.run.building() || self.targets.builder.is_none() {
+        if self.run.building() {
+            return Vec::new();
+        }
+        // Create Disk validates first; the window shows why it refused.
+        let valid = self
+            .targets
+            .builder
+            .as_mut()
+            .is_some_and(|b| b.validate().is_some());
+        if !valid {
             return Vec::new();
         }
         if !self.targets.build.is_device {

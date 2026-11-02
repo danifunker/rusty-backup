@@ -753,17 +753,13 @@ impl InspectTab {
     }
 
     fn show_editor_popup(&mut self, ui: &mut egui::Ui) {
-        let allow_apply = self.ctl.backup_folder().is_none();
-        let (editor, partitions, table) = self.ctl.editor_parts();
-        let action = super::partition_editor_modal::show(
-            ui,
-            super::partition_editor_modal::Mode::EditExisting {
-                editor,
-                partitions,
-                table,
-            },
-            allow_apply,
-        );
+        let Some(view) = self.ctl.table_editor() else {
+            return;
+        };
+        let (edits, action) = super::partition_editor_modal::show_table(ui, &view);
+        for edit in edits {
+            self.act(InspectAction::Table(edit));
+        }
         match action {
             super::partition_editor_modal::Action::Stay => {}
             super::partition_editor_modal::Action::Close => self.act(InspectAction::CloseEditor),

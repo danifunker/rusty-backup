@@ -157,6 +157,9 @@ pub enum InspectAction {
     /// Open the editor with a new partition filling the largest free gap.
     AddPartition,
     CloseEditor,
+    /// An edit in the partition-table window.
+    Table(crate::controller::partition_edit::TableEditAction),
+    /// Apply Changes: validates first, then writes the edits.
     ApplyTableEdits,
     /// Open the Export Disk Image window.
     OpenExport,
@@ -1042,6 +1045,10 @@ impl Controller for InspectController {
             }
             InspectAction::CloseEditor => {
                 self.tools.close_editor();
+                Vec::new()
+            }
+            InspectAction::Table(edit) => {
+                self.table_edit(edit);
                 Vec::new()
             }
             InspectAction::ApplyTableEdits => {

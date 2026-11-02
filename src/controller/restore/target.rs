@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use super::source::finished;
 use super::{
-    AlignmentChoice, DiskBuilder, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType, Picked,
-    PlanSegment, RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
+    purpose, AlignmentChoice, DiskBuilder, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType,
+    Picked, PlanSegment, RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
 };
+use crate::controller::{Effect, PickSpec};
 use crate::device::{DeviceIdentity, DiskDevice};
 use crate::model::job::{Job, Snapshot};
 use crate::model::source_scan::ScanFailure;
@@ -35,6 +36,9 @@ pub(super) struct TargetState {
     pub build_size_text: String,
     /// The partition plan, while Build Disk's editor is open.
     pub builder: Option<DiskBuilder>,
+    /// The plan row a picked source image goes to, then its decoded-size probe.
+    pub build_source_row: Option<usize>,
+    pub build_source: Option<(usize, Job<(PathBuf, u64)>)>,
 }
 
 impl Default for TargetState {
@@ -60,6 +64,8 @@ impl Default for TargetState {
             },
             build_size_text: "512M".to_string(),
             builder: None,
+            build_source_row: None,
+            build_source: None,
         }
     }
 }
@@ -422,9 +428,80 @@ impl RestoreController {
         }
     }
 
-    /// The partition plan, while its editor is open.
-    pub fn builder(&mut self) -> Option<&mut DiskBuilder> {
-        self.targets.builder.as_mut()
+    /// Build Disk's partition window content, while it is open.
+    pub fn build_view(&self) -> Option<crate::controller::partition_edit::BuildView> {
+        self.targets
+            .builder
+            .as_ref()
+            .map(crate::controller::partition_edit::build_view)
+    }
+
+    /// A row's source image is being measured.
+    pub fn build_source_probing(&self) -> Option<Snapshot> {
+        self.targets
+            .build_source
+            .as_ref()
+            .map(|(_, j)| j.snapshot())
+    }
+
+    /// An edit in Build Disk's partition window; a source pick asks for the file first.
+    pub(super) fn build_edit(
+        &mut self,
+        action: crate::controller::partition_edit::BuildAction,
+    ) -> Vec<Effect> {
+        use crate::controller::partition_edit::BuildAction;
+        let Some(builder) = self.targets.builder.as_mut() else {
+            return Vec::new();
+        };
+        if let BuildAction::PickRowSource(row) = action {
+            if row >= builder.rows.len() {
+                return Vec::new();
+            }
+            self.targets.build_source_row = Some(row);
+            let mut filters = vec![(
+                "Disk images".to_string(),
+                Self::ext(crate::model::file_types::DISK_IMAGE_EXTS),
+            )];
+            filters.push(("All Files".to_string(), vec!["*".to_string()]));
+            return vec![Effect::PickFile(PickSpec {
+                purpose: purpose::BUILD_SOURCE,
+                title: format!("Source image for partition {}", row + 1),
+                filters,
+                save: false,
+                file_name: String::new(),
+            })];
+        }
+        crate::controller::partition_edit::apply_build(builder, action);
+        Vec::new()
+    }
+
+    /// A row's source image was picked: measure its decoded size off the UI thread.
+    pub(super) fn build_source_picked(&mut self, path: PathBuf) {
+        let Some(row) = self.targets.build_source_row.take() else {
+            return;
+        };
+        let job = self.spawn("Measuring the source image...", move |_| {
+            let size = crate::model::source_reader::decoded_image_size(path.as_path()).unwrap_or(0);
+            Ok((path, size))
+        });
+        self.targets.build_source = Some((row, job));
+    }
+
+    pub(super) fn poll_build_source(&mut self) {
+        let Some(done) = self
+            .targets
+            .build_source
+            .as_ref()
+            .and_then(|(_, j)| finished(j))
+        else {
+            return;
+        };
+        let Some((row, _)) = self.targets.build_source.take() else {
+            return;
+        };
+        if let (Ok((path, size)), Some(builder)) = (done, self.targets.builder.as_mut()) {
+            crate::controller::partition_edit::set_row_source(builder, row, path, size);
+        }
     }
 
     pub fn builder_open(&self) -> bool {
