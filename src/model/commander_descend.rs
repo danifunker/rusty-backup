@@ -343,13 +343,14 @@ pub fn optical_choice_labels(
     info: &opticaldiscs::detect::DiscImageInfo,
     areas: &[crate::optical::boot_area::BootArea],
 ) -> Vec<String> {
+    let primary = format!("{:?}", info.filesystem);
     let mut labels = vec![optical_fs_label(
-        &format!("{:?}", info.filesystem),
+        primary.as_str(),
         info.volume_label.as_deref(),
     )];
     for h in &info.hybrid_filesystems {
         let ty = format!("{:?}", h.filesystem);
-        labels.push(optical_fs_label(&ty, h.volume_label.as_deref()));
+        labels.push(optical_fs_label(ty.as_str(), h.volume_label.as_deref()));
     }
     labels.extend(areas.iter().map(|a| a.label.clone()));
     labels

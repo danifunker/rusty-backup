@@ -957,7 +957,7 @@ fn run_disc_extract(job: DiscExtractJob, status: &Arc<Mutex<HostCopyStatus>>) ->
         rs_to_lf: false,
     };
     let forks = job.disc.has_forks();
-    let taken = extraction_conflicts(&job.entry, &job.dest, &options, forks);
+    let taken = extraction_conflicts(&job.entry, job.dest.as_path(), &options, forks);
     if !taken.is_empty() && job.on_conflict == OnConflict::Skip {
         if let Ok(mut g) = status.lock() {
             g.skipped
