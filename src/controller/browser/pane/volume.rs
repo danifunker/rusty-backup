@@ -27,7 +27,7 @@ pub use fs_mac::hfsplus_journal::JournalDetail;
 
 /// The metadata structure a journal block's byte offset falls in.
 pub fn journal_block_class(detail: &JournalDetail, target: u64) -> &'static str {
-    fs_mac::hfsplus_journal::classify_target(&detail.regions, target)
+    fs_mac::hfsplus_journal::classify_target(detail.regions.as_slice(), target)
 }
 
 /// Which subsystems a journal transaction's blocks touch, as one line ("empty" for none).

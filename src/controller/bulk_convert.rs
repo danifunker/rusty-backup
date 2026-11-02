@@ -333,7 +333,7 @@ impl BulkConvertController {
             Arc::clone(&self.notify),
             move |job| {
                 job.set_can_cancel(false);
-                Ok(scan_source_folder(&folder, format))
+                Ok(scan_source_folder(folder.as_path(), format))
             },
         ));
     }
@@ -375,7 +375,7 @@ impl BulkConvertController {
         let ext = self.extension.trim().to_string();
         let chosen = self.chosen(&[]);
         let conflicts = match &self.output {
-            Some(out) => detect_conflicts(&chosen, out, &ext),
+            Some(out) => detect_conflicts(chosen.as_slice(), out.as_path(), ext.as_str()),
             None => Vec::new(),
         };
         if conflicts.is_empty() {
@@ -393,7 +393,7 @@ impl BulkConvertController {
         let chd = self.pending_chd.take();
         match choice {
             ConflictChoice::SkipConflicting => {
-                let chosen = self.chosen(&conflicts);
+                let chosen = self.chosen(conflicts.as_slice());
                 if !chosen.is_empty() {
                     self.launch(chosen, chd);
                 }

@@ -154,7 +154,7 @@ pub fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
     // Check HFS type code first (if present)
     if let Some(ref type_code) = entry.type_code {
         let type_str = fs_mac::hfs_common::decode_ostype(type_code);
-        if let Some(is_text) = hfs_file_types::classify(&type_str) {
+        if let Some(is_text) = hfs_file_types::classify(type_str.as_str()) {
             if !is_text {
                 return FileContent::Binary(data.to_vec());
             }

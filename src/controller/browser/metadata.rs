@@ -35,8 +35,8 @@ pub fn hfs_type_creator(queue: &EditQueue, entry: &FileEntry) -> TypeCreator {
     TypeCreator {
         type_code: t,
         creator_code: c,
-        type_text: String::from_utf8_lossy(&t).to_string(),
-        creator_text: String::from_utf8_lossy(&c).to_string(),
+        type_text: String::from_utf8_lossy(&t[..]).to_string(),
+        creator_text: String::from_utf8_lossy(&c[..]).to_string(),
         description: hfs_common::describe_type_creator(&t, &c),
     }
 }
@@ -137,7 +137,7 @@ pub fn parse_prodos_type(type_text: &str, aux_text: &str) -> Option<(u8, u16)> {
 /// (create, modify, backup) in Mac seconds: a staged edit, else the catalog, else zeros.
 pub fn hfs_dates(queue: &EditQueue, entry: &FileEntry) -> (u32, u32, u32) {
     queue
-        .pending_dates_for(&entry.path)
+        .pending_dates_for(entry.path.as_str())
         .or(entry.mac_dates)
         .unwrap_or((0, 0, 0))
 }
@@ -166,7 +166,7 @@ pub fn parse_hfs_dates(
 /// The effective permission bits (low 12): a staged edit, else the entry's mode, else 0.
 pub fn permissions(queue: &EditQueue, entry: &FileEntry) -> u32 {
     queue
-        .pending_permissions_for(&entry.path)
+        .pending_permissions_for(entry.path.as_str())
         .or(entry.mode)
         .map(|m| m & 0o7777)
         .unwrap_or(0)
@@ -182,7 +182,7 @@ pub fn parse_permissions(text: &str) -> Option<u32> {
 /// The effective (uid, gid): a staged edit, else the entry's, else (0, 0).
 pub fn owner(queue: &EditQueue, entry: &FileEntry) -> (u32, u32) {
     queue
-        .pending_owner_for(&entry.path)
+        .pending_owner_for(entry.path.as_str())
         .or_else(|| Some((entry.uid?, entry.gid?)))
         .unwrap_or((0, 0))
 }
@@ -197,7 +197,7 @@ pub fn parse_owner(uid: &str, gid: &str) -> Option<(u32, u32)> {
 /// The on-disk attributes with pending sets and removes applied, sorted by name.
 pub fn effective_xattrs(queue: &EditQueue, entry: &FileEntry, on_disk: &[Xattr]) -> Vec<Xattr> {
     let mut effective: Vec<Xattr> = on_disk.to_vec();
-    for (name, val) in &queue.pending_xattrs_for(&entry.path) {
+    for (name, val) in &queue.pending_xattrs_for(entry.path.as_str()) {
         effective.retain(|x| &x.name != name);
         if let Some(v) = val {
             effective.push(Xattr {
