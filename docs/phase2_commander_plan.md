@@ -1389,17 +1389,19 @@ four gaps slice 16 listed are closed in the pane rather than special-cased in a 
   order.
 - TUI: none beyond Commander's disc readout. CLI: none (`rb-cli optical` keeps its verbs).
 
-### Decisions for the user
+### Decisions (answered 2026-11-02)
 
-- Extraction keeps the Optical tab's walker behind the pane (`HostCopyJob::DiscExtract`): the
-  generic `model::extract` writes different bytes in 33 of the 288 cases (Rock Ridge symlinks
-  become real symlinks instead of empty files, the root folder is named `/`-derived instead of
-  `_`, AppleDouble / MacBinary headers carry other dates, BinHex writes `.hqx`). Keep the walker,
-  or switch discs to the generic extraction and accept those changes.
-- The preview of a Rock Ridge symlink: the pane shows the target, the old browser showed an
-  empty text file (`identity_tests::PANE_DIFFERS`). Display only.
-- Picker labels: Commander's ("RETRO (ISO 9660)") now serve both; the Optical tab's style
-  ("ISO 9660 (RETRO)") could replace them in both.
+- **Extraction: collapse to one extractor, in a crate** (slice 19). Today the disc walker
+  stays behind the pane (`HostCopyJob::DiscExtract`) because the generic `model::extract`
+  writes different bytes in 33 of 288 cases. The single extractor picks, per case: Rock Ridge
+  symlinks become real symlinks (a small text file where the host refuses symlinks, e.g.
+  Windows without the privilege); a whole-disc extract's top folder is the volume name
+  (today `_` or a `/`-derived name); AppleDouble / MacBinary headers carry the file's real
+  dates from the disc; BinHex writes `.hqx`. The identity goldens are recaptured for exactly
+  those cases.
+- **Symlink preview:** accepted; the pane shows the target (`identity_tests::PANE_DIFFERS`).
+- **Picker labels:** "volume (format)", as Commander had, in both; the format name is italic
+  in egui (slice 18b).
 
 ### Left
 
@@ -1409,3 +1411,68 @@ four gaps slice 16 listed are closed in the pane rather than special-cased in a 
 - `rb-cli optical extract` is still its own implementation (case-collision modes, POSIX modes,
   tar output).
 
+## Slice 18b: hybrid discs list each Mac file once; italic format names
+
+Found while checking slice 18 in the GUI (2026-11-02).
+
+- **Duplicate rows on a hybrid disc's ISO 9660 side.** Mac hybrid CDs store a file's
+  resource fork on the ISO side as an *associated file* (file-flags bit 2, ECMA-119
+  §9.1.6) named like the data file; `opticaldiscs` listed it as a second file. Fixed in
+  **opticaldiscs 0.16.1** (danifunker/opticaldiscs-rs d9574d3, published): the associated
+  file becomes the partner's resource fork (`resource_fork_size`, `read_resource_fork`);
+  an orphan stays listed. rusty-backup pins 0.16.1 (2ca0c689); only the root lockfile
+  carries opticaldiscs. The 63 identity cases for the hybrid discs' ISO side (`fs0`) were
+  recaptured: one row per file, forks in AppleDouble / MacBinary / BinHex / SeparateRsrc
+  extracts, Native still errors off macOS (as on the HFS side), and Zip export now works
+  (it failed on the duplicate names).
+- **Italic format names** (3119ea34). The pane serves `partition_label_parts()` (`LabelParts`:
+  lead, format, tail) beside `partition_labels()`; `gui::theme::format_label` draws the
+  format italic in the disc browser header and both Commander pickers. The TUI keeps the
+  joined text. `model::commander_descend::OPTICAL_FS_NAMES` is the one name table for the
+  label builder and the splitter.
+
+## Decisions taken 2026-11-02 (assumed accepted)
+
+All behaviour changes listed in slices 11-18 stand. In particular:
+- TUI **Minimum** restore uses the GUI's per-partition minimum (slice 13).
+- The TUI partition write addresses X68000 partitions by byte offset (slice 14).
+- Inspect's image prepare job stays as the one place a future decode would run (slice 17).
+- The TUI Bulk screen asks before overwriting outputs (slice 17).
+- Still open: **Resize's Cancel does nothing** (slice 15). `apply_resize` has no safe stop
+  point; leave it until a resize can stop without leaving a half-moved partition.
+
+## Where Phase 2 stands (2026-11-02)
+
+- Slices 1-18b done. `src/gui` is enforced whole at 0 engine references; the TUI Commander
+  and Explorer files are enforced. Shell engine references: 979 at the start of Phase 2,
+  **20** now, all in `src/cli/verbs/tui_app.rs` (device lists, image probes, the update
+  check, the palette).
+- CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
+  pushed with CI running. Commits after 3119ea34 are local until the user says push.
+- Not yet run on the Phase 2 code: the full fixture regression suite (last full run
+  450/450 at 7fc076cd, before slice 10). Suggest it (about 95 min) before Phase 2 exit.
+
+## Next steps
+
+1. **Slice 19: one extractor, in a crate.** A new MIT crate (working name `fs-extract`)
+   over `disk-core` and `fs-mac` (the fork encoders already live in `fs-mac` /
+   `arc-mac`; `disk-core` can't hold it because `fs-mac` depends on `disk-core`). It
+   replaces `model::extract`, the disc walker in `model::optical_browse`, and
+   `src/fs/export_selection.rs`'s walk where it duplicates; then `rb-cli optical extract`
+   moves onto it if its collision / POSIX / tar modes fit. Byte rules: the four choices
+   above; everything else byte-identical (prove it with the identity tests and the
+   Commander / Inspect extract tests). Version, publish (publish-crates.yml) and update the
+   root, vintage, ppc and sol9 lockfiles.
+2. **Slice 20: the TUI's last 20 references** in `tui_app.rs`: drive `controller::app`
+   (shell rules, device list, update check) and the existing controllers; enforce the whole
+   TUI in `scripts/check-boundaries.sh`.
+3. **TUI parity gaps** the controllers already support (Backup partition selection / split
+   / CHD codec / remote; Restore single-partition / new-disk / Build Disk; Inspect disk
+   tools / Calc min / Export; Optical convert / Browse Contents / player; Inspect dialogs):
+   add them, or record each as N/A with a reason in `docs/platform_matrix.md` (Phase 2 exit).
+4. **Pickers off the UI thread:** egui still calls rfd synchronously; route `PickFile` /
+   `PickFolder` through the portal-friendly async dialogs (needed by GTK4 anyway).
+5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
+   Windows, then close Phase 2 in `native_frontends_plan.md`.
+6. **Phase 4 (GTK4) or Phase 3 (AppKit)** per `native_frontends_plan.md`; the GTK4 and Qt6 /
+   Kirigami dev packages are installed on m900.

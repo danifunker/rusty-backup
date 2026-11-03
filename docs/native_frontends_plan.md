@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 0 and Phase 1 done (2026-11-01)** on `native-frontends`, except Commander's synchronous operations, which move with the Phase 2 Commander pilot; Phase 2 is next. Drafted 2026-10-29.
+Status: **Phase 0 and Phase 1 done (2026-11-01). Phase 2 nearly done (2026-11-02):** every egui screen and dialog runs on `src/controller/` (slices 1-18b); 20 engine references remain in the TUI. Progress, decisions and next steps: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
