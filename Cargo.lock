@@ -4680,9 +4680,9 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "opticaldiscs"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "356575d67c2cacd2d9d18d333db8593956cc44468312644d696a150c0400b1a4"
+checksum = "34d34109911e2a9685ddfe11532f646687be0cbb365c96792c014c5aa1a08e76"
 dependencies = [
  "encoding_rs",
  "flate2",
