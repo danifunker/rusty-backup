@@ -23,7 +23,7 @@ pub use pane::{
     MAX_TEXT_EDIT,
 };
 pub use profile::{DetailPlacement, ListingStyle, PaneProfile, Sources};
-pub use rows::{DisplayRow, RowKind};
+pub use rows::{DisplayRow, LabelParts, RowKind};
 
 #[cfg(test)]
 mod archive_tests;

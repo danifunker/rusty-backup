@@ -369,23 +369,25 @@ impl PaneView {
                 // (ISO 9660 + any hybrid Mac side); every other image lists its
                 // partition-table entries.
                 if !pane.listing.is_host() {
-                    let labels = pane.partition_labels();
+                    let labels = pane.partition_label_parts();
                     let empty_text = if pane.is_optical() {
                         "(no filesystems)"
                     } else {
                         "(no partitions)"
                     };
                     let selected = pane.selected_partition();
-                    let current = selected
-                        .and_then(|i| labels.get(i).cloned())
-                        .unwrap_or_else(|| empty_text.to_string());
+                    let current: egui::WidgetText = match selected.and_then(|i| labels.get(i)) {
+                        Some(p) => crate::gui::theme::format_label(ui, p).into(),
+                        None => empty_text.into(),
+                    };
                     let mut chosen = selected;
                     // Capped so a long label (a raw-carve "Amiga NDOS (no filesystem)") can't push the readout.
                     egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
                         .selected_text(current)
                         .width(210.0)
                         .show_ui(ui, |ui| {
-                            for (i, label) in labels.iter().enumerate() {
+                            for (i, parts) in labels.iter().enumerate() {
+                                let label = crate::gui::theme::format_label(ui, parts);
                                 ui.selectable_value(&mut chosen, Some(i), label);
                             }
                         });

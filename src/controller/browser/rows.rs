@@ -368,12 +368,52 @@ pub fn tree_row_to_display(tr: &TreeRow) -> DisplayRow {
 
 /// Short label for a partition: `1: FAT16 (510.0 MiB)`. `pos` matches `inspect`'s `#` and `IMG@N`.
 pub fn partition_label(pos: usize, p: &PartitionInfo) -> String {
-    format!(
-        "{}: {} ({})",
-        pos + 1,
-        p.type_name,
-        format_size(p.size_bytes)
-    )
+    partition_label_parts(pos, p).joined()
+}
+
+/// A picker label split around its format name, so a view can style the format (italic in egui).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelParts {
+    pub lead: String,
+    pub format: String,
+    pub tail: String,
+}
+
+impl LabelParts {
+    pub fn joined(&self) -> String {
+        format!("{}{}{}", self.lead, self.format, self.tail)
+    }
+}
+
+pub fn partition_label_parts(pos: usize, p: &PartitionInfo) -> LabelParts {
+    LabelParts {
+        lead: format!("{}: ", pos + 1),
+        format: p.type_name.clone(),
+        tail: format!(" ({})", format_size(p.size_bytes)),
+    }
+}
+
+/// Split a disc picker label (`VOLUME (ISO 9660)` or a bare `ISO 9660`) around its filesystem name.
+pub fn optical_label_parts(label: &str) -> LabelParts {
+    for (_, name) in crate::model::commander_descend::OPTICAL_FS_NAMES.iter() {
+        let whole = |lead: String, tail: &str| LabelParts {
+            lead,
+            format: name.to_string(),
+            tail: tail.to_string(),
+        };
+        if label == *name {
+            return whole(String::new(), "");
+        }
+        let suffix = format!(" ({name})");
+        if let Some(vol) = label.strip_suffix(suffix.as_str()) {
+            return whole(format!("{vol} ("), ")");
+        }
+    }
+    LabelParts {
+        lead: label.to_string(),
+        format: String::new(),
+        tail: String::new(),
+    }
 }
 
 /// The parent directory of a daemon-side path (`/a/b/c.img` -> `/a/b`).
@@ -394,4 +434,29 @@ pub fn is_mac_archive_path(path: &std::path::Path) -> bool {
                 .any(|a| a.eq_ignore_ascii_case(ext))
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod label_parts_tests {
+    use super::optical_label_parts;
+
+    #[test]
+    fn a_disc_label_splits_around_its_filesystem_name() {
+        let p = optical_label_parts("Open Transport 1.3.1 (HFS (Mac))");
+        assert_eq!(
+            (p.lead.as_str(), p.format.as_str(), p.tail.as_str()),
+            ("Open Transport 1.3.1 (", "HFS (Mac)", ")")
+        );
+        let p = optical_label_parts("ISO 9660");
+        assert_eq!((p.lead.as_str(), p.format.as_str()), ("", "ISO 9660"));
+        let p = optical_label_parts("PReP boot partition");
+        assert_eq!(
+            (p.lead.as_str(), p.format.as_str()),
+            ("PReP boot partition", "")
+        );
+        assert_eq!(
+            optical_label_parts("RETRO (ISO 9660)").joined(),
+            "RETRO (ISO 9660)"
+        );
+    }
 }

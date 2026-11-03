@@ -295,18 +295,24 @@ pub struct DiscSource {
     pub physical: bool,
 }
 
+/// The picker names of opticaldiscs `FilesystemType` debug tokens.
+pub const OPTICAL_FS_NAMES: &[(&str, &str)] = &[
+    ("Iso9660", "ISO 9660"),
+    ("HighSierra", "High Sierra"),
+    ("Hfs", "HFS (Mac)"),
+    ("HfsPlus", "HFS+ (Mac)"),
+    ("Efs", "IRIX EFS"),
+];
+
 /// Turn an opticaldiscs `FilesystemType` debug token + optional volume label
 /// into a friendly picker label. Only the optical build enumerates filesystems.
 #[cfg(feature = "optical")]
 fn optical_fs_label(ty: &str, label: Option<&str>) -> String {
-    let nice = match ty {
-        "Iso9660" => "ISO 9660",
-        "HighSierra" => "High Sierra",
-        "Hfs" => "HFS (Mac)",
-        "HfsPlus" => "HFS+ (Mac)",
-        "Efs" => "IRIX EFS",
-        other => other,
-    };
+    let nice = OPTICAL_FS_NAMES
+        .iter()
+        .find(|(t, _)| *t == ty)
+        .map(|(_, n)| *n)
+        .unwrap_or(ty);
     match label {
         Some(l) if !l.trim().is_empty() => format!("{l} ({nice})"),
         _ => nice.to_string(),

@@ -697,8 +697,9 @@ impl CommanderMode {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                for (i, label) in pane.partition_labels().iter().enumerate() {
+                for (i, parts) in pane.partition_label_parts().iter().enumerate() {
                     let on = pane.selected_partition() == Some(i);
+                    let label = crate::gui::theme::format_label(ui, parts);
                     if ui.selectable_label(on, label).clicked() {
                         acts.push(A::Pane(side, BrowserPaneAction::SelectPartition(i)));
                     }

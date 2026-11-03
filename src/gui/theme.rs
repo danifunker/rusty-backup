@@ -175,6 +175,22 @@ pub fn dimmed(visuals: &Visuals) -> Color32 {
     }
 }
 
+/// A picker label with its format name (filesystem or partition type) in italics.
+pub fn format_label(
+    ui: &egui::Ui,
+    parts: &rusty_backup::controller::browser::LabelParts,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let style = ui.style();
+    let (font, align) = (egui::FontSelection::Default, egui::Align::Center);
+    egui::RichText::new(parts.lead.as_str()).append_to(&mut job, style, font.clone(), align);
+    egui::RichText::new(parts.format.as_str())
+        .italics()
+        .append_to(&mut job, style, font.clone(), align);
+    egui::RichText::new(parts.tail.as_str()).append_to(&mut job, style, font, align);
+    job
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

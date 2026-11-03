@@ -15,7 +15,9 @@ use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
 
 use super::{BrowserPaneAction, BrowserPaneController};
-use crate::controller::browser::rows::{is_mac_archive_path, partition_label};
+use crate::controller::browser::rows::{
+    is_mac_archive_path, optical_label_parts, partition_label, partition_label_parts, LabelParts,
+};
 use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::fs::partition_is_browsable;
 use crate::model::browse_session::{looks_like_password_error, BrowseOpenStatus, BrowseSession};
@@ -416,6 +418,17 @@ impl BrowserPaneController {
         } else {
             let parts = self.src.partitions.iter().enumerate();
             parts.map(|(i, p)| partition_label(i, p)).collect()
+        }
+    }
+
+    /// The picker labels split around their format name, for views that style it.
+    pub fn partition_label_parts(&self) -> Vec<LabelParts> {
+        if self.is_optical() {
+            let labels = self.src.optical.iter();
+            labels.map(|l| optical_label_parts(l.as_str())).collect()
+        } else {
+            let parts = self.src.partitions.iter().enumerate();
+            parts.map(|(i, p)| partition_label_parts(i, p)).collect()
         }
     }
 

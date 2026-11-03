@@ -877,7 +877,7 @@ impl BrowseView {
     fn render_disc_header(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let pane = self.ctl.pane(Side::Left);
-        let labels = pane.partition_labels();
+        let labels = pane.partition_label_parts();
         let selected = pane.selected_partition().unwrap_or(0);
         let game = pane.disc_game().map(|g| g.to_string());
         let mut acts = Vec::new();
@@ -885,17 +885,24 @@ impl BrowseView {
             ui.label(egui::RichText::new("Disc Browser").strong());
             if labels.len() > 1 {
                 ui.label("Filesystem:");
+                let current = labels
+                    .get(selected)
+                    .map(|p| super::theme::format_label(ui, p));
                 egui::ComboBox::from_id_salt("optical_fs_picker")
-                    .selected_text(labels.get(selected).cloned().unwrap_or_default())
+                    .selected_text(current.unwrap_or_default())
                     .show_ui(ui, |ui| {
-                        for (idx, label) in labels.iter().enumerate() {
+                        for (idx, parts) in labels.iter().enumerate() {
+                            let label = super::theme::format_label(ui, parts);
                             if ui.selectable_label(idx == selected, label).clicked() {
                                 acts.push(BrowserPaneAction::SelectPartition(idx));
                             }
                         }
                     });
-            } else if let Some(label) = labels.first() {
-                ui.label(format!("[{label}]"));
+            } else if let Some(parts) = labels.first() {
+                let mut bracketed = parts.clone();
+                bracketed.lead.insert(0, '[');
+                bracketed.tail.push(']');
+                ui.label(super::theme::format_label(ui, &bracketed));
             }
             if let Some(g) = &game {
                 ui.label(format!("Game: {g}"));
