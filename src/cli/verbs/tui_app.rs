@@ -55,6 +55,8 @@ mod commander;
 mod dialogs;
 mod explorer;
 mod inspect;
+#[cfg(feature = "optical")]
+mod optical;
 mod resize;
 mod restore;
 mod table_edit;
@@ -62,6 +64,8 @@ mod writer;
 
 use backup::BackupState;
 use inspect::InspectState;
+#[cfg(feature = "optical")]
+use optical::OpticalState;
 use restore::RestoreState;
 
 /// Shared state for a running progress task: a worker thread advances
@@ -1211,126 +1215,6 @@ impl BulkState {
     }
 }
 
-/// The Optical screen (rip): choose a drive -> config (output / format / eject)
-/// -> run, through a headless `controller::optical::OpticalController`.
-#[cfg(feature = "optical")]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OpticalStep {
-    Drives,
-    Config,
-    Run,
-}
-
-/// Rip output formats.
-#[cfg(feature = "optical")]
-const RIP_FORMATS: &[(&str, crate::controller::optical::OutputFormat)] = &[
-    ("ISO (data)", crate::controller::optical::OutputFormat::Iso),
-    (
-        "BIN/CUE (raw)",
-        crate::controller::optical::OutputFormat::BinCue,
-    ),
-];
-/// Config-form rows: 0 output, 1 format, 2 eject, 3 "Start".
-#[cfg(feature = "optical")]
-const OPTICAL_FIELDS: usize = 4;
-
-/// Optical *image* operations (as opposed to ripping a physical drive), offered
-/// by the Optical tab's `i` launcher. Optical browse/extract run on the
-/// `opticaldiscs` crate's own filesystem trait — a distinct code path from the
-/// partition Explorer — so, like the Explorer's transforms, they're launched
-/// through the `:` command palette (shared CLI `dispatch`) with a template the
-/// user completes. `(label, verb-template)`.
-#[cfg(feature = "optical")]
-const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
-    ("Browse an optical image", "optical browse \"<IMAGE.iso>\""),
-    (
-        "Extract files to a folder",
-        "optical extract --to \"<OUTPUT_DIR>\" \"<IMAGE.iso>\"",
-    ),
-    ("Show volume info", "optical info \"<IMAGE.iso>\""),
-    (
-        "Convert to another format",
-        "optical convert --format iso \"<IMAGE>\" \"<OUTPUT.iso>\"",
-    ),
-    (
-        "New blank CD-ROM (SGI EFS)",
-        "optical new sgi-efs \"<OUTPUT.iso>\"",
-    ),
-    (
-        "New blank CD-ROM (Mac HFS)",
-        "optical new mac-hfs \"<OUTPUT.iso>\"",
-    ),
-    (
-        "New blank CD-ROM (Mac HFS+)",
-        "optical new mac-hfsplus \"<OUTPUT.iso>\"",
-    ),
-    (
-        "New blank CD-ROM (NeXTSTEP UFS)",
-        "optical new next-ufs \"<OUTPUT.iso>\"",
-    ),
-];
-
-#[cfg(feature = "optical")]
-struct OpticalState {
-    step: OpticalStep,
-    /// The drive list, the detect and the rip job.
-    ctl: crate::controller::optical::OpticalController,
-    drive_sel: usize,
-    device_path: String,
-    device_name: String,
-    output: String,
-    format_sel: usize,
-    eject: bool,
-    field: usize,
-    picker: Option<FilePicker>,
-    op: String,
-    result: Option<String>,
-    is_error: bool,
-    /// Esc asked the running rip to stop; the final result replaces the note.
-    cancel_note: bool,
-    /// The optical-image-operations launcher menu (selected index), when open.
-    image_menu: Option<usize>,
-}
-
-#[cfg(feature = "optical")]
-impl Default for OpticalState {
-    fn default() -> Self {
-        use crate::controller::optical::{OpticalAction, OpticalController, SourceMode};
-        use crate::controller::Controller as _;
-        let mut ctl = OpticalController::new(Arc::new(crate::controller::optical::NoNotify));
-        ctl.apply(OpticalAction::SetSourceMode(SourceMode::PhysicalDrive));
-        OpticalState {
-            step: OpticalStep::Drives,
-            ctl,
-            drive_sel: 0,
-            device_path: String::new(),
-            device_name: String::new(),
-            output: String::new(),
-            format_sel: 0,
-            eject: false,
-            field: 0,
-            picker: None,
-            op: String::new(),
-            result: None,
-            is_error: false,
-            cancel_note: false,
-            image_menu: None,
-        }
-    }
-}
-
-#[cfg(feature = "optical")]
-impl OpticalState {
-    /// A fresh screen whose drive scan has started.
-    fn scanned() -> Self {
-        use crate::controller::Controller as _;
-        let mut o = OpticalState::default();
-        o.ctl
-            .apply(crate::controller::optical::OpticalAction::FindDrives);
-        o
-    }
-}
-
 /// Fork container formats for archive extraction.
 const ARCHIVE_FORK_FORMATS: &[(&str, crate::controller::archives::ForkFormat)] = {
     use crate::controller::archives::ForkFormat as F;
@@ -1528,7 +1412,7 @@ struct App {
     restore: Option<RestoreState>,
     /// The Bulk convert screen state (lazily created on first visit).
     bulk: Option<BulkState>,
-    /// The Optical (rip) screen state (lazily created on first visit).
+    /// The Optical screen state (lazily created on first visit).
     #[cfg(feature = "optical")]
     optical: Option<OpticalState>,
     /// The Archives screen state (lazily created on first visit).
@@ -1610,6 +1494,18 @@ impl App {
         app
     }
 
+    /// An Optical job runs whose end the screen shows.
+    fn optical_busy(&self) -> bool {
+        #[cfg(feature = "optical")]
+        {
+            self.optical.as_ref().is_some_and(|o| o.busy())
+        }
+        #[cfg(not(feature = "optical"))]
+        {
+            false
+        }
+    }
+
     /// Short privilege label for the status line.
     fn privilege_label(&self) -> &'static str {
         if !self.elevated {
@@ -1683,7 +1579,8 @@ impl App {
         // Commander jobs finish without a keypress, so poll faster while one runs.
         let working = self.commander.as_ref().is_some_and(|c| c.is_working())
             || self.explorer.as_ref().is_some_and(|c| c.is_working())
-            || self.inspect.as_ref().is_some_and(|s| s.busy());
+            || self.inspect.as_ref().is_some_and(|s| s.busy())
+            || self.optical_busy();
         let wait = if working { 50 } else { 200 };
         if !event::poll(Duration::from_millis(wait))? {
             return Ok(());
@@ -2040,10 +1937,7 @@ impl App {
         #[cfg(feature = "optical")]
         if let Some(o) = self.optical.as_mut() {
             if o.ctl.is_running() {
-                use crate::controller::Controller as _;
-                o.ctl
-                    .apply(crate::controller::optical::OpticalAction::Cancel);
-                o.cancel_note = true;
+                o.act(crate::controller::optical::OpticalAction::Cancel);
             }
         }
         self.progress = None;
@@ -2105,7 +1999,7 @@ impl App {
         }
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.optical.is_none() {
-            self.optical = Some(OpticalState::scanned());
+            self.optical = Some(OpticalState::new(self.shell.recent_handle()));
         }
         if self.current() == TabId::Archives && self.archive.is_none() {
             self.archive = Some(ArchiveState::new(self.shell.recent_handle()));
@@ -2865,237 +2759,6 @@ impl App {
         });
     }
 
-    /// Optical (rip) screen keys. Returns `true` when consumed.
-    #[cfg(feature = "optical")]
-    fn handle_optical_key(&mut self, code: KeyCode) -> bool {
-        if self.optical.is_none() {
-            self.optical = Some(OpticalState::scanned());
-        }
-        // Output-path picker (modal).
-        if self
-            .optical
-            .as_ref()
-            .map(|o| o.picker.is_some())
-            .unwrap_or(false)
-        {
-            let res = self
-                .optical
-                .as_mut()
-                .unwrap()
-                .picker
-                .as_mut()
-                .unwrap()
-                .handle_key(code);
-            match res {
-                Some(PickResult::Cancel) => self.optical.as_mut().unwrap().picker = None,
-                Some(PickResult::Confirm(path)) => {
-                    let o = self.optical.as_mut().unwrap();
-                    o.output = path.to_string_lossy().into_owned();
-                    o.picker = None;
-                }
-                None => {}
-            }
-            return true;
-        }
-
-        // Optical-image-operations launcher menu (modal).
-        if self
-            .optical
-            .as_ref()
-            .map(|o| o.image_menu.is_some())
-            .unwrap_or(false)
-        {
-            let sel = self
-                .optical
-                .as_ref()
-                .and_then(|o| o.image_menu)
-                .unwrap_or(0);
-            match code {
-                KeyCode::Esc => self.optical.as_mut().unwrap().image_menu = None,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.optical.as_mut().unwrap().image_menu = Some(sel.saturating_sub(1));
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.optical.as_mut().unwrap().image_menu =
-                        Some((sel + 1).min(OPTICAL_IMAGE_OPS.len() - 1));
-                }
-                KeyCode::Enter => {
-                    self.optical.as_mut().unwrap().image_menu = None;
-                    let tmpl = OPTICAL_IMAGE_OPS.get(sel).map(|t| t.1).unwrap_or("");
-                    self.palette_input = Some(tmpl.to_string());
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        let step = self.optical.as_ref().unwrap().step;
-        // `i` opens the optical-image-operations launcher from any step.
-        if code == KeyCode::Char('i') {
-            self.optical.as_mut().unwrap().image_menu = Some(0);
-            return true;
-        }
-        if step == OpticalStep::Config
-            && code == KeyCode::Enter
-            && self.optical.as_ref().map(|o| o.field).unwrap_or(0) == 3
-        {
-            self.start_optical_rip();
-            return true;
-        }
-
-        let o = self.optical.as_mut().unwrap();
-        match step {
-            OpticalStep::Drives => match code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    o.drive_sel = o.drive_sel.saturating_sub(1);
-                    true
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    o.drive_sel = (o.drive_sel + 1).min(o.ctl.drive_count().saturating_sub(1));
-                    true
-                }
-                KeyCode::Char('r') => {
-                    use crate::controller::Controller as _;
-                    o.ctl
-                        .apply(crate::controller::optical::OpticalAction::RefreshDrives);
-                    o.drive_sel = 0;
-                    true
-                }
-                KeyCode::Enter => {
-                    if let Some((name, path)) = o.ctl.drive_names().get(o.drive_sel).cloned() {
-                        use crate::controller::Controller as _;
-                        o.ctl
-                            .apply(crate::controller::optical::OpticalAction::SelectDrive(
-                                Some(o.drive_sel),
-                            ));
-                        o.device_path = path;
-                        o.device_name = name;
-                        if o.output.is_empty() {
-                            let ext = if o.format_sel == 1 { "cue" } else { "iso" };
-                            let home = dirs::home_dir().unwrap_or_default();
-                            o.output = home.join(format!("disc.{ext}")).display().to_string();
-                        }
-                        o.step = OpticalStep::Config;
-                        o.field = 0;
-                    }
-                    true
-                }
-                _ => false,
-            },
-            OpticalStep::Config => match code {
-                KeyCode::Esc => {
-                    o.step = OpticalStep::Drives;
-                    true
-                }
-                KeyCode::Down => {
-                    o.field = (o.field + 1) % OPTICAL_FIELDS;
-                    true
-                }
-                KeyCode::Up | KeyCode::BackTab => {
-                    o.field = (o.field + OPTICAL_FIELDS - 1) % OPTICAL_FIELDS;
-                    true
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if o.field == 1 => {
-                    let n = RIP_FORMATS.len();
-                    o.format_sel = if code == KeyCode::Left {
-                        (o.format_sel + n - 1) % n
-                    } else {
-                        (o.format_sel + 1) % n
-                    };
-                    true
-                }
-                KeyCode::Char(' ') if o.field == 2 => {
-                    o.eject = !o.eject;
-                    true
-                }
-                KeyCode::Tab if o.field == 0 => {
-                    let mut p = FilePicker::new(PickKind::Any, "Choose output path");
-                    p.input = o.output.clone();
-                    o.picker = Some(p);
-                    true
-                }
-                KeyCode::Enter => {
-                    o.field = (o.field + 1) % OPTICAL_FIELDS;
-                    true
-                }
-                KeyCode::Backspace if o.field == 0 => {
-                    o.output.pop();
-                    true
-                }
-                KeyCode::Char(c) if !c.is_control() && o.field == 0 => {
-                    o.output.push(c);
-                    true
-                }
-                _ => false,
-            },
-            OpticalStep::Run => match code {
-                KeyCode::Esc => {
-                    let running = o.ctl.is_running();
-                    if running {
-                        self.cancel_progress();
-                        if let Some(o) = self.optical.as_mut() {
-                            o.result = Some("Cancel requested...".to_string());
-                            o.is_error = true;
-                        }
-                    } else {
-                        self.progress = None;
-                        if let Some(o) = self.optical.as_mut() {
-                            o.result = None;
-                            o.cancel_note = false;
-                            o.step = OpticalStep::Config;
-                        }
-                    }
-                    true
-                }
-                _ => true,
-            },
-        }
-    }
-
-    /// Hand the form to the controller and start the rip.
-    #[cfg(feature = "optical")]
-    fn start_optical_rip(&mut self) {
-        use crate::controller::optical::OpticalAction;
-        use crate::controller::Controller as _;
-        let Some(o) = self.optical.as_mut() else {
-            return;
-        };
-        let output = expand_tilde(o.output.trim());
-        if output.as_os_str().is_empty() {
-            o.result = Some("Enter an output path.".to_string());
-            o.is_error = true;
-            o.step = OpticalStep::Run;
-            return;
-        }
-        let format = RIP_FORMATS[o.format_sel.min(RIP_FORMATS.len() - 1)].1;
-        o.ctl.apply(OpticalAction::SetOutputFormat(format));
-        o.ctl.apply(OpticalAction::SetEjectAfter(o.eject));
-        o.ctl.set_output_path(output);
-        o.ctl.apply(OpticalAction::Start(None));
-        o.result = None;
-        o.is_error = false;
-        o.cancel_note = false;
-        o.step = OpticalStep::Run;
-        if !o.ctl.is_running() {
-            let why = o
-                .ctl
-                .take_log()
-                .into_iter()
-                .last()
-                .map(|(_, m)| m)
-                .unwrap_or_else(|| "No drive selected".to_string());
-            o.result = Some(format!("Cannot start the rip: {why}"));
-            o.is_error = true;
-            return;
-        }
-        o.op = "Starting...".to_string();
-        self.progress = Some(Progress {
-            shared: Arc::new(Mutex::new(ProgressShared::default())),
-            tracker: RateTracker::default(),
-            label: "Ripping".to_string(),
-        });
-    }
-
     /// Archives screen keys. Returns `true` when consumed.
     fn handle_archive_key(&mut self, code: KeyCode) -> bool {
         if self.archive.is_none() {
@@ -3300,44 +2963,8 @@ impl App {
                 }
             }
         }
-        // Drive the Optical controller and mirror its rip into the visual bar.
         #[cfg(feature = "optical")]
-        if let Some(o) = self.optical.as_mut() {
-            use crate::controller::Controller as _;
-            let _ = o.ctl.tick();
-            let _ = o.ctl.take_log();
-            let running = o.ctl.is_running();
-            if let Some(bar) = o.ctl.progress() {
-                o.op = bar.operation.clone();
-                if let Some(prog) = self.progress.as_ref() {
-                    if let Ok(mut sh) = prog.shared.lock() {
-                        sh.current = bar.current_bytes;
-                        sh.total = bar.total_bytes;
-                        sh.done = false;
-                    }
-                }
-            }
-            if o.step == OpticalStep::Run && !running && (o.result.is_none() || o.cancel_note) {
-                if let Some(last) = o.ctl.last_result() {
-                    if let Some(prog) = self.progress.as_ref() {
-                        if let Ok(mut sh) = prog.shared.lock() {
-                            sh.done = true;
-                        }
-                    }
-                    match last {
-                        Err(e) => {
-                            o.result = Some(format!("Rip failed: {e}"));
-                            o.is_error = true;
-                        }
-                        Ok(()) => {
-                            o.result = Some("Rip complete.".to_string());
-                            o.is_error = false;
-                        }
-                    }
-                    o.cancel_note = false;
-                }
-            }
-        }
+        self.optical_tick();
         if let Some(p) = &mut self.progress {
             let cur = p.shared.lock().map(|s| s.current).unwrap_or(0);
             p.tracker.record(cur, &p.label);
@@ -3520,7 +3147,7 @@ impl App {
                 area.height.saturating_sub(2),
                 area,
             );
-            let outer = self.pane_block(&format!("Explorer  {}", ex.explorer_label()), true);
+            let outer = self.pane_block(ex.explorer_title().as_str(), true);
             let inner = outer.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(outer, popup);
@@ -4226,196 +3853,6 @@ impl App {
         }
     }
 
-    /// The Optical rip screen: drive list -> config -> run.
-    #[cfg(feature = "optical")]
-    fn draw_optical(&self, frame: &mut Frame, area: Rect, o: &OpticalState) {
-        let title = match o.step {
-            OpticalStep::Drives => "Optical  -  step 1/3: drive",
-            OpticalStep::Config => "Optical  -  step 2/3: rip options",
-            OpticalStep::Run => "Optical  -  step 3/3: run",
-        };
-        let mut lines: Vec<Line> = Vec::new();
-        match o.step {
-            OpticalStep::Drives => {
-                lines.push(Line::styled(
-                    "Rip an optical disc. Pick a drive:",
-                    self.palette.accent(),
-                ));
-                lines.push(Line::raw(""));
-                let drives = o.ctl.drive_names();
-                if o.ctl.scanning_drives() {
-                    lines.push(Line::styled(
-                        "  Looking for optical drives...",
-                        self.palette.dim(),
-                    ));
-                } else if drives.is_empty() {
-                    lines.push(Line::styled(
-                        "  No optical drives detected. Press `r` to rescan.",
-                        self.palette.dim(),
-                    ));
-                } else {
-                    for (i, (name, path)) in drives.iter().enumerate() {
-                        let sel = i == o.drive_sel;
-                        let marker = if sel { "> " } else { "  " };
-                        let style = if sel {
-                            self.palette
-                                .accent()
-                                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                        } else {
-                            self.palette.accent()
-                        };
-                        lines.push(Line::styled(format!("{marker}{name}  ({path})"), style));
-                    }
-                }
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Up/Down select   Enter next   r rescan   i image ops (browse/extract/new)",
-                    self.palette.dim(),
-                ));
-                if let Some(note) = self.device_note() {
-                    lines.push(Line::raw(""));
-                    lines.push(note);
-                }
-            }
-            OpticalStep::Config => {
-                lines.push(Line::from(vec![
-                    Span::styled("Drive: ", self.palette.dim()),
-                    Span::raw(format!("{} ({})", o.device_name, o.device_path)),
-                ]));
-                if let Some(d) = o.ctl.disc() {
-                    lines.push(Line::from(vec![
-                        Span::styled("Disc:  ", self.palette.dim()),
-                        Span::raw(format!(
-                            "{} / {} {}",
-                            d.format,
-                            d.filesystem,
-                            d.volume.unwrap_or_default()
-                        )),
-                    ]));
-                } else if o.ctl.detecting().is_some() {
-                    lines.push(Line::styled("Disc:  reading...", self.palette.dim()));
-                }
-                lines.push(Line::raw(""));
-                let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
-                    let active = o.field == idx;
-                    let cursor = if active && editable {
-                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
-                    } else {
-                        Span::raw("")
-                    };
-                    let marker = if active { "> " } else { "  " };
-                    let mstyle = if active {
-                        self.palette.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        self.palette.accent()
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("{marker}{label:<9}"), mstyle),
-                        Span::raw(val),
-                        cursor,
-                    ])
-                };
-                lines.push(row(0, "Output:", o.output.clone(), true));
-                lines.push(row(
-                    1,
-                    "Format:",
-                    format!("< {} >", RIP_FORMATS[o.format_sel].0),
-                    false,
-                ));
-                lines.push(row(
-                    2,
-                    "Eject:",
-                    format!("[{}]", if o.eject { "x" } else { " " }),
-                    false,
-                ));
-                lines.push(Line::raw(""));
-                let start_sel = o.field == 3;
-                lines.push(Line::styled(
-                    format!("{}[ Start rip ]", if start_sel { "> " } else { "  " }),
-                    if start_sel {
-                        self.palette
-                            .accent()
-                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                    } else {
-                        self.palette.accent()
-                    },
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Up/Down field   Left/Right format   Space eject   Tab browse (Output)   \
-                     Enter Start   Esc back",
-                    self.palette.dim(),
-                ));
-            }
-            OpticalStep::Run => {
-                lines.push(Line::from(vec![
-                    Span::styled("Drive: ", self.palette.dim()),
-                    Span::raw(o.device_name.clone()),
-                    Span::styled("   Output: ", self.palette.dim()),
-                    Span::raw(o.output.clone()),
-                ]));
-                lines.push(Line::raw(""));
-                if !o.op.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("Step: ", self.palette.dim()),
-                        Span::raw(o.op.clone()),
-                    ]));
-                }
-                if let Some(res) = &o.result {
-                    lines.push(Line::raw(""));
-                    let style = if o.is_error {
-                        self.palette.warn()
-                    } else {
-                        self.palette.accent()
-                    };
-                    lines.push(Line::styled(format!("  {res}"), style));
-                    lines.push(Line::styled(
-                        "  Esc to return to options.",
-                        self.palette.dim(),
-                    ));
-                }
-            }
-        }
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block(title, true))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        if let Some(picker) = &o.picker {
-            picker.draw(frame, area, self.palette, self.border);
-        }
-        // Optical-image-operations launcher menu overlay.
-        if let Some(sel) = o.image_menu {
-            let mut mlines: Vec<Line> = vec![Line::raw("")];
-            for (i, (label, _)) in OPTICAL_IMAGE_OPS.iter().enumerate() {
-                let on = i == sel;
-                let marker = if on { "> " } else { "  " };
-                let style = if on {
-                    self.palette
-                        .accent()
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    self.palette.accent()
-                };
-                mlines.push(Line::styled(format!("{marker}{label}"), style));
-            }
-            mlines.push(Line::raw(""));
-            mlines.push(Line::styled(
-                "  Enter -> prefills the command line; edit and run.  Esc cancel",
-                self.palette.dim(),
-            ));
-            let h = (mlines.len() as u16 + 2).min(area.height.saturating_sub(2));
-            let popup = centered_rect(60, h, area);
-            frame.render_widget(Clear, popup);
-            frame.render_widget(
-                Paragraph::new(Text::from(mlines))
-                    .block(self.pane_block("Optical image operations", true)),
-                popup,
-            );
-        }
-    }
-
     /// The physical-disk chooser overlay used by the Backup source step.
     /// Shared physical-disk chooser overlay (Backup source + Restore target).
     fn draw_device_pick(&self, frame: &mut Frame, area: Rect, device_sel: usize, title: &str) {
@@ -4677,23 +4114,7 @@ impl App {
         } else if self.current() == TabId::Optical {
             #[cfg(feature = "optical")]
             {
-                let step = self.optical.as_ref().map(|o| o.step);
-                match step {
-                    Some(OpticalStep::Drives) => vec![
-                        ("<-/->", "Tabs"),
-                        ("Up/Dn", "Select"),
-                        ("Enter", "Next"),
-                        ("r", "Rescan"),
-                    ],
-                    Some(OpticalStep::Config) => vec![
-                        ("Up/Dn", "Field"),
-                        ("<-/->", "Format"),
-                        ("Tab", "Browse"),
-                        ("Enter", "Start"),
-                        ("Esc", "Back"),
-                    ],
-                    _ => vec![("Esc", "Back")],
-                }
+                self.optical_footer_keys()
             }
             // Optical support not compiled in (e.g. vintage build): the tab shows
             // an explanatory stub, so only the tab-navigation hints apply.
@@ -4830,6 +4251,10 @@ impl App {
         }
         if self.current() == TabId::Restore {
             return self.restore_key_context();
+        }
+        #[cfg(feature = "optical")]
+        if self.current() == TabId::Optical {
+            return self.optical_key_context();
         }
         ("Tabs", HINTS_TAB)
     }
@@ -5712,36 +5137,6 @@ mod tests {
             let b = app.backup.as_ref().unwrap();
             assert!(b.log.iter().any(|l| l == REMOTE_NOT_BUILT));
         }
-    }
-
-    #[cfg(feature = "optical")]
-    #[test]
-    fn the_optical_screen_starts_the_rip_through_the_controller() {
-        let mut app = App::new_on(BACKUP_TAB);
-        app.optical = Some(OpticalState {
-            step: OpticalStep::Config,
-            field: 3,
-            ..OpticalState::default()
-        });
-        app.start_optical_rip();
-        let o = app.optical.as_ref().unwrap();
-        assert_eq!(o.result.as_deref(), Some("Enter an output path."));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let o = app.optical.as_mut().unwrap();
-        o.output = dir.path().join("disc.iso").display().to_string();
-        o.format_sel = 1;
-        app.start_optical_rip();
-        app.tick();
-        let o = app.optical.as_ref().unwrap();
-        assert_eq!(
-            o.result.as_deref(),
-            Some("Cannot start the rip: No drive selected")
-        );
-        assert!(o.is_error && !o.ctl.is_running() && app.progress.is_none());
-        assert_eq!(
-            o.ctl.output_format(),
-            crate::controller::optical::OutputFormat::BinCue
-        );
     }
 
     #[test]

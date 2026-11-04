@@ -431,6 +431,11 @@ impl OpticalController {
         self.output = Some(path);
     }
 
+    /// A typed output field was emptied.
+    pub fn clear_output(&mut self) {
+        self.output = None;
+    }
+
     pub fn eject_after(&self) -> bool {
         self.eject_after
     }

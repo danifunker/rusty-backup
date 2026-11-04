@@ -6,7 +6,10 @@
 //! editor, import, metadata, transforms). [`CommanderView`] carries the keys, effects and the
 //! shared windows; this file adds what only the Explorer draws: the tree, the text editor (its
 //! buffer is widget state), the metadata form, the check / repair report and the transforms menu,
-//! whose chosen command goes to the TUI's `:` command line.
+//! whose chosen command goes to the TUI's `:` command line. Extract (with the volume's fork,
+//! ProDOS and QNX options) and the tree window serve every Explorer. The Optical tab's disc
+//! browser is the same window over `optical::disc_browser` (`PaneProfile::optical`, read-only,
+//! a filesystem picker and the game line), opened by [`CommanderView::disc_open`].
 
 use std::path::PathBuf;
 
@@ -22,7 +25,10 @@ use super::{centered_rect, footer_strip, App, HINTS_EDITOR};
 use crate::controller::browser::{
     BrowserPaneAction, LineEnding, MetadataFields, PaneProfile, PaneServices, TextDoc, TextShape,
 };
-use crate::controller::commander::{CommanderAction, CommanderController, Side};
+use crate::controller::commander::{
+    extract_applies, extract_fork_modes, CommanderAction, CommanderController, ExtractOptions,
+    ResourceForkMode, Side,
+};
 use crate::controller::inspect::{BrowseEdit, BrowseOpen, BrowseSession};
 use crate::controller::keys::KeyMap;
 
@@ -39,6 +45,28 @@ pub(super) struct ExplorerState {
     palette: Option<String>,
     /// The session the Inspect controller handed over, for a seekable-cache reopen.
     session: Option<BrowseSession>,
+    /// The Optical tab's disc browser (`PaneProfile::optical`) rather than an Inspect partition.
+    disc: bool,
+    /// The last tree listing and its scroll, while its window is up.
+    tree: Option<(String, usize)>,
+    extract: Option<ExtractMenu>,
+}
+
+/// The Extract window: the options the volume offers, then Extract.
+struct ExtractMenu {
+    path: String,
+    rows: Vec<XRow>,
+    sel: usize,
+    options: ExtractOptions,
+}
+
+/// One row of the Extract window.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum XRow {
+    Fork(ResourceForkMode),
+    ProdosSuffix,
+    RsToLf,
+    Go,
 }
 
 /// The metadata form's text fields while the user types; the controller checks them on Enter.
@@ -233,8 +261,180 @@ impl CommanderView {
             report_scroll: 0,
             palette: None,
             session: Some(open.session),
+            disc: false,
+            tree: None,
+            extract: None,
         });
         v
+    }
+
+    /// The disc browser over the Optical tab's disc: one pane under `PaneProfile::optical`.
+    #[cfg(feature = "optical")]
+    pub(super) fn disc_open(src: crate::controller::browser::DiscSource, label: String) -> Self {
+        let (keymap, problems) = load_keymap();
+        let mut services = PaneServices::headless();
+        services.recent = super::commander::recent_store();
+        let mut ctl = crate::controller::optical::disc_browser(services, keymap);
+        ctl.report_keymap_problems(problems);
+        let fx = ctl.open_disc(src);
+        let mut v = CommanderView::with_ctl(ctl);
+        v.ex = Some(ExplorerState {
+            label,
+            editor: None,
+            meta: None,
+            transforms: None,
+            report_scroll: 0,
+            palette: None,
+            session: None,
+            disc: true,
+            tree: None,
+            extract: None,
+        });
+        v.run(fx);
+        v
+    }
+
+    /// This is the Optical tab's disc browser.
+    pub(super) fn is_disc(&self) -> bool {
+        self.ex.as_ref().is_some_and(|e| e.disc)
+    }
+
+    /// The window title: the disc browser or the Explorer, and the label.
+    pub(super) fn explorer_title(&self) -> String {
+        let what = if self.is_disc() {
+            "Disc Browser"
+        } else {
+            "Explorer"
+        };
+        format!("{what}  {}", self.explorer_label())
+    }
+
+    /// Extract the cursor entry: at once, or after the Extract window when the volume has options.
+    pub(super) fn open_extract(&mut self) {
+        let pane = self.ctl.pane(Side::Left);
+        let path = pane
+            .cursor_index()
+            .and_then(|i| pane.rows().get(i))
+            .and_then(|r| pane.row_entry(r))
+            .map(|e| e.path)
+            .unwrap_or_else(|| "/".to_string());
+        let applies = extract_applies(pane.volume().fs_type.as_str());
+        let options = ExtractOptions::default();
+        let mut rows: Vec<XRow> = Vec::new();
+        if applies.forks {
+            rows.extend(extract_fork_modes().into_iter().map(XRow::Fork));
+        }
+        if applies.prodos_suffix {
+            rows.push(XRow::ProdosSuffix);
+        }
+        if applies.rs_to_lf {
+            rows.push(XRow::RsToLf);
+        }
+        if rows.is_empty() || self.ex.is_none() {
+            self.send(CommanderAction::Extract {
+                from: Side::Left,
+                path,
+                options,
+                dest: None,
+            });
+            return;
+        }
+        rows.push(XRow::Go);
+        let sel = rows
+            .iter()
+            .position(|r| *r == XRow::Fork(options.fork_mode))
+            .unwrap_or(0);
+        if let Some(ex) = self.ex.as_mut() {
+            ex.extract = Some(ExtractMenu {
+                path,
+                rows,
+                sel,
+                options,
+            });
+        }
+    }
+
+    /// The Extract window's rows as drawn, for tests.
+    #[cfg(test)]
+    pub(super) fn extract_rows(&self) -> Vec<String> {
+        let rows = self.ex.as_ref().and_then(|e| e.extract.as_ref());
+        let label = |r: &XRow| match r {
+            XRow::Fork(m) => m.label().to_string(),
+            other => format!("{other:?}"),
+        };
+        rows.map(|m| m.rows.iter().map(label).collect())
+            .unwrap_or_default()
+    }
+
+    /// The tree window's text, while it is up.
+    #[cfg(test)]
+    pub(super) fn tree_text(&self) -> Option<String> {
+        let tree = self.ex.as_ref().and_then(|e| e.tree.as_ref());
+        tree.map(|(text, _)| text.clone())
+    }
+
+    /// The Extract window's keys.
+    fn extract_key(&mut self, code: KeyCode) {
+        let Some(m) = self.ex.as_mut().and_then(|e| e.extract.as_mut()) else {
+            return;
+        };
+        let row = m.rows[m.sel];
+        let mut go = false;
+        match code {
+            KeyCode::Esc => {
+                if let Some(ex) = self.ex.as_mut() {
+                    ex.extract = None;
+                }
+                return;
+            }
+            KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+            KeyCode::Down => m.sel = (m.sel + 1).min(m.rows.len() - 1),
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                match row {
+                    XRow::Fork(mode) => m.options.fork_mode = mode,
+                    XRow::ProdosSuffix => m.options.prodos_suffix = !m.options.prodos_suffix,
+                    XRow::RsToLf => m.options.rs_to_lf = !m.options.rs_to_lf,
+                    XRow::Go => {}
+                }
+                // Enter on a fork mode picks it and extracts; on a box it only toggles.
+                go = code == KeyCode::Enter && matches!(row, XRow::Fork(_) | XRow::Go);
+            }
+            _ => {}
+        }
+        if go {
+            let Some(m) = self.ex.as_mut().and_then(|e| e.extract.take()) else {
+                return;
+            };
+            self.send(CommanderAction::Extract {
+                from: Side::Left,
+                path: m.path,
+                options: m.options,
+                dest: None,
+            });
+        }
+    }
+
+    /// The tree window's keys: scroll, Save, close.
+    fn tree_key(&mut self, code: KeyCode) {
+        let Some((text, scroll)) = self.ex.as_mut().and_then(|e| e.tree.as_mut()) else {
+            return;
+        };
+        let max = text.lines().count().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                if let Some(ex) = self.ex.as_mut() {
+                    ex.tree = None;
+                }
+            }
+            KeyCode::Char('s') => self.send(CommanderAction::Pane(Side::Left, P::SaveTree)),
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down => *scroll = (*scroll + 1).min(max),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(page()),
+            KeyCode::PageDown => *scroll = (*scroll + page()).min(max),
+            KeyCode::Home => *scroll = 0,
+            KeyCode::End => *scroll = max,
+            _ => {}
+        }
     }
 
     /// A streamed backup partition's seekable cache is ready: reopen on it, keeping the folder.
@@ -270,10 +470,14 @@ impl CommanderView {
             Some(_) => self.ctl.take_text_doc(),
             None => return,
         };
+        let tree = self.ctl.host_pane().take_tree_text();
         let form = self.ctl.pane(Side::Left).metadata_form().cloned();
         let Some(ex) = self.ex.as_mut() else { return };
         if let Some(doc) = doc {
             ex.editor = Some(TextEditor::new(doc));
+        }
+        if let Some(tree) = tree {
+            ex.tree = Some((tree.text, 0));
         }
         match (form, ex.meta.is_some()) {
             (Some(f), false) => {
@@ -346,6 +550,14 @@ impl CommanderView {
                 _ => {}
             }
             self.explorer_tick();
+            return Some(true);
+        }
+        if self.ex.as_ref()?.extract.is_some() {
+            self.extract_key(code);
+            return Some(true);
+        }
+        if self.ex.as_ref()?.tree.is_some() {
+            self.tree_key(code);
             return Some(true);
         }
         if let Some(sel) = self.ex.as_ref()?.transforms {
@@ -453,10 +665,18 @@ impl App {
         let ctl = &v.ctl;
         let pane = ctl.pane(Side::Left);
         let pal = self.palette;
+        let game = pane.disc_game().map(|g| format!(" Game: {g}"));
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(game.is_some() as u16),
+                Constraint::Length(1),
+            ])
             .split(area);
+        if let Some(g) = game {
+            frame.render_widget(Paragraph::new(Line::styled(g, pal.dim())), rows[1]);
+        }
         // Another listing style, chosen in the View menu, draws the pane alone.
         if pane.has_folder_tree() {
             let cols = Layout::default()
@@ -470,7 +690,7 @@ impl App {
         }
         frame.render_widget(
             Paragraph::new(Line::styled(format!(" {}", ctl.status()), pal.dim())),
-            rows[1],
+            rows[2],
         );
     }
 
@@ -556,6 +776,67 @@ impl App {
                 pal.dim(),
             ));
             self.draw_cmd_box_auto(frame, area, 64, "Edit metadata", lines);
+        }
+        if let Some((text, scroll)) = &ex.tree {
+            let h = area.height.saturating_sub(2);
+            let inner = h.saturating_sub(4) as usize;
+            let mut lines: Vec<Line<'static>> = text
+                .lines()
+                .skip(*scroll)
+                .take(inner)
+                .map(|l| Line::raw(format!(" {l}")))
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " Up/Down scroll   s save to a file   Esc close",
+                pal.dim(),
+            ));
+            let w = area.width.saturating_sub(4).min(110);
+            self.draw_cmd_box(frame, centered_rect(w, h, area), "Tree", lines);
+        }
+        if let Some(m) = &ex.extract {
+            let mut lines = vec![Line::styled(format!("  {}", m.path), pal.dim())];
+            let mut forks = false;
+            for (i, row) in m.rows.iter().enumerate() {
+                let (text, style) = match row {
+                    XRow::Fork(mode) => {
+                        if !forks {
+                            forks = true;
+                            lines.push(Line::styled("  Resource forks:", pal.dim()));
+                        }
+                        let on = if m.options.fork_mode == *mode {
+                            "(*)"
+                        } else {
+                            "( )"
+                        };
+                        (format!("  {on} {}", mode.label()), pal.accent())
+                    }
+                    XRow::ProdosSuffix => {
+                        let on = if m.options.prodos_suffix { "x" } else { " " };
+                        (
+                            format!("  [{on}] ProDOS type suffix (#TTAAAA)"),
+                            pal.accent(),
+                        )
+                    }
+                    XRow::RsToLf => {
+                        let on = if m.options.rs_to_lf { "x" } else { " " };
+                        (format!("  [{on}] Text: RS to LF"), pal.accent())
+                    }
+                    XRow::Go => ("  [ Extract... ]".to_string(), pal.accent()),
+                };
+                let style = if i == m.sel {
+                    style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    style
+                };
+                lines.push(Line::styled(text, style));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  Space choose   Enter extract (asks for the folder)   Esc cancel",
+                pal.dim(),
+            ));
+            self.draw_cmd_box_auto(frame, area, 70, "Extract", lines);
         }
         if let Some(ed) = &ex.editor {
             self.draw_editor(frame, area, ed, v.ctl.status());

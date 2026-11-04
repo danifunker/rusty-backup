@@ -193,6 +193,8 @@ pub(super) struct InspectState {
     close_explorer: bool,
     upgrade: Option<PathBuf>,
     archive: Option<PathBuf>,
+    /// An optical disc the open found, for the Optical tab.
+    optical: Option<PathBuf>,
     /// The writer's run is on screen; its end becomes the note.
     writing: bool,
 }
@@ -243,6 +245,7 @@ impl InspectState {
             close_explorer: false,
             upgrade: None,
             archive: None,
+            optical: None,
             writing: false,
         }
     }
@@ -385,11 +388,13 @@ impl InspectState {
                 HostRequest::UpgradeSeekable(path) => self.upgrade = Some(path),
                 HostRequest::OpenArchive(path) => self.archive = Some(path),
                 HostRequest::OpenOptical(path) => {
-                    self.note = Some(format!(
-                        "{} is an optical disc; the terminal's Optical tab does not open disc \
-                         images yet.",
-                        path.display()
-                    ))
+                    if cfg!(feature = "optical") {
+                        self.optical = Some(path);
+                    } else {
+                        let what = path.display();
+                        let why = "this build has no Optical tab.";
+                        self.note = Some(format!("{what} is an optical disc; {why}"));
+                    }
                 }
                 // No other TUI screen shares the backup folder.
                 HostRequest::BackupClosed => {}
@@ -1431,6 +1436,7 @@ impl App {
         let browse = s.browse.take();
         let upgrade = s.upgrade.take();
         let archive = s.archive.take();
+        let optical = s.optical.take();
         if let Some((open, label)) = browse {
             self.explorer = Some(super::commander::CommanderView::explorer_open(*open, label));
             self.status = None;
@@ -1451,6 +1457,21 @@ impl App {
                 self.load_archive(path);
             }
         }
+        // As the GUI does: the disc opens on the Optical tab.
+        #[cfg(feature = "optical")]
+        if let Some(path) = optical {
+            if let Some(idx) = super::TABS
+                .iter()
+                .position(|t| t.0 == super::TabId::Optical)
+            {
+                self.active = idx;
+                self.scroll = 0;
+                self.on_tab_changed();
+                self.optical_open_image(path);
+            }
+        }
+        #[cfg(not(feature = "optical"))]
+        let _ = optical;
     }
 
     // --- drawing ------------------------------------------------------------------------

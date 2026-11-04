@@ -120,6 +120,12 @@ impl CommanderView {
         }
     }
 
+    /// A Skip / Continue / Stop question is up, for tests.
+    #[cfg(test)]
+    pub(super) fn choosing(&self) -> bool {
+        matches!(self.modal, Some(Modal::Choose(_)))
+    }
+
     pub(super) fn closed(&self) -> bool {
         self.closed
     }
@@ -162,7 +168,7 @@ impl CommanderView {
         }
     }
 
-    fn run(&mut self, fx: Vec<Effect>) {
+    pub(super) fn run(&mut self, fx: Vec<Effect>) {
         for effect in fx {
             match effect {
                 Effect::CloseScreen => self.closed = true,
@@ -269,6 +275,10 @@ impl CommanderView {
             }
             Some(Command::Transforms) => {
                 self.open_transforms();
+                return true;
+            }
+            Some(Command::Extract) if !self.ctl.modal_open() => {
+                self.open_extract();
                 return true;
             }
             _ => {}
@@ -633,6 +643,19 @@ impl CommanderView {
             (Command::Help, "Keys"),
             (Command::Close, "Close"),
         ];
+        let disc = [
+            (Command::SwitchPane, "Tree/List"),
+            (Command::Partition, "Filesystem"),
+            (Command::Extract, "Extract"),
+            (Command::Export, "Export"),
+            (Command::Tree, "Tree"),
+            (Command::Help, "Keys"),
+            (Command::Close, "Close"),
+        ];
+        if self.is_disc() {
+            let hints = disc.iter().map(|(c, d)| (self.ctl.key_hint(*c), *d));
+            return hints.filter(|(k, _)| !k.is_empty()).collect();
+        }
         if self.ctl.is_single() {
             let hints = explorer.iter().map(|(c, d)| (self.ctl.key_hint(*c), *d));
             return hints.filter(|(k, _)| !k.is_empty()).collect();
