@@ -3415,15 +3415,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let bitmap = self.read_allocation_bitmap()?;
-        // The HFS+ alternate volume header occupies the second-to-last 512-byte sector
-        // of the partition.  For volumes whose allocation block size is ≤ 1024 bytes this
-        // overlaps with the last TWO allocation blocks; for larger block sizes (4 KiB, etc.)
-        // it falls within only the last block.  Either way the last 1–2 blocks are reserved
-        // for VH/alternate-VH and are always marked allocated — if we include them in the
-        // search, find_last_set_bit returns the very end of the partition, making trimming
-        // impossible.  Exclude the final two blocks so that the trim point reflects the
-        // last genuine user-data block instead.
-        let search_up_to = self.vh.total_blocks.saturating_sub(2);
+        // The alternate header's blocks are always allocated; skip them, and only them (R-078).
+        let search_up_to = alt_vh_blocks(self.vh.total_blocks, self.vh.block_size).start;
         let last = find_last_set_bit(&bitmap, search_up_to);
         // The trim point must leave room for the alternate VH at the new end:
         // the resizer counts those trailing blocks as used (two at 512 bytes).
@@ -8855,6 +8848,19 @@ mod tests {
         // is 4 → delta is 12 → 6 + 12 = 18 user blocks + alt-VH = 19.
         assert_eq!(defrag, 19 * 4096);
         assert!(defrag <= total);
+    }
+
+    /// R-078: with blocks of 1 KiB or more only the last block is the alternate header's.
+    #[test]
+    fn last_data_byte_counts_the_block_before_the_alternate_header() {
+        let mut img = make_editable_hfsplus_image();
+        let block_size = 4096usize;
+        let total = 256u32;
+        // Block 254 is the last one before the alternate header's block.
+        let b = total - 2;
+        img[block_size + (b / 8) as usize] |= 0x80 >> (b % 8);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.last_data_byte().unwrap(), 256 * 4096);
     }
 
     #[test]

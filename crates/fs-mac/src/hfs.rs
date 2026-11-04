@@ -3452,12 +3452,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let bitmap = self.read_volume_bitmap()?;
         let last_block = find_last_set_bit(&bitmap, self.mdb.total_blocks as u32);
+        // The alternate MDB and the sector after it follow the allocation area (R-078).
         match last_block {
-            Some(block) => {
-                let byte = self.alloc_block_offset(block + 1);
-                Ok(byte)
-            }
-            None => Ok(self.total_size()),
+            Some(block) => Ok(self.alloc_block_offset(block + 1) + 1024),
+            None => Ok(self.alloc_block_offset(self.mdb.total_blocks as u32) + 1024),
         }
     }
 
@@ -5132,6 +5130,33 @@ mod tests {
         img[byte] &= !(0x80 >> (tail % 8));
         resize_hfs_in_place(&mut Cursor::new(&mut img), 0, SIZE / 2, &mut |_| {})
             .expect("with the tail free the shrink goes through");
+    }
+
+    /// R-078: the minimum size left no room for the alternate MDB, so a shrink to it cut the last block.
+    #[test]
+    fn last_data_byte_is_a_size_the_volume_shrinks_to() {
+        use disk_core::filesystem::Filesystem;
+        const SIZE: u64 = 8 * 1024 * 1024;
+        let mut img = create_blank_hfs(SIZE, 4096, "Tail").unwrap();
+        let total = BigEndian::read_u16(&img[1024 + 18..1024 + 20]) as usize;
+        let vbm_start = BigEndian::read_u16(&img[1024 + 14..1024 + 16]) as usize;
+        let free = BigEndian::read_u16(&img[1024 + 34..1024 + 36]);
+        // Mark a block halfway through used, as the last allocated one.
+        let last = total / 2;
+        img[vbm_start * 512 + last / 8] |= 0x80 >> (last % 8);
+        BigEndian::write_u16(&mut img[1024 + 34..1024 + 36], free - 1);
+        let floor = {
+            let mut fs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+            fs.last_data_byte().unwrap()
+        };
+        resize_hfs_in_place(&mut Cursor::new(&mut img), 0, floor, &mut |_| {})
+            .expect("a shrink to last_data_byte must keep the last allocated block");
+        let new_total = BigEndian::read_u16(&img[1024 + 18..1024 + 20]) as usize;
+        assert_eq!(
+            new_total,
+            last + 1,
+            "the floor holds exactly the used blocks"
+        );
     }
 
     #[test]

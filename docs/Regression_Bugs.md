@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-078](#r-078)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (HFS `last_data_byte`) | ~~`restore --size minimum` of a classic HFS volume fails: the recorded minimum is one allocation block short, because it leaves no room for the alternate MDB and the sector after it~~ — the minimum ends 1024 bytes past the last allocated block; HFS+ no longer skips the block before its alternate header, 2026-11-04 |
 | ~~[R-077](#r-077)~~ | ~~Medium~~ **FIXED** | `crates/disk-core` (`times`), `src/fs/copy.rs` | ~~A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC~~ — FAT, exFAT, Human68k and ProDOS dates are local wall-clock time too, 2026-11-04 |
 | ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
 | ~~[R-075](#r-075)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (`new volume ufs-43bsd`) | ~~A blank 4.3BSD UFS volume whose cylinder count is a multiple of `fs_cpg` fails NeXTSTEP 3.3's fsck ("SUMMARY INFORMATION BAD")~~ — the last group's `cg_ncyl` is `fs_ncyl % fs_cpg`, 2026-11-01 |
@@ -97,6 +98,45 @@ finding depends on a fixture, the fixture is named.
 | [R-011](#r-011) | **Partial** | `src/rbformats/containers/g64.rs` | Copy-protected G64 dumps: read-only refusal fixed; decode of non-standard GCR unverified (no fixture) |
 | ~~R-001~~ | ~~Doc~~ **FIXED** | `README.md` | ~~Partition-table list missing AHDI and X68000~~ — X68k and DSD rows added, guarded by a parity test, 2026-08-09 |
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
+
+---
+
+## Found on the issue #104 Manhole CD, 2026-11-04
+
+### R-078 — a minimum-size restore of a classic HFS volume cuts its last block {#r-078}
+
+**FIXED 2026-11-04.** `HfsFilesystem::last_data_byte` now ends 1024 bytes past
+the last allocated block, where `resize_hfs_in_place` puts the alternate MDB
+and the unused sector after it (R-059), so a shrink to the recorded minimum
+keeps every allocated block. An all-free bitmap reports the whole volume
+including that tail (it used to report only the allocation blocks). fs-mac
+0.1.3. Test: `hfs::tests::last_data_byte_is_a_size_the_volume_shrinks_to`
+marks a block used and shrinks to `last_data_byte`; it failed before the fix
+("new size 1023 blocks ends before the last allocated block (1024)").
+
+HFS+ did not have the same gap (its minimum already adds the alternate
+header's block) but had a neighbour: `last_data_byte` skipped the last *two*
+allocation blocks whatever the block size, while with blocks of 1 KiB or more
+only the last one holds the alternate header. Data in the second-to-last
+block was missed, so the minimum came out short and the resize refused it.
+It now skips exactly `alt_vh_blocks()`, the range the resizer reserves. Test:
+`hfsplus::tests::last_data_byte_counts_the_block_before_the_alternate_header`.
+
+Verified on the Manhole track-1 image (cooked to 2048-byte sectors):
+`backup --format chd` records a minimum of 61378048 bytes (was 61377024),
+`restore --size minimum` shrinks the volume 63377 -> 59929 blocks, and
+`rb-cli fsck` on the restored partition is clean. The source's own
+`AllocationAreaEnd` error (the volume stops 1024 bytes short of its partition)
+is gone after the restore, since the restored partition is sized to the volume.
+
+Original report: found 2026-11-04 on the Manhole CD (GitHub #104, fixture
+`optical.hfs.ts-map-manhole.cd`). `rb-cli restore --size minimum` of a CHD
+backup of track 1 failed: the backup recorded a minimum of 61377024 bytes, which
+is `drAlBlSt` (19 sectors) + 59929 blocks of 1024 bytes and nothing after, so
+the resize made a 59928-block volume while block 59928 (the 59929th) was in use. The bare
+HFS volume gave the same minimum, so the TS map was not involved:
+`last_data_byte` returned the end of the last allocated block, and the resizer
+subtracts the 1024-byte alternate-MDB tail from the size it is given.
 
 ---
 
