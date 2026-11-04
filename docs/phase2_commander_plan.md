@@ -1780,6 +1780,83 @@ answered.
   smoke (Next steps item 5).
 - Pickers could take the egui window as parent (`set_parent`) to be modal again; not done.
 
+## Slice 24: TUI Backup parity
+
+User decision (2026-11-04): the TUI reaches full parity with the egui GUI before Phase 2 closes
+(except the CD-DA player, and Build Disk, which has its own plan in `docs/build_disk_plan.md`).
+After slice 12 the TUI Backup screen offered a source, the output folder, name, format and
+checksum; it forced resize and split off and answered the VHD window itself (one .vhd per
+partition).
+
+### Steps
+
+1. (6146721d) Controller lift, so both shells offer the same choices:
+   - `controller::app::chd` (now `src/controller/app/chd.rs`) holds the CHD options control the
+     egui widget kept: `ChdOptionsControl` / `ChdOptionsMode` (with `label`), `effective`,
+     `validate` / `is_valid`, `modes_for`, `unit_size_for`, `hunk_presets`, `codec_choices`.
+     `gui::chd_options_ui` only draws it (Backup, Optical, Bulk, Inspect export).
+   - `model::backup_plan`: `SPLIT_MIB_MIN` / `SPLIT_MIB_MAX` (the GUI's 100..=64000 drag range)
+     and `split_mib_effective` (a typed size outside the range is clamped; `split_size` uses it);
+     `size_options_editable` (sector-by-sector locks resize and keep swap), which the egui tab
+     now uses in place of its own `!sector_by_sector`.
+   - `VhdRow::mode_choices` (Minimum only once a minimum below the original is known),
+     `custom_bounds_mib`, and `effective_size` clamps a Custom size into them; `VhdSize` into
+     Custom starts at the minimum (what the egui size cell seeded itself).
+   - `BackupController::remote_available()`; `RemoteOpen` in a build without `remote` logs
+     `REMOTE_NOT_BUILT` and opens nothing (the egui tab never offers it there).
+   - Tests: `a_vhd_custom_size_starts_at_the_minimum_and_is_clamped`,
+     `remote_drive_opens_only_when_built`, the chd control's two, `split_follows_the_format`
+     extended; `tests/ui_scenarios/backup_options_vhd_sizes.toml` (sector-by-sector locks resize,
+     split clamp, VHD Custom seed and size, a per-partition VHD run; its control failed on a
+     wrong expected size).
+2. (dc15d7ab) The TUI Backup screen moves to `src/cli/verbs/tui_app/backup.rs` and offers the GUI's
+   set over the same actions:
+   - Source step: `Enter` / `o` image, `d` disk, `r` Remote Drive window (host field, Enter
+     connects, the listed drives take the focus, Enter backs one up; Esc closes), `c` closes
+     the source (CloseSource / RemoteClear); Enter continues when a source is set.
+   - Options step, a list of rows (the partition grid first, as the egui tab draws it): Space
+     toggles Include, `a` / `n` all / none, `c` Calc min, `x` Compact Space; `p` Load / Reload
+     partition info on a disk; Output (typed, Tab browses; the controller gets it as typed),
+     Name, Format, the CHD rows (Default / Custom, hunk, four codec slots, refused with the
+     controller's message while a hunk is off the unit), Sector-by-sector, Resize, Keep swap,
+     Split and Split MiB, Checksum, Start (`s` from any non-text row). The form scrolls to the
+     focused row; the last log line shows under it.
+   - The VHD window draws over the form when Start opens it: layout, each row's size mode
+     (Left / Right through `mode_choices`), Custom MiB typed in, `c` Calc min, Start, Esc.
+   - Run: "Waiting for the minimum sizes..." while Start waits (Esc stops waiting), the bar,
+     the log, the result. The device list's refresh reconciles a device source.
+   - `?` lists each step's keys (`HINTS_BACKUP_*`), the footer a short strip.
+   - Tests: `the_backup_grid_selects_partitions_and_calcs_min`,
+     `the_backup_options_reach_the_controller` (split MiB, sector-by-sector lock, CHD mode /
+     hunk / codec reaching `Start`, an off-unit hunk refused),
+     `the_backup_vhd_window_sets_sizes_and_starts` (per partition, Custom MiB, the run),
+     `the_backup_remote_drive_opens_or_is_refused`,
+     `the_backup_form_and_windows_draw_in_a_small_terminal` (80x24), and the existing
+     device backup test.
+3. (this commit) Docs: this section, `docs/platform_matrix.md` "Backup tab".
+
+### Behaviour changes
+
+- TUI: resize to minimum and split (4000 MiB) now default on, as in the GUI (the screen forced
+  both off); a zstd / raw / gzip / LZ4 backup of a scanned source is trimmed and split unless
+  the rows are turned off.
+- TUI: a VHD Start opens the VHD window (whole disk by default, as in the GUI) instead of
+  writing one .vhd per partition without asking.
+- TUI: Enter on the source step continues to the options when a source is already set (it
+  always opened the image picker; `o` still does).
+- TUI: the output folder reaches the controller as it is typed, so Start's reason ("Choose a
+  destination folder.") shows beside the Start row before Start is pressed.
+- GUI: none (the CHD control, the split range and the size-options lock moved to the
+  controller unchanged; a VHD Custom size the drag value already kept in range is clamped the
+  same way by the controller).
+- CLI: none.
+
+### Left
+
+- Nothing on the Backup screen. A terminal has no drag-and-drop or hover help (recorded in
+  `docs/platform_matrix.md`).
+- TUI parity continues with Restore, Inspect and Optical (Next steps item 3).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1792,7 +1869,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-23 done; every GUI picker is async (slice 23). `src/gui` and the whole TUI are enforced at 0 engine references
+- Slices 1-24 done; every GUI picker is async (slice 23); the TUI Backup screen has the GUI's
+  feature set (slice 24). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -1814,10 +1892,10 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 2. **Slice 20: the TUI's last 20 references** (done, above): the whole TUI is enforced.
    **Slice 21** (done, above): one AppleDouble rule, and a failed entry asks the user;
    publish `rb-fsexporter` 0.1.1.
-3. **TUI parity gaps** the controllers already support (Backup partition selection / split
-   / CHD codec / remote; Restore single-partition / new-disk / Build Disk; Inspect disk
-   tools / Calc min / Export; Optical convert / Browse Contents / player; Inspect dialogs):
-   add them, or record each as N/A with a reason in `docs/platform_matrix.md` (Phase 2 exit).
+3. **TUI parity gaps** the controllers already support (Backup done in slice 24; Restore
+   single-partition / new-disk; Inspect disk tools / Calc min / Export; Optical convert /
+   Browse Contents; Inspect dialogs): add them before Phase 2 closes (user decision
+   2026-11-04: full parity except the CD-DA player and Build Disk, `docs/build_disk_plan.md`).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
 5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
