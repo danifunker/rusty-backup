@@ -184,7 +184,7 @@ fn restore_size_floor(
 fn is_disk_label_scheme(table_type: &str) -> bool {
     matches!(
         table_type,
-        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI" | "X68k"
+        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI" | "X68k" | "APM-TS"
     )
 }
 

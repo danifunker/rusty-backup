@@ -249,7 +249,7 @@ pub fn inspect_source(
         }
     };
 
-    if matches!(table, PartitionTable::Apm(_)) {
+    if matches!(table, PartitionTable::Apm(_) | PartitionTable::ApmTs(_)) {
         relabel_apm_hfs(&mut partitions, &probe);
     }
     relabel_linux_types(&mut partitions, &probe);

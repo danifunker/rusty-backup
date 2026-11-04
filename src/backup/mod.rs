@@ -52,7 +52,7 @@ use metadata::{
 /// Disk-label schemes back up only through the single-file-CHD layout, which
 /// copies the head region verbatim. See `docs/backup_partition_schemes.md`.
 const LABEL_BACKUP_NEEDS_CHD: &str =
-    "disk-label sources (Sun / NeXT / SGI / Amiga RDB / Atari AHDI) back up as a \
+    "disk-label sources (Sun / NeXT / SGI / Amiga RDB / Atari AHDI / Apple TS map) back up as a \
      single-file CHD only: re-run with CHD output. The per-partition layout \
      would have to rewrite the table on restore, which is not implemented.";
 
@@ -876,7 +876,7 @@ fn run_backup_inner(
 
     // For APM disks, probe "Apple_HFS" partitions to detect the actual HFS variant
     // (native HFS vs native HFS+ vs embedded HFS+) and update the type_name accordingly.
-    if matches!(table, PartitionTable::Apm(_)) {
+    if matches!(table, PartitionTable::Apm(_) | PartitionTable::ApmTs(_)) {
         for part in &mut partitions {
             if part.partition_type_string.as_deref() == Some("Apple_HFS") {
                 let part_offset = part.byte_offset();
@@ -1286,6 +1286,20 @@ fn run_backup_inner(
                 &progress,
                 LogLevel::Info,
                 "Exported SGI disk label (sgi_dklabel.json)",
+            );
+            if !single_file_chd_planned {
+                bail!("{}", LABEL_BACKUP_NEEDS_CHD);
+            }
+        }
+        PartitionTable::ApmTs(map) => {
+            let json = serde_json::to_string_pretty(map)
+                .context("failed to serialize the TS partition map to JSON")?;
+            std::fs::write(backup_folder.join("apm_ts.json"), json)
+                .context("failed to write apm_ts.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported old Apple TS partition map (apm_ts.json)",
             );
             if !single_file_chd_planned {
                 bail!("{}", LABEL_BACKUP_NEEDS_CHD);

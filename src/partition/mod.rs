@@ -26,7 +26,7 @@ pub mod x68k_ipl;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
-use apm::Apm;
+use apm::{Apm, TsMap};
 use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use bsd::BsdDiskLabel;
 use gpt::Gpt;
@@ -52,6 +52,9 @@ pub enum PartitionTable {
         gpt: Gpt,
     },
     Apm(Apm),
+    /// The pre-1986 Apple SCSI map: `ER` DDR at block 0, `TS` entry list at block 1.
+    /// Read-only; backed up whole through the single-file CHD. See `docs/backup_partition_schemes.md`.
+    ApmTs(TsMap),
     /// Amiga Rigid Disk Block — `RDSK` table in the first 16 sectors of a
     /// hard-disk image, used by AmigaDOS, PFS, SFS. See `src/partition/rdb.rs`.
     Rdb(Rdb),
@@ -1147,6 +1150,36 @@ fn bsd_partitions(label: &BsdDiskLabel) -> Vec<PartitionInfo> {
     out
 }
 
+/// Old `TS` map rows; `TFS1` reads as `Apple_HFS` so every HFS path opens it.
+fn ts_map_partitions(map: &TsMap) -> Vec<PartitionInfo> {
+    map.entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let type_string = if e.is_hfs() {
+                "Apple_HFS".to_string()
+            } else {
+                e.fs_id.clone()
+            };
+            PartitionInfo {
+                index: i,
+                type_name: format!("{} ({})", type_string, e.fs_id),
+                partition_type_byte: 0,
+                start_lba: e.start_block as u64,
+                start_byte: None,
+                size_bytes: e.size_bytes(),
+                bootable: false,
+                is_logical: false,
+                is_extended_container: false,
+                partition_type_string: Some(type_string),
+                hfs_block_size: None,
+                rdb_part_block: None,
+                drv_name: None,
+            }
+        })
+        .collect()
+}
+
 /// The MBR's own entries: primaries at their slot (0-3), EBR logicals from 4.
 fn mbr_partitions(mbr: &Mbr) -> Vec<PartitionInfo> {
     let mut result: Vec<PartitionInfo> = mbr
@@ -1302,6 +1335,9 @@ impl PartitionTable {
                 .map_err(RustyBackupError::Io)?;
             if let Ok(apm) = Apm::parse(reader) {
                 return Ok(PartitionTable::Apm(apm));
+            }
+            if let Ok(map) = TsMap::parse(reader) {
+                return Ok(PartitionTable::ApmTs(map));
             }
             // Fall through to MBR/GPT parsing on failure
             reader
@@ -1519,7 +1555,7 @@ impl PartitionTable {
             // fdisk: primaries 1-4, logicals from 5; `index` is 0-3 then 4+j.
             PartitionTable::Mbr(_) | PartitionTable::Ahdi(_) => Some(raw + 1),
             // diskutil's `sN` counts map entries from 1.
-            PartitionTable::Apm(_) => Some(raw + 1),
+            PartitionTable::Apm(_) | PartitionTable::ApmTs(_) => Some(raw + 1),
             // IRIX `fx` and Sun `format(1M)` both number from 0.
             PartitionTable::Sgi(_) | PartitionTable::SgiDkLabel(_) | PartitionTable::Sun(_) => {
                 Some(raw)
@@ -1547,6 +1583,7 @@ impl PartitionTable {
             PartitionTable::Mbr(_)
                 | PartitionTable::Ahdi(_)
                 | PartitionTable::Apm(_)
+                | PartitionTable::ApmTs(_)
                 | PartitionTable::Sgi(_)
                 | PartitionTable::SgiDkLabel(_)
                 | PartitionTable::Sun(_)
@@ -1606,6 +1643,7 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::ApmTs(map) => ts_map_partitions(map),
             PartitionTable::Sgi(vh) => {
                 vh.partitions
                     .iter()
@@ -1998,6 +2036,7 @@ impl PartitionTable {
         "MBR",
         "GPT",
         "APM",
+        "APM-TS",
         "RDB",
         "SGI",
         "SGI-DkLabel",
@@ -2051,6 +2090,7 @@ impl PartitionTable {
             PartitionTable::Mbr(_) => "MBR",
             PartitionTable::Gpt { .. } => "GPT",
             PartitionTable::Apm(_) => "APM",
+            PartitionTable::ApmTs(_) => "APM-TS",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
             PartitionTable::SgiDkLabel(_) => "SGI-DkLabel",
@@ -2083,6 +2123,7 @@ impl PartitionTable {
             PartitionTable::Mbr(mbr) => mbr.disk_signature,
             PartitionTable::Gpt { protective_mbr, .. } => protective_mbr.disk_signature,
             PartitionTable::Apm(_)
+            | PartitionTable::ApmTs(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::SgiDkLabel(_)
@@ -2397,6 +2438,45 @@ mod tests {
         assert_eq!(table.type_name(), "MBR");
         assert_eq!(table.partitions().len(), 1);
         assert_eq!(table.partitions()[0].type_name, "FAT32 (LBA)");
+    }
+
+    /// An `ER` DDR + `TS` map disk with a blank HFS volume at block 6 (The Manhole's layout).
+    fn ts_map_hfs_disk(name: &str) -> Vec<u8> {
+        use part_tables::apm::TsEntry;
+        let hfs = fs_mac::hfs::create_blank_hfs(4 * 1024 * 1024, 512, name).unwrap();
+        let blocks = (hfs.len() / 512) as u32;
+        let entry = TsEntry {
+            start_block: 6,
+            block_count: blocks,
+            fs_id: "TFS1".into(),
+        };
+        let mut disk = TsMap::build_blocks(6 + blocks, &[entry]);
+        disk.resize(6 * 512, 0);
+        disk.extend_from_slice(&hfs);
+        disk
+    }
+
+    #[test]
+    fn ts_map_disk_opens_its_hfs_volume_through_the_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("manhole.img");
+        std::fs::write(&path, ts_map_hfs_disk("Manhole CD-ROM")).unwrap();
+        let mut src = crate::model::source_reader::open_read(&path).unwrap();
+        let table = PartitionTable::detect(&mut src).unwrap();
+        assert_eq!(table.type_name(), "APM-TS");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("Apple_HFS"));
+        assert_eq!(parts[0].byte_offset(), 6 * 512);
+        assert_eq!(table.native_slot(&parts[0]), Some(1));
+        let fs = crate::fs::open_filesystem(
+            crate::model::source_reader::open_read(&path).unwrap(),
+            parts[0].byte_offset(),
+            parts[0].partition_type_byte,
+            parts[0].partition_type_string.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(fs.volume_label(), Some("Manhole CD-ROM"));
     }
 
     #[test]
@@ -3244,6 +3324,7 @@ mod type_name_parity {
             PartitionTable::Bsd(_) => 13,
             PartitionTable::HpuxLvm(_) => 14,
             PartitionTable::AixLvm(_) => 15,
+            PartitionTable::ApmTs(_) => 16,
         }
     }
 
@@ -3251,7 +3332,7 @@ mod type_name_parity {
     fn all_type_names_covers_every_variant() {
         assert_eq!(
             PartitionTable::ALL_TYPE_NAMES.len(),
-            13,
+            14,
             "a PartitionTable variant was added or removed: update ALL_TYPE_NAMES, \
              every_variant_has_an_index, and the README table tests/doc_parity.rs checks"
         );

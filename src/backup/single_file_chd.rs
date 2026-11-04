@@ -214,6 +214,7 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
         PartitionTable::Mbr(_)
             | PartitionTable::Gpt { .. }
             | PartitionTable::Apm(_)
+            | PartitionTable::ApmTs(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
@@ -234,7 +235,8 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
 fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
     matches!(
         table,
-        PartitionTable::Sun(_)
+        PartitionTable::ApmTs(_)
+            | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
             | PartitionTable::HpuxLvm(_)
@@ -2212,7 +2214,8 @@ fn build_patched_head_segments(
             let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
             Ok((vec![head], None))
         }
-        PartitionTable::Sun(_)
+        PartitionTable::ApmTs(_)
+        | PartitionTable::Sun(_)
         | PartitionTable::Next(_)
         | PartitionTable::Bsd(_)
         | PartitionTable::HpuxLvm(_)
@@ -2300,6 +2303,7 @@ mod tests {
         for table in [
             PartitionTable::Sun(sun_label()),
             PartitionTable::Next(next_label()),
+            PartitionTable::ApmTs(ts_map()),
         ] {
             assert!(is_supported(&table), "{}", table.type_name());
             assert!(is_verbatim_head_scheme(&table), "{}", table.type_name());
@@ -2313,6 +2317,17 @@ mod tests {
         let dsd = PartitionTable::Dsd { size_bytes: 409600 };
         assert!(!is_supported(&dsd));
         assert!(!is_verbatim_head_scheme(&dsd));
+    }
+
+    fn ts_map() -> part_tables::apm::TsMap {
+        use part_tables::apm::{TsEntry, TsMap};
+        let hfs = TsEntry {
+            start_block: 6,
+            block_count: 100,
+            fs_id: "TFS1".into(),
+        };
+        let blocks = TsMap::build_blocks(106, &[hfs]);
+        TsMap::parse_blocks(&blocks[..512], &blocks[512..]).unwrap()
     }
 
     fn sun_label() -> part_tables::sun::SunDiskLabel {
@@ -2475,6 +2490,80 @@ mod tests {
             "round-tripped CHD should still parse as a NeXT label, got: {}",
             detected.type_name(),
         );
+    }
+
+    /// The old Apple TS map backs up whole: DDR, map and the driver blocks ahead of
+    /// the HFS volume ride verbatim, and the CHD re-detects and opens as before.
+    #[test]
+    fn end_to_end_round_trip_apm_ts_map() {
+        use part_tables::apm::{TsEntry, TsMap};
+        let hfs = fs_mac::hfs::create_blank_hfs(2 * 1024 * 1024, 512, "Manhole").unwrap();
+        let blocks = (hfs.len() / 512) as u32;
+        let entry = TsEntry {
+            start_block: 6,
+            block_count: blocks,
+            fs_id: "TFS1".into(),
+        };
+        let mut data = TsMap::build_blocks(6 + blocks, &[entry]);
+        // Driver code in blocks 2-5, the way HD SC Setup lays it out.
+        data.extend((0..4 * 512).map(|i| (i % 249) as u8 + 3));
+        data.extend_from_slice(&hfs);
+        let total_bytes = data.len() as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect TS map");
+        assert!(matches!(table, PartitionTable::ApmTs(_)));
+        let partitions = table.partitions();
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |_: &str| {},
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("TS-map single-file CHD backup");
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(back, data, "the whole disk is verbatim");
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).unwrap();
+        assert!(matches!(detected, PartitionTable::ApmTs(_)));
+        let p = &detected.partitions()[0];
+        let fs = crate::fs::open_filesystem(
+            BufReader::new(ChdReader::open(&chd_path).unwrap()),
+            p.byte_offset(),
+            0,
+            p.partition_type_string.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(fs.volume_label(), Some("Manhole"));
     }
 
     /// The RDSK block and its PART / FSHD / LSEG chain live in the reserved

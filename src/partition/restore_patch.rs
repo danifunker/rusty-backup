@@ -30,7 +30,7 @@ pub struct PatchedHead {
 pub fn can_patch(table_type: &str) -> bool {
     matches!(
         table_type,
-        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI" | "X68k"
+        "Sun" | "NeXT" | "SGI" | "SGI-DkLabel" | "RDB" | "AHDI" | "X68k" | "APM-TS"
     )
 }
 
@@ -50,6 +50,7 @@ pub fn patch_head_for_restore(
         "RDB" => patch_rdb(head, overrides, target_size, log_cb),
         "AHDI" => patch_ahdi(head, overrides, target_size, log_cb),
         "X68k" => patch_x68k(head, overrides, target_size, log_cb),
+        "APM-TS" => patch_apm_ts(head, overrides, target_size, log_cb),
         other => bail!("no restore-time label patcher for {other} tables"),
     }
 }
@@ -470,6 +471,47 @@ fn patch_ahdi(
     })
 }
 
+// --- Old Apple "TS" partition map -----------------------------------------------
+
+fn patch_apm_ts(
+    head: &[u8],
+    overrides: &[PartitionSizeOverride],
+    target_size: u64,
+    log_cb: &mut dyn FnMut(&str),
+) -> Result<PatchedHead> {
+    use part_tables::apm::TsMap;
+    need(head, 1024, "a DDR and a TS partition map")?;
+    let map = TsMap::parse_blocks(&head[..512], &head[512..1024])
+        .context("TS partition map in the backup")?;
+    let adjusted = repack(overrides, 512, 1024)?;
+    check_fits(&adjusted, target_size, "the target")?;
+    let mut out = head.to_vec();
+    for o in &adjusted {
+        let Some(slot) = map
+            .entries
+            .iter()
+            .position(|e| e.start_block as u64 == o.start_lba)
+        else {
+            bail!(
+                "no TS map entry starts at block {} for partition {}",
+                o.start_lba,
+                o.index
+            );
+        };
+        let off = TsMap::entry_byte_offset(slot);
+        BigEndian::write_u32(&mut out[off..off + 4], o.effective_start_lba() as u32);
+        BigEndian::write_u32(&mut out[off + 4..off + 8], (o.export_size / 512) as u32);
+    }
+    // sbBlkCount, in the DDR's own block size.
+    let block_size = (map.ddr.block_size as u64).max(512);
+    BigEndian::write_u32(&mut out[4..8], (target_size / block_size) as u32);
+    log_cb("  table: DDR and TS partition map rewritten");
+    Ok(PatchedHead {
+        head: out,
+        overrides: adjusted,
+    })
+}
+
 // --- Sharp X68000 ---------------------------------------------------------------
 
 fn patch_x68k(
@@ -708,6 +750,61 @@ mod tests {
         let err = patch_head_for_restore("AHDI", &bytes[..512], &overrides, DISK, &mut |_| {})
             .unwrap_err();
         assert!(err.to_string().contains("starts at"), "{err:#}");
+    }
+
+    /// The old Apple TS map: entries and the DDR's block count follow the resize,
+    /// and the driver blocks between the map and the first partition do not move.
+    #[test]
+    fn apm_ts_patch_rewrites_entries_and_ddr() {
+        use part_tables::apm::{TsEntry, TsMap};
+        let entries = [
+            TsEntry {
+                start_block: 6,
+                block_count: 1000,
+                fs_id: "TFS1".into(),
+            },
+            TsEntry {
+                start_block: 1006,
+                block_count: 500,
+                fs_id: "TFS1".into(),
+            },
+        ];
+        let mut head = TsMap::build_blocks(1506, &entries);
+        head.resize(6 * 512, 0xA5);
+        let table = PartitionTable::detect(&mut Cursor::new(head.clone())).unwrap();
+        assert_eq!(table.type_name(), "APM-TS");
+        assert!(can_patch("APM-TS"));
+        let parts = table.partitions();
+        let overrides = vec![
+            PartitionSizeOverride::size_only(0, 6, 1000 * 512, 400 * 512),
+            PartitionSizeOverride {
+                new_start_lba: Some(406),
+                ..PartitionSizeOverride::size_only(1, 1006, 500 * 512, 500 * 512)
+            },
+        ];
+        assert_eq!(parts.len(), 2);
+        let target = 2000 * 512;
+        let patched =
+            patch_head_for_restore("APM-TS", &head, &overrides, target, &mut |_| {}).unwrap();
+        assert_eq!(
+            &patched.head[1024..],
+            &head[1024..],
+            "driver blocks verbatim"
+        );
+        let map = TsMap::parse_blocks(&patched.head[..512], &patched.head[512..1024]).unwrap();
+        assert_eq!(map.ddr.block_count, 2000);
+        assert_eq!(
+            (map.entries[0].start_block, map.entries[0].block_count),
+            (6, 400)
+        );
+        assert_eq!(
+            (map.entries[1].start_block, map.entries[1].block_count),
+            (406, 500)
+        );
+        let mut moved = overrides.clone();
+        moved[0].start_lba = 7;
+        let err = patch_head_for_restore("APM-TS", &head, &moved, target, &mut |_| {}).unwrap_err();
+        assert!(err.to_string().contains("no TS map entry"), "{err:#}");
     }
 
     #[test]

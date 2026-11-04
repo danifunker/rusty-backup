@@ -210,6 +210,9 @@ pub fn apply_edits(
         PartitionTable::Next(label) => {
             apply_next_edits(file, label, edits, disk_size_bytes, log_cb)
         }
+        PartitionTable::ApmTs(_) => {
+            bail!("old Apple TS partition-map editing is not implemented (read / browse / back up only)")
+        }
         PartitionTable::Bsd(_) => {
             bail!("BSD disk-label editing is not yet implemented (read / browse / back up only)")
         }
