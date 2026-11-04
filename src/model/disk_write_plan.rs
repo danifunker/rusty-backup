@@ -303,6 +303,12 @@ pub fn build_request(
             wrap: None,
         });
     }
+    // An image file grows to hold the source, and the synthesized table around it.
+    let target_size = if !target.is_device && form.synthesize {
+        target_size.max(wrapped_image_size(source, form))
+    } else {
+        target_size
+    };
     let capacity = if target.is_device {
         target_size
     } else {
@@ -320,6 +326,21 @@ pub fn build_request(
         extent: WriteExtent::whole_disk(capacity),
         wrap,
     })
+}
+
+/// The size an image file needs for the synthesized table: Fill means just the source there.
+fn wrapped_image_size(source: &WriteSource, form: &WrapForm) -> u64 {
+    let first_byte = form.alignment().first_partition_lba() * 512;
+    let part = if form.size_mode == SizeMode::FillRemaining {
+        source.size_bytes.div_ceil(512) * 512
+    } else {
+        form.partition_size(source.size_bytes, 0, first_byte)
+    };
+    let gpt_tail = match form.table_kind {
+        TableKind::Gpt => 34 * 512,
+        TableKind::Mbr => 0,
+    };
+    first_byte + part + gpt_tail
 }
 
 fn wrap_params(
@@ -437,6 +458,27 @@ mod tests {
             .wrap
             .unwrap();
         assert_eq!(wrap.partition_size_bytes, (64 << 20) - 2048 * 512);
+    }
+
+    #[test]
+    fn an_image_file_grows_to_hold_a_synthesized_table() {
+        let s = src(10 << 20, false);
+        let file = WriteTarget {
+            path: PathBuf::from("/x.out"),
+            size_bytes: 0,
+            is_device: false,
+        };
+        let mut f = WrapForm {
+            synthesize: true,
+            ..WrapForm::default()
+        };
+        let r = build_request(&s, &f, &file, None).unwrap();
+        assert_eq!(r.target_size_bytes, (10 << 20) + 2048 * 512);
+        assert_eq!(r.wrap.unwrap().partition_size_bytes, 10 << 20);
+        f.table_kind = TableKind::Gpt;
+        f.size_mode = SizeMode::FillRemaining;
+        let r = build_request(&s, &f, &file, None).unwrap();
+        assert_eq!(r.target_size_bytes, (10 << 20) + 2048 * 512 + 34 * 512);
     }
 
     #[test]

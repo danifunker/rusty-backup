@@ -263,11 +263,19 @@ pub fn run_single_partition_restore(
                 config.target_path.display()
             ),
         );
+        // A new disk's image file is created at its full size; a partition target must exist.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(config.new_disk.is_some())
+            .truncate(false)
             .open(&config.target_path)
             .with_context(|| format!("failed to open {}", config.target_path.display()))?;
+        if let Some(nd) = &config.new_disk {
+            if file.metadata()?.len() < nd.disk_size_bytes {
+                file.set_len(nd.disk_size_bytes)?;
+            }
+        }
         crate::os::DeviceWriteHandle::from_file(file)
     };
 
