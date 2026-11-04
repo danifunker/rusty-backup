@@ -303,3 +303,41 @@ fn the_source_label_close_and_expand_preview_follow_the_source() {
     assert!(!ctl.can_close() && !ctl.can_reinspect());
     assert_eq!(ctl.source_label(&[]), "Select a device or image...");
 }
+
+#[test]
+fn add_partition_needs_a_gap_and_the_dialog_sources_follow_the_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::controller::test_fixtures::mbr_with_gap(dir.path());
+    let mut ctl = controller();
+    ctl.apply(InspectAction::Open(InspectSource::Image {
+        path: img.clone(),
+        temp: None,
+    }));
+    settle(&mut ctl);
+    assert!(ctl.can_edit_table() && ctl.can_add_partition());
+    assert!(ctl.add_partition_hint().contains("gap at LBA"));
+    assert_eq!(ctl.alto_resize_source(), Ok(img.clone()));
+    assert_eq!(ctl.floppy_convert_source(), None);
+    assert!(!ctl.summarizing_hfs());
+    ctl.apply(InspectAction::AddPartition);
+    let v = ctl.table_editor().expect("the editor opens");
+    assert!(!v.add_start.is_empty() && !v.add_size.is_empty());
+
+    let (_d, _fat, mut fat) = opened_fat();
+    assert!(
+        !fat.can_add_partition(),
+        "a superfloppy has no table to add to"
+    );
+    assert_eq!(fat.add_partition_hint(), "No free space available");
+    fat.apply(InspectAction::AddPartition);
+    assert!(fat.table_editor().is_none());
+    let xdf = crate::controller::test_fixtures::blank_xdf(dir.path());
+    fat.apply(InspectAction::Open(InspectSource::Image {
+        path: xdf.clone(),
+        temp: None,
+    }));
+    settle(&mut fat);
+    assert_eq!(fat.floppy_convert_source(), Some(xdf));
+    fat.apply(InspectAction::Close);
+    assert!(fat.alto_resize_source().is_err());
+}

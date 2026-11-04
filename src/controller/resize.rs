@@ -70,6 +70,18 @@ pub struct ResizeRow {
     pub offers_minimum: bool,
 }
 
+impl ResizeRow {
+    /// The size modes the row offers: Minimum only when a known minimum is below the size.
+    pub fn mode_choices(&self) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.offers_minimum {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        modes
+    }
+}
+
 /// One row of the preview.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewRow {
@@ -517,5 +529,33 @@ impl Controller for ResizeController {
     fn tick(&mut self) -> Vec<Effect> {
         self.poll();
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_size_row_offers_minimum_only_below_its_size() {
+        let mut row = ResizeRow {
+            index: 0,
+            type_name: "FAT16".into(),
+            original_size: 8 << 20,
+            minimum_size: 512,
+            extended: false,
+            mode: SizeMode::Original,
+            text: stamp_mib(8 << 20),
+            offers_minimum: false,
+        };
+        assert_eq!(
+            row.mode_choices(),
+            vec![SizeMode::Original, SizeMode::Custom]
+        );
+        row.offers_minimum = true;
+        assert_eq!(
+            row.mode_choices(),
+            vec![SizeMode::Original, SizeMode::Minimum, SizeMode::Custom]
+        );
     }
 }

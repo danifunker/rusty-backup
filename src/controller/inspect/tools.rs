@@ -24,6 +24,8 @@ enum BootStep {
     Written(Result<MakeBootableReport, String>),
 }
 
+const MIB: u64 = 1024 * 1024;
+
 /// A partition-table write: the engine's messages and its error text.
 type TableApply = (Vec<String>, Result<(), String>);
 
@@ -174,6 +176,44 @@ impl InspectController {
             disk_size,
             min_start,
         )
+    }
+
+    /// Add Partition applies: the table is editable and its largest gap holds at least 1 MiB.
+    pub fn can_add_partition(&mut self) -> bool {
+        self.can_edit_table() && self.largest_gap().is_some_and(|g| g.size_bytes >= MIB)
+    }
+
+    /// What Add Partition would fill, or why it is off.
+    pub fn add_partition_hint(&mut self) -> String {
+        match self.largest_gap() {
+            Some(gap) if gap.size_bytes >= MIB => format!(
+                "Add a new partition into the {} gap at LBA {}",
+                format_size(gap.size_bytes),
+                gap.start_lba,
+            ),
+            _ => "No free space available".to_string(),
+        }
+    }
+
+    /// The image Resize Alto Disk re-lays, or the error the shell logs.
+    pub fn alto_resize_source(&self) -> Result<PathBuf, String> {
+        self.image_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "Resize: no image file loaded".to_string())
+    }
+
+    /// The floppy container Convert Floppy Container starts from, when the source is one.
+    pub fn floppy_convert_source(&self) -> Option<PathBuf> {
+        if self.source_is_floppy() {
+            self.image_path().map(|p| p.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    /// Expand HFS is reading its source volume; `HostRequest::ExpandHfs` follows.
+    pub fn summarizing_hfs(&self) -> bool {
+        self.tools.hfs_summary.is_some()
     }
 
     /// Running tools a shell shows in small windows.
@@ -486,6 +526,9 @@ impl InspectController {
 
     /// The editor, pre-filled to add one partition filling the largest gap.
     pub(super) fn add_partition(&mut self) {
+        if !self.can_add_partition() {
+            return;
+        }
         let Some(gap) = self.largest_gap() else {
             return;
         };

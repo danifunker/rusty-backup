@@ -11,8 +11,8 @@
 use eframe::egui;
 
 use rusty_backup::controller::partition_edit::{
-    describe_type, format_size, type_choices, BarSegment, BootStyle, BuildAction, BuildView,
-    LayoutBar, SizeMode, TableEditAction, TableEditView, TableKind,
+    describe_type, format_size, type_choices, type_note, BarSegment, BootStyle, BuildAction,
+    BuildView, LayoutBar, SizeMode, TableEditAction, TableEditView, TableKind,
 };
 
 /// What the caller should do after a frame.
@@ -117,11 +117,9 @@ pub fn show_table(ui: &mut egui::Ui, view: &TableEditView) -> (Vec<TableEditActi
                         // Minimum shows only when known; the editor does no filesystem analysis.
                         let mut mode = row.size_mode;
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut mode, SizeMode::Original, "Original");
-                            if row.minimum_size > 0 && row.minimum_size < row.size_bytes {
-                                ui.radio_value(&mut mode, SizeMode::Minimum, "Minimum");
+                            for choice in row.mode_choices() {
+                                ui.radio_value(&mut mode, choice, choice.label());
                             }
-                            ui.radio_value(&mut mode, SizeMode::Custom, "Custom");
                         });
                         if mode != row.size_mode {
                             edits.push(TableEditAction::SetSizeMode { row: i, mode });
@@ -168,7 +166,7 @@ pub fn show_table(ui: &mut egui::Ui, view: &TableEditView) -> (Vec<TableEditActi
                             }
                         }
 
-                        if row.logical {
+                        if !row.can_delete() {
                             ui.label("");
                         } else if ui
                             .small_button("Delete")
@@ -585,14 +583,10 @@ fn type_field(ui: &mut egui::Ui, kind: TableKind, id: &str, text: &mut String) {
                 .on_hover_text("Choose a well-known partition type");
         }
 
-        match describe_type(kind, text) {
-            Some(label) => {
-                ui.label(egui::RichText::new(label).weak());
-            }
-            None if !text.trim().is_empty() => {
-                ui.label(egui::RichText::new("custom").weak().italics());
-            }
-            None => {}
+        if let Some(note) = type_note(kind, text) {
+            let custom = describe_type(kind, text).is_none();
+            let note = egui::RichText::new(note).weak();
+            ui.label(if custom { note.italics() } else { note });
         }
     });
 }

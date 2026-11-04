@@ -194,13 +194,8 @@ fn size_row(ui: &mut egui::Ui, row: &ResizeRow, running: bool, actions: &mut Vec
     });
     ui.add_enabled_ui(!running, |ui| {
         ui.horizontal(|ui| {
-            let mut modes = vec![(SizeMode::Original, "Original")];
-            if row.offers_minimum {
-                modes.push((SizeMode::Minimum, "Minimum"));
-            }
-            modes.push((SizeMode::Custom, "Custom"));
-            for (mode, label) in modes {
-                if ui.radio(row.mode == mode, label).clicked() && row.mode != mode {
+            for mode in row.mode_choices() {
+                if ui.radio(row.mode == mode, mode.label()).clicked() && row.mode != mode {
                     actions.push(ResizeAction::SetMode {
                         index: row.index,
                         mode,

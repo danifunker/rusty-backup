@@ -69,6 +69,28 @@ pub struct TableRowView {
     pub bootable: bool,
 }
 
+impl TableRowView {
+    /// The size modes the row offers: Minimum only when known and smaller than the size.
+    pub fn mode_choices(&self) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.minimum_size > 0 && self.minimum_size < self.size_bytes {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        modes
+    }
+
+    /// Type, size and boot flag are editable: not deleted, not an extended container.
+    pub fn editable(&self) -> bool {
+        !self.deleted && !self.extended
+    }
+
+    /// Delete applies: a primary partition (a logical one or the container stays).
+    pub fn can_delete(&self) -> bool {
+        !self.deleted && !self.extended && !self.logical
+    }
+}
+
 /// Everything the editor window draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableEditView {

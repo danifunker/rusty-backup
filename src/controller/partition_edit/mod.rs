@@ -46,6 +46,15 @@ pub fn describe_type(kind: TableKind, text: &str) -> Option<&'static str> {
     crate::partition::type_catalog::describe(kind, text)
 }
 
+/// The note beside a type field: the catalog's name, "custom" for an unknown value, or nothing.
+pub fn type_note(kind: TableKind, text: &str) -> Option<&'static str> {
+    match describe_type(kind, text) {
+        Some(label) => Some(label),
+        None if !text.trim().is_empty() => Some("custom"),
+        None => None,
+    }
+}
+
 /// One run of a layout bar: a partition (with its colour slot) or free space (`color: None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarSegment {

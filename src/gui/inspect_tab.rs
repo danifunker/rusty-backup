@@ -566,18 +566,16 @@ impl InspectTab {
             }
 
             // Only shown for a floppy container, so the long button does not crowd an HDD's bar.
-            if self.ctl.source_is_floppy() {
-                if let Some(src) = self.ctl.image_path().map(|p| p.to_path_buf()) {
-                    if ui
-                        .button("Convert Floppy Container...")
-                        .on_hover_text(
-                            "Convert between XDF, HDM, DIM, and D88 floppy container \
-                             formats (X68000 / PC-98 / FM-7).",
-                        )
-                        .clicked()
-                    {
-                        self.floppy_convert_dialog = Some(FloppyConvertDialog::with_source(src));
-                    }
+            if let Some(src) = self.ctl.floppy_convert_source() {
+                if ui
+                    .button("Convert Floppy Container...")
+                    .on_hover_text(
+                        "Convert between XDF, HDM, DIM, and D88 floppy container \
+                         formats (X68000 / PC-98 / FM-7).",
+                    )
+                    .clicked()
+                {
+                    self.floppy_convert_dialog = Some(FloppyConvertDialog::with_source(src));
                 }
             }
 
@@ -590,21 +588,11 @@ impl InspectTab {
             }
 
             // Pre-fills the editor for the largest gap, between partitions or at the tail.
-            let gap = self.ctl.largest_gap();
-            let gap_bytes = gap.as_ref().map(|g| g.size_bytes).unwrap_or(0);
+            let can_add = self.ctl.can_add_partition();
+            let add_hint = self.ctl.add_partition_hint();
             if ui
-                .add_enabled(
-                    editable && gap_bytes >= 1024 * 1024,
-                    egui::Button::new("Add Partition..."),
-                )
-                .on_hover_text(match &gap {
-                    Some(gap) if gap.size_bytes >= 1024 * 1024 => format!(
-                        "Add a new partition into the {} gap at LBA {}",
-                        format_size(gap.size_bytes),
-                        gap.start_lba,
-                    ),
-                    _ => "No free space available".to_string(),
-                })
+                .add_enabled(can_add, egui::Button::new("Add Partition..."))
+                .on_hover_text(add_hint)
                 .clicked()
             {
                 self.act(InspectAction::AddPartition);
@@ -1194,9 +1182,9 @@ impl InspectTab {
             self.act(action);
         }
         if resize_alto {
-            match self.ctl.image_path().map(|p| p.to_path_buf()) {
-                Some(path) => self.alto_resize_dialog = Some(AltoResizeDialog::new(path)),
-                None => ctx.log.error("Resize: no image file loaded"),
+            match self.ctl.alto_resize_source() {
+                Ok(path) => self.alto_resize_dialog = Some(AltoResizeDialog::new(path)),
+                Err(e) => ctx.log.error(e),
             }
         }
 

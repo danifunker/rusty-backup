@@ -238,11 +238,17 @@ impl Target for JobProbeController {
 /// list), `ExportWholeDisk` (bool), `ExportSizeMode` / `ExportCustomMib` (the first row). Probes:
 /// `source`, `source_label`, `can_close`, `partitions`, `superfloppy`, `error`, `check_clean`,
 /// `export_format`, `export_whole_disk`, `export_modes`, `export_size_mib`, `log`.
+/// The table editor: `OpenImage` also takes `$mbr_gap` (16 MiB, one 4 MiB FAT16 partition, the
+/// rest free); actions `EditTable`, `AddPartition`, `CloseEditor`, `TableMode` (row 0: `Original`,
+/// `Custom`), `TableDelete` / `TableUndo` (a row), `TableAdd`, `TableValidate`, `ApplyTable`;
+/// probes `can_add_partition`, `editor_open`, `table_rows`, `table_modes` (row 0's choices),
+/// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `floppy_source`, `alto_source`.
 struct InspectTarget {
     ctl: rusty_backup::controller::inspect::InspectController,
     dir: tempfile::TempDir,
     asked: Option<&'static str>,
     log: Vec<String>,
+    can_add: bool,
 }
 
 impl InspectTarget {
@@ -258,6 +264,7 @@ impl InspectTarget {
             dir: tempfile::tempdir().expect("temp dir"),
             asked: None,
             log: Vec::new(),
+            can_add: false,
         }
     }
 
@@ -269,7 +276,76 @@ impl InspectTarget {
         }
         self.log
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        self.can_add = self.ctl.can_add_partition();
         fx
+    }
+
+    /// A 16 MiB MBR disk: one 4 MiB FAT16 partition at LBA 2048, the rest free.
+    fn mbr_gap(&self) -> Result<PathBuf, String> {
+        let vol = fs_pc::fat::create_blank_fat(4 << 20, Some("GAP")).map_err(|e| e.to_string())?;
+        let mut bytes = vec![0u8; 16 << 20];
+        bytes[2048 * 512..2048 * 512 + vol.len()].copy_from_slice(&vol);
+        bytes[0x1BE + 4] = 0x06;
+        bytes[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
+        bytes[0x1BE + 12..0x1BE + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        let p = self.dir.path().join("gap.img");
+        std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    /// The table editor's actions.
+    fn table_act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::inspect::InspectAction;
+        use rusty_backup::controller::partition_edit::{SizeMode, TableEditAction};
+        let row = || arg.and_then(Value::as_integer).map(|n| n as usize);
+        let a = match action {
+            "EditTable" => InspectAction::EditTable,
+            "AddPartition" => InspectAction::AddPartition,
+            "CloseEditor" => InspectAction::CloseEditor,
+            "TableMode" => InspectAction::Table(TableEditAction::SetSizeMode {
+                row: 0,
+                mode: match arg_str(arg)? {
+                    "Original" => SizeMode::Original,
+                    "Custom" => SizeMode::Custom,
+                    other => return Err(format!("no table size mode {other:?}")),
+                },
+            }),
+            "TableDelete" => InspectAction::Table(TableEditAction::Delete(row().ok_or("a row")?)),
+            "TableUndo" => InspectAction::Table(TableEditAction::Undo(row().ok_or("a row")?)),
+            "TableAdd" => InspectAction::Table(TableEditAction::Add),
+            "TableValidate" => InspectAction::Table(TableEditAction::Validate),
+            _ => InspectAction::ApplyTableEdits,
+        };
+        let fx = self.ctl.apply(a);
+        Ok(self.note(fx))
+    }
+
+    fn table_probe(&self, name: &str) -> Result<Value, String> {
+        let view = self.ctl.table_editor();
+        let first = view.as_ref().and_then(|v| v.rows.first().cloned());
+        Ok(match name {
+            "can_add_partition" => Value::Boolean(self.can_add),
+            "editor_open" => Value::Boolean(view.is_some()),
+            "table_rows" => Value::Integer(view.as_ref().map_or(0, |v| v.rows.len() as i64)),
+            "table_modes" => Value::String(
+                first
+                    .map(|r| {
+                        r.mode_choices()
+                            .iter()
+                            .map(|m| m.label())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .join(","),
+            ),
+            "table_can_delete" => Value::Boolean(first.is_some_and(|r| r.can_delete())),
+            "table_can_apply" => Value::Boolean(view.as_ref().is_some_and(|v| v.can_apply)),
+            "table_errors" => Value::String(view.map(|v| v.errors.join("; ")).unwrap_or_default()),
+            "floppy_source" => Value::Boolean(self.ctl.floppy_convert_source().is_some()),
+            _ => Value::Boolean(self.ctl.alto_resize_source().is_ok()),
+        })
     }
 }
 
@@ -346,6 +422,8 @@ impl Target for InspectTarget {
                         .map_err(|e| e.to_string())?;
                     std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
                     p
+                } else if arg == "$mbr_gap" {
+                    self.mbr_gap()?
                 } else {
                     PathBuf::from(arg)
                 };
@@ -370,6 +448,10 @@ impl Target for InspectTarget {
             "OpenExport" => InspectAction::OpenExport,
             "ExportFormat" | "ExportWholeDisk" | "ExportSizeMode" | "ExportCustomMib" => {
                 return self.export_edit(action, arg).map(|_| Vec::new());
+            }
+            "EditTable" | "AddPartition" | "CloseEditor" | "TableMode" | "TableDelete"
+            | "TableUndo" | "TableAdd" | "TableValidate" | "ApplyTable" => {
+                return self.table_act(action, arg);
             }
             other => return Err(format!("InspectController has no action {other:?}")),
         };
@@ -403,6 +485,9 @@ impl Target for InspectTarget {
                 Value::Boolean(self.ctl.fsck_view().is_some_and(|v| v.result.is_clean()))
             }
             "log" => Value::String(self.log.join("\n")),
+            "can_add_partition" | "editor_open" | "table_rows" | "table_modes"
+            | "table_can_delete" | "table_can_apply" | "table_errors" | "floppy_source"
+            | "alto_source" => self.table_probe(name)?,
             other => return Err(format!("InspectController has no probe {other:?}")),
         })
     }

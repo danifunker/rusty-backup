@@ -150,3 +150,38 @@ fn a_build_rows_source_is_picked_then_measured_in_a_job() {
     c.apply(RestoreAction::Build(BuildAction::ClearRowSource(0)));
     assert!(c.build_view().unwrap().rows[0].source.is_none());
 }
+
+#[test]
+fn table_rows_offer_their_modes_delete_and_type_note() {
+    let table = mbr_table();
+    let parts = table.partitions();
+    let mut ed = PartitionEditor::new();
+    ed.seed_from_with_minimums(parts.as_slice(), &HashMap::new(), Some(64 * MIB));
+    let row = table_view(&ed, parts.as_slice(), Some(&table), true).rows[0].clone();
+    assert_eq!(
+        row.mode_choices(),
+        vec![SizeMode::Original, SizeMode::Custom]
+    );
+    assert!(row.editable() && row.can_delete());
+    let mut mins = HashMap::new();
+    mins.insert(parts[0].index, MIB);
+    ed.seed_from_with_minimums(parts.as_slice(), &mins, Some(64 * MIB));
+    let row = table_view(&ed, parts.as_slice(), Some(&table), true).rows[0].clone();
+    assert_eq!(
+        row.mode_choices(),
+        vec![SizeMode::Original, SizeMode::Minimum, SizeMode::Custom]
+    );
+    apply_table_edit(&mut ed, Some(&table), TableEditAction::Delete(0));
+    let row = table_view(&ed, parts.as_slice(), Some(&table), true).rows[0].clone();
+    assert!(!row.editable() && !row.can_delete());
+    let logical = TableRowView {
+        deleted: false,
+        logical: true,
+        ..row
+    };
+    assert!(logical.editable() && !logical.can_delete());
+    let known = type_choices(TableKind::Mbr)[0];
+    assert_eq!(type_note(TableKind::Mbr, known.value), Some(known.label));
+    assert_eq!(type_note(TableKind::Mbr, "zz"), Some("custom"));
+    assert_eq!(type_note(TableKind::Mbr, " "), None);
+}
