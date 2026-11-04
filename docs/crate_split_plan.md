@@ -313,7 +313,7 @@ Files move with `git mv` so history follows them. Steps 2–6 parallelize across
 
 **Environment notes:**
 - Homebrew's `rustc` / `cargo` 1.98 come before rustup on this machine's `PATH`, so `rustup run 1.73.0 cargo` silently pairs cargo 1.73 with rustc 1.98. For 1.73, use `~/.rustup/toolchains/1.73.0-*/bin/{cargo,rustc}` explicitly with `RUSTC` set.
-- Homebrew's clippy 1.98 adds lints (`chunks_exact_to_as_chunks`, `drain_collect`, …) that fail `cargo clippy -D warnings` in ~70 places of existing code. That predates this work. The suggested `as_chunks` fix needs Rust 1.88, so it must not be applied to engine code.
+- Newer clippy lints (`chunks_exact_to_as_chunks`, `drain_collect`, ...) were fixed on 2026-11-04 (clean on 1.99.1). A root `clippy.toml` sets `msrv = "1.73"` so clippy never suggests the 1.88-only `as_chunks` fix; never apply it to engine code.
 
 ## 10. Risk
 

@@ -144,5 +144,5 @@ Also worth trying: G3/G4 binaries can be tested in the emulator, but G5 (`-mcpu=
 - **Mac-side scratch.** Logs and the extracted AppImage firmware are in the Mac session's temp scratchpad. Not needed on m900.
 - **This Mac's `~/.ssh/config`** has the new `g5` entry. m900's too (backup at `~/.ssh/config.bak-2026-10-30`). The G5's `~/.ssh/authorized_keys.bak-2026-10-30` was **not** created: the key was already there.
 - **The first, mis-aimed PowerPC run** re-ran `cargo vendor` in m900 `~/repos/rusty-backup/rb-cli-ppc/vendor`. It's gitignored and harmless.
-- **Clippy:** Homebrew/clippy 1.98 adds lints (`chunks_exact_to_as_chunks`, `drain_collect`) that fail the pre-commit hook in ~70 existing places, identically on `main`. Step 0 was committed with `--no-verify` for that reason. Never apply the `as_chunks` autofix: it needs Rust 1.88 and breaks the 1.73 floor.
+- **Clippy:** clean on 1.99.1 since 2026-11-04 (c2fc6c1b), so the pre-commit hook passes on a current Rust. The root `clippy.toml` (`msrv = "1.73"`) keeps clippy from suggesting the 1.88-only `as_chunks` fix; never apply it.
 - **Rust 1.73 on the Mac:** call `~/.rustup/toolchains/1.73.0-aarch64-apple-darwin/bin/{cargo,rustc}` directly with `RUSTC` set, because Homebrew's `rustc` comes first on `PATH`.
