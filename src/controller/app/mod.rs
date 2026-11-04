@@ -35,15 +35,7 @@ pub use disk_core::display::format_size;
 
 /// The CHD codec and profile choices the shared CHD options control offers.
 #[cfg(feature = "chd")]
-pub mod chd {
-    pub use crate::rbformats::chd_options::{
-        codec_label, codec_long_name, is_codec_supported, ChdOptions, ChdProfile,
-    };
-    pub use libchdman_rs::{
-        CHD_CODEC_CD_FLAC, CHD_CODEC_CD_LZMA, CHD_CODEC_CD_ZLIB, CHD_CODEC_CD_ZSTD, CHD_CODEC_FLAC,
-        CHD_CODEC_HUFF, CHD_CODEC_LZMA, CHD_CODEC_NONE, CHD_CODEC_ZLIB, CHD_CODEC_ZSTD,
-    };
-}
+pub mod chd;
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {

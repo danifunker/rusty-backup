@@ -90,8 +90,13 @@ impl RunState {
             .as_mut()
             .and_then(|rows| rows.iter_mut().find(|r| r.index == index))
         {
+            // Switching into Custom starts from the minimum, as the size cell shows it.
+            row.custom_mib = if mode == SizeMode::Custom && row.mode != SizeMode::Custom {
+                row.custom_bounds_mib().0
+            } else {
+                custom_mib
+            };
             row.mode = mode;
-            row.custom_mib = custom_mib;
         }
     }
 

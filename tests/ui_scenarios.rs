@@ -353,10 +353,13 @@ impl Target for InspectTarget {
 
 /// The Backup tab's controller. Actions: `OpenImage` (arg: a path, or `$blank_fat` for a fresh
 /// FAT image), `SetDestination` (a path, or `$out` for a temp folder), `SetName`, `SetFormat`
-/// (`zstd`, `vhd`, `chd`, `raw`), `SelectAll`, `SelectNone`, `Start`, `VhdClose`, `Close`.
-/// Probes: `source`, `partitions`, `selected`, `error` (why Start is refused, empty when it is
-/// not), `vhd_open`, `result` (`ok`, the failure, or empty), `output` (the backup folder holds a
-/// `metadata.json`), `log` (every line so far).
+/// (`zstd`, `vhd`, `chd`, `raw`), `SelectAll`, `SelectNone`, `SetSectorBySector` / `SetResize` /
+/// `SetSplit` (bool), `SetSplitMib` (int), `Start`, `VhdClose`, `VhdWholeDisk` (bool), `VhdSize`
+/// (`original`, `minimum` or a Custom MiB int, on the first row), `VhdStart`, `RemoteOpen`,
+/// `Close`. Probes: `source`, `partitions`, `selected`, `error` (why Start is refused, empty when
+/// it is not), `vhd_open`, `vhd_mode`, `vhd_custom_mib`, `vhd_at_minimum` (the Custom size is the
+/// row's lowest), `split_size` (0 for none), `resize`, `remote_open`, `result` (`ok`, the failure,
+/// or empty), `output` (the backup folder holds a `metadata.json`), `log` (every line so far).
 struct BackupTarget {
     ctl: rusty_backup::controller::backup::BackupController,
     dir: tempfile::TempDir,
@@ -423,8 +426,42 @@ impl Target for BackupTarget {
             }),
             "SelectAll" => BackupAction::SelectAll,
             "SelectNone" => BackupAction::SelectNone,
+            "SetSectorBySector" => {
+                BackupAction::SetSectorBySector(arg.and_then(Value::as_bool).ok_or("needs a bool")?)
+            }
+            "SetResize" => {
+                BackupAction::SetResize(arg.and_then(Value::as_bool).ok_or("needs a bool")?)
+            }
+            "SetSplit" => {
+                BackupAction::SetSplit(arg.and_then(Value::as_bool).ok_or("needs a bool")?)
+            }
+            "SetSplitMib" => BackupAction::SetSplitMib(
+                arg.and_then(Value::as_integer).ok_or("needs an int")? as u32,
+            ),
             "Start" => BackupAction::Start(None),
             "VhdClose" => BackupAction::VhdClose,
+            "VhdWholeDisk" => {
+                BackupAction::VhdWholeDisk(arg.and_then(Value::as_bool).ok_or("needs a bool")?)
+            }
+            "VhdSize" => {
+                use rusty_backup::controller::backup::SizeMode;
+                let row = self.ctl.vhd_rows().first().cloned().ok_or("no VHD row")?;
+                let (mode, custom_mib) = match arg {
+                    Some(Value::String(m)) if m == "original" => {
+                        (SizeMode::Original, row.custom_mib)
+                    }
+                    Some(Value::String(m)) if m == "minimum" => (SizeMode::Minimum, row.custom_mib),
+                    Some(Value::Integer(n)) => (SizeMode::Custom, *n as u32),
+                    _ => return Err("VhdSize needs original, minimum or a MiB int".into()),
+                };
+                BackupAction::VhdSize {
+                    index: row.index,
+                    mode,
+                    custom_mib,
+                }
+            }
+            "VhdStart" => BackupAction::VhdStart,
+            "RemoteOpen" => BackupAction::RemoteOpen,
             "Close" => BackupAction::CloseSource,
             other => return Err(format!("BackupController has no action {other:?}")),
         };
@@ -448,6 +485,29 @@ impl Target for BackupTarget {
             "selected" => Value::Integer(self.ctl.selected_count() as i64),
             "error" => Value::String(self.ctl.validate().err().unwrap_or_default()),
             "vhd_open" => Value::Boolean(self.ctl.vhd_open()),
+            "vhd_mode" => Value::String(
+                self.ctl
+                    .vhd_rows()
+                    .first()
+                    .map(|r| format!("{:?}", r.mode))
+                    .unwrap_or_default(),
+            ),
+            "vhd_custom_mib" => Value::Integer(
+                self.ctl
+                    .vhd_rows()
+                    .first()
+                    .map(|r| r.custom_mib as i64)
+                    .unwrap_or(-1),
+            ),
+            "vhd_at_minimum" => Value::Boolean(
+                self.ctl
+                    .vhd_rows()
+                    .first()
+                    .is_some_and(|r| r.custom_mib == r.custom_bounds_mib().0),
+            ),
+            "split_size" => Value::Integer(self.ctl.options().split_size().unwrap_or(0) as i64),
+            "resize" => Value::Boolean(self.ctl.options().resize),
+            "remote_open" => Value::Boolean(self.ctl.remote_dialog_open()),
             "result" => Value::String(match self.ctl.last_result() {
                 Some(Ok(())) => "ok".to_string(),
                 Some(Err(e)) => e.clone(),

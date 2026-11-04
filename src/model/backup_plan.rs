@@ -150,7 +150,21 @@ impl Default for BackupOptions {
     }
 }
 
+/// The split sizes the form accepts, in MiB.
+pub const SPLIT_MIB_MIN: u32 = 100;
+pub const SPLIT_MIB_MAX: u32 = 64000;
+
 impl BackupOptions {
+    /// The split size in force: a typed value outside the range is clamped into it.
+    pub fn split_mib_effective(&self) -> u32 {
+        self.split_mib.clamp(SPLIT_MIB_MIN, SPLIT_MIB_MAX)
+    }
+
+    /// Resize and keep-swap are for a trimmed copy, so a sector-by-sector copy locks them.
+    pub fn size_options_editable(&self) -> bool {
+        !self.sector_by_sector
+    }
+
     /// Resizing preserves nothing a sector-by-sector copy keeps, so it is off while that is on.
     pub fn resize_effective(&self) -> bool {
         self.resize && !self.sector_by_sector
@@ -162,7 +176,7 @@ impl BackupOptions {
             self.compression,
             CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
         );
-        (self.split && !single_file).then_some(self.split_mib)
+        (self.split && !single_file).then_some(self.split_mib_effective())
     }
 
     /// The split option is offered at all (chdman and MAME do not read split CHDs).
@@ -377,6 +391,10 @@ mod tests {
         assert_eq!(o.split_size(), None);
         assert!(!o.split_shown());
         o.compression = CompressionType::None;
+        o.split_mib = 5;
+        assert_eq!(o.split_size(), Some(SPLIT_MIB_MIN));
+        o.split_mib = 1_000_000;
+        assert_eq!(o.split_size(), Some(SPLIT_MIB_MAX));
         o.split = false;
         assert_eq!(o.split_size(), None);
     }

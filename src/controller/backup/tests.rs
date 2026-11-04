@@ -198,3 +198,44 @@ fn a_vanished_device_is_cleared() {
         .iter()
         .any(|(_, m)| m.contains("no longer listed")));
 }
+
+#[test]
+fn a_vhd_custom_size_starts_at_the_minimum_and_is_clamped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = controller();
+    open(&mut ctl, blank_fat(dir.path()));
+    ctl.apply(BackupAction::SetDestination(Some(dir.path().to_path_buf())));
+    ctl.apply(BackupAction::SetFormat(CompressionType::Vhd));
+    ctl.apply(BackupAction::Start(None));
+    let row = ctl.vhd_rows()[0].clone();
+    assert_eq!(row.mode_choices()[0], SizeMode::Original);
+    assert_eq!(row.mode_choices().last(), Some(&SizeMode::Custom));
+    let (lo, hi) = row.custom_bounds_mib();
+    assert!(lo >= 1 && hi >= lo);
+    ctl.apply(BackupAction::VhdSize {
+        index: row.index,
+        mode: SizeMode::Custom,
+        custom_mib: 999,
+    });
+    assert_eq!(ctl.vhd_rows()[0].custom_mib, lo);
+    ctl.apply(BackupAction::VhdSize {
+        index: row.index,
+        mode: SizeMode::Custom,
+        custom_mib: 1_000_000,
+    });
+    assert_eq!(ctl.vhd_rows()[0].custom_mib, 1_000_000);
+    assert_eq!(ctl.vhd_rows()[0].effective_size(), hi as u64 * 1024 * 1024);
+}
+
+#[test]
+fn remote_drive_opens_only_when_built() {
+    let mut ctl = controller();
+    ctl.apply(BackupAction::RemoteOpen);
+    assert_eq!(
+        ctl.remote_dialog_open(),
+        BackupController::remote_available()
+    );
+    if !BackupController::remote_available() {
+        assert!(ctl.take_log().iter().any(|(_, m)| m == REMOTE_NOT_BUILT));
+    }
+}

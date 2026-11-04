@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::backup::{
     format_size, BackupAction, BackupController, BackupServices, ChdChoice, ChdProfile,
-    ChecksumType, CompactCell, CompressionType, HostRequest, MinCell,
+    ChecksumType, CompactCell, CompressionType, HostRequest, MinCell, SPLIT_MIB_MAX, SPLIT_MIB_MIN,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller as _, Effect};
@@ -502,7 +502,7 @@ impl BackupTab {
             {
                 actions.push(BackupAction::SetSectorBySector(sbs));
             }
-            ui.add_enabled_ui(!opts.sector_by_sector, |ui| {
+            ui.add_enabled_ui(opts.size_options_editable(), |ui| {
                 ui.horizontal(|ui| {
                     let mut resize = opts.resize;
                     if ui
@@ -511,12 +511,12 @@ impl BackupTab {
                     {
                         actions.push(BackupAction::SetResize(resize));
                     }
-                    if opts.sector_by_sector {
+                    if !opts.size_options_editable() {
                         ui.label("(not available with sector-by-sector copy)");
                     }
                 });
             });
-            ui.add_enabled_ui(!opts.sector_by_sector, |ui| {
+            ui.add_enabled_ui(opts.size_options_editable(), |ui| {
                 ui.horizontal(|ui| {
                     let mut keep = opts.keep_swap;
                     if ui
@@ -531,7 +531,7 @@ impl BackupTab {
                     {
                         actions.push(BackupAction::SetKeepSwap(keep));
                     }
-                    if opts.sector_by_sector {
+                    if !opts.size_options_editable() {
                         ui.label("(not available with sector-by-sector copy)");
                     }
                 });
@@ -548,7 +548,10 @@ impl BackupTab {
                             ui.label("Split size (MiB):");
                             let mut mib = opts.split_mib;
                             if ui
-                                .add(egui::DragValue::new(&mut mib).range(100..=64000))
+                                .add(
+                                    egui::DragValue::new(&mut mib)
+                                        .range(SPLIT_MIB_MIN..=SPLIT_MIB_MAX),
+                                )
                                 .changed()
                             {
                                 actions.push(BackupAction::SetSplitMib(mib));

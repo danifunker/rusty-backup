@@ -13,6 +13,10 @@ use crate::remote::protocol::WireDevice;
 #[cfg(feature = "remote")]
 use crate::remote::RemoteConnection;
 
+/// Why "Remote Drive..." does nothing in a build without the `remote` feature.
+pub const REMOTE_NOT_BUILT: &str =
+    "Remote drives aren't compiled into this build (no `remote` feature).";
+
 #[cfg(feature = "remote")]
 type Conn = Arc<Mutex<RemoteConnection>>;
 
@@ -159,11 +163,13 @@ impl BackupController {
     }
 
     pub(super) fn remote_open(&mut self) {
-        self.remote.dialog = true;
         #[cfg(feature = "remote")]
         {
+            self.remote.dialog = true;
             self.remote.address = self.remote.addr.clone().unwrap_or_default();
         }
+        #[cfg(not(feature = "remote"))]
+        self.warn(REMOTE_NOT_BUILT);
     }
 
     #[cfg(feature = "remote")]

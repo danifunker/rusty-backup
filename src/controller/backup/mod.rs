@@ -12,6 +12,7 @@
 //! [`HostRequest`]. See docs/phase2_commander_plan.md § "Slice 12".
 
 mod remote;
+pub use remote::REMOTE_NOT_BUILT;
 mod run;
 mod source;
 
@@ -31,6 +32,7 @@ use crate::partition::PartitionInfo;
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::backup::{ChecksumType, CompressionType};
+pub use crate::model::backup_plan::{SPLIT_MIB_MAX, SPLIT_MIB_MIN};
 pub use crate::model::job::{JobRegistry, NoNotify};
 pub use crate::model::size_mode::SizeMode;
 pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
@@ -194,9 +196,31 @@ pub struct VhdRow {
 }
 
 impl VhdRow {
+    /// The size the export gets; a Custom size outside [`Self::custom_bounds_mib`] is clamped.
     pub fn effective_size(&self) -> u64 {
-        self.mode
-            .effective_size(self.original_size, self.minimum_size, self.custom_mib)
+        let (lo, hi) = self.custom_bounds_mib();
+        self.mode.effective_size(
+            self.original_size,
+            self.minimum_size,
+            self.custom_mib.clamp(lo, hi),
+        )
+    }
+
+    /// The size modes this row offers: Minimum only once a minimum below the original is known.
+    pub fn mode_choices(&self) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.minimum_size < self.original_size {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        modes
+    }
+
+    /// A Custom size's range in MiB: the minimum (at least 1) up to the original.
+    pub fn custom_bounds_mib(&self) -> (u32, u32) {
+        let mib = |b: u64| (b / (1024 * 1024)).min(u32::MAX as u64) as u32;
+        let lo = mib(self.minimum_size).max(1);
+        (lo, mib(self.original_size).max(lo))
     }
 }
 
@@ -353,6 +377,11 @@ impl BackupController {
     /// A device or image is selected (a remote drive is not counted).
     pub fn has_local_source(&self) -> bool {
         self.source.is_some()
+    }
+
+    /// This build can back up a drive on an `rb-cli serve` daemon (the `remote` feature).
+    pub fn remote_available() -> bool {
+        cfg!(feature = "remote")
     }
 
     pub fn has_source(&self) -> bool {
