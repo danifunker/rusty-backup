@@ -410,15 +410,18 @@ What wrote them is unknown. After the skip, the later entries in most of these
 archives decode with good CRCs.
 
 StuffIt 5 archives keep absolute offsets, so a text conversion cannot be
-skipped over. `damage_hint` names the conversions it can prove from byte
+skipped over. `damage_hint` names the two conversions it can prove from byte
 statistics alone (files of 4 KiB or more, where every byte value should occur):
 - **No 0x0d byte anywhere** (#102, `LogoWriter.sea.hqx`, `POV-Ray ... .hqx`):
   the file went through a Mac-to-Unix line-ending conversion. CR LF became LF,
   which shifted the header's flags byte (0x10) into the version slot and gave
   "version 16", and every other CR became LF. A StuffIt 5 header whose bytes
   78..80 are not CR LF is reported as damaged.
+- **No C0, C1 or F5-FF byte anywhere** (#103, `MacPaint.sit`): those are the
+  byte values UTF-8 never uses, so the file was decoded and re-encoded as text.
+  Every 0xA5 of the 0xA5A5A5A5 entry ids was lost with them.
 
-This damage cannot be undone: the conversion is many-to-one.
+Neither kind of damage can be undone: the conversions are many-to-one.
 
 ---
 

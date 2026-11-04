@@ -141,7 +141,10 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
 
         let headid = cur.u32()?;
         if headid != SIT5_ID {
-            bail!("StuffIt 5: bad entry id {headid:#x} at {offs}");
+            bail!(
+                "StuffIt 5: bad entry id {headid:#x} at {offs}{}",
+                crate::stuffit::damage_hint(data)
+            );
         }
         let entry_version = cur.u8()?;
         cur.skip(1)?;
@@ -331,6 +334,19 @@ mod tests {
         assert!(!err.contains("version 16"), "{err}");
         assert!(err.contains("offset 78 reads 0a 1a"), "{err}");
         assert!(err.contains("line-ending"), "{err}");
+    }
+
+    #[test]
+    fn utf8_conversion_is_named() {
+        // Issue #103: a UTF-8 round trip drops C0, C1 and F5-FF, so the A5A5A5A5 entry id is lost.
+        let mut data = sit5_header();
+        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x38, 0x00, 0x40, 0x14, 0x50, 0x00]);
+        let mut missing = vec![0xc0, 0xc1];
+        missing.extend(0xf5..=0xff);
+        data.extend(filler_without(&missing, 8000));
+        let err = parse(&data).unwrap_err().to_string();
+        assert!(err.contains("bad entry id"), "{err}");
+        assert!(err.contains("UTF-8"), "{err}");
     }
 
     #[test]

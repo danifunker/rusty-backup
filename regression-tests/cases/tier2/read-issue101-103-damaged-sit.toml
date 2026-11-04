@@ -1,0 +1,51 @@
+# Tier 2 — GitHub issues #101, #102 and #103: StuffIt archives damaged before
+# they reached us. Background and evidence: docs/native_mac_archives.md § 6a.
+#
+# #101: 149 bytes no length field counts follow the first file entry. The walk
+# used to stop there ("entry header CRC mismatch"); it now skips to the next
+# valid header, warns, and the later entries extract with good CRCs.
+# #102: a text-mode transfer turned every CR into LF, so the StuffIt 5 header
+# read "version 16". #103: a UTF-8 round trip dropped the A5 bytes of every
+# entry id. Neither can be repaired; the error now says what happened.
+#
+# The Unarchiver 1.10.8 (`lsar -t`) fails all of these at the same points.
+
+[meta]
+tier = 2
+group = "archive.read.damaged-sit"
+description = "Damaged StuffIt archives list what survives and name the damage."
+
+[[case]]
+id = "read.archive.sit.issue101-gap-freehand7"
+description = "A classic .sit with 149 stray bytes after its first entry lists and extracts the rest"
+fixture = "arc.sit.issue101-freehand7"
+timeout_ms = 600000
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 0
+stderr_contains = ["149 unexpected bytes at offset 1435567"]
+stdout_contains = ["Disk 8/Segment.8", "Disk 10/Freehand Read me"]
+[[case.step]]
+args = ["archive", "extract", "--format", "raw", "{fixture}", "{scratch}/ex"]
+expect_exit = 0
+stderr_contains = ["Skipped Disk 7/Segment.7", "11 files extracted"]
+file_sha256 = [{ path = "{scratch}/ex/Disk 8/Segment.8", sha256 = "3528f4f8783f036141731adefb0d8cc696256bc75747e7dd5dd6fc335555819d" }]
+
+[[case]]
+id = "read.archive.sit5.issue102-line-endings"
+description = "A StuffIt 5 archive with its CRs turned into LFs is reported as a text-mode transfer"
+fixture = "arc.sit5.issue102-logowriter"
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 1
+stderr_contains = ["offset 78 reads 0a 1a", "line-ending"]
+stderr_not_contains = ["version 16"]
+
+[[case]]
+id = "read.archive.sit5.issue103-utf8"
+description = "A StuffIt 5 archive that went through a UTF-8 round trip is reported as such"
+fixture = "arc.sit5.issue103-macpaint"
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 1
+stderr_contains = ["bad entry id 0x40145000 at 114", "UTF-8"]
