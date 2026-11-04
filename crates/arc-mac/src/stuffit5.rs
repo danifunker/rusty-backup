@@ -26,6 +26,17 @@ pub fn is_stuffit5(data: &[u8]) -> bool {
     data.len() >= SIT5_MAGIC.len() && &data[..SIT5_MAGIC.len()] == SIT5_MAGIC
 }
 
+/// [`crate::stuffit::damage_hint`], falling back to naming the header's own line-ending damage.
+fn line_ending_hint(data: &[u8]) -> &'static str {
+    match crate::stuffit::damage_hint(data) {
+        "" => {
+            " - the file went through a text-mode (line-ending) conversion that rewrote the \
+             compressed data; it cannot be repaired, fetch a copy transferred in binary mode"
+        }
+        h => h,
+    }
+}
+
 /// A minimal big-endian cursor over the archive bytes.
 struct Cursor<'a> {
     data: &'a [u8],
@@ -85,6 +96,15 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
     }
     if data.len() < 100 {
         bail!("StuffIt 5: truncated header");
+    }
+    // The signature text ends in CR LF at 78; a text-mode transfer collapses it (#102).
+    if &data[78..80] != b"\r\n" {
+        bail!(
+            "StuffIt 5: damaged archive header - the CR LF at offset 78 reads {:02x} {:02x}{}",
+            data[78],
+            data[79],
+            line_ending_hint(data)
+        );
     }
     let version = data[82];
     if version != 5 {
@@ -279,6 +299,39 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 100-byte archive header plus 14 reserved bytes; the first entry goes at 114.
+    fn sit5_header() -> Vec<u8> {
+        let mut h =
+            b"StuffIt (c)1997-1998 Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/\r\n"
+                .to_vec();
+        assert_eq!(h.len(), 80);
+        h.extend_from_slice(&[0x1a, 0x00, 5, 0x10]);
+        h.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x72, 0, 1, 0, 0, 0, 0x72, 0, 0]);
+        h.extend_from_slice(b"\xa5\xa5Reserved\xa5\xa5\x00\xa5");
+        assert_eq!(h.len(), 114);
+        h
+    }
+
+    /// Filler that has every byte value except the ones in `missing`.
+    fn filler_without(missing: &[u8], len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i % 256) as u8)
+            .filter(|b| !missing.contains(b))
+            .collect()
+    }
+
+    #[test]
+    fn line_ending_conversion_is_named() {
+        // Issue #102: CR LF -> LF at offset 78 shifts the flags byte (0x10) into the version slot.
+        let mut data = sit5_header();
+        data.remove(78);
+        data.extend(filler_without(&[0x0d], 8000));
+        let err = parse(&data).unwrap_err().to_string();
+        assert!(!err.contains("version 16"), "{err}");
+        assert!(err.contains("offset 78 reads 0a 1a"), "{err}");
+        assert!(err.contains("line-ending"), "{err}");
+    }
 
     #[test]
     fn rejects_non_sit5() {
