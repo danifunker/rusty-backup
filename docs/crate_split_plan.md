@@ -41,11 +41,12 @@ All names were checked against crates.io on 2026-10-30 and are free. `fs-core` w
 | `fs-qnx` | QNX 2 (wraps `qnx2fs`), QNX 4, QNX 6 | |
 | `fs-xerox` | Alto (Pilot/Cedar later). **Co-copyright: Alan Steremberg** | |
 
-### Filesystem tools (1)
+### Filesystem tools (2)
 
 | Crate | Contents |
 |---|---|
 | `fs-tar` | export any `disk-core` filesystem (or a folder in it) to `.tar` / `.tar.gz` / `.tar.zst`, and import a tar into any editable filesystem. Handles permissions, symlinks, times and case-insensitive filesystems. Builds on the `tar` crate. |
+| `rb-fsexporter` | export any `disk-core` filesystem (a file, a folder, a whole volume) to a host folder: Mac forks in every `fs-mac` mode, symlinks (a text file where the host refuses one), existing-file / error / case-collision policies, POSIX modes, progress and cancel through a `Host` trait. Depends on `disk-core` and `fs-mac` only. Added in Phase 2 slice 19 (docs/phase2_commander_plan.md). |
 
 ### Partition tables (1)
 

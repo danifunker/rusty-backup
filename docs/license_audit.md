@@ -28,6 +28,7 @@ This is engineering evidence (what matches what), **not legal advice**. Anything
 | `fs-8bit/oric.rs` | MAME `fs_oric_jasmin.cpp`: `prepare_name` is a close translation of `file_name_prepare` | BSD-3-Clause (Olivier Galibert) | NOTICE | **Done:** `crates/fs-8bit/THIRD_PARTY_NOTICES.md` |
 | `fs-8bit/dragondos.rs` | MAME imgtool `dgndos.cpp` (layout reference) | BSD-3-Clause (tim lindner) | FACTS / NOTICE | Covered by the same notice file, as a precaution |
 | other `fs-8bit` modules, `disk-core` | MAME imgtool as a test oracle only | n/a | FACTS | none |
+| `rb-fsexporter` (new 2026-11-04, Phase 2 slice 19) | none: the walker that was `model::extract`, the disc walker and `rb-cli optical extract`, all our own; forks through `fs-mac`'s encoders | n/a | CLEAN (MIT) | none. Depends on `fs-mac`, so a build with it carries the GPL-2.0-only `fs-mac-unicode`, as `fs-tar`'s `appledouble` does; its README says so |
 
 ### Filesystems (future `fs-*` crates)
 

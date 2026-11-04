@@ -1447,7 +1447,7 @@ that copy a filesystem tree out to host files:
 
 ### Plan
 
-1. `crates/fs-extract` (MIT, 0.1.0, beside `fs-tar` under "Filesystem tools" in
+1. `crates/rb-fsexporter` (MIT, 0.1.0, beside `fs-tar` under "Filesystem tools" in
    crate_split_plan.md): `extract` (an entry: a file, a folder, or a whole volume) and
    `extract_contents` (a folder's children) over any `disk_core::filesystem::Filesystem`,
    writing forks through `fs_mac::fork_export` (no encoder of its own). `Options` holds the
@@ -1483,6 +1483,75 @@ that copy a filesystem tree out to host files:
    - **R4** BinHex mode writes `.hqx` files (the disc walker wrote the data fork).
    The identity goldens are recaptured only where these rules explain the change.
 
+### Steps
+
+1. (60695e46) This plan.
+2. (17baa02f) `crates/rb-fsexporter` 0.1.0 (MIT; the user named it, 2026-11-04: an export helper,
+   not a filesystem family) and `fs-mac` 0.1.1 (`fork_export::export_file_with_fork_opts`,
+   `ForkExportOptions { finder_info_sidecar }`). API: `extract`, `extract_contents`, `count`,
+   `existing_outputs`, `top_name`, `volume_folder_name`, `is_volume_root`, `write_symlink`;
+   `Options` (`fork_mode`, `finder_info_sidecar`, `symlinks`, `on_error`, `existing`,
+   `case_collision`, `recursive`, `posix_modes`, `volume_folder`), `Host` (`cancelled`,
+   `started`, `wrote`, `failed`, `exists`, `collision`, `host_name`, `write_file`), `Summary`,
+   `Cancelled`. Tests in the crate (a memory filesystem), on 1.73 too.
+3. (470d218d) Callers: `model::extract` is the app's `Host` over `HostCopyStatus` (ProDOS
+   suffix, QNX 2 RS -> LF); a disc goes through it with `DiscChoice::extract_filesystem`
+   (`OpticalFilesystem::with_extract_metadata`: Mac dates, POSIX mode / owner), the entry
+   looked up again in that filesystem, no Finder-info-only sidecar and stop-on-error.
+   `HostCopyJob::DiscExtract`, `DiscExtractJob`, `DiscChoice::extract_path` / `has_forks` and
+   the disc walker are gone. `export_selection`'s folder outputs (`folder_recurse` gone) and
+   `copy_image_entries_to_host` (F6 to a host pane) call the crate. `rb-cli optical extract
+   --to` calls `extract` / `extract_contents` with its settings; `--tar` keeps its tar writer.
+
+### Byte changes
+
+The identity test's 50 recaptured cases, each checked by diffing the old and new manifests
+with the four rules undone (nothing else differed):
+
+- `extract / <mode>` on every choice whose root extract succeeds: **R2** (the top folder is
+  `RETRO` for the hybrid ISO side, `HFS+ Volume` for its HFS+ side, `RRDISC` for the Rock
+  Ridge disc, `PReP boot partition` for the boot area): `hybrid`, `hybrid-cue`, `hybrid-chd`
+  fs0 and fs1 in AppleDouble, MacBinary, SeparateRsrc, DataForkOnly (24); `rr` and `rr-prep`
+  fs0 in Native, AppleDouble, MacBinary, SeparateRsrc, DataForkOnly (10, also **R1**: `link`);
+  `rr-prep` fs1 in those five (5).
+- `extract / BinHex` on the same choices: **R2** and **R4** (9; the Rock Ridge fs0 ones also
+  **R1**).
+- `rr fs0 extract /link`, `rr-prep fs0 extract /link`: **R1**.
+- Unchanged: Native on the hybrid discs still errors off macOS (stop-on-error); the
+  AppleDouble / MacBinary dates (**R3**) match the old disc walker, which already wrote them,
+  so no case moved for R3; every export, tree and preview case.
+
+`rb-cli optical extract --to` against the pre-slice binary, on `rock_ridge.iso`,
+`hybrid_rsrc.iso` (both sides, all five fork modes), the opentransport and StuffIt HFS discs,
+the EFS and Joliet discs, with `--path`, `-r` and `--preserve-permissions`: the same trees,
+modes and bytes except **R1** (the Rock Ridge `link` is a symlink, not an empty file); a
+skipped entry's warning now names the step that failed ("writing native resource fork of
+...").
+
+Commander / Inspect: a whole-volume extract's folder is the volume name (**R2**), a symlink
+is created on every host (a text file where refused; Unix only before) (**R1**). The tests
+listed in the brief pass unchanged.
+
+### Decisions for the user
+
+- Two per-caller settings keep the old disc / CLI bytes: discs and `rb-cli optical extract`
+  write an AppleDouble sidecar only for a resource fork (Commander also writes one for
+  type / creator codes alone), and a disc extraction stops at the first error (Commander and
+  the CLI skip the entry and go on). Unify either way, or keep.
+
+### Left
+
+- Publish, in order: `fs-mac` 0.1.1, then `rb-fsexporter` 0.1.0 (publish-crates.yml, dry
+  run first).
+- `rb-cli get` keeps its own walker (a `cp`-shaped verb: globs, data forks only, symlinks
+  always as text); it could move onto the crate with `Symlinks::Create` if its contract
+  changes.
+- `optical extract --tar`'s help still says symlinks don't survive a loose extract; the
+  help text is pinned by the CLI snapshot, so it changes with the next CLI-doc pass.
+- Pre-existing, not from this slice: `rb-regress` `optical.extract.path-dir-stops-at-one-level`,
+  `path-dir-recursive-descends` and `nested-dir-addressable-directly` fail on the
+  opentransport disc with the pre-slice binary too (5 entries where the case wants 10).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1506,7 +1575,7 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Next steps
 
-1. **Slice 19: one extractor, in a crate.** A new MIT crate (working name `fs-extract`)
+1. **Slice 19: one extractor, in a crate** (done, above; publish pending). A new MIT crate (`rb-fsexporter`)
    over `disk-core` and `fs-mac` (the fork encoders already live in `fs-mac` /
    `arc-mac`; `disk-core` can't hold it because `fs-mac` depends on `disk-core`). It
    replaces `model::extract`, the disc walker in `model::optical_browse`, and
