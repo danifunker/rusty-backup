@@ -12,6 +12,8 @@
 //! in `fs-mac`, none here. Symlinks become host symlinks, or a small text file holding the
 //! target (`target\n`) where the host refuses one. [`Options`] also carries an existing-file
 //! policy, case-collision handling for case-insensitive hosts, POSIX modes and an error policy.
+//! A [`Host`] that answers [`Host::on_error`] decides each failure itself: skip it, skip it and
+//! every later one ([`ErrorChoice::SkipAll`]), or stop, as a prompt to the user would.
 //!
 //! Progress, cancellation and the per-entry reports go through the [`Host`] trait, which also
 //! lets a caller rename files (e.g. a ProDOS `#TTAAAA` suffix) or write one itself (a text
@@ -37,12 +39,23 @@ pub enum Symlinks {
     Skip,
 }
 
-/// What an entry that fails to extract does to the rest of the run.
+/// What an entry that fails to extract does to the rest of the run, unless [`Host::on_error`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     /// Report it through [`Host::failed`] and carry on with its siblings.
     SkipEntry,
     /// Stop the extraction with the error.
+    Stop,
+}
+
+/// A [`Host`]'s answer to an entry that failed ([`Host::on_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorChoice {
+    /// Skip this entry (reported through [`Host::failed`]) and ask again at the next failure.
+    Skip,
+    /// Skip this entry and every later failure of the run without asking.
+    SkipAll,
+    /// Stop the extraction with the error; what was written stays.
     Stop,
 }
 
@@ -142,7 +155,12 @@ pub trait Host {
     fn started(&mut self, _entry: &FileEntry) {}
     /// A file or symlink was written: `bytes` for it, `total` so far.
     fn wrote(&mut self, _entry: &FileEntry, _bytes: u64, _total: &Summary) {}
-    /// An entry failed and was skipped ([`OnError::SkipEntry`]).
+    /// An entry below the starting point failed: `Some` answers for this run, overriding
+    /// [`Options::on_error`]; `None` (the default) follows it.
+    fn on_error(&mut self, _entry: &FileEntry, _err: &anyhow::Error) -> Option<ErrorChoice> {
+        None
+    }
+    /// An entry failed and was skipped ([`OnError::SkipEntry`] or an [`ErrorChoice`] skip).
     fn failed(&mut self, _entry: &FileEntry, _err: &anyhow::Error) {}
     /// A file was left because its output exists ([`Existing::Skip`]).
     fn exists(&mut self, _path: &Path) {}
@@ -260,6 +278,8 @@ pub fn extract(
         opts,
         host,
         summary: Summary::default(),
+        skip_all: false,
+        stopped: false,
     };
     if is_volume_root(entry) {
         if !opts.volume_folder {
@@ -289,6 +309,8 @@ pub fn extract_contents(
         opts,
         host,
         summary: Summary::default(),
+        skip_all: false,
+        stopped: false,
     };
     w.children(dir, dest)?;
     Ok(w.summary)
@@ -299,6 +321,10 @@ struct Walker<'a> {
     opts: &'a Options,
     host: &'a mut dyn Host,
     summary: Summary,
+    /// The host answered [`ErrorChoice::SkipAll`]: later failures are skipped without asking.
+    skip_all: bool,
+    /// A failure stopped the run: its error passes up through every folder unasked.
+    stopped: bool,
 }
 
 impl Walker<'_> {
@@ -314,14 +340,37 @@ impl Walker<'_> {
         // Each folder is its own case-collision namespace.
         let mut used = HashSet::new();
         for child in &kids {
-            match self.entry(child, host_dir, &mut used, false) {
-                Ok(()) => {}
-                Err(e) if self.opts.on_error == OnError::Stop => return Err(e),
-                Err(e) if e.is::<Cancelled>() || self.host.cancelled() => return Err(e),
-                Err(e) => self.host.failed(child, &e),
+            if let Err(e) = self.entry(child, host_dir, &mut used, false) {
+                self.settle_error(child, e)?;
             }
         }
         Ok(())
+    }
+
+    /// `Ok` when the failed `entry` is skipped, its error when the run stops.
+    fn settle_error(&mut self, entry: &FileEntry, e: anyhow::Error) -> Result<()> {
+        if self.stopped || e.is::<Cancelled>() || self.host.cancelled() {
+            return Err(e);
+        }
+        let choice = match self.skip_all {
+            true => ErrorChoice::SkipAll,
+            false => match self.host.on_error(entry, &e) {
+                Some(choice) => choice,
+                None if self.opts.on_error == OnError::Stop => ErrorChoice::Stop,
+                None => ErrorChoice::Skip,
+            },
+        };
+        match choice {
+            ErrorChoice::Stop => {
+                self.stopped = true;
+                Err(e)
+            }
+            ErrorChoice::Skip | ErrorChoice::SkipAll => {
+                self.skip_all |= choice == ErrorChoice::SkipAll;
+                self.host.failed(entry, &e);
+                Ok(())
+            }
+        }
     }
 
     fn entry(

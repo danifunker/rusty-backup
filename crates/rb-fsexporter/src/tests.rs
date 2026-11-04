@@ -8,7 +8,7 @@ struct Mem {
     label: Option<String>,
     nodes: HashMap<String, (FileEntry, Vec<u8>, Vec<u8>)>,
     kids: HashMap<String, Vec<String>>,
-    broken: Option<String>,
+    broken: Vec<String>,
 }
 
 impl Mem {
@@ -17,7 +17,7 @@ impl Mem {
             label: label.map(str::to_string),
             nodes: HashMap::new(),
             kids: HashMap::new(),
-            broken: None,
+            broken: Vec::new(),
         };
         m.nodes
             .insert("/".into(), (FileEntry::root(), Vec::new(), Vec::new()));
@@ -65,7 +65,7 @@ impl Filesystem for Mem {
         Ok(kids.iter().map(|p| self.nodes[p].0.clone()).collect())
     }
     fn read_file(&mut self, entry: &FileEntry, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        if self.broken.as_deref() == Some(entry.path.as_str()) {
+        if self.broken.iter().any(|b| *b == entry.path) {
             return Err(FilesystemError::Parse("bad sector".into()));
         }
         let mut d = self.nodes[&entry.path].1.clone();
@@ -237,7 +237,7 @@ fn a_refused_symlink_is_a_text_file_with_the_target() {
 #[test]
 fn a_bad_entry_is_skipped_or_stops_the_run() {
     let mut fs = sample();
-    fs.broken = Some("/docs/a.txt".into());
+    fs.broken = vec!["/docs/a.txt".into()];
     let root = fs.entry("/");
     let dest = tempfile::tempdir().unwrap();
     let mut opts = Options::new(ResourceForkMode::AppleDouble);
@@ -251,6 +251,113 @@ fn a_bad_entry_is_skipped_or_stops_the_run() {
     opts.on_error = OnError::Stop;
     let stop = tempfile::tempdir().unwrap();
     assert!(extract(&mut fs, &root, stop.path(), &opts, &mut NoHost).is_err());
+}
+
+/// A host that answers each failure from a script and records what it was asked.
+struct Asker {
+    answers: Vec<ErrorChoice>,
+    asked: Vec<String>,
+    skipped: Vec<String>,
+}
+
+impl Asker {
+    fn new(answers: &[ErrorChoice]) -> Self {
+        Asker {
+            answers: answers.to_vec(),
+            asked: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+}
+
+impl Host for Asker {
+    fn on_error(&mut self, entry: &FileEntry, _err: &anyhow::Error) -> Option<ErrorChoice> {
+        self.asked.push(entry.path.clone());
+        Some(self.answers.remove(0))
+    }
+    fn failed(&mut self, entry: &FileEntry, err: &anyhow::Error) {
+        self.skipped.push(format!("{} {err:#}", entry.path));
+    }
+}
+
+/// `sample()` with three unreadable files, met in this order.
+fn three_bad() -> Mem {
+    let mut fs = sample();
+    fs.file("/docs/c.txt", b"gamma");
+    fs.file("/z.txt", b"zed");
+    fs.broken = vec!["/docs/a.txt".into(), "/docs/c.txt".into(), "/z.txt".into()];
+    fs
+}
+
+#[test]
+fn skip_asks_again_at_each_failure() {
+    let mut fs = three_bad();
+    let root = fs.entry("/");
+    let dest = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(ResourceForkMode::AppleDouble);
+    // The host's answer wins over the policy.
+    opts.on_error = OnError::Stop;
+    let mut host = Asker::new(&[ErrorChoice::Skip; 3]);
+    let s = extract(&mut fs, &root, dest.path(), &opts, &mut host).unwrap();
+    assert_eq!(s.files, 2);
+    assert_eq!(host.asked, ["/docs/a.txt", "/docs/c.txt", "/z.txt"]);
+    assert_eq!(host.skipped.len(), 3);
+}
+
+#[test]
+fn skip_all_skips_every_later_failure_without_asking() {
+    let mut fs = three_bad();
+    let root = fs.entry("/");
+    let dest = tempfile::tempdir().unwrap();
+    let opts = Options::new(ResourceForkMode::AppleDouble);
+    let mut host = Asker::new(&[ErrorChoice::SkipAll]);
+    let s = extract(&mut fs, &root, dest.path(), &opts, &mut host).unwrap();
+    assert_eq!(s.files, 2);
+    assert_eq!(host.asked, ["/docs/a.txt"]);
+    assert_eq!(
+        host.skipped,
+        [
+            "/docs/a.txt extracting 'a.txt': parse error: bad sector",
+            "/docs/c.txt extracting 'c.txt': parse error: bad sector",
+            "/z.txt extracting 'z.txt': parse error: bad sector"
+        ]
+    );
+    assert!(dest.path().join("MY DISK/top.txt").is_file());
+}
+
+#[test]
+fn stop_ends_the_run_and_keeps_what_was_written() {
+    let mut fs = three_bad();
+    let root = fs.entry("/");
+    let dest = tempfile::tempdir().unwrap();
+    let opts = Options::new(ResourceForkMode::AppleDouble);
+    let mut host = Asker::new(&[ErrorChoice::Skip, ErrorChoice::Stop]);
+    let err = extract(&mut fs, &root, dest.path(), &opts, &mut host).unwrap_err();
+    assert!(format!("{err:#}").contains("bad sector"));
+    assert_eq!(host.asked, ["/docs/a.txt", "/docs/c.txt"]);
+    assert_eq!(
+        host.skipped,
+        ["/docs/a.txt extracting 'a.txt': parse error: bad sector"]
+    );
+    // /docs/deep came before the second failure and stays; /top.txt and /z.txt never ran.
+    assert!(dest.path().join("MY DISK/docs/deep/b.txt").is_file());
+    assert!(!dest.path().join("MY DISK/top.txt").exists());
+}
+
+#[test]
+fn a_host_that_does_not_answer_follows_the_policy() {
+    let mut fs = three_bad();
+    let root = fs.entry("/");
+    let dest = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(ResourceForkMode::AppleDouble);
+    let mut log = Log::default();
+    extract(&mut fs, &root, dest.path(), &opts, &mut log).unwrap();
+    let failed = log.lines.iter().filter(|l| l.starts_with("failed "));
+    assert_eq!(failed.count(), 3);
+    opts.on_error = OnError::Stop;
+    let mut log = Log::default();
+    assert!(extract(&mut fs, &root, dest.path(), &opts, &mut log).is_err());
+    assert!(!log.lines.iter().any(|l| l.starts_with("failed ")));
 }
 
 #[test]

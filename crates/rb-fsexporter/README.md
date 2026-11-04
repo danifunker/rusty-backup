@@ -6,6 +6,7 @@ Export a tree from any [`disk-core`](https://crates.io/crates/disk-core) filesys
 - **Mac forks** in every `fs-mac` mode: AppleDouble `._name` sidecars, MacBinary `.bin`, BinHex `.hqx`, `.rsrc` sidecars, the macOS named fork, or data forks only. The encoders are `fs-mac`'s; this crate has none of its own.
 - **Symlinks** become host symlinks; where the host refuses one (Windows without the privilege, for instance), a small text file holding the target.
 - **Policies:** existing files (overwrite, skip, fail), errors (skip the entry, or stop), case collisions on a case-insensitive host (rename with `~N`, skip, refuse), POSIX permission bits, recursion.
+- **Asking about errors:** a `Host` that answers `on_error` decides each failed entry itself, as a prompt to the user would: `Skip` it (and ask again next time), `SkipAll` (skip it and every later failure without asking), or `Stop` (end the run with the error, keeping what was written). Every skipped entry is reported through `Host::failed`, so the host holds the list for a summary even when a later answer stops the run.
 - **Progress and cancel** through a `Host` trait, which also receives the per-entry reports and can rename a file or write it itself (a text conversion, per-file compression).
 
 ## Compatible crates
@@ -33,6 +34,10 @@ Every filesystem in these crates implements `disk_core::filesystem::Filesystem`,
 | `dsk-tape` | tape images |
 
 Optical discs (`opticaldiscs`) have their own filesystem trait; rusty-backup exports them through its adapter, not directly.
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Dependencies
 
