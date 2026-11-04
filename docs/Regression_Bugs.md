@@ -19,7 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
-| [R-077](#r-077) | Medium | `crates/disk-core` (`times`), `src/fs/copy.rs` | A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC |
+| ~~[R-077](#r-077)~~ | ~~Medium~~ **FIXED** | `crates/disk-core` (`times`), `src/fs/copy.rs` | ~~A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC~~ — FAT, exFAT, Human68k and ProDOS dates are local wall-clock time too, 2026-11-04 |
 | ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
 | ~~[R-075](#r-075)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (`new volume ufs-43bsd`) | ~~A blank 4.3BSD UFS volume whose cylinder count is a multiple of `fs_cpg` fails NeXTSTEP 3.3's fsck ("SUMMARY INFORMATION BAD")~~ — the last group's `cg_ncyl` is `fs_ncyl % fs_cpg`, 2026-11-01 |
 | ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
@@ -165,7 +165,25 @@ rb-cli's own, and clear on Solaris's.
 
 ### R-077 — an HFS to FAT copy shifts the modification time by the host's UTC offset {#r-077}
 
-Found 2026-11-04 by the `cp -p` CLI regression test
+**FIXED 2026-11-04.** FAT keeps local wall-clock time, as DOS, Windows, mtools
+and Linux vfat (default `tz`) write it, so `disk-core` 0.2.1 adds
+`dos_local_to_unix` / `unix_to_dos_local` (built like the Mac pair, on the raw
+functions plus `local_utc_offset_secs()`) and FAT, Human68k and ProDOS read and
+write through them, "now" stamps included. exFAT honours its UtcOffset bytes:
+a read subtracts a valid stored offset (an invalid one means host local time),
+and a write stores local time tagged with the host offset in all three offset
+fields, as Windows does (UTC with offset 0 when the host offset is not whole
+quarter hours). The raw functions stay, documented as zone-less. Displayed
+FAT and ProDOS dates come from the raw fields and do not change. The
+`cp -p` HFS -> FAT test passes un-ignored; disk-core unit tests check the new
+conversions against `local_utc_offset_secs()` and an HFS -> FAT -> HFS round
+trip (run under UTC, EST, Kathmandu, Kiritimati and a +0:07 zone). Known
+approximation, shared with HFS and unchanged here: the offset is the host's
+current one, not the one in force on the stamped date, so a date from the
+other side of a DST change is stored an hour off what that day's clock showed
+(a copy between two zone-less volumes is unaffected).
+
+Original report: found 2026-11-04 by the `cp -p` CLI regression test
 (`tests/cli_suite/cli_cp.rs`, `preserve_times::cp_p_from_hfs_to_fat_keeps_the_modification_date`,
 `#[ignore = "R-077"]` until fixed). On a host at UTC-5, `rb-cli cp -p` of an HFS
 file whose catalog modify date reads `1991-06-17 10:40` writes a FAT file that
