@@ -48,6 +48,8 @@ const INDEX_ENTRY_END: u32 = 0x02;
 
 // File attribute flags (from $FILE_NAME)
 const FILE_ATTR_DIRECTORY: u32 = 0x1000_0000;
+/// First MFT record that can hold a listed file (0-15 are $MFT, $Bitmap, $Extend, ...).
+const FIRST_NON_METAFILE_RECORD: u64 = 16;
 /// Windows writes this on every ordinary file; a zero attribute word is a shape it never produces.
 const FILE_ATTR_ARCHIVE: u32 = 0x20;
 
@@ -1155,13 +1157,8 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 ]) & 0x0000_FFFF_FFFF_FFFF;
 
                 if let Some(entry) = self.parse_file_name_entry(content, parent_path, mft_ref) {
-                    // NTFS reserves MFT records 0-23 for system metafiles
-                    // ($MFT, $Bitmap, $Boot, $Extend, $ObjId, ...). These are
-                    // filesystem metadata, not user files (Windows hides them),
-                    // and the reserved $Extend children have no unnamed $DATA
-                    // attribute, so reading them as files fails. User files
-                    // always start at record 24, so only push those.
-                    if mft_ref >= 24 {
+                    // Records 0-15 are the fixed metafiles; NT4 put user files in 16-23.
+                    if mft_ref >= FIRST_NON_METAFILE_RECORD {
                         entries.push(entry);
                     }
                 }
@@ -7139,5 +7136,48 @@ mod backup_boot_sector_tests {
     fn ignores_a_volume_that_is_not_ntfs() {
         let mut img = Cursor::new(vec![0u8; 1024 * 1024]);
         assert!(!ensure_backup_boot_sector(&mut img, 0, &mut |_| {}).unwrap());
+    }
+
+    /// NT4 put user files in MFT records 16-23 (WTSRV at 17 on Terminal Server Edition).
+    #[test]
+    fn index_entries_in_records_16_to_23_are_listed() {
+        fn entry(mft_ref: u64, name: &str, dir: bool) -> Vec<u8> {
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            let mut content = vec![0u8; 66 + utf16.len() * 2];
+            let flags: u32 = if dir {
+                crate::ntfs::FILE_ATTR_DIRECTORY
+            } else {
+                0
+            };
+            content[56..60].copy_from_slice(&flags.to_le_bytes());
+            content[64] = utf16.len() as u8;
+            content[65] = 3;
+            for (i, c) in utf16.iter().enumerate() {
+                content[66 + i * 2..68 + i * 2].copy_from_slice(&c.to_le_bytes());
+            }
+            let len = (16 + content.len() + 7) & !7;
+            let mut e = vec![0u8; len];
+            e[0..8].copy_from_slice(&mft_ref.to_le_bytes());
+            e[8..10].copy_from_slice(&(len as u16).to_le_bytes());
+            e[10..12].copy_from_slice(&(content.len() as u16).to_le_bytes());
+            e[16..16 + content.len()].copy_from_slice(&content);
+            e
+        }
+        let mut blank = Cursor::new(Vec::new());
+        crate::ntfs_format::create_blank_ntfs(&mut blank, 32 * 1024 * 1024, 64, Some("N")).unwrap();
+        let mut img = blank.into_inner();
+        let fs = crate::ntfs::NtfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let mut data = entry(5, "$Root", true);
+        data.extend(entry(15, "$Reserved15", false));
+        data.extend(entry(17, "WTSRV", true));
+        data.extend(entry(24, "pagefile.sys", false));
+        let mut end = vec![0u8; 16];
+        end[8] = 16;
+        end[12] = 0x02;
+        data.extend(end);
+        let mut listed = Vec::new();
+        fs.parse_index_entry_list(&data, "/", &mut listed).unwrap();
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["WTSRV", "pagefile.sys"]);
     }
 }

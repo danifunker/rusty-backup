@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-079](#r-079)~~ | ~~**High**~~ **FIXED** | `crates/fs-pc` (NTFS directory listing) | ~~An NT4 NTFS volume hides every file in MFT records 16-23: NT4 Terminal Server's `WTSRV` (record 17) and its 3,600 files were missing from browse, backup sizing and extract~~ — only the fixed metafiles 0-15 are hidden, 2026-11-04 |
 | ~~[R-078](#r-078)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (HFS `last_data_byte`) | ~~`restore --size minimum` of a classic HFS volume fails: the recorded minimum is one allocation block short, because it leaves no room for the alternate MDB and the sector after it~~ — the minimum ends 1024 bytes past the last allocated block; HFS+ no longer skips the block before its alternate header, 2026-11-04 |
 | ~~[R-077](#r-077)~~ | ~~Medium~~ **FIXED** | `crates/disk-core` (`times`), `src/fs/copy.rs` | ~~A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC~~ — FAT, exFAT, Human68k and ProDOS dates are local wall-clock time too, 2026-11-04 |
 | ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
@@ -100,6 +101,24 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found on the user's NT4 Terminal Server Edition disk, 2026-11-04
+
+### R-079 — NT4 NTFS volumes hide the files in MFT records 16-23 {#r-079}
+
+**FIXED 2026-11-04.** The NTFS directory reader kept an index entry only when its
+MFT record was 24 or higher, on the belief that 0-23 are all system metafiles. Only
+0-15 are ($MFT .. $Extend); 16-23 are reserved by later Windows versions, but NT4
+allocated ordinary files there. On an NT4 TSE disk the system folder `WTSRV` is record
+17, so it and everything below it vanished: the root listed 8 of 9 entries and a
+walk found 926 files / 80 folders (462 MiB) instead of 4,590 / 373 (692 MiB). The
+reader now hides records 0-15 only; the allocator still hands out records from 24.
+fs-pc 0.1.2. Test: `ntfs::backup_boot_sector_tests::index_entries_in_records_16_to_23_are_listed`
+(fails with the old threshold: `WTSRV` missing). Checked against `ntfs-3g`'s `ntfsls -R`
+on the same volume: identical file and folder counts.
+
+Left: `ntfs_fsck`'s "N files checked" count still starts at record 24; it checks every
+record's clusters regardless, so only that count is low on NT4 volumes.
 
 ## Found on the issue #104 Manhole CD, 2026-11-04
 
