@@ -1735,6 +1735,51 @@ the script did not count.
   `UserConfig` in the app), so they do not share the handle's lock; they write the same
   config.json, as before.
 
+## Slice 23: pickers off the UI thread
+
+egui called rfd's blocking `FileDialog` on the UI thread (`EffectHost::run`, the Inspect
+source bar, the browse view's "Add File..."), so the window stopped repainting until the user
+answered.
+
+### Steps
+
+1. (3faac362) `gui::picker`: every picker is an rfd `AsyncFileDialog` whose future the frame
+   polls. rfd drives the dialog itself (GTK3 on its global GTK thread, a sheet on the main
+   window on macOS, a thread it spawns on Windows), so the shell spawns nothing and
+   `check-boundaries.sh` stays clean. The future's waker requests a repaint, so the answer
+   lands on the next frame without mouse movement.
+   - One picker at a time, app-wide: a `Gate` flag is claimed when a dialog opens and freed
+     when it answers (or its holder is dropped). A second request is **refused, not queued**:
+     an effect's picker answers at once as a cancel (`Picked { path: None }`), a direct one
+     does nothing.
+   - `EffectHost`: `PickFile` / `PickFolder` start a pending picker; the same
+     `Reply::Picked { purpose, path }` comes back from a later `run` or `show`.
+     `modal_open()` counts a pending picker, so the browse view's "picker cancelled" checks
+     wait for the answer. `pick_own` opens a view's own dialog through the same slot.
+   - Inspect's "Open File..." / "Open Backup Folder..." go through the tab's `EffectHost`
+     with the same filters and start folder; `source_picker` no longer runs dialogs
+     (`run_dialogs`, `include_mac_archives` and the `Image` / `HostFolder` / `BackupFolder`
+     events are gone).
+   - The browse view's "Add File..." keeps a pending multi-file picker polled in `show`.
+   - Tests: `gui::picker::tests` (answer on a later poll with a repaint, cancel, a second
+     picker refused without reaching rfd, the gate freed on drop, an answer ready at once).
+   - Smoke on m900 (GNOME, X11 backend): the GTK dialog opened with Inspect's filters and home
+     start folder, frames kept coming while it was up, and closing it cleared the pending
+     picker.
+
+### Behaviour changes
+
+- The window keeps repainting (jobs, progress, the log) while a picker is up, and its
+  controls stay live. Pickers have no parent window, as before, so they are not modal.
+- A second picker while one is up is refused (logged "A file dialog is already open").
+- A picker answered after its view closed is dropped.
+
+### Left
+
+- Smoke on macOS (the sheet path) and Windows (rfd's dialog thread) with the Phase 2 exit
+  smoke (Next steps item 5).
+- Pickers could take the egui window as parent (`set_parent`) to be modal again; not done.
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1747,7 +1792,7 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-22 done. `src/gui` and the whole TUI are enforced at 0 engine references
+- Slices 1-23 done; every GUI picker is async (slice 23). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -1773,8 +1818,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    / CHD codec / remote; Restore single-partition / new-disk / Build Disk; Inspect disk
    tools / Calc min / Export; Optical convert / Browse Contents / player; Inspect dialogs):
    add them, or record each as N/A with a reason in `docs/platform_matrix.md` (Phase 2 exit).
-4. **Pickers off the UI thread:** egui still calls rfd synchronously; route `PickFile` /
-   `PickFolder` through the portal-friendly async dialogs (needed by GTK4 anyway).
+4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
+   `AsyncFileDialog` polled from the frame, one at a time.
 5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
    Windows, then close Phase 2 in `native_frontends_plan.md`.
 6. **Phase 4 (GTK4) or Phase 3 (AppKit)** per `native_frontends_plan.md`; the GTK4 and Qt6 /
