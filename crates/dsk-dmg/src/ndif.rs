@@ -10,11 +10,17 @@
 //! BinHex, AppleDouble) provides.
 //!
 //! `bcem` layout (big-endian), pinned against real images:
-//! - `u16` version, then a `Str63` volume name,
-//! - `u32` total 512-byte sectors at offset 68,
+//! - `u16` version, `u16` driver, then a `Str63` volume name,
+//! - `u32` total 512-byte sectors at offset 68, `u32` max sectors per chunk at 72,
+//! - `u32` data offset at 76 (added to every chunk offset), `u32` CRC at 80,
 //! - `u32` chunk count at offset 124,
 //! - then `count` × 12-byte chunk entries from offset 128:
 //!   `w0 = (firstSector << 8) | type`, `w1 = dataForkOffset`, `w2 = length`.
+//!
+//! The CRC at 80 covers the rebuilt image: a table CRC that shifts right yet uses the
+//! *unreflected* polynomial `0x04C11DB7`, seed `0xFFFFFFFF`, no final XOR, low 28 bits
+//! kept (Aaru's `NdifCrc28`; it matches all 15 ShrinkWrap samples of issue #100). A rebuild
+//! checks it, which is how a damaged data fork is told apart from an unknown codec.
 //!
 //! Chunk `type` (the low byte of `w0`) selects the per-chunk codec:
 //! `0x00` NOCOPY (zero-fill), `0x02` COPY (raw), `0x83` ADC, `0x81` RLE,
@@ -33,6 +39,8 @@ const BCEM: [u8; 4] = *b"bcem";
 
 /// Offsets within the `bcem` resource.
 const OFF_TOTAL_SECTORS: usize = 68;
+const OFF_DATA_OFFSET: usize = 76;
+const OFF_CRC: usize = 80;
 const OFF_CHUNK_COUNT: usize = 124;
 const OFF_CHUNKS: usize = 128;
 const CHUNK_LEN: usize = 12;
@@ -92,6 +100,8 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
 ) -> Result<u64> {
     use std::io::SeekFrom;
     let total_sectors = read_u32(bcem, OFF_TOTAL_SECTORS)? as u64;
+    let data_offset = read_u32(bcem, OFF_DATA_OFFSET)? as usize;
+    let stored_crc = read_u32(bcem, OFF_CRC)? & CRC28_MASK;
     let count = read_u32(bcem, OFF_CHUNK_COUNT)? as usize;
     let image_len = total_sectors
         .checked_mul(512)
@@ -105,9 +115,11 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         let w0 = read_u32(bcem, base)?;
         let w1 = read_u32(bcem, base + 4)? as usize;
         let w2 = read_u32(bcem, base + 8)? as usize;
-        chunks.push((w0 >> 8, (w0 & 0xff) as u8, w1, w2)); // (sector, type, off, len)
+        let off = w1.saturating_add(data_offset);
+        chunks.push((w0 >> 8, (w0 & 0xff) as u8, off, w2)); // (sector, type, off, len)
     }
 
+    let mut crc = Crc28::new();
     for (i, &(sector, ty, off, len)) in chunks.iter().enumerate() {
         if ty == TYPE_END {
             break;
@@ -121,6 +133,7 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         if o + span as u64 > image_len {
             bail!("NDIF: chunk {i} (sector {sector}) runs past the image end");
         }
+        crc.zeros_to(o);
         if ty == TYPE_ZERO || len == 0 {
             continue; // left as a hole / zero-fill
         }
@@ -129,8 +142,12 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
             // Uncompressed: the stored length equals the span it covers.
             TYPE_RAW => src[..len.min(span)].to_vec(),
             TYPE_ADC => {
-                let mut dec = decompress_adc(&src, span)
-                    .with_context(|| format!("NDIF: ADC decompress failed for chunk {i}"))?;
+                let mut dec = decompress_adc(&src, span).with_context(|| {
+                    format!(
+                        "NDIF chunk {i} (sector {sector}, type 0x83 ADC) does not decode; the \
+                         image's data fork looks damaged (bytes Disk Copy did not write there)"
+                    )
+                })?;
                 dec.truncate(span);
                 dec
             }
@@ -158,8 +175,80 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         };
         out.seek(SeekFrom::Start(o))?;
         out.write_all(&piece)?;
+        crc.update(&piece);
+    }
+    crc.zeros_to(image_len);
+    if let Some(got) = crc.finish().filter(|&c| stored_crc != 0 && c != stored_crc) {
+        log::warn!(
+            "NDIF: rebuilt image CRC {got:07X} does not match the stored {stored_crc:07X}; the \
+             image data is damaged"
+        );
     }
     Ok(image_len)
+}
+
+/// The 28 bits of a rebuilt image's CRC that `bcem` stores.
+const CRC28_MASK: u32 = 0x0fff_ffff;
+
+/// Running NDIF image CRC over the bytes written so far, holes counted as zeros.
+struct Crc28 {
+    table: [u32; 256],
+    crc: u32,
+    pos: u64,
+    in_order: bool,
+}
+
+impl Crc28 {
+    fn new() -> Self {
+        let mut table = [0u32; 256];
+        for (i, t) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x04c1_1db7
+                } else {
+                    c >> 1
+                };
+            }
+            *t = c;
+        }
+        Crc28 {
+            table,
+            crc: 0xffff_ffff,
+            pos: 0,
+            in_order: true,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.crc = (self.crc >> 8) ^ self.table[((self.crc ^ b as u32) & 0xff) as usize];
+        }
+        self.pos += bytes.len() as u64;
+    }
+
+    /// Feed zeros up to byte `end` of the image (a hole, or a short raw chunk's tail).
+    fn zeros_to(&mut self, end: u64) {
+        self.in_order &= end >= self.pos;
+        let zeros = [0u8; 4096];
+        while self.pos < end {
+            let n = (end - self.pos).min(zeros.len() as u64) as usize;
+            self.update(&zeros[..n]);
+        }
+    }
+
+    /// `None` when chunks came out of image order, so the CRC is not the image's.
+    fn finish(&self) -> Option<u32> {
+        self.in_order.then_some(self.crc & CRC28_MASK)
+    }
+}
+
+/// CRC the stored `bcem` header expects for `image`.
+#[cfg(test)]
+fn image_crc28(image: &[u8]) -> u32 {
+    let mut c = Crc28::new();
+    c.update(image);
+    c.crc & CRC28_MASK
 }
 
 /// Read a big-endian u32 at `off`, erroring if it runs past the slice.
@@ -302,5 +391,59 @@ mod tests {
         let data = vec![0u8; 16];
         let err = reconstruct(&data, &bcem).unwrap_err().to_string();
         assert!(err.contains("LZH"), "error should name the codec: {err}");
+    }
+
+    /// Build a `bcem` map for `total` sectors from `(sector, type, offset, length)` entries.
+    fn bcem_for(total: u32, entries: &[(u32, u8, usize, usize)], crc: u32) -> Vec<u8> {
+        let mut bcem = vec![0u8; OFF_CHUNKS];
+        bcem[OFF_TOTAL_SECTORS..OFF_TOTAL_SECTORS + 4].copy_from_slice(&total.to_be_bytes());
+        bcem[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_be_bytes());
+        bcem[OFF_CHUNK_COUNT..OFF_CHUNK_COUNT + 4]
+            .copy_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (sector, ty, off, len) in entries {
+            let w0 = (sector << 8) | (*ty as u32);
+            bcem.extend_from_slice(&w0.to_be_bytes());
+            bcem.extend_from_slice(&(*off as u32).to_be_bytes());
+            bcem.extend_from_slice(&(*len as u32).to_be_bytes());
+        }
+        bcem
+    }
+
+    /// Pins the odd CRC (right-shifting with the unreflected polynomial) Disk Copy uses.
+    #[test]
+    fn crc28_check_value() {
+        assert_eq!(image_crc28(b"123456789"), 0x03b0_d416);
+    }
+
+    /// An ADC chunk whose bytes are not ADC (issue #99: a damaged data fork) names the
+    /// chunk and the likely cause instead of a bare decoder error.
+    #[test]
+    fn undecodable_adc_chunk_reports_damage() {
+        // 0x48 opens a long match at output 0, as the damaged #99 chunks do.
+        let data = vec![0x48, 0xe7, 0x01, 0x08, 0x49, 0xee, 0xff, 0xf0];
+        let bcem = bcem_for(2, &[(0, TYPE_ADC, 0, data.len()), (2, TYPE_END, 0, 0)], 0);
+        let err = format!("{:#}", reconstruct(&data, &bcem).unwrap_err());
+        assert!(err.contains("chunk 0") && err.contains("damaged"), "{err}");
+    }
+
+    /// The data offset at 76 shifts every chunk, and a matching CRC rebuilds as before.
+    #[test]
+    fn data_offset_and_crc_are_honoured() {
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 253) as u8).collect();
+        let mut img = payload.clone();
+        img.resize(1024, 0);
+        let mut bcem = bcem_for(
+            2,
+            &[
+                (0, TYPE_RAW, 0, 512),
+                (1, TYPE_ZERO, 0, 0),
+                (2, TYPE_END, 0, 0),
+            ],
+            image_crc28(&img),
+        );
+        bcem[OFF_DATA_OFFSET..OFF_DATA_OFFSET + 4].copy_from_slice(&7u32.to_be_bytes());
+        let mut data = vec![0xAA; 7];
+        data.extend_from_slice(&payload);
+        assert_eq!(reconstruct(&data, &bcem).unwrap(), img);
     }
 }
