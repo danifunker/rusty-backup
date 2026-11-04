@@ -248,10 +248,10 @@ never copy it sideways.
   raw threads in `src/controller` and on raw threads in views, and counts views'
   direct references to the model and engine. That count only goes down; a path
   that reaches zero is switched to enforcing.
-- Enforced so far (`ENFORCED` in the script): all of `src/gui` (the egui shell,
-  since Phase 2 slice 17), `src/cli/verbs/tui_app/commander.rs` and
-  `src/cli/verbs/tui_app/explorer.rs`. What is left is the rest of the TUI
-  (`src/cli/verbs/tui_app.rs`).
+- Enforced (`ENFORCED` in the script): all of `src/gui` (the egui shell, since
+  Phase 2 slice 17) and the whole TUI (`src/cli/verbs/tui_app.rs` and
+  `src/cli/verbs/tui_app/`, since slice 20). The other `rb-cli` verbs are not
+  checked yet; they move onto their task's controller one by one.
 - Exhaustive `Action` / `Effect` enums make an unhandled feature a compile
   error.
 - Controller logic is tested without any view. Code that cannot be tested
