@@ -1,6 +1,6 @@
 [package]
 name = "fs-pc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -22,7 +22,7 @@ ntfs = []
 rust173-polyfill = ["disk-core/rust173-polyfill"]
 
 [dependencies]
-disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+disk-core = { path = "../disk-core", version = "0.2.1", features = ["fs"] }
 anyhow = "1"
 byteorder = "1"
 # Human68k names are Shift-JIS.

@@ -3,8 +3,6 @@
 // callbacks, cancel checks).
 #![allow(clippy::too_many_arguments)]
 
-#[cfg(feature = "rust173-polyfill")]
-use disk_core::rust173::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -707,7 +705,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 FileEntry::new_file(display_name, path, size, cluster as u64)
             };
             entry.modified = Some(modified);
-            entry.modified_unix = disk_core::times::dos_datetime_to_unix(date_val, time_val);
+            entry.modified_unix = disk_core::times::dos_local_to_unix(date_val, time_val);
             // Carry RO/HID/SYS/ARC so the cross-image copy engine can
             // preserve them on FAT/exFAT destinations (drop the directory /
             // volume-id bits — those are structural, not user attributes).
@@ -937,76 +935,9 @@ fn encode_ucs2_lfn(name: &str) -> Vec<u16> {
     chars
 }
 
-/// Get current FAT date/time as (date_word, time_word).
+/// Get current FAT date/time as (date_word, time_word), on the local wall clock.
 fn current_fat_datetime() -> (u16, u16) {
-    // Use a simple approach — get seconds since Unix epoch and convert
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Convert to FAT date/time
-    // Days from 1970-01-01 to 1980-01-01 = 3652
-    let secs_since_1980 = now.saturating_sub(315532800); // 3652 days * 86400
-    let days = secs_since_1980 / 86400;
-    let time_of_day = secs_since_1980 % 86400;
-
-    // Approximate date calculation (not perfectly accurate but sufficient)
-    let mut year = 0u16;
-    let mut remaining_days = days as u32;
-    loop {
-        let days_in_year = if (year + 1980).is_multiple_of(4)
-            && (!(year + 1980).is_multiple_of(100) || (year + 1980).is_multiple_of(400))
-        {
-            366
-        } else {
-            365
-        };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-        if year > 127 {
-            year = 127;
-            break;
-        }
-    }
-    let is_leap = (year + 1980).is_multiple_of(4)
-        && (!(year + 1980).is_multiple_of(100) || (year + 1980).is_multiple_of(400));
-    let days_in_months: [u32; 12] = [
-        31,
-        if is_leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u16;
-    for (i, &dim) in days_in_months.iter().enumerate() {
-        if remaining_days < dim {
-            month = i as u16 + 1;
-            break;
-        }
-        remaining_days -= dim;
-    }
-    if month == 0 {
-        month = 12;
-    }
-    let day = remaining_days as u16 + 1;
-
-    let hour = (time_of_day / 3600) as u16;
-    let minute = ((time_of_day % 3600) / 60) as u16;
-    let second = ((time_of_day % 60) / 2) as u16; // FAT uses 2-second resolution
-
-    let date_word = (year << 9) | (month << 5) | day;
-    let time_word = (hour << 11) | (minute << 5) | second;
-    (date_word, time_word)
+    disk_core::times::dos_local_now()
 }
 
 impl<R: Read + Write + Seek> FatFilesystem<R> {
@@ -1345,7 +1276,7 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
         mtime_secs: Option<u64>,
     ) -> Vec<u8> {
         let (date, time) = match mtime_secs {
-            Some(s) => disk_core::times::unix_to_dos_datetime(s),
+            Some(s) => disk_core::times::unix_to_dos_local(s),
             None => current_fat_datetime(),
         };
         let checksum = lfn_checksum(sfn);
@@ -1913,11 +1844,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         let mut file_entry =
             FileEntry::new_file(name.to_string(), path, data_len, first_cluster as u64);
         let (date, time) = match mtime {
-            Some(s) => disk_core::times::unix_to_dos_datetime(s),
+            Some(s) => disk_core::times::unix_to_dos_local(s),
             None => current_fat_datetime(),
         };
         file_entry.modified = Some(format_fat_datetime(date, time));
-        file_entry.modified_unix = disk_core::times::dos_datetime_to_unix(date, time);
+        file_entry.modified_unix = disk_core::times::dos_local_to_unix(date, time);
 
         Ok(file_entry)
     }
@@ -1948,7 +1879,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         let mut new_dir = vec![0u8; cluster_size];
         let mtime = options.unix_times.map(|t| t.mtime_or_now());
         let (date, time) = match mtime {
-            Some(s) => disk_core::times::unix_to_dos_datetime(s),
+            Some(s) => disk_core::times::unix_to_dos_local(s),
             None => current_fat_datetime(),
         };
 
@@ -2012,7 +1943,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
 
         let mut dir_entry = FileEntry::new_directory(name.to_string(), path, new_cluster as u64);
         dir_entry.modified = Some(format_fat_datetime(date, time));
-        dir_entry.modified_unix = disk_core::times::dos_datetime_to_unix(date, time);
+        dir_entry.modified_unix = disk_core::times::dos_local_to_unix(date, time);
 
         Ok(dir_entry)
     }

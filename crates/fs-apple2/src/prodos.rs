@@ -980,7 +980,7 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
 /// Build a 39-byte ProDOS file directory entry.
 ///
 /// `mtime_secs = Some(secs)` stamps that Unix time (converted via
-/// [`disk_core::times::unix_to_prodos_datetime`]) into both the creation
+/// [`disk_core::times::unix_to_prodos_local`]) into both the creation
 /// and modification date/time fields — what a cross-fs copy carrying the
 /// source mtime through calls for. `None` stamps `now`.
 #[allow(clippy::too_many_arguments)]
@@ -1010,7 +1010,7 @@ fn build_file_entry_bytes(
     e[22] = (eof >> 8) as u8;
     e[23] = (eof >> 16) as u8;
     let (date, time) = match mtime_secs {
-        Some(s) => disk_core::times::unix_to_prodos_datetime(s),
+        Some(s) => disk_core::times::unix_to_prodos_local(s),
         None => make_prodos_datetime_now(),
     };
     let cd = date.to_le_bytes();
@@ -1050,7 +1050,7 @@ fn build_subdir_entry_bytes(name: &str, key_ptr: u16, mtime_secs: Option<u64>) -
     e[19] = 1;
     e[20] = 0;
     let (date, time) = match mtime_secs {
-        Some(s) => disk_core::times::unix_to_prodos_datetime(s),
+        Some(s) => disk_core::times::unix_to_prodos_local(s),
         None => make_prodos_datetime_now(),
     };
     let cd = date.to_le_bytes();
@@ -1085,7 +1085,7 @@ fn build_subdir_header_bytes(
     // Bytes 17-23: reserved
     // Bytes 24-25: creation date, 26-27: creation time
     let (date, time) = match mtime_secs {
-        Some(s) => disk_core::times::unix_to_prodos_datetime(s),
+        Some(s) => disk_core::times::unix_to_prodos_local(s),
         None => make_prodos_datetime_now(),
     };
     let cd = date.to_le_bytes();
@@ -1110,11 +1110,8 @@ fn build_subdir_header_bytes(
     e
 }
 
-/// Generate current date/time in ProDOS format.
-/// Returns `(date_word, time_word)`.
+/// Current local date/time as ProDOS `(date_word, time_word)`; tests get a fixed 2024-01-15 12:00.
 fn make_prodos_datetime_now() -> (u16, u16) {
-    // Use a fixed reasonable date for reproducibility in tests and simplicity.
-    // In a real scenario you'd call system time. For now: 2024-01-15 12:00.
     #[cfg(test)]
     {
         let year: u16 = 24; // 2024 (year < 70 → 2000+year)
@@ -1129,41 +1126,8 @@ fn make_prodos_datetime_now() -> (u16, u16) {
     }
     #[cfg(not(test))]
     {
-        use std::time::SystemTime;
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Simple conversion from Unix epoch seconds.
-        let days = (now / 86400) as i64;
-        let time_of_day = now % 86400;
-        let hour = (time_of_day / 3600) as u16;
-        let minute = ((time_of_day % 3600) / 60) as u16;
-
-        // Convert days since 1970-01-01 to year/month/day.
-        let (year, month, day) = days_to_ymd(days);
-        let prodos_year = (year % 100) as u16;
-        let date = (prodos_year << 9) | ((month as u16) << 5) | (day as u16);
-        let time = (hour << 8) | minute;
-        (date, time)
+        disk_core::times::prodos_local_now()
     }
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-#[cfg(not(test))]
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    // Civil calendar algorithm from Howard Hinnant.
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i32, m, d)
 }
 
 /// Validate a ProDOS name: 1-15 chars, A-Z/0-9/period, first char must be a
@@ -1985,8 +1949,8 @@ fn list_prodos_directory<R: Read + Seek>(
             let modified = parse_prodos_datetime(modified_date, modified_time)
                 .or_else(|| parse_prodos_datetime(creation_date, creation_time));
             let modified_unix =
-                disk_core::times::prodos_datetime_to_unix(modified_date, modified_time).or_else(
-                    || disk_core::times::prodos_datetime_to_unix(creation_date, creation_time),
+                disk_core::times::prodos_local_to_unix(modified_date, modified_time).or_else(
+                    || disk_core::times::prodos_local_to_unix(creation_date, creation_time),
                 );
 
             if type_nibble == 0xD {

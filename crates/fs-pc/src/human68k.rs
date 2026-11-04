@@ -807,7 +807,7 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
             if de.attr & attr::READ_ONLY != 0 {
                 fe.special_type = Some("R/O".to_string());
             }
-            fe.modified_unix = disk_core::times::dos_datetime_to_unix(de.date, de.time);
+            fe.modified_unix = disk_core::times::dos_local_to_unix(de.date, de.time);
             out.push(fe);
         }
         out.sort_by_key(|a| a.name.to_lowercase());
@@ -1311,7 +1311,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             .unix_times
             .map(|t| t.mtime_or_now())
             .unwrap_or_else(disk_core::times::now);
-        let (date, time) = disk_core::times::unix_to_dos_datetime(mtime_secs);
+        let (date, time) = disk_core::times::unix_to_dos_local(mtime_secs);
         LittleEndian::write_u16(&mut entry[22..24], time);
         LittleEndian::write_u16(&mut entry[24..26], date);
         LittleEndian::write_u16(&mut entry[26..28], first_cluster);
@@ -1327,7 +1327,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             payload.len() as u64,
             first_cluster as u64,
         );
-        fe.modified_unix = disk_core::times::dos_datetime_to_unix(date, time);
+        fe.modified_unix = disk_core::times::dos_local_to_unix(date, time);
         Ok(fe)
     }
 
@@ -1371,7 +1371,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             .unix_times
             .map(|t| t.mtime_or_now())
             .unwrap_or_else(disk_core::times::now);
-        let (date, time) = disk_core::times::unix_to_dos_datetime(mtime_secs);
+        let (date, time) = disk_core::times::unix_to_dos_local(mtime_secs);
         LittleEndian::write_u16(&mut entry[22..24], time);
         LittleEndian::write_u16(&mut entry[24..26], date);
         LittleEndian::write_u16(&mut entry[26..28], dir_cluster);
@@ -1387,7 +1387,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             format!("{parent_path}/{name}"),
             dir_cluster as u64,
         );
-        fe.modified_unix = disk_core::times::dos_datetime_to_unix(date, time);
+        fe.modified_unix = disk_core::times::dos_local_to_unix(date, time);
         Ok(fe)
     }
 

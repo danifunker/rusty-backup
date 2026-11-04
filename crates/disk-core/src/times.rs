@@ -225,6 +225,9 @@ const DOS_EPOCH_SECS: u64 = 315_532_800;
 /// dirent slots hold. `fat_date` layout: `year_since_1980 (7) | month (4)
 /// | day (5)`; `fat_time` layout: `hour (5) | minute (6) | second/2 (5)`.
 ///
+/// Raw and zone-less (the words get the UTC wall clock); drivers use
+/// [`unix_to_dos_local`], since FAT stores local wall-clock time.
+///
 /// Any Unix time before 1980-01-01 clamps to 1980-01-01 00:00:00 (the
 /// earliest representable DOS date) so a pre-1980 mtime doesn't become
 /// year-2107. Anything past 2107-12-31 23:59:58 pins to that moment: the
@@ -248,9 +251,8 @@ pub fn unix_to_dos_datetime(secs: u64) -> (u16, u16) {
 /// Decode a FAT (date, time) pair back to Unix seconds. Returns `None` for
 /// a zero `date` (the "no date set" sentinel every DOS filesystem tool
 /// uses) or for a date field whose components don't make sense (month 0,
-/// day 0, day > days-in-month, etc). Values are treated as UTC — FAT
-/// stores wall-clock time with no timezone, and every tool we round-trip
-/// against does the same.
+/// day 0, day > days-in-month, etc). Raw and zone-less: the words are read
+/// as UTC. FAT stores local wall-clock time, so drivers use [`dos_local_to_unix`].
 pub fn dos_datetime_to_unix(date: u16, time: u16) -> Option<u64> {
     if date == 0 {
         return None;
@@ -277,9 +279,58 @@ pub fn unix_to_exfat_timestamp(secs: u64) -> u32 {
     ((date as u32) << 16) | time as u32
 }
 
-/// Inverse of [`unix_to_exfat_timestamp`].
+/// Inverse of [`unix_to_exfat_timestamp`]. Raw and zone-less like the DOS pair;
+/// drivers use [`exfat_local_to_unix`], which honours the UtcOffset byte.
 pub fn exfat_timestamp_to_unix(ts: u32) -> Option<u64> {
     dos_datetime_to_unix((ts >> 16) as u16, ts as u16)
+}
+
+/// Unix seconds to FAT's (date, time) words as the local wall clock, as DOS and Windows write them.
+pub fn unix_to_dos_local(secs: u64) -> (u16, u16) {
+    unix_to_dos_datetime(utc_to_local(secs))
+}
+
+/// FAT's local wall-clock (date, time) words back to Unix seconds (UTC).
+pub fn dos_local_to_unix(date: u16, time: u16) -> Option<u64> {
+    dos_datetime_to_unix(date, time).map(local_to_utc)
+}
+
+/// The current wall clock as FAT (date, time) words.
+pub fn dos_local_now() -> (u16, u16) {
+    unix_to_dos_local(now())
+}
+
+/// exFAT UtcOffset bit 7: the low 7 bits hold a valid offset in 15-minute steps.
+pub const EXFAT_UTC_OFFSET_VALID: u8 = 0x80;
+
+/// Unix seconds to an exFAT (timestamp, UtcOffset) pair: local time tagged with the host offset.
+/// A host offset exFAT cannot express (not whole quarter hours) is written as UTC, offset 0.
+pub fn unix_to_exfat_local(secs: u64) -> (u32, u8) {
+    let offset = local_utc_offset_secs();
+    let quarters = offset / 900;
+    if offset % 900 != 0 || !(-64..=63).contains(&quarters) {
+        return (unix_to_exfat_timestamp(secs), EXFAT_UTC_OFFSET_VALID);
+    }
+    let local = (secs as i64).saturating_add(offset).max(0) as u64;
+    let byte = EXFAT_UTC_OFFSET_VALID | ((quarters as i8 as u8) & 0x7F);
+    (unix_to_exfat_timestamp(local), byte)
+}
+
+/// An exFAT (timestamp, UtcOffset) pair back to Unix seconds. With no valid offset the
+/// stamp is the local wall clock of an unknown zone, read as this host's (as Linux does).
+pub fn exfat_local_to_unix(ts: u32, utc_offset: u8) -> Option<u64> {
+    let local = exfat_timestamp_to_unix(ts)?;
+    if utc_offset & EXFAT_UTC_OFFSET_VALID == 0 {
+        return Some(local_to_utc(local));
+    }
+    // Sign-extend the 7-bit two's-complement quarter-hour count.
+    let quarters = (((utc_offset & 0x7F) << 1) as i8 >> 1) as i64;
+    Some((local as i64).saturating_sub(quarters * 900).max(0) as u64)
+}
+
+/// The current wall clock as an exFAT (timestamp, UtcOffset) pair.
+pub fn exfat_local_now() -> (u32, u8) {
+    unix_to_exfat_local(now())
 }
 
 // ---------------------------------------------------------------------------
@@ -322,25 +373,32 @@ pub fn filetime_to_unix(ft: u64) -> Option<u64> {
 /// HFS/HFS+ modules (MFS uses the same epoch and lives elsewhere).
 const MAC_EPOCH_DELTA: u64 = 2_082_844_800;
 
-/// Seconds this host's local time is ahead of UTC, for the filesystems that
-/// store wall-clock time with no zone (classic HFS, MFS).
+/// Seconds this host's local time is ahead of UTC, for the filesystems that store
+/// wall-clock time with no zone (HFS, MFS, FAT, Human68k, ProDOS). The current offset, not the date's.
 pub fn local_utc_offset_secs() -> i64 {
     chrono::Local::now().offset().local_minus_utc() as i64
 }
 
+/// Unix seconds (UTC) to the same moment on this host's wall clock, as zone-less seconds.
+fn utc_to_local(secs: u64) -> u64 {
+    (secs as i64).saturating_add(local_utc_offset_secs()).max(0) as u64
+}
+
+/// Zone-less wall-clock seconds on this host back to Unix seconds (UTC).
+fn local_to_utc(local: u64) -> u64 {
+    (local as i64)
+        .saturating_sub(local_utc_offset_secs())
+        .max(0) as u64
+}
+
 /// Unix seconds to a classic-Mac local-time stamp: the wall clock the Mac shows.
 pub fn unix_to_mac_local(secs: u64) -> u32 {
-    let local = (secs as i64).saturating_add(local_utc_offset_secs()).max(0) as u64;
-    unix_to_mac_epoch(local)
+    unix_to_mac_epoch(utc_to_local(secs))
 }
 
 /// A classic-Mac local-time stamp back to Unix seconds (UTC).
 pub fn mac_local_to_unix(mac_secs: u32) -> Option<u64> {
-    mac_epoch_to_unix(mac_secs).map(|local| {
-        (local as i64)
-            .saturating_sub(local_utc_offset_secs())
-            .max(0) as u64
-    })
+    mac_epoch_to_unix(mac_secs).map(local_to_utc)
 }
 
 /// The current wall clock as a classic-Mac local-time stamp.
@@ -376,7 +434,7 @@ pub fn mac_epoch_to_unix(mac_secs: u32) -> Option<u64> {
 ///
 /// Clamps to 1940-01-01 for pre-1940 input (the earliest representable
 /// ProDOS date under its own convention) and to 2039-12-31 for
-/// post-2039 input.
+/// post-2039 input. Raw and zone-less; drivers use [`unix_to_prodos_local`].
 pub fn unix_to_prodos_datetime(secs: u64) -> (u16, u16) {
     let (mut year, month, day, hour, minute, _second) = ymd_hms(secs);
     if year < 1940 {
@@ -400,7 +458,7 @@ pub fn unix_to_prodos_datetime(secs: u64) -> (u16, u16) {
 
 /// Decode a ProDOS (date, time) pair back to Unix seconds. Returns `None`
 /// for a zero `date` ("no date set" — ProDOS Technical Note #28 formalises
-/// this).
+/// this). Raw and zone-less; drivers use [`prodos_local_to_unix`].
 pub fn prodos_datetime_to_unix(date: u16, time: u16) -> Option<u64> {
     if date == 0 {
         return None;
@@ -425,6 +483,21 @@ pub fn prodos_datetime_to_unix(date: u16, time: u16) -> Option<u64> {
         return None;
     }
     Some(secs_from_ymd_hms(year, month, day, hour, minute, 0))
+}
+
+/// Unix seconds to a ProDOS (date, time) pair on the local wall clock an Apple II clock card keeps.
+pub fn unix_to_prodos_local(secs: u64) -> (u16, u16) {
+    unix_to_prodos_datetime(utc_to_local(secs))
+}
+
+/// A ProDOS local wall-clock (date, time) pair back to Unix seconds (UTC).
+pub fn prodos_local_to_unix(date: u16, time: u16) -> Option<u64> {
+    prodos_datetime_to_unix(date, time).map(local_to_utc)
+}
+
+/// The current wall clock as a ProDOS (date, time) pair.
+pub fn prodos_local_now() -> (u16, u16) {
+    unix_to_prodos_local(now())
 }
 
 // ---------------------------------------------------------------------------
@@ -767,5 +840,62 @@ mod tests {
         // ADFS: centisecond-granular but we input whole seconds.
         let (l, e) = unix_to_adfs_time(T_2020, 0xFFF);
         assert_eq!(adfs_time_to_unix(l, e), Some(T_2020));
+    }
+
+    /// R-077: FAT words hold the host's wall clock, i.e. UTC shifted by the host offset.
+    #[test]
+    fn dos_local_stores_the_host_wall_clock() {
+        let local = (T_2020 as i64 + local_utc_offset_secs()) as u64;
+        assert_eq!(unix_to_dos_local(T_2020), unix_to_dos_datetime(local));
+        let (d, t) = unix_to_dos_local(T_2020);
+        assert_eq!(dos_local_to_unix(d, t), Some(T_2020));
+        assert_eq!(dos_local_to_unix(0, 0), None);
+    }
+
+    #[test]
+    fn prodos_local_stores_the_host_wall_clock() {
+        let t = T_2020 - T_2020 % 60;
+        let local = (t as i64 + local_utc_offset_secs()) as u64;
+        assert_eq!(unix_to_prodos_local(t), unix_to_prodos_datetime(local));
+        let (d, tm) = unix_to_prodos_local(t);
+        assert_eq!(prodos_local_to_unix(d, tm), Some(t));
+    }
+
+    /// R-077: a Mac date copied to FAT and back keeps its wall clock, whatever the host zone.
+    #[test]
+    fn hfs_to_fat_to_hfs_keeps_the_wall_clock() {
+        let mac = unix_to_mac_epoch(T_2020);
+        let (d, t) = unix_to_dos_local(mac_local_to_unix(mac).unwrap());
+        assert_eq!(dos_datetime_to_unix(d, t), Some(T_2020));
+        assert_eq!(unix_to_mac_local(dos_local_to_unix(d, t).unwrap()), mac);
+    }
+
+    #[test]
+    fn exfat_local_tags_the_host_offset() {
+        let (ts, off) = unix_to_exfat_local(T_2020);
+        assert_ne!(off & EXFAT_UTC_OFFSET_VALID, 0);
+        assert_eq!(exfat_local_to_unix(ts, off), Some(T_2020));
+        let host = local_utc_offset_secs();
+        if host % 900 == 0 {
+            let local = (T_2020 as i64 + host) as u64;
+            assert_eq!(ts, unix_to_exfat_timestamp(local));
+        }
+    }
+
+    #[test]
+    fn exfat_local_reads_any_stored_offset() {
+        let base = unix_to_exfat_timestamp(T_2020);
+        // UTC-5 is -20 quarter hours: the stamp is 5 hours behind UTC.
+        let minus5 = EXFAT_UTC_OFFSET_VALID | ((-20i8 as u8) & 0x7F);
+        assert_eq!(exfat_local_to_unix(base, minus5), Some(T_2020 + 5 * 3600));
+        let plus9 = EXFAT_UTC_OFFSET_VALID | 36;
+        assert_eq!(exfat_local_to_unix(base, plus9), Some(T_2020 - 9 * 3600));
+        assert_eq!(
+            exfat_local_to_unix(base, EXFAT_UTC_OFFSET_VALID),
+            Some(T_2020)
+        );
+        // No valid offset: the host's wall clock.
+        let host = (T_2020 as i64 - local_utc_offset_secs()) as u64;
+        assert_eq!(exfat_local_to_unix(base, 0), Some(host));
     }
 }

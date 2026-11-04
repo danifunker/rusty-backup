@@ -340,7 +340,6 @@ mod preserve_times {
     }
 
     #[test]
-    #[ignore = "R-077: HFS reads as local time, FAT as UTC, so the copy shifts by the UTC offset"]
     fn cp_p_from_hfs_to_fat_keeps_the_modification_date() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src.hfv");

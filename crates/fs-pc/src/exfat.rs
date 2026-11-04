@@ -519,7 +519,9 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                     dir_data[pos + 14],
                     dir_data[pos + 15],
                 ]);
-                let modified_unix = disk_core::times::exfat_timestamp_to_unix(modify_ts);
+                // LastModifiedUtcOffset at 23: Windows tags its local stamp with the zone.
+                let modified_unix =
+                    disk_core::times::exfat_local_to_unix(modify_ts, dir_data[pos + 23]);
 
                 // Next entry should be stream extension (0xC0)
                 let stream_pos = pos + 32;
@@ -824,13 +826,10 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
 // Editing support
 // =============================================================================
 
-/// Current wall-clock time as an exFAT timestamp (DOS-style u32: date in
-/// upper 16 bits, time in lower 16). Falls back to 2024-01-01 midnight on
-/// the (impossible) pre-1970 system clock. Used only when the caller left
-/// `CreateFileOptions.unix_times = None` — a genuinely new file. Copies /
-/// imports carry a real source mtime through [`disk_core::times::unix_to_exfat_timestamp`].
-fn current_exfat_timestamp() -> u32 {
-    disk_core::times::unix_to_exfat_timestamp(disk_core::times::now())
+/// Current wall-clock time as an exFAT (timestamp, UtcOffset) pair, for a genuinely
+/// new file; copies carry the source mtime through [`disk_core::times::unix_to_exfat_local`].
+fn current_exfat_timestamp() -> (u32, u8) {
+    disk_core::times::exfat_local_now()
 }
 
 impl<R: Read + Write + Seek> ExfatFilesystem<R> {
@@ -1061,8 +1060,8 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
         let total_entries = 1 + secondary_count; // file + secondaries
         let mut entries = vec![0u8; total_entries * 32];
 
-        let ts = match mtime_secs {
-            Some(s) => disk_core::times::unix_to_exfat_timestamp(s),
+        let (ts, utc_offset) = match mtime_secs {
+            Some(s) => disk_core::times::unix_to_exfat_local(s),
             None => current_exfat_timestamp(),
         };
 
@@ -1078,6 +1077,10 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
         entries[12..16].copy_from_slice(&ts.to_le_bytes());
         // AccessTimestamp [16-19]
         entries[16..20].copy_from_slice(&ts.to_le_bytes());
+        // Create / LastModified / LastAccessed UtcOffset [22-24], as Windows writes them.
+        entries[22] = utc_offset;
+        entries[23] = utc_offset;
+        entries[24] = utc_offset;
 
         // Stream Extension (0xC0) at offset 32
         let s = 32;
@@ -3239,6 +3242,18 @@ mod tests {
         copy[3] = 0;
         let recomputed = ExfatFilesystem::<Cursor<Vec<u8>>>::entry_set_checksum(&copy);
         assert_eq!(recomputed, stored_cs);
+    }
+
+    /// R-077: the entry set stores the local wall clock tagged with its UtcOffset.
+    #[test]
+    fn entry_set_stamps_local_time_with_its_utc_offset() {
+        const T: u64 = 1_592_224_496;
+        let e = ExfatFilesystem::<Cursor<Vec<u8>>>::build_entry_set("a.txt", 0x20, 5, 1, Some(T));
+        let ts = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+        assert_eq!((ts, e[23]), disk_core::times::unix_to_exfat_local(T));
+        assert_eq!(e[22], e[23]);
+        assert_eq!(e[24], e[23]);
+        assert_eq!(disk_core::times::exfat_local_to_unix(ts, e[23]), Some(T));
     }
 
     #[test]
