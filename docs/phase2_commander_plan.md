@@ -1552,6 +1552,68 @@ listed in the brief pass unchanged.
   `path-dir-recursive-descends` and `nested-dir-addressable-directly` fail on the
   opentransport disc with the pre-slice binary too (5 entries where the case wants 10).
 
+## Slice 20: the TUI's last engine references
+
+After slice 19, `src/cli/verbs/tui_app.rs` reached the engine 20 times: `RateTracker` and
+`format_size` (2), the Working-box task's `model::job` types (6), `os::is_elevated` and the
+old-Mac colour gate's `os::host_version` (2), the device view's plain table read
+(`partition::PartitionTable`, 1), the New Disk wizard's SGI geometry and `MacCdFs` (5), and
+test fixtures (`fs_unix`, `fs_pc`, `part_tables`, 3) plus their `use`. Two more shell rules
+the script does not count (`crate::device`, `crate::update`) moved with them: the device list
+and the Settings screen's save and update check.
+
+### Steps
+
+1. (2a7ca8bf) The 20 references. `controller::task::ShellTask` is the TUI's one-at-a-time
+   Working-box job (refuses a second start with `BUSY`, reports each end once as `TaskEnd`).
+   `controller::app` gains `running_elevated` and `host_known_older_than` (true only for a
+   version it read). `controller::inspect` re-exports `read_table_unelevated` /
+   `size_unelevated` (new in `model::inspect_runner`): the device view's plain read, which
+   never elevates (slice 11 note: the controller's device open prompts on macOS). A new
+   `controller::new_disk` re-exports the wizard's plain data (`DEFAULT_HEADS`,
+   `DEFAULT_SECTORS_PER_TRACK`, `MacCdFs`). The TUI's tests build fixtures through the
+   test-only `controller::test_fixtures`. `RateTracker` / `format_size` come from
+   `controller::app`.
+2. (6d058185) The TUI holds an `AppController`: the Inspect / Backup device list is the
+   shell's (`load_devices` the first time either tab is shown, a plain listing), and `r` is
+   the shell's `RefreshDevices` job. The Settings screen drives `SettingsController` (each
+   toggle is a Set then Save; a memory config in tests), shows `config_file()`, and Check for
+   updates runs `controller::app::check_updates_now_text` in the Working box, still compiled
+   only with `tui-update` (builds without it, the vintage and musl ones included, keep
+   "isn't compiled into this build"; the slim build has no TUI). Tests: `r_refreshes_the_device_list_in_the_shell_job`,
+   `a_settings_toggle_saves_through_the_settings_controller`,
+   `check_now_without_tui_update_says_it_is_not_built`, `ShellTask`'s own test, the
+   `host_known_older_than` gate; the existing disk-list tests cover the plain read.
+3. (6e7ff42d) `scripts/check-boundaries.sh` enforces the whole TUI (`tui_app.rs` and
+   `tui_app/`) as slice 17 did `src/gui`; a planted reference in either fails it.
+   CONTRIBUTING's list follows.
+
+Shells' engine references 20 -> **0** (`src/gui` and the whole TUI are enforced).
+
+### Behaviour changes
+
+- TUI `r` on the Inspect disk list refreshes in a job (the screen stays live): the status line
+  says "Looking for devices..." and then "Refreshed: N device(s) found" (the shell's log
+  line); it was a synchronous re-list with no message.
+- TUI Settings: a toggle saves through the shared form, so the status reads "Settings saved
+  successfully! Restart to apply update check changes." / "Error saving settings: ..."
+  (was "Saved to config.json." / "Save failed: ..."). On Windows the file-associations
+  toggle now registers or removes the associations, as the GUI's does (it only flipped the
+  flag). The save also writes the repository URL back trimmed.
+- None in the GUI or the other `rb-cli` verbs.
+
+### Left
+
+- Recent files: the TUI sub-screens (and the GUI tabs) still call `crate::update`'s
+  `load_recent` / `push_recent` (not an engine module to the script); `AppController::recent`
+  / `remember` are there for when the screens get the shell.
+- The New Disk wizard still runs the `rb-cli new` / `optical new` verbs itself;
+  `controller::new_disk` only carries its data. A wizard controller (shared with a future
+  GUI one) is parity work.
+- The TUI has no update banner or start-up check, drops or shared backup folder.
+- The other `rb-cli` verbs are not checked by the script; they move per task.
+- TUI parity gaps: Next steps item 3.
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1562,12 +1624,10 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 - Still open: **Resize's Cancel does nothing** (slice 15). `apply_resize` has no safe stop
   point; leave it until a resize can stop without leaving a half-moved partition.
 
-## Where Phase 2 stands (2026-11-02)
+## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-18b done. `src/gui` is enforced whole at 0 engine references; the TUI Commander
-  and Explorer files are enforced. Shell engine references: 979 at the start of Phase 2,
-  **20** now, all in `src/cli/verbs/tui_app.rs` (device lists, image probes, the update
-  check, the palette).
+- Slices 1-20 done. `src/gui` and the whole TUI are enforced at 0 engine references.
+  Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
   pushed with CI running. Commits after 3119ea34 are local until the user says push.
 - Not yet run on the Phase 2 code: the full fixture regression suite (last full run
@@ -1584,9 +1644,7 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    above; everything else byte-identical (prove it with the identity tests and the
    Commander / Inspect extract tests). Version, publish (publish-crates.yml) and update the
    root, vintage, ppc and sol9 lockfiles.
-2. **Slice 20: the TUI's last 20 references** in `tui_app.rs`: drive `controller::app`
-   (shell rules, device list, update check) and the existing controllers; enforce the whole
-   TUI in `scripts/check-boundaries.sh`.
+2. **Slice 20: the TUI's last 20 references** (done, above): the whole TUI is enforced.
 3. **TUI parity gaps** the controllers already support (Backup partition selection / split
    / CHD codec / remote; Restore single-partition / new-disk / Build Disk; Inspect disk
    tools / Calc min / Export; Optical convert / Browse Contents / player; Inspect dialogs):
