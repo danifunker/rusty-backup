@@ -241,6 +241,7 @@ fn synth_single_entry(
         StuffItArchive {
             entries: vec![entry],
             truncated: None,
+            damage: Vec::new(),
         },
     )
 }
@@ -284,6 +285,9 @@ pub fn extract_filtered(
     // bug rather than a missing-disk problem.
     if let Some(t) = archive.truncated {
         log(t.describe());
+    }
+    for d in &archive.damage {
+        log(d.describe());
     }
 
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;

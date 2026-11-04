@@ -134,6 +134,30 @@ pub struct StuffItArchive {
     /// `Some` when the archive header declares more bytes than the container
     /// actually holds — see [`SitTruncation`].
     pub truncated: Option<SitTruncation>,
+    /// Stretches of unexpected bytes the entry walk skipped; see [`SitDamage`].
+    pub damage: Vec<SitDamage>,
+}
+
+/// Bytes between two entries that no header accounts for, skipped by the entry walk (#101).
+/// See `docs/native_mac_archives.md` section 6a.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SitDamage {
+    /// Offset from the `SIT!` signature where an entry header was expected.
+    pub offset: u64,
+    /// Bytes skipped before the next valid entry header.
+    pub skipped: u64,
+}
+
+impl SitDamage {
+    /// One-line ASCII summary for logs and the CLI.
+    pub fn describe(&self) -> String {
+        format!(
+            "Warning: damaged StuffIt archive - {} unexpected bytes at offset {} where an entry \
+             header should be; skipped to the next valid header. The entry before the gap is \
+             likely damaged too and may fail its CRC.",
+            self.skipped, self.offset
+        )
+    }
 }
 
 /// An archive whose header declares a longer stream than is present.
@@ -244,17 +268,30 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
     });
 
     let mut entries = Vec::new();
+    let mut damage = Vec::new();
     let mut currdir: Vec<String> = Vec::new();
     let mut pos = ARCHIVE_HEADER_LEN;
 
     while pos + ENTRY_HEADER_LEN <= total_size {
         let h = &archive[pos..pos + ENTRY_HEADER_LEN];
 
-        let stored_hdr_crc = BigEndian::read_u16(&h[110..112]);
-        let computed = crc16_arc(&h[0..110]);
-        if stored_hdr_crc != computed {
+        if !entry_header_valid(h) {
+            if let Some(next) = find_next_entry_header(archive, pos + 1, total_size) {
+                damage.push(SitDamage {
+                    offset: pos as u64,
+                    skipped: (next - pos) as u64,
+                });
+                pos = next;
+                continue;
+            }
+            if h[..110].iter().all(|&b| b == 0) {
+                break; // zero padding to the end
+            }
+            let stored_hdr_crc = BigEndian::read_u16(&h[110..112]);
+            let computed = crc16_arc(&h[0..110]);
             bail!(
-                "StuffIt: entry header CRC mismatch at offset {pos} (got {computed:#06x}, expected {stored_hdr_crc:#06x})"
+                "StuffIt: entry header CRC mismatch at offset {pos} (got {computed:#06x}, expected {stored_hdr_crc:#06x}){}",
+                damage_hint(data)
             );
         }
 
@@ -349,7 +386,51 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         pos += ENTRY_HEADER_LEN + rsrc_clen as usize + data_clen as usize;
     }
 
-    Ok(StuffItArchive { entries, truncated })
+    Ok(StuffItArchive {
+        entries,
+        truncated,
+        damage,
+    })
+}
+
+/// CRC-valid and not all zero (a zero block's CRC is also zero).
+fn entry_header_valid(h: &[u8]) -> bool {
+    BigEndian::read_u16(&h[110..112]) == crc16_arc(&h[0..110]) && h[..110].iter().any(|&b| b != 0)
+}
+
+/// Offset of the next plausible, CRC-valid entry header in `from..`, if any.
+fn find_next_entry_header(archive: &[u8], from: usize, total_size: usize) -> Option<usize> {
+    let method_ok = |m: u8| {
+        let f = m & FOLDER_MASK;
+        f == START_FOLDER || f == END_FOLDER || (m & !ENCRYPTED_FLAG) <= 0x0f
+    };
+    (from..(total_size + 1).saturating_sub(ENTRY_HEADER_LEN)).find(|&q| {
+        let h = &archive[q..q + ENTRY_HEADER_LEN];
+        h[2] <= 31 && method_ok(h[0]) && method_ok(h[1]) && entry_header_valid(h)
+    })
+}
+
+/// A hint naming the damage when the file shows the marks of a text conversion.
+/// See `docs/native_mac_archives.md` section 6a for why each signature is conclusive.
+pub(crate) fn damage_hint(data: &[u8]) -> &'static str {
+    if data.len() < 4096 {
+        return "";
+    }
+    let mut seen = [false; 256];
+    for &b in data {
+        seen[b as usize] = true;
+    }
+    if !seen[0x0d] {
+        return " - the file holds no CR (0x0d) bytes at all, so it went through a text-mode \
+                (line-ending) conversion that rewrote the compressed data; it cannot be repaired, \
+                fetch a copy transferred in binary mode";
+    }
+    if !seen[0xc0] && !seen[0xc1] && !seen[0xf5..].contains(&true) {
+        return " - the file holds none of the bytes C0, C1, F5-FF (the ones UTF-8 never uses), \
+                so it went through a text-encoding conversion that rewrote the compressed data; it \
+                cannot be repaired, fetch a copy transferred in binary mode";
+    }
+    ""
 }
 
 /// Decompress one fork from the archive bytes, verifying its CRC.
@@ -728,6 +809,84 @@ mod tests {
             .to_string();
         assert!(err.contains("truncated"), "unhelpful message: {err}");
         assert!(err.contains("10000 missing"), "no shortfall in: {err}");
+    }
+
+    fn two_file_archive() -> (Vec<StuffItInput>, Vec<u8>) {
+        let mk = |name: &str, body: Vec<u8>| StuffItInput {
+            name: name.to_string(),
+            type_code: *b"BINA",
+            creator_code: *b"????",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: body,
+            resource_fork: Vec::new(),
+        };
+        let files = vec![
+            mk("First", (0..3000u32).map(|i| (i % 253) as u8).collect()),
+            mk("Second", b"after the gap".to_vec()),
+        ];
+        let bytes = build_archive(&files, WriteMethod::Store).unwrap();
+        (files, bytes)
+    }
+
+    /// Splice `junk` in after the first entry's forks and fix the declared total
+    /// to cover it, the shape of the #101 samples.
+    fn splice_after_first(bytes: &[u8], junk: &[u8]) -> (Vec<u8>, usize) {
+        let gap_at = ARCHIVE_HEADER_LEN + ENTRY_HEADER_LEN + 3000;
+        let mut out = bytes[..gap_at].to_vec();
+        out.extend_from_slice(junk);
+        out.extend_from_slice(&bytes[gap_at..]);
+        let total = out.len() as u32;
+        BigEndian::write_u32(&mut out[6..10], total);
+        (out, gap_at)
+    }
+
+    #[test]
+    fn bytes_between_entries_are_skipped_and_reported() {
+        // Issue #101: 149 stray bytes after the first entry. The rest must list and extract.
+        let (files, bytes) = two_file_archive();
+        let junk: Vec<u8> = (0..149u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (damaged, gap_at) = splice_after_first(&bytes, &junk);
+
+        let archive = parse(&damaged).expect("damaged archive must still parse");
+        assert_eq!(archive.entries.len(), 2);
+        assert_eq!(archive.entries[1].name, "Second");
+        assert_eq!(
+            archive.damage,
+            vec![SitDamage {
+                offset: gap_at as u64,
+                skipped: 149
+            }]
+        );
+        assert!(archive.damage[0].describe().contains("149"));
+        let second = decompress_fork(&damaged, archive.entries[1].data.as_ref().unwrap()).unwrap();
+        assert_eq!(second, files[1].data_fork);
+    }
+
+    #[test]
+    fn zero_block_is_not_an_entry() {
+        // Poser 1.0.sit: the gap opens with 112 zero bytes, whose header CRC is also zero.
+        let (_, bytes) = two_file_archive();
+        let mut junk = vec![0u8; ENTRY_HEADER_LEN];
+        junk.extend_from_slice(&[0x80, 0xff, 0x97, 0x05, 0x7f, 0xff, 0x3f, 0x00]);
+        let (damaged, gap_at) = splice_after_first(&bytes, &junk);
+
+        let archive = parse(&damaged).expect("damaged archive must still parse");
+        let names: Vec<&str> = archive.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        assert_eq!(archive.damage.len(), 1);
+        assert_eq!(archive.damage[0].offset, gap_at as u64);
+        assert_eq!(archive.damage[0].skipped, junk.len() as u64);
+    }
+
+    #[test]
+    fn bad_header_with_nothing_after_it_still_errors() {
+        let (_, mut bytes) = two_file_archive();
+        let second_hdr = ARCHIVE_HEADER_LEN + ENTRY_HEADER_LEN + 3000;
+        bytes[second_hdr + 5] ^= 0xff;
+        let err = parse(&bytes).unwrap_err().to_string();
+        assert!(err.contains("CRC mismatch"), "{err}");
     }
 
     #[test]

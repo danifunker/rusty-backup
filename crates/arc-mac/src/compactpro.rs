@@ -113,6 +113,7 @@ pub fn parse(bytes: &[u8]) -> Result<StuffItArchive> {
     Ok(StuffItArchive {
         entries,
         truncated: None,
+        damage: Vec::new(),
     })
 }
 

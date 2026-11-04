@@ -109,6 +109,9 @@ fn run_list(args: ListArgs) -> Result<()> {
     if let Some(t) = archive.truncated {
         log_stderr(t.describe());
     }
+    for d in &archive.damage {
+        log_stderr(d.describe());
+    }
     for e in &archive.entries {
         if e.is_dir {
             println!("DIR   {}/", e.display_path());

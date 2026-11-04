@@ -156,6 +156,7 @@ pub fn parse(data: &[u8]) -> Result<(Vec<u8>, StuffItArchive)> {
         StuffItArchive {
             entries,
             truncated: None,
+            damage: Vec::new(),
         },
     ))
 }
