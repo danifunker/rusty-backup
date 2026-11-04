@@ -11,6 +11,7 @@ use rusty_backup::rust173_compat::IntIsMultipleOf as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::inspect::{
     format_size, BackupSummary, ChdProfile, ClonezillaSummary, ExportFormat, HostRequest,
     InspectAction, InspectController, InspectServices, InspectSource, LayoutBar, LayoutSegment,
@@ -43,6 +44,8 @@ pub struct InspectTab {
     pending_fx: Vec<Effect>,
     /// In-memory mirror of the Inspect recent-image list (config.json), for the picker.
     recent_files: Vec<String>,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     /// The user closed a backup; the app clears the shared backup folder.
     close_backup_requested: bool,
     pending_open_archive: Option<PathBuf>,
@@ -62,13 +65,14 @@ pub struct InspectTab {
     physical_disk_export: PhysicalDiskExport,
 }
 
-impl Default for InspectTab {
-    fn default() -> Self {
+impl InspectTab {
+    pub fn new(recent: RecentHandle) -> Self {
         Self {
             ctl: new_controller(),
             effects: EffectHost::default(),
             pending_fx: Vec::new(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Inspect),
+            recent_files: recent.list(RecentMode::Inspect),
+            recent,
             close_backup_requested: false,
             pending_open_archive: None,
             pending_open_optical: None,
@@ -131,13 +135,13 @@ impl InspectTab {
 
     /// Open an image file dropped or named on the command line; a wrapper is decoded first.
     pub fn open_file(&mut self, path: PathBuf) {
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Inspect, &path);
+        self.recent_files = super::push_recent(&self.recent, RecentMode::Inspect, &path);
         self.act(InspectAction::Load(InspectSource::ImageFile(path)));
     }
 
     /// Open an image handed over by another tab, keeping `guard` (its temp folder) alive.
     pub fn load_image_with_tempdir(&mut self, path: PathBuf, guard: Option<tempfile::TempDir>) {
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Inspect, &path);
+        self.recent_files = super::push_recent(&self.recent, RecentMode::Inspect, &path);
         self.act(InspectAction::Load(InspectSource::Image {
             path,
             temp: guard,

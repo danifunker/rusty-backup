@@ -29,7 +29,7 @@ pub(super) struct UpdateState {
 impl AppController {
     /// Check for a newer release in a job, if config.json enables the check.
     pub fn start_update_check(&mut self) {
-        let config = self.config.load().update_check;
+        let config = self.config.load_config().update_check;
         if !config.enabled {
             return;
         }

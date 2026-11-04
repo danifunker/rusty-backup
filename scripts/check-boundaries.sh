@@ -20,7 +20,8 @@ VERBOSE=0
 
 SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app)
 ENFORCED=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app)
-ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model'
+# `update` owns config.json (recent files, settings); views reach it through controller::app (slice 22).
+ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model|update'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
 TOOLKITS='egui|eframe|ratatui|crossterm|rfd|objc2[a-z0-9_]*|gtk4?|glib|libadwaita|windows::Win32::UI'
 

@@ -80,7 +80,7 @@ pub struct AppController {
     jobs: JobRegistry,
     notify: Arc<dyn Notify>,
     #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
-    config: Box<dyn ConfigStore>,
+    config: RecentHandle,
     shell: shell::ShellState,
     #[cfg(feature = "gui")]
     update: update::UpdateState,
@@ -95,7 +95,7 @@ impl AppController {
             jobs: JobRegistry::new(),
             notify,
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
-            config: Box::new(UserConfig),
+            config: RecentHandle::new(Box::new(UserConfig)),
             shell: shell::ShellState::default(),
             #[cfg(feature = "gui")]
             update: update::UpdateState::default(),
@@ -110,7 +110,7 @@ impl AppController {
             jobs: JobRegistry::new(),
             notify: Arc::new(NoNotify),
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
-            config: Box::<MemoryConfig>::default(),
+            config: RecentHandle::new(Box::<MemoryConfig>::default()),
             shell: shell::ShellState::default(),
             #[cfg(feature = "gui")]
             update: update::UpdateState::default(),
@@ -194,8 +194,11 @@ impl Controller for AppController {
     }
 }
 
+/// Which tab a recent-files list belongs to.
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
-pub use recent::{CommanderRecent, ConfigStore, MemoryConfig, UserConfig};
+pub use crate::update::RecentMode;
+#[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+pub use recent::{CommanderRecent, ConfigStore, MemoryConfig, RecentHandle, UserConfig};
 
 /// Check the release feed at `repo_url` now and say what it found (blocking: run it in a job).
 #[cfg(any(feature = "gui", feature = "tui-update"))]
@@ -219,6 +222,7 @@ pub fn check_updates_now_text(repo_url: &str) -> String {
 mod recent {
     use super::AppController;
     use crate::update::{RecentMode, UpdateConfig};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Where `AppController` loads and saves config.json; swapped for memory in tests.
     pub trait ConfigStore: Send {
@@ -290,25 +294,65 @@ mod recent {
         }
     }
 
-    impl AppController {
+    /// The app's config store, shared so a screen built apart from the root records into it too.
+    #[derive(Clone)]
+    pub struct RecentHandle(Arc<Mutex<Box<dyn ConfigStore>>>);
+
+    impl RecentHandle {
+        pub(super) fn new(store: Box<dyn ConfigStore>) -> Self {
+            RecentHandle(Arc::new(Mutex::new(store)))
+        }
+
+        fn lock(&self) -> MutexGuard<'_, Box<dyn ConfigStore>> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        pub(super) fn load_config(&self) -> UpdateConfig {
+            self.lock().load()
+        }
+
         /// The recent-files list for `mode`, newest first.
-        pub fn recent(&self, mode: RecentMode) -> Vec<String> {
-            self.config.load().recent_files.list(mode).to_vec()
+        pub fn list(&self, mode: RecentMode) -> Vec<String> {
+            self.load_config().recent_files.list(mode).to_vec()
         }
 
         /// Record a successful open of `path` and return the updated list for `mode`.
-        pub fn remember(&mut self, mode: RecentMode, path: &str) -> Vec<String> {
-            let mut cfg = self.config.load();
+        pub fn remember(&self, mode: RecentMode, path: &str) -> Vec<String> {
+            let mut store = self.lock();
+            let mut cfg = store.load();
             cfg.remember_file(mode, path);
-            self.config.save(&cfg);
+            store.save(&cfg);
             cfg.recent_files.list(mode).to_vec()
         }
 
         /// Forget every mode's recent files.
-        pub fn clear_recent(&mut self) {
-            let mut cfg = self.config.load();
+        pub fn clear(&self) {
+            let mut store = self.lock();
+            let mut cfg = store.load();
             cfg.recent_files.clear();
-            self.config.save(&cfg);
+            store.save(&cfg);
+        }
+    }
+
+    impl AppController {
+        /// A handle on this app's recent files, for a screen that records opens on its own.
+        pub fn recent_handle(&self) -> RecentHandle {
+            self.config.clone()
+        }
+
+        /// The recent-files list for `mode`, newest first.
+        pub fn recent(&self, mode: RecentMode) -> Vec<String> {
+            self.config.list(mode)
+        }
+
+        /// Record a successful open of `path` and return the updated list for `mode`.
+        pub fn remember(&mut self, mode: RecentMode, path: &str) -> Vec<String> {
+            self.config.remember(mode, path)
+        }
+
+        /// Forget every mode's recent files.
+        pub fn clear_recent(&mut self) {
+            self.config.clear();
         }
     }
 }
@@ -350,6 +394,19 @@ mod tests {
         assert!(app.recent(RecentMode::Optical).is_empty());
         app.clear_recent();
         assert!(app.recent(RecentMode::Inspect).is_empty());
+    }
+
+    #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+    #[test]
+    fn a_recent_handle_shares_the_app_store() {
+        let mut app = AppController::headless();
+        let handle = app.recent_handle();
+        handle.remember(RecentMode::Backup, "/src.img");
+        assert_eq!(app.recent(RecentMode::Backup), ["/src.img"]);
+        app.remember(RecentMode::Backup, "/b.img");
+        assert_eq!(handle.list(RecentMode::Backup), ["/b.img", "/src.img"]);
+        app.clear_recent();
+        assert!(handle.list(RecentMode::Backup).is_empty());
     }
 
     #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]

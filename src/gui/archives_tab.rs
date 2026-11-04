@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
     ArchivesAction, ArchivesController, ForkFormat, HostRequest,
 };
@@ -29,17 +30,20 @@ pub struct ArchivesTab {
     pending_fx: Vec<Effect>,
     /// MRU of opened archive paths (newest first), mirrored to `config.json`.
     recent_files: Vec<String>,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     /// Queued by "Mount in new Inspect tab"; drained by the app via [`Self::take_pending_inspect_open`].
     pending_inspect_open: Option<PendingInspectOpen>,
 }
 
-impl Default for ArchivesTab {
-    fn default() -> Self {
+impl ArchivesTab {
+    pub fn new(recent: RecentHandle) -> Self {
         Self {
             ctl: ArchivesController::new(Arc::new(super::ui_logger::EguiWake)),
             effects: EffectHost::default(),
             pending_fx: Vec::new(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Archives),
+            recent_files: recent.list(RecentMode::Archives),
+            recent,
             pending_inspect_open: None,
         }
     }
@@ -72,7 +76,7 @@ impl ArchivesTab {
             match req {
                 HostRequest::RememberRecent(path) => {
                     self.recent_files =
-                        super::push_recent(rusty_backup::update::RecentMode::Archives, &path);
+                        super::push_recent(&self.recent, RecentMode::Archives, &path);
                 }
                 HostRequest::OpenInInspect { path, guard } => {
                     self.pending_inspect_open = Some(PendingInspectOpen { path, guard });

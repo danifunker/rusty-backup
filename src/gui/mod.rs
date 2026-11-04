@@ -41,11 +41,10 @@ use progress::ProgressState;
 use restore_tab::RestoreTab;
 use rusty_backup::controller::app::{
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate, AppAction,
-    AppController, AppTab, DropRoute, DropTargets, ElevationGate, InstallState, ShareStep,
-    UpdateInfo,
+    AppController, AppTab, DropRoute, DropTargets, ElevationGate, InstallState, RecentHandle,
+    RecentMode, ShareStep, UpdateInfo,
 };
 use rusty_backup::controller::{Controller, Effect};
-use rusty_backup::update::RecentMode;
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
@@ -90,20 +89,13 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
     }
 }
 
-/// Record `path` in the per-mode recent-files MRU (persisted in config.json)
-/// and return the updated newest-first list for `mode`. Mirrors the Optical
-/// tab's `remember_daemon_addr` write-through: config.json is the source of
-/// truth and each tab keeps an in-memory mirror it refreshes from this return
-/// value. Loading + saving on every open is cheap (a small JSON file) and keeps
-/// the history durable across runs without an eframe `save()` hook.
-pub(crate) fn push_recent(mode: RecentMode, path: &std::path::Path) -> Vec<String> {
-    rusty_backup::update::push_recent(mode, &path.display().to_string())
-}
-
-/// The persisted recent-files list for `mode` (newest first). Used to seed a
-/// tab's in-memory mirror at construction.
-pub(crate) fn load_recent(mode: RecentMode) -> Vec<String> {
-    rusty_backup::update::load_recent(mode)
+/// Record `path` in `mode`'s recent files through the app's store and return the new list.
+pub(crate) fn push_recent(
+    recent: &RecentHandle,
+    mode: RecentMode,
+    path: &std::path::Path,
+) -> Vec<String> {
+    recent.remember(mode, &path.display().to_string())
 }
 
 /// A dedicated "Recent" dropdown (its own popup, so it never gets clipped inside
@@ -210,15 +202,15 @@ impl Default for RustyBackupApp {
         app.start_update_check();
 
         // The scan runs in a job; "Found N optical drive(s)" is logged when it ends.
-        let mut optical_tab = OpticalTab::default();
+        let mut optical_tab = OpticalTab::new(app.recent_handle());
         optical_tab.find_drives();
 
         Self {
-            backup_tab: BackupTab::default(),
-            restore_tab: RestoreTab::default(),
-            inspect_tab: InspectTab::default(),
+            backup_tab: BackupTab::new(app.recent_handle()),
+            restore_tab: RestoreTab::new(app.recent_handle()),
+            inspect_tab: InspectTab::new(app.recent_handle()),
             optical_tab,
-            archives_tab: ArchivesTab::default(),
+            archives_tab: ArchivesTab::new(app.recent_handle()),
             app,
             progress: ProgressState::default(),
             settings_dialog: SettingsDialog::default(),

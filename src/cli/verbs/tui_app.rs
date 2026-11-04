@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
-use crate::controller::app::DiskDevice;
 use crate::controller::app::{format_size, RateTracker};
+use crate::controller::app::{DiskDevice, RecentMode};
 
 mod commander;
 mod explorer;
@@ -1163,6 +1163,8 @@ const BACKUP_FIELDS: usize = 5;
 
 struct BackupState {
     step: BackupStep,
+    /// The app's recent-files store; a successful open is recorded through it.
+    recent: crate::controller::app::RecentHandle,
     ctl: crate::controller::backup::BackupController,
     /// Source image file picker, when open.
     picker: Option<FilePicker>,
@@ -1182,8 +1184,8 @@ struct BackupState {
     cancel_note: bool,
 }
 
-impl Default for BackupState {
-    fn default() -> Self {
+impl BackupState {
+    fn new(recent: crate::controller::app::RecentHandle) -> Self {
         use crate::controller::backup::{
             BackupAction, BackupController, BackupServices, JobRegistry, NoNotify,
         };
@@ -1197,6 +1199,7 @@ impl Default for BackupState {
         ctl.apply(BackupAction::SetSplit(false));
         BackupState {
             step: BackupStep::Source,
+            recent,
             ctl,
             picker: None,
             device_pick: false,
@@ -1226,10 +1229,8 @@ impl BackupState {
         for req in self.ctl.take_requests() {
             match req {
                 HostRequest::RememberRecent(path) => {
-                    crate::update::push_recent(
-                        crate::update::RecentMode::Backup,
-                        &path.to_string_lossy(),
-                    );
+                    self.recent
+                        .remember(RecentMode::Backup, path.to_string_lossy().as_ref());
                 }
             }
         }
@@ -1287,6 +1288,8 @@ const RESTORE_FIELDS: usize = 4;
 
 struct RestoreState {
     step: RestoreStep,
+    /// The app's recent-files store; a successful open is recorded through it.
+    recent: crate::controller::app::RecentHandle,
     ctl: crate::controller::restore::RestoreController,
     /// The backup folder or `.cbk` (or, for an image source, the image) as picked.
     backup_folder: String,
@@ -1331,13 +1334,14 @@ struct RestoreState {
     writing: bool,
 }
 
-impl Default for RestoreState {
-    fn default() -> Self {
+impl RestoreState {
+    fn new(recent: crate::controller::app::RecentHandle) -> Self {
         use crate::controller::restore::{
             JobRegistry, NoNotify, RestoreController, RestoreServices,
         };
         RestoreState {
             step: RestoreStep::Source,
+            recent,
             ctl: RestoreController::new(RestoreServices {
                 jobs: JobRegistry::new(),
                 notify: Arc::new(NoNotify),
@@ -1389,10 +1393,8 @@ impl RestoreState {
         for req in self.ctl.take_requests() {
             match req {
                 HostRequest::RememberRecent(path) => {
-                    crate::update::push_recent(
-                        crate::update::RecentMode::Restore,
-                        &path.to_string_lossy(),
-                    );
+                    self.recent
+                        .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
                 }
                 // The TUI pours an image itself; it never asks for the GUI's writer.
                 HostRequest::WriteImage { .. } => {}
@@ -1699,6 +1701,8 @@ const ARCHIVE_FORK_FORMATS: &[(&str, crate::controller::archives::ForkFormat)] =
 /// through a headless `controller::archives::ArchivesController`.
 struct ArchiveState {
     ctl: crate::controller::archives::ArchivesController,
+    /// The app's recent-files store; a successful open is recorded through it.
+    recent: crate::controller::app::RecentHandle,
     picker: Option<FilePicker>,
     /// When true, a picker confirm chooses the extract destination folder.
     picker_dest: bool,
@@ -1714,11 +1718,12 @@ struct ArchiveState {
     awaiting_extract: bool,
 }
 
-impl Default for ArchiveState {
-    fn default() -> Self {
+impl ArchiveState {
+    fn new(recent: crate::controller::app::RecentHandle) -> Self {
         use crate::controller::archives::{ArchivesController, NoNotify};
         ArchiveState {
             ctl: ArchivesController::new(Arc::new(NoNotify)),
+            recent,
             picker: None,
             picker_dest: false,
             archive_path: String::new(),
@@ -1752,10 +1757,8 @@ impl ArchiveState {
                 self.status = Some(format!("Cannot open archive: {}", e.detail));
                 self.is_error = true;
             } else if self.ctl.is_loaded() {
-                crate::update::push_recent(
-                    crate::update::RecentMode::Archives,
-                    &path.to_string_lossy(),
-                );
+                self.recent
+                    .remember(RecentMode::Archives, path.to_string_lossy().as_ref());
                 self.archive_path = path.display().to_string();
                 self.entries = self.ctl.rows().iter().map(archive_row_line).collect();
                 self.list_sel = 0;
@@ -1908,6 +1911,23 @@ struct App {
 
 impl App {
     fn new_on(initial_tab: usize) -> Self {
+        let notify = Arc::new(crate::controller::task::NoNotify);
+        Self::with_shell(
+            initial_tab,
+            crate::controller::app::AppController::new(notify),
+        )
+    }
+
+    /// For tests: recent files and other config kept in memory.
+    #[cfg(test)]
+    fn headless_on(initial_tab: usize) -> Self {
+        Self::with_shell(
+            initial_tab,
+            crate::controller::app::AppController::headless(),
+        )
+    }
+
+    fn with_shell(initial_tab: usize, shell: crate::controller::app::AppController) -> Self {
         let active = initial_tab.min(TABS.len() - 1);
         let mut app = App {
             palette: Palette::detect(),
@@ -1921,9 +1941,7 @@ impl App {
             explorer: None,
             status: None,
             progress: None,
-            shell: crate::controller::app::AppController::new(Arc::new(
-                crate::controller::task::NoNotify,
-            )),
+            shell,
             devices_loaded: false,
             refreshing_devices: false,
             newdisk: None,
@@ -2208,7 +2226,7 @@ impl App {
             KeyCode::Enter => self.activate(),
             // Open a file / backup (Inspect tab): the shared picker + MRU.
             KeyCode::Char('o') if self.current() == TabId::Inspect => {
-                let recent = crate::update::load_recent(crate::update::RecentMode::Inspect);
+                let recent = self.shell.recent(RecentMode::Inspect);
                 self.open_picker =
                     Some(FilePicker::new(PickKind::Any, "Open file / backup").with_recent(recent));
             }
@@ -2239,7 +2257,7 @@ impl App {
                 let display = path.display().to_string();
                 Ok(Box::new(move |app: &mut App| match opened {
                     Ok(opened) => {
-                        crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                        app.shell.remember(RecentMode::Inspect, display.as_str());
                         app.opened = Some(opened);
                     }
                     Err(e) => app.status = Some(format!("Cannot open: {e}")),
@@ -2316,7 +2334,7 @@ impl App {
         };
         match parts {
             Ok(parts) => {
-                crate::update::push_recent(crate::update::RecentMode::Inspect, &display);
+                self.shell.remember(RecentMode::Inspect, display.as_str());
                 self.status = None;
                 self.opened = Some(Opened::Image {
                     path: display,
@@ -2566,12 +2584,12 @@ impl App {
         }
         if self.current() == TabId::Backup {
             if self.backup.is_none() {
-                self.backup = Some(BackupState::default());
+                self.backup = Some(BackupState::new(self.shell.recent_handle()));
             }
             self.load_devices_once();
         }
         if self.current() == TabId::Restore && self.restore.is_none() {
-            self.restore = Some(RestoreState::default());
+            self.restore = Some(RestoreState::new(self.shell.recent_handle()));
         }
         if self.current() == TabId::Bulk && self.bulk.is_none() {
             self.bulk = Some(BulkState::default());
@@ -2581,7 +2599,7 @@ impl App {
             self.optical = Some(OpticalState::scanned());
         }
         if self.current() == TabId::Archives && self.archive.is_none() {
-            self.archive = Some(ArchiveState::default());
+            self.archive = Some(ArchiveState::new(self.shell.recent_handle()));
         }
         if self.current() == TabId::Commander && self.commander.is_none() {
             self.commander = Some(commander::CommanderView::new());
@@ -3115,7 +3133,7 @@ impl App {
     fn handle_backup_key(&mut self, code: KeyCode) -> bool {
         use crate::controller::backup::BackupAction;
         if self.backup.is_none() {
-            self.backup = Some(BackupState::default());
+            self.backup = Some(BackupState::new(self.shell.recent_handle()));
         }
         // Source image file picker (modal).
         if let Some(b) = self.backup.as_mut() {
@@ -3177,7 +3195,7 @@ impl App {
         match step {
             BackupStep::Source => match code {
                 KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = crate::update::load_recent(crate::update::RecentMode::Backup);
+                    let recent = b.recent.list(RecentMode::Backup);
                     b.picker = Some(
                         FilePicker::new(PickKind::File, "Choose source image").with_recent(recent),
                     );
@@ -3327,7 +3345,7 @@ impl App {
     /// Restore screen keys. Returns `true` when consumed.
     fn handle_restore_key(&mut self, code: KeyCode) -> bool {
         if self.restore.is_none() {
-            self.restore = Some(RestoreState::default());
+            self.restore = Some(RestoreState::new(self.shell.recent_handle()));
         }
         // Source / target picker (modal).
         if self
@@ -3481,7 +3499,7 @@ impl App {
         match step {
             RestoreStep::Source => match code {
                 KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = crate::update::load_recent(crate::update::RecentMode::Restore);
+                    let recent = r.recent.list(RecentMode::Restore);
                     let prompt = if r.source_is_image {
                         "Choose a disk image to write"
                     } else {
@@ -3737,10 +3755,8 @@ impl App {
             r.after();
             match r.ctl.write_image().map(|(_, n)| n).filter(|&n| n > 0) {
                 Some(n) => {
-                    crate::update::push_recent(
-                        crate::update::RecentMode::Restore,
-                        &path.to_string_lossy(),
-                    );
+                    r.recent
+                        .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
                     r.backup_folder = path.to_string_lossy().into_owned();
                     r.image_size = n;
                     r.source_size = n;
@@ -4372,7 +4388,7 @@ impl App {
     /// Archives screen keys. Returns `true` when consumed.
     fn handle_archive_key(&mut self, code: KeyCode) -> bool {
         if self.archive.is_none() {
-            self.archive = Some(ArchiveState::default());
+            self.archive = Some(ArchiveState::new(self.shell.recent_handle()));
         }
         // Archive / destination picker (modal).
         if self
@@ -4415,7 +4431,7 @@ impl App {
         if !loaded {
             return match code {
                 KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = crate::update::load_recent(crate::update::RecentMode::Archives);
+                    let recent = a.recent.list(RecentMode::Archives);
                     a.picker = Some(
                         FilePicker::new(PickKind::File, "Open a Mac archive").with_recent(recent),
                     );
@@ -4473,7 +4489,7 @@ impl App {
             }
             KeyCode::Esc => {
                 // Close the archive, back to the open prompt.
-                *a = ArchiveState::default();
+                *a = ArchiveState::new(a.recent.clone());
                 true
             }
             _ => false,
@@ -7561,13 +7577,15 @@ mod tests {
     fn the_archives_screen_opens_and_extracts_through_the_controller() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sit = crate::controller::archives::sample_archive(dir.path(), &[("readme", b"hello")]);
-        let mut app = App::new_on(BACKUP_TAB);
-        app.archive = Some(ArchiveState::default());
-        app.load_archive(sit);
+        let mut app = App::headless_on(BACKUP_TAB);
+        app.archive = Some(ArchiveState::new(app.shell.recent_handle()));
+        app.load_archive(sit.clone());
         app.archive.as_mut().unwrap().ctl.wait_idle();
         app.tick();
         let a = app.archive.as_ref().unwrap();
         assert_eq!(a.status.as_deref(), Some("Opened (1 entries)."));
+        let recent = app.shell.recent(RecentMode::Archives);
+        assert_eq!(recent, [sit.to_string_lossy().into_owned()]);
         assert!(a.entries[0].starts_with("FILE  readme"), "{:?}", a.entries);
         let out = dir.path().join("out");
         app.archive.as_mut().unwrap().fork_fmt_sel = 3;
@@ -7641,7 +7659,7 @@ mod tests {
         let folder = dir.path().join("bk");
 
         let mut app = App::new_on(BACKUP_TAB + 1);
-        app.restore = Some(RestoreState::default());
+        app.restore = Some(RestoreState::new(app.shell.recent_handle()));
         app.load_restore_source(folder.clone());
         for _ in 0..3000 {
             app.tick();
@@ -7694,7 +7712,7 @@ mod tests {
         let mut app = App::new_on(BACKUP_TAB + 1);
         app.restore = Some(RestoreState {
             source_is_image: true,
-            ..RestoreState::default()
+            ..RestoreState::new(app.shell.recent_handle())
         });
         app.load_restore_source(img.clone());
         let r = app.restore.as_mut().unwrap();
@@ -7870,6 +7888,23 @@ mod tests {
             !status.contains("No such file or directory"),
             "an existing path must not be reported as missing: {status}"
         );
+    }
+
+    /// An Inspect open is recorded through the app controller, and `o` offers it next time.
+    #[test]
+    fn an_image_open_is_remembered_through_the_app_controller() {
+        let mut app = App::headless_on(tab_index(TabId::Inspect));
+        let path = std::path::PathBuf::from("/rb-tui-test/recent.img");
+        let shown = vec![path.display().to_string()];
+        app.apply_image_open(path, None, Ok(1 << 20), Some(Ok(Vec::new())));
+        assert_eq!(app.shell.recent(RecentMode::Inspect), shown);
+        app.opened = None;
+        app.on_key_inner(crossterm::event::KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+        ));
+        let picker = app.open_picker.as_ref().expect("o opens the picker");
+        assert_eq!(picker.recent, shown);
     }
 
     /// `parse_partitions` must report an unreadable target rather than return an

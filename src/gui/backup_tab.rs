@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::backup::{
     format_size, BackupAction, BackupController, BackupServices, ChdChoice, ChdProfile,
     ChecksumType, CompactCell, CompressionType, HostRequest, MinCell,
@@ -36,13 +37,15 @@ pub struct BackupTab {
     pending_fx: Vec<Effect>,
     /// In-memory mirror of the Backup recent-image list (config.json), for the Recent dropdown.
     recent_files: Vec<String>,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     chd_hd_control: ChdOptionsControl,
     /// The shared progress bar shows this tab's job.
     showing_bar: bool,
 }
 
-impl Default for BackupTab {
-    fn default() -> Self {
+impl BackupTab {
+    pub fn new(recent: RecentHandle) -> Self {
         let mut chd = ChdOptionsControl::new(ChdProfile::Hd);
         // The last Custom codecs and hunk size wait in the Custom slot.
         chd.custom = BackupController::saved_chd_custom(chd.custom.clone());
@@ -50,7 +53,8 @@ impl Default for BackupTab {
             ctl: new_controller(),
             effects: EffectHost::default(),
             pending_fx: Vec::new(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Backup),
+            recent_files: recent.list(RecentMode::Backup),
+            recent,
             chd_hd_control: chd,
             showing_bar: false,
         }
@@ -92,8 +96,7 @@ impl BackupTab {
         for req in self.ctl.take_requests() {
             match req {
                 HostRequest::RememberRecent(path) => {
-                    self.recent_files =
-                        super::push_recent(rusty_backup::update::RecentMode::Backup, &path)
+                    self.recent_files = super::push_recent(&self.recent, RecentMode::Backup, &path)
                 }
             }
         }

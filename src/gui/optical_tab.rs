@@ -6,6 +6,7 @@
 //! address being typed, and the recent-files mirror. The disc browser is the Inspect tab's
 //! browse view over the browser pane's optical profile, opened on `HostRequest::OpenBrowser`.
 
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::optical::{
     ChdChoice, ChdProfile, HostRequest, OpticalAction, OpticalController, OutputFormat, SourceMode,
@@ -23,6 +24,8 @@ pub struct OpticalTab {
     pending_fx: Vec<Effect>,
     /// MRU of opened disc-image paths (config.json), for the "Recent:" quick-pick row.
     recent_files: Vec<String>,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     chd_cd_control: ChdOptionsControl,
     /// The "Add remote daemon" address field.
     add_remote_addr: String,
@@ -32,15 +35,16 @@ pub struct OpticalTab {
     browser: super::browse_view::BrowseView,
 }
 
-impl Default for OpticalTab {
-    fn default() -> Self {
+impl OpticalTab {
+    pub fn new(recent: RecentHandle) -> Self {
         let mut chd = ChdOptionsControl::new(ChdProfile::Cd);
         chd.custom = OpticalController::saved_chd_custom(chd.custom.clone());
         Self {
             ctl: OpticalController::new(std::sync::Arc::new(super::ui_logger::EguiWake)),
             effects: EffectHost::default(),
             pending_fx: Vec::new(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Optical),
+            recent_files: recent.list(RecentMode::Optical),
+            recent,
             chd_cd_control: chd,
             add_remote_addr: String::new(),
             showing_bar: false,
@@ -92,7 +96,7 @@ impl OpticalTab {
             match req {
                 HostRequest::RememberRecent(path) => {
                     self.recent_files =
-                        super::push_recent(rusty_backup::update::RecentMode::Optical, &path);
+                        super::push_recent(&self.recent, RecentMode::Optical, &path);
                 }
                 HostRequest::OpenBrowser(src) => self.browser.open_disc(src),
                 HostRequest::CloseBrowser => self.browser.close(),

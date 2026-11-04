@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::disk_write::WriteOpen;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
@@ -39,19 +40,22 @@ pub struct RestoreTab {
     pending_fx: Vec<Effect>,
     /// MRU of opened backup-folder paths (newest first), mirrored to `config.json`.
     recent_files: Vec<String>,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     /// Write Image File's target picker and progress, shared with the Inspect tab's export.
     image_write: PhysicalDiskExport,
     /// The shared progress bar shows this tab's restore.
     showing_bar: bool,
 }
 
-impl Default for RestoreTab {
-    fn default() -> Self {
+impl RestoreTab {
+    pub fn new(recent: RecentHandle) -> Self {
         Self {
             ctl: new_controller(),
             effects: EffectHost::default(),
             pending_fx: Vec::new(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Restore),
+            recent_files: recent.list(RecentMode::Restore),
+            recent,
             image_write: PhysicalDiskExport::default(),
             showing_bar: false,
         }
@@ -121,8 +125,7 @@ impl RestoreTab {
         for req in self.ctl.take_requests() {
             match req {
                 HostRequest::RememberRecent(path) => {
-                    self.recent_files =
-                        super::push_recent(rusty_backup::update::RecentMode::Restore, &path)
+                    self.recent_files = super::push_recent(&self.recent, RecentMode::Restore, &path)
                 }
                 HostRequest::WriteImage { path, size } => {
                     self.image_write.open_for(WriteOpen::image(path, size));
