@@ -303,3 +303,23 @@ mention creation), `docs/cli-reference.md`, `docs/platform_matrix.md`, and
    on the filesystem backlog?
 7. **In-RAM formatters.** For the `Vec` filesystems on a device: cap the size
    and refuse above it, or write streaming variants first (G3)?
+
+## 6. Decisions (answered 2026-11-04)
+
+1. **CLI:** a new `rb-cli build` verb takes the full request. `rb-cli new` stays for at
+   least a couple of months as shorthand, then gets a deprecation notice.
+2. **Order:** as proposed (MBR + FAT / NTFS, RDB + PFS3 / SFS, APM + HFS / HFS+, Sun / NeXT +
+   UFS first). Each phase also adds test disks for the combinations it opens, not only the
+   oracle-backed ones.
+3. **Boot:** keep what exists (the X68000 IPL, the fixed builders' boot pieces,
+   `make-bootable` for Mac). Per-filesystem "what bootable means" and booting from a
+   validated donor disk go to `docs/bootable_disks_backlog.md`, not this feature.
+4. **GUI entry:** Build Disk becomes its own section of the app (a top-level tab), out of
+   the Restore tab.
+5. **Fixed builders:** still open; see question 5 above (explained to the user 2026-11-04).
+6. **Filesystems:** Build Disk can create every filesystem we support writing. The E rows
+   with no creator stay on the filesystem backlog until a writer exists; each writer that
+   lands joins Build Disk.
+7. **Size limits:** the in-RAM (`Vec`) creators get streaming variants (G3) for the ones
+   that reach card sizes; until then the builder refuses above a cap and says why. The
+   user wants to be told the limit up front (shown in the size field and in the refusal).
