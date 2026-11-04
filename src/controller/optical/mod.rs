@@ -78,6 +78,9 @@ pub mod ids {
     pub const REMOTE_CANCEL: &str = "optical.remote_cancel";
 }
 
+/// What CHD output and CHD Info say in a build without the `chd` feature.
+pub const CHD_NOT_BUILT: &str = "CHD needs the `chd` feature; this binary was built without it.";
+
 /// Where the disc comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMode {
@@ -315,6 +318,27 @@ impl OpticalController {
         }
     }
 
+    /// The connect dialog is open; never without `remote`.
+    #[cfg(not(feature = "remote"))]
+    pub fn add_remote_open(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "remote"))]
+    pub fn add_remote_error(&self) -> Option<&str> {
+        None
+    }
+
+    #[cfg(not(feature = "remote"))]
+    pub fn remote_connecting(&self) -> Option<Snapshot> {
+        None
+    }
+
+    #[cfg(not(feature = "remote"))]
+    pub fn recent_daemons(&self) -> &[String] {
+        &[]
+    }
+
     pub fn disc(&self) -> Option<DiscSummary> {
         let info = self.disc.as_ref()?;
         Some(DiscSummary {
@@ -341,13 +365,23 @@ impl OpticalController {
         self.detecting.as_ref().map(|(j, _)| j.snapshot())
     }
 
-    /// The image is a CHD: CHD Info is offered.
+    /// The image is a CHD: CHD Info is offered (a build without `chd` cannot read one).
     pub fn can_chd_info(&self) -> bool {
+        cfg!(feature = "chd") && self.chd_info_job.is_none() && self.is_chd_image()
+    }
+
+    /// The image file is a `.chd`.
+    pub fn is_chd_image(&self) -> bool {
         self.image.as_ref().is_some_and(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("chd"))
         })
+    }
+
+    /// CHD Info is reading the header.
+    pub fn chd_info_running(&self) -> bool {
+        self.chd_info_job.is_some()
     }
 
     /// The CHD Info window's text, while it is open.
@@ -364,8 +398,29 @@ impl OpticalController {
         let source = self.disc.as_ref().map(|i| i.format);
         OutputFormat::ALL
             .iter()
-            .map(|&f| (f, self.task() == Task::Rip || f.converts_from(source)))
+            .map(|&f| {
+                let built = f != OutputFormat::Chd || cfg!(feature = "chd");
+                (
+                    f,
+                    built && (self.task() == Task::Rip || f.converts_from(source)),
+                )
+            })
             .collect()
+    }
+
+    /// Why `format` is not offered, for a shell that names it beside the choice.
+    pub fn format_refusal(&self, format: OutputFormat) -> Option<String> {
+        if self.format_ok(format) {
+            return None;
+        }
+        Some(if format == OutputFormat::Chd && !cfg!(feature = "chd") {
+            CHD_NOT_BUILT.to_string()
+        } else {
+            format!(
+                "The image is already {}; choose another output format.",
+                format.label()
+            )
+        })
     }
 
     pub fn output(&self) -> Option<&Path> {
@@ -389,7 +444,47 @@ impl OpticalController {
     }
 
     pub fn can_start(&self) -> bool {
-        !self.is_running() && self.output.is_some() && self.has_valid_source()
+        self.start_refusal().is_none()
+    }
+
+    /// "Start Rip" or "Start Convert".
+    pub fn start_label(&self) -> &'static str {
+        match self.task() {
+            Task::Rip => "Start Rip",
+            Task::Convert => "Start Convert",
+        }
+    }
+
+    /// Why Start is refused, or `None` when it can run.
+    pub fn start_refusal(&self) -> Option<String> {
+        if self.is_running() {
+            return Some("A rip or conversion is running.".to_string());
+        }
+        if !self.has_valid_source() {
+            return Some(match self.mode {
+                SourceMode::PhysicalDrive => "Select a drive.".to_string(),
+                SourceMode::ImageFile => "Choose a disc image.".to_string(),
+            });
+        }
+        // A conversion picks its route by the detected format.
+        if self.task() == Task::Convert && self.disc.is_none() {
+            return Some(match self.detecting {
+                Some(_) => "Detecting the disc...".to_string(),
+                None => "The image was not recognised as a disc.".to_string(),
+            });
+        }
+        if let Some(why) = self.format_refusal(self.format) {
+            return Some(why);
+        }
+        if self.output.is_none() {
+            return Some("Choose an output file.".to_string());
+        }
+        None
+    }
+
+    /// Whether this build has remote daemons (`Add remote daemon`).
+    pub const fn remote_available() -> bool {
+        cfg!(feature = "remote")
     }
 
     /// The disc browser is open (`HostRequest::OpenBrowser` was the last word on it).
@@ -537,12 +632,13 @@ impl OpticalController {
     }
 
     fn start_chd_info(&mut self) {
+        if !cfg!(feature = "chd") && self.is_chd_image() {
+            self.warn(CHD_NOT_BUILT);
+            return;
+        }
         let Some(path) = self.image.clone().filter(|_| self.can_chd_info()) else {
             return;
         };
-        if self.chd_info_job.is_some() {
-            return;
-        }
         self.chd_info_job = Some(Job::spawn(
             "Reading the CHD header...",
             Arc::clone(&self.notify),
@@ -715,6 +811,8 @@ impl Controller for OpticalController {
             OpticalAction::OpenAddRemote => {
                 #[cfg(feature = "remote")]
                 self.remote.open_dialog();
+                #[cfg(not(feature = "remote"))]
+                self.warn(crate::controller::backup::REMOTE_NOT_BUILT);
             }
             OpticalAction::CloseAddRemote => {
                 #[cfg(feature = "remote")]

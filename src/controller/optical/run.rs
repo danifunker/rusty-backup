@@ -95,7 +95,10 @@ impl OpticalController {
     }
 
     pub(super) fn start(&mut self, chd: Option<ChdChoice>) {
-        if self.is_running() || !self.has_valid_source() {
+        if let Some(why) = self.start_refusal() {
+            if !self.is_running() {
+                self.error(format!("Cannot start: {why}"));
+            }
             return;
         }
         match self.task() {

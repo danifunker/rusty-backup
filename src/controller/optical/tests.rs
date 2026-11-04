@@ -303,3 +303,60 @@ fn a_drive_the_browser_cannot_open_shows_the_error() {
     );
     assert!(!pane.listing.is_loaded());
 }
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn start_names_what_it_waits_for_and_refuses_the_images_own_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = hybrid_disc(dir.path());
+    let mut ctl = controller();
+    assert_eq!(ctl.start_label(), "Start Convert");
+    assert_eq!(ctl.start_refusal().as_deref(), Some("Choose a disc image."));
+    ctl.apply(OpticalAction::SetSourceMode(SourceMode::PhysicalDrive));
+    assert_eq!(ctl.start_label(), "Start Rip");
+    assert_eq!(ctl.start_refusal().as_deref(), Some("Select a drive."));
+    ctl.apply(OpticalAction::OpenImage(iso));
+    assert_eq!(ctl.source_mode(), SourceMode::ImageFile);
+    assert_eq!(
+        ctl.start_refusal().as_deref(),
+        Some("Detecting the disc...")
+    );
+    ctl.wait_idle();
+    let own = "The image is already ISO; choose another output format.";
+    assert_eq!(ctl.start_refusal().as_deref(), Some(own));
+    assert_eq!(ctl.format_refusal(OutputFormat::Iso).as_deref(), Some(own));
+    assert_eq!(ctl.format_refusal(OutputFormat::BinCue), None);
+    ctl.set_output_path(dir.path().join("out.iso"));
+    ctl.take_log();
+    ctl.apply(OpticalAction::Start(None));
+    assert!(!ctl.is_running(), "an ISO is not converted to ISO");
+    let log: Vec<String> = ctl.take_log().into_iter().map(|(_, m)| m).collect();
+    assert_eq!(log, [format!("Cannot start: {own}")]);
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::BinCue));
+    assert!(ctl.can_start(), "{:?}", ctl.start_refusal());
+    let chd = ctl.format_refusal(OutputFormat::Chd);
+    if cfg!(feature = "chd") {
+        assert_eq!(chd, None);
+    } else {
+        assert_eq!(chd.as_deref(), Some(CHD_NOT_BUILT));
+    }
+    assert!(!ctl.can_chd_info() && !ctl.is_chd_image());
+    assert_eq!(
+        OpticalController::remote_available(),
+        cfg!(feature = "remote")
+    );
+}
+
+#[test]
+fn an_image_that_does_not_open_is_not_converted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = controller();
+    ctl.apply(OpticalAction::OpenImage(dir.path().join("missing.iso")));
+    ctl.wait_idle();
+    assert!(ctl.disc_error().is_some());
+    ctl.set_output_path(dir.path().join("out.cue"));
+    assert_eq!(
+        ctl.start_refusal().as_deref(),
+        Some("The image was not recognised as a disc.")
+    );
+}

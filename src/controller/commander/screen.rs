@@ -49,6 +49,7 @@ mod budget;
 mod copy;
 mod detail;
 mod extract;
+pub use extract::{extract_applies, extract_fork_modes, ExtractApplies};
 mod follow;
 mod modes;
 #[cfg(test)]
@@ -1217,6 +1218,7 @@ impl CommanderController {
             Command::Metadata => Some(P::EditMetadata),
             Command::Expand => Some(P::ExpandCursor),
             Command::Collapse => Some(P::CollapseCursor),
+            Command::Tree => Some(P::ListTree { ids: false }),
             Command::Apply
             | Command::Delete
             | Command::Edits
@@ -1231,7 +1233,8 @@ impl CommanderController {
             | Command::Log
             | Command::QuickView
             | Command::ViewMenu
-            | Command::Transforms => None,
+            | Command::Transforms
+            | Command::Extract => None,
         };
         if let Some(action) = pane_action {
             let sort = matches!(action, P::SortBy(_));
@@ -1257,8 +1260,12 @@ impl CommanderController {
             Command::Export => return self.request_export(side, None),
             Command::Log => self.show_log = !self.show_log,
             Command::Edits => self.status = format!("[{}] No staged edits.", side.label()),
-            // Apply and Delete land here only when refused; the view shows the transforms menu.
-            Command::Apply | Command::Delete | Command::Transforms | Command::Edit => {}
+            // Apply and Delete land here only when refused; the view shows the transforms and extract menus.
+            Command::Apply
+            | Command::Delete
+            | Command::Transforms
+            | Command::Edit
+            | Command::Extract => {}
             Command::CursorUp
             | Command::CursorDown
             | Command::PageUp
@@ -1283,7 +1290,8 @@ impl CommanderController {
             | Command::Import
             | Command::Metadata
             | Command::Expand
-            | Command::Collapse => {}
+            | Command::Collapse
+            | Command::Tree => {}
         }
         Vec::new()
     }

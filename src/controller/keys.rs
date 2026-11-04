@@ -120,6 +120,10 @@ pub enum Command {
     Import,
     Metadata,
     Transforms,
+    /// Extract the cursor entry to a host folder (the view asks for the fork mode first).
+    Extract,
+    /// List the whole volume as a text tree.
+    Tree,
 }
 
 impl Command {
@@ -161,7 +165,7 @@ impl Command {
         Command::Collapse,
     ];
 
-    pub const ALL: [Command; 40] = [
+    pub const ALL: [Command; 42] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -202,10 +206,12 @@ impl Command {
         Command::Import,
         Command::Metadata,
         Command::Transforms,
+        Command::Extract,
+        Command::Tree,
     ];
 
     /// The commands the one-pane Explorer binds.
-    pub const EXPLORER: [Command; 33] = [
+    pub const EXPLORER: [Command; 36] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -225,6 +231,7 @@ impl Command {
         Command::PageDown,
         Command::Home,
         Command::End,
+        Command::Partition,
         Command::Sort,
         Command::Checksums,
         Command::Export,
@@ -239,6 +246,8 @@ impl Command {
         Command::Import,
         Command::Metadata,
         Command::Transforms,
+        Command::Extract,
+        Command::Tree,
     ];
 
     /// The name used in `keybindings.toml`.
@@ -284,6 +293,8 @@ impl Command {
             Command::Import => "import",
             Command::Metadata => "metadata",
             Command::Transforms => "transforms",
+            Command::Extract => "extract",
+            Command::Tree => "tree",
         }
     }
 
@@ -334,6 +345,8 @@ impl Command {
             Command::Import => "Import host file",
             Command::Metadata => "Edit metadata",
             Command::Transforms => "Transform image",
+            Command::Extract => "Extract to a folder",
+            Command::Tree => "List the tree",
         }
     }
 }
@@ -387,6 +400,8 @@ const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
     (Command::Import, &["Primary+O"]),
     (Command::Metadata, &["Primary+A"]),
     (Command::Transforms, &["Primary+T"]),
+    (Command::Extract, &["Primary+X"]),
+    (Command::Tree, &["Primary+D"]),
 ];
 
 /// The command each chord means, for one platform.

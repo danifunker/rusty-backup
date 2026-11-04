@@ -1844,7 +1844,7 @@ impl Target for ResizeTarget {
 /// Actions: `OpenImage` (arg `$hybrid`: the committed hybrid ISO 9660 + HFS+ disc),
 /// `SetOutputFormat` (`iso`, `bincue`, `chd`), `PickOutput`, `Pick` (the output, `out.<ext>`),
 /// `Start`, `BrowseContents`, `SelectFs` (a label substring), `Expand` / `Select` (a path),
-/// `Extract`, `PickExtract`, `Tree`, `CloseDisc`. Probes: `format`, `can_start`, `result`,
+/// `Extract`, `PickExtract`, `Tree`, `CloseDisc`. Probes: `format`, `can_start`, `refusal`, `label`, `result`,
 /// `bin_bytes`, `browsing`, `choices`, `error`, `content`, `extract_result`, `extracted`, `tree`,
 /// `source`.
 #[cfg(all(feature = "optical", feature = "native-zstd"))]
@@ -2052,6 +2052,8 @@ impl Target for OpticalTarget {
                     .unwrap_or_default(),
             ),
             "can_start" => Value::Boolean(self.ctl.can_start()),
+            "refusal" => Value::String(self.ctl.start_refusal().unwrap_or_default()),
+            "label" => Value::String(self.ctl.start_label().to_string()),
             "result" => Value::String(match self.ctl.last_result() {
                 Some(Ok(())) => "ok".to_string(),
                 Some(Err(e)) => format!("error: {e}"),
