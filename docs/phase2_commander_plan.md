@@ -2066,6 +2066,85 @@ floppy convert).
   rips drives only; Optical parity is a later slice).
 - A terminal has no drag-and-drop, hover help or a disk-layout bar (the layout is a text line).
 
+## Slice 27: TUI partition table editor and Inspect dialogs
+
+After slice 26 the TUI Inspect screen had the GUI's disk tools, Calc min and Export, but none of
+the dialogs the egui Inspect tab hosts: Edit Partition Table, Add Partition, Resize Partitions,
+Resize Alto Disk, Expand HFS Volume and Convert Floppy Container (Expand HFS's summary ended in
+"not in the terminal yet"). Each already had its controller (slices 14b and 15); the screen now
+drives the same ones. The remote image picker came with slice 26.
+
+### Steps
+
+1. (5a689738) Controller lift, so both shells offer the same choices:
+   - `partition_edit`: `TableRowView::mode_choices` (Minimum only when known and smaller),
+     `editable`, `can_delete` (never a logical row or the extended container),
+     `type_note` (the catalog's name, "custom", or nothing).
+   - `ResizeRow::mode_choices`; `SizeMode::label` (the model's short names).
+   - `InspectController::can_add_partition` (an editable table whose largest gap holds 1 MiB;
+     `AddPartition` now refuses otherwise, which the egui button already did), `add_partition_hint`
+     (the button's hover text), `alto_resize_source` (the image, or the "no image file loaded"
+     error), `floppy_convert_source`, `summarizing_hfs`.
+   - The egui partition window, resize popup and Inspect tab use them.
+   - Tests: `table_rows_offer_their_modes_delete_and_type_note`,
+     `a_size_row_offers_minimum_only_below_its_size`,
+     `add_partition_needs_a_gap_and_the_dialog_sources_follow_the_image`;
+     `tests/ui_scenarios/inspect_table_edit.toml` (Add Partition on an MBR disk with a gap, the
+     row's modes, delete / undo, Add, Validate, Apply and the re-read; its control failed on a
+     wrong mode list).
+2. (f6257f9b) The TUI windows, each over its controller, in their own files:
+   - `tui_app/table_edit.rs`, Edit Partition Table (`t`) and Add Partition (`a`, the cursor on
+     Add with the gap filled): per partition its header (`Delete` or `x` deletes or undoes), Type
+     (typed, Left / Right through the catalog, the catalog's name beside it), Size mode (Left /
+     Right / Space through `mode_choices`) and the Custom MiB field, Boot (MBR box, RDB boot /
+     no boot); the free gaps (Enter fills the Add fields); Start LBA, Size MiB, Type, Bootable
+     (MBR); Add, Validate (`v`), Apply Changes (`w`); errors and status; the Current / After
+     layout as text lines.
+   - `tui_app/resize.rs`, Resize Partitions (`s`): the device warning and risk box (devices),
+     the disk size and the Expand Image hint, Current / After as text, each row's mode and
+     Custom MiB, Preview (`p`) with its table, Apply (`w`) in a job (the shared job box; Esc asks
+     to cancel, which only logs, as in the GUI); a finished write re-reads the grid
+     (`InspectAction::DiskChanged`).
+   - `tui_app/dialogs.rs`: Resize Alto Disk (`A` on an Alto row: summary, Diablo 31 / 44 with the
+     fit warning, Resize and Save As), Expand HFS Volume (`H` on a classic-HFS row: APM disk or
+     flat HFV, block size, target MiB typed and set with Enter or stepped with Left / Right,
+     Save As, Expand (`s`) with its step and lines), Convert Floppy Container (`f` on an XDF /
+     HDM / DIM / D88: Choose File, target, Save As, Convert (`s`) with its summary).
+   - The pickers answer the controller that asked (`Pick::Of(Who, purpose)`); every new `Who`
+     is matched with no `_` arm. A tool that does not apply says why.
+   - `?` and F1 open the key list from every Inspect window (they were swallowed by the window's
+     own keys), except `?` typed into the table editor's type field. `HINTS_TABLE_EDIT`,
+     `HINTS_RESIZE`, `HINTS_ALTO_RESIZE`, `HINTS_EXPAND_HFS`, `HINTS_FLOPPY_CONVERT`, and the
+     grid's list gains `t a s H A f`.
+   - Tests: `the_inspect_table_editor_adds_a_partition_and_applies` (type typed and stepped, a
+     mode change and back, delete / undo, Validate, Apply, the MBR bytes and the re-read),
+     `the_inspect_resize_window_previews_and_shrinks_a_partition` (Apply waits for Preview, an
+     EFS partition shrinks to 32 MiB, the file is trimmed, the grid re-read),
+     `the_inspect_dialogs_resize_alto_expand_hfs_and_convert_a_floppy`,
+     `the_inspect_dialogs_refuse_what_does_not_apply_and_draw_in_a_small_terminal` (80x24).
+     They assert on controller state and log lines, not on wrapped text beside a path.
+3. (this commit) Docs: this section, `docs/platform_matrix.md` "Partition window", "Inspect tab"
+   and "Inspect dialogs".
+
+### Behaviour changes
+
+- TUI: the Inspect grid offers Edit Partition Table (`t`), Add Partition (`a`), Resize
+  Partitions (`s`), Expand HFS (`H`), Resize Alto Disk (`A`) and Convert Floppy Container (`f`)
+  at the GUI's feature set; Expand HFS's summary opens its window instead of the "not in the
+  terminal yet" note.
+- TUI: `?` and F1 open the key list from inside the Export, Expand Image, remote, Check, CHD
+  Info and writer windows too (the footer offered them; the window ate the key).
+- GUI: none (the rules moved to the controller unchanged; `AddPartition` refusing a gap under
+  1 MiB matches the button, which was disabled then).
+- CLI: none (`rb-cli partmap`, `resize`, `expand` and `floppy convert` keep their own verbs).
+
+### Left
+
+- Build Disk in the TUI: its own top-level section later (`docs/build_disk_plan.md`).
+- The layout bars are text lines (a terminal has no bar widget or hover help).
+- Resize's Cancel still only logs: `apply_resize` has no stop point (slice 15, as in the GUI).
+- TUI parity continues with Optical (convert, CHD rip, Browse Contents).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -2078,9 +2157,10 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-26 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
+- Slices 1-27 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
   have the GUI's feature set (slices 24, 25; Build Disk planned separately), and the TUI Inspect
-  screen its disk tools, Calc min and Export (slice 26; the dialogs are slice 27). `src/gui` and the whole TUI are enforced at 0 engine references
+  screen its disk tools, Calc min and Export (slice 26) and its dialogs: the table editor, Add
+  Partition, Resize, Alto resize, Expand HFS and floppy convert (slice 27). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -2103,10 +2183,10 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    **Slice 21** (done, above): one AppleDouble rule, and a failed entry asks the user;
    publish `rb-fsexporter` 0.1.1.
 3. **TUI parity gaps** the controllers already support (Backup done in slice 24, Restore and
-   the disk writer in slice 25, Inspect disk tools / Calc min / Export in slice 26; next the
-   Inspect dialogs in slice 27: table editor, Add Partition, Resize, Alto resize, Expand HFS,
-   floppy convert; then Optical convert / Browse Contents): add them before Phase 2 closes (user decision
-   2026-11-04: full parity except the CD-DA player and Build Disk, `docs/build_disk_plan.md`).
+   the disk writer in slice 25, Inspect disk tools / Calc min / Export in slice 26, the Inspect
+   dialogs in slice 27; next Optical convert / CHD rip / Browse Contents): add them before
+   Phase 2 closes (user decision 2026-11-04: full parity except the CD-DA player and Build
+   Disk, `docs/build_disk_plan.md`).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
 5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
