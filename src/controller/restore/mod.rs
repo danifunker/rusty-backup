@@ -34,11 +34,12 @@ use crate::model::restore_plan::LoadedBackup;
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::disk_builder::DiskBuilder;
+pub use crate::model::disk_write_plan::WriteOpen;
 pub use crate::model::job::{JobRegistry, NoNotify, Snapshot};
 pub use crate::model::restore_plan::{
-    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, PlanSegment, SizeRow,
+    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, PlanSegment, SizeRow, ALIGN_SECTORS_MAX,
 };
-pub use crate::model::size_mode::SizeMode;
+pub use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 pub use crate::restore::single::NewTableType;
 pub use disk_core::display::format_size;
 
@@ -194,8 +195,8 @@ pub enum RestoreAction {
 pub enum HostRequest {
     /// A backup folder was opened: put it at the top of the Restore recent list.
     RememberRecent(PathBuf),
-    /// Open the shell's disk writer for this image and its decoded size.
-    WriteImage { path: PathBuf, size: u64 },
+    /// Open the shell's disk writer for this image (its decoded size measured, a superfloppy found).
+    WriteImage(WriteOpen),
 }
 
 /// A partition of the loaded backup, for the source-partition picker.
@@ -479,27 +480,41 @@ impl Controller for RestoreController {
                     TargetSlot::BuildDisk => purpose::BUILD_IMAGE,
                     TargetSlot::FullDisk | TargetSlot::SinglePartition => purpose::TARGET_IMAGE,
                 };
-                return vec![Effect::PickFile(Self::picker(
+                let mut spec = Self::picker(
                     purpose,
                     "Save the restored image as",
                     vec![("Disk Images".to_string(), Self::ext(&["img", "raw", "bin"]))],
                     true,
-                ))];
+                );
+                if slot == TargetSlot::FullDisk {
+                    spec.file_name = self
+                        .default_target_image()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .unwrap_or_default();
+                }
+                return vec![Effect::PickFile(spec)];
             }
             RestoreAction::SetTargetImage(slot, path) => self.targets.target_mut(slot).image = path,
             RestoreAction::SetAlignment(a) => self.targets.alignment = a,
-            RestoreAction::SetCustomAlignment(n) => self.targets.custom_alignment = n,
+            RestoreAction::SetCustomAlignment(n) => {
+                self.targets.custom_alignment = n.min(ALIGN_SECTORS_MAX)
+            }
             RestoreAction::SetPartitionSize {
                 index,
                 mode,
                 custom_mib,
             } => self.src.set_size(index, mode, custom_mib),
             RestoreAction::SetExpand(on) => self.targets.expand.enabled = on,
-            RestoreAction::SetExpandMib(n) => self.targets.expand.free_mib = n,
+            RestoreAction::SetExpandMib(n) => {
+                self.targets.expand.free_mib = n.min(self.expand_cap_mib())
+            }
             RestoreAction::SetExtendLast(on) => self.targets.expand.extend_last = on,
             RestoreAction::ScanTarget => self.scan_target(),
             RestoreAction::SetTargetPartition(idx) => self.targets.sp_part = Some(idx),
-            RestoreAction::SetNewDisk(choice) => self.targets.new_disk_choice = choice,
+            RestoreAction::SetNewDisk(mut choice) => {
+                choice.custom_alignment = choice.custom_alignment.min(ALIGN_SECTORS_MAX);
+                self.targets.new_disk_choice = choice;
+            }
             RestoreAction::PickWriteImage => {
                 return vec![Effect::PickFile(Self::picker(
                     purpose::WRITE_IMAGE,
@@ -518,7 +533,7 @@ impl Controller for RestoreController {
             RestoreAction::BuildCancel => self.run.cancel_build(),
             RestoreAction::Start => return self.start(),
             RestoreAction::Cancel => self.cancel(),
-            RestoreAction::SetRemote(on) => self.remote.active = on,
+            RestoreAction::SetRemote(on) => self.set_remote(on),
             RestoreAction::RemoteSetAddress(addr) => self.remote.address = addr,
             RestoreAction::RemoteConnect => self.remote_connect(),
             RestoreAction::RemotePickDevice { path, size } => self.remote_pick_device(path, size),

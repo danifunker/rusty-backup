@@ -626,6 +626,7 @@ impl InspectController {
             fs_hint,
             has_partition_table,
             superfloppy,
+            synthesize: !has_partition_table,
         })
     }
 

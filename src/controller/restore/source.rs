@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{HostRequest, RestoreController, RestoreMode, SizeMode, SourcePartition};
+use super::{HostRequest, RestoreController, RestoreMode, SizeMode, SourcePartition, WriteOpen};
 use crate::backup::metadata::BackupMetadata;
 use crate::model::job::{Job, Snapshot, Status};
 use crate::model::restore_plan::LoadedBackup;
@@ -29,9 +29,9 @@ pub(super) struct SourceState {
     image: Option<Prepared>,
     decode: Option<(PathBuf, Job<Prepared>)>,
     pub source_partition: Option<usize>,
-    /// Write Image File's source and its decoded size (0 when unreadable).
-    pub write: Option<(PathBuf, u64)>,
-    probe: Option<(PathBuf, Job<Option<u64>>)>,
+    /// Write Image File's source as the disk writer takes it (size 0 when unreadable).
+    pub write: Option<WriteOpen>,
+    probe: Option<(PathBuf, Job<WriteOpen>)>,
 }
 
 /// A job's result, or the failure message once it ended without one.
@@ -63,14 +63,20 @@ impl SourceState {
         self.load.is_some() || self.decode.is_some() || self.probe.is_some()
     }
 
+    /// A switch into Custom starts at the original size, as the GUI's size cell did.
     pub fn set_size(&mut self, index: usize, mode: SizeMode, custom_mib: u32) {
         if let Some(row) = self
             .loaded
             .as_mut()
             .and_then(|l| l.rows.iter_mut().find(|r| r.index == index))
         {
+            let seed = mode == SizeMode::Custom && row.mode != SizeMode::Custom;
             row.mode = mode;
-            row.custom_mib = custom_mib;
+            row.custom_mib = if seed {
+                (row.original_size / (1024 * 1024)).max(1) as u32
+            } else {
+                custom_mib
+            };
         }
     }
 
@@ -165,7 +171,36 @@ impl RestoreController {
 
     /// Write Image File's source and its decoded size (0 when it could not be read).
     pub fn write_image(&self) -> Option<(&Path, u64)> {
-        self.src.write.as_ref().map(|(p, n)| (p.as_path(), *n))
+        self.src
+            .write
+            .as_ref()
+            .map(|w| (w.path.as_path(), w.size_bytes.unwrap_or(0)))
+    }
+
+    /// Write Image File's source is a table-less volume: its filesystem, for the writer's table.
+    pub fn write_image_superfloppy(&self) -> Option<&str> {
+        self.src
+            .write
+            .as_ref()
+            .filter(|w| w.superfloppy)
+            .map(|w| w.fs_hint.as_str())
+    }
+
+    /// Where a full-disk image target goes by default: beside the backup, `<name>_restored.img`.
+    pub fn default_target_image(&self) -> Option<PathBuf> {
+        let folder = self.src.folder.as_deref()?;
+        let stem = folder.file_name()?.to_string_lossy().into_owned();
+        Some(folder.parent()?.join(format!("{stem}_restored.img")))
+    }
+
+    /// The size modes a row offers; Fill only on the last.
+    pub fn size_mode_choices(&self, index: usize) -> Vec<SizeMode> {
+        let rows = self.size_rows();
+        let is_last = rows.last().map(|r| r.index) == Some(index);
+        rows.iter()
+            .find(|r| r.index == index)
+            .map(|r| r.mode_choices(is_last))
+            .unwrap_or_default()
     }
 
     /// The decoded-size probe of Write Image File's source in progress.
@@ -288,9 +323,7 @@ impl RestoreController {
         let job = self.spawn("Reading the image", move |ctx| {
             ctx.set_can_cancel(false);
             ctx.set_phase("Measuring the decoded image...");
-            Ok(crate::model::source_reader::decoded_image_size(
-                worker_path.as_path(),
-            ))
+            Ok(WriteOpen::probe_image(worker_path))
         });
         self.src.write = None;
         self.src.probe = Some((path, job));
@@ -303,7 +336,8 @@ impl RestoreController {
         let Some((path, _)) = self.src.probe.take() else {
             return;
         };
-        let size = done.ok().flatten().unwrap_or(0);
+        let open = done.unwrap_or_else(|_| WriteOpen::image(path.clone(), 0));
+        let size = open.size_bytes.unwrap_or(0);
         if size == 0 {
             self.error(format!("Could not read {} as a disk image", path.display()));
         } else {
@@ -313,13 +347,13 @@ impl RestoreController {
                 format_size(size)
             ));
         }
-        self.src.write = Some((path, size));
+        self.src.write = Some(open);
     }
 
     pub(super) fn write_image_target(&mut self) {
-        if let Some((path, size)) = self.src.write.clone() {
-            if size > 0 {
-                self.requests.push(HostRequest::WriteImage { path, size });
+        if let Some(open) = self.src.write.clone() {
+            if open.size_bytes.unwrap_or(0) > 0 {
+                self.requests.push(HostRequest::WriteImage(open));
             }
         }
     }

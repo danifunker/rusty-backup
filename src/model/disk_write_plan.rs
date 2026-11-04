@@ -7,10 +7,11 @@
 //! `physical_write_runner::run_worker`; the table synthesis is `restore::superfloppy_wrap`.
 //! See docs/phase2_commander_plan.md § "Slice 14".
 
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::model::physical_write_runner::{PhysicalWriteRequest, PhysicalWriteSource, WriteExtent};
-use crate::model::size_mode::SizeMode;
+use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 use crate::partition::PartitionInfo;
 use crate::restore::superfloppy_wrap::{self, WrapAlignment, WrapParams, WrapTable};
 use disk_core::display::format_size;
@@ -25,6 +26,8 @@ pub struct WriteOpen {
     pub has_partition_table: bool,
     /// A table-less volume: its VBR's hidden-sectors field seeds the alignment.
     pub superfloppy: bool,
+    /// "Synthesize partition table" starts ticked (it is offered whenever there is no table).
+    pub synthesize: bool,
 }
 
 impl WriteOpen {
@@ -36,7 +39,33 @@ impl WriteOpen {
             fs_hint: "image".to_string(),
             has_partition_table: true,
             superfloppy: false,
+            synthesize: false,
         }
+    }
+
+    /// Write Image File's source: the decoded size, and a superfloppy offers (unticked) a table.
+    pub fn probe_image(path: PathBuf) -> Self {
+        let mut open = WriteOpen::image(path, 0);
+        let Ok(mut reader) = crate::model::source_reader::open_peeled_read_with_entry(
+            open.path.as_path(),
+            None,
+            None,
+        ) else {
+            return open;
+        };
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        open.size_bytes = Some(size);
+        if size == 0 || reader.seek(SeekFrom::Start(0)).is_err() {
+            return open;
+        }
+        if let Ok(crate::partition::PartitionTable::None { fs_hint, .. }) =
+            crate::partition::PartitionTable::detect(&mut reader)
+        {
+            open.fs_hint = fs_hint;
+            open.has_partition_table = false;
+            open.superfloppy = true;
+        }
+        open
     }
 }
 
@@ -112,6 +141,21 @@ impl WrapForm {
         };
         (raw / 512) * 512
     }
+
+    /// The size modes the synthesized partition offers (nothing is compacted, so no Minimum).
+    pub fn size_choices() -> [SizeMode; 3] {
+        [
+            SizeMode::Original,
+            SizeMode::Custom,
+            SizeMode::FillRemaining,
+        ]
+    }
+
+    /// A Custom size's range in MiB: the source (at least 1) up to 2 TiB; a smaller one is refused.
+    pub fn custom_bounds_mib(source_size: u64) -> (u32, u32) {
+        let lo = (source_size / (1024 * 1024)).clamp(1, CUSTOM_MIB_MAX as u64) as u32;
+        (lo, CUSTOM_MIB_MAX)
+    }
 }
 
 /// The common MBR type bytes the type picker offers (any byte may be typed).
@@ -156,7 +200,7 @@ pub fn prepare(open: WriteOpen) -> (WriteSource, WrapForm) {
         ),
     };
     let mut form = WrapForm {
-        synthesize: !open.has_partition_table,
+        synthesize: open.synthesize && !open.has_partition_table,
         table_kind,
         type_byte,
         size_mode: SizeMode::Original,

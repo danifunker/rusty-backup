@@ -1,0 +1,48 @@
+# The Restore controller's form rules every shell (egui, TUI) relies on: the size modes a row
+# offers, a Custom size starting at the original and clamped, the alignment and free-space caps,
+# and Write Image File finding a superfloppy the disk writer may wrap.
+name = "Restore: size modes, clamps, Write Image superfloppy"
+vm = "restore"
+
+[[step]]
+action = "OpenBackup"
+arg = "$backup"
+settle = true
+expect = { backup = true, partitions = 1 }
+
+[[step]]
+expect = { modes = "~Custom,FillRemaining" }
+
+[[step]]
+action = "SetCustomSize"
+arg = 0
+expect = { custom_mib = 2 }
+
+[[step]]
+action = "SetCustomSize"
+arg = 0
+expect = { custom_mib = 1 }
+
+[[step]]
+action = "SetCustomAlignment"
+arg = 1000000
+expect = { alignment = 65535 }
+
+[[step]]
+action = "SetExpandMib"
+arg = 99999999
+expect = { expand_mib = 8194 }
+
+[[step]]
+action = "SetMode"
+arg = "write"
+
+[[step]]
+action = "OpenWriteImage"
+arg = "$superfloppy"
+settle = true
+expect = { write_superfloppy = "~FAT" }
+
+[[step]]
+action = "WriteImageTarget"
+expect = { write_request = "2097152:true:false" }

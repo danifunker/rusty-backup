@@ -1258,7 +1258,7 @@ impl RestoreState {
                         .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
                 }
                 // The TUI pours an image itself; it never asks for the GUI's writer.
-                HostRequest::WriteImage { .. } => {}
+                HostRequest::WriteImage(_) => {}
             }
         }
         let _ = self.ctl.take_log();

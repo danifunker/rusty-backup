@@ -188,14 +188,90 @@ fn write_image_measures_the_source_and_hands_it_to_the_shell() {
     });
     ctl.wait_idle();
     assert_eq!(ctl.write_image(), Some((img.as_path(), 2 * 1024 * 1024)));
+    // A table-less FAT volume: the writer may wrap it, but starts unticked.
+    assert!(ctl.write_image_superfloppy().is_some());
     ctl.apply(RestoreAction::WriteImageTarget);
+    let reqs = ctl.take_requests();
+    let [HostRequest::WriteImage(open)] = reqs.as_slice() else {
+        panic!("{reqs:?}");
+    };
+    assert_eq!(open.path, img);
+    assert_eq!(open.size_bytes, Some(2 * 1024 * 1024));
+    assert!(open.superfloppy && !open.has_partition_table && !open.synthesize);
+}
+
+#[test]
+fn size_rows_offer_their_modes_and_clamp_a_custom_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, folder) = backup_of(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    let row = ctl.size_rows()[0].clone();
+    // The only row is the last, so it may fill.
+    let modes = ctl.size_mode_choices(row.index);
+    assert_eq!(modes.first(), Some(&SizeMode::Original));
+    assert!(modes.contains(&SizeMode::Custom) && modes.contains(&SizeMode::FillRemaining));
     assert_eq!(
-        ctl.take_requests(),
-        vec![HostRequest::WriteImage {
-            path: img,
-            size: 2 * 1024 * 1024
-        }]
+        modes.contains(&SizeMode::Minimum),
+        row.minimum_size < row.original_size
     );
+    // Into Custom starts at the original size; a typed size below the minimum is clamped.
+    ctl.apply(RestoreAction::SetPartitionSize {
+        index: row.index,
+        mode: SizeMode::Custom,
+        custom_mib: 0,
+    });
+    let mib = (row.original_size / (1024 * 1024)).max(1) as u32;
+    assert_eq!(ctl.size_rows()[0].custom_mib, mib);
+    ctl.apply(RestoreAction::SetPartitionSize {
+        index: row.index,
+        mode: SizeMode::Custom,
+        custom_mib: 0,
+    });
+    let r = &ctl.size_rows()[0];
+    assert_eq!(r.custom_mib, 0);
+    assert_eq!(r.custom_mib_effective(), r.custom_bounds_mib().0);
+    assert!(r.effective_size() >= 1024 * 1024);
+}
+
+#[test]
+fn alignment_and_free_space_fields_are_clamped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, folder) = backup_of(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder.clone());
+    ctl.apply(RestoreAction::SetCustomAlignment(1_000_000));
+    assert_eq!(ctl.alignment().1, ALIGN_SECTORS_MAX);
+    ctl.apply(RestoreAction::SetExpandMib(u32::MAX));
+    assert_eq!(ctl.expand().free_mib, ctl.expand_cap_mib());
+    let mut nd = ctl.new_disk();
+    nd.custom_alignment = 99_999;
+    ctl.apply(RestoreAction::SetNewDisk(nd));
+    assert_eq!(ctl.new_disk().custom_alignment, ALIGN_SECTORS_MAX);
+    // The default image target sits beside the backup.
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(
+        ctl.default_target_image(),
+        Some(
+            folder
+                .parent()
+                .unwrap()
+                .join(format!("{name}_restored.img"))
+        )
+    );
+}
+
+#[test]
+fn the_remote_target_turns_on_only_when_built() {
+    let mut ctl = controller();
+    ctl.apply(RestoreAction::SetRemote(true));
+    assert_eq!(ctl.remote_active(), RestoreController::remote_available());
+    if !RestoreController::remote_available() {
+        let log = ctl.take_log();
+        assert!(log
+            .iter()
+            .any(|(_, m)| m == crate::controller::backup::REMOTE_NOT_BUILT));
+    }
 }
 
 fn fake_device(path: &Path) -> DiskDevice {

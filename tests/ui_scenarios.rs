@@ -539,15 +539,18 @@ impl Target for BackupTarget {
 /// `write`, `build`), `SetTargetIsDevice` (bool), `SetTargetImage` (a path, or `$out`),
 /// `SetSize` (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`, and
 /// Build Disk's `BuildTarget` (an image target of this size), `BuildDefine`, `BuildRowSize`
-/// (`row:size`), `BuildAddRow`, `BuildApply`.
+/// (`row:size`), `BuildAddRow`, `BuildApply`, `SetCustomSize` / `SetCustomAlignment` /
+/// `SetExpandMib` (integers), `OpenWriteImage` (`$superfloppy`), `WriteImageTarget`.
 /// Probes: `backup` (one is loaded), `partitions`, `error` (why Start is refused, empty when it is
 /// not), `load_error`, `result` (`ok`, the failure, or empty), `output` (the restored image equals
 /// the image backed up), `log` (every line so far), `build_rows` (-1 with no plan open),
-/// `build_layout` (`ok` or why it cannot be placed), `build_result`, `built_mbr`.
+/// `build_layout` (`ok` or why it cannot be placed), `build_result`, `built_mbr`, `modes`,
+/// `custom_mib`, `alignment`, `expand_mib`, `expand_cap`, `write_superfloppy`, `write_request`.
 struct RestoreTarget {
     ctl: rusty_backup::controller::restore::RestoreController,
     dir: tempfile::TempDir,
     log: Vec<String>,
+    requests: Vec<rusty_backup::controller::restore::HostRequest>,
 }
 
 impl RestoreTarget {
@@ -562,12 +565,14 @@ impl RestoreTarget {
             }),
             dir: tempfile::tempdir().expect("temp dir"),
             log: Vec::new(),
+            requests: Vec::new(),
         }
     }
 
     fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
         self.log
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
+        self.requests.extend(self.ctl.take_requests());
         fx
     }
 
@@ -661,6 +666,41 @@ impl Target for RestoreTarget {
                 }
                 return Ok(Vec::new());
             }
+            "SetCustomSize" => {
+                let mib = arg
+                    .and_then(Value::as_integer)
+                    .ok_or_else(|| "SetCustomSize needs an integer `arg`".to_string())?;
+                let index = self.ctl.size_rows().first().ok_or("no size rows")?.index;
+                RestoreAction::SetPartitionSize {
+                    index,
+                    mode: SizeMode::Custom,
+                    custom_mib: mib as u32,
+                }
+            }
+            "SetCustomAlignment" => RestoreAction::SetCustomAlignment(
+                arg.and_then(Value::as_integer)
+                    .ok_or_else(|| "SetCustomAlignment needs an integer `arg`".to_string())?
+                    as u32,
+            ),
+            "SetExpandMib" => RestoreAction::SetExpandMib(
+                arg.and_then(Value::as_integer)
+                    .ok_or_else(|| "SetExpandMib needs an integer `arg`".to_string())?
+                    as u32,
+            ),
+            "OpenWriteImage" => {
+                let path = match arg_str(arg)? {
+                    "$superfloppy" => {
+                        let p = self.dir.path().join("vol.img");
+                        let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T"))
+                            .map_err(|e| e.to_string())?;
+                        std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                        p
+                    }
+                    other => PathBuf::from(other),
+                };
+                RestoreAction::OpenWriteImage(path)
+            }
+            "WriteImageTarget" => RestoreAction::WriteImageTarget,
             "Start" => RestoreAction::Start,
             "Confirm" => RestoreAction::Confirmed {
                 purpose: purpose::RESTORE,
@@ -720,6 +760,42 @@ impl Target for RestoreTarget {
                 )
             }
             "log" => Value::String(self.log.join("\n")),
+            "modes" => Value::String(match self.ctl.size_rows().first() {
+                Some(r) => self
+                    .ctl
+                    .size_mode_choices(r.index)
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                None => String::new(),
+            }),
+            "custom_mib" => Value::Integer(
+                self.ctl
+                    .size_rows()
+                    .first()
+                    .map_or(-1, |r| r.custom_mib_effective() as i64),
+            ),
+            "alignment" => Value::Integer(self.ctl.alignment().1 as i64),
+            "expand_mib" => Value::Integer(self.ctl.expand().free_mib as i64),
+            "expand_cap" => Value::Integer(self.ctl.expand_cap_mib() as i64),
+            "write_superfloppy" => {
+                Value::String(self.ctl.write_image_superfloppy().unwrap_or("").to_string())
+            }
+            "write_request" => Value::String(
+                match self.requests.iter().find_map(|r| match r {
+                    rusty_backup::controller::restore::HostRequest::WriteImage(o) => Some(o),
+                    _ => None,
+                }) {
+                    Some(o) => format!(
+                        "{}:{}:{}",
+                        o.size_bytes.unwrap_or(0),
+                        o.superfloppy,
+                        o.synthesize
+                    ),
+                    None => String::new(),
+                },
+            ),
             "build_rows" => {
                 Value::Integer(self.ctl.build_view().map_or(-1, |v| v.rows.len() as i64))
             }
@@ -853,6 +929,7 @@ impl Target for DiskWriteTarget {
                         fs_hint: "FAT16".into(),
                         has_partition_table: false,
                         superfloppy: true,
+                        synthesize: true,
                     },
                     other => return Err(format!("unknown source {other:?}")),
                 })

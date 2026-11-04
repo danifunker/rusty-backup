@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backup::metadata::BackupMetadata;
-use crate::model::size_mode::SizeMode;
+use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 use crate::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
 };
@@ -24,6 +24,9 @@ use disk_core::display::format_size;
 use dsk_clonezilla::metadata::ClonezillaImage;
 
 const MIB: u64 = 1024 * 1024;
+
+/// The largest alignment, in sectors, the alignment fields take.
+pub const ALIGN_SECTORS_MAX: u32 = 65535;
 
 /// Where partitions start: the backup's own layout, 1 MB boundaries, or a sector multiple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,9 +62,38 @@ impl SizeRow {
         }
     }
 
+    /// The size this row restores to; a Custom size outside [`Self::custom_bounds_mib`] is clamped.
     pub fn effective_size(&self) -> u64 {
-        self.mode
-            .effective_size(self.original_size, self.minimum_size, self.custom_mib)
+        self.mode.effective_size(
+            self.original_size,
+            self.minimum_size,
+            self.custom_mib_effective(),
+        )
+    }
+
+    /// The Custom size in MiB once clamped into [`Self::custom_bounds_mib`].
+    pub fn custom_mib_effective(&self) -> u32 {
+        let (lo, hi) = self.custom_bounds_mib();
+        self.custom_mib.clamp(lo, hi)
+    }
+
+    /// The size modes this row offers: Minimum below the original, Fill on the last row only.
+    pub fn mode_choices(&self, is_last: bool) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.minimum_size < self.original_size {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        if is_last {
+            modes.push(SizeMode::FillRemaining);
+        }
+        modes
+    }
+
+    /// A Custom size's range in MiB: the minimum (at least 1) up to 2 TiB.
+    pub fn custom_bounds_mib(&self) -> (u32, u32) {
+        let lo = (self.minimum_size / MIB).clamp(1, CUSTOM_MIB_MAX as u64) as u32;
+        (lo, CUSTOM_MIB_MAX)
     }
 
     /// The engine's size choice for this row.
@@ -70,7 +102,7 @@ impl SizeRow {
             SizeMode::Original => RestoreSizeChoice::Original,
             SizeMode::Minimum => RestoreSizeChoice::Custom(self.minimum_size),
             SizeMode::MinPlus20 => RestoreSizeChoice::Custom(self.effective_size()),
-            SizeMode::Custom => RestoreSizeChoice::Custom(self.custom_mib as u64 * MIB),
+            SizeMode::Custom => RestoreSizeChoice::Custom(self.custom_mib_effective() as u64 * MIB),
             SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
         }
     }
@@ -260,7 +292,9 @@ pub fn resolve_alignment(choice: AlignmentChoice, custom_sectors: u32) -> Restor
     match choice {
         AlignmentChoice::Original => RestoreAlignment::Original,
         AlignmentChoice::Modern1MB => RestoreAlignment::Modern1MB,
-        AlignmentChoice::Custom => RestoreAlignment::Custom(custom_sectors as u64),
+        AlignmentChoice::Custom => {
+            RestoreAlignment::Custom(custom_sectors.clamp(1, ALIGN_SECTORS_MAX) as u64)
+        }
     }
 }
 
@@ -411,7 +445,7 @@ pub fn new_disk_alignment_sectors(choice: AlignmentChoice, custom: u32) -> u64 {
     match choice {
         AlignmentChoice::Original => 63,
         AlignmentChoice::Modern1MB => 2048,
-        AlignmentChoice::Custom => custom as u64,
+        AlignmentChoice::Custom => custom.clamp(1, ALIGN_SECTORS_MAX) as u64,
     }
 }
 

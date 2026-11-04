@@ -59,6 +59,20 @@ impl RemoteState {
 }
 
 impl RestoreController {
+    /// This build can restore to an `rb-cli serve` daemon.
+    pub const fn remote_available() -> bool {
+        cfg!(feature = "remote")
+    }
+
+    /// "Restore to a remote machine"; a build without `remote` says so and stays local.
+    pub(super) fn set_remote(&mut self, on: bool) {
+        if on && !Self::remote_available() {
+            self.warn(crate::controller::backup::REMOTE_NOT_BUILT);
+            return;
+        }
+        self.remote.active = on;
+    }
+
     /// The full-disk target is on a daemon.
     pub fn remote_active(&self) -> bool {
         cfg!(feature = "remote") && self.remote.active

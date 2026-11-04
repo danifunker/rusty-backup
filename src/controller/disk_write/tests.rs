@@ -101,6 +101,7 @@ fn a_superfloppy_gets_a_synthesized_mbr_after_the_device_name_is_typed() {
         fs_hint: "FAT16".into(),
         has_partition_table: false,
         superfloppy: true,
+        synthesize: true,
     }));
     c.wait_idle();
     assert_eq!(c.source().map(|s| s.size_bytes), Some(2 << 20));
@@ -218,4 +219,49 @@ fn the_write_region_cycles_whole_disk_then_each_partition() {
     assert_eq!(next_region(&[], None), None);
     assert_eq!(next_region(&[], Some(3)), None);
     assert_eq!(next_region(&[0], Some(9)), None);
+}
+
+#[test]
+fn the_synthesized_size_offers_three_modes_and_seeds_custom() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(dir.path(), 3 << 20);
+    let mut c = ctl();
+    c.apply(DiskWriteAction::Open(WriteOpen::image(src, 3 << 20)));
+    c.wait_idle();
+    assert_eq!(
+        c.size_choices(),
+        [
+            SizeMode::Original,
+            SizeMode::Custom,
+            SizeMode::FillRemaining
+        ]
+    );
+    assert_eq!(c.custom_bounds_mib().0, 3);
+    c.apply(DiskWriteAction::SetSize {
+        mode: SizeMode::Custom,
+        custom_mib: 0,
+    });
+    assert_eq!(c.form().custom_size_mib, 3);
+    c.apply(DiskWriteAction::SetSize {
+        mode: SizeMode::Custom,
+        custom_mib: 1,
+    });
+    assert_eq!(c.form().custom_size_mib, 1);
+}
+
+#[test]
+fn write_image_file_finds_a_superfloppy_and_leaves_the_table_unticked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vol.img");
+    std::fs::write(
+        &path,
+        fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap(),
+    )
+    .unwrap();
+    let open = WriteOpen::probe_image(path);
+    assert!(open.superfloppy && !open.has_partition_table && !open.synthesize);
+    let mut c = ctl();
+    c.apply(DiskWriteAction::Open(open));
+    c.wait_idle();
+    assert!(c.can_synthesize() && !c.form().synthesize);
 }

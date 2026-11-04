@@ -199,6 +199,27 @@ impl DiskWriteController {
         self.error.as_deref()
     }
 
+    /// The size modes the synthesized partition offers.
+    pub fn size_choices(&self) -> [SizeMode; 3] {
+        WrapForm::size_choices()
+    }
+
+    /// The synthesized partition's Custom range in MiB; Write refuses a size below it.
+    pub fn custom_bounds_mib(&self) -> (u32, u32) {
+        WrapForm::custom_bounds_mib(self.source.as_ref().map_or(0, |s| s.size_bytes))
+    }
+
+    /// A switch into Custom starts at the source's size, as the GUI's size cell did.
+    fn set_size(&mut self, mode: SizeMode, custom_mib: u32) {
+        let seed = mode == SizeMode::Custom && self.form.size_mode != SizeMode::Custom;
+        self.form.size_mode = mode;
+        self.form.custom_size_mib = if seed {
+            self.custom_bounds_mib().0
+        } else {
+            custom_mib
+        };
+    }
+
     fn open_source(&mut self, open: WriteOpen) {
         if self.run.running() {
             return;
@@ -312,10 +333,7 @@ impl Controller for DiskWriteController {
             DiskWriteAction::SetAlignment(a) => self.form.alignment = a,
             DiskWriteAction::SetCustomAlignment(n) => self.form.custom_alignment_sectors = n.max(1),
             DiskWriteAction::SetTypeByte(b) => self.form.type_byte = b,
-            DiskWriteAction::SetSize { mode, custom_mib } => {
-                self.form.size_mode = mode;
-                self.form.custom_size_mib = custom_mib;
-            }
+            DiskWriteAction::SetSize { mode, custom_mib } => self.set_size(mode, custom_mib),
             DiskWriteAction::Write => return self.write(),
         }
         Vec::new()

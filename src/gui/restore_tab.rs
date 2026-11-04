@@ -10,11 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
-use rusty_backup::controller::disk_write::WriteOpen;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
     format_size, AlignmentChoice, HostRequest, LayoutFit, NewTableType, RestoreAction,
-    RestoreController, RestoreMode, RestoreServices, TargetSlot,
+    RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
 };
 use rusty_backup::controller::{Controller as _, Effect};
 
@@ -127,9 +126,7 @@ impl RestoreTab {
                 HostRequest::RememberRecent(path) => {
                     self.recent_files = super::push_recent(&self.recent, RecentMode::Restore, &path)
                 }
-                HostRequest::WriteImage { path, size } => {
-                    self.image_write.open_for(WriteOpen::image(path, size));
-                }
+                HostRequest::WriteImage(open) => self.image_write.open_for(open),
             }
         }
     }
@@ -527,7 +524,6 @@ impl RestoreTab {
 
     fn show_size_grid(&mut self, ui: &mut egui::Ui) {
         let rows = self.ctl.size_rows().to_vec();
-        let last_index = rows.last().map(|r| r.index);
         let mut actions = Vec::new();
         egui::Grid::new("restore_partition_sizes")
             .striped(true)
@@ -559,7 +555,10 @@ impl RestoreTab {
                         row.original_size,
                         row.minimum_size,
                         SizeModeRowOptions {
-                            allow_fill: Some(row.index) == last_index,
+                            allow_fill: self
+                                .ctl
+                                .size_mode_choices(row.index)
+                                .contains(&SizeMode::FillRemaining),
                             custom_seed: super::size_mode_row::CustomSeed::Original,
                             ..Default::default()
                         },

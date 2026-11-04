@@ -7,6 +7,9 @@
 //!
 //! See `gui/size_mode_row.rs` for the matching widget.
 
+/// The largest Custom size a size row offers, in MiB (2 TiB).
+pub const CUSTOM_MIB_MAX: u32 = 2_097_152;
+
 /// Per-partition size choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SizeMode {
