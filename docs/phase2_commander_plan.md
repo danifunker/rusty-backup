@@ -1605,9 +1605,6 @@ Shells' engine references 20 -> **0** (`src/gui` and the whole TUI are enforced)
 
 ### Left
 
-- Recent files: the TUI sub-screens (and the GUI tabs) still call `crate::update`'s
-  `load_recent` / `push_recent` (not an engine module to the script); `AppController::recent`
-  / `remember` are there for when the screens get the shell.
 - The New Disk wizard still runs the `rb-cli new` / `optical new` verbs itself;
   `controller::new_disk` only carries its data. A wizard controller (shared with a future
   GUI one) is parity work.
@@ -1708,6 +1705,36 @@ overriding it, so crate users see no change.
   overwritten silently, as before slice 19 in Commander). A crate fix for 0.1.2.
 - Publish `rb-fsexporter` 0.1.1 (publish-crates.yml, dry run first).
 
+## Slice 22: recent files through the AppController
+
+After slice 20 the GUI tabs and the TUI screens still read and recorded recent files through
+`crate::update`'s `load_recent` / `push_recent` (11 calls in the GUI, 10 in the TUI), which
+the script did not count.
+
+### Steps
+
+1. (04ca7bd6) `AppController`'s config store is a shared `controller::app::RecentHandle`
+   (`list`, `remember`, `clear` over one `Arc<Mutex<Box<dyn ConfigStore>>>`);
+   `recent` / `remember` / `clear_recent` go through it and `recent_handle()` hands a clone to
+   a screen built apart from the root. Every GUI tab (`BackupTab::new(handle)` etc., in place
+   of `Default`) and the TUI's Backup / Restore / Archives states hold one; the TUI's Inspect
+   opens use `App::shell` directly. `RecentMode` is re-exported from `controller::app`.
+   `scripts/check-boundaries.sh` counts `crate::update` / `rusty_backup::update` as model, so
+   the enforced shells fail on it. Tests: `a_recent_handle_shares_the_app_store`,
+   `an_image_open_is_remembered_through_the_app_controller` (TUI, in-memory config, the
+   next `o` picker offers it), and the Archives screen test checks its record.
+
+### Behaviour changes
+
+- None: the same lists, ordering, and Settings "Clear Recent Files" (still the settings
+  controller's clear plus each tab's mirror).
+
+### Left
+
+- Settings' clear and Commander's `CommanderRecent` keep their own config stores (both
+  `UserConfig` in the app), so they do not share the handle's lock; they write the same
+  config.json, as before.
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1720,7 +1747,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-21 done. `src/gui` and the whole TUI are enforced at 0 engine references.
+- Slices 1-22 done. `src/gui` and the whole TUI are enforced at 0 engine references
+  (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
   pushed with CI running. Commits after 3119ea34 are local until the user says push.
