@@ -156,7 +156,7 @@ fn walk_catalog(catalog: &[u8]) -> (Vec<SourceDirSnapshot>, Vec<SourceFileSnapsh
         return (dirs, files);
     }
     let node_size = BigEndian::read_u16(&catalog[32..34]) as usize;
-    if node_size == 0 || catalog.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || catalog.len() < node_size {
         return (dirs, files);
     }
     // BTHeaderRec.firstLeafNode is at offset 14 within the header record,

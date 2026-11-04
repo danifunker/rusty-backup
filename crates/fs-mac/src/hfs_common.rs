@@ -383,6 +383,12 @@ pub fn compare_classic_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
 // ---------------------------------------------------------------------------
 
 /// B-tree node kinds.
+/// Smallest node size a classic HFS or HFS+ B-tree can have (Inside Macintosh:
+/// HFS nodes are always 512 bytes; HFS+ nodes are 512..=32768). A header that
+/// claims less is garbage: the node descriptor alone is 14 bytes and the
+/// header record runs past byte 32, so smaller values would slice out of range.
+pub const BTREE_MIN_NODE_SIZE: usize = 512;
+
 pub const BTREE_LEAF_NODE: i8 = -1;
 pub const BTREE_INDEX_NODE: i8 = 0;
 #[allow(dead_code)]
@@ -694,7 +700,7 @@ pub fn walk_leaf_records<T, F>(
 where
     F: FnMut(u32, usize, usize, &[u8]) -> Option<T>,
 {
-    if node_size == 0 || catalog_data.len() < node_size {
+    if node_size < BTREE_MIN_NODE_SIZE || catalog_data.len() < node_size {
         return None;
     }
     let mut node_idx = first_leaf;
@@ -1241,7 +1247,7 @@ where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
     let mut stale = Vec::new();
-    if node_size == 0 || data.len() < node_size {
+    if node_size < BTREE_MIN_NODE_SIZE || data.len() < node_size {
         return stale;
     }
     let max_nodes = (data.len() / node_size) as u32;
@@ -1326,7 +1332,7 @@ where
 /// and fsck_hfs reports one as "Invalid node structure".
 pub fn btree_lonely_empty_leaves(data: &[u8], node_size: usize) -> Vec<u32> {
     let mut lonely = Vec::new();
-    if node_size == 0 || data.len() < node_size {
+    if node_size < BTREE_MIN_NODE_SIZE || data.len() < node_size {
         return lonely;
     }
     let max_nodes = (data.len() / node_size) as u32;
@@ -1369,7 +1375,7 @@ pub fn btree_free_node(catalog_data: &mut [u8], node_size: usize, node_idx: u32)
 /// fsck_hfs reports one that is not ("Unused node is not erased").
 pub fn btree_unerased_free_nodes(data: &[u8], node_size: usize) -> Vec<u32> {
     let mut dirty = Vec::new();
-    if node_size == 0 || data.len() < node_size {
+    if node_size < BTREE_MIN_NODE_SIZE || data.len() < node_size {
         return dirty;
     }
     let max_nodes = (data.len() / node_size) as u32;
@@ -2456,9 +2462,9 @@ where
 {
     let mut header = BTreeHeader::read(data);
     let node_size = header.node_size as usize;
-    if node_size == 0 {
+    if node_size < BTREE_MIN_NODE_SIZE {
         return Err(disk_core::filesystem::FilesystemError::InvalidData(
-            "B-tree has zero node_size".into(),
+            format!("B-tree has invalid node_size {node_size}"),
         ));
     }
 

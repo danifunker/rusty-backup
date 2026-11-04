@@ -174,7 +174,7 @@ fn hfs_fragmentation_stats(catalog_data: &[u8]) -> disk_core::filesystem::Fragme
     }
     let node_size = BigEndian::read_u16(&catalog_data[32..34]) as usize;
     let first_leaf = BigEndian::read_u32(&catalog_data[24..28]);
-    if node_size == 0 || first_leaf == 0 {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || first_leaf == 0 {
         return stats;
     }
     walk_leaf_records::<(), _>(
@@ -623,7 +623,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         // Node descriptor: 14 bytes, then BTHeaderRec starts
         // BTHeaderRec: treeDepth(2) + rootNode(4) + leafRecords(4) + firstLeafNode(4) + ...
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as u32;
-        if node_size == 0 || self.catalog_data.len() < node_size as usize {
+        if (node_size as usize) < crate::hfs_common::BTREE_MIN_NODE_SIZE
+            || self.catalog_data.len() < node_size as usize
+        {
             return Ok(vec![]);
         }
         let header_node = &self.catalog_data[0..node_size as usize];
@@ -775,7 +777,9 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             return None;
         }
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as u32;
-        if node_size == 0 || self.catalog_data.len() < node_size as usize {
+        if (node_size as usize) < crate::hfs_common::BTREE_MIN_NODE_SIZE
+            || self.catalog_data.len() < node_size as usize
+        {
             return None;
         }
         let header_node = &self.catalog_data[0..node_size as usize];
@@ -969,7 +973,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         let search_key = Self::build_catalog_key(parent_id, name);
         let header = BTreeHeader::read(&self.catalog_data);
         let node_size = header.node_size as usize;
-        if node_size == 0 || self.catalog_data.len() < node_size {
+        if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || self.catalog_data.len() < node_size
+        {
             return None;
         }
 
@@ -1277,7 +1282,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         rec_idx: usize,
     ) -> Result<(), FilesystemError> {
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
-        if node_size == 0 {
+        if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE {
             return Ok(());
         }
         let offset = node_idx as usize * node_size;
@@ -4115,7 +4120,7 @@ fn collect_fork_overflow_extents(
     }
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || extents_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || extents_data.len() < node_size {
         return Vec::new();
     }
 
@@ -4222,7 +4227,7 @@ fn remove_fork_overflow_records(
     }
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || extents_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || extents_data.len() < node_size {
         return Ok(0);
     }
     let mut victims: Vec<(u32, usize)> = Vec::new();
@@ -4994,6 +4999,33 @@ mod tests {
     /// space at its front and one file at its tail could be cut through.
     /// H10: classic HFS keeps wall-clock local time, but stamps went out as
     /// UTC and came back shifted by the zone offset on every read.
+    /// A catalog header claiming a node size smaller than the header record
+    /// (seen in the raw data fork of Disk Copy 6 images, opened without their
+    /// `bcem` map) used to panic slicing `header_node[24..28]`. Every size below
+    /// 512 must now read as "no records" rather than index out of range.
+    #[test]
+    fn tiny_catalog_node_size_does_not_panic() {
+        use disk_core::filesystem::Filesystem;
+        let clean = create_blank_hfs(1474560, 512, "Tiny").unwrap();
+        let mdb = {
+            let fs = HfsFilesystem::open(Cursor::new(clean.clone()), 0).unwrap();
+            fs.mdb.clone()
+        };
+        let cat_off = mdb.first_alloc_block as usize * 512
+            + mdb.catalog_file_extents[0].start_block as usize * mdb.block_size as usize;
+        for bad in [1u16, 3, 9, 14, 17, 27, 28, 511] {
+            let mut img = clean.clone();
+            img[cat_off + 32..cat_off + 34].copy_from_slice(&bad.to_be_bytes());
+            let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+            let root = fs.root().unwrap();
+            let listed = fs.list_directory(&root);
+            assert!(
+                listed.map(|v| v.is_empty()).unwrap_or(true),
+                "node size {bad}: expected an empty listing or an error"
+            );
+        }
+    }
+
     #[test]
     fn classic_hfs_stamps_are_local_time_and_round_trip_to_utc() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
