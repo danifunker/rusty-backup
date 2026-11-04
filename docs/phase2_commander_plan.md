@@ -1965,6 +1965,107 @@ Disk stays out by the user's decision (2026-11-04): it gets its own top-level se
 - TUI parity continues with Inspect (disk tools, Calc min, Export; its Physical Disk Export can
   reuse this screen's writer window), the Inspect dialogs and Optical (Next steps item 3).
 
+## Slice 26: TUI Inspect disk tools
+
+After slice 11 the TUI Inspect tab read an image's or backup's rows through a headless
+`InspectController` it then threw away, kept a plain unelevated read for devices, and offered
+only Browse. The tab now drives the controller the egui tab uses, at its feature set except the
+dialogs slice 27 brings (the table editor, Add Partition, Resize, Expand HFS, Alto resize,
+floppy convert).
+
+### Steps
+
+1. (a8319d00) Controller lift, so both shells offer the same choices:
+   - `InspectController::source_label(devices)` (the egui tab's label), `can_reinspect`,
+     `can_close`, `remote_available`, `expand_image_preview(mib)` and `expand_image_bytes` capped
+     at `EXPAND_IMAGE_MIB_MAX` (the GUI's 4 TiB drag range), `export_settings()` to read.
+   - Export: `EXPORT_FORMATS` (each format's label and hint, CHD last), `CHD_REFUSAL`,
+     `per_partition_refusal(format)` and `export_formats()` (CHD greyed for a backup or
+     Clonezilla source) replace the egui radios' own lists; `ExportSettings::set_whole_disk`
+     keeps a format's forced layout.
+   - `PartitionExportConfig` (`model::export_runner`): `mode_choices` (Minimum only below the
+     original), `custom_bounds_mib` (the minimum up to the volume's cap or 2 TiB),
+     `custom_mib_effective`, `set_choice` (Custom starts at the minimum, as the egui cell seeded);
+     `effective_size` clamps a Custom size into the bounds.
+   - Tests: `the_export_window_lists_formats_and_its_size_rows_follow_their_rules`,
+     `the_source_label_close_and_expand_preview_follow_the_source`;
+     `tests/ui_scenarios/inspect_export_settings.toml` (its control failed on a wrong clamped
+     size).
+2. (0de345ca) Write Image File's window moves out of the Restore screen into
+   `tui_app/writer.rs` (rows, keys, drawing over a `DiskWriteController` the host owns), so
+   Inspect's Physical Disk Export opens the same window. No behaviour change.
+3. (3f3580e7) The TUI Inspect screen, `src/cli/verbs/tui_app/inspect.rs`:
+   - Sources: Enter on the disk list opens the disk through the controller
+     (`InspectSource::Device`), its facts above the grid; when that open fails the old plain read
+     (`read_table_unelevated`) lists the table read-only with the reason. `o` opens an image file
+     (`ImageFile`, decoded in the controller's job), a backup folder or Clonezilla image, or a
+     listed disk by path; `R` opens the remote window over `RemotePickController` (address asked
+     with its validator, the daemon's folders, Enter on an image opens it; on an open remote
+     image `R` browses again on the same connection). Every source change goes through
+     `InspectAction::Open`, so the unsaved-edits question applies.
+   - Grid: type, volume label, start LBA, size, Min size (`m` Calc min, the phase while it runs),
+     Slot for tables that name slots; the selected row's defrag minimum, block size, boot flag and
+     keys; table type and signature, word order, alignment and CHS, a text layout line; backup and
+     Clonezilla summaries; the controller's log lines; a Tools line of what applies.
+   - Tools: `c` Check (results window: errors, warnings, `d` debug, `r` Repair behind the
+     controller's question, the repair report), `B` Make Bootable (donor picker), `x` Expand Image
+     (MiB typed, current and new size), `d` Defragment (Human68k, asks), `w` word-order swap
+     (save picker), `i` CHD Info (scrolling text), `e` Export (layout, format, CHD options rows,
+     each partition's size mode and Custom MiB, the PFS3 / CHD workflow / estimate /
+     sector-by-sector notes, Export, Physical Disk Export), `u` remote Back Up Image (folder
+     picker), Enter Browse: the controller's `OpenBrowse` session opens the Explorer
+     (`CommanderView::explorer_open`; read-only unless the edit is in place; `UpgradeSeekable`
+     reopens it on the seekable cache), `r` Re-inspect, Esc closes (cancels a running export
+     first; a remote image unloads quietly). A tool that does not apply says so. Running tools,
+     the export and the write show job boxes; `OpenArchive` switches to the Archives tab.
+   - Questions are one shared box, `tui_app/ask.rs` (`Ask<W>`: y / n or a typed answer with the
+     controller's validator), now also used by Restore. Every `Effect` and `HostRequest` is
+     matched with no `_` arm.
+   - `?` lists the grid's, the Export window's and the other windows' keys
+     (`HINTS_INSPECT_SOURCE`, `HINTS_INSPECT_EXPORT`, `HINTS_INSPECT_WINDOW`, `HINTS_WRITER`).
+   - Tests: `one_enter_on_a_disk_reaches_its_partition_table` (now through the controller),
+     `the_inspect_grid_calcs_min_checks_and_browses`,
+     `the_inspect_export_window_exports_and_hands_over_to_the_writer` (a byte-equal raw export,
+     then a wrapped write), `the_inspect_tools_expand_the_image_and_refuse_what_does_not_apply`,
+     `the_inspect_screen_opens_a_backup_folder_and_browses_it`,
+     `a_disk_that_cannot_be_opened_falls_back_to_the_plain_read`,
+     `the_inspect_remote_window_asks_for_a_daemon_or_is_absent`,
+     `the_inspect_screen_and_windows_draw_in_a_small_terminal` (80x24); the Explorer tests open
+     through the controller's Browse.
+4. (ea8c90fb) The restore tests read the confirmation's own message instead of the screen,
+   where the box wraps it by the temp path's length (arm64 CI failed on it).
+5. (this commit) Docs: this section, `docs/platform_matrix.md` "Inspect tab", "Physical Disk
+   Export / Write Image File" and "TUI Explorer".
+
+### Behaviour changes
+
+- TUI: a disk from the list opens through the controller, which elevates as the GUI does (on
+  macOS the open unmounts and claims the disk and shows the administrator dialog; over SSH it
+  refuses and asks for sudo). The plain unelevated read remains only as the fallback.
+- TUI: an image file opens through `ImageFile` (a wrapper is decoded in a job), and a backup
+  folder or Clonezilla image shows its grid and is browsable (it showed a summary only).
+- TUI: the Inspect source stays open across tab switches, as in the GUI (switching tabs closed
+  it).
+- TUI: the Explorer opens on the controller's session instead of reopening the image itself; a
+  compressed backup partition opens read-only.
+- TUI: Esc on the grid closes the source through the controller (`Source closed.`), behind the
+  unsaved-edits question.
+- GUI: none (the label, enablement, format list, refusals, Expand cap and size-row rules moved to
+  the controller unchanged; a typed Custom export size the drag value kept in range is clamped
+  the same way).
+- CLI: none.
+
+### Left
+
+- Slice 27: the partition table editor, Add Partition, Resize Partitions, Alto resize, Expand
+  HFS and floppy convert (the grid does not offer them yet). The remote image picker landed
+  here already (the remote source needs it).
+- The Explorer has no Edit Mode for compressed backups or CHD (the egui browse view decompresses
+  and recompresses); those partitions browse read-only.
+- An optical image found by the open is reported, not handed to the Optical tab (its TUI screen
+  rips drives only; Optical parity is a later slice).
+- A terminal has no drag-and-drop, hover help or a disk-layout bar (the layout is a text line).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1977,8 +2078,9 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-25 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
-  have the GUI's feature set (slices 24, 25; Build Disk planned separately). `src/gui` and the whole TUI are enforced at 0 engine references
+- Slices 1-26 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
+  have the GUI's feature set (slices 24, 25; Build Disk planned separately), and the TUI Inspect
+  screen its disk tools, Calc min and Export (slice 26; the dialogs are slice 27). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -2001,8 +2103,9 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    **Slice 21** (done, above): one AppleDouble rule, and a failed entry asks the user;
    publish `rb-fsexporter` 0.1.1.
 3. **TUI parity gaps** the controllers already support (Backup done in slice 24, Restore and
-   the disk writer in slice 25; Inspect disk tools / Calc min / Export; Optical convert /
-   Browse Contents; Inspect dialogs): add them before Phase 2 closes (user decision
+   the disk writer in slice 25, Inspect disk tools / Calc min / Export in slice 26; next the
+   Inspect dialogs in slice 27: table editor, Add Partition, Resize, Alto resize, Expand HFS,
+   floppy convert; then Optical convert / Browse Contents): add them before Phase 2 closes (user decision
    2026-11-04: full parity except the CD-DA player and Build Disk, `docs/build_disk_plan.md`).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
