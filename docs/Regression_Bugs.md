@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-077](#r-077) | Medium | `crates/disk-core` (`times`), `src/fs/copy.rs` | A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC |
 | ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
 | ~~[R-075](#r-075)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (`new volume ufs-43bsd`) | ~~A blank 4.3BSD UFS volume whose cylinder count is a multiple of `fs_cpg` fails NeXTSTEP 3.3's fsck ("SUMMARY INFORMATION BAD")~~ — the last group's `cg_ncyl` is `fs_ncyl % fs_cpg`, 2026-11-01 |
 | ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
@@ -161,6 +162,27 @@ layout, which Solaris's do too; Solaris keeps other superblock data there.
 FreeBSD only keeps that mirror on UFS2, or on UFS1 once `FS_FLAGS_UPDATED`
 (0x80) is set in `fs_old_flags` (byte 211): it is set on FreeBSD's volumes and
 rb-cli's own, and clear on Solaris's.
+
+### R-077 — an HFS to FAT copy shifts the modification time by the host's UTC offset {#r-077}
+
+Found 2026-11-04 by the `cp -p` CLI regression test
+(`tests/cli_suite/cli_cp.rs`, `preserve_times::cp_p_from_hfs_to_fat_keeps_the_modification_date`,
+`#[ignore = "R-077"]` until fixed). On a host at UTC-5, `rb-cli cp -p` of an HFS
+file whose catalog modify date reads `1991-06-17 10:40` writes a FAT file that
+reads `1991-06-17 15:40`.
+
+Both formats store wall-clock time with no zone, but `disk-core::times` treats
+them differently: `mac_local_to_unix` subtracts the host's UTC offset (HFS / MFS
+are local time), while `dos_datetime_to_unix` / `unix_to_dos_datetime` treat FAT
+as UTC. `copy::source_times` goes HFS local -> Unix UTC -> FAT as UTC, so the
+wall clock moves by the offset. Not introduced by PR #97 (which changed HFS to
+HFS only); every `preserve_times` copy from HFS / MFS to FAT, exFAT or Human68k
+does this, as does the reverse direction.
+
+Fixing it means choosing one convention for FAT (local, as DOS and Windows
+write it, or UTC, as the comment on `dos_datetime_to_unix` says our round-trip
+tools assume). That choice also changes host-to-FAT imports and FAT-to-host
+exports, so it is the maintainer's call.
 
 ### R-073 — a big-endian UFS1 volume from `new volume ufs` is not a Solaris volume {#r-073}
 
