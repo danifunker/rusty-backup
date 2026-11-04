@@ -60,6 +60,29 @@ pub fn hfs_volume(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// [`hfs_volume`] holding `README`, a TEXT / ttxt file with Mac dates.
+pub fn hfs_volume_with_text(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = hfs_volume(dir);
+    let session = crate::model::browse_session::BrowseSession {
+        source_path: Some(path.clone()),
+        ..Default::default()
+    };
+    let (mut fs, commit) = session.open_editable().expect("editable HFS");
+    let root = fs.as_filesystem_mut().root().expect("root");
+    let opts = disk_core::filesystem::CreateFileOptions {
+        os_type: Some(*b"TEXT"),
+        os_creator: Some(*b"ttxt"),
+        ..Default::default()
+    };
+    let mut data: &[u8] = b"hello";
+    fs.create_file(&root, "README", &mut data, 5, &opts)
+        .expect("create README");
+    fs.sync_metadata().expect("sync");
+    drop(fs);
+    commit.commit().expect("commit");
+    path
+}
+
 /// A blank 1.2 MB X68000 XDF floppy.
 pub fn blank_xdf(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("disk.xdf");

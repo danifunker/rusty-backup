@@ -728,3 +728,70 @@ fn an_explicit_export_pick_survives_a_refresh_but_not_another_volume() {
     open_image(&mut ctl, Side::Left, other.path());
     assert_eq!(ctl.export_format(), ExportFormat::Zip);
 }
+
+#[test]
+fn file_info_offers_the_mac_fields_and_stages_type_creator_and_a_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::controller::test_fixtures::hfs_volume_with_text(dir.path());
+    let mut ctl = CommanderController::headless();
+    ctl.apply(A::Pane(Side::Left, P::OpenImage(img)));
+    settle(&mut ctl);
+    let node = ctl
+        .left
+        .rows()
+        .iter()
+        .find(|r| r.name == "README")
+        .expect("README listed")
+        .node_id
+        .clone();
+    ctl.apply(A::Pane(Side::Left, P::Activate(node)));
+    settle(&mut ctl);
+    let fields = ctl.detail_fields();
+    for f in [
+        DetailField::TypeCreator,
+        DetailField::Created,
+        DetailField::Modified,
+        DetailField::Backup,
+    ] {
+        assert!(fields.contains(&f), "{f:?} offered: {fields:?}");
+    }
+    assert!(!fields.contains(&DetailField::ProdosType));
+    let meta = ctl.detail_metadata().unwrap();
+    assert_eq!(meta.type_creator.as_ref().unwrap().type_text, "TEXT");
+    let spec = match ctl
+        .apply(A::EditDetail(DetailField::TypeCreator))
+        .as_slice()
+    {
+        [Effect::AskText(spec)] => spec.clone(),
+        other => panic!("expected a prompt, got {other:?}"),
+    };
+    assert_eq!(spec.initial, "TEXT ttxt");
+    assert!(spec.validate("TOOLONG x").is_err());
+    let suggestions = ctl.suggestions_for(spec.purpose);
+    assert!(
+        suggestions.iter().any(|(t, _)| t == "APPL ttxt"),
+        "{suggestions:?}"
+    );
+    ctl.apply(A::Answered {
+        purpose: spec.purpose,
+        text: Some("PICT 8BIM".into()),
+    });
+    let meta = ctl.detail_metadata().unwrap();
+    assert_eq!(meta.type_creator.unwrap().creator_text, "8BIM");
+    let spec = match ctl.apply(A::EditDetail(DetailField::Backup)).as_slice() {
+        [Effect::AskText(spec)] => spec.clone(),
+        other => panic!("expected a prompt, got {other:?}"),
+    };
+    ctl.apply(A::Answered {
+        purpose: spec.purpose,
+        text: Some("2001-02-03 04:05:06".into()),
+    });
+    let dates = ctl.detail_metadata().unwrap().dates.unwrap();
+    assert_eq!(dates[2].as_deref(), Some("2001-02-03 04:05:06"));
+    assert!(dates[1].is_some(), "the modified date is kept");
+    assert_eq!(ctl.pane(Side::Left).queue.len(), 2);
+    let fx = ctl.apply(A::EditDetail(DetailField::ProdosType));
+    assert!(fx.is_empty());
+    let result = ctl.detail().and_then(|d| d.result.clone()).unwrap();
+    assert!(result.contains("no ProDOS type"), "{result}");
+}

@@ -158,8 +158,10 @@ pub(super) struct Modes {
     archive: Option<ArchiveEditContext>,
     archive_temp: Option<PathBuf>,
     chd: Option<ChdEdit>,
-    /// Edits written into a CHD diff that no flatten has committed yet.
-    chd_dirty: bool,
+    /// Writes into a CHD diff or an archive's temp copy that no flatten or recompress saved yet.
+    copy_dirty: bool,
+    /// The close question's Apply saves the copy first; the close follows a save that succeeded.
+    close_after_save: bool,
     /// The single-file-chd backup whose metadata a flatten refreshes.
     backup_folder: Option<PathBuf>,
     job: Option<ModeJob>,
@@ -240,6 +242,11 @@ impl CommanderController {
 
     // --- read accessors ---------------------------------------------------
 
+    /// The host opened this screen's pane through `open_inspect`.
+    pub fn modes_active(&self) -> bool {
+        self.modes.active
+    }
+
     pub fn edit_mode(&self) -> bool {
         self.modes.edit_mode
     }
@@ -269,7 +276,7 @@ impl CommanderController {
 
     /// Closing or switching the source would lose work.
     pub fn has_unsaved_edits(&self) -> bool {
-        self.modes.edit_mode && (!self.left.queue.is_empty() || self.modes.chd_dirty)
+        self.modes.edit_mode && (!self.left.queue.is_empty() || self.modes.copy_dirty)
     }
 
     /// The source-level job in progress (CHD open or flatten, decompress, recompress, measure).
@@ -516,6 +523,7 @@ impl CommanderController {
         else {
             return;
         };
+        self.modes.copy_dirty = false;
         self.leave_edit_state();
         // The pane lets go of the temp file before it is recompressed and removed.
         self.left.release_source();
@@ -582,7 +590,7 @@ impl CommanderController {
     }
 
     fn start_chd_flatten(&mut self) {
-        self.modes.chd_dirty = false;
+        self.modes.copy_dirty = false;
         let Some(chd) = self.modes.chd.take() else {
             return;
         };
@@ -591,6 +599,7 @@ impl CommanderController {
             // Uncompressed: the writes already landed in the parent.
             self.modes.notice = Some("Changes saved successfully.".into());
             self.reopen_modes();
+            self.saved_for_close(true);
             return;
         };
         let folder = self.modes.backup_folder.clone();
@@ -602,7 +611,7 @@ impl CommanderController {
 
     /// Drop the CHD session and its diff; the parent is untouched.
     fn discard_chd(&mut self) {
-        self.modes.chd_dirty = false;
+        self.modes.copy_dirty = false;
         self.modes.session.chd_edit_session = None;
         if let Some(diff) = self.modes.chd.take().and_then(|c| c.diff) {
             // The pane's readers hold the diff open until the reopen replaces them.
@@ -643,17 +652,45 @@ impl CommanderController {
                 if self.modes.chd.is_some() {
                     self.discard_chd();
                 }
+                if self.modes.copy_dirty {
+                    self.discard_archive_temp();
+                }
                 self.leave_or_close();
                 fx
             }
         }
     }
 
+    /// After the question: close, or leave Edit Mode; a copy with writes is saved first.
     fn leave_or_close(&mut self) {
-        if std::mem::take(&mut self.modes.pending_close) {
+        let closing = std::mem::take(&mut self.modes.pending_close);
+        let unsaved_copy = self.modes.edit_mode && self.modes.copy_dirty;
+        if closing && !unsaved_copy {
             self.modes.close = true;
-        } else {
-            self.exit_edit_mode();
+            return;
+        }
+        self.modes.close_after_save = closing;
+        self.exit_edit_mode();
+    }
+
+    /// Drop an archive's temp copy and its writes; the archive itself is untouched.
+    fn discard_archive_temp(&mut self) {
+        self.modes.copy_dirty = false;
+        let (Some(ctx), Some(temp)) = (self.modes.archive.clone(), self.modes.archive_temp.take())
+        else {
+            return;
+        };
+        self.leave_edit_state();
+        self.left.release_source();
+        let _ = std::fs::remove_file(temp);
+        self.modes.session.source_path = Some(ctx.archive_path);
+        self.reopen_modes();
+    }
+
+    /// A save the close question asked for has ended: close on success.
+    fn saved_for_close(&mut self, ok: bool) {
+        if std::mem::take(&mut self.modes.close_after_save) && ok {
+            self.modes.close = true;
         }
     }
 
@@ -776,11 +813,13 @@ impl CommanderController {
             Some(ModeJob::Flatten(job)) => {
                 let snap = job.snapshot();
                 let out = job.take_result();
+                let ok = matches!(out, Some(Ok(_)));
                 self.modes.notice = Some(match out {
                     Some(Ok(said)) | Some(Err(said)) => said,
                     None => format!("Error flattening CHD: {}", failed(snap)),
                 });
                 self.reopen_modes();
+                self.saved_for_close(ok);
             }
             Some(ModeJob::Extract(job)) => {
                 let snap = job.snapshot();
@@ -800,11 +839,14 @@ impl CommanderController {
                         self.modes.archive_temp = None;
                         self.modes.notice = Some("Changes saved successfully.".into());
                         self.reopen_modes();
+                        self.saved_for_close(true);
                     }
                     (Err(e), _) => {
+                        self.saved_for_close(false);
                         // The temp still holds the edits: adopt it again so a retry saves, not re-extracts.
                         if let Some(temp) = self.modes.archive_temp.clone() {
                             self.adopt_archive_temp(temp);
+                            self.modes.copy_dirty = true;
                         }
                         self.modes.notice = Some(format!(
                             "Error saving the archive: {e}. Your edits are still in the temporary \
@@ -859,8 +901,8 @@ impl CommanderController {
         self.modes.generation += 1;
         self.modes.free = None;
         self.modes.free_job = None;
-        if self.modes.chd.is_some() {
-            self.modes.chd_dirty = true;
+        if self.modes.chd.is_some() || (self.modes.edit_mode && self.modes.archive_temp.is_some()) {
+            self.modes.copy_dirty = true;
         }
     }
 

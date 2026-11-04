@@ -124,6 +124,8 @@ pub enum Command {
     Extract,
     /// List the whole volume as a text tree.
     Tree,
+    /// Enter or leave Edit Mode on a source edited through a copy (a CHD or compressed backup).
+    EditMode,
 }
 
 impl Command {
@@ -165,7 +167,7 @@ impl Command {
         Command::Collapse,
     ];
 
-    pub const ALL: [Command; 42] = [
+    pub const ALL: [Command; 43] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -208,10 +210,11 @@ impl Command {
         Command::Transforms,
         Command::Extract,
         Command::Tree,
+        Command::EditMode,
     ];
 
     /// The commands the one-pane Explorer binds.
-    pub const EXPLORER: [Command; 36] = [
+    pub const EXPLORER: [Command; 37] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -248,6 +251,7 @@ impl Command {
         Command::Transforms,
         Command::Extract,
         Command::Tree,
+        Command::EditMode,
     ];
 
     /// The name used in `keybindings.toml`.
@@ -295,6 +299,7 @@ impl Command {
             Command::Transforms => "transforms",
             Command::Extract => "extract",
             Command::Tree => "tree",
+            Command::EditMode => "edit-mode",
         }
     }
 
@@ -347,6 +352,7 @@ impl Command {
             Command::Transforms => "Transform image",
             Command::Extract => "Extract to a folder",
             Command::Tree => "List the tree",
+            Command::EditMode => "Edit Mode",
         }
     }
 }
@@ -402,6 +408,7 @@ const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
     (Command::Transforms, &["Primary+T"]),
     (Command::Extract, &["Primary+X"]),
     (Command::Tree, &["Primary+D"]),
+    (Command::EditMode, &["Primary+W"]),
 ];
 
 /// The command each chord means, for one platform.

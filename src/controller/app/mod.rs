@@ -3,12 +3,12 @@
 //! Holds the log, the job registry, the shell's wake handle, (in builds with the
 //! `update` module) the recent-files history persisted in config.json, and the app
 //! shell's rules in [`shell`]: the active tab, drops, the shared backup folder, the
-//! device list and elevation. The update banner's checks are in [`update`] (GUI builds).
+//! device list and elevation. The update banner's checks are in [`update`] (GUI and `tui-update` builds).
 
 use std::sync::Arc;
 
 mod shell;
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 mod update;
 
 pub use shell::{
@@ -17,7 +17,7 @@ pub use shell::{
     running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
     ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
 };
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 pub use update::{InstallState, UpdateInfo};
 
 use super::log::{capture, LogStore};
@@ -74,7 +74,7 @@ pub struct AppController {
     #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
     config: RecentHandle,
     shell: shell::ShellState,
-    #[cfg(feature = "gui")]
+    #[cfg(any(feature = "gui", feature = "tui-update"))]
     update: update::UpdateState,
 }
 
@@ -89,7 +89,7 @@ impl AppController {
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
             config: RecentHandle::new(Box::new(UserConfig)),
             shell: shell::ShellState::default(),
-            #[cfg(feature = "gui")]
+            #[cfg(any(feature = "gui", feature = "tui-update"))]
             update: update::UpdateState::default(),
         }
     }
@@ -104,7 +104,7 @@ impl AppController {
             #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
             config: RecentHandle::new(Box::<MemoryConfig>::default()),
             shell: shell::ShellState::default(),
-            #[cfg(feature = "gui")]
+            #[cfg(any(feature = "gui", feature = "tui-update"))]
             update: update::UpdateState::default(),
         }
     }
@@ -154,17 +154,17 @@ impl Controller for AppController {
                 Vec::new()
             }
             AppAction::DismissUpdate => {
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "tui-update"))]
                 self.dismiss_update();
                 Vec::new()
             }
             AppAction::InstallUpdate => {
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "tui-update"))]
                 self.install_update();
                 Vec::new()
             }
             AppAction::RetryUpdate => {
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "tui-update"))]
                 self.retry_update();
                 Vec::new()
             }
@@ -180,7 +180,7 @@ impl Controller for AppController {
     fn tick(&mut self) -> Vec<Effect> {
         self.log.extend_from_capture(capture::drain());
         self.poll_shell();
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "tui-update"))]
         self.poll_update();
         Vec::new()
     }
@@ -326,6 +326,21 @@ mod recent {
         }
     }
 
+    /// Settings reads and saves through the app's store, so its Clear empties every screen's list.
+    impl ConfigStore for RecentHandle {
+        fn load(&self) -> UpdateConfig {
+            self.load_config()
+        }
+
+        fn save(&mut self, config: &UpdateConfig) {
+            self.lock().save(config);
+        }
+
+        fn try_save(&mut self, config: &UpdateConfig) -> Result<(), String> {
+            self.lock().try_save(config)
+        }
+    }
+
     impl AppController {
         /// A handle on this app's recent files, for a screen that records opens on its own.
         pub fn recent_handle(&self) -> RecentHandle {
@@ -399,6 +414,23 @@ mod tests {
         assert_eq!(handle.list(RecentMode::Backup), ["/b.img", "/src.img"]);
         app.clear_recent();
         assert!(handle.list(RecentMode::Backup).is_empty());
+    }
+
+    #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
+    #[test]
+    fn settings_clear_goes_through_the_app_store() {
+        use crate::controller::settings::{SettingsAction, SettingsController};
+        let mut app = AppController::headless();
+        app.remember(RecentMode::Inspect, "/a.img");
+        let mut s = SettingsController::with_store(Box::new(app.recent_handle()));
+        s.apply(SettingsAction::Open);
+        assert_eq!(s.recent_count(), 1);
+        s.apply(SettingsAction::SetRepoUrl("https://github.com/o/r".into()));
+        s.apply(SettingsAction::Save);
+        s.apply(SettingsAction::ClearRecent);
+        assert!(app.recent(RecentMode::Inspect).is_empty());
+        let saved = app.recent_handle().load();
+        assert_eq!(saved.update_check.repository_url, "https://github.com/o/r");
     }
 
     #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]

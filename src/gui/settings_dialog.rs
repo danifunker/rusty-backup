@@ -2,12 +2,18 @@ use rusty_backup::controller::settings::{SettingsAction, SettingsController};
 use rusty_backup::controller::Controller as _;
 
 /// The Settings window over `SettingsController`; the form's state lives there.
-#[derive(Default)]
 pub struct SettingsDialog {
     ctl: SettingsController,
 }
 
 impl SettingsDialog {
+    /// The dialog over the app's config store, so its Clear goes through the app's recent files.
+    pub fn new(store: rusty_backup::controller::app::RecentHandle) -> Self {
+        SettingsDialog {
+            ctl: SettingsController::with_store(Box::new(store)),
+        }
+    }
+
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.ctl.is_open() {
             return;
@@ -99,14 +105,9 @@ impl SettingsDialog {
                          Restore, Optical, Archives, and Commander source pickers.",
                     );
                     ui.add_space(5.0);
-                    let recent_count = self.ctl.recent_count();
-                    let clear_label = if recent_count > 0 {
-                        format!("Clear Recent Files ({recent_count})")
-                    } else {
-                        "Clear Recent Files".to_string()
-                    };
+                    let clear_label = self.ctl.clear_recent_label();
                     if ui
-                        .add_enabled(recent_count > 0, egui::Button::new(clear_label))
+                        .add_enabled(self.ctl.can_clear_recent(), egui::Button::new(clear_label))
                         .clicked()
                     {
                         actions.push(SettingsAction::ClearRecent);

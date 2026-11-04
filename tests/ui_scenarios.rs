@@ -1414,9 +1414,10 @@ impl Target for FloppyConvertTarget {
 /// `BulkConvertController`. Actions: `Open`, `PickSource` / `PickOutput` (answered with the
 /// scenario's folders: the source holds `a.img` and `b.img`, the output an `a.img` already),
 /// `SetFormat` (an output extension, e.g. `img`, `vhd`), `Scan`, `SelectNone`, `SelectAll`,
-/// `SetExtension`, `Start`, `Skip` / `Overwrite` / `Back` (the conflict answer), `Close`. Probes:
-/// `open`, `phase`, `files`, `selected`, `extension`, `can_start`, `problem`, `conflicts`,
-/// `running`, `result`, `log`, `outputs` (the output folder's names, comma-joined).
+/// `SetExtension`, `ResetExtension`, `SetMultiBin`, `Start`, `Skip` / `Overwrite` / `Back` (the
+/// conflict answer), `Close`. Probes: `open`, `phase`, `files`, `selected`, `extension`,
+/// `can_start`, `problem`, `conflicts`, `running`, `result`, `log`, `outputs` (the output
+/// folder's names, comma-joined), `label`, `note`, `multi_bin`.
 struct BulkConvertTarget {
     ctl: rusty_backup::controller::bulk_convert::BulkConvertController,
     src: tempfile::TempDir,
@@ -1473,6 +1474,11 @@ impl Target for BulkConvertTarget {
             "SelectNone" => A::SelectNone,
             "SelectAll" => A::SelectAll,
             "SetExtension" => A::SetExtension(arg_str(arg)?.to_string()),
+            "ResetExtension" => A::ResetExtension,
+            "SetMultiBin" => A::SetMultiBin(
+                arg.and_then(Value::as_bool)
+                    .ok_or("SetMultiBin takes a bool")?,
+            ),
             "Start" => A::Start(None),
             "Skip" => A::ResolveConflicts(ConflictChoice::SkipConflicting),
             "Overwrite" => A::ResolveConflicts(ConflictChoice::Overwrite),
@@ -1497,6 +1503,15 @@ impl Target for BulkConvertTarget {
             "files" => Value::Integer(self.ctl.files().len() as i64),
             "selected" => Value::Integer(self.ctl.selected_count() as i64),
             "extension" => Value::String(self.ctl.extension().to_string()),
+            "label" => Value::String(
+                rusty_backup::controller::bulk_convert::format_label(self.ctl.format()).to_string(),
+            ),
+            "note" => Value::String(
+                rusty_backup::controller::bulk_convert::format_note(self.ctl.format())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "multi_bin" => Value::Boolean(self.ctl.multi_bin()),
             "can_start" => Value::Boolean(self.ctl.can_start()),
             "problem" => Value::String(self.ctl.start_problem().unwrap_or("").to_string()),
             "conflicts" => Value::Integer(self.ctl.conflicts().map_or(0, |c| c.len()) as i64),
@@ -1537,12 +1552,14 @@ impl Target for BulkConvertTarget {
 /// `ArchivesController`. Actions: `Open` (arg: `$sit` writes a two-file StuffIt archive, or a
 /// path), `Untick` (an entry index), `SetFormat` (`raw`, `binhex`, `macbinary`, `appledouble`),
 /// `ExtractSelected`, `ExtractAll`, `Pick` (answers the folder picker with `out/`), `Close`.
-/// Probes: `loaded`, `files`, `selected`, `error`, `extracted`, `log`, `outputs`.
+/// Probes: `loaded`, `files`, `selected`, `error`, `extracted`, `log`, `outputs`, `mountable`,
+/// `mounted` (the file name handed to Inspect).
 struct ArchivesTarget {
     ctl: rusty_backup::controller::archives::ArchivesController,
     dir: tempfile::TempDir,
     asked: Option<&'static str>,
     log: Vec<String>,
+    mounted: Option<(PathBuf, tempfile::TempDir)>,
 }
 
 impl ArchivesTarget {
@@ -1554,6 +1571,17 @@ impl ArchivesTarget {
             dir: tempfile::tempdir().expect("temp dir"),
             asked: None,
             log: Vec::new(),
+            mounted: None,
+        }
+    }
+
+    fn take_requests(&mut self) {
+        use rusty_backup::controller::archives::HostRequest;
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(_) => {}
+                HostRequest::OpenInInspect { path, guard } => self.mounted = Some((path, guard)),
+            }
         }
     }
 }
@@ -1584,6 +1612,26 @@ impl Target for ArchivesTarget {
                     std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
                     p
                 }
+                "$sit_hfs" => {
+                    use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
+                    let disk = fs_mac::hfs::create_blank_hfs(1024 * 1024, 512, "Disk")
+                        .map_err(|e| e.to_string())?;
+                    let entry = StuffItInput {
+                        name: "Disk.image".into(),
+                        type_code: *b"rohd",
+                        creator_code: *b"ddsk",
+                        finder_flags: 0,
+                        create_date: 0,
+                        mod_date: 0,
+                        data_fork: disk,
+                        resource_fork: Vec::new(),
+                    };
+                    let bytes =
+                        build_archive(&[entry], WriteMethod::Store).map_err(|e| e.to_string())?;
+                    let p = self.dir.path().join("disk.sit");
+                    std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
+                    p
+                }
                 other => PathBuf::from(other),
             }),
             "Untick" => A::SetSelected(
@@ -1605,9 +1653,11 @@ impl Target for ArchivesTarget {
                 path: Some(self.dir.path().join("out")),
             },
             "Close" => A::Close,
+            "Mount" => A::Mount,
             other => return Err(format!("ArchivesController has no action {other:?}")),
         };
         let fx = self.ctl.apply(a);
+        self.take_requests();
         for e in &fx {
             if let Effect::PickFolder(spec) = e {
                 self.asked = Some(spec.purpose);
@@ -1643,6 +1693,19 @@ impl Target for ArchivesTarget {
                 names.sort();
                 Value::String(names.join(","))
             }
+            "mountable" => Value::String(
+                self.ctl
+                    .mountable()
+                    .map(|k| k.label().to_string())
+                    .unwrap_or_default(),
+            ),
+            "mounted" => Value::String(
+                self.mounted
+                    .as_ref()
+                    .and_then(|(p, _)| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
             other => return Err(format!("ArchivesController has no probe {other:?}")),
         })
     }
@@ -1652,6 +1715,7 @@ impl Target for ArchivesTarget {
         let fx = self.ctl.tick();
         self.log
             .extend(self.ctl.take_log().into_iter().map(|(_, line)| line));
+        self.take_requests();
         fx
     }
 }

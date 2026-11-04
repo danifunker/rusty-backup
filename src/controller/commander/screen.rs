@@ -40,7 +40,7 @@ use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
 pub use crate::model::extract::ExtractOptions;
 pub use budget::{BudgetAction, BudgetForm, BudgetMode};
-pub use detail::DetailField;
+pub use detail::{DetailField, DetailMetadata};
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
 pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
@@ -94,6 +94,11 @@ pub mod purpose {
     pub const DETAIL_MODE: &str = "commander.detail_mode";
     pub const DETAIL_OWNER: &str = "commander.detail_owner";
     pub const DETAIL_XATTR: &str = "commander.detail_xattr";
+    pub const DETAIL_TYPE_CREATOR: &str = "commander.detail_type_creator";
+    pub const DETAIL_PRODOS: &str = "commander.detail_prodos";
+    pub const DETAIL_CREATED: &str = "commander.detail_created";
+    pub const DETAIL_MODIFIED: &str = "commander.detail_modified";
+    pub const DETAIL_BACKUP: &str = "commander.detail_backup";
     /// An extracted entry failed: Skip, Continue with all errors, or Stop.
     pub const ENTRY_FAILED: &str = "commander.entry_failed";
 }
@@ -1234,7 +1239,8 @@ impl CommanderController {
             | Command::QuickView
             | Command::ViewMenu
             | Command::Transforms
-            | Command::Extract => None,
+            | Command::Extract
+            | Command::EditMode => None,
         };
         if let Some(action) = pane_action {
             let sort = matches!(action, P::SortBy(_));
@@ -1260,6 +1266,12 @@ impl CommanderController {
             Command::Export => return self.request_export(side, None),
             Command::Log => self.show_log = !self.show_log,
             Command::Edits => self.status = format!("[{}] No staged edits.", side.label()),
+            Command::EditMode if self.edit_supported() => {
+                return self.apply_mode(ModeAction::ToggleEditMode)
+            }
+            Command::EditMode => {
+                self.status = "Edit Mode is for a CHD or compressed backup partition.".into()
+            }
             // Apply and Delete land here only when refused; the view shows the transforms and extract menus.
             Command::Apply
             | Command::Delete
@@ -1348,6 +1360,10 @@ impl CommanderController {
     }
 
     fn request_close(&mut self, quit: bool) -> Vec<Effect> {
+        // A CHD diff or archive copy in Edit Mode is saved or discarded by the modes' question.
+        if self.modes_active() && !quit && self.has_unsaved_edits() {
+            return self.apply_mode(ModeAction::RequestClose);
+        }
         let n = self.left.queue.len() + self.right.queue.len();
         if n == 0 && self.single && !quit {
             return vec![Effect::Confirm(ConfirmSpec {

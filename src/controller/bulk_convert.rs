@@ -62,6 +62,77 @@ pub const FORMATS: &[ExportFormat] = &[
     ExportFormat::D88,
 ];
 
+/// A format's name in the format list.
+pub fn format_label(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Vhd => "VHD",
+        ExportFormat::VhdDynamic => "VHD (Dynamic)",
+        ExportFormat::Qcow2 => "QCOW2",
+        ExportFormat::VmdkFlat => "VMDK (Flat)",
+        ExportFormat::VmdkSparse => "VMDK (Sparse)",
+        ExportFormat::Raw => "Raw (.img)",
+        ExportFormat::TwoMg => "2MG (.2mg)",
+        ExportFormat::Woz => "WOZ (.woz)",
+        ExportFormat::Moof => "MOOF (.moof)",
+        ExportFormat::Dc42 => "DiskCopy 4.2 (.dsk)",
+        ExportFormat::Chd => "CHD (Hard Disk)",
+        ExportFormat::ChdDvd => "DVD CHD",
+        ExportFormat::ChdCd => "CD CHD",
+        ExportFormat::BinCue => "BIN/CUE",
+        ExportFormat::Xdf => "XDF (.xdf)",
+        ExportFormat::Hdm => "HDM (.hdm)",
+        ExportFormat::Dim => "DIM (.dim)",
+        ExportFormat::D88 => "D88 (.d88)",
+        other => other.description(),
+    }
+}
+
+/// What a format needs from its inputs or how it writes, when there is more to say than its name.
+pub fn format_note(format: ExportFormat) -> Option<&'static str> {
+    Some(match format {
+        ExportFormat::VhdDynamic => {
+            "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
+             readable by Hyper-V, qemu-img, Disk Management."
+        }
+        ExportFormat::Qcow2 => {
+            "QCOW2 v3 - sparse, uncompressed. The format UTM uses for \
+             classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager."
+        }
+        ExportFormat::VmdkFlat => {
+            "monolithicFlat VMDK - descriptor + <name>-flat.vmdk pair. \
+             Opens in VMware, VirtualBox, qemu-img."
+        }
+        ExportFormat::VmdkSparse => {
+            "monolithicSparse VMDK - single self-contained .vmdk; \
+             zero grains omitted. Opens in VMware, VirtualBox, qemu-img."
+        }
+        ExportFormat::Woz => "Floppy only: 140K / 400K / 800K sources",
+        ExportFormat::Moof => "Macintosh 3.5\" bitstream, floppy only: 400K / 800K (Snow / MAME)",
+        ExportFormat::Dc42 => "Floppy only: 400K / 720K / 800K / 1440K sources",
+        ExportFormat::Chd => "MAME hard-disk CHD (512-byte unit)",
+        ExportFormat::ChdDvd => "MAME DVD CHD (2048-byte unit, MAME 0.287+)",
+        ExportFormat::ChdCd => "MAME CD CHD - input must be .iso or .cue",
+        ExportFormat::BinCue => "Extract a CD CHD into a BIN/CUE pair",
+        ExportFormat::Xdf => {
+            "X68000 raw headerless floppy dump. Floppy only (.xdf/.hdm/.dim/.d88 sources)."
+        }
+        ExportFormat::Hdm => "PC-98 / DiskExplorer raw floppy dump. Byte-identical layout to XDF.",
+        ExportFormat::Dim => {
+            "DiskExplorer DIFC DIM (256-byte header + payload). \
+             Floppy only; 640 KB 2DD not representable here."
+        }
+        ExportFormat::D88 => {
+            "Sharp D88 sparse track-table container (X68000 / PC-88 / PC-98 / FM-7)."
+        }
+        _ => return None,
+    })
+}
+
+/// The multi-bin option's label and what it does.
+pub const MULTI_BIN_LABEL: &str = "Multi-bin (one .bin per track)";
+pub const MULTI_BIN_NOTE: &str = "Beyond chdman: writes <name> (Track NN).bin per track plus a \
+     multi-FILE cue. Falls back to single-bin if track sizes don't match.";
+
 /// The CHD profile a format writes with, if it is a CHD format.
 pub fn chd_profile(format: ExportFormat) -> Option<ChdProfile> {
     match format {

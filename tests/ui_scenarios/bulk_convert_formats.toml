@@ -1,0 +1,51 @@
+# Bulk Convert: the CD / floppy formats, their notes, multi-bin BIN/CUE and the output extension.
+name = "Bulk convert: CD and floppy formats, multi-bin and the extension"
+vm = "bulk_convert"
+
+[[step]]
+action = "Open"
+expect = { open = true, phase = "setup", label = "VHD", note = "" }
+
+[[step]]
+action = "SetFormat"
+arg = "cue"
+expect = { label = "BIN/CUE", note = "Extract a CD CHD into a BIN/CUE pair", multi_bin = false }
+
+[[step]]
+action = "SetMultiBin"
+arg = true
+expect = { multi_bin = true }
+
+[[step]]
+action = "SetFormat"
+arg = "xdf"
+expect = { label = "XDF (.xdf)", note = "~Floppy only" }
+
+[[step]]
+action = "AnswerSource"
+
+[[step]]
+action = "AnswerOutput"
+
+[[step]]
+action = "SetFormat"
+arg = "img"
+
+[[step]]
+action = "Scan"
+settle = true
+expect = { phase = "review", extension = "img" }
+
+[[step]]
+action = "SetExtension"
+arg = "raw"
+expect = { extension = "raw" }
+
+[[step]]
+action = "ResetExtension"
+expect = { extension = "img" }
+
+[[step]]
+action = "SetFormat"
+arg = "xdf"
+expect = { extension = "xdf", label = "XDF (.xdf)" }

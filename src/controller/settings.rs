@@ -88,6 +88,19 @@ impl SettingsController {
         self.recent_count
     }
 
+    /// The Clear Recent Files button's label, with the count while there is one.
+    pub fn clear_recent_label(&self) -> String {
+        match self.recent_count {
+            0 => "Clear Recent Files".to_string(),
+            n => format!("Clear Recent Files ({n})"),
+        }
+    }
+
+    /// Clear Recent Files has something to clear.
+    pub fn can_clear_recent(&self) -> bool {
+        self.recent_count > 0
+    }
+
     /// The last Save or Clear result; an error starts with "Error".
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
@@ -199,8 +212,11 @@ mod tests {
         let saved = s.config.load();
         assert!(saved.update_check.enabled);
         assert_eq!(saved.update_check.repository_url, "https://github.com/o/r");
+        assert_eq!(s.clear_recent_label(), "Clear Recent Files (2)");
         s.apply(SettingsAction::ClearRecent);
         assert_eq!(s.status(), Some("Cleared 2 recent files."));
+        assert!(!s.can_clear_recent());
+        assert_eq!(s.clear_recent_label(), "Clear Recent Files");
         assert!(s.take_cleared_recents());
         assert!(!s.take_cleared_recents());
         assert_eq!(s.config.load().recent_files.total(), 0);

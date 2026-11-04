@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use rusty_backup::controller::bulk_convert::{
-    chd_profile, fmt_bytes, BulkConvertAction, BulkConvertController, BulkPhase, ChdOptions,
-    ChdProfile, Conflict, ConflictChoice, ExportFormat,
+    chd_profile, fmt_bytes, format_label, format_note, BulkConvertAction, BulkConvertController,
+    BulkPhase, ChdOptions, ChdProfile, Conflict, ConflictChoice, ExportFormat, FORMATS,
+    MULTI_BIN_LABEL, MULTI_BIN_NOTE,
 };
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller, Effect};
@@ -184,62 +185,12 @@ impl BulkConvertDialog {
 
                 ui.label(egui::RichText::new("Output format:").strong());
                 ui.horizontal_wrapped(|ui| {
-                    ui.radio_value(&mut format, ExportFormat::Vhd, "VHD");
-                    ui.radio_value(&mut format, ExportFormat::VhdDynamic, "VHD (Dynamic)")
-                        .on_hover_text(
-                            "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
-                             readable by Hyper-V, qemu-img, Disk Management.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::Qcow2, "QCOW2")
-                        .on_hover_text(
-                            "QCOW2 v3 - sparse, uncompressed. The format UTM uses for \
-                             classic-Mac PPC guests; opens in QEMU, qemu-img, virt-manager.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::VmdkFlat, "VMDK (Flat)")
-                        .on_hover_text(
-                            "monolithicFlat VMDK - descriptor + <name>-flat.vmdk pair. \
-                             Opens in VMware, VirtualBox, qemu-img.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::VmdkSparse, "VMDK (Sparse)")
-                        .on_hover_text(
-                            "monolithicSparse VMDK - single self-contained .vmdk; \
-                             zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::Raw, "Raw (.img)");
-                    ui.radio_value(&mut format, ExportFormat::TwoMg, "2MG (.2mg)");
-                    ui.radio_value(&mut format, ExportFormat::Woz, "WOZ (.woz)")
-                        .on_hover_text("Floppy only: 140K / 400K / 800K sources");
-                    ui.radio_value(&mut format, ExportFormat::Moof, "MOOF (.moof)")
-                        .on_hover_text("Macintosh 3.5\" bitstream, floppy only: 400K / 800K (Snow / MAME)");
-                    ui.radio_value(&mut format, ExportFormat::Dc42, "DiskCopy 4.2 (.dsk)")
-                        .on_hover_text("Floppy only: 400K / 720K / 800K / 1440K sources");
-                    ui.radio_value(&mut format, ExportFormat::Chd, "CHD (Hard Disk)")
-                        .on_hover_text("MAME hard-disk CHD (512-byte unit)");
-                    ui.radio_value(&mut format, ExportFormat::ChdDvd, "DVD CHD")
-                        .on_hover_text("MAME DVD CHD (2048-byte unit, MAME 0.287+)");
-                    ui.radio_value(&mut format, ExportFormat::ChdCd, "CD CHD")
-                        .on_hover_text("MAME CD CHD - input must be .iso or .cue");
-                    ui.radio_value(&mut format, ExportFormat::BinCue, "BIN/CUE")
-                        .on_hover_text("Extract a CD CHD into a BIN/CUE pair");
-                    ui.radio_value(&mut format, ExportFormat::Xdf, "XDF (.xdf)")
-                        .on_hover_text(
-                            "X68000 raw headerless floppy dump. \
-                             Floppy only (.xdf/.hdm/.dim/.d88 sources).",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::Hdm, "HDM (.hdm)")
-                        .on_hover_text(
-                            "PC-98 / DiskExplorer raw floppy dump. \
-                             Byte-identical layout to XDF.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::Dim, "DIM (.dim)")
-                        .on_hover_text(
-                            "DiskExplorer DIFC DIM (256-byte header + payload). \
-                             Floppy only; 640 KB 2DD not representable here.",
-                        );
-                    ui.radio_value(&mut format, ExportFormat::D88, "D88 (.d88)")
-                        .on_hover_text(
-                            "Sharp D88 sparse track-table container (X68000 / PC-88 / PC-98 / FM-7).",
-                        );
+                    for f in FORMATS {
+                        let radio = ui.radio_value(&mut format, *f, format_label(*f));
+                        if let Some(note) = format_note(*f) {
+                            radio.on_hover_text(note);
+                        }
+                    }
                 });
 
                 match format {
@@ -272,14 +223,8 @@ impl BulkConvertDialog {
                     }
                     ExportFormat::BinCue => {
                         ui.add_space(4.0);
-                        ui.checkbox(
-                            &mut multi_bin,
-                            "Multi-bin (one .bin per track)",
-                        )
-                        .on_hover_text(
-                            "Beyond chdman: writes <name> (Track NN).bin per track plus a \
-                             multi-FILE cue. Falls back to single-bin if track sizes don't match.",
-                        );
+                        ui.checkbox(&mut multi_bin, MULTI_BIN_LABEL)
+                            .on_hover_text(MULTI_BIN_NOTE);
                     }
                     _ => {}
                 }

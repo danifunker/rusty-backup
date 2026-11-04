@@ -269,3 +269,153 @@ fn edit_mode_on_squashfs_asks_for_a_size_budget_first() {
         ctl.take_mode_error()
     );
 }
+
+/// A zstd backup of a FAT volume: the archive, its decoded size, and its edit context.
+fn zstd_backup(dir: &Path) -> (PathBuf, u64, ArchiveEditContext) {
+    let img = fat_volume(dir);
+    let size = std::fs::metadata(&img).unwrap().len();
+    let base = dir.join("partition-0");
+    let mut log = |_: &str| {};
+    let files = crate::rbformats::compress_file_to_archive(
+        &img,
+        &base,
+        "zstd",
+        None,
+        &mut |_| {},
+        &|| false,
+        &mut log,
+    )
+    .unwrap();
+    let archive = dir.join(&files[0]);
+    let ctx = ArchiveEditContext {
+        archive_path: archive.clone(),
+        compression_type: "zstd".into(),
+        original_size: size,
+        compacted: false,
+        metadata_path: PathBuf::new(),
+        partition_index: 0,
+        checksum_type: "sha256".into(),
+    };
+    (archive, size, ctx)
+}
+
+fn archive_names(archive: &Path, size: u64, dir: &Path) -> Vec<String> {
+    let out = dir.join("check.img");
+    crate::rbformats::decompress_partition_to_file(
+        archive,
+        "zstd",
+        &out,
+        size,
+        false,
+        &mut |_| {},
+        &|| false,
+    )
+    .unwrap();
+    root_names(&out)
+}
+
+/// The TUI Explorer writes each edit at once, so the temp copy holds what the close must save.
+#[test]
+fn the_explorer_edits_a_zstd_backup_in_edit_mode_and_saves_it_on_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let (archive, size, ctx) = zstd_backup(dir.path());
+    let mut ctl = CommanderController::single(
+        PaneServices::headless(),
+        KeyMap::explorer_terminal(),
+        PaneProfile::explorer(),
+    );
+    ctl.open_inspect(BrowseSession::streaming(&archive, 0, None).unwrap(), "vol");
+    settle(&mut ctl);
+    ctl.inspect_edit_archive(ctx);
+    let ctrl = crate::controller::keys::Mods {
+        ctrl: true,
+        ..Default::default()
+    };
+    ctl.apply(CommanderAction::Key(
+        crate::controller::keys::Key::Char('w'),
+        ctrl,
+    ));
+    settle(&mut ctl);
+    assert!(ctl.editing_archive(), "{:?}", ctl.take_mode_notice());
+    let host = dir.path().join("NOTE.TXT");
+    std::fs::write(&host, b"note").unwrap();
+    let add = BrowserPaneAction::AddHostPaths {
+        paths: vec![host],
+        folder: None,
+    };
+    ctl.apply(CommanderAction::Pane(Side::Left, add));
+    settle(&mut ctl);
+    assert!(ctl.pane(Side::Left).queue.is_empty(), "written at once");
+    assert!(ctl.has_unsaved_edits(), "the temp copy is not saved yet");
+    let esc = crate::controller::keys::Key::Escape;
+    let fx = ctl.apply(CommanderAction::Key(esc, Default::default()));
+    assert!(fx.is_empty() && ctl.unsaved_shown(), "{fx:?}");
+    mode(&mut ctl, ModeAction::Unsaved(UnsavedChoice::Apply));
+    settle(&mut ctl);
+    assert!(ctl.take_close_request(), "{:?}", ctl.take_mode_notice());
+    assert!(archive_names(&archive, size, dir.path()).contains(&"NOTE.TXT".to_string()));
+}
+
+#[test]
+fn discarding_a_written_archive_copy_leaves_the_archive_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let (archive, size, ctx) = zstd_backup(dir.path());
+    let mut ctl = CommanderController::single(
+        PaneServices::headless(),
+        KeyMap::explorer_terminal(),
+        PaneProfile::explorer(),
+    );
+    ctl.open_inspect(BrowseSession::streaming(&archive, 0, None).unwrap(), "vol");
+    settle(&mut ctl);
+    ctl.inspect_edit_archive(ctx);
+    mode(&mut ctl, ModeAction::ToggleEditMode);
+    let temp = dir.path().join("partition-0-edit.img");
+    assert!(temp.exists());
+    let host = dir.path().join("NOTE.TXT");
+    std::fs::write(&host, b"note").unwrap();
+    let add = BrowserPaneAction::AddHostPaths {
+        paths: vec![host],
+        folder: None,
+    };
+    ctl.apply(CommanderAction::Pane(Side::Left, add));
+    settle(&mut ctl);
+    mode(&mut ctl, ModeAction::ToggleEditMode);
+    assert!(ctl.unsaved_shown());
+    mode(&mut ctl, ModeAction::Unsaved(UnsavedChoice::Discard));
+    settle(&mut ctl);
+    assert!(!ctl.edit_mode() && !ctl.has_unsaved_edits());
+    assert!(!temp.exists());
+    assert!(!archive_names(&archive, size, dir.path()).contains(&"NOTE.TXT".to_string()));
+}
+
+#[cfg(feature = "chd")]
+#[test]
+fn closing_a_chd_with_a_written_diff_flattens_it_before_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
+    let data = std::fs::read(fat_volume(dir.path())).unwrap();
+    let chd = dir.path().join("zdisk.chd");
+    let opts = HdCreateOptions {
+        logical_size: data.len() as u64,
+        hunk_size: 4096,
+        unit_size: 512,
+        codecs: [libchdman_rs::CHD_CODEC_ZLIB, 0, 0, 0],
+        geometry: None,
+        ident: None,
+    };
+    let mut src = std::io::Cursor::new(&data);
+    create_from_reader(&mut src, &chd, opts, &mut |_| {}, &|| false).unwrap();
+    let mut ctl = inspect(session(&chd));
+    ctl.inspect_edit_in_place();
+    mode(&mut ctl, ModeAction::ToggleEditMode);
+    assert!(ctl.editing_chd(), "{:?}", ctl.take_mode_notice());
+    stage_folder(&mut ctl, "KEPT");
+    ctl.apply(CommanderAction::Mode(ModeAction::Apply));
+    settle(&mut ctl);
+    mode(&mut ctl, ModeAction::RequestClose);
+    assert!(ctl.unsaved_shown());
+    mode(&mut ctl, ModeAction::Unsaved(UnsavedChoice::Apply));
+    settle(&mut ctl);
+    assert!(ctl.take_close_request());
+    assert!(root_names(&chd).contains(&"KEPT".to_string()));
+}

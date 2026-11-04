@@ -212,9 +212,9 @@ impl Default for RustyBackupApp {
             inspect_tab: InspectTab::new(app.recent_handle()),
             optical_tab,
             archives_tab: ArchivesTab::new(app.recent_handle()),
+            settings_dialog: SettingsDialog::new(app.recent_handle()),
             app,
             progress: ProgressState::default(),
-            settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
             elevation_dialog: ElevationDialog::default(),
             shield_texture: None,

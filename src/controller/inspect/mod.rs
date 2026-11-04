@@ -231,6 +231,25 @@ pub struct BrowseOpen {
     pub backup_folder: Option<PathBuf>,
 }
 
+impl BrowseOpen {
+    /// Edited through Edit Mode's copy (a compressed backup decompressed, a CHD over a diff),
+    /// not written in place at once.
+    pub fn edits_through_modes(&self) -> bool {
+        let chd = self
+            .session
+            .source_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("chd"));
+        match &self.edit {
+            BrowseEdit::Archive(_) => true,
+            BrowseEdit::InPlace => chd,
+            BrowseEdit::ReadOnly => false,
+        }
+    }
+}
+
 /// The partition-table row's header facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSummary {

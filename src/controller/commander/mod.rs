@@ -22,10 +22,10 @@ pub use crate::controller::browser::{metadata, pane, rows};
 pub use screen::{
     default_export_format, export_choices, extract_applies, extract_fork_modes, BudgetAction,
     BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction, CommanderController,
-    DetailField, ExportChoice, ExportFormat, ExtractApplies, ExtractOptions, FileDetail, HashAlgo,
-    IdNameMap, MetadataEdit, ModeAction, RenameNotice, ResourceForkMode, Side, SizePlan,
-    SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY,
-    MIN_NESTED_IMAGE_BYTES,
+    DetailField, DetailMetadata, ExportChoice, ExportFormat, ExtractApplies, ExtractOptions,
+    FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice, ResourceForkMode,
+    Side, SizePlan, SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr,
+    FOLLOW_DELAY, MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
