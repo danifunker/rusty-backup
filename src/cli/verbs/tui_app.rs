@@ -49,8 +49,11 @@ use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, Volume
 use crate::controller::app::{format_size, RateTracker};
 use crate::controller::app::{DiskDevice, RecentMode};
 
+mod backup;
 mod commander;
 mod explorer;
+
+use backup::BackupState;
 
 /// Shared state for a running progress task: a worker thread advances
 /// `current` toward `total`; the UI thread reads it each frame.
@@ -1123,148 +1126,6 @@ impl NewWizard {
             DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
             DiskClass::Cdrom => CD_TARGETS[i.min(CD_TARGETS.len() - 1)].0,
         }
-    }
-}
-
-/// The Backup screen: a guided source -> config -> run flow over a headless
-/// `controller::backup::BackupController`, the controller behind the GUI's Backup tab.
-/// The run's progress is mirrored into the shell's bottom progress bar.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BackupStep {
-    Source,
-    Config,
-    Run,
-}
-
-/// Output formats offered on the Backup config form (label -> compression).
-const BACKUP_FORMATS: &[(&str, crate::controller::backup::CompressionType)] = &[
-    ("Zstd", crate::controller::backup::CompressionType::Zstd),
-    (
-        "CHD (single-file)",
-        crate::controller::backup::CompressionType::Chd,
-    ),
-    ("VHD", crate::controller::backup::CompressionType::Vhd),
-    ("gzip", crate::controller::backup::CompressionType::Gzip),
-    ("LZ4", crate::controller::backup::CompressionType::Lz4),
-    (
-        "Raw (uncompressed)",
-        crate::controller::backup::CompressionType::None,
-    ),
-];
-
-/// Checksum choices on the Backup config form (label -> algorithm).
-const BACKUP_CHECKSUMS: &[(&str, crate::controller::backup::ChecksumType)] = &[
-    ("SHA-256", crate::controller::backup::ChecksumType::Sha256),
-    ("CRC32", crate::controller::backup::ChecksumType::Crc32),
-];
-
-/// Config-form rows: 0 output dir, 1 name, 2 format, 3 checksum, 4 "Start".
-const BACKUP_FIELDS: usize = 5;
-
-struct BackupState {
-    step: BackupStep,
-    /// The app's recent-files store; a successful open is recorded through it.
-    recent: crate::controller::app::RecentHandle,
-    ctl: crate::controller::backup::BackupController,
-    /// Source image file picker, when open.
-    picker: Option<FilePicker>,
-    /// Physical-disk chooser sub-mode + its cursor.
-    device_pick: bool,
-    device_sel: usize,
-    /// The typed output folder (`~` expands on Start).
-    out_dir: String,
-    format_sel: usize,
-    checksum_sel: usize,
-    field: usize,
-    /// Latest operation string from the run (shown during Run).
-    op: String,
-    /// The controller's latest log lines, shown under the run.
-    log: Vec<String>,
-    /// Esc asked the running backup to stop.
-    cancel_note: bool,
-}
-
-impl BackupState {
-    fn new(recent: crate::controller::app::RecentHandle) -> Self {
-        use crate::controller::backup::{
-            BackupAction, BackupController, BackupServices, JobRegistry, NoNotify,
-        };
-        use crate::controller::Controller as _;
-        let mut ctl = BackupController::new(BackupServices {
-            jobs: JobRegistry::new(),
-            notify: Arc::new(NoNotify),
-        });
-        // The TUI keeps each partition's size and writes one archive per partition.
-        ctl.apply(BackupAction::SetResize(false));
-        ctl.apply(BackupAction::SetSplit(false));
-        BackupState {
-            step: BackupStep::Source,
-            recent,
-            ctl,
-            picker: None,
-            device_pick: false,
-            device_sel: 0,
-            out_dir: String::new(),
-            format_sel: 0,
-            checksum_sel: 0,
-            field: 0,
-            op: String::new(),
-            log: Vec::new(),
-            cancel_note: false,
-        }
-    }
-}
-
-impl BackupState {
-    fn act(&mut self, action: crate::controller::backup::BackupAction) {
-        use crate::controller::Controller as _;
-        // The controller's pickers are the TUI's own file picker, opened by key.
-        let _ = self.ctl.apply(action);
-        self.after();
-    }
-
-    /// Carry out the controller's requests and keep its latest log lines.
-    fn after(&mut self) {
-        use crate::controller::backup::HostRequest;
-        for req in self.ctl.take_requests() {
-            match req {
-                HostRequest::RememberRecent(path) => {
-                    self.recent
-                        .remember(RecentMode::Backup, path.to_string_lossy().as_ref());
-                }
-            }
-        }
-        self.log
-            .extend(self.ctl.take_log().into_iter().map(|(_, msg)| msg));
-        let n = self.log.len();
-        if n > 6 {
-            self.log.drain(..n - 6);
-        }
-    }
-
-    /// A backup runs or waits to start.
-    fn busy(&self) -> bool {
-        self.ctl.is_running() || self.ctl.start_pending() || self.ctl.vhd_open()
-    }
-
-    /// How the run ended (text, is an error); `None` while it runs.
-    fn result(&self) -> Option<(String, bool)> {
-        if self.busy() {
-            return self
-                .cancel_note
-                .then(|| ("Cancel requested...".to_string(), true));
-        }
-        match self.ctl.last_result()? {
-            Ok(()) => Some(("Backup complete.".to_string(), false)),
-            Err(e) => Some((e.clone(), true)),
-        }
-    }
-
-    fn source_text(&self) -> String {
-        self.ctl
-            .source_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
     }
 }
 
@@ -3128,220 +2989,6 @@ impl App {
         });
     }
 
-    /// Backup screen keys. Returns `true` when consumed; `false` lets a key fall
-    /// through to the shell (Left/Right switch tabs, `q` quits from idle steps).
-    fn handle_backup_key(&mut self, code: KeyCode) -> bool {
-        use crate::controller::backup::BackupAction;
-        if self.backup.is_none() {
-            self.backup = Some(BackupState::new(self.shell.recent_handle()));
-        }
-        // Source image file picker (modal).
-        if let Some(b) = self.backup.as_mut() {
-            if let Some(picker) = b.picker.as_mut() {
-                let is_dir = matches!(picker.kind, PickKind::Dir);
-                match picker.handle_key(code) {
-                    Some(PickResult::Cancel) => b.picker = None,
-                    Some(PickResult::Confirm(path)) => {
-                        b.picker = None;
-                        if is_dir {
-                            b.out_dir = path.to_string_lossy().into_owned();
-                        } else {
-                            b.act(BackupAction::OpenImage { path, rename: true });
-                            self.backup_source_chosen();
-                        }
-                    }
-                    None => {}
-                }
-                return true;
-            }
-        }
-
-        let step = self.backup.as_ref().unwrap().step;
-        // Physical-disk chooser sub-mode.
-        if self.backup.as_ref().map(|b| b.device_pick).unwrap_or(false) {
-            let ndisks = self.shell.devices().len();
-            let b = self.backup.as_mut().unwrap();
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => b.device_sel = b.device_sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    b.device_sel = (b.device_sel + 1).min(ndisks.saturating_sub(1))
-                }
-                KeyCode::Esc => b.device_pick = false,
-                KeyCode::Enter => {
-                    let sel = b.device_sel;
-                    let dev = self.shell.devices().get(sel).cloned();
-                    if let Some(device) = dev {
-                        let b = self.backup.as_mut().unwrap();
-                        b.device_pick = false;
-                        b.act(BackupAction::SelectDevice { slot: sel, device });
-                        self.backup_source_chosen();
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Start is handled outside the mutable borrow below.
-        if step == BackupStep::Config
-            && code == KeyCode::Enter
-            && self.backup.as_ref().map(|b| b.field).unwrap_or(0) == 4
-        {
-            self.start_backup();
-            return true;
-        }
-
-        let b = self.backup.as_mut().unwrap();
-        match step {
-            BackupStep::Source => match code {
-                KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = b.recent.list(RecentMode::Backup);
-                    b.picker = Some(
-                        FilePicker::new(PickKind::File, "Choose source image").with_recent(recent),
-                    );
-                    true
-                }
-                KeyCode::Char('d') => {
-                    b.device_pick = true;
-                    b.device_sel = 0;
-                    true
-                }
-                _ => false,
-            },
-            BackupStep::Config => match code {
-                KeyCode::Esc => {
-                    b.step = BackupStep::Source;
-                    true
-                }
-                KeyCode::Down => {
-                    b.field = (b.field + 1) % BACKUP_FIELDS;
-                    true
-                }
-                KeyCode::Up | KeyCode::BackTab => {
-                    b.field = (b.field + BACKUP_FIELDS - 1) % BACKUP_FIELDS;
-                    true
-                }
-                // Format / checksum fields: Left/Right (and Space) cycle choices;
-                // on other fields Left/Right fall through to tab switching.
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if b.field == 2 => {
-                    let n = BACKUP_FORMATS.len();
-                    if code == KeyCode::Left {
-                        b.format_sel = (b.format_sel + n - 1) % n;
-                    } else {
-                        b.format_sel = (b.format_sel + 1) % n;
-                    }
-                    let format = BACKUP_FORMATS[b.format_sel].1;
-                    b.act(BackupAction::SetFormat(format));
-                    true
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if b.field == 3 => {
-                    let n = BACKUP_CHECKSUMS.len();
-                    if code == KeyCode::Left {
-                        b.checksum_sel = (b.checksum_sel + n - 1) % n;
-                    } else {
-                        b.checksum_sel = (b.checksum_sel + 1) % n;
-                    }
-                    let checksum = BACKUP_CHECKSUMS[b.checksum_sel].1;
-                    b.act(BackupAction::SetChecksum(checksum));
-                    true
-                }
-                KeyCode::Tab if b.field == 0 => {
-                    // Browse for the output folder (Dir picker); the confirm
-                    // branch routes it to out_dir by its PickKind.
-                    let mut p = FilePicker::new(PickKind::Dir, "Choose output folder");
-                    p.input = b.out_dir.clone();
-                    b.picker = Some(p);
-                    true
-                }
-                KeyCode::Enter => {
-                    b.field = (b.field + 1) % BACKUP_FIELDS;
-                    true
-                }
-                KeyCode::Backspace => {
-                    match b.field {
-                        0 => {
-                            b.out_dir.pop();
-                        }
-                        1 => {
-                            let mut name = b.ctl.name().to_string();
-                            name.pop();
-                            b.act(BackupAction::SetName(name));
-                        }
-                        _ => {}
-                    }
-                    true
-                }
-                KeyCode::Char(c) if !c.is_control() && (b.field == 0 || b.field == 1) => {
-                    if b.field == 0 {
-                        b.out_dir.push(c);
-                    } else {
-                        let mut name = b.ctl.name().to_string();
-                        name.push(c);
-                        b.act(BackupAction::SetName(name));
-                    }
-                    true
-                }
-                _ => false,
-            },
-            BackupStep::Run => match code {
-                KeyCode::Esc => {
-                    if b.result().is_none() {
-                        // Request cancel; the bar clears via cancel_progress.
-                        self.cancel_progress();
-                        if let Some(b) = self.backup.as_mut() {
-                            if !b.busy() && b.result().is_none() {
-                                b.step = BackupStep::Config;
-                            }
-                        }
-                    } else {
-                        // Done: clear and return to the config form.
-                        self.progress = None;
-                        b.cancel_note = false;
-                        b.step = BackupStep::Config;
-                    }
-                    true
-                }
-                _ => true, // swallow keys while a backup is on screen
-            },
-        }
-    }
-
-    /// A source was picked: on to the config form, defaulting the output folder to the image's.
-    fn backup_source_chosen(&mut self) {
-        let Some(b) = self.backup.as_mut() else {
-            return;
-        };
-        if b.out_dir.is_empty() {
-            if let Some(dir) = b.ctl.default_destination() {
-                b.out_dir = dir.display().to_string();
-            }
-        }
-        b.step = BackupStep::Config;
-        b.field = 0;
-    }
-
-    /// Hand the form to the controller and press its Start; it validates and runs the backup.
-    fn start_backup(&mut self) {
-        use crate::controller::backup::BackupAction;
-        let Some(b) = self.backup.as_mut() else {
-            return;
-        };
-        let out_dir = expand_tilde(b.out_dir.trim());
-        let dest = (!out_dir.as_os_str().is_empty()).then_some(out_dir);
-        b.act(BackupAction::SetDestination(dest));
-        b.act(BackupAction::Start(None));
-        b.cancel_note = false;
-        b.op = "Starting...".to_string();
-        b.step = BackupStep::Run;
-        if b.busy() {
-            self.progress = Some(Progress {
-                shared: Arc::new(Mutex::new(ProgressShared::default())),
-                tracker: RateTracker::default(),
-                label: "Backing up".to_string(),
-            });
-        }
-    }
-
     /// Restore screen keys. Returns `true` when consumed.
     fn handle_restore_key(&mut self, code: KeyCode) -> bool {
         if self.restore.is_none() {
@@ -4550,34 +4197,7 @@ impl App {
     fn tick(&mut self) {
         self.poll_task();
         self.poll_devices();
-        // Drive the Backup controller and mirror its run into the visual bar.
-        if let Some(b) = self.backup.as_mut() {
-            use crate::controller::backup::BackupAction;
-            use crate::controller::Controller as _;
-            let _ = b.ctl.tick();
-            // The TUI has no VHD window: one .vhd per partition, as before.
-            if b.ctl.vhd_open() {
-                b.act(BackupAction::VhdWholeDisk(false));
-                b.act(BackupAction::VhdStart);
-            }
-            b.after();
-            let bar = b.ctl.progress();
-            if let Some(bar) = &bar {
-                b.op = bar.operation.clone();
-            }
-            if b.step == BackupStep::Run {
-                let done = !b.busy();
-                if let Some(prog) = self.progress.as_ref() {
-                    if let Ok(mut sh) = prog.shared.lock() {
-                        if let Some(bar) = &bar {
-                            sh.current = bar.current_bytes;
-                            sh.total = bar.total_bytes;
-                        }
-                        sh.done = done;
-                    }
-                }
-            }
-        }
+        self.backup_tick();
         // An image write reports through the writer's job.
         let writing = self.restore.as_ref().is_some_and(|r| r.writing);
         if writing {
@@ -5407,194 +5027,6 @@ impl App {
 
     /// The Backup screen: source -> config -> run. The progress bar overlay
     /// (drawn by `draw_progress`) sits on top during the Run step.
-    fn draw_backup(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
-        let title = match b.step {
-            BackupStep::Source => "Backup  -  step 1/3: source",
-            BackupStep::Config => "Backup  -  step 2/3: options",
-            BackupStep::Run => "Backup  -  step 3/3: run",
-        };
-        let mut lines: Vec<Line> = Vec::new();
-        match b.step {
-            BackupStep::Source => {
-                lines.push(Line::styled(
-                    "Choose what to back up:",
-                    self.palette.accent(),
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled("  Enter / o  ", self.palette.accent()),
-                    Span::raw("choose a source image file"),
-                ]));
-                let dev_line = if self.elevated {
-                    Span::raw("choose a physical disk")
-                } else {
-                    Span::styled(
-                        "choose a physical disk (may prompt for admin)",
-                        self.palette.dim(),
-                    )
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("  d          ", self.palette.accent()),
-                    dev_line,
-                ]));
-                let source = b.source_text();
-                if !source.is_empty() {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::from(vec![
-                        Span::styled("Current source: ", self.palette.dim()),
-                        Span::raw(source),
-                    ]));
-                }
-                lines.push(Line::raw(""));
-                if let Some(note) = self.device_note() {
-                    lines.push(note);
-                }
-            }
-            BackupStep::Config => {
-                lines.push(Line::from(vec![
-                    Span::styled("Source: ", self.palette.dim()),
-                    Span::raw(b.source_text()),
-                    Span::styled(
-                        if b.ctl.device_slot().is_some() {
-                            "  [device]"
-                        } else {
-                            ""
-                        },
-                        self.palette.dim(),
-                    ),
-                ]));
-                if let Some(snap) = b.ctl.decoding().or_else(|| b.ctl.scanning()) {
-                    let what = if snap.phase.is_empty() {
-                        snap.label
-                    } else {
-                        snap.phase
-                    };
-                    lines.push(Line::styled(format!("  {what}"), self.palette.dim()));
-                } else if let Some(table) = b.ctl.table_desc() {
-                    lines.push(Line::styled(
-                        format!("  {} partition(s) ({table})", b.ctl.partition_count()),
-                        self.palette.dim(),
-                    ));
-                } else if let Some(err) = b.ctl.load_error() {
-                    lines.push(Line::styled(format!("  {err}"), self.palette.warn()));
-                }
-                lines.push(Line::raw(""));
-                let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
-                    let active = b.field == idx;
-                    let cursor = if active && editable {
-                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
-                    } else {
-                        Span::raw("")
-                    };
-                    let marker = if active { "> " } else { "  " };
-                    let mstyle = if active {
-                        self.palette.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        self.palette.accent()
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("{marker}{label:<10}"), mstyle),
-                        Span::raw(val),
-                        cursor,
-                    ])
-                };
-                let out_disp = if b.out_dir.is_empty() && b.field != 0 {
-                    "(output folder)".to_string()
-                } else {
-                    b.out_dir.clone()
-                };
-                lines.push(row(0, "Output:", out_disp, true));
-                lines.push(row(1, "Name:", b.ctl.name().to_string(), true));
-                lines.push(row(
-                    2,
-                    "Format:",
-                    format!("< {} >", BACKUP_FORMATS[b.format_sel].0),
-                    false,
-                ));
-                lines.push(row(
-                    3,
-                    "Checksum:",
-                    format!("< {} >", BACKUP_CHECKSUMS[b.checksum_sel].0),
-                    false,
-                ));
-                lines.push(Line::raw(""));
-                let start_sel = b.field == 4;
-                let start_style = if start_sel {
-                    self.palette
-                        .accent()
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    self.palette.accent()
-                };
-                lines.push(Line::styled(
-                    format!("{}[ Start backup ]", if start_sel { "> " } else { "  " }),
-                    start_style,
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Up/Down field   Left/Right change Format/Checksum   Tab browse (Output)   \
-                     Enter next / Start   Esc back",
-                    self.palette.dim(),
-                ));
-            }
-            BackupStep::Run => {
-                lines.push(Line::from(vec![
-                    Span::styled("Source: ", self.palette.dim()),
-                    Span::raw(b.source_text()),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("Output: ", self.palette.dim()),
-                    Span::raw(format!(
-                        "{}/{}  ({}, {})",
-                        b.out_dir,
-                        b.ctl.name(),
-                        BACKUP_FORMATS[b.format_sel].0,
-                        BACKUP_CHECKSUMS[b.checksum_sel].0
-                    )),
-                ]));
-                lines.push(Line::raw(""));
-                if !b.op.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("Step: ", self.palette.dim()),
-                        Span::raw(b.op.clone()),
-                    ]));
-                }
-                for msg in &b.log {
-                    lines.push(Line::styled(format!("  {msg}"), self.palette.dim()));
-                }
-                if let Some((r, is_error)) = b.result() {
-                    lines.push(Line::raw(""));
-                    let style = if is_error {
-                        self.palette.warn()
-                    } else {
-                        self.palette.accent()
-                    };
-                    lines.push(Line::styled(format!("  {r}"), style));
-                    lines.push(Line::styled(
-                        "  Esc to return to options.",
-                        self.palette.dim(),
-                    ));
-                }
-            }
-        }
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block(title, true))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-
-        // Source picker overlay.
-        if let Some(picker) = &b.picker {
-            picker.draw(frame, area, self.palette, self.border);
-        }
-        // Physical-disk chooser overlay.
-        if b.device_pick {
-            self.draw_backup_device_pick(frame, area, b);
-        }
-    }
-
     /// The Restore screen: source -> config -> run. The progress bar overlay
     /// sits on top during the Run step.
     fn draw_restore(&self, frame: &mut Frame, area: Rect, r: &RestoreState) {
@@ -6340,10 +5772,6 @@ impl App {
     }
 
     /// The physical-disk chooser overlay used by the Backup source step.
-    fn draw_backup_device_pick(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
-        self.draw_device_pick(frame, area, b.device_sel, "Pick a physical disk");
-    }
-
     /// Shared physical-disk chooser overlay (Backup source + Restore target).
     fn draw_device_pick(&self, frame: &mut Frame, area: Rect, device_sel: usize, title: &str) {
         let disks = self.shell.devices();
@@ -6583,23 +6011,7 @@ impl App {
         } else if self.progress.is_some() {
             vec![("Esc", "Cancel")]
         } else if self.current() == TabId::Backup {
-            let step = self.backup.as_ref().map(|b| b.step);
-            match step {
-                Some(BackupStep::Source) => vec![
-                    ("<-/->", "Tabs"),
-                    ("Enter/o", "Image"),
-                    ("d", "Disk"),
-                    ("?", "Help"),
-                ],
-                Some(BackupStep::Config) => vec![
-                    ("Up/Dn", "Field"),
-                    ("<-/->", "Format"),
-                    ("Tab", "Browse"),
-                    ("Enter", "Next/Start"),
-                    ("Esc", "Back"),
-                ],
-                _ => vec![("Esc", "Back")],
-            }
+            self.backup_footer_keys()
         } else if self.current() == TabId::Restore {
             let step = self.restore.as_ref().map(|r| r.step);
             match step {
@@ -6787,6 +6199,9 @@ impl App {
                 Some(Opened::Image { .. }) => ("Inspect - partitions", HINTS_INSPECT_IMAGE),
                 _ => ("Inspect - disks", HINTS_INSPECT_DISKS),
             };
+        }
+        if self.current() == TabId::Backup {
+            return self.backup_key_context();
         }
         ("Tabs", HINTS_TAB)
     }
@@ -7524,12 +6939,49 @@ mod tests {
         assert!(app.handle_backup_key(KeyCode::Char('d')));
         assert!(app.handle_backup_key(KeyCode::Enter));
         let b = app.backup.as_mut().unwrap();
-        assert!(b.step == BackupStep::Config);
+        assert!(b.step == backup::BackupStep::Config);
         assert!(!b.ctl.name().is_empty());
         b.out_dir = out.path().display().to_string();
-        b.field = 4;
+        b.focus = backup::Field::Start;
         assert!(app.handle_backup_key(KeyCode::Enter));
         assert!(app.progress.is_some());
+        let b = run_backup_to_end(&mut app);
+        assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
+        let folder = out.path().join(b.ctl.name());
+        assert!(folder.join("metadata.json").exists());
+    }
+
+    /// Type `text` and press Enter (a picker's path field, or a form row).
+    fn type_line(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_backup_key(KeyCode::Char(c));
+        }
+        app.handle_backup_key(KeyCode::Enter);
+    }
+
+    /// The Backup screen with `img` opened through `o` and its preview read.
+    fn backup_on_image(img: &std::path::Path) -> App {
+        let mut app = App::headless_on(BACKUP_TAB);
+        assert!(app.handle_backup_key(KeyCode::Char('o')));
+        type_line(&mut app, img.display().to_string().as_str());
+        let b = app.backup.as_mut().unwrap();
+        assert!(b.step == backup::BackupStep::Config);
+        b.ctl.wait_idle();
+        app.tick();
+        app
+    }
+
+    fn focus_on(app: &mut App, field: backup::Field) {
+        for _ in 0..40 {
+            if app.backup.as_ref().unwrap().focus == field {
+                return;
+            }
+            app.handle_backup_key(KeyCode::Down);
+        }
+        panic!("no row {field:?} on the form");
+    }
+
+    fn run_backup_to_end(app: &mut App) -> &BackupState {
         for _ in 0..6000 {
             app.tick();
             if app.backup.as_ref().unwrap().result().is_some() {
@@ -7537,10 +6989,232 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        app.backup.as_ref().unwrap()
+    }
+
+    /// The partition grid: Space includes, a / n select all / none, c runs Calc min as a job.
+    #[test]
+    fn the_backup_grid_selects_partitions_and_calcs_min() {
+        use crate::controller::backup::MinCell;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let mut app = backup_on_image(&img);
         let b = app.backup.as_ref().unwrap();
+        assert_eq!(b.ctl.partition_count(), 1);
+        assert_eq!(b.ctl.selected_count(), 1);
+        let index = b.ctl.rows()[0].index;
+        assert_eq!(b.ctl.rows()[0].min, MinCell::CanCalc);
+        assert_eq!(b.fields()[0], backup::Field::Partition(index));
+
+        app.handle_backup_key(KeyCode::Up);
+        assert_eq!(
+            app.backup.as_ref().unwrap().focus,
+            backup::Field::Partition(index)
+        );
+        app.handle_backup_key(KeyCode::Char(' '));
+        assert_eq!(app.backup.as_ref().unwrap().ctl.selected_count(), 0);
+        app.handle_backup_key(KeyCode::Char('a'));
+        assert_eq!(app.backup.as_ref().unwrap().ctl.selected_count(), 1);
+        app.handle_backup_key(KeyCode::Char('n'));
+        assert_eq!(app.backup.as_ref().unwrap().ctl.selected_count(), 0);
+        app.handle_backup_key(KeyCode::Char(' '));
+        assert_eq!(app.backup.as_ref().unwrap().ctl.selected_count(), 1);
+
+        app.handle_backup_key(KeyCode::Char('c'));
+        let b = app.backup.as_mut().unwrap();
+        b.ctl.wait_idle();
+        app.tick();
+        let b = app.backup.as_ref().unwrap();
+        assert!(
+            matches!(b.ctl.rows()[0].min, MinCell::Size(_) | MinCell::Empty),
+            "{:?}",
+            b.ctl.rows()[0].min
+        );
+    }
+
+    /// Split, sector-by-sector and the CHD codec rows reach the controller.
+    #[test]
+    fn the_backup_options_reach_the_controller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let mut app = backup_on_image(&img);
+
+        focus_on(&mut app, backup::Field::SplitMib);
+        for _ in 0..5 {
+            app.handle_backup_key(KeyCode::Backspace);
+        }
+        for c in "750".chars() {
+            app.handle_backup_key(KeyCode::Char(c));
+        }
+        let opts = app.backup.as_ref().unwrap().ctl.options().clone();
+        assert_eq!(opts.split_size(), Some(750));
+        focus_on(&mut app, backup::Field::Split);
+        app.handle_backup_key(KeyCode::Char(' '));
+        assert_eq!(
+            app.backup.as_ref().unwrap().ctl.options().split_size(),
+            None
+        );
+
+        focus_on(&mut app, backup::Field::SectorBySector);
+        app.handle_backup_key(KeyCode::Char(' '));
+        let opts = app.backup.as_ref().unwrap().ctl.options().clone();
+        assert!(opts.sector_by_sector && !opts.resize_effective());
+        // Resize is locked while sector-by-sector is on.
+        focus_on(&mut app, backup::Field::Resize);
+        app.handle_backup_key(KeyCode::Char(' '));
+        assert!(!app.backup.as_ref().unwrap().ctl.options().resize);
+
+        #[cfg(feature = "chd")]
+        {
+            use crate::controller::app::chd::{hunk_presets, ChdOptionsMode, ChdProfile};
+            use crate::controller::backup::CompressionType;
+            focus_on(&mut app, backup::Field::Format);
+            app.handle_backup_key(KeyCode::Right);
+            let b = app.backup.as_ref().unwrap();
+            assert_eq!(b.ctl.options().compression, CompressionType::Chd);
+            assert!(!b.fields().contains(&backup::Field::Split));
+            focus_on(&mut app, backup::Field::ChdMode);
+            app.handle_backup_key(KeyCode::Right);
+            assert_eq!(
+                app.backup.as_ref().unwrap().chd.mode,
+                ChdOptionsMode::Custom
+            );
+            focus_on(&mut app, backup::Field::ChdHunk);
+            let before = app.backup.as_ref().unwrap().chd.custom.hunk_size;
+            app.handle_backup_key(KeyCode::Right);
+            let hunk = app.backup.as_ref().unwrap().chd.custom.hunk_size;
+            assert_ne!(hunk, before);
+            assert!(hunk_presets(ChdProfile::Hd).contains(&hunk));
+            focus_on(&mut app, backup::Field::ChdCodec(0));
+            let codec = app.backup.as_ref().unwrap().chd.custom.codecs[0];
+            app.handle_backup_key(KeyCode::Right);
+            let codec2 = app.backup.as_ref().unwrap().chd.custom.codecs[0];
+            assert_ne!(codec, codec2);
+
+            // A hunk off the unit is refused by the form, as the GUI disables Start.
+            let out = tempfile::tempdir().expect("tempdir");
+            let b = app.backup.as_mut().unwrap();
+            b.out_dir = out.path().display().to_string();
+            b.chd.custom.hunk_size = 1000;
+            b.focus = backup::Field::Format;
+            app.handle_backup_key(KeyCode::Char('s'));
+            assert!(!app.backup.as_ref().unwrap().busy());
+            app.backup.as_mut().unwrap().chd.custom.hunk_size = hunk;
+            app.handle_backup_key(KeyCode::Char('s'));
+            let b = app.backup.as_mut().unwrap();
+            let chd = b
+                .ctl
+                .options()
+                .chd
+                .clone()
+                .expect("the CHD choice went with Start");
+            assert_eq!(chd.hunk_size, hunk);
+            assert_eq!(chd.codecs[0], codec2);
+            app.handle_backup_key(KeyCode::Esc);
+            app.backup.as_mut().unwrap().ctl.wait_finished();
+        }
+    }
+
+    /// The VHD window: per-partition layout, a Custom size typed in MiB, then the backup runs.
+    #[test]
+    fn the_backup_vhd_window_sets_sizes_and_starts() {
+        use crate::controller::backup::{CompressionType, SizeMode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let mut app = backup_on_image(&img);
+        app.backup.as_mut().unwrap().out_dir = out.path().display().to_string();
+        focus_on(&mut app, backup::Field::Format);
+        while app.backup.as_ref().unwrap().ctl.options().compression != CompressionType::Vhd {
+            app.handle_backup_key(KeyCode::Right);
+        }
+        app.handle_backup_key(KeyCode::Char('s'));
+        let b = app.backup.as_ref().unwrap();
+        assert!(b.ctl.vhd_open());
+        assert!(b.ctl.vhd_whole_disk());
+        app.handle_backup_key(KeyCode::Right);
+        assert!(!app.backup.as_ref().unwrap().ctl.vhd_whole_disk());
+        app.handle_backup_key(KeyCode::Down);
+        app.handle_backup_key(KeyCode::Left);
+        let row = app.backup.as_ref().unwrap().ctl.vhd_rows()[0].clone();
+        assert_eq!(row.mode, SizeMode::Custom);
+        assert_eq!(row.custom_mib, row.custom_bounds_mib().0);
+        app.handle_backup_key(KeyCode::Backspace);
+        app.handle_backup_key(KeyCode::Backspace);
+        app.handle_backup_key(KeyCode::Char('9'));
+        assert_eq!(app.backup.as_ref().unwrap().ctl.vhd_rows()[0].custom_mib, 9);
+        app.handle_backup_key(KeyCode::Down);
+        app.handle_backup_key(KeyCode::Enter);
+        assert!(!app.backup.as_ref().unwrap().ctl.vhd_open());
+        assert!(app.progress.is_some());
+        let b = run_backup_to_end(&mut app);
         assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
-        let folder = out.path().join(b.ctl.name());
-        assert!(folder.join("metadata.json").exists());
+        assert!(out.path().join(b.ctl.name()).join("metadata.json").exists());
+    }
+
+    fn backup_screen(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The form scrolls to its focused row in a small terminal; the VHD window draws over it.
+    #[test]
+    fn the_backup_form_and_windows_draw_in_a_small_terminal() {
+        use crate::controller::backup::CompressionType;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let mut app = backup_on_image(&img);
+        let text = backup_screen(&app);
+        assert!(text.contains("Partitions") && text.contains("Output:"), "{text}");
+        focus_on(&mut app, backup::Field::Start);
+        let text = backup_screen(&app);
+        assert!(text.contains("[ Start backup ]"), "{text}");
+        eprintln!("{text}");
+        focus_on(&mut app, backup::Field::Format);
+        while app.backup.as_ref().unwrap().ctl.options().compression != CompressionType::Vhd {
+            app.handle_backup_key(KeyCode::Right);
+        }
+        app.backup.as_mut().unwrap().out_dir = dir.path().display().to_string();
+        app.handle_backup_key(KeyCode::Char('s'));
+        let text = backup_screen(&app);
+        assert!(text.contains("VHD Backup Options") && text.contains("Start VHD backup"), "{text}");
+        eprintln!("{text}");
+        assert_eq!(app.key_context().0, "Backup - VHD options");
+    }
+
+    /// `r` opens the Remote Drive window, or says the build has no remote support.
+    #[test]
+    fn the_backup_remote_drive_opens_or_is_refused() {
+        use crate::controller::backup::{BackupController, REMOTE_NOT_BUILT};
+        let mut app = App::headless_on(BACKUP_TAB);
+        assert!(app.handle_backup_key(KeyCode::Char('r')));
+        let open = app.backup.as_ref().unwrap().ctl.remote_dialog_open();
+        if BackupController::remote_available() {
+            assert!(open);
+            for c in "127.0.0.1".chars() {
+                app.handle_backup_key(KeyCode::Char(c));
+            }
+            assert_eq!(
+                app.backup.as_ref().unwrap().ctl.remote_address(),
+                "127.0.0.1"
+            );
+            app.handle_backup_key(KeyCode::Esc);
+            assert!(!app.backup.as_ref().unwrap().ctl.remote_dialog_open());
+        } else {
+            assert!(!open);
+            let b = app.backup.as_ref().unwrap();
+            assert!(b.log.iter().any(|l| l == REMOTE_NOT_BUILT));
+        }
     }
 
     #[cfg(feature = "optical")]
