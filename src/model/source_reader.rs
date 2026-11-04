@@ -1171,7 +1171,7 @@ fn open_read_dispatch(
         // flat image stream — a Lisa disk becomes DiskCopy 4.2 *with* tags,
         // everything else its block data.
         Ok(Box::new(std::io::Cursor::new(image)))
-    } else if let Some(image) = try_open_ndif_carrier(path).map(BufReader::new) {
+    } else if let Some(image) = try_open_ndif_carrier(path)?.map(BufReader::new) {
         // Self-mounting image / NDIF disk image delivered through a fork carrier
         // (MacBinary `.smi.bin`, AppleDouble sidecar, or a native resource fork):
         // the raw disk lives across both forks — data-fork chunks described by a
@@ -1214,25 +1214,33 @@ fn open_read_dispatch(
 /// files reach us as a MacBinary `.smi.bin`, an AppleDouble `._name` sidecar
 /// pair, or (on macOS) a native resource fork. Returns the flat image only when
 /// a `bcem` resource is present, so a plain `.bin` raw image is never hijacked.
-fn try_open_ndif_carrier(path: &Path) -> Option<File> {
+///
+/// `Ok(None)` means "not an NDIF carrier". Once a `bcem` map is found the file
+/// *is* NDIF, so a rebuild failure (an unsupported chunk codec, a bad chunk)
+/// is returned as an error rather than falling through to the raw-disk probe,
+/// which could only report "Unrecognized media".
+fn try_open_ndif_carrier(path: &Path) -> Result<Option<File>> {
     use dsk_dmg::ndif;
     use fs_mac::resource_fork::{detect_resource_fork, parse_macbinary};
 
     // Cheap gate: peek the 128-byte MacBinary header before reading a whole
     // (possibly multi-GB) file. If it's not MacBinary, fall back to the
     // sidecar/native probe, which only touches small companion files.
-    let head = crate::compat::read_head(path, 128).ok()?;
+    let Ok(head) = crate::compat::read_head(path, 128) else {
+        return Ok(None);
+    };
     // MacBinary forks are capped at 8 MiB, so that carrier is read whole; the image is not.
     if head.len() == 128 && arc_mac::macbinary::is_macbinary(&head).is_some() {
         if let Ok(bytes) = std::fs::read(path) {
             if let Some(rf) = parse_macbinary(&bytes) {
                 if let Some(bcem) = ndif::extract_bcem(&rf.data) {
                     let data = rf.data_fork.unwrap_or_default();
-                    return ndif_to_tempfile(&bcem, &mut |off, len| {
+                    return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                         data.get(off..off + len)
                             .map(<[u8]>::to_vec)
                             .context("NDIF: chunk past the data fork")
-                    });
+                    })
+                    .map(Some);
                 }
             }
         }
@@ -1243,34 +1251,38 @@ fn try_open_ndif_carrier(path: &Path) -> Option<File> {
     if let Some(rf) = detect_resource_fork(path) {
         if let Some(bcem) = ndif::extract_bcem(&rf.data) {
             if let Some(data) = rf.data_fork {
-                return ndif_to_tempfile(&bcem, &mut |off, len| {
+                return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                     data.get(off..off + len)
                         .map(<[u8]>::to_vec)
                         .context("NDIF: chunk past the data fork")
-                });
+                })
+                .map(Some);
             }
-            let mut f = File::open(path).ok()?;
-            return ndif_to_tempfile(&bcem, &mut |off, len| {
+            let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                 let mut buf = vec![0u8; len];
                 f.seek(SeekFrom::Start(off as u64))?;
                 f.read_exact(&mut buf)?;
                 Ok(buf)
-            });
+            })
+            .map(Some);
         }
     }
-    None
+    Ok(None)
 }
 
 /// Rebuild an NDIF image into an anonymous, sparse temp file rather than memory.
 fn ndif_to_tempfile(
+    path: &Path,
     bcem: &[u8],
     read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
-) -> Option<File> {
-    let mut f = tempfile::tempfile().ok()?;
-    let len = dsk_dmg::ndif::reconstruct_to(read, bcem, &mut f).ok()?;
-    f.set_len(len).ok()?;
-    f.seek(SeekFrom::Start(0)).ok()?;
-    Some(f)
+) -> Result<File> {
+    let mut f = tempfile::tempfile().context("create a temp file for the NDIF image")?;
+    let len = dsk_dmg::ndif::reconstruct_to(read, bcem, &mut f)
+        .with_context(|| format!("rebuild Disk Copy 6 (NDIF) image {}", path.display()))?;
+    f.set_len(len)?;
+    f.seek(SeekFrom::Start(0))?;
+    Ok(f)
 }
 
 /// Content-detect a DART image and, if so, decode it into a flat image stream.
@@ -1371,7 +1383,7 @@ pub fn open_peeled_read_with_entry(
     // Self-mounting image / NDIF via a fork carrier (`.smi.bin`, AppleDouble,
     // native resource fork): reconstruct the raw disk from both forks. Gated on
     // a `bcem` resource, so a plain `.bin` raw image is never affected.
-    if let Some(image) = try_open_ndif_carrier(path) {
+    if let Some(image) = try_open_ndif_carrier(path)? {
         return Ok(Box::new(BufReader::new(image)));
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -1647,6 +1659,82 @@ pub fn is_container_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Disk Copy 6 (NDIF) image as a data fork plus an AppleDouble `._`
+    /// sidecar whose resource fork holds a one-chunk `bcem` map of `ty`.
+    fn write_ndif_pair(dir: &Path, name: &str, ty: u8, data: &[u8]) -> std::path::PathBuf {
+        let sectors = (data.len() / 512) as u32;
+        let mut bcem = vec![0u8; 128];
+        bcem[68..72].copy_from_slice(&sectors.to_be_bytes());
+        bcem[124..128].copy_from_slice(&2u32.to_be_bytes());
+        for (sector, t, off, len) in [(0u32, ty, 0u32, data.len() as u32), (sectors, 0xff, 0, 0)] {
+            bcem.extend_from_slice(&((sector << 8) | t as u32).to_be_bytes());
+            bcem.extend_from_slice(&off.to_be_bytes());
+            bcem.extend_from_slice(&len.to_be_bytes());
+        }
+        // Resource fork: header, one data item (length-prefixed bcem), and a
+        // map with a single type `bcem` holding one reference (id 128).
+        let mut item = (bcem.len() as u32).to_be_bytes().to_vec();
+        item.extend_from_slice(&bcem);
+        let mut map = vec![0u8; 28];
+        map[24..26].copy_from_slice(&28u16.to_be_bytes());
+        map.extend_from_slice(&0u16.to_be_bytes()); // one type
+        map.extend_from_slice(b"bcem");
+        map.extend_from_slice(&0u16.to_be_bytes()); // one ref
+        map.extend_from_slice(&10u16.to_be_bytes()); // ref list right after the type list
+        map.extend_from_slice(&128u16.to_be_bytes());
+        map.extend_from_slice(&0xffffu16.to_be_bytes());
+        map.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // attrs + data offset 0, reserved
+        let mut rsrc = Vec::new();
+        for v in [
+            16u32,
+            16 + item.len() as u32,
+            item.len() as u32,
+            map.len() as u32,
+        ] {
+            rsrc.extend_from_slice(&v.to_be_bytes());
+        }
+        rsrc.resize(16, 0);
+        rsrc.extend_from_slice(&item);
+        rsrc.extend_from_slice(&map);
+        // AppleDouble v2 with only entry 2 (resource fork).
+        let mut ad = 0x0005_1607u32.to_be_bytes().to_vec();
+        ad.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        ad.extend_from_slice(&[0u8; 16]);
+        ad.extend_from_slice(&1u16.to_be_bytes());
+        ad.extend_from_slice(&2u32.to_be_bytes());
+        ad.extend_from_slice(&38u32.to_be_bytes());
+        ad.extend_from_slice(&(rsrc.len() as u32).to_be_bytes());
+        ad.extend_from_slice(&rsrc);
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        std::fs::write(dir.join(format!("._{name}")), &ad).unwrap();
+        path
+    }
+
+    #[test]
+    fn ndif_sidecar_pair_rebuilds_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..2048u32).map(|i| (i * 7 % 251) as u8).collect();
+        let path = write_ndif_pair(dir.path(), "Raw.img", 0x02, &data);
+        let mut got = Vec::new();
+        open_read(&path).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// Once a `bcem` map is found the file is NDIF, so a chunk codec rb-cli
+    /// can't decode must surface as that error, not as "Unrecognized media".
+    #[test]
+    fn ndif_rebuild_failure_reports_the_ndif_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ndif_pair(dir.path(), "Shrunk.img", 0xf0, &[0x5a; 2048]);
+        let err = match open_read(&path) {
+            Ok(_) => panic!("a StuffIt-compressed chunk should not open"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("Disk Copy 6 (NDIF)"), "{err}");
+        assert!(err.contains("StuffIt compression"), "{err}");
+    }
 
     #[test]
     fn arculator_hdf_opens_as_a_window_past_its_header() {
