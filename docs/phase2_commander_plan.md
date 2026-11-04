@@ -1431,6 +1431,58 @@ Found while checking slice 18 in the GUI (2026-11-02).
   joined text. `model::commander_descend::OPTICAL_FS_NAMES` is the one name table for the
   label builder and the splitter.
 
+## Slice 19: one extractor, in a crate
+
+User decision (2026-11-02): one extractor, living in a crate. The survey found six walkers
+that copy a filesystem tree out to host files:
+
+| Walker | Used by | Differs in |
+|---|---|---|
+| `model::extract` | Commander / Inspect Extract (`HostCopyJob::Extract`) | forks through `fs_mac::fork_export` (an AppleDouble sidecar for Finder info alone); ProDOS `#TTAAAA` names; QNX 2 RS -> LF; a root folder named `_`; symlinks only on Unix; one bad entry skipped |
+| `DiscChoice::extract_path` (`model::optical_browse`) | a disc behind the pane (`HostCopyJob::DiscExtract`) | its own fork writer: AppleDouble only with a resource fork, Mac dates from opticaldiscs' timestamps; BinHex writes the data fork; a symlink becomes an empty file; any error stops it |
+| `rb-cli optical extract` (`src/cli/verbs/optical.rs`) | the CLI | as the disc walker, plus case-collision modes on a case-insensitive host, POSIX modes, `--path` / `--recursive`, the root's contents straight into `--to`, one bad entry skipped and counted; `--tar` writes a tar instead |
+| `export_selection::folder_recurse` | Export as loose files / BinHex / gzip / zstd per file | the root's contents into the folder, symlinks skipped, any error stops it |
+| `commander_ops::copy_image_entries_to_host` | F6 copy from an image pane to a host pane | an Overwrite / Skip / Fail answer per file, symlinks skipped |
+| `rb-cli get` (`src/cli/verbs/get.rs`) | the CLI | `cp`-shaped: globs, a file to a named target, data forks only, symlinks always as text |
+
+### Plan
+
+1. `crates/fs-extract` (MIT, 0.1.0, beside `fs-tar` under "Filesystem tools" in
+   crate_split_plan.md): `extract` (an entry: a file, a folder, or a whole volume) and
+   `extract_contents` (a folder's children) over any `disk_core::filesystem::Filesystem`,
+   writing forks through `fs_mac::fork_export` (no encoder of its own). `Options` holds the
+   fork mode, whether Finder info alone earns an AppleDouble sidecar, symlinks (create, or
+   skip), errors (skip the entry, or stop), existing files (overwrite, skip, fail), the CLI's
+   case-collision modes, POSIX modes, recursion and whether a volume root becomes a folder
+   named after the volume. A `Host` trait carries cancel, progress, the skipped / failed /
+   renamed reports, the host name (ProDOS suffix) and a per-file writer override (QNX 2
+   text, gzip / zstd per file). `count` and `existing_outputs` (the up-front conflict check)
+   move there too. No app types.
+2. `fs-mac` 0.1.1: `fork_export::export_file_with_fork_opts` with `ForkExportOptions {
+   finder_info_sidecar }`; the old function keeps its behaviour.
+3. `OpticalFilesystem::with_extract_metadata()`: entries carry Mac dates (from opticaldiscs'
+   timestamps) and POSIX mode / owner. Only the extractors ask for it, so listings, exports
+   and archives over a disc keep their bytes.
+4. Callers: `model::extract` becomes the app's `Host` over `HostCopyStatus`; a disc source
+   goes through it too (`HostCopyJob::DiscExtract` and `DiscChoice::extract_path` go), with
+   the disc walker's settings (no Finder-info-only sidecar, stop on error);
+   `export_selection`'s folder outputs and `copy_image_entries_to_host` call the crate;
+   `rb-cli optical extract --to` calls it with the CLI's settings. Kept: `--tar` (a tar
+   writer, not an extractor: its GNU headers carry the disc's modes and owners, which no
+   host folder holds) and `rb-cli get` (a `cp`-shaped verb with its own documented
+   contract: data forks only, symlinks as text, glob targets).
+5. The byte changes, and only these (versus the old disc walker, and where they apply
+   versus `model::extract`):
+   - **R1** symlinks are real symlinks on the host; where the host refuses one (Windows
+     without the privilege, any error), a small text file holding the target (`target\n`,
+     as `rb-cli get` writes).
+   - **R2** a whole-volume extract's top folder is the volume name, sanitised for the host
+     (it was `_`); a volume with no name keeps `_`.
+   - **R3** AppleDouble / MacBinary headers carry the file's dates from the source
+     filesystem (the disc walker did; the pane's disc listing did not).
+   - **R4** BinHex mode writes `.hqx` files (the disc walker wrote the data fork).
+   The identity goldens are recaptured only where these rules explain the change.
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
