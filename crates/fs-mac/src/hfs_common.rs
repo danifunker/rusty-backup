@@ -382,13 +382,10 @@ pub fn compare_classic_extents_keys(a: &[u8], b: &[u8]) -> Ordering {
 // B-tree node manipulation
 // ---------------------------------------------------------------------------
 
-/// B-tree node kinds.
-/// Smallest node size a classic HFS or HFS+ B-tree can have (Inside Macintosh:
-/// HFS nodes are always 512 bytes; HFS+ nodes are 512..=32768). A header that
-/// claims less is garbage: the node descriptor alone is 14 bytes and the
-/// header record runs past byte 32, so smaller values would slice out of range.
+/// HFS nodes are 512 and HFS+ 512..=32768; anything smaller would slice past the header record.
 pub const BTREE_MIN_NODE_SIZE: usize = 512;
 
+/// B-tree node kinds.
 pub const BTREE_LEAF_NODE: i8 = -1;
 pub const BTREE_INDEX_NODE: i8 = 0;
 #[allow(dead_code)]

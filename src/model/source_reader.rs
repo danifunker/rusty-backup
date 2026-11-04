@@ -1214,11 +1214,7 @@ fn open_read_dispatch(
 /// files reach us as a MacBinary `.smi.bin`, an AppleDouble `._name` sidecar
 /// pair, or (on macOS) a native resource fork. Returns the flat image only when
 /// a `bcem` resource is present, so a plain `.bin` raw image is never hijacked.
-///
-/// `Ok(None)` means "not an NDIF carrier". Once a `bcem` map is found the file
-/// *is* NDIF, so a rebuild failure (an unsupported chunk codec, a bad chunk)
-/// is returned as an error rather than falling through to the raw-disk probe,
-/// which could only report "Unrecognized media".
+/// `Ok(None)` = not NDIF; past a `bcem` map a rebuild failure errors, not "Unrecognized media".
 fn try_open_ndif_carrier(path: &Path) -> Result<Option<File>> {
     use dsk_dmg::ndif;
     use fs_mac::resource_fork::{detect_resource_fork, parse_macbinary};

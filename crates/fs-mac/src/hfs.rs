@@ -4995,14 +4995,7 @@ mod tests {
         assert!(utf8_to_mac_roman(text).is_err());
     }
 
-    /// H13: the shrink guard compared block counts, so a volume with free
-    /// space at its front and one file at its tail could be cut through.
-    /// H10: classic HFS keeps wall-clock local time, but stamps went out as
-    /// UTC and came back shifted by the zone offset on every read.
-    /// A catalog header claiming a node size smaller than the header record
-    /// (seen in the raw data fork of Disk Copy 6 images, opened without their
-    /// `bcem` map) used to panic slicing `header_node[24..28]`. Every size below
-    /// 512 must now read as "no records" rather than index out of range.
+    /// A node size under 512 (a Disk Copy 6 data fork read without `bcem`) used to panic.
     #[test]
     fn tiny_catalog_node_size_does_not_panic() {
         use disk_core::filesystem::Filesystem;
@@ -5026,6 +5019,10 @@ mod tests {
         }
     }
 
+    /// H13: the shrink guard compared block counts, so a volume with free
+    /// space at its front and one file at its tail could be cut through.
+    /// H10: classic HFS keeps wall-clock local time, but stamps went out as
+    /// UTC and came back shifted by the zone offset on every read.
     #[test]
     fn classic_hfs_stamps_are_local_time_and_round_trip_to_utc() {
         use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
