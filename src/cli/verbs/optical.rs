@@ -1766,9 +1766,9 @@ pub struct ExtractArgs {
     /// Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files.
     ///
     /// The faithful option for archiving: a tar entry carries the POSIX mode,
-    /// uid and gid a Rock Ridge / HFS+ / EFS disc records, and real symlinks,
-    /// none of which survive extraction onto a filesystem that has no concept
-    /// of them. Compression follows the extension.
+    /// uid and gid a Rock Ridge / HFS+ / EFS disc records, and its symlinks,
+    /// which a host without them (Windows without the privilege) can't hold.
+    /// Compression follows the extension.
     #[arg(long = "tar", value_name = "FILE")]
     pub tar: Option<PathBuf>,
 
@@ -1804,6 +1804,13 @@ pub struct ExtractArgs {
     #[arg(long = "on-collision", value_enum)]
     pub on_collision: Option<CliCaseCollisionMode>,
 
+    /// What to do when an entry can't be extracted (a read error, a file the
+    /// destination refuses). `ask` prompts on the terminal: skip it, continue
+    /// with all errors, or stop. Defaults to `ask` when stdin and stderr are
+    /// a terminal, otherwise `stop`. Ignored with `--tar`.
+    #[arg(long = "on-error", value_enum)]
+    pub on_error: Option<CliOnError>,
+
     /// Which filesystem to extract from on a hybrid Mac/PC disc. `auto`
     /// (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS
     /// side; `iso` forces the ISO 9660 tree. See `optical info`.
@@ -1815,6 +1822,28 @@ pub struct ExtractArgs {
     /// list `optical info` prints. Overrides `--filesystem`.
     #[arg(long = "filesystem-index", value_name = "N")]
     pub filesystem_index: Option<usize>,
+}
+
+/// What `optical extract --to` does when an entry fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliOnError {
+    /// Ask on the terminal for each failure: skip, continue with all errors, or stop.
+    Ask,
+    /// Skip every failed entry (each named on stderr, then listed in a summary).
+    Skip,
+    /// Stop at the first failure; what was written stays.
+    Stop,
+}
+
+impl CliOnError {
+    /// `ask` on an interactive terminal (stdin and stderr), otherwise `stop`.
+    fn default_for_terminal() -> Self {
+        use std::io::IsTerminal;
+        match std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            true => CliOnError::Ask,
+            false => CliOnError::Stop,
+        }
+    }
 }
 
 /// How to resolve case-insensitive filename collisions during extraction.
@@ -1879,8 +1908,6 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         .unwrap_or(CaseCollisionMode::Rename);
 
     let mut opts = rb_fsexporter::Options::new(rf_mode.into());
-    // AppleDouble sidecars only for a resource fork, as optical extract always wrote them.
-    opts.finder_info_sidecar = false;
     // Only disambiguate when the destination genuinely can't tell the names apart; on a
     // case-sensitive host everything extracts verbatim.
     opts.case_collision = match dest_is_case_insensitive(&to) {
@@ -1902,7 +1929,10 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     let start = rfs
         .entry_at(start.as_str())
         .map_err(|e| anyhow::anyhow!("{start}: {e}"))?;
-    let mut host = CliExtractHost::default();
+    let mut host = CliExtractHost::new(
+        args.on_error
+            .unwrap_or_else(CliOnError::default_for_terminal),
+    );
     // A named file extracts on its own; a named directory extracts its contents into --to
     // rather than recreating the directory itself, as `cp -r DIR/. DEST` does.
     let result = match start.is_directory() {
@@ -1911,6 +1941,7 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     };
     let count = match result {
         Ok(done) => done.files,
+        Err(_) if host.stopped.is_some() => host.wrote,
         Err(e) => {
             log_stderr(format!("warning: skipping {}: {e:#}", start.path));
             host.errors += 1;
@@ -1926,6 +1957,15 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         summary.push_str(&format!(", {} error(s)", host.errors));
     }
     log_stderr(summary);
+    if !host.failed.is_empty() {
+        log_stderr(format!("skipped {} entry/entries:", host.failed.len()));
+        for f in &host.failed {
+            log_stderr(format!("  {f}"));
+        }
+    }
+    if let Some(at) = host.stopped {
+        anyhow::bail!("extraction stopped at {at}");
+    }
 
     // Only a total failure (nothing extracted, at least one error) is fatal.
     if count == 0 && host.errors > 0 {
@@ -1937,16 +1977,87 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     Ok(())
 }
 
-/// What `optical extract` reports while the extractor runs: skips and errors, on stderr.
-#[derive(Default)]
+/// What `optical extract` reports while the extractor runs: skips and errors, on stderr; a
+/// failed entry is asked about, skipped or stops the run per `--on-error`.
 struct CliExtractHost {
+    on_error: CliOnError,
     skipped: u64,
     errors: u64,
+    wrote: usize,
+    /// Each entry skipped after an error, with the error, for the summary.
+    failed: Vec<String>,
+    /// The entry (and its error) the run stopped at.
+    stopped: Option<String>,
+}
+
+impl CliExtractHost {
+    fn new(on_error: CliOnError) -> Self {
+        CliExtractHost {
+            on_error,
+            skipped: 0,
+            errors: 0,
+            wrote: 0,
+            failed: Vec::new(),
+            stopped: None,
+        }
+    }
+}
+
+/// Ask on stderr what to do about a failed entry; end of input stops.
+fn ask_entry_failed(path: &str, err: &anyhow::Error) -> rb_fsexporter::ErrorChoice {
+    use rb_fsexporter::ErrorChoice;
+    use std::io::{BufRead, Write};
+    eprintln!("Could not extract {path}: {err:#}");
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("[s]kip, [c]ontinue with all errors, s[t]op? ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return ErrorChoice::Stop,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "s" | "skip" => return ErrorChoice::Skip,
+            "c" | "continue" => return ErrorChoice::SkipAll,
+            "t" | "stop" => return ErrorChoice::Stop,
+            _ => {}
+        }
+    }
 }
 
 impl rb_fsexporter::Host for CliExtractHost {
+    fn wrote(
+        &mut self,
+        _entry: &disk_core::entry::FileEntry,
+        _bytes: u64,
+        total: &rb_fsexporter::Summary,
+    ) {
+        self.wrote = total.files;
+    }
+
+    fn on_error(
+        &mut self,
+        entry: &disk_core::entry::FileEntry,
+        err: &anyhow::Error,
+    ) -> Option<rb_fsexporter::ErrorChoice> {
+        use rb_fsexporter::ErrorChoice;
+        let choice = match self.on_error {
+            CliOnError::Skip => ErrorChoice::SkipAll,
+            CliOnError::Stop => ErrorChoice::Stop,
+            CliOnError::Ask => ask_entry_failed(entry.path.as_str(), err),
+        };
+        match choice {
+            ErrorChoice::SkipAll => self.on_error = CliOnError::Skip,
+            ErrorChoice::Stop => self.stopped = Some(format!("{}: {err:#}", entry.path)),
+            ErrorChoice::Skip => {}
+        }
+        Some(choice)
+    }
+
     fn failed(&mut self, entry: &disk_core::entry::FileEntry, err: &anyhow::Error) {
         log_stderr(format!("warning: skipping {}: {err:#}", entry.path));
+        self.failed.push(format!("{}: {err:#}", entry.path));
         self.errors += 1;
     }
 

@@ -1504,6 +1504,7 @@ Usage: extract [OPTIONS] <SOURCE>
 - `--preserve-permissions` — Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the extracted files. Unix hosts only — on Windows the bits have nowhere to go, so use `--tar`, which carries them regardless of host
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
+- `--on-error` — What to do when an entry can't be extracted (a read error, a file the destination refuses). `ask` prompts on the terminal: skip it, continue with all errors, or stop. Defaults to `ask` when stdin and stderr are a terminal, otherwise `stop`. Ignored with `--tar`
 - `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`
 - `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 
