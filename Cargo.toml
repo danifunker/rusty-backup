@@ -240,7 +240,7 @@ webbrowser = { version = "1.0", optional = true }
 #   0.13.0 — `physical` / `open_physical`: reading a disc from the drive as flat
 #            cooked sectors, which is what makes DVD and Blu-ray work at all
 #            (the CD-only MMC ioctls fail on that media with ENOTTY).
-opticaldiscs = { version = "0.16.1", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.16.2", features = ["drives"], optional = true }
 # Back on the upstream crate as of 1.0.0, which absorbed everything the
 # `danifunker/rust-cd-da-reader` fork carried (PR #58): `CdReader::from_file`
 # for a pre-opened elevated handle, and the streaming reader
