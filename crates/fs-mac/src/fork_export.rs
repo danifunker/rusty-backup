@@ -62,6 +62,34 @@ pub fn export_file_with_fork(
     out_name: &str,
     mode: ResourceForkMode,
 ) -> Result<u64> {
+    let opts = ForkExportOptions::default();
+    export_file_with_fork_opts(fs, entry, dest_dir, out_name, mode, opts)
+}
+
+/// Choices [`export_file_with_fork_opts`] adds to [`export_file_with_fork`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkExportOptions {
+    /// AppleDouble mode: write a `._name` sidecar for type / creator codes alone (no fork).
+    pub finder_info_sidecar: bool,
+}
+
+impl Default for ForkExportOptions {
+    fn default() -> Self {
+        ForkExportOptions {
+            finder_info_sidecar: true,
+        }
+    }
+}
+
+/// [`export_file_with_fork`] with its [`ForkExportOptions`] spelled out.
+pub fn export_file_with_fork_opts(
+    fs: &mut dyn Filesystem,
+    entry: &FileEntry,
+    dest_dir: &Path,
+    out_name: &str,
+    mode: ResourceForkMode,
+    opts: ForkExportOptions,
+) -> Result<u64> {
     let safe = out_name;
     let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
     let type_code = entry.type_code.unwrap_or([0; 4]);
@@ -132,7 +160,7 @@ pub fn export_file_with_fork(
     // fork" modes. MacBinary-without-rsrc and DataForkOnly land here as a plain
     // data-fork write with no sidecar.
     let mut extra = 0u64;
-    let has_finfo = type_code != [0; 4] || creator_code != [0; 4];
+    let has_finfo = opts.finder_info_sidecar && (type_code != [0; 4] || creator_code != [0; 4]);
     match mode {
         ResourceForkMode::Native if has_rsrc => {
             let rsrc = read_rsrc(fs)?;

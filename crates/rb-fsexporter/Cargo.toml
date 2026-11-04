@@ -1,0 +1,25 @@
+[package]
+name = "rb-fsexporter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Export files, folders or whole volumes from any disk-core filesystem to a host folder, keeping Mac forks, symlinks and modes"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "export", "resource-fork", "disk-image", "retro"]
+categories = ["filesystem", "emulators"]
+
+[features]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+# The fork writers (AppleDouble, MacBinary, BinHex); fs-mac pulls in the GPL-2.0-only fs-mac-unicode.
+fs-mac = { path = "../fs-mac", version = "0.1.1", default-features = false, features = ["forks"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
