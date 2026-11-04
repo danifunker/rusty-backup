@@ -1310,16 +1310,10 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
     });
 
     // Partition table / HFS. Our own detector handles the zeroed-DDR case.
-    let apm = probe_apm(&args.source);
-    let (partition_table, ddr_present) = match &apm {
-        Some(a) => ("APM".to_string(), a.ddr_present),
-        None => ("none".to_string(), false),
+    let (partition_table, ddr_present, apm_has_hfs) = match probe_apple_map(&args.source) {
+        Some(found) => found,
+        None => ("none".to_string(), false, false),
     };
-    let apm_has_hfs = apm.as_ref().is_some_and(|a| {
-        a.entries
-            .iter()
-            .any(|e| e.partition_type.to_ascii_uppercase().contains("HFS"))
-    });
     let hfs = build_hfs_info(&info, partition_table, ddr_present);
 
     // Assemble the filesystems list from everything detected.
@@ -1484,11 +1478,23 @@ fn optical_data_and_cue_sizes(
     (data_size, cue_size)
 }
 
-fn probe_apm(path: &Path) -> Option<part_tables::apm::Apm> {
+/// An Apple map on a flat image: (scheme name, DDR present, has an HFS partition).
+fn probe_apple_map(path: &Path) -> Option<(String, bool, bool)> {
+    use crate::partition::PartitionTable;
     let f = std::fs::File::open(path).ok()?;
     let mut r = std::io::BufReader::new(f);
-    match crate::partition::PartitionTable::detect(&mut r) {
-        Ok(crate::partition::PartitionTable::Apm(apm)) => Some(apm),
+    match PartitionTable::detect(&mut r) {
+        Ok(PartitionTable::Apm(apm)) => {
+            let hfs = apm
+                .entries
+                .iter()
+                .any(|e| e.partition_type.to_ascii_uppercase().contains("HFS"));
+            Some(("APM".to_string(), apm.ddr_present, hfs))
+        }
+        Ok(PartitionTable::ApmTs(map)) => {
+            let hfs = map.entries.iter().any(|e| e.is_hfs());
+            Some(("APM-TS".to_string(), true, hfs))
+        }
         _ => None,
     }
 }

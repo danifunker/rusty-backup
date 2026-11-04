@@ -1,0 +1,32 @@
+# Tier 2 — GitHub issue #104: The Manhole CD-ROM (Redump, BIN/CUE, 17 tracks).
+#
+# Track 1 holds an `ER` Driver Descriptor Record at block 0 and, at block 1, the
+# pre-1986 Apple SCSI partition map: signature `TS`, then 12-byte entries
+# {start, size, file-system ID} in 512-byte blocks, ended by an all-zero entry.
+# The one entry is `TFS1` (HFS) at block 6, size 0x1ef3a. Before the fix the
+# `PM`-only map parser rejected it and `optical browse` failed with
+# "Unsupported filesystem". The fix is in opticaldiscs 0.16.2 (disc probe) and
+# part-tables 0.1.1 + `PartitionTable::ApmTs` (flat images / hard disks).
+
+[meta]
+tier = 2
+group = "optical.read.issue104"
+description = "Open, identify, walk and extract the issue #104 old-TS-map Mac CD."
+
+[[case]]
+id = "read.optical.hfs.ts-map-manhole"
+description = "An HFS disc behind the pre-1986 Apple TS partition map opens, lists and extracts"
+fixture = "optical.hfs.ts-map-manhole.cd"
+timeout_ms = 300000
+[[case.step]]
+args = ["optical", "info", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Manhole CD-ROM"]
+[[case.step]]
+args = ["optical", "browse", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["the Manhole Installer", "HyperCard", "Read Me"]
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/ex", "--path", "/Read Me", "--resource-forks", "data-only"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/Read Me", sha256 = "81be81be80a006cab66c8a5f48fbeab632c4e7f65ef0d36c18e03bd02322aab0" }]
