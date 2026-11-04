@@ -53,6 +53,7 @@ mod backup;
 mod commander;
 mod explorer;
 mod restore;
+mod writer;
 
 use backup::BackupState;
 use restore::RestoreState;
@@ -6228,9 +6229,9 @@ mod tests {
         panic!("no row {field:?} on the form");
     }
 
-    fn restore_wfocus(app: &mut App, row: restore::WRow) {
+    fn restore_wfocus(app: &mut App, row: writer::WRow) {
         for _ in 0..30 {
-            if app.restore.as_ref().unwrap().wsel == row {
+            if app.restore.as_ref().unwrap().win.sel == row {
                 return;
             }
             app.handle_restore_key(KeyCode::Down);
@@ -6473,7 +6474,8 @@ mod tests {
     #[test]
     fn the_restore_write_image_mode_writes_through_the_writer() {
         use crate::controller::restore::RestoreMode;
-        use restore::{Field, WRow};
+        use restore::Field;
+        use writer::WRow;
         let dir = tempfile::tempdir().expect("tempdir");
         let vol = dir.path().join("vol.img");
         let bytes = crate::controller::test_fixtures::blank_fat(1024 * 1024, Some("T"));

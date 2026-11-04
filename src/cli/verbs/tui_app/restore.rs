@@ -14,18 +14,15 @@ use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
 use super::{
-    centered_rect, expand_tilde, hint, App, FilePicker, KeyHint, PickKind, PickResult, Progress,
-    ProgressShared,
+    expand_tilde, hint, App, FilePicker, KeyHint, PickKind, PickResult, Progress, ProgressShared,
 };
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
-use crate::controller::disk_write::{
-    DiskWriteAction, DiskWriteController, DiskWriteServices, TableKind, WrapAlign,
-    TYPE_BYTE_PRESETS,
-};
+use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::restore::{
     format_size, purpose, AlignmentChoice, HostRequest, JobRegistry, LayoutFit, NewTableType,
     NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
@@ -89,22 +86,6 @@ impl Field {
     }
 }
 
-/// One row of the disk-writer window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum WRow {
-    Device,
-    Image,
-    Region,
-    Synthesize,
-    Table,
-    Align,
-    AlignCustom,
-    TypeByte,
-    Size,
-    SizeMib,
-    Write,
-}
-
 /// Which controller asked a question.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Who {
@@ -163,17 +144,6 @@ pub(super) const HINTS_RESTORE_FORM: &[KeyHint] = &[
     ),
 ];
 
-pub(super) const HINTS_RESTORE_WRITER: &[KeyHint] = &[
-    hint("Up/Down", "Move between rows"),
-    hint("Enter", "Pick a device, set the image file, or write"),
-    hint("Tab", "Browse for the image file"),
-    hint("Left/Right", "Change the region or a table choice"),
-    hint("Space", "Toggle Synthesize, or change a choice"),
-    hint("0-9 a-f", "Type the type byte in hex; digits for sizes"),
-    hint("w", "Write to the target"),
-    hint("Esc", "Close the window"),
-];
-
 pub(super) const HINTS_RESTORE_RUN: &[KeyHint] = &[hint(
     "Esc",
     "Cancel the run; back to the form once it ended",
@@ -197,8 +167,7 @@ pub(super) struct RestoreState {
     /// The controllers' latest log lines.
     pub(super) log: Vec<String>,
     /// The writer window's cursor and its typed image file (set with Enter).
-    pub(super) wsel: WRow,
-    pub(super) w_image: String,
+    pub(super) win: WriterWindow,
     /// The run on screen is a write (else a restore).
     writing: bool,
     /// Esc asked the running restore or write to stop.
@@ -228,8 +197,7 @@ impl RestoreState {
             full_target: String::new(),
             nd_target: String::new(),
             log: Vec::new(),
-            wsel: WRow::Device,
-            w_image: String::new(),
+            win: WriterWindow::default(),
             writing: false,
             cancel_note: false,
             defaulted_for: None,
@@ -309,8 +277,7 @@ impl RestoreState {
                         .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
                 }
                 HostRequest::WriteImage(open) => {
-                    self.wsel = WRow::Device;
-                    self.w_image.clear();
+                    self.win = WriterWindow::default();
                     let fx = self.writer.apply(DiskWriteAction::Open(open));
                     self.absorb(Who::Writer, fx);
                 }
@@ -684,133 +651,6 @@ impl RestoreState {
         self.act(RestoreAction::Start);
     }
 
-    // --- the writer window --------------------------------------------------------------
-
-    fn wrows(&self) -> Vec<WRow> {
-        let w = &self.writer;
-        let mut r = vec![WRow::Device, WRow::Image];
-        if w.target_device().is_some() {
-            r.push(WRow::Region);
-        }
-        if w.can_synthesize() {
-            r.push(WRow::Synthesize);
-            let form = w.form();
-            if form.synthesize {
-                r.extend([WRow::Table, WRow::Align]);
-                if form.alignment == WrapAlign::Custom {
-                    r.push(WRow::AlignCustom);
-                }
-                r.extend([WRow::TypeByte, WRow::Size]);
-                if form.size_mode == SizeMode::Custom {
-                    r.push(WRow::SizeMib);
-                }
-            }
-        }
-        r.push(WRow::Write);
-        r
-    }
-
-    fn wmove(&mut self, delta: isize) {
-        let rows = self.wrows();
-        let n = rows.len() as isize;
-        let at = rows.iter().position(|r| *r == self.wsel).unwrap_or(0);
-        self.wsel = rows[((at as isize + delta).rem_euclid(n)) as usize];
-    }
-
-    fn wchange(&mut self, row: WRow, forward: bool) -> bool {
-        let form = *self.writer.form();
-        let pick = |n: usize, i: usize| {
-            if forward {
-                (i + 1) % n
-            } else {
-                (i + n - 1) % n
-            }
-        };
-        let a = match row {
-            WRow::Region => DiskWriteAction::CycleTargetPartition,
-            WRow::Synthesize => DiskWriteAction::SetSynthesize(!form.synthesize),
-            WRow::Table => DiskWriteAction::SetTableKind(match form.table_kind {
-                TableKind::Mbr => TableKind::Gpt,
-                TableKind::Gpt => TableKind::Mbr,
-            }),
-            WRow::Align => {
-                let all = [
-                    WrapAlign::DosTraditional,
-                    WrapAlign::Modern1MB,
-                    WrapAlign::Custom,
-                ];
-                let i = all.iter().position(|a| *a == form.alignment).unwrap_or(0);
-                DiskWriteAction::SetAlignment(all[pick(all.len(), i)])
-            }
-            WRow::TypeByte => {
-                let n = TYPE_BYTE_PRESETS.len();
-                let i = match TYPE_BYTE_PRESETS
-                    .iter()
-                    .position(|(b, _)| *b == form.type_byte)
-                {
-                    Some(i) => pick(n, i),
-                    None => 0,
-                };
-                DiskWriteAction::SetTypeByte(TYPE_BYTE_PRESETS[i].0)
-            }
-            WRow::Size => {
-                let all = self.writer.size_choices();
-                let i = all.iter().position(|m| *m == form.size_mode).unwrap_or(0);
-                DiskWriteAction::SetSize {
-                    mode: all[pick(all.len(), i)],
-                    custom_mib: form.custom_size_mib,
-                }
-            }
-            _ => return false,
-        };
-        self.wact(a);
-        true
-    }
-
-    /// A digit (or hex digit on the type byte) typed in the writer window.
-    fn wdigit(&mut self, c: Option<char>) -> bool {
-        let form = *self.writer.form();
-        let a = match self.wsel {
-            WRow::TypeByte => {
-                let b = match c.and_then(|c| c.to_digit(16)) {
-                    Some(d) => (form.type_byte << 4) | d as u8,
-                    None if c.is_none() => form.type_byte >> 4,
-                    None => return false,
-                };
-                DiskWriteAction::SetTypeByte(b)
-            }
-            WRow::AlignCustom => {
-                let n = form.custom_alignment_sectors;
-                DiskWriteAction::SetCustomAlignment(match c.and_then(|c| c.to_digit(10)) {
-                    Some(d) => n.saturating_mul(10).saturating_add(d as u64),
-                    None if c.is_none() => n / 10,
-                    None => return false,
-                })
-            }
-            WRow::SizeMib => {
-                let n = form.custom_size_mib;
-                DiskWriteAction::SetSize {
-                    mode: SizeMode::Custom,
-                    custom_mib: match c.and_then(|c| c.to_digit(10)) {
-                        Some(d) => n.saturating_mul(10).saturating_add(d),
-                        None if c.is_none() => n / 10,
-                        None => return false,
-                    },
-                }
-            }
-            _ => return false,
-        };
-        self.wact(a);
-        true
-    }
-
-    fn commit_writer_image(&mut self) {
-        let path = expand_tilde(self.w_image.trim());
-        if !path.as_os_str().is_empty() {
-            self.wact(DiskWriteAction::SetTargetImage(path));
-        }
-    }
-
     /// Press the writer's Write; its question comes back as an `Ask`.
     fn write(&mut self) {
         self.cancel_note = false;
@@ -898,7 +738,7 @@ impl App {
             return ("Restore - run", HINTS_RESTORE_RUN);
         }
         if r.writer.is_open() {
-            return ("Restore - write image", HINTS_RESTORE_WRITER);
+            return ("Restore - write image", HINTS_WRITER);
         }
         ("Restore", HINTS_RESTORE_FORM)
     }
@@ -976,8 +816,10 @@ impl App {
                             }
                         }
                         Pick::WriterImage => {
-                            r.w_image = path.display().to_string();
-                            r.commit_writer_image();
+                            r.win.image = path.display().to_string();
+                            if let Some(a) = r.win.image_target() {
+                                r.wact(a);
+                            }
                         }
                     }
                 }
@@ -1004,7 +846,7 @@ impl App {
                                 r.act(RestoreAction::SelectDevice { slot, row, device })
                             }
                             DeviceFor::Writer => {
-                                r.w_image.clear();
+                                r.win.image.clear();
                                 r.wact(DiskWriteAction::SelectDevice { row, device });
                             }
                         }
@@ -1043,48 +885,22 @@ impl App {
 
     fn restore_writer_key(&mut self, code: KeyCode) {
         let r = self.restore.as_mut().unwrap();
-        let row = r.wsel;
-        match code {
-            KeyCode::Esc => r.wact(DiskWriteAction::Close),
-            KeyCode::Down => r.wmove(1),
-            KeyCode::Up | KeyCode::BackTab => r.wmove(-1),
-            KeyCode::Tab if row == WRow::Image => {
+        match r.win.key(&r.writer, code) {
+            WriterKey::Done => {}
+            WriterKey::Act(a) => r.wact(a),
+            WriterKey::PickDevice => {
+                r.device_sel = r.writer.target_row().unwrap_or(0);
+                r.device_pick = Some(DeviceFor::Writer);
+            }
+            WriterKey::BrowseImage => {
                 let mut p = FilePicker::new(PickKind::Save, "Write the image to this file");
-                p.input = r.w_image.clone();
+                p.input = r.win.image.clone();
                 r.picker = Some((Pick::WriterImage, p));
             }
-            KeyCode::Enter => match row {
-                WRow::Device => {
-                    r.device_sel = r.writer.target_row().unwrap_or(0);
-                    r.device_pick = Some(DeviceFor::Writer);
-                }
-                WRow::Image => r.commit_writer_image(),
-                WRow::Write => r.write(),
-                _ => r.wmove(1),
-            },
-            KeyCode::Char(' ') if row != WRow::Image => {
-                r.wchange(row, true);
-            }
-            KeyCode::Left | KeyCode::Right => {
-                r.wchange(row, code == KeyCode::Right);
-            }
-            KeyCode::Backspace if row == WRow::Image => {
-                r.w_image.pop();
-            }
-            KeyCode::Backspace => {
-                r.wdigit(None);
-            }
-            KeyCode::Char(c) if row == WRow::Image && !c.is_control() => r.w_image.push(c),
-            KeyCode::Char('w') => r.write(),
-            KeyCode::Char(c) => {
-                r.wdigit(Some(c));
-            }
-            _ => {}
+            WriterKey::Write => r.write(),
+            WriterKey::Close => r.wact(DiskWriteAction::Close),
         }
-        let rows = r.wrows();
-        if !rows.contains(&r.wsel) {
-            r.wsel = WRow::Device;
-        }
+        r.win.settle(&r.writer);
     }
 
     fn restore_form_key(&mut self, code: KeyCode) -> bool {
@@ -1260,7 +1076,7 @@ impl App {
         frame.render_widget(para, area);
 
         if r.step == RestoreStep::Form && r.writer.is_open() {
-            self.draw_restore_writer(frame, area, r);
+            self.draw_writer(frame, area, "Write Image File", &r.writer, &r.win);
         }
         if let Some((_, picker)) = &r.picker {
             picker.draw(frame, area, self.palette, self.border);
@@ -1875,184 +1691,6 @@ impl App {
             lines.push(Line::styled(format!("  {res}"), style));
             lines.push(Line::styled("  Esc to return to the form.", pal.dim()));
         }
-    }
-
-    fn draw_restore_writer(&self, frame: &mut Frame, area: Rect, r: &RestoreState) {
-        let pal = self.palette;
-        let w = &r.writer;
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        if let Some(snap) = w.opening() {
-            lines.push(Line::styled(format!("  {}", snap.label), pal.dim()));
-        }
-        if let Some(src) = w.source() {
-            lines.push(Line::styled(
-                format!("  Source: {}", src.path.display()),
-                pal.dim(),
-            ));
-            lines.push(Line::styled(
-                format!(
-                    "  Size: {}  -  {}  -  {}",
-                    format_size(src.size_bytes),
-                    src.fs_hint,
-                    if src.has_partition_table {
-                        "has partition table"
-                    } else {
-                        "superfloppy (no partition table)"
-                    }
-                ),
-                pal.dim(),
-            ));
-        }
-        lines.push(Line::raw(""));
-        let style_for = |sel: bool| {
-            if sel {
-                pal.accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                pal.accent()
-            }
-        };
-        let form = *w.form();
-        let mut focus_line = 0usize;
-        for row in r.wrows() {
-            let sel = r.wsel == row;
-            if sel {
-                focus_line = lines.len();
-            }
-            let m = if sel { "> " } else { "  " };
-            let text = match row {
-                WRow::Device => format!(
-                    "Target disk: {}",
-                    w.target_device()
-                        .map(|d| format!("{} ({})", d.display_name(), format_size(d.size_bytes)))
-                        .unwrap_or_else(|| "(Enter picks a device)".into())
-                ),
-                WRow::Image => format!(
-                    "Or file:     {}{}{}",
-                    r.w_image,
-                    if sel { "_" } else { "" },
-                    match w.target_image() {
-                        Some(p) => format!("   [target: {}]", p.display()),
-                        None if r.w_image.is_empty() && !sel => {
-                            "(type a path, Enter sets it; Tab browses)".into()
-                        }
-                        None => String::new(),
-                    }
-                ),
-                WRow::Region => {
-                    if w.target_scan().is_some() {
-                        "Write to:    (reading the target's partition table...)".into()
-                    } else {
-                        let parts = w.target_partitions();
-                        let size = w.target_device().map_or(0, |d| d.size_bytes);
-                        let region = match w
-                            .target_partition()
-                            .and_then(|i| parts.iter().find(|p| p.index == i))
-                        {
-                            Some(p) => p.label.clone(),
-                            None => format!(
-                                "Entire disk ({}) - replaces the partition table",
-                                format_size(size)
-                            ),
-                        };
-                        format!("Write to:    < {region} >")
-                    }
-                }
-                WRow::Synthesize => format!(
-                    "{} Synthesize partition table",
-                    if form.synthesize { "[x]" } else { "[ ]" }
-                ),
-                WRow::Table => format!(
-                    "  Table:     < {} >",
-                    match form.table_kind {
-                        TableKind::Mbr => "MBR",
-                        TableKind::Gpt => "GPT",
-                    }
-                ),
-                WRow::Align => format!(
-                    "  Alignment: < {} >",
-                    match form.alignment {
-                        WrapAlign::DosTraditional => "DOS legacy (LBA 63)",
-                        WrapAlign::Modern1MB => "Modern (LBA 2048)",
-                        WrapAlign::Custom => "Custom",
-                    }
-                ),
-                WRow::AlignCustom => {
-                    format!("  Sectors:   {}", form.custom_alignment_sectors)
-                }
-                WRow::TypeByte => format!(
-                    "  Type:      < {} >  (0-9 a-f types a byte)",
-                    TYPE_BYTE_PRESETS
-                        .iter()
-                        .find(|(b, _)| *b == form.type_byte)
-                        .map(|(_, n)| (*n).to_string())
-                        .unwrap_or_else(|| format!("0x{:02X} (custom)", form.type_byte))
-                ),
-                WRow::Size => format!(
-                    "  Size:      < {} >",
-                    match form.size_mode {
-                        SizeMode::Custom => "Custom",
-                        SizeMode::FillRemaining => "Fill the disk",
-                        _ => "Original",
-                    }
-                ),
-                WRow::SizeMib => {
-                    let (lo, hi) = w.custom_bounds_mib();
-                    format!("  MiB:       {}  ({lo}-{hi})", form.custom_size_mib)
-                }
-                WRow::Write => {
-                    lines.push(Line::raw(""));
-                    if sel {
-                        focus_line = lines.len();
-                    }
-                    let hint = if w.target_partition().is_some() {
-                        "replaces the selected partition"
-                    } else {
-                        "erases all data on the target"
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{m}[ Write to disk... ]"), style_for(sel)),
-                        Span::styled(format!("  {hint}"), pal.dim()),
-                    ]));
-                    continue;
-                }
-            };
-            lines.push(Line::styled(format!("{m}{text}"), style_for(sel)));
-            if row == WRow::Region {
-                if let Some(warning) = w.partition_warning() {
-                    lines.push(Line::styled(format!("    {warning}"), pal.warn()));
-                }
-            }
-        }
-        if !w.can_synthesize() && w.source().is_some() {
-            lines.push(Line::styled(
-                "  Synthesize partition table: the source already has one.",
-                pal.dim(),
-            ));
-        }
-        if let Some(err) = w.error() {
-            lines.push(Line::styled(format!("  {err}"), pal.warn()));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Up/Down row  Left/Right change  Enter act  w write  Esc close",
-            pal.dim(),
-        ));
-        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
-        let inner = h.saturating_sub(2) as usize;
-        let scroll = if inner > 2 && focus_line + 2 > inner {
-            (focus_line + 2 - inner) as u16
-        } else {
-            0
-        };
-        let popup = centered_rect(90.min(area.width), h, area);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block("Write Image File", true))
-                .scroll((scroll, 0)),
-            popup,
-        );
     }
 
     fn draw_restore_ask(&self, frame: &mut Frame, area: Rect, ask: &Ask) {
