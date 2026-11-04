@@ -52,8 +52,10 @@ use crate::controller::app::{DiskDevice, RecentMode};
 mod backup;
 mod commander;
 mod explorer;
+mod restore;
 
 use backup::BackupState;
+use restore::RestoreState;
 
 /// Shared state for a running progress task: a worker thread advances
 /// `current` toward `total`; the UI thread reads it each frame.
@@ -1129,200 +1131,6 @@ impl NewWizard {
     }
 }
 
-/// The Restore screen: source (backup folder / `.cbk`) -> config (target /
-/// sizing / alignment) -> run, over a headless `controller::restore::RestoreController`,
-/// the controller behind the GUI's Restore tab. An image source is poured by a headless
-/// `controller::disk_write::DiskWriteController`, the GUI's Physical Disk Export window.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RestoreStep {
-    Source,
-    Config,
-    Run,
-}
-
-/// Partition-sizing policy applied to every partition; index 1 is the controller's Minimum.
-const RESTORE_SIZE_LABELS: &[&str] = &["Original", "Minimum"];
-/// Restore alignment choices; index must match `start_restore`.
-const RESTORE_ALIGN_LABELS: &[&str] = &["Original", "Modern 1MB"];
-/// Config-form rows: 0 target, 1 size, 2 alignment, 3 "Start".
-const RESTORE_FIELDS: usize = 4;
-
-struct RestoreState {
-    step: RestoreStep,
-    /// The app's recent-files store; a successful open is recorded through it.
-    recent: crate::controller::app::RecentHandle,
-    ctl: crate::controller::restore::RestoreController,
-    /// The backup folder or `.cbk` (or, for an image source, the image) as picked.
-    backup_folder: String,
-    /// Original disk size from the backup metadata (default target size).
-    source_size: u64,
-    part_count: usize,
-    loaded: bool,
-    /// The controller is loading the picked backup.
-    loading: bool,
-    /// The controller runs the restore this screen started.
-    restoring: bool,
-    /// Shared picker; `picker_target` says whether a confirm sets the target.
-    picker: Option<FilePicker>,
-    picker_target: bool,
-    /// Config form.
-    target: String,
-    size_sel: usize,
-    align_sel: usize,
-    field: usize,
-    op: String,
-    result: Option<String>,
-    is_error: bool,
-    /// The "Target type" chooser (Image file / Physical device) opened with Tab
-    /// on the target field; its selected index when open.
-    target_type_menu: Option<usize>,
-    /// Physical-device target chooser (modal) + its selection.
-    device_pick: bool,
-    device_sel: usize,
-    /// True when `target` names a physical disk (restore writes to the raw
-    /// device, `RestoreConfig::target_is_device`) rather than an image file.
-    target_is_device: bool,
-    /// The device path + label pending a destructive-write confirmation.
-    confirm_device: Option<(String, String)>,
-    /// Source kind: `false` restores a backup folder, `true` pours a plain
-    /// image file onto the target (any format the engine can read).
-    source_is_image: bool,
-    /// Decoded length of the chosen image; a container's file size is not it.
-    image_size: u64,
-    /// Pours an image source: the target, its partitions and the write.
-    writer: crate::controller::disk_write::DiskWriteController,
-    /// The writer runs the write this screen started.
-    writing: bool,
-}
-
-impl RestoreState {
-    fn new(recent: crate::controller::app::RecentHandle) -> Self {
-        use crate::controller::restore::{
-            JobRegistry, NoNotify, RestoreController, RestoreServices,
-        };
-        RestoreState {
-            step: RestoreStep::Source,
-            recent,
-            ctl: RestoreController::new(RestoreServices {
-                jobs: JobRegistry::new(),
-                notify: Arc::new(NoNotify),
-            }),
-            backup_folder: String::new(),
-            source_size: 0,
-            part_count: 0,
-            loaded: false,
-            loading: false,
-            restoring: false,
-            picker: None,
-            picker_target: false,
-            target: String::new(),
-            size_sel: 0,
-            align_sel: 0,
-            field: 0,
-            op: String::new(),
-            result: None,
-            is_error: false,
-            target_type_menu: None,
-            device_pick: false,
-            device_sel: 0,
-            target_is_device: false,
-            confirm_device: None,
-            source_is_image: false,
-            image_size: 0,
-            writer: crate::controller::disk_write::DiskWriteController::new(
-                crate::controller::disk_write::DiskWriteServices {
-                    jobs: crate::controller::disk_write::JobRegistry::new(),
-                    notify: Arc::new(crate::controller::disk_write::NoNotify),
-                },
-            ),
-            writing: false,
-        }
-    }
-}
-
-impl RestoreState {
-    fn act(&mut self, action: crate::controller::restore::RestoreAction) {
-        use crate::controller::Controller as _;
-        // The TUI answers the controller's confirmation with its own device prompt.
-        let _ = self.ctl.apply(action);
-        self.after();
-    }
-
-    /// Carry out the controller's requests and follow its load and run.
-    fn after(&mut self) {
-        use crate::controller::restore::HostRequest;
-        for req in self.ctl.take_requests() {
-            match req {
-                HostRequest::RememberRecent(path) => {
-                    self.recent
-                        .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
-                }
-                // The TUI pours an image itself; it never asks for the GUI's writer.
-                HostRequest::WriteImage(_) => {}
-            }
-        }
-        let _ = self.ctl.take_log();
-        if self.loading && self.ctl.loading().is_none() {
-            self.loading = false;
-            self.loaded_backup();
-        }
-        if let Some(bar) = self.ctl.progress() {
-            self.op = bar.operation;
-        }
-        if self.restoring && !self.ctl.is_running() {
-            self.restoring = false;
-            match self.ctl.last_result() {
-                Some(Ok(())) => {
-                    self.result = Some("Restore complete.".to_string());
-                    self.is_error = false;
-                }
-                Some(Err(e)) => {
-                    self.result = Some(e.clone());
-                    self.is_error = true;
-                }
-                None => {}
-            }
-        }
-    }
-
-    /// The load ended: on to the options, or the reason on the source step.
-    fn loaded_backup(&mut self) {
-        if !self.ctl.has_backup() {
-            self.result = Some(
-                self.ctl
-                    .load_error()
-                    .unwrap_or("Not a backup folder.")
-                    .to_string(),
-            );
-            self.is_error = true;
-            return;
-        }
-        let folder = std::path::PathBuf::from(self.backup_folder.as_str());
-        let default_target = folder
-            .parent()
-            .map(|par| {
-                let stem = folder
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "restore".to_string());
-                par.join(format!("{stem}_restored.img"))
-                    .display()
-                    .to_string()
-            })
-            .unwrap_or_default();
-        self.source_size = self.ctl.source_size().unwrap_or(0);
-        self.part_count = self.ctl.size_rows().len();
-        self.loaded = true;
-        if self.target.is_empty() {
-            self.target = default_target;
-        }
-        self.step = RestoreStep::Config;
-        self.field = 0;
-        self.result = None;
-        self.is_error = false;
-    }
-}
-
 /// The Bulk convert screen: pick a source folder, choose a format, review /
 /// un-check the scanned files, then convert them all via `bulk_convert_runner`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2381,11 +2189,7 @@ impl App {
                 b.act(BackupAction::CancelPendingStart);
             }
         }
-        if let Some(r) = self.restore.as_mut() {
-            if r.ctl.restore_running() {
-                r.act(crate::controller::restore::RestoreAction::Cancel);
-            }
-        }
+        self.restore_cancel();
         if let Some(b) = self.bulk.as_mut() {
             if b.ctl.is_running() {
                 b.act(crate::controller::bulk_convert::BulkConvertAction::Cancel);
@@ -2986,590 +2790,6 @@ impl App {
                     }
                 }
             }) as TaskDone)
-        });
-    }
-
-    /// Restore screen keys. Returns `true` when consumed.
-    fn handle_restore_key(&mut self, code: KeyCode) -> bool {
-        if self.restore.is_none() {
-            self.restore = Some(RestoreState::new(self.shell.recent_handle()));
-        }
-        // Source / target picker (modal).
-        if self
-            .restore
-            .as_ref()
-            .map(|r| r.picker.is_some())
-            .unwrap_or(false)
-        {
-            let for_target = self.restore.as_ref().unwrap().picker_target;
-            let res = self
-                .restore
-                .as_mut()
-                .unwrap()
-                .picker
-                .as_mut()
-                .unwrap()
-                .handle_key(code);
-            match res {
-                Some(PickResult::Cancel) => self.restore.as_mut().unwrap().picker = None,
-                Some(PickResult::Confirm(path)) => {
-                    if for_target {
-                        let r = self.restore.as_mut().unwrap();
-                        r.target = path.to_string_lossy().into_owned();
-                        r.picker = None;
-                    } else {
-                        self.restore.as_mut().unwrap().picker = None;
-                        self.load_restore_source(path);
-                    }
-                }
-                None => {}
-            }
-            return true;
-        }
-
-        // "Target type" chooser (modal): Image file vs Physical device.
-        if self
-            .restore
-            .as_ref()
-            .map(|r| r.target_type_menu.is_some())
-            .unwrap_or(false)
-        {
-            let sel = self
-                .restore
-                .as_ref()
-                .and_then(|r| r.target_type_menu)
-                .unwrap_or(0);
-            match code {
-                KeyCode::Esc => self.restore.as_mut().unwrap().target_type_menu = None,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.restore.as_mut().unwrap().target_type_menu = Some(sel.saturating_sub(1));
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.restore.as_mut().unwrap().target_type_menu = Some((sel + 1).min(1));
-                }
-                KeyCode::Enter => {
-                    let r = self.restore.as_mut().unwrap();
-                    r.target_type_menu = None;
-                    if sel == 0 {
-                        // Image file: open the shared path picker.
-                        let mut p = FilePicker::new(PickKind::Any, "Choose target image path");
-                        p.input = if r.target_is_device {
-                            String::new()
-                        } else {
-                            r.target.clone()
-                        };
-                        r.picker = Some(p);
-                        r.picker_target = true;
-                        r.target_is_device = false;
-                    } else {
-                        // Physical device: open the device chooser.
-                        r.device_pick = true;
-                        r.device_sel = 0;
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Physical-device target chooser (modal).
-        if self
-            .restore
-            .as_ref()
-            .map(|r| r.device_pick)
-            .unwrap_or(false)
-        {
-            let ndisks = self.shell.devices().len();
-            let r = self.restore.as_mut().unwrap();
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => r.device_sel = r.device_sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    r.device_sel = (r.device_sel + 1).min(ndisks.saturating_sub(1))
-                }
-                KeyCode::Esc => r.device_pick = false,
-                KeyCode::Enter => {
-                    let sel = r.device_sel;
-                    let dev = self
-                        .shell
-                        .devices()
-                        .get(sel)
-                        .map(|d| d.path.display().to_string());
-                    if let Some(path) = dev {
-                        let r = self.restore.as_mut().unwrap();
-                        r.device_pick = false;
-                        r.target = path;
-                        r.target_is_device = true;
-                        // The writer reads the target's partitions, so an image can go into one.
-                        self.select_write_device();
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Destructive device-write confirmation (modal): only `y` proceeds.
-        if self
-            .restore
-            .as_ref()
-            .map(|r| r.confirm_device.is_some())
-            .unwrap_or(false)
-        {
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(r) = self.restore.as_mut() {
-                        r.confirm_device = None;
-                    }
-                    self.start_restore_confirmed();
-                }
-                _ => {
-                    if let Some(r) = self.restore.as_mut() {
-                        r.confirm_device = None;
-                    }
-                }
-            }
-            return true;
-        }
-
-        let step = self.restore.as_ref().unwrap().step;
-        // Start handled outside the borrow. A device target routes through a
-        // destructive-write confirmation first; an image target starts directly.
-        if step == RestoreStep::Config
-            && code == KeyCode::Enter
-            && self.restore.as_ref().map(|r| r.field).unwrap_or(0) == 3
-        {
-            self.request_restore_start();
-            return true;
-        }
-
-        let r = self.restore.as_mut().unwrap();
-        match step {
-            RestoreStep::Source => match code {
-                KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = r.recent.list(RecentMode::Restore);
-                    let prompt = if r.source_is_image {
-                        "Choose a disk image to write"
-                    } else {
-                        "Choose backup folder or .cbk"
-                    };
-                    r.picker = Some(FilePicker::new(PickKind::Any, prompt).with_recent(recent));
-                    r.picker_target = false;
-                    true
-                }
-                // Same toggle key the rest of the wizard uses for a choice.
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
-                    r.source_is_image = !r.source_is_image;
-                    r.loaded = false;
-                    r.result = None;
-                    true
-                }
-                _ => false,
-            },
-            RestoreStep::Config => match code {
-                KeyCode::Esc => {
-                    r.step = RestoreStep::Source;
-                    true
-                }
-                KeyCode::Down => {
-                    r.field = (r.field + 1) % RESTORE_FIELDS;
-                    true
-                }
-                KeyCode::Up | KeyCode::BackTab => {
-                    r.field = (r.field + RESTORE_FIELDS - 1) % RESTORE_FIELDS;
-                    true
-                }
-                // Image mode reuses this row for the target region, since size
-                // mode means nothing when pouring a fixed image.
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                    if r.field == 1 && r.source_is_image =>
-                {
-                    use crate::controller::Controller as _;
-                    r.writer.apply(
-                        crate::controller::disk_write::DiskWriteAction::CycleTargetPartition,
-                    );
-                    true
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 1 => {
-                    let n = RESTORE_SIZE_LABELS.len();
-                    r.size_sel = if code == KeyCode::Left {
-                        (r.size_sel + n - 1) % n
-                    } else {
-                        (r.size_sel + 1) % n
-                    };
-                    true
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 2 => {
-                    let n = RESTORE_ALIGN_LABELS.len();
-                    r.align_sel = if code == KeyCode::Left {
-                        (r.align_sel + n - 1) % n
-                    } else {
-                        (r.align_sel + 1) % n
-                    };
-                    true
-                }
-                // Tab on the target field opens the "Target type" chooser
-                // (Image file vs Physical device), so the destructive device
-                // path is an explicit, discoverable choice — not a keystroke
-                // that collides with typing a path.
-                KeyCode::Tab if r.field == 0 => {
-                    r.target_type_menu = Some(0);
-                    true
-                }
-                KeyCode::Enter => {
-                    r.field = (r.field + 1) % RESTORE_FIELDS;
-                    true
-                }
-                KeyCode::Backspace if r.field == 0 => {
-                    r.target.pop();
-                    r.target_is_device = false;
-                    true
-                }
-                KeyCode::Char(c) if !c.is_control() && r.field == 0 => {
-                    r.target.push(c);
-                    r.target_is_device = false;
-                    true
-                }
-                _ => false,
-            },
-            RestoreStep::Run => match code {
-                KeyCode::Esc => {
-                    let running = r.result.is_none();
-                    if running {
-                        self.cancel_progress();
-                        if let Some(r) = self.restore.as_mut() {
-                            r.result = Some("Cancel requested...".to_string());
-                            r.is_error = true;
-                        }
-                    } else {
-                        self.progress = None;
-                        if let Some(r) = self.restore.as_mut() {
-                            r.result = None;
-                            r.step = RestoreStep::Config;
-                        }
-                    }
-                    true
-                }
-                _ => true,
-            },
-        }
-    }
-
-    /// Load a chosen backup source (native folder or `.cbk`), read its metadata
-    /// for defaults, and advance to the config form. Errors show on the source
-    /// screen.
-    /// Hand the device named in the target field to the writer, which reads its partitions.
-    fn select_write_device(&mut self) {
-        use crate::controller::disk_write::DiskWriteAction;
-        use crate::controller::Controller as _;
-        let Some(r) = self.restore.as_mut() else {
-            return;
-        };
-        let target = std::path::PathBuf::from(r.target.trim());
-        let picked = self
-            .shell
-            .devices()
-            .iter()
-            .enumerate()
-            .find(|(_, dev)| dev.path == target)
-            .map(|(row, dev)| (row, dev.clone()));
-        if let Some((row, device)) = picked {
-            r.writer
-                .apply(DiskWriteAction::SelectDevice { row, device });
-            r.writer.wait_idle();
-        }
-    }
-
-    /// Pour the chosen image onto the target, whole-disk or into one partition.
-    fn start_image_write(&mut self, target: std::path::PathBuf, is_device: bool) {
-        use crate::controller::disk_write::{DiskWriteAction, DiskWriteController};
-        use crate::controller::{Controller as _, Effect};
-        let same_device = self
-            .restore
-            .as_ref()
-            .and_then(|r| r.writer.target_device())
-            .is_some_and(|d| d.path == target);
-        if is_device && !same_device {
-            self.select_write_device();
-        }
-        let Some(r) = self.restore.as_mut() else {
-            return;
-        };
-        if !is_device {
-            r.writer.apply(DiskWriteAction::SetTargetImage(target));
-        }
-        // The device was confirmed by this screen's own prompt, so the writer's question is answered here.
-        fn answer(w: &mut DiskWriteController, fx: Vec<Effect>) {
-            for e in fx {
-                let reply = match e {
-                    Effect::AskText(spec) => DiskWriteAction::Answered {
-                        purpose: spec.purpose,
-                        text: spec.taken.first().cloned(),
-                    },
-                    Effect::Confirm(spec) => DiskWriteAction::Confirmed {
-                        purpose: spec.purpose,
-                        yes: true,
-                    },
-                    Effect::PickFile(_)
-                    | Effect::PickFolder(_)
-                    | Effect::AskPassword(_)
-                    | Effect::Choose(_)
-                    | Effect::Message(_)
-                    | Effect::OpenUrl(_)
-                    | Effect::CopyToClipboard(_)
-                    | Effect::CloseScreen
-                    | Effect::Quit => continue,
-                };
-                w.apply(reply);
-            }
-        }
-        if !r.writer.can_write() {
-            r.result = Some("Choose a target.".to_string());
-            r.is_error = true;
-            r.step = RestoreStep::Run;
-            return;
-        }
-        let fx = r.writer.apply(DiskWriteAction::Write);
-        answer(&mut r.writer, fx);
-        r.step = RestoreStep::Run;
-        if !r.writer.is_writing() {
-            r.result = Some(
-                r.writer
-                    .error()
-                    .unwrap_or("The image write did not start.")
-                    .to_string(),
-            );
-            r.is_error = true;
-            return;
-        }
-        r.writing = true;
-        r.op = "Writing image...".to_string();
-        r.result = None;
-        r.is_error = false;
-    }
-
-    /// Follow the writer's job into the shared result/op fields the Run step already renders.
-    fn poll_image_write(&mut self) {
-        use crate::controller::Controller as _;
-        let Some(r) = self.restore.as_mut() else {
-            return;
-        };
-        let _ = r.writer.tick();
-        let _ = r.writer.take_log();
-        if !r.writing {
-            return;
-        }
-        if r.writer.is_writing() {
-            if let Some(snap) = r.writer.progress() {
-                if let crate::controller::disk_write::Progress::Determinate {
-                    done, total, ..
-                } = snap.progress
-                {
-                    if total > 0 {
-                        r.op = format!(
-                            "Writing image: {} / {}",
-                            format_size(done),
-                            format_size(total),
-                        );
-                    }
-                }
-            }
-            return;
-        }
-        r.writing = false;
-        r.op = String::new();
-        match r.writer.result() {
-            Some(Ok(n)) => {
-                r.result = Some(format!("Wrote {} to the target.", format_size(*n)));
-                r.is_error = false;
-            }
-            Some(Err(e)) => {
-                r.result = Some(format!("Image write failed: {e}"));
-                r.is_error = true;
-            }
-            None => {}
-        }
-    }
-
-    fn load_restore_source(&mut self, path: std::path::PathBuf) {
-        use crate::controller::restore::RestoreAction;
-        let Some(r) = self.restore.as_mut() else {
-            return;
-        };
-        // Image-write source: no metadata to read, just the decoded length.
-        if r.source_is_image {
-            r.act(RestoreAction::OpenWriteImage(path.clone()));
-            r.ctl.wait_idle();
-            r.after();
-            match r.ctl.write_image().map(|(_, n)| n).filter(|&n| n > 0) {
-                Some(n) => {
-                    r.recent
-                        .remember(RecentMode::Restore, path.to_string_lossy().as_ref());
-                    r.backup_folder = path.to_string_lossy().into_owned();
-                    r.image_size = n;
-                    r.source_size = n;
-                    r.part_count = 0;
-                    r.loaded = true;
-                    r.result = None;
-                    r.is_error = false;
-                    r.step = RestoreStep::Config;
-                    use crate::controller::Controller as _;
-                    r.writer
-                        .apply(crate::controller::disk_write::DiskWriteAction::Open(
-                            crate::controller::disk_write::WriteOpen::image(path.clone(), n),
-                        ));
-                    r.writer.wait_idle();
-                    // A new source starts the writer with no target; keep the one on the form.
-                    if r.target_is_device {
-                        self.select_write_device();
-                    }
-                }
-                None => {
-                    r.result = Some(format!("Cannot read {} as a disk image", path.display()));
-                    r.is_error = true;
-                }
-            }
-            return;
-        }
-        // The controller unpacks a .cbk and reads the metadata in a job; `tick` follows it.
-        r.backup_folder = path.to_string_lossy().into_owned();
-        r.result = None;
-        r.is_error = false;
-        r.loading = true;
-        r.act(RestoreAction::OpenBackup(path));
-    }
-
-    /// Handle the "Start" action: an image-file target starts the restore
-    /// directly; a physical-device target first raises a destructive-write
-    /// confirmation (naming the device) that `start_restore_confirmed` clears.
-    fn request_restore_start(&mut self) {
-        let Some(r) = self.restore.as_ref() else {
-            return;
-        };
-        if r.target_is_device {
-            if r.target.trim().is_empty() {
-                let r = self.restore.as_mut().unwrap();
-                r.result = Some("Choose a target device.".to_string());
-                r.is_error = true;
-                r.step = RestoreStep::Run;
-                return;
-            }
-            // Name the device (with its media label if we have it) in the prompt.
-            let path = r.target.clone();
-            let label = self
-                .shell
-                .devices()
-                .iter()
-                .find(|dev| dev.path.display().to_string() == path)
-                .map(|dev| dev.display_name())
-                .unwrap_or_else(|| path.clone());
-            self.restore.as_mut().unwrap().confirm_device = Some((path, label));
-        } else {
-            self.start_restore_confirmed();
-        }
-    }
-
-    /// Hand the form to the controller, press its Start and answer its confirmation.
-    fn start_restore_confirmed(&mut self) {
-        use crate::controller::restore::{
-            AlignmentChoice, RestoreAction, RestoreMode, SizeMode, TargetSlot,
-        };
-        let Some(r) = self.restore.as_ref() else {
-            return;
-        };
-        let is_device = r.target_is_device;
-        let target = if is_device {
-            std::path::PathBuf::from(r.target.trim())
-        } else {
-            expand_tilde(r.target.trim())
-        };
-        if target.as_os_str().is_empty() {
-            let r = self.restore.as_mut().unwrap();
-            r.result = Some("Enter a target image path.".to_string());
-            r.is_error = true;
-            r.step = RestoreStep::Run;
-            return;
-        }
-        if r.source_is_image {
-            self.start_image_write(target, is_device);
-            return;
-        }
-        let device = if is_device {
-            self.shell
-                .devices()
-                .iter()
-                .enumerate()
-                .find(|(_, dev)| dev.path == target)
-                .map(|(row, dev)| (row, dev.clone()))
-        } else {
-            None
-        };
-        let r = self.restore.as_mut().unwrap();
-        r.act(RestoreAction::SetMode(RestoreMode::FullDisk));
-        r.act(RestoreAction::SetRemote(false));
-        r.act(RestoreAction::SetTargetIsDevice(
-            TargetSlot::FullDisk,
-            is_device,
-        ));
-        match device {
-            Some((row, device)) => r.act(RestoreAction::SelectDevice {
-                slot: TargetSlot::FullDisk,
-                row,
-                device,
-            }),
-            None => r.act(RestoreAction::ClearDevice(TargetSlot::FullDisk)),
-        }
-        r.act(RestoreAction::SetTargetImage(
-            TargetSlot::FullDisk,
-            (!is_device).then_some(target),
-        ));
-        r.act(RestoreAction::SetAlignment(if r.align_sel == 1 {
-            AlignmentChoice::Modern1MB
-        } else {
-            AlignmentChoice::Original
-        }));
-        let mode = if r.size_sel == 1 {
-            SizeMode::Minimum
-        } else {
-            SizeMode::Original
-        };
-        let rows: Vec<(usize, u32)> = r
-            .ctl
-            .size_rows()
-            .iter()
-            .map(|row| (row.index, row.custom_mib))
-            .collect();
-        for (index, custom_mib) in rows {
-            r.act(RestoreAction::SetPartitionSize {
-                index,
-                mode,
-                custom_mib,
-            });
-        }
-        use crate::controller::Controller as _;
-        let fx = r.ctl.apply(RestoreAction::Start);
-        r.after();
-        r.step = RestoreStep::Run;
-        // The device prompt (or, for an image file, the path typed) was the confirmation.
-        let Some(crate::controller::Effect::Confirm(spec)) = fx.into_iter().next() else {
-            r.result = Some(match r.ctl.last_result() {
-                Some(Err(e)) => e.clone(),
-                _ => "Restore could not start.".to_string(),
-            });
-            r.is_error = true;
-            return;
-        };
-        r.act(RestoreAction::Confirmed {
-            purpose: spec.purpose,
-            yes: true,
-        });
-        r.restoring = true;
-        r.result = None;
-        r.is_error = false;
-        r.op = "Starting...".to_string();
-        self.progress = Some(Progress {
-            shared: Arc::new(Mutex::new(ProgressShared::default())),
-            tracker: RateTracker::default(),
-            label: "Restoring".to_string(),
         });
     }
 
@@ -4198,46 +3418,7 @@ impl App {
         self.poll_task();
         self.poll_devices();
         self.backup_tick();
-        // An image write reports through the writer's job.
-        let writing = self.restore.as_ref().is_some_and(|r| r.writing);
-        if writing {
-            self.poll_image_write();
-            if let Some(r) = self.restore.as_ref() {
-                let snap = r.writer.progress();
-                if let (Some(prog), Some(snap)) = (self.progress.as_ref(), snap) {
-                    if let Ok(mut sh) = prog.shared.lock() {
-                        if let crate::controller::disk_write::Progress::Determinate {
-                            done,
-                            total,
-                            ..
-                        } = snap.progress
-                        {
-                            sh.current = done;
-                            sh.total = total;
-                        }
-                        sh.done = !r.writer.is_writing();
-                    }
-                }
-            }
-        }
-        // Drive the Restore controller and mirror its run into the visual bar.
-        if let Some(r) = self.restore.as_mut() {
-            use crate::controller::Controller as _;
-            let _ = r.ctl.tick();
-            r.after();
-            if r.step == RestoreStep::Run && !writing {
-                let bar = r.ctl.progress();
-                if let Some(prog) = self.progress.as_ref() {
-                    if let Ok(mut sh) = prog.shared.lock() {
-                        if let Some(bar) = &bar {
-                            sh.current = bar.current_bytes;
-                            sh.total = bar.total_bytes;
-                        }
-                        sh.done = !r.ctl.is_running();
-                    }
-                }
-            }
-        }
+        self.restore_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
         if let Some(a) = self.archive.as_mut() {
             a.poll();
@@ -5025,306 +4206,6 @@ impl App {
         }
     }
 
-    /// The Backup screen: source -> config -> run. The progress bar overlay
-    /// (drawn by `draw_progress`) sits on top during the Run step.
-    /// The Restore screen: source -> config -> run. The progress bar overlay
-    /// sits on top during the Run step.
-    fn draw_restore(&self, frame: &mut Frame, area: Rect, r: &RestoreState) {
-        let title = match r.step {
-            RestoreStep::Source => "Restore  -  step 1/3: backup",
-            RestoreStep::Config => "Restore  -  step 2/3: options",
-            RestoreStep::Run => "Restore  -  step 3/3: run",
-        };
-        let mut lines: Vec<Line> = Vec::new();
-        match r.step {
-            RestoreStep::Source => {
-                lines.push(Line::styled(
-                    "Choose what to restore:",
-                    self.palette.accent(),
-                ));
-                lines.push(Line::raw(""));
-                let (folder_mark, image_mark) = if r.source_is_image {
-                    ("  ", "> ")
-                } else {
-                    ("> ", "  ")
-                };
-                lines.push(Line::styled(
-                    format!("{folder_mark}Backup folder or .cbk"),
-                    if r.source_is_image {
-                        self.palette.dim()
-                    } else {
-                        self.palette.accent().add_modifier(Modifier::BOLD)
-                    },
-                ));
-                lines.push(Line::styled(
-                    format!("{image_mark}Disk image file (raw, DMG, CHD, VHD, ...)"),
-                    if r.source_is_image {
-                        self.palette.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        self.palette.dim()
-                    },
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled("  Space      ", self.palette.accent()),
-                    Span::raw("switch between the two"),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("  Enter / o  ", self.palette.accent()),
-                    Span::raw(if r.source_is_image {
-                        "choose the image file to write"
-                    } else {
-                        "choose a backup folder or .cbk file"
-                    }),
-                ]));
-                if r.loading {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::styled("  Loading the backup...", self.palette.dim()));
-                }
-                if let Some(res) = &r.result {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::styled(format!("  {res}"), self.palette.warn()));
-                }
-            }
-            RestoreStep::Config => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if r.source_is_image {
-                            "Image:  "
-                        } else {
-                            "Backup: "
-                        },
-                        self.palette.dim(),
-                    ),
-                    Span::raw(r.backup_folder.clone()),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("Contents: ", self.palette.dim()),
-                    Span::raw(if r.source_is_image {
-                        format!("{} decoded", format_size(r.image_size))
-                    } else {
-                        format!(
-                            "{} partition(s), original size {}",
-                            r.part_count,
-                            format_size(r.source_size)
-                        )
-                    }),
-                ]));
-                lines.push(Line::raw(""));
-                let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
-                    let active = r.field == idx;
-                    let cursor = if active && editable {
-                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
-                    } else {
-                        Span::raw("")
-                    };
-                    let marker = if active { "> " } else { "  " };
-                    let mstyle = if active {
-                        self.palette.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        self.palette.accent()
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("{marker}{label:<11}"), mstyle),
-                        Span::raw(val),
-                        cursor,
-                    ])
-                };
-                let tgt_disp = if r.target.is_empty() && r.field != 0 {
-                    "(target image path, or `d` for a device)".to_string()
-                } else if r.target_is_device {
-                    format!("{}  [device]", r.target)
-                } else {
-                    r.target.clone()
-                };
-                lines.push(row(0, "Target:", tgt_disp, !r.target_is_device));
-                if r.source_is_image {
-                    // Size mode and alignment don't apply to a fixed image;
-                    // the choice that matters is where on the target it lands.
-                    let parts = r.writer.target_partitions();
-                    let region = match r.writer.target_partition() {
-                        None => "< Entire disk >".to_string(),
-                        // Position, matching every other surface; selection keys on `p.index`.
-                        Some(idx) => match parts.iter().find(|p| p.index == idx) {
-                            Some(p) => format!(
-                                "< Partition {} - {} ({}) >",
-                                p.position,
-                                p.type_name,
-                                format_size(p.size_bytes),
-                            ),
-                            None => "< Entire disk >".to_string(),
-                        },
-                    };
-                    lines.push(row(1, "Write to:", region, false));
-                    if r.target_is_device && parts.is_empty() {
-                        lines.push(Line::styled(
-                            "             (no partition table on the target)",
-                            self.palette.dim(),
-                        ));
-                    }
-                } else {
-                    lines.push(row(
-                        1,
-                        "Size:",
-                        format!("< {} >", RESTORE_SIZE_LABELS[r.size_sel]),
-                        false,
-                    ));
-                    lines.push(row(
-                        2,
-                        "Alignment:",
-                        format!("< {} >", RESTORE_ALIGN_LABELS[r.align_sel]),
-                        false,
-                    ));
-                }
-                lines.push(Line::raw(""));
-                let start_sel = r.field == 3;
-                let start_style = if start_sel {
-                    self.palette
-                        .accent()
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    self.palette.accent()
-                };
-                lines.push(Line::styled(
-                    format!(
-                        "{}[ {} ]",
-                        if start_sel { "> " } else { "  " },
-                        if r.source_is_image {
-                            "Write image"
-                        } else {
-                            "Start restore"
-                        },
-                    ),
-                    start_style,
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Up/Down field   Left/Right Size/Align   Tab choose target (file/device)   \
-                     Enter Start   Esc back",
-                    self.palette.dim(),
-                ));
-                if r.target_is_device {
-                    if let Some(note) = self.device_note() {
-                        lines.push(note);
-                    }
-                }
-            }
-            RestoreStep::Run => {
-                lines.push(Line::from(vec![
-                    Span::styled("Backup: ", self.palette.dim()),
-                    Span::raw(r.backup_folder.clone()),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("Target: ", self.palette.dim()),
-                    Span::raw(format!(
-                        "{}  ({}, {} align)",
-                        r.target,
-                        RESTORE_SIZE_LABELS[r.size_sel],
-                        RESTORE_ALIGN_LABELS[r.align_sel]
-                    )),
-                ]));
-                lines.push(Line::raw(""));
-                if !r.op.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("Step: ", self.palette.dim()),
-                        Span::raw(r.op.clone()),
-                    ]));
-                }
-                if let Some(res) = &r.result {
-                    lines.push(Line::raw(""));
-                    let style = if r.is_error {
-                        self.palette.warn()
-                    } else {
-                        self.palette.accent()
-                    };
-                    lines.push(Line::styled(format!("  {res}"), style));
-                    lines.push(Line::styled(
-                        "  Esc to return to options.",
-                        self.palette.dim(),
-                    ));
-                }
-            }
-        }
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block(title, true))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-        if let Some(picker) = &r.picker {
-            picker.draw(frame, area, self.palette, self.border);
-        }
-        // "Target type" chooser overlay (Image file / Physical device).
-        if let Some(sel) = r.target_type_menu {
-            let opts = [
-                "Image file (write to a .img / container)",
-                "Physical device (raw disk)",
-            ];
-            let mut ml: Vec<Line> = vec![Line::raw("")];
-            for (i, label) in opts.iter().enumerate() {
-                let on = i == sel;
-                let marker = if on { "> " } else { "  " };
-                let style = if on {
-                    self.palette
-                        .accent()
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-                } else {
-                    self.palette.accent()
-                };
-                ml.push(Line::styled(format!("{marker}{label}"), style));
-            }
-            ml.push(Line::raw(""));
-            ml.push(Line::styled(
-                "  Enter choose   Esc cancel",
-                self.palette.dim(),
-            ));
-            let h = (ml.len() as u16 + 2).min(area.height.saturating_sub(2));
-            let popup = centered_rect(60, h, area);
-            frame.render_widget(Clear, popup);
-            frame.render_widget(
-                Paragraph::new(Text::from(ml)).block(self.pane_block("Restore target", true)),
-                popup,
-            );
-        }
-        // Physical-device target chooser overlay.
-        if r.device_pick {
-            self.draw_device_pick(frame, area, r.device_sel, "Pick a target device (RESTORE)");
-        }
-        // Destructive device-write confirmation overlay.
-        if let Some((path, label)) = &r.confirm_device {
-            let mut cl = vec![
-                Line::raw(""),
-                Line::styled(
-                    "  Restore will OVERWRITE the entire device:",
-                    self.palette.warn(),
-                ),
-                Line::styled(format!("    {label}"), self.palette.accent()),
-                Line::styled(format!("    {path}"), self.palette.dim()),
-                Line::raw(""),
-                Line::styled(
-                    "  All existing data on it will be lost.  Proceed?  (y / n)",
-                    self.palette.warn(),
-                ),
-            ];
-            if !self.elevated {
-                cl.push(Line::raw(""));
-                cl.push(Line::styled(
-                    "  Note: writing a device needs elevation; you may be prompted, \
-                     or it may fail if unavailable.",
-                    self.palette.dim(),
-                ));
-            }
-            let h = (cl.len() as u16 + 2).min(area.height.saturating_sub(2));
-            let popup = centered_rect(74, h, area);
-            frame.render_widget(Clear, popup);
-            frame.render_widget(
-                Paragraph::new(Text::from(cl)).block(self.pane_block("Confirm device write", true)),
-                popup,
-            );
-        }
-    }
-
     /// The Bulk convert screen: source -> config (format + review list) -> run.
     fn draw_bulk(&self, frame: &mut Frame, area: Rect, b: &BulkState) {
         let title = match b.step {
@@ -6013,20 +4894,7 @@ impl App {
         } else if self.current() == TabId::Backup {
             self.backup_footer_keys()
         } else if self.current() == TabId::Restore {
-            let step = self.restore.as_ref().map(|r| r.step);
-            match step {
-                Some(RestoreStep::Source) => {
-                    vec![("<-/->", "Tabs"), ("Enter/o", "Backup"), ("?", "Help")]
-                }
-                Some(RestoreStep::Config) => vec![
-                    ("Up/Dn", "Field"),
-                    ("<-/->", "Size/Align"),
-                    ("Tab", "Browse"),
-                    ("Enter", "Next/Start"),
-                    ("Esc", "Back"),
-                ],
-                _ => vec![("Esc", "Back")],
-            }
+            self.restore_footer_keys()
         } else if self.current() == TabId::Bulk {
             let step = self.bulk.as_ref().map(|b| b.step);
             match step {
@@ -6202,6 +5070,9 @@ impl App {
         }
         if self.current() == TabId::Backup {
             return self.backup_key_context();
+        }
+        if self.current() == TabId::Restore {
+            return self.restore_key_context();
         }
         ("Tabs", HINTS_TAB)
     }
@@ -7309,12 +6180,11 @@ mod tests {
         assert!(out.path().join("b.img").exists());
     }
 
-    #[test]
-    fn the_restore_screen_restores_a_backup_through_the_controller() {
+    /// A zstd backup of a 2 MiB blank FAT image, made through the Backup controller.
+    fn restore_fixture(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
         use crate::controller::backup::{BackupAction, BackupController, BackupServices};
         use crate::controller::Controller as _;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let img = dir.path().join("vol.img");
+        let img = dir.join("vol.img");
         let bytes = crate::controller::test_fixtures::blank_fat(2 * 1024 * 1024, Some("T"));
         std::fs::write(&img, &bytes).unwrap();
         let mut b = BackupController::new(BackupServices {
@@ -7322,102 +6192,94 @@ mod tests {
             notify: Arc::new(crate::controller::backup::NoNotify),
         });
         b.apply(BackupAction::OpenImage {
-            path: img.clone(),
+            path: img,
             rename: false,
         });
         b.wait_idle();
-        b.apply(BackupAction::SetDestination(Some(dir.path().to_path_buf())));
+        b.apply(BackupAction::SetDestination(Some(dir.to_path_buf())));
         b.apply(BackupAction::SetName("bk".into()));
+        b.apply(BackupAction::SetResize(false));
         b.apply(BackupAction::Start(None));
         b.wait_finished();
-        let folder = dir.path().join("bk");
-
-        let mut app = App::new_on(BACKUP_TAB + 1);
-        app.restore = Some(RestoreState::new(app.shell.recent_handle()));
-        app.load_restore_source(folder.clone());
-        for _ in 0..3000 {
-            app.tick();
-            if app.restore.as_ref().unwrap().step == RestoreStep::Config {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let r = app.restore.as_mut().unwrap();
-        assert!(r.step == RestoreStep::Config, "{:?}", r.result);
-        assert_eq!(r.part_count, 1);
-        assert_eq!(
-            r.target,
-            dir.path().join("bk_restored.img").display().to_string()
-        );
-        r.field = 3;
-        assert!(app.handle_restore_key(KeyCode::Enter));
-        assert!(app.progress.is_some());
-        for _ in 0..6000 {
-            app.tick();
-            if app.restore.as_ref().unwrap().result.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let r = app.restore.as_ref().unwrap();
-        assert_eq!(r.result.as_deref(), Some("Restore complete."));
-        let out = std::fs::read(dir.path().join("bk_restored.img")).unwrap();
-        assert_eq!(out, bytes);
+        (dir.join("bk"), bytes)
     }
 
-    /// An image source pours through the disk writer: whole into an image file, then into one
-    /// partition of a disk-image file standing in for a device (never a real disk).
-    #[test]
-    fn the_restore_screen_writes_an_image_through_the_disk_writer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let img = dir.path().join("src.img");
-        let bytes: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 249) as u8).collect();
-        std::fs::write(&img, &bytes).unwrap();
-        let run = |app: &mut App| {
-            for _ in 0..3000 {
-                app.tick();
-                if app.restore.as_ref().unwrap().result.is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        };
+    fn restore_keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_restore_key(KeyCode::Char(c));
+        }
+    }
 
-        let mut app = App::new_on(BACKUP_TAB + 1);
-        app.restore = Some(RestoreState {
-            source_is_image: true,
-            ..RestoreState::new(app.shell.recent_handle())
-        });
-        app.load_restore_source(img.clone());
+    /// Let the controllers' jobs end and the screen follow them.
+    fn restore_settle(app: &mut App) {
         let r = app.restore.as_mut().unwrap();
-        assert!(r.step == RestoreStep::Config, "{:?}", r.result);
-        let out = dir.path().join("out.img");
-        r.target = out.display().to_string();
-        r.field = 3;
-        assert!(app.handle_restore_key(KeyCode::Enter));
-        run(&mut app);
-        let r = app.restore.as_ref().unwrap();
-        assert_eq!(
-            r.result.as_deref(),
-            Some("Wrote 1.0 MiB to the target."),
-            "{:?}",
-            r.result
-        );
-        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        r.ctl.wait_idle();
+        r.writer.wait_idle();
+        app.tick();
+    }
 
-        // A "device" with one MBR partition at LBA 2048; the table must survive.
-        let disk = dir.path().join("disk.img");
-        let mut d = vec![0u8; 4 << 20];
+    fn restore_focus(app: &mut App, field: restore::Field) {
+        for _ in 0..60 {
+            if app.restore.as_ref().unwrap().focus == field {
+                return;
+            }
+            app.handle_restore_key(KeyCode::Down);
+        }
+        panic!("no row {field:?} on the form");
+    }
+
+    fn restore_wfocus(app: &mut App, row: restore::WRow) {
+        for _ in 0..30 {
+            if app.restore.as_ref().unwrap().wsel == row {
+                return;
+            }
+            app.handle_restore_key(KeyCode::Down);
+        }
+        panic!("no row {row:?} in the writer");
+    }
+
+    fn restore_run_to_end(app: &mut App) -> (String, bool) {
+        for _ in 0..6000 {
+            app.tick();
+            if let Some(res) = app.restore.as_ref().unwrap().result() {
+                if !app.restore.as_ref().unwrap().busy() {
+                    return res;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the run did not end");
+    }
+
+    /// The Restore screen with the fixture backup opened through `o` and the picker.
+    fn restore_on_backup(dir: &std::path::Path) -> (App, std::path::PathBuf, Vec<u8>) {
+        let (folder, bytes) = restore_fixture(dir);
+        let mut app = App::headless_on(BACKUP_TAB + 1);
+        assert!(app.handle_restore_key(KeyCode::Char('o')));
+        restore_keys(&mut app, folder.display().to_string().as_str());
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        assert!(app.restore.as_ref().unwrap().ctl.has_backup());
+        (app, folder, bytes)
+    }
+
+    fn restore_screen(app: &App) -> String {
+        backup_screen(app)
+    }
+
+    /// A disk-image file standing in for a device, with one MBR partition at LBA 2048.
+    fn restore_fake_disk(app: &mut App, path: &std::path::Path, sectors: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 8 << 20];
         d[0x1BE + 4] = 0x06;
         d[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
-        d[0x1BE + 12..0x1BE + 16].copy_from_slice(&4096u32.to_le_bytes());
+        d[0x1BE + 12..0x1BE + 16].copy_from_slice(&sectors.to_le_bytes());
         d[510] = 0x55;
         d[511] = 0xAA;
-        std::fs::write(&disk, &d).unwrap();
+        std::fs::write(path, &d).unwrap();
         app.set_test_devices(vec![DiskDevice {
             name: "fake".into(),
-            path: disk.clone(),
-            size_bytes: 4 << 20,
+            path: path.to_path_buf(),
+            size_bytes: 8 << 20,
             is_removable: true,
             is_read_only: false,
             is_system: false,
@@ -7425,33 +6287,347 @@ mod tests {
             media_name: "Fake".into(),
             partitions: Vec::new(),
         }]);
-        let r = app.restore.as_mut().unwrap();
-        r.result = None;
-        r.step = RestoreStep::Config;
-        r.target = disk.display().to_string();
-        r.target_is_device = true;
-        app.select_write_device();
-        let r = app.restore.as_mut().unwrap();
-        assert_eq!(r.writer.target_partitions().len(), 1);
-        r.field = 1;
-        assert!(app.handle_restore_key(KeyCode::Right));
-        let r = app.restore.as_mut().unwrap();
-        assert!(r.writer.target_partition().is_some());
-        r.field = 3;
-        assert!(app.handle_restore_key(KeyCode::Enter));
-        assert!(app.restore.as_ref().unwrap().confirm_device.is_some());
-        assert!(app.handle_restore_key(KeyCode::Char('y')));
-        run(&mut app);
+        d
+    }
+
+    /// Full Disk: sizes, alignment and free space reach the controller; the run restores bytes.
+    #[test]
+    fn the_restore_full_disk_form_restores_a_backup() {
+        use crate::controller::restore::{AlignmentChoice, SizeMode};
+        use restore::Field;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _, bytes) = restore_on_backup(dir.path());
+        let out = dir.path().join("bk_restored.img");
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(r.full_target, out.display().to_string());
+        let index = r.ctl.size_rows()[0].index;
+        // The target defaults to a device; Space switches it to the image file.
+        restore_focus(&mut app, Field::TargetKind);
+        app.handle_restore_key(KeyCode::Char(' '));
         let r = app.restore.as_ref().unwrap();
         assert_eq!(
-            r.result.as_deref(),
-            Some("Wrote 1.0 MiB to the target."),
-            "{:?}",
-            r.result
+            r.ctl
+                .target_image(crate::controller::restore::TargetSlot::FullDisk),
+            Some(out.as_path())
         );
+        // Size: Right steps through the row's modes; Custom starts at the original and types.
+        restore_focus(&mut app, Field::Size(index));
+        while app.restore.as_ref().unwrap().ctl.size_rows()[0].mode != SizeMode::Custom {
+            assert!(app.handle_restore_key(KeyCode::Right));
+        }
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.size_rows()[0].custom_mib,
+            2
+        );
+        app.handle_restore_key(KeyCode::Char('3'));
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.size_rows()[0].custom_mib,
+            23
+        );
+        while app.restore.as_ref().unwrap().ctl.size_rows()[0].mode != SizeMode::Original {
+            app.handle_restore_key(KeyCode::Left);
+        }
+        // Alignment: Custom opens its sector row.
+        restore_focus(&mut app, Field::Alignment);
+        while app.restore.as_ref().unwrap().ctl.alignment().0 != AlignmentChoice::Custom {
+            app.handle_restore_key(KeyCode::Right);
+        }
+        restore_focus(&mut app, Field::AlignCustom);
+        app.handle_restore_key(KeyCode::Backspace);
+        assert_eq!(app.restore.as_ref().unwrap().ctl.alignment().1, 204);
+        restore_focus(&mut app, Field::Alignment);
+        app.handle_restore_key(KeyCode::Right);
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.alignment().0,
+            AlignmentChoice::Original
+        );
+        // Free space: the toggle opens MiB and extend-last; the screen shows the preview.
+        restore_focus(&mut app, Field::Expand);
+        app.handle_restore_key(KeyCode::Char(' '));
+        restore_focus(&mut app, Field::ExpandMib);
+        restore_keys(&mut app, "4");
+        restore_focus(&mut app, Field::ExtendLast);
+        app.handle_restore_key(KeyCode::Char(' '));
+        let plan = app.restore.as_ref().unwrap().ctl.expand();
+        assert!(plan.enabled && plan.extend_last && plan.free_mib == 4);
+        let text = restore_screen(&app);
+        assert!(text.contains("After:"), "{text}");
+        restore_focus(&mut app, Field::Expand);
+        app.handle_restore_key(KeyCode::Char(' '));
+        // Start asks; `y` runs it.
+        app.handle_restore_key(KeyCode::Char('s'));
+        assert!(matches!(
+            app.restore.as_ref().unwrap().ask,
+            Some(restore::Ask::Confirm(..))
+        ));
+        let text = restore_screen(&app);
+        assert!(text.contains("permanently overwritten"), "{text}");
+        app.handle_restore_key(KeyCode::Char('y'));
+        assert!(app.progress.is_some());
+        let (res, err) = restore_run_to_end(&mut app);
+        assert_eq!((res.as_str(), err), ("Restore complete.", false));
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        app.handle_restore_key(KeyCode::Esc);
+        assert_eq!(
+            app.restore.as_ref().unwrap().step,
+            restore::RestoreStep::Form
+        );
+    }
+
+    /// New Disk: a backup partition onto an image under a fresh bootable MBR.
+    #[test]
+    fn the_restore_new_disk_mode_writes_a_fresh_table() {
+        use crate::controller::restore::{NewTableType, RestoreMode, TargetSlot};
+        use restore::Field;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _, _) = restore_on_backup(dir.path());
+        restore_focus(&mut app, Field::Mode);
+        while app.restore.as_ref().unwrap().ctl.mode() != RestoreMode::NewDisk {
+            app.handle_restore_key(KeyCode::Right);
+        }
+        restore_focus(&mut app, Field::SourcePartition);
+        app.handle_restore_key(KeyCode::Char(' '));
+        assert!(app
+            .restore
+            .as_ref()
+            .unwrap()
+            .ctl
+            .source_partition()
+            .is_some());
+        restore_focus(&mut app, Field::TargetKind);
+        app.handle_restore_key(KeyCode::Char(' '));
+        restore_focus(&mut app, Field::TargetImage);
+        let out = dir.path().join("new.img");
+        restore_keys(&mut app, out.display().to_string().as_str());
+        assert_eq!(
+            app.restore
+                .as_ref()
+                .unwrap()
+                .ctl
+                .target_image(TargetSlot::NewDisk),
+            Some(out.as_path())
+        );
+        restore_focus(&mut app, Field::NdTable);
+        app.handle_restore_key(KeyCode::Right);
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.new_disk().table,
+            NewTableType::Gpt
+        );
+        app.handle_restore_key(KeyCode::Left);
+        restore_focus(&mut app, Field::NdBootable);
+        app.handle_restore_key(KeyCode::Char(' '));
+        assert!(app.restore.as_ref().unwrap().ctl.new_disk().bootable);
+        let text = restore_screen(&app);
+        assert!(text.contains("starts at LBA 2048"), "{text}");
+        app.handle_restore_key(KeyCode::Char('s'));
+        app.handle_restore_key(KeyCode::Char('y'));
+        let (res, err) = restore_run_to_end(&mut app);
+        assert_eq!((res.as_str(), err), ("Restore complete.", false), "{res}");
+        let d = std::fs::read(&out).unwrap();
+        assert_eq!(&d[510..512], &[0x55, 0xAA]);
+        assert_eq!(d[0x1BE], 0x80);
+        assert_eq!(&d[0x1BE + 8..0x1BE + 12], &2048u32.to_le_bytes());
+    }
+
+    /// Single Partition: pick the device, scan it, pick its partition; Start names it.
+    #[test]
+    fn the_restore_single_partition_mode_scans_and_picks_a_partition() {
+        use crate::controller::restore::RestoreMode;
+        use restore::Field;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _, _) = restore_on_backup(dir.path());
+        restore_fake_disk(&mut app, dir.path().join("disk.img").as_path(), 8192);
+        restore_focus(&mut app, Field::Mode);
+        app.handle_restore_key(KeyCode::Right);
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.mode(),
+            RestoreMode::SinglePartition
+        );
+        restore_focus(&mut app, Field::SourcePartition);
+        app.handle_restore_key(KeyCode::Char(' '));
+        restore_focus(&mut app, Field::TargetDevice);
+        app.handle_restore_key(KeyCode::Enter);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_focus(&mut app, Field::Scan);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        let parts = app.restore.as_ref().unwrap().ctl.target_partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].fits, Some(true));
+        restore_focus(&mut app, Field::TargetPartition(parts[0].index));
+        app.handle_restore_key(KeyCode::Enter);
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(r.ctl.target_partition(), Some(parts[0].index));
+        assert_eq!(r.ctl.validate(), Ok(()));
+        app.handle_restore_key(KeyCode::Char('s'));
+        let text = restore_screen(&app);
+        assert!(text.contains("will NOT be modified"), "{text}");
+        // `n` leaves the device alone.
+        app.handle_restore_key(KeyCode::Char('n'));
+        let r = app.restore.as_ref().unwrap();
+        assert!(r.ask.is_none() && !r.busy());
+    }
+
+    /// Write Image File: the writer window wraps a superfloppy into an image file, then writes
+    /// into one partition of a disk-image "device" behind its typed name.
+    #[test]
+    fn the_restore_write_image_mode_writes_through_the_writer() {
+        use crate::controller::restore::RestoreMode;
+        use restore::{Field, WRow};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vol = dir.path().join("vol.img");
+        let bytes = crate::controller::test_fixtures::blank_fat(1024 * 1024, Some("T"));
+        std::fs::write(&vol, &bytes).unwrap();
+        let mut app = App::headless_on(BACKUP_TAB + 1);
+        restore_focus(&mut app, Field::Mode);
+        while app.restore.as_ref().unwrap().ctl.mode() != RestoreMode::WriteImage {
+            app.handle_restore_key(KeyCode::Right);
+        }
+        restore_focus(&mut app, Field::WriteSource);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_keys(&mut app, vol.display().to_string().as_str());
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        assert!(restore_screen(&app).contains("the writer can wrap it"));
+        restore_focus(&mut app, Field::WriteTarget);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        assert!(app.restore.as_ref().unwrap().writer.is_open());
+        assert_eq!(app.key_context().0, "Restore - write image");
+        // An image-file target, wrapped in a fresh MBR.
+        let out = dir.path().join("out.img");
+        restore_wfocus(&mut app, WRow::Image);
+        restore_keys(&mut app, out.display().to_string().as_str());
+        app.handle_restore_key(KeyCode::Enter);
+        restore_wfocus(&mut app, WRow::Synthesize);
+        app.handle_restore_key(KeyCode::Char(' '));
+        restore_wfocus(&mut app, WRow::TypeByte);
+        restore_keys(&mut app, "0e");
+        assert_eq!(app.restore.as_ref().unwrap().writer.form().type_byte, 0x0E);
+        let text = restore_screen(&app);
+        assert!(text.contains("Synthesize partition table"), "{text}");
+        app.handle_restore_key(KeyCode::Char('w'));
+        let r = app.restore.as_ref().unwrap();
+        assert!(
+            matches!(r.ask, Some(restore::Ask::Confirm(..))),
+            "{:?} {:?}",
+            r.writer.error(),
+            r.writer.target_image()
+        );
+        app.handle_restore_key(KeyCode::Char('y'));
+        let (res, err) = restore_run_to_end(&mut app);
+        assert!(!err && res.starts_with("Wrote "), "{res}");
+        let d = std::fs::read(&out).unwrap();
+        assert_eq!(&d[510..512], &[0x55, 0xAA]);
+        assert_eq!(d[0x1BE + 4], 0x0E);
+        // The volume follows at LBA 2048, its VBR's hidden sectors patched to match.
+        assert_eq!(&d[(1 << 20) + 512..2 << 20], &bytes[512..]);
+        assert_eq!(
+            &d[(1 << 20) + 0x1C..(1 << 20) + 0x20],
+            &2048u32.to_le_bytes()
+        );
+        app.handle_restore_key(KeyCode::Esc);
+        assert!(!app.restore.as_ref().unwrap().writer.is_open());
+
+        // Into the partition of a stand-in device; the name must be typed exactly.
+        let disk = dir.path().join("disk.img");
+        let before = restore_fake_disk(&mut app, disk.as_path(), 4096);
+        restore_focus(&mut app, Field::WriteTarget);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        restore_wfocus(&mut app, WRow::Device);
+        app.handle_restore_key(KeyCode::Enter);
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        restore_wfocus(&mut app, WRow::Region);
+        app.handle_restore_key(KeyCode::Right);
+        assert!(app
+            .restore
+            .as_ref()
+            .unwrap()
+            .writer
+            .target_partition()
+            .is_some());
+        restore_wfocus(&mut app, WRow::Write);
+        app.handle_restore_key(KeyCode::Enter);
+        assert!(matches!(
+            app.restore.as_ref().unwrap().ask,
+            Some(restore::Ask::Text { .. })
+        ));
+        restore_keys(&mut app, "wrong");
+        app.handle_restore_key(KeyCode::Enter);
+        assert!(app.restore.as_ref().unwrap().ask.is_some());
+        for _ in 0..5 {
+            app.handle_restore_key(KeyCode::Backspace);
+        }
+        let name = app.restore.as_ref().unwrap().writer.device_name().unwrap();
+        restore_keys(&mut app, name.as_str());
+        app.handle_restore_key(KeyCode::Enter);
+        let (res, err) = restore_run_to_end(&mut app);
+        assert!(!err && res.starts_with("Wrote "), "{res}");
         let after = std::fs::read(&disk).unwrap();
-        assert_eq!(&after[..512], &d[..512]);
+        assert_eq!(&after[..512], &before[..512]);
         assert_eq!(&after[1 << 20..2 << 20], &bytes[..]);
+    }
+
+    /// The remote target turns on and takes a host only in a build with `remote`.
+    #[test]
+    fn the_restore_remote_target_opens_or_is_absent() {
+        use crate::controller::restore::RestoreController;
+        use restore::Field;
+        let mut app = App::headless_on(BACKUP_TAB + 1);
+        app.handle_restore_key(KeyCode::Down);
+        let fields = app.restore.as_ref().unwrap().fields();
+        if !RestoreController::remote_available() {
+            assert!(!fields.contains(&Field::Remote));
+            return;
+        }
+        restore_focus(&mut app, Field::Remote);
+        app.handle_restore_key(KeyCode::Char(' '));
+        assert!(app.restore.as_ref().unwrap().ctl.remote_active());
+        restore_focus(&mut app, Field::RemoteHost);
+        restore_keys(&mut app, "127.0.0.1");
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.remote_address(),
+            "127.0.0.1"
+        );
+        assert!(app
+            .restore
+            .as_ref()
+            .unwrap()
+            .ctl
+            .remote_target_label()
+            .is_none());
+    }
+
+    /// Every mode's form and the writer window draw in an 80x24 terminal.
+    #[test]
+    fn the_restore_forms_draw_in_a_small_terminal() {
+        use crate::controller::restore::RestoreMode;
+        use restore::Field;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _, _) = restore_on_backup(dir.path());
+        restore_focus(&mut app, Field::Start);
+        let text = restore_screen(&app);
+        assert!(text.contains("[ Start restore ]"), "{text}");
+        assert_eq!(app.key_context().0, "Restore");
+        restore_focus(&mut app, Field::Mode);
+        for mode in [
+            RestoreMode::SinglePartition,
+            RestoreMode::NewDisk,
+            RestoreMode::WriteImage,
+        ] {
+            app.handle_restore_key(KeyCode::Right);
+            assert_eq!(app.restore.as_ref().unwrap().ctl.mode(), mode);
+            let text = restore_screen(&app);
+            assert!(text.contains("Mode:"), "{text}");
+        }
+        // Build Disk is not on the TUI's mode list; Right wraps to Full Disk.
+        app.handle_restore_key(KeyCode::Right);
+        assert_eq!(
+            app.restore.as_ref().unwrap().ctl.mode(),
+            RestoreMode::FullDisk
+        );
     }
 
     /// The file picker must accept a raw device path.
