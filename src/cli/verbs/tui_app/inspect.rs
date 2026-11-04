@@ -197,6 +197,8 @@ pub(super) struct InspectState {
     optical: Option<PathBuf>,
     /// The writer's run is on screen; its end becomes the note.
     writing: bool,
+    /// A backup was closed here; the app closes the shared folder (Restore too).
+    pub(super) closed_backup: bool,
 }
 
 impl InspectState {
@@ -247,6 +249,7 @@ impl InspectState {
             archive: None,
             optical: None,
             writing: false,
+            closed_backup: false,
         }
     }
 
@@ -396,8 +399,7 @@ impl InspectState {
                         self.note = Some(format!("{what} is an optical disc; {why}"));
                     }
                 }
-                // No other TUI screen shares the backup folder.
-                HostRequest::BackupClosed => {}
+                HostRequest::BackupClosed => self.closed_backup = true,
                 HostRequest::ExpandHfs(source) => {
                     let fx = self.hfs.apply(ExpandHfsAction::Open(*source));
                     self.absorb(Who::Hfs, fx);
@@ -1192,6 +1194,20 @@ impl App {
         s.plain_for = None;
         s.sel = 0;
         s.act(InspectAction::Open(source));
+        self.after_inspect();
+    }
+
+    /// Open the backup folder Restore shares (not recorded in the recent list, as the GUI's).
+    pub(super) fn inspect_load_backup(&mut self, folder: PathBuf) {
+        let s = self.inspect_state();
+        if s.ctl.backup_folder() == Some(folder.as_path()) {
+            return;
+        }
+        s.disk = None;
+        s.plain = None;
+        s.plain_for = None;
+        s.sel = 0;
+        s.act(InspectAction::Open(InspectSource::Backup { folder }));
         self.after_inspect();
     }
 

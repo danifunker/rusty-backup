@@ -164,6 +164,8 @@ pub(super) struct RestoreState {
     cancel_note: bool,
     /// The backup the image target was defaulted for.
     defaulted_for: Option<std::path::PathBuf>,
+    /// The user closed the backup here; the app closes the shared folder (Inspect too).
+    pub(super) closed_backup: bool,
 }
 
 impl RestoreState {
@@ -191,6 +193,7 @@ impl RestoreState {
             writing: false,
             cancel_note: false,
             defaulted_for: None,
+            closed_backup: false,
         }
     }
 
@@ -905,7 +908,10 @@ impl App {
             }
             KeyCode::Char('o') => r.act(RestoreAction::PickBackupFolder),
             KeyCode::Char('c') => match focus {
-                Field::Backup => r.act(RestoreAction::ClearBackup),
+                Field::Backup => {
+                    r.closed_backup = r.ctl.has_backup();
+                    r.act(RestoreAction::ClearBackup);
+                }
                 Field::TargetDevice => r.act(RestoreAction::ClearDevice(slot)),
                 _ => return false,
             },

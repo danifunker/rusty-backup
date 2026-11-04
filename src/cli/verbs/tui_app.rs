@@ -59,6 +59,8 @@ mod inspect;
 mod optical;
 mod resize;
 mod restore;
+mod settings;
+mod shell;
 mod table_edit;
 mod writer;
 
@@ -67,6 +69,7 @@ use inspect::InspectState;
 #[cfg(feature = "optical")]
 use optical::OpticalState;
 use restore::RestoreState;
+use settings::SettingsState;
 
 /// Shared state for a running progress task: a worker thread advances
 /// `current` toward `total`; the UI thread reads it each frame.
@@ -840,7 +843,9 @@ pub fn run_on(initial_tab: usize, label: &'static str) -> Result<()> {
     let mut terminal = ratatui::init();
     // An old Terminal.app may not give a blank alternate screen, and ratatui only redraws changed cells.
     let _ = terminal.clear();
-    let outcome = App::new_on(initial_tab).run(&mut terminal);
+    let mut app = App::new_on(initial_tab);
+    app.start_update_check();
+    let outcome = app.run(&mut terminal);
     ratatui::restore();
     outcome
 }
@@ -1341,37 +1346,6 @@ fn archive_row_line(e: &crate::controller::archives::ArchiveEntryRow) -> String 
     )
 }
 
-/// The Settings tab: the shared Settings form (each toggle saves at once) and a cursor.
-struct SettingsState {
-    ctl: crate::controller::settings::SettingsController,
-    sel: usize,
-    /// The last save or update-check result.
-    status: Option<String>,
-}
-
-impl SettingsState {
-    /// The form loaded from config.json (memory in tests).
-    fn open() -> Self {
-        use crate::controller::settings::{SettingsAction, SettingsController};
-        use crate::controller::Controller as _;
-        #[cfg(not(test))]
-        let mut ctl = SettingsController::default();
-        #[cfg(test)]
-        let mut ctl = SettingsController::with_store(Box::new(
-            crate::controller::app::MemoryConfig::default(),
-        ));
-        ctl.apply(SettingsAction::Open);
-        SettingsState {
-            ctl,
-            sel: 0,
-            status: None,
-        }
-    }
-}
-
-/// Number of editable toggle rows on the Settings tab.
-const SETTINGS_TOGGLES: usize = 2;
-
 /// What a finished [`TuiTask`] does to the app, run on the UI thread.
 type TaskDone = Box<dyn FnOnce(&mut App) + Send>;
 
@@ -1673,6 +1647,14 @@ impl App {
                 }
                 None => {}
             }
+            return;
+        }
+
+        // F12 hides the update banner wherever the keyboard is.
+        if key.code == KeyCode::F(12) && self.update_banner().is_some() {
+            use crate::controller::Controller as _;
+            self.shell
+                .apply(crate::controller::app::AppAction::DismissUpdate);
             return;
         }
 
@@ -2011,88 +1993,8 @@ impl App {
             self.tab_before_commander = Some(self.active);
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
-            self.settings = Some(SettingsState::open());
+            self.settings = Some(SettingsState::open(self.shell.recent_handle()));
         }
-    }
-
-    /// Settings tab keys. Returns `true` when consumed (Left/Right fall through
-    /// so they still switch tabs).
-    fn handle_settings_key(&mut self, code: KeyCode) -> bool {
-        if self.settings.is_none() {
-            self.settings = Some(SettingsState::open());
-        }
-        let s = self.settings.as_mut().unwrap();
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                s.sel = s.sel.saturating_sub(1);
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                s.sel = (s.sel + 1).min(SETTINGS_TOGGLES - 1);
-                true
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.settings_toggle();
-                true
-            }
-            // Check for updates now.
-            KeyCode::Char('c') => {
-                self.settings_check_now();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Run an update check against GitHub and report the result on the Settings
-    /// status line. Only functional in a `tui-update` build (which links the
-    /// reqwest client); otherwise it explains how to enable it.
-    fn settings_check_now(&mut self) {
-        #[cfg(feature = "tui-update")]
-        {
-            let repo = self.settings.as_ref().map(|s| s.ctl.repo_url().to_string());
-            let Some(repo) = repo else { return };
-            // A network round-trip: run it as a task so the screen stays live.
-            self.start_task("Checking for updates", move |job| {
-                job.set_can_cancel(false);
-                let msg = crate::controller::app::check_updates_now_text(repo.as_str());
-                Ok(Box::new(move |app: &mut App| {
-                    if let Some(s) = app.settings.as_mut() {
-                        s.status = Some(msg);
-                    }
-                }) as TaskDone)
-            });
-        }
-        #[cfg(not(feature = "tui-update"))]
-        {
-            if let Some(s) = self.settings.as_mut() {
-                s.status = Some(
-                    "Update checking isn't compiled into this build \
-                     (rebuild with `--features tui-update`)."
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    /// Flip the selected preference and save the form, through the Settings controller.
-    fn settings_toggle(&mut self) {
-        use crate::controller::settings::SettingsAction;
-        use crate::controller::Controller as _;
-        let Some(s) = self.settings.as_mut() else {
-            return;
-        };
-        match s.sel {
-            0 => s
-                .ctl
-                .apply(SettingsAction::SetUpdateCheck(!s.ctl.update_check())),
-            1 => s.ctl.apply(SettingsAction::SetFileAssociations(
-                !s.ctl.file_associations(),
-            )),
-            _ => Vec::new(),
-        };
-        s.ctl.apply(SettingsAction::Save);
-        s.status = s.ctl.status().map(str::to_string);
     }
 
     /// New Disk wizard keys. Returns `true` when consumed; `false` lets the key
@@ -2920,6 +2822,7 @@ impl App {
     fn tick(&mut self) {
         self.poll_task();
         self.poll_devices();
+        self.share_backup_tick();
         self.backup_tick();
         self.restore_tick();
         self.inspect_tick();
@@ -3125,18 +3028,31 @@ impl App {
             return;
         }
 
+        let shell_line = self.shell_line();
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // tab bar + version
+                Constraint::Length(u16::from(shell_line.is_some())),
                 Constraint::Min(3),    // body
                 Constraint::Length(1), // footer key bar
             ])
             .split(area);
 
         self.draw_tab_bar(frame, rows[0]);
-        self.draw_body(frame, rows[1]);
-        self.draw_footer(frame, rows[2]);
+        if let Some((text, warn)) = shell_line {
+            let style = if warn {
+                self.palette.warn()
+            } else {
+                self.palette.dim()
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" {text}"), style)),
+                rows[1],
+            );
+        }
+        self.draw_body(frame, rows[2]);
+        self.draw_footer(frame, rows[3]);
 
         if self.progress.is_some() {
             self.draw_progress(frame, area);
@@ -3901,110 +3817,6 @@ impl App {
         );
     }
 
-    /// The interactive Settings tab: environment info (read-only) plus editable
-    /// preference toggles persisted to `config.json` via `UpdateConfig::save`.
-    fn draw_settings_tab(&self, frame: &mut Frame, area: Rect, s: &SettingsState) {
-        let updater = if cfg!(feature = "tui-update") {
-            "built in (rb-cli update available)"
-        } else {
-            "not built (rebuild with --features tui-update)"
-        };
-        let info = |k: &str, v: String| -> Line<'static> {
-            Line::from(vec![
-                Span::styled(format!("{k:<14}"), self.palette.accent()),
-                Span::raw(v),
-            ])
-        };
-        let mut lines = vec![
-            info(
-                "Platform:",
-                format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
-            ),
-            {
-                let (txt, style) = if self.elevated {
-                    (
-                        format!("{} - device operations enabled", self.privilege_label()),
-                        self.palette.accent(),
-                    )
-                } else {
-                    (
-                        "normal user - device operations disabled".to_string(),
-                        self.palette.warn(),
-                    )
-                };
-                Line::from(vec![
-                    Span::styled(format!("{:<14}", "Privilege:"), self.palette.accent()),
-                    Span::styled(txt, style),
-                ])
-            },
-            info(
-                "Color:",
-                if self.palette.color {
-                    "on".to_string()
-                } else {
-                    "off (NO_COLOR)".to_string()
-                },
-            ),
-            info(
-                "Borders:",
-                if self.border == ASCII_BORDER {
-                    "ASCII fallback".to_string()
-                } else {
-                    "Unicode rounded".to_string()
-                },
-            ),
-            info("Updater:", updater.to_string()),
-            info(
-                "Config file:",
-                crate::controller::settings::SettingsController::config_file()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(no config dir)".to_string()),
-            ),
-            info("Update repo:", s.ctl.repo_url().to_string()),
-            Line::raw(""),
-            Line::styled(
-                "Preferences  (Enter / Space toggles):",
-                self.palette.accent(),
-            ),
-            Line::raw(""),
-        ];
-
-        let toggles = [
-            ("Check for updates on startup", s.ctl.update_check()),
-            ("Register file associations", s.ctl.file_associations()),
-        ];
-        for (i, (label, on)) in toggles.iter().enumerate() {
-            let selected = i == s.sel;
-            let marker = if selected { "> " } else { "  " };
-            let boxed = if *on { "[x]" } else { "[ ]" };
-            let style = if selected {
-                self.palette
-                    .accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                self.palette.accent()
-            };
-            lines.push(Line::styled(format!("{marker}{boxed} {label}"), style));
-        }
-
-        lines.push(Line::raw(""));
-        if let Some(st) = &s.status {
-            lines.push(Line::styled(format!("  {st}"), self.palette.dim()));
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::styled(
-            "Up/Down select   Enter/Space toggle   c check for updates   Left/Right change tab",
-            self.palette.dim(),
-        ));
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(self.pane_block("Settings", true))
-                .wrap(Wrap { trim: false }),
-            area,
-        );
-    }
-
     /// A bottom-anchored progress bar: percentage + bytes + live rate + ETA,
     /// drawn ASCII-safe (Unicode blocks on capable terminals). Driven by the
     /// shared `RateTracker` the GUI and CLI also use.
@@ -4256,6 +4068,9 @@ impl App {
         if self.current() == TabId::Optical {
             return self.optical_key_context();
         }
+        if self.current() == TabId::Settings {
+            return self.settings_key_context();
+        }
         ("Tabs", HINTS_TAB)
     }
 
@@ -4274,6 +4089,9 @@ impl App {
         rows.push(("Anywhere".to_string(), String::new()));
         for h in HINTS_GLOBAL {
             rows.push((h.keys.to_string(), h.desc.to_string()));
+        }
+        if self.update_banner().is_some() {
+            rows.push(("F12".to_string(), "Hide the update banner".to_string()));
         }
         let key_w = rows
             .iter()
@@ -5996,6 +5814,79 @@ mod tests {
         assert!(app.explorer.is_some());
     }
 
+    /// A backup opened on Inspect is shared with Restore, and closing it on Restore closes both.
+    #[test]
+    fn restore_and_inspect_share_the_backup_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (folder, _) = restore_fixture(dir.path());
+        let mut app = inspect_on(&folder);
+        let opened = app
+            .inspect
+            .as_ref()
+            .unwrap()
+            .ctl
+            .backup_folder()
+            .map(|p| p.to_path_buf());
+        assert_eq!(app.shell.shared_backup(), opened.as_deref());
+        let line = app.shell_line().expect("the shell line names the backup").0;
+        assert!(line.starts_with("Backup: "), "{line}");
+        app.restore
+            .as_mut()
+            .expect("Restore got it")
+            .ctl
+            .wait_idle();
+        app.tick();
+        let r = app.restore.as_ref().unwrap();
+        assert_eq!(r.ctl.backup_folder(), opened.as_deref());
+        app.active = tab_index(TabId::Restore);
+        app.on_tab_changed();
+        restore_focus(&mut app, restore::Field::Backup);
+        assert!(app.handle_restore_key(KeyCode::Char('c')));
+        app.tick();
+        assert!(app.shell.shared_backup().is_none());
+        assert!(app.inspect.as_ref().unwrap().ctl.backup_folder().is_none());
+        assert!(!app.restore.as_ref().unwrap().ctl.has_backup());
+        // Opened on Restore, an empty Inspect adopts it when shown.
+        assert!(app.handle_restore_key(KeyCode::Char('o')));
+        restore_keys(&mut app, folder.display().to_string().as_str());
+        app.handle_restore_key(KeyCode::Enter);
+        restore_settle(&mut app);
+        assert!(app.shell.shared_backup().is_some());
+        app.active = tab_index(TabId::Inspect);
+        app.on_tab_changed();
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert_eq!(s.ctl.backup_folder(), app.shell.shared_backup());
+    }
+
+    /// Without `tui-update` there is no banner; with it the shell's announced release shows.
+    #[test]
+    fn the_update_banner_follows_the_shell_and_f12_hides_it() {
+        let mut app = App::headless_on(tab_index(TabId::Settings));
+        assert!(app.update_banner().is_none());
+        #[cfg(feature = "tui-update")]
+        {
+            app.shell
+                .set_update_info(crate::controller::app::UpdateInfo {
+                    current_version: "1.0.0".into(),
+                    latest_version: "2.0.0".into(),
+                    releases_url: String::new(),
+                    is_outdated: true,
+                    asset_url: None,
+                    cli_asset_url: None,
+                });
+            let line = app.shell_line().unwrap().0;
+            assert!(
+                line.contains("2.0.0") && line.contains("update --apply"),
+                "{line}"
+            );
+            ikey(&mut app, KeyCode::F(12));
+            assert!(app.update_banner().is_none());
+        }
+        ikey(&mut app, KeyCode::F(12));
+        assert!(!app.show_help && !app.should_quit);
+    }
+
     /// A disk the controller cannot open falls back to the plain read, which reports why.
     #[test]
     fn a_disk_that_cannot_be_opened_falls_back_to_the_plain_read() {
@@ -6543,31 +6434,5 @@ mod tests {
         let status = app.status.clone().unwrap_or_default();
         assert!(status.starts_with("Refreshed: "), "{status}");
         assert!(status.ends_with("device(s) found"), "{status}");
-    }
-
-    /// A Settings toggle saves through the Settings controller (memory config in tests).
-    #[test]
-    fn a_settings_toggle_saves_through_the_settings_controller() {
-        let mut app = App::new_on(tab_index(TabId::Settings));
-        let before = app.settings.as_ref().unwrap().ctl.update_check();
-        assert!(app.handle_settings_key(KeyCode::Enter));
-        let s = app.settings.as_ref().unwrap();
-        assert_eq!(s.ctl.update_check(), !before);
-        let status = s.status.clone().unwrap_or_default();
-        assert!(status.starts_with("Settings saved"), "{status}");
-        assert!(app.handle_settings_key(KeyCode::Down));
-        assert!(app.handle_settings_key(KeyCode::Char(' ')));
-        assert!(app.settings.as_ref().unwrap().ctl.file_associations());
-    }
-
-    /// Without `tui-update` the check stays out of the build and says so.
-    #[cfg(not(feature = "tui-update"))]
-    #[test]
-    fn check_now_without_tui_update_says_it_is_not_built() {
-        let mut app = App::new_on(tab_index(TabId::Settings));
-        assert!(app.handle_settings_key(KeyCode::Char('c')));
-        assert!(!app.task.is_active());
-        let status = app.settings.as_ref().unwrap().status.clone();
-        assert!(status.unwrap_or_default().contains("tui-update"));
     }
 }
