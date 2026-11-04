@@ -213,6 +213,9 @@ mod preserve_times {
     use std::fs::{File, OpenOptions};
     use std::path::Path;
 
+    /// Raw classic-Mac (create, modify, backup) catalog words.
+    type MacDates = (u32, u32, u32);
+
     /// Distinct early-1990s catalog words (seconds since 1904) that can't be mistaken for "now".
     const FILE_DATES: (u32, u32, u32) = (2_750_000_000, 2_760_000_000, 2_770_000_000);
     const DIR_DATES: (u32, u32, u32) = (2_740_000_000, 2_745_000_000, 0);
@@ -264,7 +267,7 @@ mod preserve_times {
     }
 
     /// The catalog dates of `/Games` and `/Games/Game` on `path`.
-    fn copied_dates(path: &Path) -> (Option<(u32, u32, u32)>, Option<(u32, u32, u32)>) {
+    fn copied_dates(path: &Path) -> (Option<MacDates>, Option<MacDates>) {
         let mut fs = open_rw(path);
         let root = fs.root().unwrap();
         let dir = child(&mut fs, &root, "Games");
