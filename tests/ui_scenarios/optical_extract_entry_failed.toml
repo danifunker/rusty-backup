@@ -1,0 +1,53 @@
+# An extraction that hits an entry it can't write asks Skip / Continue with all errors / Stop
+# (slice 21): a folder sits where /Apps/GameApp would land, the answer is "continue", and the
+# run ends with the list of what it skipped.
+name = "Optical: an entry that fails to extract asks the user"
+vm = "optical"
+requires = ["optical"]
+
+[[step]]
+action = "OpenImage"
+arg = "$hybrid"
+settle = true
+
+[[step]]
+action = "BrowseContents"
+settle = true
+expect = { browsing = true, error = "" }
+
+[[step]]
+action = "SelectFs"
+arg = "HFS"
+settle = true
+
+[[step]]
+action = "Select"
+arg = "/Apps"
+settle = true
+
+[[step]]
+action = "Block"
+arg = "Apps/GameApp"
+
+[[step]]
+action = "Extract"
+effects = ["PickFolder"]
+
+# The Apps folder exists, so the conflict review comes first.
+[[step]]
+action = "PickExtract"
+
+[[step]]
+action = "Overwrite"
+settle = true
+effects = ["Choose"]
+
+[[step]]
+action = "Chose"
+arg = 1
+settle = true
+expect = { extract_result = "Copied 0 file(s) to the extract folder; skipped 1.", skipped = 1, skipped_report = true }
+
+[[step]]
+action = "SkippedReportOk"
+expect = { skipped_report = false }

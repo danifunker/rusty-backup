@@ -303,14 +303,30 @@ impl PaneBrowser {
         self.ctl.as_mut().expect("open first")
     }
 
+    /// Run jobs to the end; a failed entry is answered Stop, as the disc browser always stopped.
     fn settle(&mut self) {
+        use crate::controller::commander::screen::purpose;
+        use crate::controller::commander::CommanderAction;
+        use crate::controller::Effect;
         let ctl = self.ctl();
         let start = std::time::Instant::now();
-        ctl.tick();
-        while ctl.is_working() {
+        let mut fx = ctl.tick();
+        loop {
+            for e in fx {
+                if let Effect::Choose(spec) = e {
+                    assert_eq!(spec.purpose, purpose::ENTRY_FAILED);
+                    ctl.apply(CommanderAction::Chose {
+                        purpose: spec.purpose,
+                        choice: spec.dismiss,
+                    });
+                }
+            }
+            if !ctl.is_working() {
+                break;
+            }
             assert!(start.elapsed().as_secs() < 60, "a job never ended");
             std::thread::sleep(std::time::Duration::from_millis(5));
-            ctl.tick();
+            fx = ctl.tick();
         }
     }
 
@@ -756,4 +772,3 @@ pub(super) const GOLDEN: &[(&str, &str)] = &[
     ("hybrid-chd fs1 export loose SeparateRsrc", "67ae8c744e9111d7fb9e4fb20975877419dffa6da041af6e5d3f88fe0a3177ae"),
     ("hybrid-chd fs1 export loose DataForkOnly", "b4541ad5de4fcc9325261dcb5356f0ea123aa7e495206599f14d5916150a64f9"),
 ];
-

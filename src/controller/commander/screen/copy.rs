@@ -7,15 +7,23 @@ use disk_core::display::format_size;
 use disk_core::entry::FileEntry;
 
 use super::{
-    ChecksumRow, Checksums, CommanderController, CopyRun, ExportFormat, PendingConflict,
-    PendingExport, RenameNotice, Side,
+    purpose, ChecksumRow, Checksums, CommanderController, CopyRun, ExportFormat, PendingConflict,
+    PendingExport, RenameNotice, Side, SkippedReport,
 };
 use crate::controller::browser::pane::StageOutcome;
 use crate::controller::commander::OnConflict;
-use crate::controller::{Effect, PickSpec};
+use crate::controller::{Choice, ChoiceSpec, Effect, PickSpec};
 use crate::model::checksum::{self, ChecksumJob, FileChecksum};
 use crate::model::commander_ops::{self, ExportJob, HostCopyJob};
+use crate::model::extract::{ASK_ENTRY_FAILED, ENTRY_FAILED_CHOICES};
 use crate::model::job::{Resource, Status};
+
+/// A failed entry's buttons, in `ENTRY_FAILED_CHOICES` order, with the terminal keys.
+const ENTRY_FAILED_BUTTONS: [(&str, char); 3] = [
+    ("Skip", 's'),
+    ("Continue with all errors", 'c'),
+    ("Stop", 't'),
+];
 
 impl CommanderController {
     /// Copy the `from` pane's selection into the other pane's folder; returns the status line.
@@ -252,6 +260,7 @@ impl CommanderController {
             });
         match spawned {
             Ok(job) => {
+                self.asked = None;
                 self.copy = Some(CopyRun::Host {
                     job,
                     dest,
@@ -279,6 +288,41 @@ impl CommanderController {
         self.report(msg);
     }
 
+    /// Put the running copy's new question (an entry that failed) to the shell, once.
+    pub(super) fn poll_question(&mut self) -> Vec<Effect> {
+        let Some(CopyRun::Host { job, .. }) = &self.copy else {
+            return Vec::new();
+        };
+        let Some(q) = job.question().filter(|q| self.asked != Some(q.id)) else {
+            return Vec::new();
+        };
+        self.asked = Some(q.id);
+        if q.kind != ASK_ENTRY_FAILED {
+            return Vec::new();
+        }
+        let choices = ENTRY_FAILED_BUTTONS
+            .iter()
+            .map(|(label, key)| Choice {
+                label: label.to_string(),
+                key: *key,
+            })
+            .collect();
+        vec![Effect::Choose(ChoiceSpec {
+            purpose: purpose::ENTRY_FAILED,
+            title: "Extraction error".into(),
+            message: format!("Could not extract {}: {}", q.subject, q.detail),
+            choices,
+            dismiss: ENTRY_FAILED_BUTTONS.len() - 1,
+        })]
+    }
+
+    /// Hand the user's answer to the waiting copy.
+    pub(super) fn answer_entry_failed(&mut self, choice: usize) {
+        if let (Some(CopyRun::Host { job, .. }), Some(id)) = (&self.copy, self.asked) {
+            job.answer(id, choice.min(ENTRY_FAILED_CHOICES.len() - 1));
+        }
+    }
+
     pub(super) fn poll_copy(&mut self) {
         let finished = match &self.copy {
             Some(CopyRun::Host { job, .. }) => !job.is_running(),
@@ -297,7 +341,12 @@ impl CommanderController {
                 if let Some(side) = dest {
                     self.reload(side);
                 }
+                let asked = self.asked.take().is_some();
                 let msg = match (job.snapshot().status, job.take_result()) {
+                    (Status::Done, Some(done)) if done.stopped.is_some() || asked => {
+                        self.end_asked_run(done, &where_to);
+                        return;
+                    }
                     (Status::Done, Some(done)) => {
                         let skipped = done.skipped.len();
                         let msg = if skipped == 0 {
@@ -333,6 +382,31 @@ impl CommanderController {
                 self.report(msg);
             }
             None => {}
+        }
+    }
+
+    /// A run that asked about failed entries ends with their list (and where it stopped).
+    fn end_asked_run(&mut self, done: commander_ops::HostCopyDone, where_to: &str) {
+        let copied = done.copied;
+        let n = done.skipped.len();
+        let summary = match &done.stopped {
+            Some(at) => {
+                format!("Stopped at {at}. Copied {copied} file(s) to the {where_to}; skipped {n}.")
+            }
+            None if n == 0 => format!("Copied {copied} file(s) to the {where_to}."),
+            None => format!("Copied {copied} file(s) to the {where_to}; skipped {n}."),
+        };
+        self.report(summary.clone());
+        for s in &done.skipped {
+            self.record_log(format!("Skipped {s}"));
+        }
+        if n > 0 || done.stopped.is_some() {
+            self.skipped_report = Some(SkippedReport {
+                title: "Entries not extracted".into(),
+                summary,
+                skipped: done.skipped,
+                stopped: done.stopped,
+            });
         }
     }
 

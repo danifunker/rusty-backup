@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use rusty_backup::controller::{ConfirmSpec, Effect, PickSpec, TextSpec};
+use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, Effect, PickSpec, TextSpec};
 
 /// An answer to an effect, for the view to turn into its controller's action.
 pub(crate) enum Reply {
@@ -24,6 +24,10 @@ pub(crate) enum Reply {
     Answered {
         purpose: &'static str,
         text: Option<String>,
+    },
+    Chose {
+        purpose: &'static str,
+        choice: usize,
     },
     /// The controller asked to leave its screen.
     CloseScreen,
@@ -40,6 +44,7 @@ struct TextPrompt {
 #[derive(Default)]
 pub(crate) struct EffectHost {
     confirm: Option<ConfirmSpec>,
+    choice: Option<ChoiceSpec>,
     text: Option<TextPrompt>,
 }
 
@@ -64,6 +69,7 @@ impl EffectHost {
                     path: pick(&spec, true),
                 }),
                 Effect::Confirm(spec) => self.confirm = Some(spec),
+                Effect::Choose(spec) => self.choice = Some(spec),
                 Effect::AskText(spec) => {
                     self.text = Some(TextPrompt {
                         input: spec.initial.clone(),
@@ -86,13 +92,16 @@ impl EffectHost {
 
     /// True while a confirmation or text prompt waits for an answer.
     pub(crate) fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.text.is_some()
+        self.confirm.is_some() || self.choice.is_some() || self.text.is_some()
     }
 
     /// The `purpose` of the confirmation or prompt on screen.
     pub(crate) fn pending_purpose(&self) -> Option<&'static str> {
         let confirm = self.confirm.as_ref().map(|c| c.purpose);
-        confirm.or_else(|| self.text.as_ref().map(|t| t.spec.purpose))
+        let choice = self.choice.as_ref().map(|c| c.purpose);
+        confirm
+            .or(choice)
+            .or_else(|| self.text.as_ref().map(|t| t.spec.purpose))
     }
 
     /// Draw the pending confirmation or prompt; `whose` tells two hosts' windows apart.
@@ -100,7 +109,40 @@ impl EffectHost {
         if self.confirm.is_some() {
             return self.show_confirm(ctx, whose);
         }
+        if self.choice.is_some() {
+            return self.show_choice(ctx, whose);
+        }
         self.show_text(ctx, whose)
+    }
+
+    fn show_choice(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {
+        let spec = self.choice.as_ref()?;
+        let mut answer = None;
+        egui::Window::new(titled(&spec.title, whose))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(&spec.message);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (i, c) in spec.choices.iter().enumerate() {
+                        if ui.button(c.label.as_str()).clicked() {
+                            answer = Some(i);
+                        }
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    answer = Some(spec.dismiss);
+                }
+            });
+        let choice = answer?;
+        let spec = self.choice.take()?;
+        Some(Reply::Chose {
+            purpose: spec.purpose,
+            choice,
+        })
     }
 
     fn show_confirm(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {

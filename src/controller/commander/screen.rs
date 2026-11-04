@@ -93,6 +93,8 @@ pub mod purpose {
     pub const DETAIL_MODE: &str = "commander.detail_mode";
     pub const DETAIL_OWNER: &str = "commander.detail_owner";
     pub const DETAIL_XATTR: &str = "commander.detail_xattr";
+    /// An extracted entry failed: Skip, Continue with all errors, or Stop.
+    pub const ENTRY_FAILED: &str = "commander.entry_failed";
 }
 
 /// Bytes of a file File Info reads for its preview.
@@ -219,6 +221,13 @@ pub enum CommanderAction {
         purpose: &'static str,
         text: Option<String>,
     },
+    /// The answer to a `Choose`: the index of the button picked.
+    Chose {
+        purpose: &'static str,
+        choice: usize,
+    },
+    /// Close the list of entries an extraction skipped.
+    SkippedReportOk,
 }
 
 /// One entry of a view's "Export as" menu: a format, and the fork container for loose files.
@@ -275,6 +284,18 @@ pub fn export_choices() -> Vec<ExportChoice> {
             fork: None,
         }))
         .collect()
+}
+
+/// The entries a run skipped after the user was asked about them, shown when it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedReport {
+    pub title: String,
+    /// What the run did, one line.
+    pub summary: String,
+    /// Each skipped entry with its error.
+    pub skipped: Vec<String>,
+    /// The entry and error at which the user chose Stop.
+    pub stopped: Option<String>,
 }
 
 /// Names a staged copy changed (or left out) for the destination filesystem.
@@ -415,6 +436,9 @@ pub struct CommanderController {
     copy: Option<CopyRun>,
     conflict: Option<PendingConflict>,
     rename_notice: Option<RenameNotice>,
+    /// The running copy's question put to the shell (its id), so it is asked once.
+    asked: Option<u64>,
+    skipped_report: Option<SkippedReport>,
     export: Option<PendingExport>,
     /// An extraction waiting for its destination picker.
     extract: Option<extract::PendingExtract>,
@@ -466,6 +490,7 @@ impl Controller for CommanderController {
             let pane_fx = self.pane_mut(side).tick();
             fx.extend(self.absorb(side, pane_fx));
         }
+        fx.extend(self.poll_question());
         self.poll_copy();
         self.poll_checksums();
         self.poll_detail();
@@ -540,6 +565,16 @@ impl CommanderController {
                 self.rename_notice = None;
                 Vec::new()
             }
+            A::SkippedReportOk => {
+                self.skipped_report = None;
+                Vec::new()
+            }
+            A::Chose { purpose, choice } if purpose == purpose::ENTRY_FAILED => {
+                self.answer_entry_failed(choice);
+                Vec::new()
+            }
+            // Only the screen itself asks a `Choose`; a stray answer has no one to go to.
+            A::Chose { .. } => Vec::new(),
             A::RenameNoticeUndo => {
                 self.undo_rename_notice();
                 Vec::new()
@@ -715,6 +750,8 @@ impl CommanderController {
             copy: None,
             conflict: None,
             rename_notice: None,
+            asked: None,
+            skipped_report: None,
             export: None,
             extract: None,
             checksums: None,
@@ -922,6 +959,11 @@ impl CommanderController {
         self.rename_notice.as_ref()
     }
 
+    /// The entries the last extraction skipped or stopped at after asking, until dismissed.
+    pub fn skipped_report(&self) -> Option<&SkippedReport> {
+        self.skipped_report.as_ref()
+    }
+
     pub fn checksums(&self) -> Option<&Checksums> {
         self.checksums.as_ref()
     }
@@ -1005,6 +1047,7 @@ impl CommanderController {
             |p: &BrowserPaneController| p.apply_review().is_some() || p.apply_report().is_some();
         self.conflict.is_some()
             || self.rename_notice.is_some()
+            || self.skipped_report.is_some()
             || pane_modal(&self.left)
             || pane_modal(&self.right)
     }
@@ -1056,6 +1099,7 @@ impl CommanderController {
                 Effect::Confirm(s) => Some(s.purpose),
                 Effect::AskPassword(s) => Some(s.purpose),
                 Effect::AskText(s) => Some(s.purpose),
+                Effect::Choose(s) => Some(s.purpose),
                 Effect::OpenUrl(_)
                 | Effect::CopyToClipboard(_)
                 | Effect::CloseScreen

@@ -126,7 +126,7 @@ impl PhysicalDiskExport {
         }
         for reply in replies {
             let action = match reply {
-                Reply::Picked { .. } | Reply::CloseScreen => continue,
+                Reply::Picked { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
                 Reply::Confirmed { purpose, yes } => DiskWriteAction::Confirmed { purpose, yes },
                 Reply::Answered { purpose, text } => DiskWriteAction::Answered { purpose, text },
             };

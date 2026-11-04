@@ -174,7 +174,7 @@ impl RestoreTab {
                 Reply::Picked { purpose, path } => RestoreAction::Picked { purpose, path },
                 Reply::Confirmed { purpose, yes } => RestoreAction::Confirmed { purpose, yes },
                 Reply::Answered { purpose, text } => RestoreAction::Answered { purpose, text },
-                Reply::CloseScreen => continue,
+                Reply::Chose { .. } | Reply::CloseScreen => continue,
             };
             self.act(action);
         }

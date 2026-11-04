@@ -970,6 +970,8 @@ pub struct HostCopyStatus {
     /// Host paths the copy passed over (symlinks, sockets, devices), for the
     /// completion message; a silent omission looked like a complete copy.
     pub skipped: Vec<String>,
+    /// The entry (and its error) at which the user chose Stop; the run ended there.
+    pub stopped: Option<String>,
 }
 
 /// Record a source entry the copy will not carry over.
@@ -998,6 +1000,8 @@ pub struct HostCopyDone {
     pub copied: usize,
     /// Host paths passed over (special files, or existing ones under `OnConflict::Skip`).
     pub skipped: Vec<String>,
+    /// The entry at which the user chose Stop (an extraction's failed entry), with its error.
+    pub stopped: Option<String>,
 }
 
 /// Run a [`HostCopyJob`] as a job body, reporting through `ctx`.
@@ -1010,10 +1014,15 @@ pub fn host_copy_in_job(job: HostCopyJob, ctx: &crate::model::job::JobCtx) -> Re
         }
         mirror_progress(ctx, &last, &s.current_file, s.bytes_done, s.bytes_total);
     };
-    let copied =
-        crate::model::worker::run_mirrored(ctx, &status, mirror, || run_host_copy(job, &status))?;
-    let skipped = std::mem::take(&mut crate::model::worker::lock_status(&status).skipped);
-    Ok(HostCopyDone { copied, skipped })
+    let copied = crate::model::worker::run_mirrored(ctx, &status, mirror, || {
+        run_host_copy(job, &status, Some(ctx))
+    })?;
+    let mut g = crate::model::worker::lock_status(&status);
+    Ok(HostCopyDone {
+        copied,
+        skipped: std::mem::take(&mut g.skipped),
+        stopped: g.stopped.take(),
+    })
 }
 
 /// Off-thread [`stage_copy`] as a job body: reopens `source` and extracts into `temp_dir`.
@@ -1069,7 +1078,7 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
     let status_thread = Arc::clone(&status);
     crate::model::worker::spawn_guarded(Arc::clone(&status), "host copy", move || {
-        let result = run_host_copy(job, &status_thread);
+        let result = run_host_copy(job, &status_thread, None);
         if let Ok(mut g) = status_thread.lock() {
             match result {
                 Ok(n) => g.copied = n,
@@ -1082,7 +1091,11 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     status
 }
 
-fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+fn run_host_copy(
+    job: HostCopyJob,
+    status: &Arc<Mutex<HostCopyStatus>>,
+    ask: Option<&crate::model::job::JobCtx>,
+) -> Result<usize> {
     match job {
         HostCopyJob::ImageToHost {
             source,
@@ -1104,6 +1117,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
                 fork_mode,
                 on_conflict,
                 status,
+                ask,
             )
         }
         HostCopyJob::HostToHost {
@@ -1159,7 +1173,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             upload_host_entries_to_remote_host(&entries, &mut conn, &dest_parent, status)
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
-        HostCopyJob::Extract(job) => crate::model::extract::run(*job, status),
+        HostCopyJob::Extract(job) => crate::model::extract::run(*job, status, ask),
     }
 }
 
@@ -1225,6 +1239,7 @@ pub fn export_fs_entries_to_host(
         fork_mode,
         OnConflict::Replace,
         &status,
+        None,
     )
 }
 
@@ -1353,7 +1368,8 @@ fn scan_host_dir(dir: &Path) -> (usize, u64) {
 }
 
 /// Extract image `entries` into `dest_dir` through the `rb-fsexporter` crate: folders recursed,
-/// forks per `fork_mode`, symlinks and special files left out, `on_conflict` per file.
+/// forks per `fork_mode`, symlinks and special files left out, `on_conflict` per file. A failed
+/// entry is put to `ask`'s user (skip, skip all, stop); without one it stops the copy.
 fn copy_image_entries_to_host(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
@@ -1361,6 +1377,7 @@ fn copy_image_entries_to_host(
     fork_mode: ResourceForkMode,
     on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
+    ask: Option<&crate::model::job::JobCtx>,
 ) -> Result<usize> {
     let mut opts = rb_fsexporter::Options::new(fork_mode);
     opts.symlinks = rb_fsexporter::Symlinks::Skip;
@@ -1370,14 +1387,27 @@ fn copy_image_entries_to_host(
         OnConflict::Skip => rb_fsexporter::Existing::Skip,
         OnConflict::Fail => rb_fsexporter::Existing::Fail,
     };
-    let mut host = CopyHost { status, count: 0 };
+    let mut host = CopyHost {
+        status,
+        count: 0,
+        asker: crate::model::extract::ErrorAsker::new(ask, status),
+    };
     for entry in entries {
-        rb_fsexporter::extract(fs, entry, dest_dir, &opts, &mut host).map_err(|e| {
-            match e.is::<rb_fsexporter::Cancelled>() {
-                true => cancelled_err(),
-                false => e.context(format!("extracting '{}'", entry.name)),
-            }
-        })?;
+        let Err(e) = rb_fsexporter::extract(fs, entry, dest_dir, &opts, &mut host) else {
+            continue;
+        };
+        if e.is::<rb_fsexporter::Cancelled>() || is_cancelled(status) {
+            return Err(cancelled_err());
+        }
+        if host.asker.stopped() {
+            break;
+        }
+        let e = e.context(format!("extracting '{}'", entry.name));
+        match host.asker.decide(entry.path.as_str(), &e) {
+            None => return Err(e),
+            Some(rb_fsexporter::ErrorChoice::Stop) => break,
+            Some(_) => host.asker.skipped(entry.path.as_str(), &e),
+        }
     }
     Ok(host.count)
 }
@@ -1386,6 +1416,7 @@ fn copy_image_entries_to_host(
 struct CopyHost<'a> {
     status: &'a Arc<Mutex<HostCopyStatus>>,
     count: usize,
+    asker: crate::model::extract::ErrorAsker<'a>,
 }
 
 impl rb_fsexporter::Host for CopyHost<'_> {
@@ -1405,6 +1436,18 @@ impl rb_fsexporter::Host for CopyHost<'_> {
             g.copied = self.count;
             g.bytes_done = g.bytes_done.saturating_add(entry.size);
         }
+    }
+
+    fn on_error(
+        &mut self,
+        entry: &FileEntry,
+        err: &anyhow::Error,
+    ) -> Option<rb_fsexporter::ErrorChoice> {
+        self.asker.decide(entry.path.as_str(), err)
+    }
+
+    fn failed(&mut self, entry: &FileEntry, err: &anyhow::Error) {
+        self.asker.skipped(entry.path.as_str(), err);
     }
 
     fn exists(&mut self, path: &Path) {
@@ -2520,6 +2563,7 @@ mod tests {
             ResourceForkMode::DataForkOnly,
             OnConflict::Replace,
             &status,
+            None,
         )
         .expect("extract");
         assert_eq!(n, 2);

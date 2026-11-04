@@ -208,7 +208,10 @@ impl FloppyConvertDialog {
                 Reply::Picked { purpose, path } => {
                     self.act(FloppyConvertAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
         }
     }

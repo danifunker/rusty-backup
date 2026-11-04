@@ -19,11 +19,11 @@
 //! - Tier A tests replay `tests/ui_scenarios/*.toml` against controllers (`tests/ui_scenarios.rs`).
 
 pub mod alto_resize;
-pub mod archives;
 pub mod app;
+pub mod archives;
 pub mod backup;
-pub mod bulk_convert;
 pub mod browser;
+pub mod bulk_convert;
 pub mod commander;
 pub mod disk_write;
 pub mod expand_hfs;
@@ -78,6 +78,8 @@ pub enum Effect {
     AskPassword(PasswordSpec),
     /// A one-line text prompt; answer with the controller's `Answered`-style action.
     AskText(TextSpec),
+    /// One of several buttons; answer with the controller's `Chose`-style action.
+    Choose(ChoiceSpec),
     /// A transient message for the user (status line, toast or alert).
     Message(String),
     OpenUrl(String),
@@ -107,6 +109,25 @@ pub struct ConfirmSpec {
     pub message: String,
     pub confirm_label: String,
     pub destructive: bool,
+}
+
+/// A question with several answers, such as Skip / Continue with all errors / Stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceSpec {
+    pub purpose: &'static str,
+    pub title: String,
+    pub message: String,
+    /// The buttons in order; the answer is an index into this list.
+    pub choices: Vec<Choice>,
+    /// The answer Esc (or closing the window) gives.
+    pub dismiss: usize,
+}
+
+/// One answer of a [`ChoiceSpec`]: its button label and the key that picks it in a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub label: String,
+    pub key: char,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

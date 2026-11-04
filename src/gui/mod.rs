@@ -72,6 +72,9 @@ pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
             Effect::Confirm(spec) => {
                 log::error!("confirm {:?} has no EffectHost to answer it", spec.purpose)
             }
+            Effect::Choose(spec) => {
+                log::error!("choice {:?} has no EffectHost to answer it", spec.purpose)
+            }
             Effect::AskPassword(spec) => {
                 log::error!("no egui handler yet for password {:?}", spec.purpose)
             }

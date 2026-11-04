@@ -119,7 +119,10 @@ impl RemoteBrowsePanel {
                 Reply::Answered { purpose, text } => {
                     self.act(RemotePickAction::Answered { purpose, text })
                 }
-                Reply::Picked { .. } | Reply::Confirmed { .. } | Reply::CloseScreen => {}
+                Reply::Picked { .. }
+                | Reply::Confirmed { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
         }
         if !self.pending_fx.is_empty() {

@@ -783,3 +783,164 @@ fn a_mac_archive_is_sniffed_and_read_on_the_shared_reader() {
         ctl.status()
     );
 }
+
+/// A FAT volume `T` with `/SUB/A.TXT`, `/SUB/AOK.TXT`, `/SUB/B.TXT` and `/HELLO.TXT`; under
+/// `out`, folders sit where A.TXT, B.TXT and HELLO.TXT would land, so writing each fails.
+fn three_failures(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let img = dir.join("vol.img");
+    let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+    std::fs::write(&img, bytes).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+    let root = fs.root().unwrap();
+    let sub = fs
+        .create_directory(&root, "SUB", &Default::default())
+        .unwrap();
+    for (parent, name) in [(&sub, "A.TXT"), (&sub, "AOK.TXT"), (&sub, "B.TXT")] {
+        let mut data: &[u8] = b"data";
+        fs.create_file(parent, name, &mut data, 4, &Default::default())
+            .unwrap();
+    }
+    let mut data: &[u8] = b"hello";
+    fs.create_file(&root, "HELLO.TXT", &mut data, 5, &Default::default())
+        .unwrap();
+    fs.sync_metadata().unwrap();
+    let out = dir.join("out");
+    for blocker in ["T/SUB/A.TXT", "T/SUB/B.TXT", "T/HELLO.TXT"] {
+        std::fs::create_dir_all(out.join(blocker)).unwrap();
+    }
+    (img, out)
+}
+
+/// Extract the whole volume into `out` over the blockers, answering each failure from `answers`;
+/// returns the messages asked.
+fn extract_answering(ctl: &mut CommanderController, out: &Path, answers: &[usize]) -> Vec<String> {
+    use crate::controller::commander::screen::purpose as screen_purpose;
+    use crate::controller::commander::{ExtractOptions, OnConflict};
+    ctl.apply(CommanderAction::Extract {
+        from: Side::Left,
+        path: "/".into(),
+        options: ExtractOptions::default(),
+        dest: Some(out.to_path_buf()),
+    });
+    // The volume's folder exists, so the conflict review comes first.
+    assert!(ctl.host_conflict().is_some(), "{}", ctl.status());
+    ctl.apply(CommanderAction::HostConflict(OnConflict::Replace));
+    let mut asked = Vec::new();
+    let mut answers = answers.iter();
+    let start = Instant::now();
+    loop {
+        for e in ctl.tick() {
+            let Effect::Choose(spec) = e else { continue };
+            assert_eq!(spec.purpose, screen_purpose::ENTRY_FAILED);
+            let labels: Vec<&str> = spec.choices.iter().map(|c| c.label.as_str()).collect();
+            assert_eq!(labels, ["Skip", "Continue with all errors", "Stop"]);
+            asked.push(spec.message.clone());
+            let choice = *answers.next().expect("asked more often than expected");
+            ctl.apply(CommanderAction::Chose {
+                purpose: spec.purpose,
+                choice,
+            });
+        }
+        if !ctl.is_working() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    settle(ctl);
+    asked
+}
+
+#[test]
+fn skip_asks_again_at_every_failed_entry_and_lists_them_at_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (img, out) = three_failures(dir.path());
+    let mut ctl = inspect(&img);
+    let asked = extract_answering(&mut ctl, &out, &[0, 0, 0]);
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    assert!(
+        asked[0].starts_with("Could not extract /SUB/A.TXT: "),
+        "{asked:?}"
+    );
+    assert!(asked[2].starts_with("Could not extract /HELLO.TXT: "));
+    assert_eq!(std::fs::read(out.join("T/SUB/AOK.TXT")).unwrap(), b"data");
+    let report = ctl.skipped_report().expect("the skipped list");
+    assert_eq!(report.skipped.len(), 3);
+    assert!(report.skipped[0].starts_with("/SUB/A.TXT ("));
+    assert_eq!(report.stopped, None);
+    assert_eq!(
+        ctl.status(),
+        "Copied 1 file(s) to the extract folder; skipped 3."
+    );
+    assert!(ctl.modal_open());
+    ctl.apply(CommanderAction::SkippedReportOk);
+    assert!(ctl.skipped_report().is_none());
+}
+
+#[test]
+fn continue_with_all_errors_asks_once_and_skips_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (img, out) = three_failures(dir.path());
+    let mut ctl = inspect(&img);
+    let asked = extract_answering(&mut ctl, &out, &[1]);
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let report = ctl.skipped_report().expect("the skipped list");
+    let paths: Vec<&str> = report
+        .skipped
+        .iter()
+        .map(|s| s.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(paths, ["/SUB/A.TXT", "/SUB/B.TXT", "/HELLO.TXT"]);
+    assert!(out.join("T/SUB/AOK.TXT").is_file());
+}
+
+#[test]
+fn stop_ends_the_extraction_and_keeps_what_was_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (img, out) = three_failures(dir.path());
+    let mut ctl = inspect(&img);
+    let asked = extract_answering(&mut ctl, &out, &[0, 2]);
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    let report = ctl.skipped_report().expect("the skipped list");
+    assert_eq!(report.skipped.len(), 1);
+    let stopped = report.stopped.as_deref().unwrap_or("");
+    assert!(stopped.starts_with("/SUB/B.TXT ("), "{stopped}");
+    assert!(ctl.status().starts_with("Stopped at /SUB/B.TXT ("));
+    let said = ctl.status();
+    assert!(
+        said.ends_with("Copied 1 file(s) to the extract folder; skipped 1."),
+        "{said}"
+    );
+    // AOK.TXT came before the stop; nothing after it ran.
+    assert!(out.join("T/SUB/AOK.TXT").is_file());
+    assert!(out.join("T/HELLO.TXT").is_dir());
+}
+
+#[test]
+fn cancel_while_asking_ends_the_copy_cancelled() {
+    use crate::controller::commander::{ExtractOptions, OnConflict};
+    let dir = tempfile::tempdir().unwrap();
+    let (img, out) = three_failures(dir.path());
+    let mut ctl = inspect(&img);
+    ctl.apply(CommanderAction::Extract {
+        from: Side::Left,
+        path: "/".into(),
+        options: ExtractOptions::default(),
+        dest: Some(out.clone()),
+    });
+    ctl.apply(CommanderAction::HostConflict(OnConflict::Replace));
+    let start = Instant::now();
+    while !ctl.tick().iter().any(|e| matches!(e, Effect::Choose(_))) {
+        assert!(start.elapsed() < Duration::from_secs(60), "never asked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ctl.apply(CommanderAction::CancelCopy);
+    settle(&mut ctl);
+    assert_eq!(ctl.status(), "Copy to the extract folder cancelled.");
+    assert!(ctl.skipped_report().is_none());
+}

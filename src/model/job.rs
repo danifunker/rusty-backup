@@ -7,6 +7,10 @@
 //! shell needs a per-frame timer. Progress wakes are throttled to about 10 Hz;
 //! phase changes and the end always wake.
 //!
+//! A body that needs the user mid-run (an entry failed: skip it or stop?) calls [`JobCtx::ask`]
+//! and waits; the controller sees [`Job::question`], puts it to its shell as an effect and
+//! hands the answer back with [`Job::answer`]. A cancel ends the wait.
+//!
 //! A [`JobRegistry`] tracks which [`Resource`]s running jobs touch, refuses a
 //! second job on a busy resource, and can say which job holds it.
 //!
@@ -133,6 +137,17 @@ pub fn progress_line(
     parts.join(", ")
 }
 
+/// A question a running job waits on; the controller that owns the job puts it to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// Tells this question from the job's earlier ones, so it is put to the user once.
+    pub id: u64,
+    /// Which question it is, for the controller (such as `model::extract::ASK_ENTRY_FAILED`).
+    pub kind: &'static str,
+    pub subject: String,
+    pub detail: String,
+}
+
 /// Wakes a shell's UI thread; implemented once per shell (egui: `request_repaint`).
 pub trait Notify: Send + Sync {
     fn wake(&self);
@@ -181,6 +196,10 @@ struct State<R> {
     last_progress_wake: Option<Instant>,
     started: Instant,
     rate: super::rate_tracker::RateTracker,
+    question: Option<Question>,
+    /// The answer to the question with this id.
+    answer: Option<(u64, usize)>,
+    questions_asked: u64,
 }
 
 struct Shared<R> {
@@ -212,6 +231,7 @@ trait CtxTarget: Send + Sync {
     fn set_phase(&self, phase: String);
     fn set_progress(&self, progress: Progress);
     fn set_can_cancel(&self, can: bool);
+    fn ask(&self, kind: &'static str, subject: String, detail: String) -> Option<usize>;
 }
 
 impl<R: Send> CtxTarget for Shared<R> {
@@ -258,6 +278,38 @@ impl<R: Send> CtxTarget for Shared<R> {
     fn set_can_cancel(&self, can: bool) {
         self.update(true, |s| s.can_cancel = can);
     }
+
+    fn ask(&self, kind: &'static str, subject: String, detail: String) -> Option<usize> {
+        let id = {
+            let mut st = lock_status(&self.state);
+            st.questions_asked += 1;
+            let id = st.questions_asked;
+            st.question = Some(Question {
+                id,
+                kind,
+                subject,
+                detail,
+            });
+            st.answer = None;
+            st.snapshot.generation += 1;
+            id
+        };
+        self.notify.wake();
+        loop {
+            {
+                let mut st = lock_status(&self.state);
+                let answered = st.answer.filter(|(a, _)| *a == id).map(|(_, c)| c);
+                let cancelled = self.cancel.load(Ordering::Relaxed);
+                if answered.is_some() || cancelled {
+                    st.question = None;
+                    st.answer = None;
+                    st.snapshot.generation += 1;
+                    return answered;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl JobCtx {
@@ -302,6 +354,16 @@ impl JobCtx {
         } else {
             Ok(())
         }
+    }
+
+    /// Put a question to the user and wait: the index of the answer, `None` once cancelled.
+    pub fn ask(
+        &self,
+        kind: &'static str,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Option<usize> {
+        self.shared.ask(kind, subject.into(), detail.into())
     }
 
     /// The cancel flag itself, for engine code that already takes an `Arc<AtomicBool>`.
@@ -358,6 +420,9 @@ impl<R: Send + 'static> Job<R> {
                 last_progress_wake: None,
                 started: Instant::now(),
                 rate: super::rate_tracker::RateTracker::default(),
+                question: None,
+                answer: None,
+                questions_asked: 0,
             }),
             cancel: Arc::clone(&cancel),
             notify,
@@ -410,6 +475,19 @@ impl<R> Job<R> {
     pub fn cancel(&self) {
         self.shared.cancel.store(true, Ordering::Relaxed);
         self.shared.update(true, |s| s.cancel_requested = true);
+    }
+
+    /// The question the body is waiting on, if any.
+    pub fn question(&self) -> Option<Question> {
+        lock_status(&self.shared.state).question.clone()
+    }
+
+    /// Answer question `id` with the index of a choice; a stale id is ignored.
+    pub fn answer(&self, id: u64, choice: usize) {
+        let mut st = lock_status(&self.shared.state);
+        if st.question.as_ref().is_some_and(|q| q.id == id) {
+            st.answer = Some((id, choice));
+        }
     }
 
     /// The body's result, once: `Some` only after `Status::Done`.
@@ -572,6 +650,50 @@ mod tests {
         assert_eq!(job.wait().status, Status::Done);
         assert_eq!(job.take_result(), Some(4));
         assert_eq!(job.take_result(), None);
+    }
+
+    fn wait_for_question<R>(job: &Job<R>) -> Question {
+        let start = Instant::now();
+        loop {
+            if let Some(q) = job.question() {
+                return q;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "no question");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_question_waits_for_its_answer_and_a_cancel_ends_the_wait() {
+        let job = Job::spawn("ask", quiet(), |ctx| {
+            let first = ctx.ask("kind", "a", "why");
+            let second = ctx.ask("kind", "b", "why");
+            Ok((first, second))
+        });
+        let q = wait_for_question(&job);
+        assert_eq!((q.kind, q.subject.as_str()), ("kind", "a"));
+        // A stale id is ignored, so an answer can't land on the next question.
+        job.answer(q.id + 1, 9);
+        job.answer(q.id, 2);
+        let q2 = wait_for_question(&job);
+        let q2 = match q2.id == q.id {
+            true => {
+                std::thread::sleep(Duration::from_millis(50));
+                wait_for_question(&job)
+            }
+            false => q2,
+        };
+        assert_eq!(q2.subject, "b");
+        job.answer(q2.id, 0);
+        assert_eq!(job.wait().status, Status::Done);
+        assert_eq!(job.take_result(), Some((Some(2), Some(0))));
+        assert_eq!(job.question(), None);
+
+        let job = Job::spawn("ask", quiet(), |ctx| Ok(ctx.ask("kind", "a", "why")));
+        wait_for_question(&job);
+        job.cancel();
+        job.wait();
+        assert_eq!(job.question(), None);
     }
 
     #[test]

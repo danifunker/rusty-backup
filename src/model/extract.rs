@@ -5,9 +5,10 @@
 //! `ResourceForkMode`, ProDOS files named with the CiderPress `#TTAAAA` suffix so type and aux
 //! survive a round trip, and QNX 2 text files with RS line separators turned into LF. It runs
 //! as a [`super::commander_ops::HostCopyJob::Extract`] so the screen's copy job reports its
-//! progress, cancels it and settles existing files. A disc keeps the Optical tab's old
-//! settings: no Finder-info-only AppleDouble sidecar, and any error stops the extraction
-//! (docs/phase2_commander_plan.md § "Slice 19").
+//! progress, cancels it and settles existing files. Every source, discs included, writes an
+//! AppleDouble sidecar for Finder info alone, and an entry that fails asks the user (through
+//! [`JobCtx::ask`], [`ASK_ENTRY_FAILED`]): skip it, skip every failure, or stop
+//! (docs/phase2_commander_plan.md § "Slice 21").
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,17 @@ use fs_mac::resource_fork::{sanitize_filename, ResourceForkMode};
 use rb_fsexporter::{Host, Options, Summary};
 
 use super::commander_ops::{HostCopyStatus, StageSource};
+use super::job::JobCtx;
 use crate::fs::replace::OnConflict;
+
+pub use rb_fsexporter::ErrorChoice;
+
+/// The [`super::job::Question::kind`] of an entry that failed: subject its path, detail the error.
+pub const ASK_ENTRY_FAILED: &str = "extract.entry-failed";
+
+/// The answers to [`ASK_ENTRY_FAILED`], in the order the answer's index counts them.
+pub const ENTRY_FAILED_CHOICES: [ErrorChoice; 3] =
+    [ErrorChoice::Skip, ErrorChoice::SkipAll, ErrorChoice::Stop];
 
 /// How files land on the host.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,7 +110,12 @@ pub fn extraction_conflicts(
 }
 
 /// Run an extraction, counting first for the progress bar; returns the files written.
-pub(crate) fn run(job: ExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+/// A failed entry is put to `ask`'s user; without one it is skipped.
+pub(crate) fn run(
+    job: ExtractJob,
+    status: &Arc<Mutex<HostCopyStatus>>,
+    ask: Option<&JobCtx>,
+) -> Result<usize> {
     let ExtractJob {
         source,
         entry,
@@ -113,6 +129,7 @@ pub(crate) fn run(job: ExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
         options,
         forks,
         on_conflict,
+        ask,
     };
     #[cfg(feature = "optical")]
     if let Some(disc) = source.disc() {
@@ -123,8 +140,7 @@ pub(crate) fn run(job: ExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
         });
     }
     let mut fs = source.open()?;
-    let opts = Options::new(options.fork_mode);
-    plan.run(fs.as_mut(), &entry, opts, status)
+    plan.run(fs.as_mut(), &entry, status)
 }
 
 /// A disc: its fresh filesystem carries the Mac dates, and the entry is looked up again in it.
@@ -137,28 +153,26 @@ fn run_disc(
 ) -> Result<usize> {
     let mut fs = disc.extract_filesystem().map_err(|e| anyhow::anyhow!(e))?;
     let entry = entry_at(fs.as_mut(), path)?;
-    let mut opts = Options::new(plan.options.fork_mode);
-    opts.finder_info_sidecar = false;
-    opts.on_error = rb_fsexporter::OnError::Stop;
-    plan.run(fs.as_mut(), &entry, opts, status)
+    plan.run(fs.as_mut(), &entry, status)
 }
 
 /// An [`ExtractJob`] without its source.
-struct Plan {
+struct Plan<'a> {
     dest: PathBuf,
     options: ExtractOptions,
     forks: bool,
     on_conflict: OnConflict,
+    ask: Option<&'a JobCtx>,
 }
 
-impl Plan {
+impl Plan<'_> {
     fn run(
         self,
         fs: &mut dyn Filesystem,
         entry: &FileEntry,
-        opts: Options,
         status: &Arc<Mutex<HostCopyStatus>>,
     ) -> Result<usize> {
+        let opts = Options::new(self.options.fork_mode);
         let label = fs.volume_label().map(str::to_string);
         let conflicts = extraction_conflicts(
             entry,
@@ -181,9 +195,14 @@ impl Plan {
         let mut host = StatusHost {
             status,
             options: self.options,
+            asker: ErrorAsker::new(self.ask, status),
         };
-        let done = rb_fsexporter::extract(fs, entry, &self.dest, &opts, &mut host)?;
-        Ok(done.files)
+        match rb_fsexporter::extract(fs, entry, &self.dest, &opts, &mut host) {
+            Ok(done) => Ok(done.files),
+            // The user chose Stop: the run ends with what it wrote, not as a failure.
+            Err(_) if host.asker.stopped() => Ok(crate::model::worker::lock_status(status).copied),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -219,6 +238,62 @@ fn entry_at(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry> {
 struct StatusHost<'a> {
     status: &'a Arc<Mutex<HostCopyStatus>>,
     options: ExtractOptions,
+    asker: ErrorAsker<'a>,
+}
+
+/// Puts an entry that failed to the user through the copy's job, and remembers "Continue with
+/// all errors" for the rest of the run (across top-level entries, which the crate can't).
+pub(crate) struct ErrorAsker<'a> {
+    ctx: Option<&'a JobCtx>,
+    status: &'a Arc<Mutex<HostCopyStatus>>,
+    skip_all: bool,
+}
+
+impl<'a> ErrorAsker<'a> {
+    pub(crate) fn new(ctx: Option<&'a JobCtx>, status: &'a Arc<Mutex<HostCopyStatus>>) -> Self {
+        ErrorAsker {
+            ctx,
+            status,
+            skip_all: false,
+        }
+    }
+
+    /// The user's answer for the entry at `path`; `None` with no job to ask through.
+    pub(crate) fn decide(&mut self, path: &str, err: &anyhow::Error) -> Option<ErrorChoice> {
+        let ctx = self.ctx?;
+        if self.skip_all {
+            return Some(ErrorChoice::SkipAll);
+        }
+        let answer = ctx.ask(ASK_ENTRY_FAILED, path, format!("{err:#}"));
+        // A cancel while asking stops too; the job then ends cancelled.
+        let choice = answer
+            .and_then(|i| ENTRY_FAILED_CHOICES.get(i).copied())
+            .unwrap_or(ErrorChoice::Stop);
+        match choice {
+            ErrorChoice::SkipAll => self.skip_all = true,
+            ErrorChoice::Stop if answer.is_some() => {
+                crate::model::worker::lock_status(self.status).stopped =
+                    Some(format!("{path} ({err:#})"));
+            }
+            _ => {}
+        }
+        Some(choice)
+    }
+
+    /// Record the entry at `path` as skipped, for the end-of-run list.
+    pub(crate) fn skipped(&self, path: &str, err: &anyhow::Error) {
+        log::warn!("Skipped {path}: {err:#}");
+        crate::model::worker::lock_status(self.status)
+            .skipped
+            .push(format!("{path} ({err:#})"));
+    }
+
+    /// Whether the user chose Stop.
+    pub(crate) fn stopped(&self) -> bool {
+        crate::model::worker::lock_status(self.status)
+            .stopped
+            .is_some()
+    }
 }
 
 impl Host for StatusHost<'_> {
@@ -242,12 +317,13 @@ impl Host for StatusHost<'_> {
         }
     }
 
-    // One unreadable entry (an NTFS metafile, a bad file) is skipped, not fatal.
+    fn on_error(&mut self, entry: &FileEntry, err: &anyhow::Error) -> Option<ErrorChoice> {
+        self.asker.decide(entry.path.as_str(), err)
+    }
+
+    // Skipped by the user's answer, or (with no one to ask) an unreadable entry skipped.
     fn failed(&mut self, entry: &FileEntry, err: &anyhow::Error) {
-        log::warn!("Skipped {}: {err:#}", entry.path);
-        if let Ok(mut g) = self.status.lock() {
-            g.skipped.push(format!("{} ({err:#})", entry.path));
-        }
+        self.asker.skipped(entry.path.as_str(), err);
     }
 
     fn host_name(&self, entry: &FileEntry, base: String) -> String {

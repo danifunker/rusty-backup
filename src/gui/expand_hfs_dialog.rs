@@ -212,7 +212,10 @@ impl ExpandHfsDialog {
                 Reply::Picked { purpose, path } => {
                     self.act(ExpandHfsAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
         }
     }

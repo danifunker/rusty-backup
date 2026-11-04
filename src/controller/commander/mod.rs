@@ -23,8 +23,8 @@ pub use screen::{
     default_export_format, export_choices, BudgetAction, BudgetForm, BudgetMode, ChecksumRow,
     Checksums, CommanderAction, CommanderController, DetailField, ExportChoice, ExportFormat,
     ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice,
-    ResourceForkMode, Side, SizePlan, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem,
-    Xattr, FOLLOW_DELAY, MIN_NESTED_IMAGE_BYTES,
+    ResourceForkMode, Side, SizePlan, SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind,
+    ViewMenuItem, Xattr, FOLLOW_DELAY, MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

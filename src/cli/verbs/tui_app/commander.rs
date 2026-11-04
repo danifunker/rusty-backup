@@ -25,7 +25,7 @@ use crate::controller::commander::{
     OnConflict, RowKind, Side, ViewItemKind, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
-use crate::controller::{ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
+use crate::controller::{ChoiceSpec, ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
 
 type A = CommanderAction;
 type P = BrowserPaneAction;
@@ -37,6 +37,7 @@ enum Modal {
         picker: FilePicker,
     },
     Confirm(ConfirmSpec),
+    Choose(ChoiceSpec),
     Text {
         spec: TextSpec,
         input: String,
@@ -207,6 +208,7 @@ impl CommanderView {
                     picker: FilePicker::new(PickKind::Dir, spec.title),
                 }),
                 Effect::Confirm(spec) => Some(Modal::Confirm(spec)),
+                Effect::Choose(spec) => Some(Modal::Choose(spec)),
                 Effect::AskText(spec) => Some(Modal::Text {
                     input: spec.initial.clone(),
                     spec,
@@ -346,6 +348,12 @@ impl CommanderView {
                 KeyCode::Char('s') => self.send(A::HostConflict(OnConflict::Skip)),
                 KeyCode::Esc | KeyCode::Char('c') => self.send(A::HostConflictCancel),
                 _ => {}
+            }
+            return Some(true);
+        }
+        if self.ctl.skipped_report().is_some() {
+            if matches!(code, KeyCode::Enter | KeyCode::Esc) {
+                self.send(A::SkippedReportOk);
             }
             return Some(true);
         }
@@ -540,6 +548,20 @@ impl CommanderView {
                 }),
                 _ => None,
             },
+            Modal::Choose(spec) => {
+                let picked = match code {
+                    KeyCode::Esc => Some(spec.dismiss),
+                    KeyCode::Char(c) => spec
+                        .choices
+                        .iter()
+                        .position(|ch| ch.key.eq_ignore_ascii_case(&c)),
+                    _ => None,
+                };
+                picked.map(|choice| A::Chose {
+                    purpose: spec.purpose,
+                    choice,
+                })
+            }
             Modal::Text {
                 spec,
                 input,
@@ -1295,6 +1317,18 @@ impl App {
             ));
             self.draw_cmd_box_auto(frame, area, 72, "Files already exist", lines);
         }
+        if let Some(report) = ctl.skipped_report() {
+            let mut lines = vec![Line::raw(format!(" {}", report.summary))];
+            for s in report.skipped.iter().take(12) {
+                lines.push(Line::raw(format!("   Skipped {}", printable(s))));
+            }
+            if report.skipped.len() > 12 {
+                let more = report.skipped.len() - 12;
+                lines.push(Line::raw(format!("   ... and {more} more (see the log)")));
+            }
+            lines.push(Line::styled(" Enter close", pal.dim()));
+            self.draw_cmd_box_auto(frame, area, 84, &report.title, lines);
+        }
         if let Some(notice) = ctl.rename_notice() {
             let out = &notice.outcome;
             let mut lines = Vec::new();
@@ -1347,6 +1381,20 @@ impl App {
                 ];
                 let title = format!("{}{}", spec.title, whose(spec.purpose));
                 self.draw_cmd_box_auto(frame, area, 70, &title, lines);
+            }
+            Modal::Choose(spec) => {
+                let keys: Vec<String> = spec
+                    .choices
+                    .iter()
+                    .map(|c| format!("{} {}", c.key, c.label))
+                    .collect();
+                let lines = vec![
+                    Line::raw(format!(" {}", printable(&spec.message))),
+                    Line::raw(""),
+                    Line::styled(format!(" {}", keys.join("   ")), pal.accent()),
+                ];
+                let title = format!("{}{}", spec.title, whose(spec.purpose));
+                self.draw_cmd_box_auto(frame, area, 80, &title, lines);
             }
             Modal::Text {
                 spec,
@@ -1750,6 +1798,51 @@ mod tests {
         let r = row(&app, Side::Right, "A.TXT").unwrap();
         assert_eq!(r.kind, RowKind::PendingRename);
         assert_eq!(r.rename_to.as_deref(), Some("B.DOC"));
+    }
+
+    #[test]
+    fn a_file_that_fails_to_copy_out_asks_skip_continue_or_stop() {
+        let (_h, _i, mut app) = host_and_image(&["A.TXT"]);
+        copy_and_apply(&mut app, &["A.TXT"]);
+        // The left pane becomes a folder where A.TXT is a directory, so writing it fails.
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir(out.path().join("A.TXT")).unwrap();
+        app.on_key(key(KeyCode::Tab));
+        open_folder(&mut app, out.path());
+        app.on_key(key(KeyCode::Tab));
+        cursor_to(&mut app, "A.TXT");
+        app.on_key(key(KeyCode::F(6)));
+        app.on_key(key(KeyCode::Char('o')));
+        let start = Instant::now();
+        while !matches!(view(&app).modal, Some(Modal::Choose(_))) {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "{}",
+                status(&app)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            app.tick();
+        }
+        let Some(Modal::Choose(spec)) = &view(&app).modal else {
+            unreachable!()
+        };
+        assert!(
+            spec.message.starts_with("Could not extract /A.TXT: "),
+            "{}",
+            spec.message
+        );
+        let keys: Vec<char> = spec.choices.iter().map(|c| c.key).collect();
+        assert_eq!(keys, ['s', 'c', 't']);
+        // A key that picks nothing leaves the prompt up; `c` continues with all errors.
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(view(&app).modal.is_some());
+        app.on_key(key(KeyCode::Char('c')));
+        settle(&mut app);
+        let report = view(&app).ctl.skipped_report().expect("the skipped list");
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert!(report.skipped[0].starts_with("/A.TXT ("));
+        app.on_key(key(KeyCode::Enter));
+        assert!(view(&app).ctl.skipped_report().is_none());
     }
 
     #[test]

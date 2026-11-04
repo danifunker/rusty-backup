@@ -62,6 +62,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::Confirm(_) => "Confirm",
         Effect::AskPassword(_) => "AskPassword",
         Effect::AskText(_) => "AskText",
+        Effect::Choose(_) => "Choose",
         Effect::Message(_) => "Message",
         Effect::OpenUrl(_) => "OpenUrl",
         Effect::CopyToClipboard(_) => "CopyToClipboard",
@@ -1713,6 +1714,27 @@ impl Target for OpticalTarget {
                 }));
             }
             "Tree" => return self.pane_act(P::ListTree { ids: false }),
+            "Block" => {
+                let blocker = self.extract_dir().join(arg_str(arg)?);
+                std::fs::create_dir_all(blocker).map_err(|e| e.to_string())?;
+                return Ok(Vec::new());
+            }
+            "Overwrite" => {
+                use rusty_backup::controller::commander::OnConflict;
+                return Ok(self
+                    .browser()?
+                    .apply(CommanderAction::HostConflict(OnConflict::Replace)));
+            }
+            "Chose" => {
+                let choice = arg.and_then(Value::as_integer).ok_or("an index `arg`")? as usize;
+                return Ok(self.browser()?.apply(CommanderAction::Chose {
+                    purpose: spurpose::ENTRY_FAILED,
+                    choice,
+                }));
+            }
+            "SkippedReportOk" => {
+                return Ok(self.browser()?.apply(CommanderAction::SkippedReportOk));
+            }
             "CloseDisc" => OpticalAction::CloseDisc,
             other => return Err(format!("OpticalController has no action {other:?}")),
         };
@@ -1782,6 +1804,18 @@ impl Target for OpticalTarget {
                 names.join(",")
             }),
             "tree" => Value::String(self.tree.clone()),
+            "skipped" => Value::Integer(
+                self.browser
+                    .as_ref()
+                    .and_then(|b| b.skipped_report())
+                    .map(|r| r.skipped.len() as i64)
+                    .unwrap_or(0),
+            ),
+            "skipped_report" => Value::Boolean(
+                self.browser
+                    .as_ref()
+                    .is_some_and(|b| b.skipped_report().is_some()),
+            ),
             other => return Err(format!("OpticalController has no probe {other:?}")),
         })
     }
@@ -1793,7 +1827,9 @@ impl Target for OpticalTarget {
         if let Some(b) = self.browser.as_mut() {
             let start = std::time::Instant::now();
             fx.extend(b.tick());
-            while b.is_working() && start.elapsed().as_secs() < 60 {
+            // A job waiting on a question settles there: the step answers it.
+            let asking = |fx: &[Effect]| fx.iter().any(|e| matches!(e, Effect::Choose(_)));
+            while b.is_working() && !asking(&fx) && start.elapsed().as_secs() < 60 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 fx.extend(b.tick());
             }

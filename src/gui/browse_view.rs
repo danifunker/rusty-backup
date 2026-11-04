@@ -821,6 +821,7 @@ impl BrowseView {
         type Cm = super::commander::CommanderMode;
         Cm::render_checksum_window(&self.ctl, &ctx, &mut acts);
         Cm::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
+        Cm::render_skipped_report(&self.ctl, &ctx, &mut acts);
         Cm::render_log_window(&self.ctl, &ctx, &mut acts);
         Cm::render_help(&self.ctl, &ctx, &mut acts);
         Cm::render_view_window(&self.ctl, &ctx, &mut acts);
@@ -968,6 +969,7 @@ impl BrowseView {
             Reply::Picked { purpose, path } => CommanderAction::Picked { purpose, path },
             Reply::Confirmed { purpose, yes } => CommanderAction::Confirmed { purpose, yes },
             Reply::Answered { purpose, text } => CommanderAction::Answered { purpose, text },
+            Reply::Chose { purpose, choice } => CommanderAction::Chose { purpose, choice },
             Reply::CloseScreen => {
                 self.request_close();
                 return;

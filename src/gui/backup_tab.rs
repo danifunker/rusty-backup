@@ -140,7 +140,10 @@ impl BackupTab {
         for reply in replies {
             let action = match reply {
                 Reply::Picked { purpose, path } => BackupAction::Picked { purpose, path },
-                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => continue,
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => continue,
             };
             self.act(action);
         }
@@ -592,10 +595,7 @@ impl BackupTab {
                     "Start Backup"
                 };
                 let enabled = self.ctl.can_start() && chd_ok && ctx.busy_elsewhere.is_none();
-                if ui
-                    .add_enabled(enabled, egui::Button::new(label))
-                    .clicked()
-                {
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                     actions.push(BackupAction::Start(self.chd_choice()));
                 }
                 if waiting {
@@ -625,10 +625,7 @@ impl BackupTab {
             .show(ui.ctx(), |ui| {
                 ui.label("Configure VHD output.");
                 ui.add_space(4.0);
-                if ui
-                    .radio(whole, "Whole Disk (single .vhd file)")
-                    .clicked()
-                {
+                if ui.radio(whole, "Whole Disk (single .vhd file)").clicked() {
                     actions.push(BackupAction::VhdWholeDisk(true));
                 }
                 if ui

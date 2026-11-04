@@ -96,7 +96,10 @@ impl ArchivesTab {
                 Reply::Picked { purpose, path } => {
                     self.act(ArchivesAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
         }
         self.carry_out_requests();

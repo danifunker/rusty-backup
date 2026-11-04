@@ -157,6 +157,7 @@ impl CommanderMode {
             Reply::Picked { purpose, path } => A::Picked { purpose, path },
             Reply::Confirmed { purpose, yes } => A::Confirmed { purpose, yes },
             Reply::Answered { purpose, text } => A::Answered { purpose, text },
+            Reply::Chose { purpose, choice } => A::Chose { purpose, choice },
             Reply::CloseScreen => {
                 self.close = true;
                 return;
@@ -176,6 +177,7 @@ impl CommanderMode {
 
         self.render_progress_modal(&ctx, &mut acts);
         Self::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
+        Self::render_skipped_report(&self.ctl, &ctx, &mut acts);
         self.render_rename_notice(&ctx, &mut acts);
 
         egui::Panel::top("commander_top").show(ui, |ui| {
@@ -420,6 +422,40 @@ impl CommanderMode {
                         acts.push(A::RenameNoticeUndo);
                     }
                 });
+            });
+    }
+
+    /// The entries an extraction skipped (or stopped at) after asking the user.
+    pub(crate) fn render_skipped_report(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(report) = ctl.skipped_report() else {
+            return;
+        };
+        egui::Window::new(report.title.as_str())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(report.summary.as_str());
+                if !report.skipped.is_empty() {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("skipped_report")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for s in &report.skipped {
+                                ui.monospace(format!("Skipped {}", printable(s)));
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() {
+                    acts.push(A::SkippedReportOk);
+                }
             });
     }
 

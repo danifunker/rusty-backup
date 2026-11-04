@@ -3647,6 +3647,7 @@ impl App {
                     Effect::PickFile(_)
                     | Effect::PickFolder(_)
                     | Effect::AskPassword(_)
+                    | Effect::Choose(_)
                     | Effect::Message(_)
                     | Effect::OpenUrl(_)
                     | Effect::CopyToClipboard(_)

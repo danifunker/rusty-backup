@@ -214,7 +214,7 @@ impl InspectTab {
             let action = match reply {
                 Reply::Picked { purpose, path } => InspectAction::Picked { purpose, path },
                 Reply::Confirmed { purpose, yes } => InspectAction::Confirmed { purpose, yes },
-                Reply::Answered { .. } | Reply::CloseScreen => continue,
+                Reply::Answered { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
             };
             self.act(action);
         }
