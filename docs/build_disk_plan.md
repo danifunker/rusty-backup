@@ -316,10 +316,15 @@ mention creation), `docs/cli-reference.md`, `docs/platform_matrix.md`, and
    validated donor disk go to `docs/bootable_disks_backlog.md`, not this feature.
 4. **GUI entry:** Build Disk becomes its own section of the app (a top-level tab), out of
    the Restore tab.
-5. **Fixed builders:** still open; see question 5 above (explained to the user 2026-11-04).
+5. **Fixed builders:** they become Build Disk presets (phase 9). `rb-cli new hd x68k` /
+   `sgi-efs` and `optical new` stay as shortcuts with byte-identical output.
 6. **Filesystems:** Build Disk can create every filesystem we support writing. The E rows
    with no creator stay on the filesystem backlog until a writer exists; each writer that
    lands joins Build Disk.
-7. **Size limits:** the in-RAM (`Vec`) creators get streaming variants (G3) for the ones
-   that reach card sizes; until then the builder refuses above a cap and says why. The
-   user wants to be told the limit up front (shown in the size field and in the refusal).
+7. **Size limits:** AFFS, PFS3 (plus its multi-MI formatting for large disks), SFS, HPFS and
+   BFS get streaming writers (G3). Until each lands, the builder shows its current cap
+   (2 GiB) in the size field and refuses above it with the reason. The small in-RAM
+   filesystems (ProDOS, MFS, Minix V1, the floppy formats, BeOS OFS, EFS v1) keep a 64 MB
+   cap. Real-world maxima were given from memory; confirm each when its writer is done.
+8. **Targets:** an image file (in any container) or a physical disk, as today's Build Disk
+   does; a physical disk needs its device name typed to confirm.
