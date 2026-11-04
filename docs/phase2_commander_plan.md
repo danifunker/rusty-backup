@@ -1537,7 +1537,8 @@ listed in the brief pass unchanged.
 - Two per-caller settings keep the old disc / CLI bytes: discs and `rb-cli optical extract`
   write an AppleDouble sidecar only for a resource fork (Commander also writes one for
   type / creator codes alone), and a disc extraction stops at the first error (Commander and
-  the CLI skip the entry and go on). Unify either way, or keep.
+  the CLI skip the entry and go on). Unify either way, or keep. **Answered 2026-11-04:**
+  slice 21 (the Finder-info rule everywhere; errors ask the user).
 
 ### Left
 
@@ -1614,6 +1615,99 @@ Shells' engine references 20 -> **0** (`src/gui` and the whole TUI are enforced)
 - The other `rb-cli` verbs are not checked by the script; they move per task.
 - TUI parity gaps: Next steps item 3.
 
+## Slice 21: one AppleDouble rule, and errors prompt the user
+
+User decisions (2026-11-04) on slice 19's two caller differences:
+
+- **A. AppleDouble rule everywhere:** in AppleDouble mode a `._name` sidecar is written when a
+  file has a resource fork **or** Finder info (type / creator, Finder flags), as Commander and
+  Inspect already did. Discs (the disc browser) and `rb-cli optical extract --to` follow it now.
+- **B. Errors prompt the user:** an entry that fails to extract asks **Skip** (this entry; ask
+  again next time), **Continue with all errors** (skip it and every later failure without
+  asking; the skipped entries are listed at the end) or **Stop** (end now, keep what was
+  written), in place of the per-caller policy (discs stopped, the others skipped).
+
+### Steps
+
+1. (ec4c51bf) `rb-fsexporter` 0.1.1: `Host::on_error(entry, err) -> Option<ErrorChoice>` with
+   `ErrorChoice { Skip, SkipAll, Stop }`. The default returns `None`, which follows
+   `Options::on_error` as 0.1.0 did. A Stop's error passes up through every folder without
+   asking again; every skipped entry (a policy skip or an answer) reaches `Host::failed`.
+   CHANGELOG.md added; the root, vintage, ppc and sol9 lockfiles follow.
+2. (1020bfc8) The app:
+   - `model::job`: the one in-job question. `JobCtx::ask(kind, subject, detail)` posts a
+     `Question` and waits (polling, 20 ms); a cancel ends the wait with `None`.
+     `Job::question` / `Job::answer(id, choice)` (a stale id is ignored).
+   - `model::extract::ErrorAsker` answers `on_error` through the copy job's ctx
+     (`ASK_ENTRY_FAILED`, answers in `ENTRY_FAILED_CHOICES` order) and remembers Continue with
+     all errors across top-level entries (the crate's own memory is per call). It serves
+     `HostCopyJob::Extract` (Commander / Inspect / disc Extract) and `HostCopyJob::ImageToHost`
+     (F6 to a host pane). A Stop ends the run as done (`HostCopyDone::stopped`), not failed.
+     Without a job (`export_fs_entries_to_host`, `spawn_host_copy`) nothing asks: Extract skips
+     the entry, the copy stops, as before.
+   - Rule A: the disc path drops its `finder_info_sidecar = false` and `OnError::Stop`.
+   - `controller::Effect::Choose(ChoiceSpec { purpose, title, message, choices: [Choice {
+     label, key }], dismiss })`, a new effect every shell handles with no `_` arm.
+     `CommanderController::tick` puts the copy job's question once as "Could not extract
+     <path>: <error>" with Skip (`s`), Continue with all errors (`c`), Stop (`t`; Esc) and
+     takes `CommanderAction::Chose { purpose, choice }`. A run that asked ends with a
+     `SkippedReport` (summary, skipped entries, where it stopped; `SkippedReportOk` closes it)
+     and the session log.
+   - egui: `EffectHost` draws the choice (`Reply::Chose`) for the Commander window, the Inspect
+     browse view and the Optical disc browser, which also draw the report window. TUI
+     Commander / Explorer: `Modal::Choose` (the spec's keys, Esc = dismiss) and the report box.
+   - Tests: the job question; Skip / Continue with all errors / Stop / cancel-while-asking
+     through the controller over a FAT volume whose outputs are blocked by folders; the TUI
+     prompt and keys on an F6 copy; `tests/ui_scenarios/optical_extract_entry_failed.toml`.
+3. (bb276187) `rb-cli optical extract --on-error ask|skip|stop`: default `ask` when stdin and
+   stderr are a terminal, otherwise `stop`. `ask` prompts on stderr `[s]kip, [c]ontinue with
+   all errors, s[t]op?` (end of input stops); `skip` names each skipped entry on stderr and
+   lists them after the summary; `stop` exits non-zero with "extraction stopped at <path>:
+   <error>". Ignored with `--tar`. Rule A applies. The `--tar` help no longer claims symlinks
+   can't survive a loose extract (slice 19 Left). cli-reference.md, the HTML help, the help
+   snapshot and `tests/cli_suite/cli_optical_extract.rs` (skip, stop, the non-terminal
+   default, ask over stdin).
+
+### Semver
+
+0.1.1 is additive only. The brief's `OnError::Ask` variant and a skipped list in `Summary`
+were left out on purpose: a new variant of the exhaustive `OnError` breaks a crate user's
+`match`, and a new field breaks `Summary { files, bytes }` / `Options { .. }` literals (and a
+`Vec` would end `Summary`'s `Copy`), both major changes. Asking is a host that answers
+`on_error`; the skipped list lives in the host (it gets every skip through `failed`), which
+also survives a Stop, whose `Err` would lose a list in `Summary`.
+`Options::finder_info_sidecar` stays with its default `true`; rule A is the app no longer
+overriding it, so crate users see no change.
+
+### Byte changes
+
+- Rule A: none of the identity goldens moved. The five discs have no file with Finder info
+  and no resource fork (the hybrid's only Mac file, `GameApp`, has a fork), so nothing to
+  recapture. On other HFS / HFS+ discs (and `rb-cli optical extract --to` in AppleDouble mode)
+  a file with type / creator and no fork now gets a `._name` sidecar.
+- Rule B writes no different bytes for a run without errors.
+
+### Behaviour changes
+
+- GUI / TUI: an entry that fails asks instead of being skipped silently (Commander / Inspect
+  Extract, the TUI and egui F6 copy to a host folder, which used to stop) or stopping the run
+  (disc extraction). A run that asked ends with "Copied N file(s) to the ...; skipped M." (or
+  "Stopped at <path> (<error>). Copied ...") and the skipped list window.
+- CLI: `optical extract --to` stops at the first failed entry when not on a terminal (it
+  skipped and counted before); `--on-error skip` keeps the old carry-on behaviour and adds
+  the list. On a terminal it asks.
+- Unchanged: exports to a folder (loose files / per-file gzip / zstd) still stop at the first
+  error; `rb-cli get` keeps its own walker.
+
+### Left
+
+- Folder exports (`export_selection`) could ask too: they run in the same copy job, but the
+  walker lives in `src/fs` and has no job ctx. Decide whether they should.
+- `rb_fsexporter::existing_outputs` lists the `._name` sidecar only for a resource fork, so
+  the overwrite review does not name a Finder-info-only sidecar it will replace (it is
+  overwritten silently, as before slice 19 in Commander). A crate fix for 0.1.2.
+- Publish `rb-fsexporter` 0.1.1 (publish-crates.yml, dry run first).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1626,7 +1720,7 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-20 done. `src/gui` and the whole TUI are enforced at 0 engine references.
+- Slices 1-21 done. `src/gui` and the whole TUI are enforced at 0 engine references.
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
   pushed with CI running. Commits after 3119ea34 are local until the user says push.
@@ -1645,6 +1739,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    Commander / Inspect extract tests). Version, publish (publish-crates.yml) and update the
    root, vintage, ppc and sol9 lockfiles.
 2. **Slice 20: the TUI's last 20 references** (done, above): the whole TUI is enforced.
+   **Slice 21** (done, above): one AppleDouble rule, and a failed entry asks the user;
+   publish `rb-fsexporter` 0.1.1.
 3. **TUI parity gaps** the controllers already support (Backup partition selection / split
    / CHD codec / remote; Restore single-partition / new-disk / Build Disk; Inspect disk
    tools / Calc min / Export; Optical convert / Browse Contents / player; Inspect dialogs):
