@@ -384,6 +384,27 @@ fn existing_files_are_overwritten_skipped_or_refused() {
 }
 
 #[test]
+fn existing_outputs_names_a_finder_info_only_sidecar() {
+    let mut fs = Mem::new(None);
+    fs.file("/doc", b"x");
+    let mut doc = fs.entry("/doc");
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("doc"), b"old").unwrap();
+    std::fs::write(dest.path().join("._doc"), b"old").unwrap();
+    let ad = ResourceForkMode::AppleDouble;
+    assert_eq!(
+        existing_outputs(&doc, dest.path(), "doc", ad, true),
+        [dest.path().join("doc")]
+    );
+    doc.type_code = Some(*b"TEXT");
+    let want = [dest.path().join("doc"), dest.path().join("._doc")];
+    assert_eq!(existing_outputs(&doc, dest.path(), "doc", ad, true), want);
+    doc.type_code = None;
+    doc.creator_code = Some(*b"ttxt");
+    assert_eq!(existing_outputs(&doc, dest.path(), "doc", ad, false), want);
+}
+
+#[test]
 fn case_collisions_are_renamed_skipped_or_refused() {
     let mut fs = Mem::new(None);
     fs.file("/Read.me", b"1");

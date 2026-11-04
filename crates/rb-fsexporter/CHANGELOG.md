@@ -3,6 +3,13 @@
 All notable changes to this crate are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.3
+
+### Fixed
+- `existing_outputs` in AppleDouble mode names the `._name` sidecar of a file
+  with a type or creator code and no resource fork, which `extract` writes and
+  so replaces. It was left out, so an overwrite review missed it.
+
 ## 0.1.1
 
 ### Added

@@ -215,7 +215,7 @@ pub fn top_name(entry: &FileEntry, volume_label: Option<&str>) -> String {
 }
 
 /// The host paths that already exist and that `entry`'s own output (named `name` in `dest`)
-/// would replace: the file and its fork sidecar, or the folder.
+/// would replace: the file and its fork sidecar, or the folder (Finder-info sidecars as by default).
 pub fn existing_outputs(
     entry: &FileEntry,
     dest: &Path,
@@ -224,6 +224,8 @@ pub fn existing_outputs(
     forks: bool,
 ) -> Vec<PathBuf> {
     let has_rsrc = forks && entry.is_file() && entry.resource_fork_size.is_some_and(|s| s > 0);
+    let coded = |c: Option<[u8; 4]>| c.is_some_and(|c| c != [0; 4]);
+    let has_finfo = entry.is_file() && (coded(entry.type_code) || coded(entry.creator_code));
     let mut out = Vec::new();
     match mode {
         ResourceForkMode::MacBinary if has_rsrc => out.push(dest.join(format!("{name}.bin"))),
@@ -232,7 +234,7 @@ pub fn existing_outputs(
         mode => {
             out.push(dest.join(name));
             match mode {
-                ResourceForkMode::AppleDouble if has_rsrc => {
+                ResourceForkMode::AppleDouble if has_rsrc || has_finfo => {
                     out.push(dest.join(format!("._{name}")))
                 }
                 ResourceForkMode::SeparateRsrc if has_rsrc => {
