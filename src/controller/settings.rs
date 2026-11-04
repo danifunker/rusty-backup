@@ -78,6 +78,11 @@ impl SettingsController {
         self.file_associations
     }
 
+    /// Where the user's config.json lives, for display.
+    pub fn config_file() -> Option<std::path::PathBuf> {
+        crate::update::UpdateConfig::user_config_path()
+    }
+
     /// Recent-file entries across every mode, for the Clear button's label.
     pub fn recent_count(&self) -> usize {
         self.recent_count

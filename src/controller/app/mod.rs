@@ -197,6 +197,24 @@ impl Controller for AppController {
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 pub use recent::{CommanderRecent, ConfigStore, MemoryConfig, UserConfig};
 
+/// Check the release feed at `repo_url` now and say what it found (blocking: run it in a job).
+#[cfg(any(feature = "gui", feature = "tui-update"))]
+pub fn check_updates_now_text(repo_url: &str) -> String {
+    let config = crate::update::UpdateCheckConfig {
+        enabled: true,
+        repository_url: repo_url.to_string(),
+    };
+    let current = env!("APP_VERSION");
+    match crate::update::check_for_updates(&config, current) {
+        Ok(info) if info.is_outdated => format!(
+            "Update available: {} (current {current}). Run `rb-cli update --apply`.",
+            info.latest_version
+        ),
+        Ok(_) => format!("Up to date (current {current})."),
+        Err(e) => format!("Update check failed: {e}"),
+    }
+}
+
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 mod recent {
     use super::AppController;

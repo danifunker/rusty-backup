@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
+use crate::controller::app::DiskDevice;
 use crate::controller::app::{format_size, RateTracker};
-use crate::device::{enumerate_devices, DiskDevice};
 
 mod commander;
 mod explorer;
@@ -1808,13 +1808,32 @@ fn archive_row_line(e: &crate::controller::archives::ArchiveEntryRow) -> String 
     )
 }
 
-/// The Settings tab state: the loaded `UpdateConfig` plus a cursor over the
-/// editable preference toggles. Edits save straight back to `config.json` via
-/// `UpdateConfig::save` (the same file the GUI reads/writes).
+/// The Settings tab: the shared Settings form (each toggle saves at once) and a cursor.
 struct SettingsState {
-    config: crate::update::UpdateConfig,
+    ctl: crate::controller::settings::SettingsController,
     sel: usize,
+    /// The last save or update-check result.
     status: Option<String>,
+}
+
+impl SettingsState {
+    /// The form loaded from config.json (memory in tests).
+    fn open() -> Self {
+        use crate::controller::settings::{SettingsAction, SettingsController};
+        use crate::controller::Controller as _;
+        #[cfg(not(test))]
+        let mut ctl = SettingsController::default();
+        #[cfg(test)]
+        let mut ctl = SettingsController::with_store(Box::new(
+            crate::controller::app::MemoryConfig::default(),
+        ));
+        ctl.apply(SettingsAction::Open);
+        SettingsState {
+            ctl,
+            sel: 0,
+            status: None,
+        }
+    }
 }
 
 /// Number of editable toggle rows on the Settings tab.
@@ -1847,8 +1866,12 @@ struct App {
     status: Option<String>,
     /// A running progress task (the preview / future backup-restore-convert).
     progress: Option<Progress>,
-    /// Lazily populated when the Inspect tab is first shown / rescanned.
-    disks: Option<Vec<DiskDevice>>,
+    /// The app shell's rules: the device list (`shell.devices()`) and its refresh job.
+    shell: crate::controller::app::AppController,
+    /// The device list is listed when the Inspect or Backup tab is first shown.
+    devices_loaded: bool,
+    /// `r` started a device refresh whose end the status line reports.
+    refreshing_devices: bool,
     /// The New Disk creation wizard state (lazily created on first visit).
     newdisk: Option<NewWizard>,
     /// The Backup screen state (lazily created on first visit).
@@ -1898,7 +1921,11 @@ impl App {
             explorer: None,
             status: None,
             progress: None,
-            disks: None,
+            shell: crate::controller::app::AppController::new(Arc::new(
+                crate::controller::task::NoNotify,
+            )),
+            devices_loaded: false,
+            refreshing_devices: false,
             newdisk: None,
             backup: None,
             restore: None,
@@ -2187,7 +2214,12 @@ impl App {
             }
             // Rescan on the Inspect tab (the k9s `r`-to-refresh idiom).
             KeyCode::Char('r') if self.current() == TabId::Inspect => {
-                self.disks = Some(enumerate_devices());
+                use crate::controller::Controller as _;
+                self.shell
+                    .apply(crate::controller::app::AppAction::RefreshDevices);
+                self.devices_loaded = true;
+                self.refreshing_devices = true;
+                self.status = Some("Looking for devices...".to_string());
                 self.selection = 0;
             }
             _ => {}
@@ -2383,9 +2415,9 @@ impl App {
             // disk, so they are now one view.
             TabId::Inspect if self.row_count() > 0 => {
                 let target = self
-                    .disks
-                    .as_ref()
-                    .and_then(|d| d.get(self.selection))
+                    .shell
+                    .devices()
+                    .get(self.selection)
                     .map(|d| (d.path.clone(), Box::new(d.clone())));
                 if let Some((path, disk)) = target {
                     self.selection = 0;
@@ -2492,6 +2524,33 @@ impl App {
         self.progress = None;
     }
 
+    /// Land a finished device refresh on the status line.
+    fn poll_devices(&mut self) {
+        use crate::controller::Controller as _;
+        let _ = self.shell.tick();
+        if self.refreshing_devices && self.shell.devices_refreshing().is_none() {
+            self.refreshing_devices = false;
+            let n = self.shell.devices().len();
+            self.selection = self.selection.min(n.saturating_sub(1));
+            self.status = Some(format!("Refreshed: {n} device(s) found"));
+        }
+    }
+
+    /// List the devices the first time a tab needs them (a plain listing; nothing elevates).
+    fn load_devices_once(&mut self) {
+        if !self.devices_loaded {
+            self.shell.load_devices();
+            self.devices_loaded = true;
+        }
+    }
+
+    /// Tests: show `devices` as the device list.
+    #[cfg(test)]
+    fn set_test_devices(&mut self, devices: Vec<DiskDevice>) {
+        self.shell.set_devices(devices);
+        self.devices_loaded = true;
+    }
+
     /// Lazily load anything a freshly-shown tab needs; reset per-tab cursor.
     fn on_tab_changed(&mut self) {
         self.selection = 0;
@@ -2499,8 +2558,8 @@ impl App {
         self.open_picker = None;
         self.explorer = None;
         self.status = None;
-        if self.current() == TabId::Inspect && self.disks.is_none() {
-            self.disks = Some(enumerate_devices());
+        if self.current() == TabId::Inspect {
+            self.load_devices_once();
         }
         if self.current() == TabId::NewDisk && self.newdisk.is_none() {
             self.newdisk = Some(NewWizard::default());
@@ -2509,9 +2568,7 @@ impl App {
             if self.backup.is_none() {
                 self.backup = Some(BackupState::default());
             }
-            if self.disks.is_none() {
-                self.disks = Some(enumerate_devices());
-            }
+            self.load_devices_once();
         }
         if self.current() == TabId::Restore && self.restore.is_none() {
             self.restore = Some(RestoreState::default());
@@ -2533,11 +2590,7 @@ impl App {
             self.tab_before_commander = Some(self.active);
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
-            self.settings = Some(SettingsState {
-                config: crate::update::UpdateConfig::load(),
-                sel: 0,
-                status: None,
-            });
+            self.settings = Some(SettingsState::open());
         }
     }
 
@@ -2545,11 +2598,7 @@ impl App {
     /// so they still switch tabs).
     fn handle_settings_key(&mut self, code: KeyCode) -> bool {
         if self.settings.is_none() {
-            self.settings = Some(SettingsState {
-                config: crate::update::UpdateConfig::load(),
-                sel: 0,
-                status: None,
-            });
+            self.settings = Some(SettingsState::open());
         }
         let s = self.settings.as_mut().unwrap();
         match code {
@@ -2580,23 +2629,12 @@ impl App {
     fn settings_check_now(&mut self) {
         #[cfg(feature = "tui-update")]
         {
-            let repo = self
-                .settings
-                .as_ref()
-                .map(|s| s.config.update_check.clone());
-            let Some(cfg) = repo else { return };
+            let repo = self.settings.as_ref().map(|s| s.ctl.repo_url().to_string());
+            let Some(repo) = repo else { return };
             // A network round-trip: run it as a task so the screen stays live.
             self.start_task("Checking for updates", move |job| {
                 job.set_can_cancel(false);
-                let current = env!("APP_VERSION");
-                let msg = match crate::update::check_for_updates(&cfg, current) {
-                    Ok(info) if info.is_outdated => format!(
-                        "Update available: {} (current {current}). Run `rb-cli update --apply`.",
-                        info.latest_version
-                    ),
-                    Ok(_) => format!("Up to date (current {current})."),
-                    Err(e) => format!("Update check failed: {e}"),
-                };
+                let msg = crate::controller::app::check_updates_now_text(repo.as_str());
                 Ok(Box::new(move |app: &mut App| {
                     if let Some(s) = app.settings.as_mut() {
                         s.status = Some(msg);
@@ -2616,20 +2654,24 @@ impl App {
         }
     }
 
-    /// Flip the selected preference and persist the whole `UpdateConfig`.
+    /// Flip the selected preference and save the form, through the Settings controller.
     fn settings_toggle(&mut self) {
+        use crate::controller::settings::SettingsAction;
+        use crate::controller::Controller as _;
         let Some(s) = self.settings.as_mut() else {
             return;
         };
         match s.sel {
-            0 => s.config.update_check.enabled = !s.config.update_check.enabled,
-            1 => s.config.file_associations_enabled = !s.config.file_associations_enabled,
-            _ => {}
-        }
-        match s.config.save() {
-            Ok(()) => s.status = Some("Saved to config.json.".to_string()),
-            Err(e) => s.status = Some(format!("Save failed: {e}")),
-        }
+            0 => s
+                .ctl
+                .apply(SettingsAction::SetUpdateCheck(!s.ctl.update_check())),
+            1 => s.ctl.apply(SettingsAction::SetFileAssociations(
+                !s.ctl.file_associations(),
+            )),
+            _ => Vec::new(),
+        };
+        s.ctl.apply(SettingsAction::Save);
+        s.status = s.ctl.status().map(str::to_string);
     }
 
     /// New Disk wizard keys. Returns `true` when consumed; `false` lets the key
@@ -3099,7 +3141,7 @@ impl App {
         let step = self.backup.as_ref().unwrap().step;
         // Physical-disk chooser sub-mode.
         if self.backup.as_ref().map(|b| b.device_pick).unwrap_or(false) {
-            let ndisks = self.disks.as_ref().map_or(0, |d| d.len());
+            let ndisks = self.shell.devices().len();
             let b = self.backup.as_mut().unwrap();
             match code {
                 KeyCode::Up | KeyCode::Char('k') => b.device_sel = b.device_sel.saturating_sub(1),
@@ -3109,7 +3151,7 @@ impl App {
                 KeyCode::Esc => b.device_pick = false,
                 KeyCode::Enter => {
                     let sel = b.device_sel;
-                    let dev = self.disks.as_ref().and_then(|d| d.get(sel)).cloned();
+                    let dev = self.shell.devices().get(sel).cloned();
                     if let Some(device) = dev {
                         let b = self.backup.as_mut().unwrap();
                         b.device_pick = false;
@@ -3372,7 +3414,7 @@ impl App {
             .map(|r| r.device_pick)
             .unwrap_or(false)
         {
-            let ndisks = self.disks.as_ref().map_or(0, |d| d.len());
+            let ndisks = self.shell.devices().len();
             let r = self.restore.as_mut().unwrap();
             match code {
                 KeyCode::Up | KeyCode::Char('k') => r.device_sel = r.device_sel.saturating_sub(1),
@@ -3383,9 +3425,9 @@ impl App {
                 KeyCode::Enter => {
                     let sel = r.device_sel;
                     let dev = self
-                        .disks
-                        .as_ref()
-                        .and_then(|d| d.get(sel))
+                        .shell
+                        .devices()
+                        .get(sel)
                         .map(|d| d.path.display().to_string());
                     if let Some(path) = dev {
                         let r = self.restore.as_mut().unwrap();
@@ -3558,12 +3600,13 @@ impl App {
             return;
         };
         let target = std::path::PathBuf::from(r.target.trim());
-        let picked = self.disks.as_ref().and_then(|d| {
-            d.iter()
-                .enumerate()
-                .find(|(_, dev)| dev.path == target)
-                .map(|(row, dev)| (row, dev.clone()))
-        });
+        let picked = self
+            .shell
+            .devices()
+            .iter()
+            .enumerate()
+            .find(|(_, dev)| dev.path == target)
+            .map(|(row, dev)| (row, dev.clone()));
         if let Some((row, device)) = picked {
             r.writer
                 .apply(DiskWriteAction::SelectDevice { row, device });
@@ -3749,9 +3792,10 @@ impl App {
             // Name the device (with its media label if we have it) in the prompt.
             let path = r.target.clone();
             let label = self
-                .disks
-                .as_ref()
-                .and_then(|d| d.iter().find(|dev| dev.path.display().to_string() == path))
+                .shell
+                .devices()
+                .iter()
+                .find(|dev| dev.path.display().to_string() == path)
                 .map(|dev| dev.display_name())
                 .unwrap_or_else(|| path.clone());
             self.restore.as_mut().unwrap().confirm_device = Some((path, label));
@@ -3786,12 +3830,12 @@ impl App {
             return;
         }
         let device = if is_device {
-            self.disks.as_ref().and_then(|d| {
-                d.iter()
-                    .enumerate()
-                    .find(|(_, dev)| dev.path == target)
-                    .map(|(row, dev)| (row, dev.clone()))
-            })
+            self.shell
+                .devices()
+                .iter()
+                .enumerate()
+                .find(|(_, dev)| dev.path == target)
+                .map(|(row, dev)| (row, dev.clone()))
         } else {
             None
         };
@@ -4478,7 +4522,7 @@ impl App {
             return parts.len();
         }
         if self.inspect_list_active() {
-            self.disks.as_ref().map_or(0, |d| d.len())
+            self.shell.devices().len()
         } else {
             0
         }
@@ -4488,6 +4532,7 @@ impl App {
     /// worker (the bar stays until the user presses Esc, showing 100%).
     fn tick(&mut self) {
         self.poll_task();
+        self.poll_devices();
         // Drive the Backup controller and mirror its run into the visual bar.
         if let Some(b) = self.backup.as_mut() {
             use crate::controller::backup::BackupAction;
@@ -4971,7 +5016,7 @@ impl App {
     }
 
     fn draw_inspect_list(&self, frame: &mut Frame, area: Rect) {
-        let disks = self.disks.as_deref().unwrap_or(&[]);
+        let disks = self.shell.devices();
         if disks.is_empty() {
             frame.render_widget(
                 Paragraph::new("No disks detected. Press `r` to rescan.")
@@ -6284,7 +6329,7 @@ impl App {
 
     /// Shared physical-disk chooser overlay (Backup source + Restore target).
     fn draw_device_pick(&self, frame: &mut Frame, area: Rect, device_sel: usize, title: &str) {
-        let disks = self.disks.as_deref().unwrap_or(&[]);
+        let disks = self.shell.devices();
         let mut lines: Vec<Line> = Vec::new();
         if disks.is_empty() {
             lines.push(Line::raw("  No disks detected."));
@@ -6384,11 +6429,11 @@ impl App {
             info("Updater:", updater.to_string()),
             info(
                 "Config file:",
-                crate::update::UpdateConfig::user_config_path()
+                crate::controller::settings::SettingsController::config_file()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(no config dir)".to_string()),
             ),
-            info("Update repo:", s.config.update_check.repository_url.clone()),
+            info("Update repo:", s.ctl.repo_url().to_string()),
             Line::raw(""),
             Line::styled(
                 "Preferences  (Enter / Space toggles):",
@@ -6398,14 +6443,8 @@ impl App {
         ];
 
         let toggles = [
-            (
-                "Check for updates on startup",
-                s.config.update_check.enabled,
-            ),
-            (
-                "Register file associations",
-                s.config.file_associations_enabled,
-            ),
+            ("Check for updates on startup", s.ctl.update_check()),
+            ("Register file associations", s.ctl.file_associations()),
         ];
         for (i, (label, on)) in toggles.iter().enumerate() {
             let selected = i == s.sel;
@@ -7433,7 +7472,7 @@ mod tests {
         let size = std::fs::metadata(&img).unwrap().len();
 
         let mut app = App::new_on(DEFAULT_TAB);
-        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.set_test_devices(vec![fake_disk(&img, size)]);
         app.selection = 0;
         assert!(app.opened.is_none());
 
@@ -7464,7 +7503,7 @@ mod tests {
         let size = std::fs::metadata(&img).unwrap().len();
 
         let mut app = App::new_on(BACKUP_TAB);
-        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.set_test_devices(vec![fake_disk(&img, size)]);
         assert!(app.handle_backup_key(KeyCode::Char('d')));
         assert!(app.handle_backup_key(KeyCode::Enter));
         let b = app.backup.as_mut().unwrap();
@@ -7682,7 +7721,7 @@ mod tests {
         d[510] = 0x55;
         d[511] = 0xAA;
         std::fs::write(&disk, &d).unwrap();
-        app.disks = Some(vec![DiskDevice {
+        app.set_test_devices(vec![DiskDevice {
             name: "fake".into(),
             path: disk.clone(),
             size_bytes: 4 << 20,
@@ -7799,7 +7838,7 @@ mod tests {
         let size = std::fs::metadata(&img).unwrap().len();
 
         let mut app = App::new_on(DEFAULT_TAB);
-        app.disks = Some(vec![fake_disk(&img, size)]);
+        app.set_test_devices(vec![fake_disk(&img, size)]);
         app.activate();
         app.finish_task();
         assert!(app.opened.is_some());
@@ -8024,5 +8063,55 @@ mod tests {
                 .any(|(_, t)| *t == CdTarget::MacHfs || *t == CdTarget::MacHfsPlus),
             "the Mac disc targets are reachable from the wizard"
         );
+    }
+
+    fn tab_index(tab: TabId) -> usize {
+        TABS.iter().position(|(t, _)| *t == tab).unwrap()
+    }
+
+    /// `r` refreshes the device list through the app shell's job and reports the count.
+    #[test]
+    fn r_refreshes_the_device_list_in_the_shell_job() {
+        let mut app = App::new_on(tab_index(TabId::Inspect));
+        app.on_key_inner(crossterm::event::KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ));
+        assert!(app.devices_loaded);
+        assert_eq!(app.status.as_deref(), Some("Looking for devices..."));
+        let start = std::time::Instant::now();
+        while app.refreshing_devices && start.elapsed() < Duration::from_secs(60) {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.starts_with("Refreshed: "), "{status}");
+        assert!(status.ends_with("device(s) found"), "{status}");
+    }
+
+    /// A Settings toggle saves through the Settings controller (memory config in tests).
+    #[test]
+    fn a_settings_toggle_saves_through_the_settings_controller() {
+        let mut app = App::new_on(tab_index(TabId::Settings));
+        let before = app.settings.as_ref().unwrap().ctl.update_check();
+        assert!(app.handle_settings_key(KeyCode::Enter));
+        let s = app.settings.as_ref().unwrap();
+        assert_eq!(s.ctl.update_check(), !before);
+        let status = s.status.clone().unwrap_or_default();
+        assert!(status.starts_with("Settings saved"), "{status}");
+        assert!(app.handle_settings_key(KeyCode::Down));
+        assert!(app.handle_settings_key(KeyCode::Char(' ')));
+        assert!(app.settings.as_ref().unwrap().ctl.file_associations());
+    }
+
+    /// Without `tui-update` the check stays out of the build and says so.
+    #[cfg(not(feature = "tui-update"))]
+    #[test]
+    fn check_now_without_tui_update_says_it_is_not_built() {
+        let mut app = App::new_on(tab_index(TabId::Settings));
+        assert!(app.handle_settings_key(KeyCode::Char('c')));
+        assert!(!app.task.is_active());
+        let status = app.settings.as_ref().unwrap().status.clone();
+        assert!(status.unwrap_or_default().contains("tui-update"));
     }
 }

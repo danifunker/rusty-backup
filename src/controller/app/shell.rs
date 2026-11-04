@@ -191,6 +191,12 @@ impl AppController {
         (self.shell.devices.as_slice(), &mut self.log)
     }
 
+    /// Tests: show `devices` as if they had been listed.
+    #[cfg(test)]
+    pub fn set_devices(&mut self, devices: Vec<DiskDevice>) {
+        self.shell.devices = devices;
+    }
+
     /// List the devices now, at start-up, and log what was found.
     pub fn load_devices(&mut self) {
         self.shell.devices = crate::device::enumerate_devices();
@@ -353,6 +359,11 @@ pub fn busy_elsewhere(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_version_gate_needs_a_version_it_read() {
+        assert!(!super::host_known_older_than(0, 0));
+    }
+
     use super::*;
 
     #[test]
