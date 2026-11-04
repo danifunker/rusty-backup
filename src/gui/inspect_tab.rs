@@ -28,6 +28,11 @@ use super::effects::{EffectHost, Reply};
 use super::expand_hfs_dialog::ExpandHfsDialog;
 use super::floppy_convert_dialog::FloppyConvertDialog;
 use super::physical_disk_export::PhysicalDiskExport;
+use super::picker;
+
+/// Purposes of the tab's own source pickers, kept apart from the controller's.
+const OWN_PICK_IMAGE: &str = "inspect-tab.open-image";
+const OWN_PICK_BACKUP: &str = "inspect-tab.open-backup-folder";
 
 fn new_controller() -> InspectController {
     InspectController::new(InspectServices {
@@ -40,6 +45,8 @@ pub struct InspectTab {
     ctl: InspectController,
     /// Pickers and confirmations the controller asks for.
     effects: EffectHost,
+    /// Answers to the tab's own pickers that came back at once (a refusal or a sync fallback).
+    own_replies: Vec<Reply>,
     /// Effects from a call made outside `show`, run on the next frame.
     pending_fx: Vec<Effect>,
     /// In-memory mirror of the Inspect recent-image list (config.json), for the picker.
@@ -70,6 +77,7 @@ impl InspectTab {
         Self {
             ctl: new_controller(),
             effects: EffectHost::default(),
+            own_replies: Vec::new(),
             pending_fx: Vec::new(),
             recent_files: recent.list(RecentMode::Inspect),
             recent,
@@ -205,17 +213,48 @@ impl InspectTab {
         }
     }
 
+    /// Open the tab's own source picker; its answer reaches `run_effects` on a later frame.
+    fn own_pick(
+        &mut self,
+        ctx: &egui::Context,
+        purpose: &'static str,
+        dialog: rfd::AsyncFileDialog,
+        kind: picker::Kind,
+    ) {
+        if let Some(reply) = self.effects.pick_own(ctx, purpose, dialog, kind) {
+            self.own_replies.push(reply);
+            ctx.request_repaint();
+        }
+    }
+
+    /// A source the tab's own picker chose; a cancel changes nothing.
+    fn open_picked(&mut self, source: Option<InspectSource>) {
+        if let Some(source) = source {
+            self.remote_browser.disconnect();
+            self.act(InspectAction::Open(source));
+        }
+    }
+
     /// Run the effects waiting and the modal on screen; answers go back to the controller.
     fn run_effects(&mut self, ui: &egui::Ui, ctx: &mut TabContext) {
         let fx = std::mem::take(&mut self.pending_fx);
         let mut messages = Vec::new();
-        let mut replies = self.effects.run(ui.ctx(), fx, &mut messages);
+        let mut replies = std::mem::take(&mut self.own_replies);
+        replies.extend(self.effects.run(ui.ctx(), fx, &mut messages));
         replies.extend(self.effects.show(ui.ctx(), "inspect"));
         for msg in messages {
             ctx.log.info(msg);
         }
         for reply in replies {
             let action = match reply {
+                Reply::Picked { purpose, path } if purpose == OWN_PICK_IMAGE => {
+                    self.open_picked(path.map(InspectSource::ImageFile));
+                    continue;
+                }
+                Reply::Picked { purpose, path } if purpose == OWN_PICK_BACKUP => {
+                    self.open_picked(path.map(|folder| InspectSource::Backup { folder }));
+                    continue;
+                }
                 Reply::Picked { purpose, path } => InspectAction::Picked { purpose, path },
                 Reply::Confirmed { purpose, yes } => InspectAction::Confirmed { purpose, yes },
                 Reply::Answered { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
@@ -285,13 +324,9 @@ impl InspectTab {
                 identity: d.identity(),
             }),
             // A wrapper (`.adz`, ...) is decoded to a temporary file in the open's job.
-            SourceEvent::Image(path) | SourceEvent::Recent(path) => {
-                Some(InspectSource::ImageFile(path))
-            }
-            SourceEvent::BackupFolder(folder) => Some(InspectSource::Backup { folder }),
-            // Inspect offers no host folder, and runs its own dialogs.
-            SourceEvent::HostFolder(_)
-            | SourceEvent::Remote
+            SourceEvent::Recent(path) => Some(InspectSource::ImageFile(path)),
+            // Inspect offers no host folder; its own pickers answer through `run_effects`.
+            SourceEvent::Remote
             | SourceEvent::PickImage
             | SourceEvent::PickHostFolder
             | SourceEvent::PickBackupFolder => None,
@@ -309,11 +344,9 @@ impl InspectTab {
                 show_host_folder: false,
                 show_backup_folder: true,
                 show_remote: true,
-                include_mac_archives: true,
                 width: 400.0,
                 // A fixed 5-row Recent group keeps egui's cached popup size right.
                 recent_slots: 5,
-                run_dialogs: true,
             };
             let state = super::source_picker::PickerState {
                 selected_device_idx: self.ctl.device_slot(),
@@ -326,8 +359,15 @@ impl InspectTab {
             if let Some(ev) =
                 super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
             {
-                if matches!(ev, super::source_picker::SourceEvent::Remote) {
+                use super::source_picker::{image_dialog, SourceEvent};
+                if matches!(ev, SourceEvent::Remote) {
                     self.remote_browser.open();
+                } else if matches!(ev, SourceEvent::PickImage) {
+                    let (dialog, kind) = (image_dialog(true), picker::Kind::Open);
+                    self.own_pick(ui.ctx(), OWN_PICK_IMAGE, dialog, kind);
+                } else if matches!(ev, SourceEvent::PickBackupFolder) {
+                    let (dialog, kind) = (super::file_dialog(), picker::Kind::Folder);
+                    self.own_pick(ui.ctx(), OWN_PICK_BACKUP, dialog, kind);
                 } else {
                     self.remote_browser.disconnect();
                     if let Some(source) = self.source_for(ev, ctx) {

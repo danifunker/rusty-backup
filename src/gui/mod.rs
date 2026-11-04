@@ -21,6 +21,7 @@ mod optical_tab;
 mod partition_bar;
 mod partition_editor_modal;
 mod physical_disk_export;
+mod picker;
 mod progress;
 mod remote_browser;
 mod resize_popup;
@@ -156,8 +157,8 @@ pub(crate) fn recent_combo(
 }
 
 /// An rfd dialog starting in the real user's home, even when running elevated through pkexec.
-fn file_dialog() -> rfd::FileDialog {
-    let dialog = rfd::FileDialog::new();
+fn file_dialog() -> rfd::AsyncFileDialog {
+    let dialog = rfd::AsyncFileDialog::new();
     match rusty_backup::controller::app::picker_start_folder() {
         Some(home) => dialog.set_directory(home),
         None => dialog,

@@ -22,6 +22,7 @@ use super::commander::DetailEditors;
 use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
 use super::metadata_editor;
+use super::picker;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
@@ -56,6 +57,8 @@ pub struct BrowseView {
     ctl: CommanderController,
     /// Pickers, confirmations and prompts the controller asks for.
     effects: EffectHost,
+    /// The "Add File" picker on screen.
+    add_files: Option<picker::Pending<Option<Vec<PathBuf>>>>,
     /// Draws the flat list and folder-tree styles, as Commander does.
     pane_view: PaneView,
     /// The tree was clicked last, so bound keys go to the pane.
@@ -171,6 +174,7 @@ impl Default for BrowseView {
             generation_seen: 0,
             ctl: new_controller(false),
             effects: EffectHost::default(),
+            add_files: None,
             pane_view: PaneView::new(Side::Left),
             keys_active: false,
             scroll_cursor: false,
@@ -320,6 +324,7 @@ impl BrowseView {
         std::mem::replace(&mut self.ctl, new_controller(self.optical)).close_inspect();
         self.pending_fx.clear();
         self.effects = EffectHost::default();
+        self.add_files = None;
         self.keys_active = false;
         self.cursor_seen = None;
         self.selected_entry = None;
@@ -404,6 +409,12 @@ impl BrowseView {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
+        }
+        if let Some(paths) = self.add_files.as_mut().and_then(|p| p.poll()) {
+            self.add_files = None;
+            if let Some(paths) = paths {
+                self.add_host_paths(&ui.ctx().clone(), &paths);
+            }
         }
         self.poll_editor();
         if let Some(snap) = self.ctl.pane(Side::Left).tool_working() {
@@ -1996,15 +2007,13 @@ impl BrowseView {
         self.edit_result = Some(self.ctl.status().to_string());
     }
 
-    /// Show the "Add File" file picker dialog and add files.
+    /// Open the "Add File" picker; [`Self::show`] adds the files once it answers.
     fn add_file_dialog(&mut self, ctx: &egui::Context) {
-        let files = rfd::FileDialog::new()
-            .set_title("Select files to add")
-            .pick_files();
-
-        if let Some(paths) = files {
-            self.add_host_paths(ctx, &paths);
+        if self.add_files.is_some() {
+            return;
         }
+        let dialog = rfd::AsyncFileDialog::new().set_title("Select files to add");
+        self.add_files = picker::paths(ctx, dialog);
     }
 
     /// Stage host picks and drops through the pane; a tar or (on HFS) a Mac archive asks first.

@@ -23,20 +23,14 @@ use rusty_backup::device::DiskDevice;
 pub enum SourceEvent {
     /// A physical device was picked (index into the `devices` slice).
     Device(usize),
-    /// A disk image / container file was picked, as the user named it.
-    Image(PathBuf),
-    /// A host folder was opened (to browse as a pane source).
-    HostFolder(PathBuf),
-    /// A rusty-backup backup folder was opened.
-    BackupFolder(PathBuf),
     /// The user chose "Connect to Remote..." — open the remote file-browser
     /// window. The connection details are gathered by that window, not here.
     Remote,
-    /// "Open File..." with `run_dialogs` off: the caller runs the picker.
+    /// "Open File...": the caller runs the picker (a controller effect, or [`image_dialog`]).
     PickImage,
-    /// "Open Local Folder..." with `run_dialogs` off.
+    /// "Open Local Folder...".
     PickHostFolder,
-    /// "Open Backup Folder..." with `run_dialogs` off.
+    /// "Open Backup Folder...".
     PickBackupFolder,
     /// A recently-opened path was picked from the "Recent" group. The raw path
     /// is returned un-materialized; the caller routes it (image / archive /
@@ -58,10 +52,6 @@ pub struct PickerConfig {
     /// Offer "Connect to Remote…" (browse an `rb-cli serve` daemon in a
     /// file-browser window).
     pub show_remote: bool,
-    /// Add the "Mac archives" (`.sit`/`.hqx`/…) filter group to the image file
-    /// dialog. Inspect can inspect those; the Commander panes (disk browsing
-    /// only) leave it off so non-disk archives don't clutter the picker.
-    pub include_mac_archives: bool,
     /// ComboBox width.
     pub width: f32,
     /// Render the "Recent" group as this many **fixed** rows — the newest
@@ -72,8 +62,6 @@ pub struct PickerConfig {
     /// (emilk/egui#5225, #5138). `0` keeps the old behavior: show every recent
     /// entry, variable height (used by Commander, whose merged list is short).
     pub recent_slots: usize,
-    /// Run the file / folder dialogs here; off, the entries emit `Pick*` for a controller.
-    pub run_dialogs: bool,
 }
 
 /// Current selection highlight state, so the open entries render "active" and
@@ -91,9 +79,8 @@ pub struct PickerState<'a> {
     pub recent: &'a [String],
 }
 
-/// Run the disk-image / container file dialog (Disk Images + Mac archives + All Files filters).
-/// Returns `None` if the user cancels; the caller's controller decodes any wrapper.
-pub fn pick_image_file(include_mac_archives: bool) -> Option<PathBuf> {
+/// The disk-image / container file dialog (Disk Images + Mac archives + All Files filters).
+pub fn image_dialog(include_mac_archives: bool) -> rfd::AsyncFileDialog {
     let mut dialog = super::file_dialog().add_filter(
         "Disk Images",
         rusty_backup::controller::app::DISK_IMAGE_EXTS,
@@ -104,7 +91,7 @@ pub fn pick_image_file(include_mac_archives: bool) -> Option<PathBuf> {
             rusty_backup::controller::app::MAC_ARCHIVE_EXTS,
         );
     }
-    dialog.add_filter("All Files", &["*"]).pick_file()
+    dialog.add_filter("All Files", &["*"])
 }
 
 /// Render the source ComboBox and return the user's choice, if any. `id_salt`
@@ -197,11 +184,7 @@ pub fn show(
                     .selectable_label(state.image_active, "Open File...")
                     .clicked()
             {
-                if !cfg.run_dialogs {
-                    event = Some(SourceEvent::PickImage);
-                } else if let Some(path) = pick_image_file(cfg.include_mac_archives) {
-                    event = Some(SourceEvent::Image(path));
-                }
+                event = Some(SourceEvent::PickImage);
             }
             if cfg.show_host_folder
                 && ui
@@ -209,22 +192,14 @@ pub fn show(
                     .on_hover_text("Browse a folder on this computer (not a backup)")
                     .clicked()
             {
-                if !cfg.run_dialogs {
-                    event = Some(SourceEvent::PickHostFolder);
-                } else if let Some(dir) = super::file_dialog().pick_folder() {
-                    event = Some(SourceEvent::HostFolder(dir));
-                }
+                event = Some(SourceEvent::PickHostFolder);
             }
             if cfg.show_backup_folder
                 && ui
                     .selectable_label(state.backup_active, "Open Backup Folder...")
                     .clicked()
             {
-                if !cfg.run_dialogs {
-                    event = Some(SourceEvent::PickBackupFolder);
-                } else if let Some(dir) = super::file_dialog().pick_folder() {
-                    event = Some(SourceEvent::BackupFolder(dir));
-                }
+                event = Some(SourceEvent::PickBackupFolder);
             }
             if cfg.show_remote {
                 if cfg.show_image || cfg.show_host_folder || cfg.show_backup_folder {

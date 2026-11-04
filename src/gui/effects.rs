@@ -2,14 +2,17 @@
 //!
 //! A view that owns a controller keeps one [`EffectHost`], hands it the controller's effects,
 //! and maps each [`Reply`] to the controller's own answer action, so an answer always returns
-//! to the controller that asked. Pickers are blocking rfd dialogs on the UI thread, as the
-//! source picker's were; a confirmation or a text prompt is a modal window drawn by
-//! [`EffectHost::show`]. A text prompt runs the controller's validator on every edit: its
-//! message shows inline and OK (or Enter) works only while it passes.
+//! to the controller that asked. Pickers are async rfd dialogs ([`super::picker`]): the answer
+//! comes back from a later `run` or `show`, one picker at a time (a second is answered as a
+//! cancel). A confirmation or a text prompt is a modal window drawn by [`EffectHost::show`].
+//! A text prompt runs the controller's validator on every edit: its message shows inline and
+//! OK (or Enter) works only while it passes.
 
 use std::path::PathBuf;
 
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, Effect, PickSpec, TextSpec};
+
+use super::picker;
 
 /// An answer to an effect, for the view to turn into its controller's action.
 pub(crate) enum Reply {
@@ -46,28 +49,34 @@ pub(crate) struct EffectHost {
     confirm: Option<ConfirmSpec>,
     choice: Option<ChoiceSpec>,
     text: Option<TextPrompt>,
+    /// The picker on screen and the purpose its answer goes back under.
+    pick: Option<(&'static str, picker::Pending<Option<PathBuf>>)>,
 }
 
 impl EffectHost {
-    /// Carry out `effects`: messages land in `messages`, picker answers come back now.
+    /// Carry out `effects`: messages land in `messages`; a finished picker's answer comes back too.
     pub(crate) fn run(
         &mut self,
         ctx: &egui::Context,
         effects: Vec<Effect>,
         messages: &mut Vec<String>,
     ) -> Vec<Reply> {
-        let mut replies = Vec::new();
+        let mut replies: Vec<Reply> = self.poll_pick().into_iter().collect();
         for effect in effects {
             match effect {
                 Effect::Message(text) => messages.push(text),
-                Effect::PickFile(spec) => replies.push(Reply::Picked {
-                    purpose: spec.purpose,
-                    path: pick(&spec, false),
-                }),
-                Effect::PickFolder(spec) => replies.push(Reply::Picked {
-                    purpose: spec.purpose,
-                    path: pick(&spec, true),
-                }),
+                Effect::PickFile(spec) => {
+                    let kind = if spec.save {
+                        picker::Kind::Save
+                    } else {
+                        picker::Kind::Open
+                    };
+                    replies.extend(self.pick_own(ctx, spec.purpose, dialog_for(&spec), kind));
+                }
+                Effect::PickFolder(spec) => {
+                    let dialog = dialog_for(&spec);
+                    replies.extend(self.pick_own(ctx, spec.purpose, dialog, picker::Kind::Folder));
+                }
                 Effect::Confirm(spec) => self.confirm = Some(spec),
                 Effect::Choose(spec) => self.choice = Some(spec),
                 Effect::AskText(spec) => {
@@ -90,9 +99,47 @@ impl EffectHost {
         replies
     }
 
-    /// True while a confirmation or text prompt waits for an answer.
+    /// Open `dialog` for the view itself; the answer comes back as `Reply::Picked { purpose, .. }`.
+    /// With a picker already on screen it is refused, and the refusal answers now as a cancel.
+    pub(crate) fn pick_own(
+        &mut self,
+        ctx: &egui::Context,
+        purpose: &'static str,
+        dialog: rfd::AsyncFileDialog,
+        kind: picker::Kind,
+    ) -> Option<Reply> {
+        let pending = match self.pick {
+            Some(_) => None,
+            None => picker::path(ctx, dialog, kind),
+        };
+        match pending {
+            Some(p) => {
+                self.pick = Some((purpose, p));
+                self.poll_pick()
+            }
+            None => {
+                log::info!("A file dialog is already open");
+                Some(Reply::Picked {
+                    purpose,
+                    path: None,
+                })
+            }
+        }
+    }
+
+    /// The picker's answer once its dialog has closed.
+    fn poll_pick(&mut self) -> Option<Reply> {
+        let (purpose, pending) = self.pick.as_mut()?;
+        let purpose = *purpose;
+        let path = pending.poll()?;
+        self.pick = None;
+        Some(Reply::Picked { purpose, path })
+    }
+
+    /// True while a picker, a confirmation or a text prompt waits for an answer.
     pub(crate) fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.choice.is_some() || self.text.is_some()
+        let prompt = self.confirm.is_some() || self.choice.is_some() || self.text.is_some();
+        prompt || self.pick.is_some()
     }
 
     /// The `purpose` of the confirmation or prompt on screen.
@@ -106,6 +153,9 @@ impl EffectHost {
 
     /// Draw the pending confirmation or prompt; `whose` tells two hosts' windows apart.
     pub(crate) fn show(&mut self, ctx: &egui::Context, whose: &str) -> Option<Reply> {
+        if let Some(reply) = self.poll_pick() {
+            return Some(reply);
+        }
         if self.confirm.is_some() {
             return self.show_confirm(ctx, whose);
         }
@@ -238,8 +288,8 @@ fn titled(title: &str, whose: &str) -> String {
     }
 }
 
-/// Run a picker dialog for `spec`; blocks the UI thread until the user answers.
-fn pick(spec: &PickSpec, folder: bool) -> Option<PathBuf> {
+/// The dialog `spec` describes: its title, default name and filters.
+fn dialog_for(spec: &PickSpec) -> rfd::AsyncFileDialog {
     let mut dialog = super::file_dialog().set_title(spec.title.as_str());
     if !spec.file_name.is_empty() {
         dialog = dialog.set_file_name(spec.file_name.as_str());
@@ -247,9 +297,5 @@ fn pick(spec: &PickSpec, folder: bool) -> Option<PathBuf> {
     for (name, exts) in &spec.filters {
         dialog = dialog.add_filter(name.as_str(), exts);
     }
-    match (folder, spec.save) {
-        (true, _) => dialog.pick_folder(),
-        (false, true) => dialog.save_file(),
-        (false, false) => dialog.pick_file(),
-    }
+    dialog
 }

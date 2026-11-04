@@ -266,14 +266,10 @@ impl PaneView {
                 // "Connect to Remote..." lives in this dropdown now (no
                 // separate button).
                 show_remote: true,
-                // Surface .sit/.hqx/... in the "Open File..." dialog; a Mac
-                // archive opens read-only in-pane (ArchiveFilesystem).
-                include_mac_archives: true,
                 width: 200.0,
                 // Variable-length recent group: the merged list is already short
                 // (newest 3 per mode) and rarely changes mid-session.
                 recent_slots: 0,
-                run_dialogs: false,
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
@@ -293,11 +289,6 @@ impl PaneView {
                 match ev {
                     // A recent pick opens like a drag-and-drop: a folder as a host folder, a file as an image.
                     SourceEvent::Recent(path) => source_action = Some(P::OpenPath(path)),
-                    SourceEvent::Image(path) => source_action = Some(P::OpenImage(path)),
-                    SourceEvent::HostFolder(dir) => source_action = Some(P::OpenHostFolder(dir)),
-                    SourceEvent::BackupFolder(dir) => {
-                        source_action = Some(P::OpenBackupFolder(dir))
-                    }
                     SourceEvent::PickImage => source_action = Some(P::PickImage),
                     SourceEvent::PickHostFolder => source_action = Some(P::PickHostFolder),
                     SourceEvent::PickBackupFolder => source_action = Some(P::PickBackupFolder),
