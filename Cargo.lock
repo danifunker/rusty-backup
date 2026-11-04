@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -5666,6 +5666,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-fsexporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-mac",
+ "tempfile",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6071,6 +6081,7 @@ dependencies = [
  "part-tables",
  "qnx2fs",
  "ratatui",
+ "rb-fsexporter",
  "reqwest",
  "rfd",
  "rodio",

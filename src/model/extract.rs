@@ -1,18 +1,22 @@
-//! Extract one entry of a volume (a file, or a folder with everything in it) to a host folder.
+//! Extract one entry of a volume (a file, a folder with everything in it, or the whole volume)
+//! to a host folder, through the `rb-fsexporter` crate.
 //!
-//! The Inspect browser's Extract: forks per a `ResourceForkMode`, ProDOS files named with the
-//! CiderPress `#TTAAAA` suffix so type and aux survive a round trip, and QNX 2 text files with
-//! RS line separators turned into LF. It runs as a [`super::commander_ops::HostCopyJob::Extract`]
-//! so the screen's copy job reports its progress, cancels it and settles existing files.
+//! The Inspect browser's and Commander's Extract, discs included: forks per a
+//! `ResourceForkMode`, ProDOS files named with the CiderPress `#TTAAAA` suffix so type and aux
+//! survive a round trip, and QNX 2 text files with RS line separators turned into LF. It runs
+//! as a [`super::commander_ops::HostCopyJob::Extract`] so the screen's copy job reports its
+//! progress, cancels it and settles existing files. A disc keeps the Optical tab's old
+//! settings: no Finder-info-only AppleDouble sidecar, and any error stops the extraction
+//! (docs/phase2_commander_plan.md § "Slice 19").
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
-use disk_core::entry::{EntryType, FileEntry};
+use anyhow::Result;
+use disk_core::entry::FileEntry;
 use disk_core::filesystem::Filesystem;
-use fs_mac::fork_export;
 use fs_mac::resource_fork::{sanitize_filename, ResourceForkMode};
+use rb_fsexporter::{Host, Options, Summary};
 
 use super::commander_ops::{HostCopyStatus, StageSource};
 use crate::fs::replace::OnConflict;
@@ -63,7 +67,10 @@ pub struct ExtractJob {
 
 /// The name an entry gets on the host.
 pub fn host_name(entry: &FileEntry, options: &ExtractOptions) -> String {
-    let base = sanitize_filename(&entry.name);
+    suffixed(entry, options, sanitize_filename(entry.name.as_str()))
+}
+
+fn suffixed(entry: &FileEntry, options: &ExtractOptions, base: String) -> String {
     if options.prodos_suffix && entry.is_file() {
         let tt = entry.prodos_file_type.unwrap_or(0x06);
         let aux = entry.aux_type.unwrap_or(0);
@@ -75,86 +82,146 @@ pub fn host_name(entry: &FileEntry, options: &ExtractOptions) -> String {
     base
 }
 
-/// The host paths the entry's own output would replace (its file and any fork sidecar).
+/// The host paths the entry's own output would replace (its file and any fork sidecar, or the
+/// folder; a volume root's folder is named after `volume_label`).
 pub fn extraction_conflicts(
     entry: &FileEntry,
     dest: &Path,
     options: &ExtractOptions,
     forks: bool,
+    volume_label: Option<&str>,
 ) -> Vec<PathBuf> {
-    let name = host_name(entry, options);
-    let has_rsrc = forks && entry.is_file() && entry.resource_fork_size.is_some_and(|s| s > 0);
-    let mut out = Vec::new();
-    match options.fork_mode {
-        ResourceForkMode::MacBinary if has_rsrc => out.push(dest.join(format!("{name}.bin"))),
-        // BinHex packs both forks and the Finder info into one file, fork or not.
-        ResourceForkMode::BinHex if entry.is_file() => out.push(dest.join(format!("{name}.hqx"))),
-        mode => {
-            out.push(dest.join(&name));
-            match mode {
-                ResourceForkMode::AppleDouble if has_rsrc => {
-                    out.push(dest.join(format!("._{name}")))
-                }
-                ResourceForkMode::SeparateRsrc if has_rsrc => {
-                    out.push(dest.join(format!("{name}.rsrc")))
-                }
-                _ => {}
-            }
-        }
-    }
-    out.into_iter().filter(|p| p.exists()).collect()
+    let name = match rb_fsexporter::is_volume_root(entry) {
+        true => rb_fsexporter::top_name(entry, volume_label),
+        false => host_name(entry, options),
+    };
+    rb_fsexporter::existing_outputs(entry, dest, name.as_str(), options.fork_mode, forks)
 }
 
 /// Run an extraction, counting first for the progress bar; returns the files written.
 pub(crate) fn run(job: ExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
-    let conflicts = extraction_conflicts(&job.entry, &job.dest, &job.options, job.forks);
-    if !conflicts.is_empty() && job.on_conflict == OnConflict::Skip {
-        if let Ok(mut g) = status.lock() {
-            g.skipped
-                .push(format!("{} (already exists)", job.entry.name));
-        }
-        return Ok(0);
-    }
-    let mut fs = job.source.open()?;
-    let (files, bytes) = count(fs.as_mut(), &job.entry)?;
-    if let Ok(mut g) = status.lock() {
-        g.files_total = files;
-        g.bytes_total = bytes;
-    }
-    let mut out = Extractor {
-        fs: fs.as_mut(),
-        options: job.options,
-        status,
-        written: 0,
+    let ExtractJob {
+        source,
+        entry,
+        dest,
+        options,
+        forks,
+        on_conflict,
+    } = job;
+    let plan = Plan {
+        dest,
+        options,
+        forks,
+        on_conflict,
     };
-    out.entry(&job.entry, &job.dest)?;
-    Ok(out.written)
+    #[cfg(feature = "optical")]
+    if let Some(disc) = source.disc() {
+        let path = disc.src.path.clone();
+        return run_disc(disc, entry.path.as_str(), plan, status).map_err(|e| {
+            let msg = crate::cli::optical_hint::with_nkit_hint(e, path.as_path());
+            anyhow::anyhow!("{msg:#}")
+        });
+    }
+    let mut fs = source.open()?;
+    let opts = Options::new(options.fork_mode);
+    plan.run(fs.as_mut(), &entry, opts, status)
 }
 
-fn count(fs: &mut dyn Filesystem, entry: &FileEntry) -> Result<(usize, u64)> {
-    Ok(match entry.entry_type {
-        EntryType::File => (1, entry.size + entry.resource_fork_size.unwrap_or(0)),
-        EntryType::Symlink => (1, 0),
-        EntryType::Special => (0, 0),
-        EntryType::Directory => {
-            let mut total = (0, 0);
-            for child in fs.list_directory(entry)? {
-                let (f, b) = count(fs, &child)?;
-                total = (total.0 + f, total.1 + b);
-            }
-            total
-        }
-    })
+/// A disc: its fresh filesystem carries the Mac dates, and the entry is looked up again in it.
+#[cfg(feature = "optical")]
+fn run_disc(
+    disc: &crate::model::optical_browse::DiscChoice,
+    path: &str,
+    plan: Plan,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<usize> {
+    let mut fs = disc.extract_filesystem().map_err(|e| anyhow::anyhow!(e))?;
+    let entry = entry_at(fs.as_mut(), path)?;
+    let mut opts = Options::new(plan.options.fork_mode);
+    opts.finder_info_sidecar = false;
+    opts.on_error = rb_fsexporter::OnError::Stop;
+    plan.run(fs.as_mut(), &entry, opts, status)
 }
 
-struct Extractor<'a> {
-    fs: &'a mut dyn Filesystem,
+/// An [`ExtractJob`] without its source.
+struct Plan {
+    dest: PathBuf,
     options: ExtractOptions,
-    status: &'a Arc<Mutex<HostCopyStatus>>,
-    written: usize,
+    forks: bool,
+    on_conflict: OnConflict,
 }
 
-impl Extractor<'_> {
+impl Plan {
+    fn run(
+        self,
+        fs: &mut dyn Filesystem,
+        entry: &FileEntry,
+        opts: Options,
+        status: &Arc<Mutex<HostCopyStatus>>,
+    ) -> Result<usize> {
+        let label = fs.volume_label().map(str::to_string);
+        let conflicts = extraction_conflicts(
+            entry,
+            &self.dest,
+            &self.options,
+            self.forks,
+            label.as_deref(),
+        );
+        if !conflicts.is_empty() && self.on_conflict == OnConflict::Skip {
+            if let Ok(mut g) = status.lock() {
+                g.skipped.push(format!("{} (already exists)", entry.name));
+            }
+            return Ok(0);
+        }
+        let (files, bytes) = rb_fsexporter::count(fs, entry)?;
+        if let Ok(mut g) = status.lock() {
+            g.files_total = files;
+            g.bytes_total = bytes;
+        }
+        let mut host = StatusHost {
+            status,
+            options: self.options,
+        };
+        let done = rb_fsexporter::extract(fs, entry, &self.dest, &opts, &mut host)?;
+        Ok(done.files)
+    }
+}
+
+/// The entry at `path`, found by listing each folder on the way from the root.
+#[cfg(feature = "optical")]
+fn entry_at(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry> {
+    let mut cur = fs.root()?;
+    if path == "/" || path.is_empty() {
+        return Ok(cur);
+    }
+    loop {
+        let mut next = None;
+        for k in fs.list_directory(&cur)? {
+            if k.path == path {
+                return Ok(k);
+            }
+            let ancestor = k.is_directory()
+                && path.len() > k.path.len()
+                && path.starts_with(k.path.as_str())
+                && path.as_bytes().get(k.path.len()) == Some(&b'/');
+            if ancestor && next.is_none() {
+                next = Some(k);
+            }
+        }
+        match next {
+            Some(dir) => cur = dir,
+            None => anyhow::bail!("{path} is not on the disc"),
+        }
+    }
+}
+
+/// The copy job's status as the extractor's host.
+struct StatusHost<'a> {
+    status: &'a Arc<Mutex<HostCopyStatus>>,
+    options: ExtractOptions,
+}
+
+impl Host for StatusHost<'_> {
     fn cancelled(&self) -> bool {
         self.status
             .lock()
@@ -162,66 +229,50 @@ impl Extractor<'_> {
             .unwrap_or(false)
     }
 
-    fn wrote(&mut self, bytes: u64) {
-        self.written += 1;
+    fn started(&mut self, entry: &FileEntry) {
         if let Ok(mut g) = self.status.lock() {
-            g.copied = self.written;
+            g.current_file = entry.path.clone();
+        }
+    }
+
+    fn wrote(&mut self, _entry: &FileEntry, bytes: u64, total: &Summary) {
+        if let Ok(mut g) = self.status.lock() {
+            g.copied = total.files;
             g.bytes_done += bytes;
         }
     }
 
-    fn entry(&mut self, entry: &FileEntry, dest: &Path) -> Result<()> {
-        if self.cancelled() {
-            anyhow::bail!("Extraction cancelled");
+    // One unreadable entry (an NTFS metafile, a bad file) is skipped, not fatal.
+    fn failed(&mut self, entry: &FileEntry, err: &anyhow::Error) {
+        log::warn!("Skipped {}: {err:#}", entry.path);
+        if let Ok(mut g) = self.status.lock() {
+            g.skipped.push(format!("{} ({err:#})", entry.path));
         }
-        let name = host_name(entry, &self.options);
-        match entry.entry_type {
-            EntryType::File => {
-                if let Ok(mut g) = self.status.lock() {
-                    g.current_file = entry.path.clone();
-                }
-                if self.options.rs_to_lf && entry.size <= 16 << 20 {
-                    let data = self.fs.read_file(entry, usize::MAX)?;
-                    if crate::fs::qnx2::looks_like_rs_text(&data) {
-                        std::fs::write(dest.join(&name), crate::fs::qnx2::rs_to_lf(&data))?;
-                        self.wrote(data.len() as u64);
-                        return Ok(());
-                    }
-                }
-                let mode = self.options.fork_mode;
-                let bytes = fork_export::export_file_with_fork(self.fs, entry, dest, &name, mode)?;
-                self.wrote(bytes);
-            }
-            EntryType::Directory => {
-                let dir = dest.join(&name);
-                std::fs::create_dir_all(&dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-                for child in self.fs.list_directory(entry)? {
-                    match self.entry(&child, &dir) {
-                        Ok(()) => {}
-                        Err(e) if self.cancelled() => return Err(e),
-                        // One unreadable entry (an NTFS metafile, a bad file) is skipped, not fatal.
-                        Err(e) => {
-                            log::warn!("Skipped {}: {e:#}", child.path);
-                            if let Ok(mut g) = self.status.lock() {
-                                g.skipped.push(format!("{} ({e:#})", child.path));
-                            }
-                        }
-                    }
-                }
-            }
-            EntryType::Symlink => {
-                #[cfg(unix)]
-                {
-                    let target = entry.symlink_target.as_deref().unwrap_or("");
-                    // The target may not exist on the host; the link is still worth writing.
-                    let _ = std::os::unix::fs::symlink(target, dest.join(&name));
-                }
-                self.wrote(0);
-            }
-            EntryType::Special => {}
+    }
+
+    fn host_name(&self, entry: &FileEntry, base: String) -> String {
+        suffixed(entry, &self.options, base)
+    }
+
+    fn write_file(
+        &mut self,
+        fs: &mut dyn Filesystem,
+        entry: &FileEntry,
+        dir: &Path,
+        name: &str,
+    ) -> Option<Result<u64>> {
+        if !self.options.rs_to_lf || entry.size > 16 << 20 {
+            return None;
         }
-        Ok(())
+        let data = match fs.read_file(entry, usize::MAX) {
+            Ok(d) => d,
+            Err(e) => return Some(Err(e.into())),
+        };
+        if !crate::fs::qnx2::looks_like_rs_text(&data) {
+            return None;
+        }
+        let out = std::fs::write(dir.join(name), crate::fs::qnx2::rs_to_lf(&data));
+        Some(out.map(|_| data.len() as u64).map_err(anyhow::Error::from))
     }
 }
 

@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::Filesystem;
-use fs_mac::fork_export::{export_file_with_fork, safe_name};
+use fs_mac::fork_export::safe_name;
 use fs_mac::resource_fork::{build_appledouble, MacFileDates, ResourceForkMode};
 use fs_tar::tar_export::{export_tar_multi, TarCompression, TarExportOptions};
 
@@ -169,85 +169,84 @@ pub fn export_to_folder(
             std::fs::create_dir_all(&t).with_context(|| format!("creating {}", t.display()))?;
             t
         };
-        folder_recurse(
-            fs,
-            std::slice::from_ref(e),
-            &target,
+        let mut host = FolderHost {
             format,
-            fork_mode,
             progress,
             cancelled,
-            &mut summary,
-        )?;
+            summary: &mut summary,
+        };
+        let opts = folder_options(format, fork_mode);
+        rb_fsexporter::extract(fs, e, &target, &opts, &mut host).map_err(|err| {
+            match err.is::<rb_fsexporter::Cancelled>() {
+                true => cancelled_err(),
+                false => err.context(format!("exporting '{}'", e.name)),
+            }
+        })?;
     }
     Ok(summary)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn folder_recurse(
-    fs: &mut dyn Filesystem,
-    entries: &[FileEntry],
-    dest_dir: &Path,
+/// How a folder export writes: the root's contents into the folder, symlinks left out, any
+/// error stops it. BinHex is a fixed fork container, independent of the loose "Forks as:".
+fn folder_options(format: ExportFormat, fork_mode: ResourceForkMode) -> rb_fsexporter::Options {
+    let mode = match format {
+        ExportFormat::BinHex => ResourceForkMode::BinHex,
+        _ => fork_mode,
+    };
+    let mut opts = rb_fsexporter::Options::new(mode);
+    opts.symlinks = rb_fsexporter::Symlinks::Skip;
+    opts.on_error = rb_fsexporter::OnError::Stop;
+    opts.volume_folder = false;
+    opts
+}
+
+/// A folder export as the extractor's host: progress, cancel and the per-file compressors.
+struct FolderHost<'a, 'b> {
     format: ExportFormat,
-    fork_mode: ResourceForkMode,
-    progress: &Progress,
-    cancelled: &Cancelled,
-    summary: &mut ExportSummary,
-) -> Result<()> {
-    for e in entries {
-        if cancelled() {
-            return Err(cancelled_err());
-        }
-        match e.entry_type {
-            EntryType::Directory => {
-                let children = fs
-                    .list_directory(e)
-                    .with_context(|| format!("listing '{}'", e.name))?;
-                // A volume root has no name of its own — extract its contents
-                // straight into `dest_dir`. Joining its literal "/" name would
-                // discard `dest_dir` entirely and target the host root.
-                let sub = match e.archive_name() {
-                    Some(name) => {
-                        let sub = dest_dir.join(fs_mac::resource_fork::sanitize_filename(name));
-                        std::fs::create_dir_all(&sub)
-                            .with_context(|| format!("creating {}", sub.display()))?;
-                        sub
-                    }
-                    None => dest_dir.to_path_buf(),
-                };
-                folder_recurse(
-                    fs, &children, &sub, format, fork_mode, progress, cancelled, summary,
-                )?;
-            }
-            EntryType::File => {
-                match format {
-                    // BinHex is a fixed fork container, independent of the loose
-                    // "Forks as:" choice.
-                    ExportFormat::LooseFiles | ExportFormat::BinHex => {
-                        let mode = if format == ExportFormat::BinHex {
-                            ResourceForkMode::BinHex
-                        } else {
-                            fork_mode
-                        };
-                        export_file_with_fork(fs, e, dest_dir, &safe_name(e), mode)
-                            .with_context(|| format!("exporting '{}'", e.name))?;
-                    }
-                    ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => {
-                        export_compressed_file(fs, e, dest_dir, format)
-                            .with_context(|| format!("compressing '{}'", e.name))?;
-                    }
-                    _ => anyhow::bail!("{:?} is not a folder-output format", format),
-                }
-                summary.files += 1;
-                summary.bytes = summary.bytes.saturating_add(e.size);
-                progress(&e.path, summary.files, summary.bytes);
-            }
-            EntryType::Symlink | EntryType::Special => {
-                // Not representable as a loose host file here; skip.
-            }
+    progress: &'a Progress<'b>,
+    cancelled: &'a Cancelled<'b>,
+    summary: &'a mut ExportSummary,
+}
+
+impl rb_fsexporter::Host for FolderHost<'_, '_> {
+    fn cancelled(&self) -> bool {
+        (self.cancelled)()
+    }
+
+    fn wrote(&mut self, entry: &FileEntry, _bytes: u64, _total: &rb_fsexporter::Summary) {
+        self.summary.files += 1;
+        self.summary.bytes = self.summary.bytes.saturating_add(entry.size);
+        (self.progress)(&entry.path, self.summary.files, self.summary.bytes);
+    }
+
+    // A folder keeps its own name with any leading or trailing '/' trimmed.
+    fn host_name(&self, entry: &FileEntry, base: String) -> String {
+        match entry.is_directory() {
+            true => entry
+                .archive_name()
+                .map(fs_mac::resource_fork::sanitize_filename)
+                .unwrap_or(base),
+            false => base,
         }
     }
-    Ok(())
+
+    fn write_file(
+        &mut self,
+        fs: &mut dyn Filesystem,
+        entry: &FileEntry,
+        dir: &Path,
+        _name: &str,
+    ) -> Option<Result<u64>> {
+        match self.format {
+            ExportFormat::LooseFiles | ExportFormat::BinHex => None,
+            ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => Some(
+                export_compressed_file(fs, entry, dir, self.format)
+                    .with_context(|| format!("compressing '{}'", entry.name))
+                    .map(|()| entry.size),
+            ),
+            f => Some(Err(anyhow::anyhow!("{:?} is not a folder-output format", f))),
+        }
+    }
 }
 
 /// Read a file's data fork fully into memory.

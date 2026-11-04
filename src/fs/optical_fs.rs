@@ -34,9 +34,36 @@ pub struct OpticalFilesystem {
     by_path: HashMap<String, OptEntry>,
     label: Option<String>,
     fs_type: String,
+    /// Entries carry Mac dates and POSIX mode / owner ([`Self::with_extract_metadata`]).
+    extract_meta: bool,
 }
 
 impl OpticalFilesystem {
+    /// Entries carry the disc's Mac dates and POSIX mode / owner, for the host extractor only.
+    pub fn with_extract_metadata(mut self) -> Self {
+        self.extract_meta = true;
+        self
+    }
+
+    /// Our entry for the disc path `path` (`/` for the root).
+    pub fn entry_at(&mut self, path: &str) -> Result<FileEntry, FilesystemError> {
+        let oe = self.opt_entry(path)?;
+        Ok(self.entry(&oe))
+    }
+
+    fn entry(&self, e: &OptEntry) -> FileEntry {
+        let mut fe = translate(e);
+        if self.extract_meta {
+            fe.mac_dates = mac_dates(e);
+            if let Some(p) = &e.posix {
+                fe.mode = Some(p.mode);
+                fe.uid = Some(p.uid);
+                fe.gid = Some(p.gid);
+            }
+        }
+        fe
+    }
+
     /// Open the optical image at `path`. For bin/cue and mdf/mds the sibling
     /// data file must sit next to `path`.
     pub fn open(path: &Path, label: Option<String>) -> Result<Self, FilesystemError> {
@@ -55,6 +82,7 @@ impl OpticalFilesystem {
             by_path,
             label,
             fs_type,
+            extract_meta: false,
         })
     }
 
@@ -77,6 +105,7 @@ impl OpticalFilesystem {
             by_path,
             label,
             fs_type,
+            extract_meta: false,
         })
     }
 
@@ -177,6 +206,25 @@ pub(crate) fn translate(e: &OptEntry) -> FileEntry {
     fe
 }
 
+/// HFS / HFS+ create and modify dates as raw Mac seconds; `None` elsewhere.
+fn mac_dates(e: &OptEntry) -> Option<(u32, u32, u32)> {
+    use opticaldiscs::FileTimestamps as T;
+    match &e.timestamps {
+        Some(T::Hfs {
+            created,
+            modified,
+            backup,
+        }) => Some((*created, *modified, *backup)),
+        Some(T::HfsPlus {
+            created,
+            content_modified,
+            backup,
+            ..
+        }) => Some((*created, *content_modified, *backup)),
+        _ => None,
+    }
+}
+
 impl Filesystem for OpticalFilesystem {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         let root = self
@@ -184,7 +232,7 @@ impl Filesystem for OpticalFilesystem {
             .root()
             .map_err(|e| FilesystemError::Parse(format!("disc root: {e}")))?;
         self.by_path.insert(root.path.clone(), root.clone());
-        Ok(translate(&root))
+        Ok(self.entry(&root))
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
@@ -196,7 +244,7 @@ impl Filesystem for OpticalFilesystem {
         let mut out = Vec::with_capacity(kids.len());
         for k in kids {
             self.by_path.insert(k.path.clone(), k.clone());
-            out.push(translate(&k));
+            out.push(self.entry(&k));
         }
         Ok(out)
     }
@@ -396,6 +444,7 @@ mod tests {
             by_path,
             label: None,
             fs_type: "MockHfs".into(),
+            extract_meta: false,
         }
     }
 

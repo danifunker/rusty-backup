@@ -65,7 +65,7 @@ native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zst
 remote = []
 tui = ["dep:ratatui", "ratatui-legacy"]
 ratatui-legacy = []
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
 windows-legacy = []
 # Declared so the shared source's cfg resolves, but not in this build's feature list.
 yaml = ["dep:serde_yml"]
@@ -82,6 +82,7 @@ dsk-tape = { path = "../crates/dsk-tape", default-features = false, features = [
 dsk-imz = { path = "../crates/dsk-imz", default-features = false }
 arc-mac = { path = "../crates/arc-mac" }
 fs-tar = { path = "../crates/fs-tar", default-features = false, features = ["appledouble", "zip"] }
+rb-fsexporter = { path = "../crates/rb-fsexporter" }
 fs-adfs = { path = "../crates/fs-adfs" }
 dsk-ghost = { path = "../crates/dsk-ghost" }
 dsk-vm = { path = "../crates/dsk-vm" }

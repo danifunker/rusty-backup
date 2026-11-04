@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1732,6 +1732,7 @@ dependencies = [
  "part-tables",
  "qnx2fs",
  "ratatui",
+ "rb-fsexporter",
  "rustyline",
  "self-replace",
  "serde",
@@ -1751,6 +1752,15 @@ dependencies = [
  "zeroize_derive",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "rb-fsexporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-mac",
 ]
 
 [[package]]

@@ -27,7 +27,7 @@ use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 use crate::remote::RemoteConnection;
 use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::Filesystem;
-use fs_mac::fork_export::{export_file_with_fork, primary_output_path, safe_name};
+use fs_mac::fork_export::{primary_output_path, safe_name};
 use fs_mac::resource_fork::{ImportedResourceFork, ResourceForkMode};
 
 /// Apply `edits` to `session`'s source in order, stopping at the first failure.
@@ -475,7 +475,7 @@ impl StageSource {
         }
     }
 
-    /// The disc a browser pane's disc source reopens, for the tools that keep the disc walker.
+    /// The disc a browser pane's disc source reopens (the extractor opens it with its dates).
     #[cfg(feature = "optical")]
     pub fn disc(&self) -> Option<&crate::model::optical_browse::DiscChoice> {
         match self {
@@ -931,46 +931,6 @@ pub enum HostCopyJob {
     ExportSelection(Box<ExportJob>),
     /// Extract one entry (a folder with its contents) to a host folder.
     Extract(Box<crate::model::extract::ExtractJob>),
-    /// Extract one entry of a disc source with the Optical tab's walker (its bytes, its fork modes).
-    #[cfg(feature = "optical")]
-    DiscExtract(Box<DiscExtractJob>),
-}
-
-/// Payload for [`HostCopyJob::DiscExtract`].
-#[cfg(feature = "optical")]
-pub struct DiscExtractJob {
-    pub disc: crate::model::optical_browse::DiscChoice,
-    pub entry: FileEntry,
-    pub dest: PathBuf,
-    pub fork_mode: ResourceForkMode,
-    /// What to do when the entry's own output already exists.
-    pub on_conflict: crate::fs::replace::OnConflict,
-}
-
-#[cfg(feature = "optical")]
-fn run_disc_extract(job: DiscExtractJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
-    use crate::fs::replace::OnConflict;
-    use crate::model::extract::{extraction_conflicts, ExtractOptions};
-    let options = ExtractOptions {
-        fork_mode: job.fork_mode,
-        prodos_suffix: false,
-        rs_to_lf: false,
-    };
-    let forks = job.disc.has_forks();
-    let taken = extraction_conflicts(&job.entry, job.dest.as_path(), &options, forks);
-    if !taken.is_empty() && job.on_conflict == OnConflict::Skip {
-        if let Ok(mut g) = status.lock() {
-            g.skipped
-                .push(format!("{} (already exists)", job.entry.name));
-        }
-        return Ok(0);
-    }
-    let path = job.entry.path.as_str();
-    let n = job
-        .disc
-        .extract_path(path, job.dest.as_path(), job.fork_mode, status)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(n as usize)
 }
 
 /// Payload for [`HostCopyJob::ExportSelection`].
@@ -1026,8 +986,6 @@ impl HostCopyJob {
             HostCopyJob::ImageToHost { on_conflict, .. }
             | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
             HostCopyJob::Extract(job) => job.on_conflict = on,
-            #[cfg(feature = "optical")]
-            HostCopyJob::DiscExtract(job) => job.on_conflict = on,
             _ => {}
         }
         self
@@ -1202,8 +1160,6 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
         HostCopyJob::Extract(job) => crate::model::extract::run(*job, status),
-        #[cfg(feature = "optical")]
-        HostCopyJob::DiscExtract(job) => run_disc_extract(*job, status),
     }
 }
 
@@ -1396,9 +1352,8 @@ fn scan_host_dir(dir: &Path) -> (usize, u64) {
     (files, bytes)
 }
 
-/// Extract image `entries` into `dest_dir`, recursing directories and
-/// preserving resource forks per `fork_mode` (via the shared
-/// [`export_file_with_fork`]).
+/// Extract image `entries` into `dest_dir` through the `rb-fsexporter` crate: folders recursed,
+/// forks per `fork_mode`, symlinks and special files left out, `on_conflict` per file.
 fn copy_image_entries_to_host(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
@@ -1407,38 +1362,54 @@ fn copy_image_entries_to_host(
     on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
-    let mut count = 0;
+    let mut opts = rb_fsexporter::Options::new(fork_mode);
+    opts.symlinks = rb_fsexporter::Symlinks::Skip;
+    opts.on_error = rb_fsexporter::OnError::Stop;
+    opts.existing = match on_conflict {
+        OnConflict::Replace => rb_fsexporter::Existing::Overwrite,
+        OnConflict::Skip => rb_fsexporter::Existing::Skip,
+        OnConflict::Fail => rb_fsexporter::Existing::Fail,
+    };
+    let mut host = CopyHost { status, count: 0 };
     for entry in entries {
-        if is_cancelled(status) {
-            return Err(cancelled_err());
-        }
-        if entry.is_directory() {
-            let sub = dest_dir.join(fs_mac::resource_fork::sanitize_filename(&entry.name));
-            std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
-            let children = fs
-                .list_directory(entry)
-                .with_context(|| format!("listing '{}'", entry.name))?;
-            count +=
-                copy_image_entries_to_host(fs, &children, &sub, fork_mode, on_conflict, status)?;
-        } else if entry.is_file() {
-            let name = safe_name(entry);
-            let target = primary_output_path(entry, dest_dir, &name, fork_mode);
-            if !resolve_host_conflict(&target, on_conflict, status)? {
-                continue;
+        rb_fsexporter::extract(fs, entry, dest_dir, &opts, &mut host).map_err(|e| {
+            match e.is::<rb_fsexporter::Cancelled>() {
+                true => cancelled_err(),
+                false => e.context(format!("extracting '{}'", entry.name)),
             }
-            if let Ok(mut g) = status.lock() {
-                g.current_file = entry.path.clone();
-            }
-            export_file_with_fork(fs, entry, dest_dir, &name, fork_mode)
-                .with_context(|| format!("extracting '{}'", entry.name))?;
-            count += 1;
-            if let Ok(mut g) = status.lock() {
-                g.copied = count;
-                g.bytes_done = g.bytes_done.saturating_add(entry.size);
-            }
+        })?;
+    }
+    Ok(host.count)
+}
+
+/// An image-to-host copy as the extractor's host, reporting through the copy status.
+struct CopyHost<'a> {
+    status: &'a Arc<Mutex<HostCopyStatus>>,
+    count: usize,
+}
+
+impl rb_fsexporter::Host for CopyHost<'_> {
+    fn cancelled(&self) -> bool {
+        is_cancelled(self.status)
+    }
+
+    fn started(&mut self, entry: &FileEntry) {
+        if let Ok(mut g) = self.status.lock() {
+            g.current_file = entry.path.clone();
         }
     }
-    Ok(count)
+
+    fn wrote(&mut self, entry: &FileEntry, _bytes: u64, _total: &rb_fsexporter::Summary) {
+        self.count += 1;
+        if let Ok(mut g) = self.status.lock() {
+            g.copied = self.count;
+            g.bytes_done = g.bytes_done.saturating_add(entry.size);
+        }
+    }
+
+    fn exists(&mut self, path: &Path) {
+        note_skipped(self.status, path, "already exists");
+    }
 }
 
 /// Copy host `entries` into `dest_dir`, recursing directories.
@@ -1593,8 +1564,14 @@ fn upload_image_entries_to_remote_host(
             // Materialize the file (+ any fork sidecar) locally, then stream
             // whatever export produced to the daemon.
             let temp = tempfile::tempdir().context("staging remote upload")?;
-            export_file_with_fork(fs, entry, temp.path(), &safe_name(entry), fork_mode)
-                .with_context(|| format!("encoding '{}'", entry.name))?;
+            fs_mac::fork_export::export_file_with_fork(
+                fs,
+                entry,
+                temp.path(),
+                &safe_name(entry),
+                fork_mode,
+            )
+            .with_context(|| format!("encoding '{}'", entry.name))?;
             upload_dir_files_to_remote(conn, temp.path(), dest_parent)?;
             count += 1;
             if let Ok(mut g) = status.lock() {
