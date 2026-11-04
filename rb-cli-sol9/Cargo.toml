@@ -87,7 +87,7 @@ fs-adfs = { path = "../crates/fs-adfs" }
 dsk-ghost = { path = "../crates/dsk-ghost" }
 dsk-vm = { path = "../crates/dsk-vm" }
 dsk-floppy = { path = "../crates/dsk-floppy" }
-dsk-dmg = { path = "../crates/dsk-dmg", default-features = false }
+dsk-dmg = { path = "../crates/dsk-dmg", default-features = false, features = ["stuffit"] }
 dsk-apple = { path = "../crates/dsk-apple" }
 dsk-flux = { path = "../crates/dsk-flux" }
 part-tables = { path = "../crates/part-tables" }

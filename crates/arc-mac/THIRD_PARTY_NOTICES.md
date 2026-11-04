@@ -38,6 +38,10 @@ Each of the XADMaster source files followed carries this notice:
  */
 ```
 
+## Aaru.Compression.Native (LGPL-2.1-or-later)
+
+`shrinkwrap.rs` (ShrinkWrap 3 "SIT2", the NDIF chunk type `0xF0` codec) is ported from `stuffit/shrinkwrap.c` in [Aaru.Compression.Native](https://github.com/aaru-dps/Aaru.Compression.Native), Copyright (c) 2019-2026 Natalia Portillo, distributed under the GNU Lesser General Public License, version 2.1 or later (`LICENSE-LGPL-2.1`). Its code-length tree reader is XADMaster's `SIT14_ReadTree` (`XADStuffItOldHandles.m`, notice above).
+
 ## Everything else (MIT)
 
 `stuffit.rs` (the StuffIt 1.5 container and its writer), `bitreader_be.rs`, `detect.rs`, `extract.rs`, `macbinary.rs`, `maczip.rs` and `mar.rs` are original and MIT licensed (`LICENSE-MIT`). `mar.rs` says it is a clean-room implementation of Hampa Hug's `mar` format (whose reference tool is GPL-2.0); that has not yet been compared against the tool's source (rusty-backup `docs/license_audit.md`).

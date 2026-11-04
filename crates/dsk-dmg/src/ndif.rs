@@ -25,10 +25,10 @@
 //! Chunk `type` (the low byte of `w0`) selects the per-chunk codec:
 //! `0x00` NOCOPY (zero-fill), `0x02` COPY (raw), `0x83` ADC, `0x81` RLE,
 //! `0x82` LZH, `0x80` KenCode, `0xF0` StuffIt, `0xFF` end-of-table. Zero / raw /
-//! ADC are decoded; the other compressed codecs are recognized and reported
-//! with a clear "not yet supported" error (rather than silently misdecoded) —
-//! they await real sample images to implement and verify against. Real
-//! Disk Copy 6 output overwhelmingly uses zero + raw + ADC.
+//! ADC are decoded, and `0xF0` (ShrinkWrap 3's "SIT2" StuffIt variant, see
+//! `arc_mac::shrinkwrap`) with the `stuffit` feature. The other compressed codecs
+//! are recognized and reported with a clear "not yet supported" error (rather
+//! than silently misdecoded) — they await real sample images to verify against.
 
 use anyhow::{bail, Context, Result};
 
@@ -166,16 +166,15 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
                 "NDIF chunk {i} uses KenCode compression (type 0x80), which is undocumented and \
                  not supported"
             ),
-            TYPE_STUFFIT => bail!(
-                "NDIF chunk {i} uses StuffIt compression (type 0xF0), which is not yet supported"
-            ),
+            TYPE_STUFFIT => decode_stuffit(src.as_slice(), span)
+                .with_context(|| format!("NDIF chunk {i} (sector {sector}, type 0xF0 StuffIt)"))?,
             // Unknown type: a verbatim copy only when the stored bytes fill the span exactly.
             _ if len == span => src,
             _ => bail!("NDIF chunk {i} has unknown type 0x{ty:02X} (length {len}, span {span})"),
         };
         out.seek(SeekFrom::Start(o))?;
         out.write_all(&piece)?;
-        crc.update(&piece);
+        crc.update(piece.as_slice());
     }
     crc.zeros_to(image_len);
     if let Some(got) = crc.finish().filter(|&c| stored_crc != 0 && c != stored_crc) {
@@ -185,6 +184,24 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         );
     }
     Ok(image_len)
+}
+
+/// A ShrinkWrap 3 chunk must rebuild exactly the sectors it spans.
+#[cfg(feature = "stuffit")]
+fn decode_stuffit(src: &[u8], span: usize) -> Result<Vec<u8>> {
+    let dec = arc_mac::shrinkwrap::decompress(src, span)?;
+    if dec.len() != span {
+        bail!(
+            "ShrinkWrap chunk holds {} bytes, not the {span} it spans",
+            dec.len()
+        );
+    }
+    Ok(dec)
+}
+
+#[cfg(not(feature = "stuffit"))]
+fn decode_stuffit(_src: &[u8], _span: usize) -> Result<Vec<u8>> {
+    bail!("StuffIt (ShrinkWrap) chunks need dsk-dmg's `stuffit` feature, off in this build")
 }
 
 /// The 28 bits of a rebuilt image's CRC that `bcem` stores.
@@ -445,5 +462,50 @@ mod tests {
         let mut data = vec![0xAA; 7];
         data.extend_from_slice(&payload);
         assert_eq!(reconstruct(&data, &bcem).unwrap(), img);
+    }
+
+    /// A ShrinkWrap 3 chunk (type 0xF0, issue #100): 12 literals and a 500-byte match.
+    fn shrinkwrap_chunk() -> Vec<u8> {
+        let mut c = vec![
+            0xb1, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x04,
+        ];
+        c.extend_from_slice(&[0x77; 118]);
+        c.extend_from_slice(&[0x88; 20]);
+        c.extend_from_slice(&[
+            0x02, 0xdb, 0xb6, 0x6d, 0xdb, 0xb6, 0x6d, 0x0b, 0x93, 0xe3, 0x73, 0x01, 0x4b, 0xc3,
+            0x83, 0xe4, 0x01, 0xe1, 0x01, 0x8f, 0xe1, 0x45,
+        ]);
+        c
+    }
+
+    #[cfg(feature = "stuffit")]
+    #[test]
+    fn stuffit_chunk_rebuilds() {
+        let data = shrinkwrap_chunk();
+        let mut img: Vec<u8> = b"Disk Copy 6 ".iter().copied().cycle().take(512).collect();
+        img.resize(1024, 0);
+        let bcem = bcem_for(
+            2,
+            &[
+                (0, TYPE_STUFFIT, 0, data.len()),
+                (1, TYPE_ZERO, 0, 0),
+                (2, TYPE_END, 0, 0),
+            ],
+            image_crc28(&img),
+        );
+        assert_eq!(reconstruct(&data, &bcem).unwrap(), img);
+    }
+
+    #[cfg(not(feature = "stuffit"))]
+    #[test]
+    fn stuffit_chunk_names_the_missing_feature() {
+        let data = shrinkwrap_chunk();
+        let bcem = bcem_for(
+            1,
+            &[(0, TYPE_STUFFIT, 0, data.len()), (1, TYPE_END, 0, 0)],
+            0,
+        );
+        let err = format!("{:#}", reconstruct(&data, &bcem).unwrap_err());
+        assert!(err.contains("`stuffit` feature"), "{err}");
     }
 }

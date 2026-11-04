@@ -21,7 +21,7 @@ use anyhow::{bail, Result};
 use std::collections::HashMap;
 
 /// LSB-first ("LE") bit reader over a byte slice.
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
     buf: u64,
@@ -29,7 +29,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         BitReader {
             data,
             pos: 0,
@@ -46,7 +46,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn next_bit(&mut self) -> u32 {
+    pub(crate) fn next_bit(&mut self) -> u32 {
         if self.nbits == 0 {
             self.fill();
             if self.nbits == 0 {
@@ -60,7 +60,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits; the first bit read lands in the LSB of the result.
-    fn next_bits(&mut self, n: u32) -> u32 {
+    pub(crate) fn next_bits(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
@@ -77,6 +77,13 @@ impl<'a> BitReader<'a> {
         self.buf >>= take;
         self.nbits -= take;
         val
+    }
+
+    /// Drop the rest of a partly read byte; the buffer only ever holds whole bytes.
+    pub(crate) fn align_to_byte(&mut self) {
+        let partial = self.nbits % 8;
+        self.buf >>= partial;
+        self.nbits -= partial;
     }
 }
 

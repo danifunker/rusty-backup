@@ -1723,13 +1723,13 @@ mod tests {
     #[test]
     fn ndif_rebuild_failure_reports_the_ndif_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_ndif_pair(dir.path(), "Shrunk.img", 0xf0, &[0x5a; 2048]);
+        let path = write_ndif_pair(dir.path(), "Shrunk.img", 0x82, &[0x5a; 2048]);
         let err = match open_read(&path) {
-            Ok(_) => panic!("a StuffIt-compressed chunk should not open"),
+            Ok(_) => panic!("an LZH-compressed chunk should not open"),
             Err(e) => format!("{e:#}"),
         };
         assert!(err.contains("Disk Copy 6 (NDIF)"), "{err}");
-        assert!(err.contains("StuffIt compression"), "{err}");
+        assert!(err.contains("LZH compression"), "{err}");
     }
 
     #[test]

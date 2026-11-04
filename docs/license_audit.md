@@ -77,6 +77,7 @@ XADMaster is **LGPL-2.1-or-later** (MacPaw; every relevant file header says "or 
 | `stuffit_lzh.rs` (+ `stuffit13_tables.rs`, "auto-generated from XADMaster") | **DERIVED** code; tables are format data | ~300 |
 | `stuffit_lzah.rs` | **DERIVED** | ~300 (LHarc / LZHUF is an independent public source) |
 | `stuffit_huffman.rs` | borderline (format forces the shape) | ~60 |
+| `shrinkwrap.rs` (NDIF `0xF0`; from Aaru.Compression.Native `stuffit/shrinkwrap.c` + XADMaster `SIT14_ReadTree`, both LGPL-2.1-or-later) | **DERIVED** | ~250 |
 | `stuffit.rs` container + writer, `bitreader_be.rs`, `detect.rs`, `extract.rs`, `macbinary.rs`, `maczip.rs`, `fs/binhex.rs`, `fs/resource_fork.rs` | FACTS / independent | none |
 | `mar.rs` (claims clean-room from GPL-2.0 `mar-0.2.0`) | UNCLEAR: mar source not on disk to compare | Compare before release |
 

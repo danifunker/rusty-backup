@@ -1,15 +1,21 @@
 # NDIF non-ADC chunk codecs — sample request + support notes
 
-**Status:** NOT on the active roadmap — gated on someone contributing real
-sample images. Sourcing NDIF images that use these codecs is hard, and modern
-`hdiutil` cannot create them, so we are **not** hunting for samples ourselves.
-If you have a `.smi` / `.img` (with its resource fork preserved — see below)
-that uses one of these codecs, please open an issue / PR with it attached and
-point at this doc; that's the trigger to implement it.
+**Status:** `0xF0` (StuffIt) is **decoded** since issue #100 — it is ShrinkWrap 3's
+"SIT2" codec (`arc_mac::shrinkwrap`, wired in through `dsk-dmg`'s `stuffit`
+feature) and all 15 sample images rebuild with a matching `bcem` CRC. RLE (0x81),
+LZH (0x82) and KenCode (0x80) are still gated on someone contributing real sample
+images. If you have a `.smi` / `.img` (with its resource fork preserved — see
+below) that uses one of these codecs, please open an issue / PR with it attached
+and point at this doc; that's the trigger to implement it.
 
 **Scope:** decode the NDIF chunk codecs `rusty-backup` does not yet handle —
-Apple RLE (0x81), LZH (0x82), KenCode (0x80), and StuffIt (0xF0). Zero / raw /
-ADC chunks and `.smi` browsing already work.
+Apple RLE (0x81), LZH (0x82) and KenCode (0x80). Zero / raw / ADC / StuffIt
+chunks and `.smi` browsing already work.
+
+**Reference implementation:** Aaru (`Aaru.Images/NDIF`, and the decoders in
+`Aaru.Compression.Native`: `apple_rle.c`, `apple_lzh.c`, `kencode.c`,
+`stuffit/shrinkwrap.c`, all LGPL-2.1-or-later) reads every NDIF chunk type and
+documents the `bcem` header, including the image CRC at offset 80.
 
 ---
 
@@ -20,7 +26,7 @@ NDIF ("New Disk Image Format") is the pre-UDIF classic-Mac disk image format
 The disk blocks live in the file's **data fork** as a series of chunks; a `bcem`
 resource in the **resource fork** is the block map describing them.
 
-Support already shipped (see [`src/rbformats/ndif.rs`](../src/rbformats/ndif.rs)
+Support already shipped (see [`crates/dsk-dmg/src/ndif.rs`](../crates/dsk-dmg/src/ndif.rs)
 and [`src/rbformats/README.md`](../src/rbformats/README.md)):
 
 - Fork-carrier delivery: MacBinary (`.smi.bin`), AppleDouble (`._name`), and
@@ -31,8 +37,18 @@ and [`src/rbformats/README.md`](../src/rbformats/README.md)):
   raw image is never affected.
 - Chunk codecs **decoded today**: `0x00` zero-fill, `0x02` raw/copy, `0x83`
   ADC. Verified against a real *Disk First Aid 8.6.1* `.smi.bin`.
+- `0xF0` StuffIt chunks are ShrinkWrap 3 "SIT2": a 16-byte header (`u32`
+  compressed length, `u32` LE uncompressed length twice, `0xFFFFFFFF`), then a
+  cut-down StuffIt method 14 bitstream (276 literal/length and 16 distance
+  symbols). Made by ShrinkWrap (creator `Wrap`) and some `.smi` images.
+- The rebuilt image is checked against the `bcem` CRC at offset 80 (a right-shifting
+  table CRC with the unreflected polynomial `0x04C11DB7`, seed `0xFFFFFFFF`, low
+  28 bits); a mismatch is logged as damage.
+- An `0x83` chunk that does not decode as ADC means a damaged data fork, not a
+  second codec (issue #99: the three samples had bytes from elsewhere at the start
+  of the fork; the uncompressed sector-2 MDB was missing).
 - Chunk codecs **recognized but not decoded**: `0x81` RLE, `0x82` LZH, `0x80`
-  KenCode, `0xF0` StuffIt. As of the codec-dispatch refactor these produce a
+  KenCode. As of the codec-dispatch refactor these produce a
   **clear per-codec error** (e.g. "NDIF chunk N uses LZH compression (type
   0x82), which is not yet supported") instead of silently misrouting the bytes
   to the ADC decoder and yielding garbage.
@@ -62,7 +78,7 @@ tool name.
 | LZH | 0x82 | ShrinkWrap (Aladdin) — the canonical LZH-NDIF creator |
 | RLE | 0x81 | older Disk Copy 6.0–6.1, DiskDup+ |
 | KenCode | 0x80 | very early Disk Copy 6.0-era — rare, undocumented |
-| StuffIt | 0xF0 | tools that ran chunks through the StuffIt engine — uncommon |
+| StuffIt | 0xF0 | ShrinkWrap 3.x (`Wrap`), "SIT2" *(supported, issue #100)* |
 
 ## Getting samples
 
@@ -95,7 +111,7 @@ each entry. ~30 lines; no new decode logic.
 
 ## Implementation notes (once a sample exists)
 
-- Codecs live in [`src/rbformats/ndif.rs`](../src/rbformats/ndif.rs). The
+- Codecs live in [`crates/dsk-dmg/src/ndif.rs`](../crates/dsk-dmg/src/ndif.rs). The
   dispatch `match ty { … }` in `reconstruct()` already has the arms stubbed with
   clear errors — replace the relevant `bail!` with a decode call.
 - Follow the existing ADC pattern: `decode(src, span) -> Result<Vec<u8>>`, then
@@ -105,10 +121,8 @@ each entry. ~30 lines; no new decode logic.
 - **LZH (0x82):** evaluate the `delharc` crate (or port the LHA decoder); the
   chunk is a raw LZH stream — confirm the framing (header vs. bare) against a
   sample.
-- **StuffIt (0xF0):** the tree already has a full StuffIt decoder in
-  [`src/macarchive/`](../src/macarchive/) — but NDIF 0xF0 is raw StuffIt-*method*
-  data on a chunk, not a `.sit` archive, so the framing differs. Determine
-  whether the macarchive engine's inner-method entry points are reusable.
+- **StuffIt (0xF0):** done (`crates/arc-mac/src/shrinkwrap.rs`). None of the
+  `.sit` methods (2, 3, 5, 13, 15) decode it; it is its own method-14 variant.
 - **KenCode (0x80):** undocumented. Leave as a clear error unless a sample makes
   reverse-engineering worthwhile.
 - Add a unit test per codec that reconstructs a known chunk (build the `bcem` +

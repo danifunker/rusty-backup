@@ -28,6 +28,7 @@ pub mod extract;
 pub mod macbinary;
 pub mod maczip;
 pub mod mar;
+pub mod shrinkwrap;
 pub mod stuffit;
 pub mod stuffit13_tables;
 pub mod stuffit5;

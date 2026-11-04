@@ -1,0 +1,95 @@
+# Tier 2 — GitHub issues #99 and #100: Disk Copy 6 / NDIF chunk codecs.
+#
+# #100: chunk type 0xF0 is ShrinkWrap 3's "SIT2" StuffIt variant (a cut-down
+# method 14; arc-mac `shrinkwrap`, Aaru's `stuffit/shrinkwrap.c`). The images
+# arrive inside StuffIt archives as BinHex; each rebuild matches the CRC in the
+# `bcem` header, so a CRC warning on stderr would be a regression.
+# #99: the three Apple Legacy Recovery CD images are damaged, not a second ADC
+# codec: the uncompressed sector-2 MDB is missing and the start of the data fork
+# holds bytes from elsewhere. The rebuild must say so. These fixtures are the
+# data fork with its `._name` AppleDouble sidecar beside it in the corpus.
+
+[meta]
+tier = 2
+group = "ndif.read.issue99-100"
+description = "NDIF: ShrinkWrap StuffIt chunks rebuild; a damaged ADC data fork is named."
+
+[[case]]
+id = "read.ndif.shrinkwrap.issue100-autocad-install"
+description = "AutoCAD r12 Install.img.hqx (all 0xF0 chunks) lists, checks clean and extracts"
+fixture = "arc.sit.issue100-autocad12"
+timeout_ms = 300000
+[[case.step]]
+args = ["archive", "extract", "{fixture}", "{scratch}/x"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/x/AutoCAD r12/Install.img.hqx", "/"]
+expect_exit = 0
+stdout_contains = ["acadm02c", "InstallScript", "readme.doc"]
+stderr_not_contains = ["CRC"]
+[[case.step]]
+args = ["fsck", "--checkonly", "{scratch}/x/AutoCAD r12/Install.img.hqx"]
+expect_exit = 0
+stdout_contains = ["13 files / 4 dirs checked"]
+[[case.step]]
+args = ["get", "{scratch}/x/AutoCAD r12/Install.img.hqx", "/readme.doc", "{scratch}/readme.doc"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/readme.doc", sha256 = "43c2da4259a60f68c64bdc02689dc9fdc6f69a4a8b15d67cb2ac36bb989bca64" }]
+
+[[case]]
+id = "read.ndif.shrinkwrap.issue100-minicad-disk7"
+description = "MiniCAD 6.0 Disk 7.img.hqx rebuilds and its installer segment extracts"
+fixture = "arc.sit.issue100-minicad6"
+timeout_ms = 300000
+[[case.step]]
+args = ["archive", "extract", "{fixture}", "{scratch}/x"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/x/MiniCAD 6.0/Disk 7.img.hqx", "/MiniCad 6.0 Installer.7", "{scratch}/inst7"]
+expect_exit = 0
+stderr_not_contains = ["CRC"]
+file_sha256 = [{ path = "{scratch}/inst7", sha256 = "8e7281db527806fda4fe0cfdbadf4fe28f7c14f1f8b5d3e896e08dd16adc9278" }]
+
+[[case]]
+id = "read.ndif.shrinkwrap.issue100-poser-smi"
+description = "A self-mounting .smi with 0xF0 and raw chunks lists and extracts"
+fixture = "arc.sit.issue100-poser"
+timeout_ms = 600000
+[[case.step]]
+args = ["archive", "extract", "{fixture}", "{scratch}/x"]
+expect_exit = 0
+[[case.step]]
+args = ["ls", "{scratch}/x/Poser4-Victoria 2&3/Michael 2.0 Full-/Poser-4.0 Michael.smi.hqx", "/"]
+expect_exit = 0
+stdout_contains = ["michaelInstall", "Install Info michael"]
+[[case.step]]
+args = ["get", "{scratch}/x/Poser4-Victoria 2&3/Michael 2.0 Full-/Poser-4.0 Michael.smi.hqx", "/Install Info michael", "{scratch}/info"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/info", sha256 = "d29d305cf6ac753aa41c95c52f34c34dbb0222b51f14e8c0f9eea724107d9a28" }]
+
+[[case]]
+id = "read.ndif.adc.issue99-damaged-laserwriter"
+description = "A data fork whose first 10752 bytes repeat a later extent is reported as damaged"
+fixture = "ndif.adc.issue99-laserwriter-disk1"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["chunk 1 (sector 4, type 0x83 ADC) does not decode", "data fork looks damaged"]
+
+[[case]]
+id = "read.ndif.adc.issue99-damaged-colorsw"
+description = "Color SW Pro GX: the damaged ADC data fork is named, not 'Unrecognized media'"
+fixture = "ndif.adc.issue99-colorsw-progx"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["data fork looks damaged"]
+
+[[case]]
+id = "read.ndif.adc.issue99-damaged-installmefirst"
+description = "InstallMeFirst (System 7.1.1 PowerBook 500): the damaged ADC data fork is named"
+fixture = "ndif.adc.issue99-installmefirst"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["data fork looks damaged"]
