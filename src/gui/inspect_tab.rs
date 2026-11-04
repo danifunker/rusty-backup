@@ -1359,7 +1359,7 @@ impl InspectTab {
     }
 }
 
-/// Why per-partition export is off for a whole-disk-only format, for the radio's hover.
+/// The Export window's format radios; CHD is greyed out where the source cannot feed it.
 fn format_radios(
     ui: &mut egui::Ui,
     format: &mut ExportFormat,

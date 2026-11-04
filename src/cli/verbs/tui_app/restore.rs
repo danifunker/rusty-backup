@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::ask::Ask;
 use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
 use super::{
     expand_tilde, hint, App, FilePicker, KeyHint, PickKind, PickResult, Progress, ProgressShared,
@@ -27,7 +28,7 @@ use crate::controller::restore::{
     format_size, purpose, AlignmentChoice, HostRequest, JobRegistry, LayoutFit, NewTableType,
     NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
 };
-use crate::controller::{ConfirmSpec, Controller as _, Effect, PickSpec, TextSpec};
+use crate::controller::{Controller as _, Effect, PickSpec};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RestoreStep {
@@ -93,17 +94,6 @@ pub(super) enum Who {
     Writer,
 }
 
-/// A question waiting on the user, drawn over the form.
-pub(super) enum Ask {
-    Confirm(Who, ConfirmSpec),
-    Text {
-        who: Who,
-        spec: TextSpec,
-        input: String,
-        edited: bool,
-    },
-}
-
 /// Where a picked device goes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DeviceFor {
@@ -160,7 +150,7 @@ pub(super) struct RestoreState {
     picker: Option<(Pick, FilePicker)>,
     device_pick: Option<DeviceFor>,
     device_sel: usize,
-    pub(super) ask: Option<Ask>,
+    pub(super) ask: Option<Ask<Who>>,
     /// The typed image targets (the controller holds the expanded path).
     pub(super) full_target: String,
     pub(super) nd_target: String,
@@ -222,14 +212,7 @@ impl RestoreState {
             match e {
                 Effect::PickFile(spec) | Effect::PickFolder(spec) => self.open_picker(spec),
                 Effect::Confirm(spec) => self.ask = Some(Ask::Confirm(who, spec)),
-                Effect::AskText(spec) => {
-                    self.ask = Some(Ask::Text {
-                        who,
-                        input: spec.initial.clone(),
-                        spec,
-                        edited: false,
-                    })
-                }
+                Effect::AskText(spec) => self.ask = Some(Ask::text(who, spec)),
                 Effect::Message(msg) => self.log.push(msg),
                 // Neither controller asks for these.
                 Effect::AskPassword(_)
@@ -692,37 +675,7 @@ impl RestoreState {
     }
 
     fn ask_key(&mut self, code: KeyCode) {
-        let outcome = match self.ask.as_mut() {
-            None => return,
-            Some(Ask::Confirm(..)) => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Some((true, None)),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some((false, None)),
-                _ => None,
-            },
-            Some(Ask::Text {
-                spec,
-                input,
-                edited,
-                ..
-            }) => match code {
-                KeyCode::Esc => Some((false, None)),
-                KeyCode::Enter if spec.validate(input.as_str()).is_ok() => {
-                    Some((true, Some(input.clone())))
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    *edited = true;
-                    None
-                }
-                KeyCode::Char(c) if !c.is_control() => {
-                    input.push(c);
-                    *edited = true;
-                    None
-                }
-                _ => None,
-            },
-        };
-        if let Some((yes, text)) = outcome {
+        if let Some((yes, text)) = self.ask.as_mut().and_then(|a| a.key(code)) {
             self.answer(yes, text);
         }
     }
@@ -1085,7 +1038,7 @@ impl App {
             self.draw_device_pick(frame, area, r.device_sel, "Pick a target device");
         }
         if let Some(ask) = &r.ask {
-            self.draw_restore_ask(frame, area, ask);
+            self.draw_ask(frame, area, ask, true);
         }
     }
 
@@ -1690,70 +1643,6 @@ impl App {
             let style = if is_error { pal.warn() } else { pal.accent() };
             lines.push(Line::styled(format!("  {res}"), style));
             lines.push(Line::styled("  Esc to return to the form.", pal.dim()));
-        }
-    }
-
-    fn draw_restore_ask(&self, frame: &mut Frame, area: Rect, ask: &Ask) {
-        let pal = self.palette;
-        match ask {
-            Ask::Confirm(_, spec) => {
-                let style = if spec.destructive {
-                    pal.warn()
-                } else {
-                    pal.accent()
-                };
-                let mut lines: Vec<Line<'static>> = spec
-                    .message
-                    .lines()
-                    .map(|l| Line::raw(format!(" {l}")))
-                    .collect();
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    format!(" y {}   n cancel", spec.confirm_label),
-                    style,
-                ));
-                if !self.elevated {
-                    lines.push(Line::styled(
-                        " Writing a device needs elevation; you may be prompted.",
-                        pal.dim(),
-                    ));
-                }
-                self.draw_cmd_box_auto(frame, area, 76, spec.title.as_str(), lines);
-            }
-            Ask::Text {
-                spec,
-                input,
-                edited,
-                ..
-            } => {
-                let error = match (&spec.error, *edited) {
-                    (Some(e), false) => Some(e.clone()),
-                    _ => spec
-                        .validate(input.as_str())
-                        .err()
-                        .filter(|e| !e.is_empty()),
-                };
-                let ok = spec.validate(input.as_str()).is_ok();
-                let mut lines: Vec<Line<'static>> = spec
-                    .prompt
-                    .lines()
-                    .map(|l| Line::raw(format!(" {l}")))
-                    .collect();
-                lines.push(Line::styled(format!(" > {input}_"), pal.accent()));
-                lines.push(match error {
-                    Some(e) => Line::styled(format!(" {e}"), pal.warn()),
-                    None => Line::raw(""),
-                });
-                lines.push(Line::styled(
-                    if ok {
-                        format!(" Enter {}   Esc cancel", spec.ok_label)
-                    } else {
-                        " Esc cancel".to_string()
-                    },
-                    pal.dim(),
-                ));
-                self.draw_cmd_box_auto(frame, area, 72, spec.title.as_str(), lines);
-            }
         }
     }
 }

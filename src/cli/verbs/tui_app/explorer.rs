@@ -23,6 +23,7 @@ use crate::controller::browser::{
     BrowserPaneAction, LineEnding, MetadataFields, PaneProfile, PaneServices, TextDoc, TextShape,
 };
 use crate::controller::commander::{CommanderAction, CommanderController, Side};
+use crate::controller::inspect::{BrowseEdit, BrowseOpen, BrowseSession};
 use crate::controller::keys::KeyMap;
 
 type P = BrowserPaneAction;
@@ -36,6 +37,8 @@ pub(super) struct ExplorerState {
     report_scroll: usize,
     /// A transform's command line, for the TUI's `:` prompt.
     palette: Option<String>,
+    /// The session the Inspect controller handed over, for a seekable-cache reopen.
+    session: Option<BrowseSession>,
 }
 
 /// The metadata form's text fields while the user types; the controller checks them on Enter.
@@ -206,25 +209,44 @@ fn load_keymap() -> (KeyMap, Vec<String>) {
 }
 
 impl CommanderView {
-    /// The Explorer over `path`, showing its `partition` (the first browsable one when `None`).
-    pub(super) fn explorer(path: PathBuf, partition: Option<usize>, label: String) -> Self {
+    /// The Explorer over a partition the Inspect controller handed over; only an in-place
+    /// source may be written (a compressed backup partition opens read-only).
+    pub(super) fn explorer_open(open: BrowseOpen, label: String) -> Self {
         let (keymap, problems) = load_keymap();
         let mut services = PaneServices::headless();
-        // The Explorer remembers its listing style under "explorer" (recent files are not kept).
         services.recent = super::commander::recent_store();
-        let mut ctl = CommanderController::single(services, keymap, PaneProfile::explorer());
+        let mut profile = PaneProfile::explorer();
+        profile.read_only = !matches!(open.edit, BrowseEdit::InPlace);
+        let mut ctl = CommanderController::single(services, keymap, profile);
         ctl.report_keymap_problems(problems);
-        ctl.open_fixed(path, partition);
+        let title = match &open.label_prefix {
+            Some(prefix) => format!("{prefix}  {label}"),
+            None => label,
+        };
+        ctl.open_fixed_session(open.session.clone(), title.as_str());
         let mut v = CommanderView::with_ctl(ctl);
         v.ex = Some(ExplorerState {
-            label,
+            label: title,
             editor: None,
             meta: None,
             transforms: None,
             report_scroll: 0,
             palette: None,
+            session: Some(open.session),
         });
         v
+    }
+
+    /// A streamed backup partition's seekable cache is ready: reopen on it, keeping the folder.
+    pub(super) fn upgrade_seekable(&mut self, path: PathBuf) {
+        let Some(ex) = self.ex.as_mut() else { return };
+        let Some(session) = ex.session.as_mut().filter(|s| s.zstd_cache.is_some()) else {
+            return;
+        };
+        session.source_path = Some(path);
+        session.zstd_cache = None;
+        let (session, label) = (session.clone(), ex.label.clone());
+        self.ctl.open_fixed_session(session, label.as_str());
     }
 
     /// The partition's label from the Inspect tab, for the window title.
@@ -627,13 +649,35 @@ mod tests {
 
     use crate::controller::browser::explorer_tests::{fat_volume, root_file};
 
+    /// The Explorer on the image's first partition, as the Inspect controller's Browse opens it.
     fn explorer_app(img: &Path) -> App {
+        use crate::controller::inspect::{
+            HostRequest, InspectAction, InspectController, InspectServices, InspectSource,
+            JobRegistry, NoNotify,
+        };
+        use crate::controller::Controller as _;
+        let mut ctl = InspectController::new(InspectServices {
+            jobs: JobRegistry::new(),
+            notify: std::sync::Arc::new(NoNotify),
+        });
+        ctl.apply(InspectAction::Load(InspectSource::Image {
+            path: img.to_path_buf(),
+            temp: None,
+        }));
+        ctl.wait_opened();
+        let index = ctl.partitions()[0].index;
+        ctl.take_requests();
+        ctl.apply(InspectAction::Browse(index));
+        let open = ctl
+            .take_requests()
+            .into_iter()
+            .find_map(|r| match r {
+                HostRequest::OpenBrowse(open) => Some(open),
+                _ => None,
+            })
+            .expect("Browse hands over a session");
         let mut app = App::new_on(DEFAULT_TAB);
-        app.explorer = Some(CommanderView::explorer(
-            img.to_path_buf(),
-            None,
-            "Whole volume".into(),
-        ));
+        app.explorer = Some(CommanderView::explorer_open(*open, "Whole volume".into()));
         settle(&mut app);
         app
     }

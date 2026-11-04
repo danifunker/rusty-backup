@@ -3,10 +3,10 @@
 //! This mirrors the desktop GUI: a top tab bar (Backup / Restore / Inspect /
 //! New Disk / Optical / Archives / Commander / Bulk / Settings) over the same
 //! shared `src/model/` runner layer the GUI uses. Real tabs so far: **Inspect**
-//! (a selectable disk list; opening an image shows its **partition table** via
-//! `PartitionTable::detect`, each partition opening a per-partition filesystem
-//! **Explorer**, one browser pane over the partition with its volume tools: see
-//! `tui_app/explorer.rs`); **New Disk** (a wizard that
+//! (a selectable disk list; a disk, image, backup or remote image opens on the
+//! shared Inspect controller with its grid and disk tools, see
+//! `tui_app/inspect.rs`, each partition opening a filesystem **Explorer**, one
+//! browser pane over the partition: see `tui_app/explorer.rs`); **New Disk** (a wizard that
 //! creates blank images through the shared `new` verb); and **Settings** (an
 //! interactive `UpdateConfig` editor). The progress overlay (live rate + ETA via
 //! `RateTracker`) is wired as a preview. Later milestones fill the remaining
@@ -49,13 +49,16 @@ use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, Volume
 use crate::controller::app::{format_size, RateTracker};
 use crate::controller::app::{DiskDevice, RecentMode};
 
+mod ask;
 mod backup;
 mod commander;
 mod explorer;
+mod inspect;
 mod restore;
 mod writer;
 
 use backup::BackupState;
+use inspect::InspectState;
 use restore::RestoreState;
 
 /// Shared state for a running progress task: a worker thread advances
@@ -77,31 +80,8 @@ struct Progress {
     label: String,
 }
 
-/// Something the user opened from the Inspect tab. A file is treated as a disk
-/// image (its partition table is parsed); a directory is routed through the
-/// shared backup loader.
-enum Opened {
-    Image {
-        path: String,
-        size: u64,
-        parts: Vec<PartRow>,
-        /// Set when this was opened from the disk list, so the view can show
-        /// the hardware facts (media, bus, flags, what the OS has mounted)
-        /// above the partition table instead of on a separate screen.
-        disk: Option<Box<DiskDevice>>,
-    },
-    Backup {
-        path: String,
-        kind: String,
-        partitions: usize,
-        info: Vec<String>,
-    },
-}
-
-/// One row of an opened image's partition table, plus the `@N` selector the
-/// shared `resolve` path uses to open its filesystem (`None` = superfloppy).
+/// One row of a disk's partition table read without elevation (the Inspect screen's fallback).
 struct PartRow {
-    selector: Option<crate::cli::img_at::PartSelector>,
     label: String,
     fs_hint: String,
     size: u64,
@@ -797,17 +777,10 @@ const HINTS_EDITOR: &[KeyHint] = &[
 
 const HINTS_INSPECT_DISKS: &[KeyHint] = &[
     hint("Up/Down", "Move  (also k/j)"),
-    hint("Enter", "Open the disk's partition table"),
-    hint("o", "Open an image file or backup folder"),
+    hint("Enter", "Open the disk's partition table and tools"),
+    hint("o", "Open an image file, backup folder or Clonezilla image"),
+    hint("R", "Open a remote image (an rb-cli serve daemon)"),
     hint("r", "Rescan disks"),
-    hint("g/G", "Top / bottom  (also Home/End)"),
-];
-
-const HINTS_INSPECT_IMAGE: &[KeyHint] = &[
-    hint("Up/Down", "Move  (also k/j)"),
-    hint("Enter", "Browse this partition's filesystem"),
-    hint("o", "Open another image or backup folder"),
-    hint("Esc", "Back to the disk list"),
     hint("g/G", "Top / bottom  (also Home/End)"),
 ];
 
@@ -1528,9 +1501,8 @@ struct App {
     scroll: u16,
     /// Cursor index into the active tab's selectable rows (Inspect disk list).
     selection: usize,
-    /// When the Inspect tab has drilled into a disk, the index of that disk.
-    /// An image/backup opened from the Inspect tab (takes over the Inspect body).
-    opened: Option<Opened>,
+    /// The Inspect screen: the open source, its grid and tools (lazily created on first visit).
+    inspect: Option<InspectState>,
     /// The shared "Open file / backup" picker (path + recent + Tab-browse).
     open_picker: Option<FilePicker>,
     /// The per-partition filesystem Explorer overlay, when open.
@@ -1606,7 +1578,7 @@ impl App {
             active,
             scroll: 0,
             selection: 0,
-            opened: None,
+            inspect: None,
             open_picker: None,
             explorer: None,
             status: None,
@@ -1707,7 +1679,8 @@ impl App {
         self.tick();
         // Commander jobs finish without a keypress, so poll faster while one runs.
         let working = self.commander.as_ref().is_some_and(|c| c.is_working())
-            || self.explorer.as_ref().is_some_and(|c| c.is_working());
+            || self.explorer.as_ref().is_some_and(|c| c.is_working())
+            || self.inspect.as_ref().is_some_and(|s| s.busy());
         let wait = if working { 50 } else { 200 };
         if !event::poll(Duration::from_millis(wait))? {
             return Ok(());
@@ -1822,6 +1795,11 @@ impl App {
             return;
         }
 
+        // The Inspect screen owns the keys of an open source and of its windows.
+        if self.current() == TabId::Inspect && self.handle_inspect_key(key.code) {
+            return;
+        }
+
         // The New Disk wizard owns most keys on its tab (Left/Right still switch
         // tabs; typed text in the details form is consumed here).
         if self.current() == TabId::NewDisk && self.handle_newdisk_key(key.code) {
@@ -1914,119 +1892,16 @@ impl App {
         }
     }
 
-    /// targets. A directory is routed through the shared `backup_loader`
-    /// (rusty-backup folder or Clonezilla image); a file is a disk image. On
-    /// success the path is recorded in the MRU (move-to-front).
+    /// Open a picked path on the Inspect screen: a folder is a backup or Clonezilla image, a
+    /// file an image, a listed disk its device.
     fn open_target(&mut self, path: std::path::PathBuf) {
         self.selection = 0;
         self.status = None;
-        if path.is_dir() {
-            self.start_task("Loading the backup", move |job| {
-                job.set_can_cancel(false);
-                let opened = open_backup_headless(path.clone());
-                let display = path.display().to_string();
-                Ok(Box::new(move |app: &mut App| match opened {
-                    Ok(opened) => {
-                        app.shell.remember(RecentMode::Inspect, display.as_str());
-                        app.opened = Some(opened);
-                    }
-                    Err(e) => app.status = Some(format!("Cannot open: {e}")),
-                }) as TaskDone)
-            });
-        } else if path.exists() {
-            // `exists()` rather than `is_file()`: a raw device (`/dev/sda`) is
-            // neither a file nor a directory, so `is_file()` sent every device
-            // path to the "No such file or directory" arm below - a flat denial
-            // for something plainly present, with no hint that the tab simply
-            // did not handle devices. Opening one is the whole point of the
-            // disk list next to it.
-            self.open_image_at(path, None);
+        if path.exists() {
+            // `exists()`, not `is_file()`: a raw device is neither a file nor a directory.
+            self.inspect_open_path(path);
         } else {
             self.status = Some(format!("No such file or directory: {}", path.display()));
-        }
-    }
-
-    /// Open an image *or* a raw device as the Inspect tab's image view.
-    ///
-    /// `size` is looked up via [`size_unelevated`](crate::controller::inspect::size_unelevated) so block devices come out at
-    /// their true size instead of the zero `metadata` reports for them. Pass
-    /// `disk` when opening from the disk list so the view can show the hardware
-    /// facts alongside the partition table.
-    fn open_image_at(&mut self, path: std::path::PathBuf, disk: Option<Box<DiskDevice>>) {
-        // Sizing a device and reading its table happen on the worker; a slow disk keeps the screen live.
-        self.start_task("Reading the partition table", move |job| {
-            job.set_can_cancel(false);
-            let size = crate::controller::inspect::size_unelevated(path.as_path());
-            // An image file is read by the Inspect controller; a device keeps the plain, unelevated read.
-            let inspected = (disk.is_none() && path.is_file())
-                .then(|| inspected_rows(path.clone()))
-                .flatten();
-            let parts = size.as_ref().ok().map(|&s| match inspected {
-                Some(rows) => Ok(rows),
-                None => parse_partitions(path.as_path(), s),
-            });
-            Ok(
-                Box::new(move |app: &mut App| app.apply_image_open(path, disk, size, parts))
-                    as TaskDone,
-            )
-        });
-    }
-
-    /// Show an image or device opened by [`open_image_at`](Self::open_image_at).
-    fn apply_image_open(
-        &mut self,
-        path: std::path::PathBuf,
-        disk: Option<Box<DiskDevice>>,
-        size: std::io::Result<u64>,
-        parts: Option<std::io::Result<Vec<PartRow>>>,
-    ) {
-        let display = path.display().to_string();
-        let size = match size {
-            Ok(s) => s,
-            // Fall back to the size the enumerator already reported. Reading a
-            // raw device needs elevation, and refusing to show anything at all
-            // is a worse answer than showing the hardware facts plus why the
-            // table could not be read.
-            Err(e) => match disk.as_ref().map(|d| d.size_bytes).filter(|&s| s > 0) {
-                Some(s) => {
-                    self.status = Some(Self::access_hint(&display, &e));
-                    s
-                }
-                None => {
-                    self.status = Some(Self::access_hint(&display, &e));
-                    return;
-                }
-            },
-        };
-        let parts = match parts {
-            Some(p) => p,
-            None => parse_partitions(&path, size),
-        };
-        match parts {
-            Ok(parts) => {
-                self.shell.remember(RecentMode::Inspect, display.as_str());
-                self.status = None;
-                self.opened = Some(Opened::Image {
-                    path: display,
-                    size,
-                    parts,
-                    disk,
-                });
-            }
-            Err(e) => {
-                self.status = Some(Self::access_hint(&display, &e));
-                // A device we cannot read still has facts worth showing, and
-                // leaving the user on the list with only a status line makes it
-                // look as though Enter did nothing.
-                if disk.is_some() {
-                    self.opened = Some(Opened::Image {
-                        path: display,
-                        size,
-                        parts: Vec::new(),
-                        disk,
-                    });
-                }
-            }
         }
     }
 
@@ -2074,43 +1949,12 @@ impl App {
     /// Enter: drill into the selected item / start the tab's action.
     fn activate(&mut self) {
         match self.current() {
-            // Opened image: Enter a partition → open its filesystem Explorer.
-            TabId::Inspect if matches!(self.opened, Some(Opened::Image { .. })) => {
-                let sel = self.selection;
-                let target = if let Some(Opened::Image { path, parts, .. }) = &self.opened {
-                    parts
-                        .get(sel)
-                        .map(|r| (path.clone(), r.selector.clone(), r.label.clone()))
-                } else {
-                    None
-                };
-                if let Some((path, selector, label)) = target {
-                    // The table's rows are the pane's partitions, in the same order.
-                    let part = selector.map(|_| sel);
-                    let path = std::path::PathBuf::from(path);
-                    self.explorer = Some(commander::CommanderView::explorer(path, part, label));
-                    self.status = None;
-                }
-            }
-            // Disk list: Enter → the disk's own partition table, with its
-            // hardware facts shown above it.
-            //
-            // One Enter, one screen. This used to take two: the first opened a
-            // read-only pane of media/bus/flags plus the partitions the *OS* had
-            // mounted, and a second - undiscoverable, and for a while not wired
-            // up at all - reached the real table. Nothing on screen said the
-            // second press existed, and the two screens were describing the same
-            // disk, so they are now one view.
+            // Disk list: Enter opens the disk through the Inspect controller, its hardware
+            // facts shown above its partition table (one Enter, one screen).
             TabId::Inspect if self.row_count() > 0 => {
-                let target = self
-                    .shell
-                    .devices()
-                    .get(self.selection)
-                    .map(|d| (d.path.clone(), Box::new(d.clone())));
-                if let Some((path, disk)) = target {
-                    self.selection = 0;
-                    self.open_image_at(path, Some(disk));
-                }
+                let slot = self.selection;
+                self.selection = 0;
+                self.inspect_open_device(slot);
             }
             _ => {}
         }
@@ -2163,12 +2007,6 @@ impl App {
     fn on_back(&mut self) {
         if self.progress.is_some() {
             self.cancel_progress();
-        } else if self.opened.is_some() {
-            // One level to unwind now that the disk's facts and its partition
-            // table are a single view: Esc goes straight back to the disk list.
-            self.opened = None;
-            self.selection = 0;
-            self.status = None;
         } else {
             self.request_quit();
         }
@@ -2238,12 +2076,14 @@ impl App {
     /// Lazily load anything a freshly-shown tab needs; reset per-tab cursor.
     fn on_tab_changed(&mut self) {
         self.selection = 0;
-        self.opened = None;
         self.open_picker = None;
         self.explorer = None;
         self.status = None;
         if self.current() == TabId::Inspect {
             self.load_devices_once();
+            if self.inspect.is_none() {
+                self.inspect = Some(InspectState::new(self.shell.recent_handle()));
+            }
         }
         if self.current() == TabId::NewDisk && self.newdisk.is_none() {
             self.newdisk = Some(NewWizard::default());
@@ -3397,15 +3237,11 @@ impl App {
     /// Commander screen keys. Returns `true` when consumed.
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
-        self.current() == TabId::Inspect && self.opened.is_none()
+        self.current() == TabId::Inspect && !self.inspect.as_ref().is_some_and(|s| s.source_open())
     }
 
     /// Number of selectable rows in the active tab (0 = the pane just scrolls).
     fn row_count(&self) -> usize {
-        // Opened image → its partition table is the selectable list.
-        if let Some(Opened::Image { parts, .. }) = &self.opened {
-            return parts.len();
-        }
         if self.inspect_list_active() {
             self.shell.devices().len()
         } else {
@@ -3420,6 +3256,7 @@ impl App {
         self.poll_devices();
         self.backup_tick();
         self.restore_tick();
+        self.inspect_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
         if let Some(a) = self.archive.as_mut() {
             a.poll();
@@ -3752,22 +3589,20 @@ impl App {
     }
 
     fn draw_body(&self, frame: &mut Frame, area: Rect) {
-        // The Inspect disk list is a real selectable widget; so is an opened
-        // image's partition table. Everything else (drill-down detail, opened
-        // backup, placeholder tabs) is scrollable text.
+        // The Inspect disk list is a real selectable widget; an open source is the
+        // Inspect screen. Everything else (placeholder tabs) is scrollable text.
         if self.inspect_list_active() {
             self.draw_inspect_list(frame, area);
+            if let Some(s) = &self.inspect {
+                self.draw_inspect_windows(frame, area, s);
+            }
             return;
         }
-        if let Some(Opened::Image {
-            path,
-            size,
-            parts,
-            disk,
-        }) = &self.opened
-        {
-            self.draw_partition_list(frame, area, path, *size, parts, disk.as_deref());
-            return;
+        if self.current() == TabId::Inspect {
+            if let Some(s) = &self.inspect {
+                self.draw_inspect(frame, area, s);
+                return;
+            }
         }
         if self.current() == TabId::NewDisk {
             if let Some(w) = &self.newdisk {
@@ -3877,81 +3712,6 @@ impl App {
             .highlight_symbol("> ");
         let mut state = ListState::default();
         state.select(Some(self.selection.min(disks.len() - 1)));
-        frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    /// The opened image's partition table: a selectable list; Enter opens the
-    /// selected partition's filesystem in the Explorer.
-    fn draw_partition_list(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        path: &str,
-        size: u64,
-        parts: &[PartRow],
-        disk: Option<&DiskDevice>,
-    ) {
-        let name = basename(path);
-
-        // Opened from the disk list: the hardware facts live in a header above
-        // the table rather than on a screen of their own. They describe the same
-        // disk, and splitting them meant an extra keypress nothing advertised.
-        let area = match disk {
-            Some(d) => {
-                let header = self.disk_header_lines(d);
-                // +2 for the block's own borders.
-                let height = (header.len() as u16 + 2).min(area.height.saturating_sub(3));
-                let rows =
-                    Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).split(area);
-                frame.render_widget(
-                    Paragraph::new(Text::from(header))
-                        .block(self.pane_block(&format!("Disk  {}", d.path.display()), false)),
-                    rows[0],
-                );
-                rows[1]
-            }
-            None => area,
-        };
-
-        if parts.is_empty() {
-            let msg = match &self.status {
-                // A device that could not be read: say so here, where the user
-                // is looking, not only in the footer.
-                Some(s) => format!("No partition table could be read.\n\n{s}"),
-                None => "No partitions detected.".to_string(),
-            };
-            frame.render_widget(
-                Paragraph::new(msg).block(self.pane_block(&format!("Partitions  {name}"), true)),
-                area,
-            );
-            return;
-        }
-        let items: Vec<ListItem> = parts
-            .iter()
-            .map(|p| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<22}", p.label), self.palette.accent()),
-                    Span::raw(format!("{:>10}  {}", format_size(p.size), p.fs_hint)),
-                ]))
-            })
-            .collect();
-        // With a header above, the title names the table rather than repeating
-        // the disk; on its own it still identifies the image.
-        let subject = if disk.is_some() {
-            format!("Partitions on {name}")
-        } else {
-            format!("Image  {name} ({})", format_size(size))
-        };
-        let title = match &self.status {
-            Some(s) => format!("{subject}  -  {s}"),
-            None => format!("{subject}  [{} partition(s)]  Enter=browse", parts.len()),
-        };
-        let list = List::new(items)
-            .block(self.pane_block(&title, true))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
-            .highlight_symbol("> ");
-        let mut state = ListState::default();
-        state.select(Some(self.selection.min(parts.len() - 1)));
         frame.render_stateful_widget(list, area, &mut state);
     }
 
@@ -4993,14 +4753,11 @@ impl App {
                 ("?", "Help"),
                 ("q", "Quit"),
             ]
-        } else if matches!(self.opened, Some(Opened::Image { .. })) {
-            vec![
-                ("<-/->", "Tabs"),
-                ("Up/Dn", "Select"),
-                ("Enter", "Browse"),
-                ("Esc", "Close"),
-                ("?", "Help"),
-            ]
+        } else if let Some(keys) = self
+            .inspect_footer_keys()
+            .filter(|_| self.current() == TabId::Inspect)
+        {
+            keys
         } else {
             // On the disk list, name what Enter actually produces. "Open" was
             // vague enough that the partition table read as a hidden second step
@@ -5011,9 +4768,6 @@ impl App {
                 ("Enter", "Open")
             };
             let mut k = vec![("<-/->", "Tabs"), ("Up/Dn", "Select"), enter];
-            if self.opened.is_some() {
-                k.push(("Esc", "Back"));
-            }
             if self.inspect_list_active() {
                 k.push(("o", "Open file"));
                 k.push(("r", "Rescan"));
@@ -5064,10 +4818,9 @@ impl App {
             return ("Text editor", HINTS_EDITOR);
         }
         if self.current() == TabId::Inspect {
-            return match self.opened {
-                Some(Opened::Image { .. }) => ("Inspect - partitions", HINTS_INSPECT_IMAGE),
-                _ => ("Inspect - disks", HINTS_INSPECT_DISKS),
-            };
+            return self
+                .inspect_key_context()
+                .unwrap_or(("Inspect - disks", HINTS_INSPECT_DISKS));
         }
         if self.current() == TabId::Backup {
             return self.backup_key_context();
@@ -5248,38 +5001,6 @@ impl App {
     /// Rendered as scrollable text only when drilled into a disk (the list is a
     /// widget). Shows the real device + mounted-partition summary.
     fn inspect_content(&self) -> Text<'static> {
-        // An opened image renders as the partition-list widget, not here.
-        if let Some(Opened::Backup {
-            path,
-            kind,
-            partitions,
-            info,
-        }) = &self.opened
-        {
-            let mut lines = vec![
-                Line::styled(
-                    format!("Backup  {}", basename(path)),
-                    self.palette.accent().add_modifier(Modifier::BOLD),
-                ),
-                Line::raw(""),
-                self.kv("Path:", path.clone()),
-                self.kv("Kind:", kind.clone()),
-                self.kv("Partitions:", partitions.to_string()),
-            ];
-            if !info.is_empty() {
-                lines.push(Line::raw(""));
-                for msg in info {
-                    lines.push(Line::styled(format!("  {msg}"), self.palette.dim()));
-                }
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Read by the shared Inspect controller (same as the GUI).".to_string(),
-                self.palette.dim(),
-            ));
-            lines.push(Line::raw("Esc to close."));
-            return Text::from(lines);
-        }
         // No disk selected yet. The disk list is the selectable widget; this
         // text is what the scrollable pane shows behind it.
         Text::from(
@@ -5355,14 +5076,6 @@ impl App {
 
     // --- shared widgets --------------------------------------------------
 
-    /// An accent-labelled `key   value` line.
-    fn kv(&self, key: &str, value: String) -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!("{key:<12}"), self.palette.accent()),
-            Span::raw(value),
-        ])
-    }
-
     fn pane_block(&self, title: &str, focused: bool) -> Block<'static> {
         let border_style = if focused {
             self.palette.accent()
@@ -5384,100 +5097,6 @@ impl App {
     }
 }
 
-/// A headless Inspect controller that opened `source`, its open and probes finished.
-fn inspect_headless(
-    source: crate::controller::inspect::InspectSource,
-) -> crate::controller::inspect::InspectController {
-    use crate::controller::inspect::{InspectAction, InspectController, InspectServices};
-    use crate::controller::Controller as _;
-    let mut ctl = InspectController::new(InspectServices {
-        jobs: crate::controller::inspect::JobRegistry::new(),
-        notify: Arc::new(crate::controller::inspect::NoNotify),
-    });
-    ctl.apply(InspectAction::Load(source));
-    ctl.wait_opened();
-    ctl
-}
-
-/// The Inspect tab's rows for what the controller found; `None` when it found no table.
-fn rows_from(ctl: &mut crate::controller::inspect::InspectController) -> Option<Vec<PartRow>> {
-    let table = ctl.table_summary()?;
-    let parts = ctl.partitions();
-    if parts.is_empty() {
-        let size = ctl.disk_size().unwrap_or(0);
-        return Some(vec![PartRow {
-            selector: None,
-            label: format!("Whole volume ({})", table.type_name),
-            fs_hint: table.type_name,
-            size,
-        }]);
-    }
-    Some(
-        parts
-            .iter()
-            .enumerate()
-            .map(|(k, p)| {
-                let n = (k + 1) as u32;
-                PartRow {
-                    selector: Some(n.into()),
-                    label: format!("#{n}  {}", p.type_name),
-                    fs_hint: p
-                        .partition_type_string
-                        .clone()
-                        .unwrap_or_else(|| p.type_name.clone()),
-                    size: p.size_bytes,
-                }
-            })
-            .collect(),
-    )
-}
-
-/// An image file's rows as the GUI's Inspect tab reads them (containers, real filesystem names).
-fn inspected_rows(path: std::path::PathBuf) -> Option<Vec<PartRow>> {
-    let mut ctl =
-        inspect_headless(crate::controller::inspect::InspectSource::Image { path, temp: None });
-    rows_from(&mut ctl)
-}
-
-/// A backup folder through the Inspect controller; a single-file-CHD backup opens as its disk image.
-fn open_backup_headless(folder: std::path::PathBuf) -> std::result::Result<Opened, String> {
-    use crate::controller::log::LogLevel;
-    let mut ctl = inspect_headless(crate::controller::inspect::InspectSource::Backup { folder });
-    if let Some(err) = ctl.last_error() {
-        return Err(err.to_string());
-    }
-    let info: Vec<String> = ctl
-        .take_log()
-        .into_iter()
-        .filter(|(level, _)| *level == LogLevel::Info)
-        .map(|(_, msg)| msg)
-        .collect();
-    if let Some(image) = ctl.image_path().map(|p| p.to_path_buf()) {
-        let size = ctl.disk_size().unwrap_or(0);
-        let parts = rows_from(&mut ctl).ok_or_else(|| "no partition table".to_string())?;
-        return Ok(Opened::Image {
-            path: image.display().to_string(),
-            size,
-            parts,
-            disk: None,
-        });
-    }
-    let kind = if ctl.clonezilla_summary().is_some() {
-        "Clonezilla"
-    } else {
-        "rusty-backup"
-    };
-    Ok(Opened::Backup {
-        path: ctl
-            .backup_folder()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-        kind: kind.to_string(),
-        partitions: ctl.partitions().len(),
-        info,
-    })
-}
-
 /// Heuristic: does this content look like text (worth showing verbatim) rather
 /// than binary (better as a hex dump)? A NUL byte or a high ratio of control
 /// characters means binary.
@@ -5493,11 +5112,7 @@ fn looks_textual(bytes: &[u8]) -> bool {
     (ctrl as f64) / (sample.len() as f64) < 0.15
 }
 
-/// Parse an image's partition table into displayable rows, mirroring the shared
-/// `resolve` semantics: `@N` selects `partitions()[N-1]`, and an image with no
-/// table is a single superfloppy volume (selector `None`). `total` is the file
-/// size, used for the superfloppy row.
-/// Read the partition table for the Inspect tab's image view.
+/// Read a disk's partition table without elevation, for the Inspect screen's fallback.
 ///
 /// Returns the open error rather than an empty list: a raw device is unreadable
 /// without elevation, and swallowing that produced an image view with no
@@ -5508,7 +5123,6 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<P
     let Some(table) = crate::controller::inspect::read_table_unelevated(path)? else {
         // No detectable table: a raw single-volume image (superfloppy).
         return Ok(vec![PartRow {
-            selector: None,
             label: "Whole volume (no partition table)".to_string(),
             fs_hint: String::new(),
             size: total,
@@ -5516,7 +5130,6 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<P
     };
     if table.partitions.is_empty() {
         return Ok(vec![PartRow {
-            selector: None,
             label: format!("Whole volume ({})", table.type_name),
             fs_hint: table.type_name,
             size: total,
@@ -5529,7 +5142,6 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<P
         .map(|(k, p)| {
             let n = (k + 1) as u32;
             PartRow {
-                selector: Some(n.into()),
                 label: format!("#{n}  {}", p.type_name),
                 fs_hint: p.type_string.unwrap_or(p.type_name),
                 size: p.size_bytes,
@@ -5692,7 +5304,7 @@ mod tests {
     /// discovered.
     #[test]
     fn the_vim_top_bottom_pair_is_listed() {
-        for table in [HINTS_TAB, HINTS_INSPECT_DISKS, HINTS_INSPECT_IMAGE] {
+        for table in [HINTS_TAB, HINTS_INSPECT_DISKS, inspect::HINTS_INSPECT_SOURCE] {
             assert!(
                 table.iter().any(|h| h.keys == "g/G"),
                 "a screen using g/G must say so in its key list"
@@ -5778,21 +5390,17 @@ mod tests {
         let mut app = App::new_on(DEFAULT_TAB);
         app.set_test_devices(vec![fake_disk(&img, size)]);
         app.selection = 0;
-        assert!(app.opened.is_none());
+        assert!(app.inspect_list_active());
 
         app.activate(); // one press
-        app.finish_task();
+        inspect_settle(&mut app);
 
-        let Some(Opened::Image { parts, disk, .. }) = &app.opened else {
-            panic!("a single Enter should have opened the disk's partition table");
-        };
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.source_open(), "a single Enter should open the disk");
+        assert_eq!(s.ctl.device_slot(), Some(0), "opened through the controller");
+        assert_eq!(s.ctl.partitions().len(), 1, "the ext partition is listed");
         assert!(
-            parts.iter().any(|p| p.selector == Some(1u32.into())),
-            "the ext partition should be selectable, got {:?}",
-            parts.iter().map(|p| &p.label).collect::<Vec<_>>()
-        );
-        assert!(
-            disk.is_some(),
+            s.disk.is_some(),
             "the disk's hardware facts must come along so the header can show \
              them instead of needing a screen of their own"
         );
@@ -6359,7 +5967,7 @@ mod tests {
         app.handle_restore_key(KeyCode::Char('s'));
         assert!(matches!(
             app.restore.as_ref().unwrap().ask,
-            Some(restore::Ask::Confirm(..))
+            Some(ask::Ask::Confirm(..))
         ));
         let text = restore_screen(&app);
         assert!(text.contains("permanently overwritten"), "{text}");
@@ -6511,7 +6119,7 @@ mod tests {
         app.handle_restore_key(KeyCode::Char('w'));
         let r = app.restore.as_ref().unwrap();
         assert!(
-            matches!(r.ask, Some(restore::Ask::Confirm(..))),
+            matches!(r.ask, Some(ask::Ask::Confirm(..))),
             "{:?} {:?}",
             r.writer.error(),
             r.writer.target_image()
@@ -6554,7 +6162,7 @@ mod tests {
         app.handle_restore_key(KeyCode::Enter);
         assert!(matches!(
             app.restore.as_ref().unwrap().ask,
-            Some(restore::Ask::Text { .. })
+            Some(ask::Ask::Text { .. })
         ));
         restore_keys(&mut app, "wrong");
         app.handle_restore_key(KeyCode::Enter);
@@ -6711,11 +6319,14 @@ mod tests {
         let mut app = App::new_on(DEFAULT_TAB);
         app.set_test_devices(vec![fake_disk(&img, size)]);
         app.activate();
-        app.finish_task();
-        assert!(app.opened.is_some());
+        inspect_settle(&mut app);
+        assert!(!app.inspect_list_active());
 
-        app.on_back();
-        assert!(app.opened.is_none(), "Esc should close the partition view");
+        ikey(&mut app, KeyCode::Esc);
+        assert!(
+            !app.inspect.as_ref().unwrap().ctl.has_source(),
+            "Esc should close the source"
+        );
         assert!(
             app.inspect_list_active(),
             "and land back on the selectable disk list"
@@ -6734,7 +6345,7 @@ mod tests {
         // says, it must not be "No such file or directory".
         let dir = tempfile::tempdir().expect("tempdir");
         app.open_target(dir.path().to_path_buf());
-        app.finish_task();
+        inspect_settle(&mut app);
         let status = app.status.clone().unwrap_or_default();
         assert!(
             !status.contains("No such file or directory"),
@@ -6746,11 +6357,13 @@ mod tests {
     #[test]
     fn an_image_open_is_remembered_through_the_app_controller() {
         let mut app = App::headless_on(tab_index(TabId::Inspect));
-        let path = std::path::PathBuf::from("/rb-tui-test/recent.img");
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::controller::commander::blank_fat_image(dir.path());
         let shown = vec![path.display().to_string()];
-        app.apply_image_open(path, None, Ok(1 << 20), Some(Ok(Vec::new())));
+        app.open_target(path);
         assert_eq!(app.shell.recent(RecentMode::Inspect), shown);
-        app.opened = None;
+        inspect_settle(&mut app);
+        ikey(&mut app, KeyCode::Esc);
         app.on_key_inner(crossterm::event::KeyEvent::new(
             KeyCode::Char('o'),
             KeyModifiers::NONE,
@@ -6771,15 +6384,255 @@ mod tests {
         );
     }
 
-    /// An image file's rows come from the Inspect controller, which names the volume's filesystem.
+    fn ikey(app: &mut App, code: KeyCode) {
+        app.on_key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn ikeys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            ikey(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Tick until the Inspect screen's jobs and the app's task have ended.
+    fn inspect_settle(app: &mut App) {
+        let start = std::time::Instant::now();
+        loop {
+            app.tick();
+            let busy =
+                app.inspect.as_ref().is_some_and(|s| s.busy()) || app.task.is_active();
+            if !busy {
+                app.tick();
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the Inspect jobs never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The Inspect screen on `path`, opened through `o` and the picker.
+    fn inspect_on(path: &std::path::Path) -> App {
+        let mut app = App::headless_on(tab_index(TabId::Inspect));
+        ikey(&mut app, KeyCode::Char('o'));
+        ikeys(&mut app, path.display().to_string().as_str());
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert!(app.inspect.as_ref().unwrap().source_open());
+        app
+    }
+
+    fn inspect_note(app: &App) -> String {
+        app.inspect
+            .as_ref()
+            .unwrap()
+            .note
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// The grid: Calc min on a volume that needs a walk, Check with its results window, and
+    /// Browse handing the partition to the Explorer.
     #[test]
-    fn an_image_file_is_read_by_the_inspect_controller() {
-        let dir = tempfile::tempdir().unwrap();
+    fn the_inspect_grid_calcs_min_checks_and_browses() {
+        use crate::controller::inspect::MinCell;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let mut app = inspect_on(&img);
+        let part = app.inspect.as_ref().unwrap().ctl.partitions()[0].clone();
+        assert_eq!(
+            app.inspect.as_ref().unwrap().ctl.min_cell(&part),
+            MinCell::CanCalc
+        );
+        let text = backup_screen(&app);
+        assert!(text.contains("m=Calc min"), "{text}");
+        ikey(&mut app, KeyCode::Char('m'));
+        inspect_settle(&mut app);
+        let min = app.inspect.as_ref().unwrap().ctl.min_cell(&part);
+        assert!(matches!(min, MinCell::Size(_)), "{min:?}");
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert!(app.explorer.is_some(), "Enter opens the Explorer");
+        app.explorer = None;
+
+        let fat = tempfile::tempdir().expect("tempdir");
+        let vol = crate::controller::commander::blank_fat_image(fat.path());
+        let mut app = inspect_on(&vol);
+        ikey(&mut app, KeyCode::Char('c'));
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.ctl.fsck_view().is_some_and(|v| v.result.is_clean()));
+        assert_eq!(app.key_context().0, "Inspect - window");
+        let text = backup_screen(&app);
+        assert!(text.contains("Filesystem is clean."), "{text}");
+        ikey(&mut app, KeyCode::Esc);
+        assert!(app.inspect.as_ref().unwrap().ctl.fsck_view().is_none());
+        assert_eq!(app.key_context().0, "Inspect - partitions");
+    }
+
+    /// Export writes a raw whole-disk copy; its Physical Disk Export opens the shared writer
+    /// window, which wraps the superfloppy in a table and writes an image file.
+    #[test]
+    fn the_inspect_export_window_exports_and_hands_over_to_the_writer() {
+        use crate::controller::inspect::ExportFormat;
+        let dir = tempfile::tempdir().expect("tempdir");
         let img = crate::controller::commander::blank_fat_image(dir.path());
-        let rows = inspected_rows(img).expect("a FAT volume has a table");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].fs_hint.contains("FAT"), "{}", rows[0].fs_hint);
-        assert!(open_backup_headless(dir.path().join("missing")).is_err());
+        let bytes = std::fs::read(&img).unwrap();
+        let mut app = inspect_on(&img);
+        ikey(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.key_context().0, "Inspect - export");
+        while app.inspect.as_ref().unwrap().ctl.export_settings().format != ExportFormat::Raw {
+            ikey(&mut app, KeyCode::Right);
+        }
+        let text = backup_screen(&app);
+        assert!(text.contains("Export Disk Image"), "{text}");
+        ikey(&mut app, KeyCode::Char('s'));
+        assert!(app.inspect.as_ref().unwrap().picker_open());
+        for _ in 0..400 {
+            ikey(&mut app, KeyCode::Backspace);
+        }
+        let out = dir.path().join("whole.img");
+        ikeys(&mut app, out.display().to_string().as_str());
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+
+        ikey(&mut app, KeyCode::Char('e'));
+        while app.inspect.as_ref().unwrap().esel != inspect::ERow::Physical {
+            ikey(&mut app, KeyCode::Down);
+        }
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert!(app.inspect.as_ref().unwrap().writer.is_open());
+        assert_eq!(app.key_context().0, "Inspect - Physical Disk Export");
+        ikey(&mut app, KeyCode::Down);
+        let wrapped = dir.path().join("wrapped.img");
+        ikeys(&mut app, wrapped.display().to_string().as_str());
+        ikey(&mut app, KeyCode::Enter);
+        ikey(&mut app, KeyCode::Down);
+        ikey(&mut app, KeyCode::Char('w'));
+        let s = app.inspect.as_ref().unwrap();
+        assert!(
+            matches!(s.ask, Some(ask::Ask::Confirm(..))),
+            "{:?} {:?} {:?}",
+            s.writer.error(),
+            s.writer.target_image(),
+            s.log
+        );
+        ikey(&mut app, KeyCode::Char('y'));
+        inspect_settle(&mut app);
+        let note = inspect_note(&app);
+        assert!(note.starts_with("Wrote "), "{note}");
+        assert!(!app.inspect.as_ref().unwrap().writer.is_open());
+        let d = std::fs::read(&wrapped).unwrap();
+        assert_eq!(&d[510..512], &[0x55, 0xAA]);
+        assert!(d.len() > bytes.len());
+    }
+
+    /// Expand Image grows the file; tools that do not apply say so instead of acting.
+    #[test]
+    fn the_inspect_tools_expand_the_image_and_refuse_what_does_not_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = crate::controller::commander::blank_fat_image(dir.path());
+        let before = std::fs::metadata(&img).unwrap().len();
+        let mut app = inspect_on(&img);
+        ikey(&mut app, KeyCode::Char('x'));
+        ikeys(&mut app, "3");
+        let text = backup_screen(&app);
+        assert!(text.contains("Expand Image") && text.contains("New size"), "{text}");
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert_eq!(
+            std::fs::metadata(&img).unwrap().len(),
+            before + 3 * 1024 * 1024
+        );
+        for k in ['B', 'w', 'i', 'u'] {
+            ikey(&mut app, KeyCode::Char(k));
+            assert!(inspect_note(&app).contains("does not apply"), "{k}");
+        }
+        ikey(&mut app, KeyCode::Char('d'));
+        assert!(inspect_note(&app).contains("Human68k"));
+    }
+
+    /// A backup folder opens through the controller, its summary shown and a partition browsable.
+    #[test]
+    fn the_inspect_screen_opens_a_backup_folder_and_browses_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (folder, _) = restore_fixture(dir.path());
+        let mut app = inspect_on(&folder);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.ctl.backup_folder().is_some());
+        assert_eq!(s.ctl.partitions().len(), 1);
+        let text = backup_screen(&app);
+        assert!(text.contains("Backup of:"), "{text}");
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        assert!(app.explorer.is_some());
+    }
+
+    /// A disk the controller cannot open falls back to the plain read, which reports why.
+    #[test]
+    fn a_disk_that_cannot_be_opened_falls_back_to_the_plain_read() {
+        let mut app = App::headless_on(tab_index(TabId::Inspect));
+        let missing = std::path::Path::new("/nonexistent/rb-tui-test/disk");
+        app.set_test_devices(vec![fake_disk(missing, 1 << 20)]);
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.ctl.last_error().is_some());
+        assert!(s.plain.is_some());
+        assert!(inspect_note(&app).contains("/nonexistent/rb-tui-test/disk"));
+        let text = backup_screen(&app);
+        assert!(text.contains("Error:"), "{text}");
+        ikey(&mut app, KeyCode::Esc);
+        assert!(app.inspect_list_active());
+    }
+
+    /// `R` asks for a daemon in a build with `remote`; without it the key does nothing.
+    #[test]
+    fn the_inspect_remote_window_asks_for_a_daemon_or_is_absent() {
+        use crate::controller::inspect::InspectController;
+        let mut app = App::headless_on(tab_index(TabId::Inspect));
+        ikey(&mut app, KeyCode::Char('R'));
+        let s = app.inspect.as_ref().unwrap();
+        if InspectController::remote_available() {
+            assert!(matches!(s.ask, Some(ask::Ask::Text { .. })));
+            let text = backup_screen(&app);
+            assert!(text.contains("Connect to remote"), "{text}");
+            ikey(&mut app, KeyCode::Esc);
+            assert!(app.inspect.as_ref().unwrap().ask.is_none());
+            ikey(&mut app, KeyCode::Esc);
+            assert!(app.inspect.as_ref().unwrap().window.is_none());
+        } else {
+            assert!(s.ask.is_none() && s.window.is_none());
+        }
+        assert!(app.inspect_list_active());
+    }
+
+    /// The grid and its windows draw in an 80x24 terminal.
+    #[test]
+    fn the_inspect_screen_and_windows_draw_in_a_small_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = mbr_with_ext(dir.path());
+        let size = std::fs::metadata(&img).unwrap().len();
+        let mut app = App::headless_on(tab_index(TabId::Inspect));
+        app.set_test_devices(vec![fake_disk(&img, size)]);
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        let text = backup_screen(&app);
+        assert!(text.contains("Partition table:") && text.contains("Layout:"), "{text}");
+        assert!(text.contains("Disk "), "the disk's facts head the screen: {text}");
+        eprintln!("{text}");
+        ikey(&mut app, KeyCode::Char('e'));
+        let text = backup_screen(&app);
+        assert!(text.contains("Export Disk Image"), "{text}");
+        eprintln!("{text}");
+        ikey(&mut app, KeyCode::Esc);
+        ikey(&mut app, KeyCode::Char('?'));
+        let text = backup_screen(&app);
+        assert!(text.contains("Calc min"), "{text}");
     }
 
     /// Walk the wizard's class list to a given class the way the arrow keys do.

@@ -41,6 +41,7 @@ pub use export::{
 pub use tools::{FsckView, ResizePlan};
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
+pub use crate::model::browse_session::BrowseSession;
 pub use crate::model::export_runner::PartitionExportConfig;
 /// A device's table and size read without elevating, for a shell's quick device view.
 pub use crate::model::inspect_runner::{
@@ -49,7 +50,7 @@ pub use crate::model::inspect_runner::{
 pub use crate::model::job::{JobRegistry, NoNotify};
 pub use crate::model::partition_editor::PartitionEditor;
 pub use crate::model::size_mode::SizeMode;
-pub use crate::rbformats::chd_options::ChdProfile;
+pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 pub use crate::rbformats::export::ExportFormat;
 pub use disk_core::display::format_size;
 pub use dsk_flux::flux::FaultReport;
