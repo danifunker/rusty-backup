@@ -5304,7 +5304,11 @@ mod tests {
     /// discovered.
     #[test]
     fn the_vim_top_bottom_pair_is_listed() {
-        for table in [HINTS_TAB, HINTS_INSPECT_DISKS, inspect::HINTS_INSPECT_SOURCE] {
+        for table in [
+            HINTS_TAB,
+            HINTS_INSPECT_DISKS,
+            inspect::HINTS_INSPECT_SOURCE,
+        ] {
             assert!(
                 table.iter().any(|h| h.keys == "g/G"),
                 "a screen using g/G must say so in its key list"
@@ -5397,7 +5401,11 @@ mod tests {
 
         let s = app.inspect.as_ref().unwrap();
         assert!(s.source_open(), "a single Enter should open the disk");
-        assert_eq!(s.ctl.device_slot(), Some(0), "opened through the controller");
+        assert_eq!(
+            s.ctl.device_slot(),
+            Some(0),
+            "opened through the controller"
+        );
         assert_eq!(s.ctl.partitions().len(), 1, "the ext partition is listed");
         assert!(
             s.disk.is_some(),
@@ -5655,7 +5663,10 @@ mod tests {
         let img = mbr_with_ext(dir.path());
         let mut app = backup_on_image(&img);
         let text = backup_screen(&app);
-        assert!(text.contains("Partitions") && text.contains("Output:"), "{text}");
+        assert!(
+            text.contains("Partitions") && text.contains("Output:"),
+            "{text}"
+        );
         focus_on(&mut app, backup::Field::Start);
         let text = backup_screen(&app);
         assert!(text.contains("[ Start backup ]"), "{text}");
@@ -5667,7 +5678,10 @@ mod tests {
         app.backup.as_mut().unwrap().out_dir = dir.path().display().to_string();
         app.handle_backup_key(KeyCode::Char('s'));
         let text = backup_screen(&app);
-        assert!(text.contains("VHD Backup Options") && text.contains("Start VHD backup"), "{text}");
+        assert!(
+            text.contains("VHD Backup Options") && text.contains("Start VHD backup"),
+            "{text}"
+        );
         eprintln!("{text}");
         assert_eq!(app.key_context().0, "Backup - VHD options");
     }
@@ -5965,12 +5979,16 @@ mod tests {
         app.handle_restore_key(KeyCode::Char(' '));
         // Start asks; `y` runs it.
         app.handle_restore_key(KeyCode::Char('s'));
-        assert!(matches!(
-            app.restore.as_ref().unwrap().ask,
-            Some(ask::Ask::Confirm(..))
-        ));
-        let text = restore_screen(&app);
-        assert!(text.contains("permanently overwritten"), "{text}");
+        // The question's own text: the box wraps it by the temp path's length.
+        let Some(ask::Ask::Confirm(_, spec)) = &app.restore.as_ref().unwrap().ask else {
+            panic!("Start asks first");
+        };
+        assert!(
+            spec.message.contains("permanently overwritten"),
+            "{}",
+            spec.message
+        );
+        assert!(restore_screen(&app).contains("permanently"));
         app.handle_restore_key(KeyCode::Char('y'));
         assert!(app.progress.is_some());
         let (res, err) = restore_run_to_end(&mut app);
@@ -6069,8 +6087,14 @@ mod tests {
         assert_eq!(r.ctl.target_partition(), Some(parts[0].index));
         assert_eq!(r.ctl.validate(), Ok(()));
         app.handle_restore_key(KeyCode::Char('s'));
-        let text = restore_screen(&app);
-        assert!(text.contains("will NOT be modified"), "{text}");
+        let Some(ask::Ask::Confirm(_, spec)) = &app.restore.as_ref().unwrap().ask else {
+            panic!("Start asks first");
+        };
+        assert!(
+            spec.message.contains("will NOT be modified"),
+            "{}",
+            spec.message
+        );
         // `n` leaves the device alone.
         app.handle_restore_key(KeyCode::Char('n'));
         let r = app.restore.as_ref().unwrap();
@@ -6399,8 +6423,7 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             app.tick();
-            let busy =
-                app.inspect.as_ref().is_some_and(|s| s.busy()) || app.task.is_active();
+            let busy = app.inspect.as_ref().is_some_and(|s| s.busy()) || app.task.is_active();
             if !busy {
                 app.tick();
                 return;
@@ -6541,7 +6564,10 @@ mod tests {
         ikey(&mut app, KeyCode::Char('x'));
         ikeys(&mut app, "3");
         let text = backup_screen(&app);
-        assert!(text.contains("Expand Image") && text.contains("New size"), "{text}");
+        assert!(
+            text.contains("Expand Image") && text.contains("New size"),
+            "{text}"
+        );
         ikey(&mut app, KeyCode::Enter);
         inspect_settle(&mut app);
         assert_eq!(
@@ -6622,8 +6648,14 @@ mod tests {
         ikey(&mut app, KeyCode::Enter);
         inspect_settle(&mut app);
         let text = backup_screen(&app);
-        assert!(text.contains("Partition table:") && text.contains("Layout:"), "{text}");
-        assert!(text.contains("Disk "), "the disk's facts head the screen: {text}");
+        assert!(
+            text.contains("Partition table:") && text.contains("Layout:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Disk "),
+            "the disk's facts head the screen: {text}"
+        );
         eprintln!("{text}");
         ikey(&mut app, KeyCode::Char('e'));
         let text = backup_screen(&app);
