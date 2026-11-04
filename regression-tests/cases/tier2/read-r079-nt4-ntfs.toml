@@ -1,0 +1,34 @@
+# Tier 2 — R-079: an NT4 NTFS volume lists the files in MFT records 16-23.
+#
+# The user's NT4 Terminal Server Edition disk: a 10 MiB FAT16 boot partition and a
+# 2 GiB NTFS (NT 4.0) logical partition holding the system folder `WTSRV`, which NT4
+# put in MFT record 17. The reader used to drop every record below 24, so `WTSRV` and
+# its 3,664 files were missing. Counts and the kernel's hash match ntfs-3g
+# (`ntfsls -R`, `ntfscat`) on the same volume.
+
+[meta]
+tier = 2
+group = "fs.read.ntfs.r079"
+description = "List, walk and extract an NT4 TSE NTFS volume whose WTSRV folder is MFT record 17."
+
+[[case]]
+id = "read.ntfs.nt4-tse.records-16-23"
+description = "WTSRV (MFT record 17) lists, the whole volume walks to ntfs-3g's counts, a system file extracts"
+fixture = "fs.ntfs.nt4-tse-wtsrv.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_matches = ["DIR\\s+\\d+\\s+WTSRV", "DIR\\s+\\d+\\s+Program Files"]
+[[case.step]]
+args = ["du", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_matches = ["\\s4590\\s+374\\s+/\\n"]
+[[case.step]]
+args = ["du", "{fixture}@3", "/WTSRV"]
+expect_exit = 0
+stdout_matches = ["\\s3664\\s+294\\s+/WTSRV"]
+[[case.step]]
+args = ["get", "{fixture}@3", "/WTSRV/system32/NTOSKRNL.EXE", "{scratch}/ex/"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/NTOSKRNL.EXE", sha256 = "64dad17b9f4b9378338078ebc1ecfed99b2285b5ab11f8fbcbce4b9f027e03f5" }]
