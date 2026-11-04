@@ -254,3 +254,52 @@ fn a_defragment_on_a_volume_that_is_not_human68k_asks_nothing() {
     let index = ctl.partitions()[0].index;
     assert!(ctl.apply(InspectAction::Defragment(index)).is_empty());
 }
+
+#[test]
+fn the_export_window_lists_formats_and_its_size_rows_follow_their_rules() {
+    let (_dir, _img, mut ctl) = opened_fat();
+    ctl.apply(InspectAction::OpenExport);
+    let formats = ctl.export_formats();
+    assert_eq!(formats.len(), EXPORT_FORMATS.len());
+    assert!(formats
+        .iter()
+        .all(|(c, on)| *on && !c.label.is_empty() && c.label.is_ascii()));
+    assert!(per_partition_refusal(ExportFormat::Qcow2).is_some());
+    assert!(per_partition_refusal(ExportFormat::Vhd).is_none());
+    let s = ctl.export_settings_mut();
+    s.format = ExportFormat::Qcow2;
+    s.set_whole_disk(false);
+    assert!(s.whole_disk, "QCOW2 is whole disk only");
+    s.format = ExportFormat::Raw;
+    s.set_whole_disk(false);
+    assert!(!s.whole_disk);
+    let cfg = &mut s.configs[0];
+    let modes = cfg.mode_choices();
+    assert_eq!(modes.first(), Some(&SizeMode::Original));
+    assert_eq!(modes.last(), Some(&SizeMode::Custom));
+    assert!(!modes.contains(&SizeMode::FillRemaining));
+    let (lo, hi) = cfg.custom_bounds_mib();
+    assert_eq!(lo, (cfg.minimum_size / (1024 * 1024)).max(1) as u32);
+    assert_eq!(hi, crate::model::size_mode::CUSTOM_MIB_MAX);
+    cfg.set_choice(SizeMode::Custom);
+    assert_eq!(cfg.custom_size_mib, lo, "Custom starts at the minimum");
+    cfg.custom_size_mib = u32::MAX;
+    assert_eq!(cfg.effective_size(), u64::from(hi) * 1024 * 1024);
+}
+
+#[test]
+fn the_source_label_close_and_expand_preview_follow_the_source() {
+    let (_dir, img, mut ctl) = opened_fat();
+    let name = img.file_name().unwrap().to_string_lossy().to_string();
+    assert!(ctl.source_label(&[]).ends_with(name.as_str()));
+    assert!(ctl.can_close() && ctl.can_reinspect());
+    let size = std::fs::metadata(&img).unwrap().len();
+    assert_eq!(ctl.expand_image_preview(3), (size, size + 3 * 1024 * 1024));
+    assert_eq!(
+        expand_image_bytes(u32::MAX),
+        u64::from(EXPAND_IMAGE_MIB_MAX) * 1024 * 1024
+    );
+    ctl.apply(InspectAction::Close);
+    assert!(!ctl.can_close() && !ctl.can_reinspect());
+    assert_eq!(ctl.source_label(&[]), "Select a device or image...");
+}

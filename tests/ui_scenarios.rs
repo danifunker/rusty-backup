@@ -234,8 +234,10 @@ impl Target for JobProbeController {
 
 /// `InspectController`. Actions: `OpenImage` (arg: a path, or `$blank_fat` for a fresh 2 MiB FAT
 /// image), `Close`, `Reinspect`, `Check` (arg: row number from 0), `SetBrowseDirty` (bool), `Confirm`
-/// (bool, answers the pending question). Probes: `source`, `partitions`, `superfloppy`, `error`,
-/// `check_clean`, `log` (every line so far).
+/// (bool, answers the pending question), `OpenExport`, `ExportFormat` (a label from the window's
+/// list), `ExportWholeDisk` (bool), `ExportSizeMode` / `ExportCustomMib` (the first row). Probes:
+/// `source`, `source_label`, `can_close`, `partitions`, `superfloppy`, `error`, `check_clean`,
+/// `export_format`, `export_whole_disk`, `export_modes`, `export_size_mib`, `log`.
 struct InspectTarget {
     ctl: rusty_backup::controller::inspect::InspectController,
     dir: tempfile::TempDir,
@@ -268,6 +270,67 @@ impl InspectTarget {
         self.log
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
         fx
+    }
+}
+
+impl InspectTarget {
+    /// The Export window's settings as a shell edits them.
+    fn export_edit(&mut self, action: &str, arg: Option<&Value>) -> Result<(), String> {
+        use rusty_backup::controller::inspect::{SizeMode, EXPORT_FORMATS};
+        let s = self.ctl.export_settings_mut();
+        match action {
+            "ExportFormat" => {
+                let label = arg_str(arg)?;
+                let c = EXPORT_FORMATS
+                    .iter()
+                    .find(|c| c.label == label)
+                    .ok_or_else(|| format!("no format {label:?}"))?;
+                s.format = c.format;
+            }
+            "ExportWholeDisk" => s.set_whole_disk(arg.and_then(Value::as_bool).ok_or("bool")?),
+            "ExportSizeMode" => {
+                let mode = match arg_str(arg)? {
+                    "Original" => SizeMode::Original,
+                    "Minimum" => SizeMode::Minimum,
+                    "Custom" => SizeMode::Custom,
+                    other => return Err(format!("no size mode {other:?}")),
+                };
+                s.configs.first_mut().ok_or("no rows")?.set_choice(mode);
+            }
+            _ => {
+                let mib = arg.and_then(Value::as_integer).ok_or("needs a number")?;
+                s.configs.first_mut().ok_or("no rows")?.custom_size_mib = mib as u32;
+            }
+        }
+        Ok(())
+    }
+
+    fn export_probe(&self, name: &str) -> Result<Value, String> {
+        use rusty_backup::controller::inspect::EXPORT_FORMATS;
+        let s = self.ctl.export_settings();
+        Ok(match name {
+            "export_format" => Value::String(
+                EXPORT_FORMATS
+                    .iter()
+                    .find(|c| c.format == s.format)
+                    .map_or("", |c| c.label)
+                    .to_string(),
+            ),
+            "export_whole_disk" => Value::Boolean(s.whole_disk),
+            "export_modes" => {
+                let cfg = s.configs.first().ok_or("no rows")?;
+                let modes: Vec<String> = cfg
+                    .mode_choices()
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect();
+                Value::String(modes.join(","))
+            }
+            _ => {
+                let cfg = s.configs.first().ok_or("no rows")?;
+                Value::Integer((cfg.effective_size() / (1024 * 1024)) as i64)
+            }
+        })
     }
 }
 
@@ -304,6 +367,10 @@ impl Target for InspectTarget {
                 purpose: self.asked.take().ok_or("nothing was asked")?,
                 yes: arg.and_then(Value::as_bool).ok_or("needs a bool")?,
             },
+            "OpenExport" => InspectAction::OpenExport,
+            "ExportFormat" | "ExportWholeDisk" | "ExportSizeMode" | "ExportCustomMib" => {
+                return self.export_edit(action, arg).map(|_| Vec::new());
+            }
             other => return Err(format!("InspectController has no action {other:?}")),
         };
         let fx = self.ctl.apply(a);
@@ -327,6 +394,11 @@ impl Target for InspectTarget {
                 Value::Boolean(self.ctl.table_summary().is_some_and(|t| t.superfloppy))
             }
             "error" => Value::String(self.ctl.last_error().unwrap_or("").to_string()),
+            "source_label" => Value::String(self.ctl.source_label(&[])),
+            "can_close" => Value::Boolean(self.ctl.can_close()),
+            "export_format" | "export_whole_disk" | "export_modes" | "export_size_mib" => {
+                self.export_probe(name)?
+            }
             "check_clean" => {
                 Value::Boolean(self.ctl.fsck_view().is_some_and(|v| v.result.is_clean()))
             }

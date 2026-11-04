@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::inspect::{
-    format_size, BackupSummary, ChdProfile, ClonezillaSummary, ExportFormat, HostRequest,
-    InspectAction, InspectController, InspectServices, InspectSource, LayoutBar, LayoutSegment,
-    MinCell, SegmentKind,
+    expand_image_bytes, format_size, per_partition_refusal, BackupSummary, ChdProfile,
+    ClonezillaSummary, ExportFormat, ExportFormatChoice, HostRequest, InspectAction,
+    InspectController, InspectServices, InspectSource, LayoutBar, LayoutSegment, MinCell,
+    SegmentKind, CHD_REFUSAL, EXPAND_IMAGE_MIB_MAX,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller as _, Effect};
@@ -290,25 +291,7 @@ impl InspectTab {
     }
 
     fn source_label(&self, ctx: &TabContext) -> String {
-        if let Some(rpath) = self.ctl.remote_path() {
-            let base = rpath.rsplit('/').find(|s| !s.is_empty()).unwrap_or(rpath);
-            format!("Remote image: {base}")
-        } else if let Some(path) = self.ctl.backup_folder() {
-            format!("Backup: {}", path.display())
-        } else if let Some(path) = self.ctl.image_path() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            match self.ctl.format_label() {
-                Some(label) => format!("{label}: {name}"),
-                None => format!("Image: {name}"),
-            }
-        } else if let Some(idx) = self.ctl.device_slot() {
-            ctx.devices
-                .get(idx)
-                .map(|d| d.display_name())
-                .unwrap_or_else(|| "Unknown".into())
-        } else {
-            "Select a device or image...".into()
-        }
+        self.ctl.source_label(ctx.devices)
     }
 
     /// The source picker's event as a source to open; `None` for one Inspect does not take.
@@ -565,12 +548,8 @@ impl InspectTab {
 
     fn show_button_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let loading = self.ctl.loading().is_some();
             if ui
-                .add_enabled(
-                    self.ctl.has_source() && !loading,
-                    egui::Button::new("Re-inspect"),
-                )
+                .add_enabled(self.ctl.can_reinspect(), egui::Button::new("Re-inspect"))
                 .clicked()
             {
                 self.act(InspectAction::Reinspect);
@@ -686,8 +665,7 @@ impl InspectTab {
             }
 
             let exporting = self.ctl.export_running();
-            if self.ctl.has_local_source() && !loading && !exporting && ui.button("Close").clicked()
-            {
+            if self.ctl.can_close() && ui.button("Close").clicked() {
                 self.act(InspectAction::Close);
             }
             if exporting && ui.button("Cancel Export").clicked() {
@@ -719,7 +697,7 @@ impl InspectTab {
         let mut open = self.expand_image_dialog_open;
         let mut do_expand = false;
         let mut cancel = false;
-        let current_size = self.ctl.disk_size().unwrap_or(0);
+        let (current_size, new_size) = self.ctl.expand_image_preview(self.expand_image_add_mib);
 
         egui::Window::new("Expand Image")
             .open(&mut open)
@@ -733,15 +711,11 @@ impl InspectTab {
                     ui.label("Add free space:");
                     ui.add(
                         egui::DragValue::new(&mut self.expand_image_add_mib)
-                            .range(0..=4_194_304u32) // 4 TiB upper bound
+                            .range(0..=EXPAND_IMAGE_MIB_MAX)
                             .suffix(" MiB"),
                     );
                 });
-                let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
-                ui.label(format!(
-                    "New size: {}",
-                    format_size(current_size.saturating_add(add_bytes)),
-                ));
+                ui.label(format!("New size: {}", format_size(new_size)));
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
@@ -770,7 +744,7 @@ impl InspectTab {
             return;
         }
         if do_expand {
-            let add_bytes = (self.expand_image_add_mib as u64) * 1024 * 1024;
+            let add_bytes = expand_image_bytes(self.expand_image_add_mib);
             self.act(InspectAction::ExpandImage(add_bytes));
             self.expand_image_dialog_open = false;
         }
@@ -794,7 +768,7 @@ impl InspectTab {
     }
 
     fn show_export_popup(&mut self, ui: &mut egui::Ui) {
-        let chd_allowed = self.ctl.chd_export_allowed();
+        let formats = self.ctl.export_formats();
         let can_physical = self.ctl.can_export_physical();
         let layout = self.ctl.export_layout();
         let notes = self.ctl.export_notes();
@@ -848,7 +822,7 @@ impl InspectTab {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Format:").strong());
                 ui.horizontal_wrapped(|ui| {
-                    format_radios(ui, &mut s.format, chd_allowed);
+                    format_radios(ui, &mut s.format, &formats);
                 });
 
                 if s.format == ExportFormat::Chd {
@@ -1386,93 +1360,25 @@ impl InspectTab {
 }
 
 /// Why per-partition export is off for a whole-disk-only format, for the radio's hover.
-fn per_partition_refusal(format: ExportFormat) -> Option<&'static str> {
-    Some(match format {
-        ExportFormat::Chd => {
-            "Per-partition export is not supported for CHD - each partition would be a \
-             headless slice with no MBR/GPT, which no emulator can consume. Use whole-disk \
-             export instead."
+fn format_radios(
+    ui: &mut egui::Ui,
+    format: &mut ExportFormat,
+    choices: &[(ExportFormatChoice, bool)],
+) {
+    for (choice, enabled) in choices {
+        let radio = ui.add_enabled(
+            *enabled,
+            egui::RadioButton::new(*format == choice.format, choice.label),
+        );
+        let hint = if *enabled { choice.hint } else { CHD_REFUSAL };
+        let radio = if hint.is_empty() {
+            radio
+        } else {
+            radio.on_hover_text(hint)
+        };
+        if radio.clicked() {
+            *format = choice.format;
         }
-        ExportFormat::VhdDynamic => {
-            "Per-partition export is not supported for dynamic VHD - the sparse layout wraps \
-             a whole disk and buys nothing on a single mostly-used partition. Use fixed VHD \
-             for per-partition export."
-        }
-        ExportFormat::Qcow2 => {
-            "Per-partition export is not supported for QCOW2 - the sparse layout wraps a \
-             whole-disk geometry that QEMU/UTM expect to find an MBR/GPT/APM at sector 0."
-        }
-        ExportFormat::VmdkFlat => {
-            "Per-partition export is not supported for VMDK flat - the descriptor wraps a \
-             whole-disk geometry that VMware/qemu-img/VirtualBox expect to find a partition \
-             table at sector 0 of."
-        }
-        ExportFormat::VmdkSparse => {
-            "Per-partition export is not supported for VMDK sparse - the grain directory \
-             wraps a whole-disk geometry that VMware/qemu-img/VirtualBox expect to find a \
-             partition table at sector 0 of."
-        }
-        _ => return None,
-    })
-}
-
-fn format_radios(ui: &mut egui::Ui, format: &mut ExportFormat, chd_allowed: bool) {
-    ui.radio_value(format, ExportFormat::Vhd, "VHD");
-    ui.radio_value(format, ExportFormat::VhdDynamic, "VHD (Dynamic)")
-        .on_hover_text(
-            "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; \
-             readable by Hyper-V, qemu-img, Disk Management.",
-        );
-    ui.radio_value(format, ExportFormat::Qcow2, "QCOW2")
-        .on_hover_text(
-            "QCOW2 v3 - sparse, uncompressed. The container UTM uses \
-         for classic-Mac PPC guests; opens in QEMU, virt-manager.",
-        );
-    ui.radio_value(format, ExportFormat::VmdkFlat, "VMDK (Flat)")
-        .on_hover_text(
-            "monolithicFlat VMDK - emits <name>.vmdk descriptor + \
-             <name>-flat.vmdk raw extent. Opens in VMware Workstation/\
-             Fusion, VirtualBox, qemu-img.",
-        );
-    ui.radio_value(format, ExportFormat::VmdkSparse, "VMDK (Sparse)")
-        .on_hover_text(
-            "monolithicSparse VMDK - single self-contained .vmdk; \
-             zero grains omitted. Opens in VMware, VirtualBox, qemu-img.",
-        );
-    ui.radio_value(format, ExportFormat::Raw, "Raw (.img)");
-    ui.radio_value(format, ExportFormat::TwoMg, "2MG (.2mg)");
-    ui.radio_value(format, ExportFormat::Woz, "WOZ (.woz)")
-        .on_hover_text("Apple II WOZ 2.0 (floppy only: 140K / 400K / 800K sources)");
-    ui.radio_value(format, ExportFormat::Moof, "MOOF (.moof)")
-        .on_hover_text(
-            "Applesauce Macintosh 3.5\" GCR bitstream (floppy only: 400K / 800K). \
-             Loadable by Snow / MAME / Applesauce.",
-        );
-    ui.radio_value(format, ExportFormat::Dc42, "DiskCopy 4.2 (.dsk)")
-        .on_hover_text("Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)");
-    ui.radio_value(format, ExportFormat::Hfv, "HFV (BasiliskII)")
-        .on_hover_text(
-            "Flat classic-HFS volume for BasiliskII / SheepShaver (no partition \
-             table, classic-HFS-only, max 2047 MB). Exported per-partition: one \
-             .hfv per HFS partition, cloned and re-floored to the chosen size.",
-        );
-    let hd = ui.add_enabled(
-        chd_allowed,
-        egui::RadioButton::new(*format == ExportFormat::Chd, "CHD (Hard Disk)"),
-    );
-    if hd.clicked() {
-        *format = ExportFormat::Chd;
-    }
-    if chd_allowed {
-        hd.on_hover_text(
-            "MAME hard-disk CHD (512-byte unit). DVD / CD CHD and BIN/CUE \
-             extraction live on the Optical tab.",
-        );
-    } else {
-        hd.on_hover_text(
-            "CHD export needs a raw image or device source - backup \
-             folders and Clonezilla images aren't supported.",
-        );
     }
 }
 

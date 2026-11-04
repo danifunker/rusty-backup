@@ -10,6 +10,117 @@ use crate::model::job::{Job, JobCtx, Status};
 use crate::rbformats::chd_options::ChdOptions;
 use crate::rbformats::export::ExportFormat;
 
+/// One format the Export window offers: its label and what it is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportFormatChoice {
+    pub format: ExportFormat,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+const fn fmt(format: ExportFormat, label: &'static str, hint: &'static str) -> ExportFormatChoice {
+    ExportFormatChoice {
+        format,
+        label,
+        hint,
+    }
+}
+
+/// The Export window's formats, in the order every shell lists them (CHD last).
+pub const EXPORT_FORMATS: &[ExportFormatChoice] = &[
+    fmt(ExportFormat::Vhd, "VHD", ""),
+    fmt(
+        ExportFormat::VhdDynamic,
+        "VHD (Dynamic)",
+        "Sparse VHD - all-zero blocks are omitted. Same .vhd extension; readable by Hyper-V, \
+         qemu-img, Disk Management.",
+    ),
+    fmt(
+        ExportFormat::Qcow2,
+        "QCOW2",
+        "QCOW2 v3 - sparse, uncompressed. The container UTM uses for classic-Mac PPC guests; \
+         opens in QEMU, virt-manager.",
+    ),
+    fmt(
+        ExportFormat::VmdkFlat,
+        "VMDK (Flat)",
+        "monolithicFlat VMDK - emits <name>.vmdk descriptor + <name>-flat.vmdk raw extent. \
+         Opens in VMware Workstation/Fusion, VirtualBox, qemu-img.",
+    ),
+    fmt(
+        ExportFormat::VmdkSparse,
+        "VMDK (Sparse)",
+        "monolithicSparse VMDK - single self-contained .vmdk; zero grains omitted. Opens in \
+         VMware, VirtualBox, qemu-img.",
+    ),
+    fmt(ExportFormat::Raw, "Raw (.img)", ""),
+    fmt(ExportFormat::TwoMg, "2MG (.2mg)", ""),
+    fmt(
+        ExportFormat::Woz,
+        "WOZ (.woz)",
+        "Apple II WOZ 2.0 (floppy only: 140K / 400K / 800K sources)",
+    ),
+    fmt(
+        ExportFormat::Moof,
+        "MOOF (.moof)",
+        "Applesauce Macintosh 3.5\" GCR bitstream (floppy only: 400K / 800K). Loadable by \
+         Snow / MAME / Applesauce.",
+    ),
+    fmt(
+        ExportFormat::Dc42,
+        "DiskCopy 4.2 (.dsk)",
+        "Mac / Apple IIgs DiskCopy 4.2 (floppy only: 400K / 720K / 800K / 1440K)",
+    ),
+    fmt(
+        ExportFormat::Hfv,
+        "HFV (BasiliskII)",
+        "Flat classic-HFS volume for BasiliskII / SheepShaver (no partition table, \
+         classic-HFS-only, max 2047 MB). Exported per-partition: one .hfv per HFS partition, \
+         cloned and re-floored to the chosen size.",
+    ),
+    fmt(
+        ExportFormat::Chd,
+        "CHD (Hard Disk)",
+        "MAME hard-disk CHD (512-byte unit). DVD / CD CHD and BIN/CUE extraction live on the \
+         Optical tab.",
+    ),
+];
+
+/// Why CHD is not offered for this source.
+pub const CHD_REFUSAL: &str = "CHD export needs a raw image or device source - backup folders \
+                               and Clonezilla images aren't supported.";
+
+/// Why a whole-disk-only format cannot be exported per partition, or `None` when it can.
+pub fn per_partition_refusal(format: ExportFormat) -> Option<&'static str> {
+    Some(match format {
+        ExportFormat::Chd => {
+            "Per-partition export is not supported for CHD - each partition would be a \
+             headless slice with no MBR/GPT, which no emulator can consume. Use whole-disk \
+             export instead."
+        }
+        ExportFormat::VhdDynamic => {
+            "Per-partition export is not supported for dynamic VHD - the sparse layout wraps \
+             a whole disk and buys nothing on a single mostly-used partition. Use fixed VHD \
+             for per-partition export."
+        }
+        ExportFormat::Qcow2 => {
+            "Per-partition export is not supported for QCOW2 - the sparse layout wraps a \
+             whole-disk geometry that QEMU/UTM expect to find an MBR/GPT/APM at sector 0."
+        }
+        ExportFormat::VmdkFlat => {
+            "Per-partition export is not supported for VMDK flat - the descriptor wraps a \
+             whole-disk geometry that VMware/qemu-img/VirtualBox expect to find a partition \
+             table at sector 0 of."
+        }
+        ExportFormat::VmdkSparse => {
+            "Per-partition export is not supported for VMDK sparse - the grain directory \
+             wraps a whole-disk geometry that VMware/qemu-img/VirtualBox expect to find a \
+             partition table at sector 0 of."
+        }
+        _ => return None,
+    })
+}
+
 /// The Export window's choices; the window edits them in place.
 #[derive(Debug, Clone)]
 pub struct ExportSettings {
@@ -44,6 +155,14 @@ impl ExportSettings {
     /// A flat HFV is one classic-HFS volume, so it is exported per partition.
     pub fn per_partition_only(&self) -> bool {
         self.format == ExportFormat::Hfv
+    }
+
+    /// Whole disk or per partition; a format that allows only one keeps it.
+    pub fn set_whole_disk(&mut self, on: bool) {
+        if (on && self.per_partition_only()) || (!on && self.whole_disk_only()) {
+            return;
+        }
+        self.whole_disk = on;
     }
 
     fn normalize(&mut self, chd_allowed: bool) {
@@ -153,9 +272,23 @@ impl InspectController {
         self.backup_folder().is_none() && self.found.clonezilla.is_none()
     }
 
+    /// The formats the window lists, each with whether this source can take it.
+    pub fn export_formats(&self) -> Vec<(ExportFormatChoice, bool)> {
+        let chd = self.chd_export_allowed();
+        EXPORT_FORMATS
+            .iter()
+            .map(|c| (*c, c.format != ExportFormat::Chd || chd))
+            .collect()
+    }
+
     /// Physical Disk Export takes a raw image file only.
     pub fn can_export_physical(&self) -> bool {
         self.image_path().is_some()
+    }
+
+    /// The window's choices as the last edit left them.
+    pub fn export_settings(&self) -> &ExportSettings {
+        &self.export.settings
     }
 
     pub fn export_settings_mut(&mut self) -> &mut ExportSettings {

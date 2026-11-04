@@ -63,9 +63,48 @@ pub struct PartitionExportConfig {
 }
 
 impl PartitionExportConfig {
+    /// The exported size; a Custom size outside [`Self::custom_bounds_mib`] is clamped.
     pub fn effective_size(&self) -> u64 {
-        self.choice
-            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
+        self.choice.effective_size(
+            self.original_size,
+            self.minimum_size,
+            self.custom_mib_effective(),
+        )
+    }
+
+    /// The size modes this row offers: Minimum only below the original.
+    pub fn mode_choices(&self) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.minimum_size < self.original_size {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        modes
+    }
+
+    /// A Custom size's range in MiB: the minimum (at least 1) up to the volume's cap or 2 TiB.
+    pub fn custom_bounds_mib(&self) -> (u32, u32) {
+        let max = crate::model::size_mode::CUSTOM_MIB_MAX as u64;
+        let lo = (self.minimum_size / (1024 * 1024)).clamp(1, max);
+        let hi = self
+            .max_size
+            .map(|b| (b / (1024 * 1024)).max(lo))
+            .unwrap_or(max)
+            .min(max);
+        (lo as u32, hi as u32)
+    }
+
+    pub fn custom_mib_effective(&self) -> u32 {
+        let (lo, hi) = self.custom_bounds_mib();
+        self.custom_size_mib.clamp(lo, hi)
+    }
+
+    /// Switch the size mode; a switch into Custom starts at the minimum.
+    pub fn set_choice(&mut self, mode: SizeMode) {
+        if mode == SizeMode::Custom && self.choice != SizeMode::Custom {
+            self.custom_size_mib = (self.minimum_size / (1024 * 1024)).max(1) as u32;
+        }
+        self.choice = mode;
     }
 }
 

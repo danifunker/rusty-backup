@@ -34,7 +34,10 @@ use crate::model::job::{Job, Notify, Snapshot};
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
 use dsk_clonezilla::metadata::ClonezillaImage;
 
-pub use export::{ExportNotes, ExportSettings, LayoutBar};
+pub use export::{
+    per_partition_refusal, ExportFormatChoice, ExportNotes, ExportSettings, LayoutBar, CHD_REFUSAL,
+    EXPORT_FORMATS,
+};
 pub use tools::{FsckView, ResizePlan};
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
@@ -45,6 +48,7 @@ pub use crate::model::inspect_runner::{
 };
 pub use crate::model::job::{JobRegistry, NoNotify};
 pub use crate::model::partition_editor::PartitionEditor;
+pub use crate::model::size_mode::SizeMode;
 pub use crate::rbformats::chd_options::ChdProfile;
 pub use crate::rbformats::export::ExportFormat;
 pub use disk_core::display::format_size;
@@ -53,6 +57,9 @@ pub use dsk_flux::flux::FaultReport;
 /// A remote image on an `rb-cli serve` daemon: the shared connection and the daemon-side path.
 #[cfg(feature = "remote")]
 pub type RemoteImage = crate::model::inspect_runner::RemoteImage;
+
+/// The largest Expand Image step, in MiB (4 TiB).
+pub const EXPAND_IMAGE_MIB_MAX: u32 = 4_194_304;
 
 /// The `purpose` of each picker and confirmation this controller asks for.
 pub mod purpose {
@@ -506,6 +513,50 @@ impl InspectController {
             return Some(conn.1.as_str());
         }
         None
+    }
+
+    /// The source as the picker names it: remote image, backup, image (with its format) or device.
+    pub fn source_label(&self, devices: &[crate::device::DiskDevice]) -> String {
+        if let Some(rpath) = self.remote_path() {
+            let base = rpath.rsplit('/').find(|s| !s.is_empty()).unwrap_or(rpath);
+            format!("Remote image: {base}")
+        } else if let Some(path) = self.backup_folder() {
+            format!("Backup: {}", path.display())
+        } else if let Some(path) = self.image_path() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            match self.format_label() {
+                Some(label) => format!("{label}: {name}"),
+                None => format!("Image: {name}"),
+            }
+        } else if let Some(idx) = self.device_slot() {
+            devices
+                .get(idx)
+                .map(|d| d.display_name())
+                .unwrap_or_else(|| "Unknown".into())
+        } else {
+            "Select a device or image...".into()
+        }
+    }
+
+    /// This build can open a remote image (the `remote` feature).
+    pub fn remote_available() -> bool {
+        cfg!(feature = "remote")
+    }
+
+    /// Re-inspect applies: a source is open and not still loading.
+    pub fn can_reinspect(&self) -> bool {
+        self.has_source() && self.loading().is_none()
+    }
+
+    /// Close applies: a local source, not loading and not exporting (a remote one closes apart).
+    pub fn can_close(&self) -> bool {
+        self.has_local_source() && self.loading().is_none() && !self.export_running()
+    }
+
+    /// Expand Image's sizes for `add_mib` more MiB: (current, after); the step is capped at 4 TiB.
+    pub fn expand_image_preview(&mut self, add_mib: u32) -> (u64, u64) {
+        let current = self.disk_size().unwrap_or(0);
+        (current, current.saturating_add(expand_image_bytes(add_mib)))
     }
 
     /// A device, image or backup folder is open (a remote session is not counted).
@@ -1008,6 +1059,11 @@ impl InspectController {
             file_name,
         }
     }
+}
+
+/// The bytes Expand Image adds for `add_mib`, capped at [`EXPAND_IMAGE_MIB_MAX`].
+pub fn expand_image_bytes(add_mib: u32) -> u64 {
+    u64::from(add_mib.min(EXPAND_IMAGE_MIB_MAX)) * 1024 * 1024
 }
 
 impl Controller for InspectController {
