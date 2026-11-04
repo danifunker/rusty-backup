@@ -1,11 +1,11 @@
 [package]
 name = "part-tables"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
 authors = ["Dani Sarfati <dani@funkervogt.com>"]
-description = "Parse and write disk partition tables and labels: MBR, GPT, Apple APM, BSD, Sun, SGI, NeXT, Amiga RDB, Atari AHDI, X68000, Solaris x86, AIX / HP-UX LVM"
+description = "Parse and write disk partition tables and labels: MBR, GPT, Apple APM (and the old TS map), BSD, Sun, SGI, NeXT, Amiga RDB, Atari AHDI, X68000, Solaris x86, AIX / HP-UX LVM"
 repository = "https://github.com/danifunker/rusty-backup"
 readme = "README.md"
 keywords = ["partition", "mbr", "gpt", "disk-image", "retro"]

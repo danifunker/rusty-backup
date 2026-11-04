@@ -30,6 +30,44 @@ pub struct DriverDescriptorRecord {
     pub driver_info: Vec<DriverInfo>,
 }
 
+impl DriverDescriptorRecord {
+    /// Parse block 0; fails unless it carries the `ER` signature.
+    pub fn parse(ddr_buf: &[u8]) -> Result<Self, PartitionError> {
+        if ddr_buf.len() < 512 {
+            return Err(PartitionError::InvalidApm("DDR block is short".into()));
+        }
+        let sig = BigEndian::read_u16(&ddr_buf[0..2]);
+        if sig != DDR_SIGNATURE {
+            return Err(PartitionError::InvalidApm(format!(
+                "bad DDR signature: 0x{sig:04X}"
+            )));
+        }
+        let driver_count = BigEndian::read_u16(&ddr_buf[16..18]);
+        let mut driver_info = Vec::with_capacity(driver_count as usize);
+        for i in 0..driver_count as usize {
+            let off = 18 + i * 8;
+            if off + 8 > 512 {
+                break;
+            }
+            driver_info.push(DriverInfo {
+                block: BigEndian::read_u32(&ddr_buf[off..off + 4]),
+                size: BigEndian::read_u16(&ddr_buf[off + 4..off + 6]),
+                kind: BigEndian::read_u16(&ddr_buf[off + 6..off + 8]),
+            });
+        }
+        Ok(DriverDescriptorRecord {
+            signature: sig,
+            block_size: BigEndian::read_u16(&ddr_buf[2..4]),
+            block_count: BigEndian::read_u32(&ddr_buf[4..8]),
+            dev_type: BigEndian::read_u16(&ddr_buf[8..10]),
+            dev_id: BigEndian::read_u16(&ddr_buf[10..12]),
+            sb_data: BigEndian::read_u32(&ddr_buf[12..16]),
+            driver_count,
+            driver_info,
+        })
+    }
+}
+
 /// One entry in the DDR's `drDriverInfo` array (8 bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriverInfo {
@@ -194,36 +232,7 @@ impl Apm {
             .read_exact(&mut ddr_buf)
             .map_err(|e| PartitionError::InvalidApm(format!("cannot read DDR: {e}")))?;
 
-        let sig = BigEndian::read_u16(&ddr_buf[0..2]);
-        if sig != DDR_SIGNATURE {
-            return Err(PartitionError::InvalidApm(format!(
-                "bad DDR signature: 0x{sig:04X}"
-            )));
-        }
-
-        let driver_count = BigEndian::read_u16(&ddr_buf[16..18]);
-        let mut driver_info = Vec::with_capacity(driver_count as usize);
-        for i in 0..driver_count as usize {
-            let off = 18 + i * 8;
-            if off + 8 > ddr_buf.len() {
-                break;
-            }
-            driver_info.push(DriverInfo {
-                block: BigEndian::read_u32(&ddr_buf[off..off + 4]),
-                size: BigEndian::read_u16(&ddr_buf[off + 4..off + 6]),
-                kind: BigEndian::read_u16(&ddr_buf[off + 6..off + 8]),
-            });
-        }
-        let ddr = DriverDescriptorRecord {
-            signature: sig,
-            block_size: BigEndian::read_u16(&ddr_buf[2..4]),
-            block_count: BigEndian::read_u32(&ddr_buf[4..8]),
-            dev_type: BigEndian::read_u16(&ddr_buf[8..10]),
-            dev_id: BigEndian::read_u16(&ddr_buf[10..12]),
-            sb_data: BigEndian::read_u32(&ddr_buf[12..16]),
-            driver_count,
-            driver_info,
-        };
+        let ddr = DriverDescriptorRecord::parse(&ddr_buf)?;
 
         // Read first partition entry to get map_entries count
         let mut entry_buf = [0u8; 512];
@@ -398,6 +407,129 @@ impl Apm {
         }
 
         patched
+    }
+}
+
+// --- The old (pre-1986) "TS" partition map ----------------------------------
+
+const TS_SIGNATURE: u16 = 0x5453;
+/// Byte offset of the first old-map entry inside block 1.
+pub const TS_ENTRIES_OFFSET: usize = 2;
+/// Bytes per old-map entry: `pdStart`, `pdSize`, `pdFSID`, big-endian u32 each.
+pub const TS_ENTRY_SIZE: usize = 12;
+/// Entries that fit block 1 after the signature.
+pub const TS_MAX_ENTRIES: usize = (512 - TS_ENTRIES_OFFSET) / TS_ENTRY_SIZE;
+/// The file-system ID the old map gives an HFS volume (`hfsID` in Apple's SCSIEqu.a).
+pub const TS_HFS_ID: &str = "TFS1";
+
+/// One entry of the old partition map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TsEntry {
+    /// `pdStart`, in 512-byte blocks from the start of the disk.
+    pub start_block: u32,
+    /// `pdSize`, in 512-byte blocks.
+    pub block_count: u32,
+    /// `pdFSID`, four ASCII characters (`TFS1` for HFS).
+    pub fs_id: String,
+}
+
+impl TsEntry {
+    pub fn is_hfs(&self) -> bool {
+        self.fs_id.as_str() == TS_HFS_ID
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.block_count as u64 * 512
+    }
+}
+
+/// The pre-1986 Apple SCSI partition map: an `ER` DDR at block 0, a `TS` map at block 1.
+/// Layout per Inside Macintosh IV (SCSI Manager) and Linux 2.4 `fs/hfs/part_tbl.c`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsMap {
+    pub ddr: DriverDescriptorRecord,
+    pub entries: Vec<TsEntry>,
+}
+
+impl TsMap {
+    /// Cheap probe: `ER` at block 0 and `TS` at block 1.
+    pub fn detect(block0: &[u8], block1: &[u8]) -> bool {
+        block0.len() >= 2
+            && block1.len() >= 2
+            && BigEndian::read_u16(&block0[0..2]) == DDR_SIGNATURE
+            && BigEndian::read_u16(&block1[0..2]) == TS_SIGNATURE
+    }
+
+    /// Parse the two 512-byte blocks; entries end at an all-zero one or the block's end.
+    pub fn parse_blocks(block0: &[u8], block1: &[u8]) -> Result<Self, PartitionError> {
+        if block1.len() < 512 || !Self::detect(block0, block1) {
+            return Err(PartitionError::InvalidApm(
+                "no ER driver descriptor + TS partition map".into(),
+            ));
+        }
+        let ddr = DriverDescriptorRecord::parse(block0)?;
+        let mut entries = Vec::new();
+        for i in 0..TS_MAX_ENTRIES {
+            let off = TS_ENTRIES_OFFSET + i * TS_ENTRY_SIZE;
+            let raw = &block1[off..off + TS_ENTRY_SIZE];
+            if raw.iter().all(|&b| b == 0) {
+                break;
+            }
+            let start_block = BigEndian::read_u32(&raw[0..4]);
+            let block_count = BigEndian::read_u32(&raw[4..8]);
+            // A real entry sits past the DDR and the map, and has a size.
+            if start_block < 2 || block_count == 0 {
+                return Err(PartitionError::InvalidApm(format!(
+                    "TS map entry {i} has start {start_block}, size {block_count}"
+                )));
+            }
+            entries.push(TsEntry {
+                start_block,
+                block_count,
+                fs_id: parse_c_string(&raw[8..12]),
+            });
+        }
+        if entries.is_empty() {
+            return Err(PartitionError::InvalidApm("TS map has no entries".into()));
+        }
+        Ok(TsMap { ddr, entries })
+    }
+
+    /// Parse from the start of a disk.
+    pub fn parse(
+        reader: &mut (impl std::io::Read + std::io::Seek),
+    ) -> Result<Self, PartitionError> {
+        reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(PartitionError::Io)?;
+        let mut buf = [0u8; 1024];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| PartitionError::InvalidApm(format!("cannot read TS map: {e}")))?;
+        Self::parse_blocks(&buf[..512], &buf[512..])
+    }
+
+    /// Byte offset, from the start of the disk, of entry `index`'s `pdStart`.
+    pub fn entry_byte_offset(index: usize) -> usize {
+        512 + TS_ENTRIES_OFFSET + index * TS_ENTRY_SIZE
+    }
+
+    /// Blocks 0 and 1 of a fresh disk: an `ER` DDR for `block_count` blocks and a `TS` map.
+    pub fn build_blocks(block_count: u32, entries: &[TsEntry]) -> Vec<u8> {
+        let mut buf = vec![0u8; 1024];
+        BigEndian::write_u16(&mut buf[0..2], DDR_SIGNATURE);
+        BigEndian::write_u16(&mut buf[2..4], 512);
+        BigEndian::write_u32(&mut buf[4..8], block_count);
+        BigEndian::write_u16(&mut buf[512..514], TS_SIGNATURE);
+        for (i, e) in entries.iter().take(TS_MAX_ENTRIES).enumerate() {
+            let off = Self::entry_byte_offset(i);
+            BigEndian::write_u32(&mut buf[off..off + 4], e.start_block);
+            BigEndian::write_u32(&mut buf[off + 4..off + 8], e.block_count);
+            let id = e.fs_id.as_bytes();
+            let n = id.len().min(4);
+            buf[off + 8..off + 8 + n].copy_from_slice(&id[..n]);
+        }
+        buf
     }
 }
 
@@ -708,5 +840,71 @@ mod tests {
         assert_eq!(parsed.entries[1].partition_type, "Apple_HFS");
         assert_eq!(parsed.entries[1].start_block, 64);
         assert_eq!(parsed.entries[1].block_count, 100000);
+    }
+
+    /// The Manhole CD's blocks 0-1: one TFS1 entry at block 6 filling the disk.
+    fn manhole_blocks() -> Vec<u8> {
+        let hfs = TsEntry {
+            start_block: 6,
+            block_count: 0x1ef3a,
+            fs_id: TS_HFS_ID.into(),
+        };
+        TsMap::build_blocks(0x1ef40, &[hfs])
+    }
+
+    #[test]
+    fn ts_map_parses_the_manhole_layout() {
+        let blocks = manhole_blocks();
+        assert_eq!(
+            &blocks[512..528],
+            &[0x54, 0x53, 0, 0, 0, 6, 0, 1, 0xef, 0x3a, b'T', b'F', b'S', b'1', 0, 0]
+        );
+        let map = TsMap::parse(&mut Cursor::new(blocks)).unwrap();
+        assert_eq!(map.ddr.block_count, 0x1ef40);
+        assert_eq!(map.entries.len(), 1);
+        assert!(map.entries[0].is_hfs());
+        assert_eq!(map.entries[0].start_block, 6);
+        assert_eq!(map.entries[0].size_bytes(), 0x1ef3a * 512);
+    }
+
+    #[test]
+    fn ts_map_stops_at_the_zero_entry_and_keeps_order() {
+        let entries = vec![
+            TsEntry {
+                start_block: 64,
+                block_count: 1000,
+                fs_id: "TFS1".into(),
+            },
+            TsEntry {
+                start_block: 1064,
+                block_count: 500,
+                fs_id: "UNIX".into(),
+            },
+        ];
+        let mut blocks = TsMap::build_blocks(2000, &entries);
+        // Garbage after the terminator must not be read as a third entry.
+        let past = TsMap::entry_byte_offset(3);
+        blocks[past..past + 4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let map = TsMap::parse(&mut Cursor::new(blocks)).unwrap();
+        assert_eq!(map.entries, entries);
+    }
+
+    #[test]
+    fn ts_map_is_refused_without_er_or_with_bad_entries() {
+        let mut no_ddr = manhole_blocks();
+        no_ddr[0] = 0;
+        assert!(!TsMap::detect(&no_ddr[..512], &no_ddr[512..]));
+        assert!(TsMap::parse(&mut Cursor::new(no_ddr)).is_err());
+        assert!(TsMap::parse(&mut Cursor::new(TsMap::build_blocks(100, &[]))).is_err());
+        let bad = TsEntry {
+            start_block: 1,
+            block_count: 10,
+            fs_id: "TFS1".into(),
+        };
+        let blocks = TsMap::build_blocks(100, &[bad]);
+        assert!(TsMap::parse(&mut Cursor::new(blocks)).is_err());
+        // A PM map is not a TS map, and the APM parser rejects a TS map.
+        let manhole = manhole_blocks();
+        assert!(Apm::parse(&mut Cursor::new(manhole)).is_err());
     }
 }

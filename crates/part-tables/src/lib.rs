@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `mbr` | [`mbr`] | PC MBR, with EBR logical partitions |
 //! | `gpt` | [`gpt`] | GUID Partition Table |
-//! | `apm` | [`apm`] | Apple Partition Map |
+//! | `apm` | [`apm`] | Apple Partition Map, and the pre-1986 `TS` map |
 //! | `bsd` | [`bsd`] | BSD disklabel |
 //! | `sun` | [`sun`] | Sun (SPARC) VTOC label |
 //! | `sgi` | [`sgi`], [`sgi_dklabel`] | SGI volume header, IRIS 3000 disk label |
