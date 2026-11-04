@@ -52,9 +52,12 @@ use crate::controller::app::{DiskDevice, RecentMode};
 mod ask;
 mod backup;
 mod commander;
+mod dialogs;
 mod explorer;
 mod inspect;
+mod resize;
 mod restore;
+mod table_edit;
 mod writer;
 
 use backup::BackupState;
@@ -6665,6 +6668,291 @@ mod tests {
         ikey(&mut app, KeyCode::Char('?'));
         let text = backup_screen(&app);
         assert!(text.contains("Calc min"), "{text}");
+    }
+
+    /// Move the table editor's cursor to `row` with the arrow keys.
+    fn table_cursor_to(app: &mut App, row: table_edit::TRow) {
+        for _ in 0..64 {
+            if app.inspect.as_ref().unwrap().twin.sel == row {
+                return;
+            }
+            ikey(app, KeyCode::Up);
+        }
+        panic!("the editor has no row {row:?}");
+    }
+
+    /// Clear a picker's prefilled path and confirm `path`.
+    fn pick_path(app: &mut App, path: &std::path::Path) {
+        assert!(app.inspect.as_ref().unwrap().picker_open());
+        for _ in 0..400 {
+            ikey(app, KeyCode::Backspace);
+        }
+        ikeys(app, path.display().to_string().as_str());
+        ikey(app, KeyCode::Enter);
+    }
+
+    /// Add Partition fills the free gap; the type is typed and stepped through the catalog, a
+    /// delete is undone, and Validate + Apply write the table, which the grid reads again.
+    #[test]
+    fn the_inspect_table_editor_adds_a_partition_and_applies() {
+        use table_edit::TRow;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = crate::controller::test_fixtures::mbr_with_gap(dir.path());
+        let mut app = inspect_on(&img);
+        assert_eq!(app.inspect.as_ref().unwrap().ctl.partitions().len(), 1);
+        ikey(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.key_context().0, "Inspect - partition table");
+        let s = app.inspect.as_ref().unwrap();
+        assert_eq!(s.twin.sel, TRow::Add);
+        let v = s.ctl.table_editor().expect("the editor is open");
+        assert!(!v.add_start.is_empty() && v.add_type == "83");
+        ikey(&mut app, KeyCode::Enter);
+        let view = |app: &App| app.inspect.as_ref().unwrap().ctl.table_editor().unwrap();
+        assert_eq!(view(&app).rows.len(), 2);
+
+        table_cursor_to(&mut app, TRow::Type(0));
+        ikey(&mut app, KeyCode::Backspace);
+        ikey(&mut app, KeyCode::Backspace);
+        ikeys(&mut app, "0E");
+        assert_eq!(view(&app).rows[0].type_text, "0E");
+        ikey(&mut app, KeyCode::Right);
+        let stepped = view(&app).rows[0].type_text.clone();
+        assert_ne!(stepped, "0E", "Right steps through the catalog");
+        ikey(&mut app, KeyCode::Left);
+        assert_eq!(view(&app).rows[0].type_text, "0E");
+        table_cursor_to(&mut app, TRow::Mode(0));
+        ikey(&mut app, KeyCode::Char(' '));
+        assert_ne!(
+            view(&app).rows[0].size_mode,
+            crate::controller::partition_edit::SizeMode::Original
+        );
+        while view(&app).rows[0].size_mode != crate::controller::partition_edit::SizeMode::Original
+        {
+            ikey(&mut app, KeyCode::Right);
+        }
+        table_cursor_to(&mut app, TRow::Part(1));
+        ikey(&mut app, KeyCode::Delete);
+        assert!(view(&app).rows[1].deleted);
+        ikey(&mut app, KeyCode::Char('x'));
+        assert!(!view(&app).rows[1].deleted);
+
+        ikey(&mut app, KeyCode::Char('v'));
+        let v = view(&app);
+        assert!(v.errors.is_empty() && v.can_apply, "{:?}", v.errors);
+        ikey(&mut app, KeyCode::Char('w'));
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert_eq!(s.ctl.partitions().len(), 2, "{:?}", s.log);
+        assert!(s
+            .log
+            .iter()
+            .any(|l| l == "Partition table updated successfully."));
+        let mbr = std::fs::read(&img).unwrap();
+        assert_eq!(mbr[0x1BE + 4], 0x0E);
+        assert_eq!(mbr[0x1CE + 4], 0x83);
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().dialog_open());
+        assert_eq!(app.key_context().0, "Inspect - partitions");
+    }
+
+    /// Resize Partitions shrinks an EFS partition: Custom size typed, Preview, Apply, and the grid
+    /// is read again after the write.
+    #[test]
+    fn the_inspect_resize_window_previews_and_shrinks_a_partition() {
+        use crate::controller::partition_edit::SizeMode;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = crate::controller::test_fixtures::sgi_efs_disk(dir.path());
+        let mut app = inspect_on(&img);
+        ikey(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.key_context().0, "Inspect - resize");
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.resize.is_open() && !s.resize.is_device());
+        let efs = s
+            .resize
+            .rows()
+            .iter()
+            .position(|r| r.type_name.contains("EFS"))
+            .expect("an EFS row");
+        while app.inspect.as_ref().unwrap().rwin.sel != resize::RRow::Mode(efs) {
+            ikey(&mut app, KeyCode::Down);
+        }
+        while app.inspect.as_ref().unwrap().resize.rows()[efs].mode != SizeMode::Custom {
+            ikey(&mut app, KeyCode::Right);
+        }
+        ikey(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.inspect.as_ref().unwrap().rwin.sel,
+            resize::RRow::Size(efs)
+        );
+        for _ in 0..12 {
+            ikey(&mut app, KeyCode::Backspace);
+        }
+        ikeys(&mut app, "32");
+        ikey(&mut app, KeyCode::Char('w'));
+        assert!(
+            !app.inspect.as_ref().unwrap().resize.is_running(),
+            "Apply waits for Preview"
+        );
+        ikey(&mut app, KeyCode::Char('p'));
+        let s = app.inspect.as_ref().unwrap();
+        assert!(
+            s.resize.preview().is_some() && s.resize.can_apply(),
+            "{:?}",
+            s.resize.plan_error()
+        );
+        let text = backup_screen(&app);
+        assert!(text.contains("Resize Partitions"), "{text}");
+        ikey(&mut app, KeyCode::Char('w'));
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(
+            s.log
+                .iter()
+                .any(|l| l.starts_with("Partition resize completed successfully")),
+            "{:?}",
+            s.log
+        );
+        assert_eq!(std::fs::metadata(&img).unwrap().len() >> 20, 34);
+        let part = s
+            .ctl
+            .partitions()
+            .iter()
+            .find(|p| p.type_name.contains("EFS"))
+            .expect("the EFS row after the re-read");
+        assert_eq!(part.size_bytes, 32 << 20);
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().resize.is_open());
+    }
+
+    /// Resize Alto Disk, Expand HFS Volume and Convert Floppy Container, each from its key on
+    /// the grid through its controller's window and Save As picker.
+    #[test]
+    fn the_inspect_dialogs_resize_alto_expand_hfs_and_convert_a_floppy() {
+        use crate::controller::alto_resize::AltoTarget;
+        use crate::controller::floppy_convert::FloppyTarget;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fx = crate::controller::test_fixtures::alto_pack(dir.path());
+        let mut app = inspect_on(&fx);
+        ikey(&mut app, KeyCode::Char('A'));
+        inspect_settle(&mut app);
+        assert_eq!(app.key_context().0, "Inspect - resize Alto");
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.alto.summary_line().is_some() && s.alto.can_save());
+        while app.inspect.as_ref().unwrap().alto.target() != AltoTarget::Diablo44 {
+            ikey(&mut app, KeyCode::Right);
+        }
+        ikey(&mut app, KeyCode::Enter);
+        ikey(&mut app, KeyCode::Enter);
+        let out = dir.path().join("big.pdi");
+        pick_path(&mut app, &out);
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(
+            matches!(s.alto.result(), Some(Ok(_))),
+            "{:?}",
+            s.alto.result()
+        );
+        assert!(std::fs::metadata(&out).unwrap().len() > std::fs::metadata(&fx).unwrap().len());
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().alto.is_open());
+
+        let hfv = crate::controller::test_fixtures::hfs_volume(dir.path());
+        let mut app = inspect_on(&hfv);
+        ikey(&mut app, KeyCode::Char('H'));
+        inspect_settle(&mut app);
+        assert_eq!(app.key_context().0, "Inspect - expand HFS");
+        let s = app.inspect.as_ref().unwrap();
+        assert!(s.hfs.flat_hfv() && s.hfs.size_mib() == 4);
+        ikey(&mut app, KeyCode::Down);
+        ikey(&mut app, KeyCode::Down);
+        ikeys(&mut app, "8");
+        ikey(&mut app, KeyCode::Enter);
+        assert_eq!(app.inspect.as_ref().unwrap().hfs.size_mib(), 8);
+        ikey(&mut app, KeyCode::Enter);
+        let big = dir.path().join("big.hfv");
+        pick_path(&mut app, &big);
+        assert_eq!(
+            app.inspect.as_ref().unwrap().hfs.output(),
+            Some(big.as_path())
+        );
+        ikey(&mut app, KeyCode::Char('s'));
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert_eq!(s.hfs.outcome(), Some(&Ok(())), "{:?}", s.hfs.lines());
+        let len = std::fs::metadata(&big).unwrap().len();
+        assert!(len > 7 << 20 && len <= 8 << 20, "{len}");
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().hfs.is_open());
+
+        let xdf = crate::controller::test_fixtures::blank_xdf(dir.path());
+        let mut app = inspect_on(&xdf);
+        ikey(&mut app, KeyCode::Char('f'));
+        inspect_settle(&mut app);
+        assert_eq!(app.key_context().0, "Inspect - convert floppy");
+        assert!(app.inspect.as_ref().unwrap().floppy.source_kind().is_some());
+        ikey(&mut app, KeyCode::Down);
+        while app.inspect.as_ref().unwrap().floppy.target() != FloppyTarget::Hdm {
+            ikey(&mut app, KeyCode::Right);
+        }
+        ikey(&mut app, KeyCode::Down);
+        ikey(&mut app, KeyCode::Enter);
+        let hdm = dir.path().join("out.hdm");
+        pick_path(&mut app, &hdm);
+        ikey(&mut app, KeyCode::Down);
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        let s = app.inspect.as_ref().unwrap();
+        assert!(
+            matches!(s.floppy.outcome(), Some(Ok(_))),
+            "{:?}",
+            s.floppy.outcome().map(|o| o.is_ok())
+        );
+        assert!(hdm.exists());
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().floppy.is_open());
+    }
+
+    /// The new keys refuse a source they do not apply to, and the dialogs draw in 80x24.
+    #[test]
+    fn the_inspect_dialogs_refuse_what_does_not_apply_and_draw_in_a_small_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = crate::controller::commander::blank_fat_image(dir.path());
+        let mut app = inspect_on(&img);
+        for k in ['t', 'a', 's'] {
+            ikey(&mut app, KeyCode::Char(k));
+            assert!(inspect_note(&app).contains("does not apply"), "{k}");
+        }
+        ikey(&mut app, KeyCode::Char('H'));
+        assert!(inspect_note(&app).contains("classic HFS"));
+        ikey(&mut app, KeyCode::Char('A'));
+        assert!(inspect_note(&app).contains("Alto"));
+        ikey(&mut app, KeyCode::Char('f'));
+        assert!(inspect_note(&app).contains("XDF"));
+        assert!(!app.inspect.as_ref().unwrap().dialog_open());
+
+        let gap = crate::controller::test_fixtures::mbr_with_gap(dir.path());
+        let mut app = inspect_on(&gap);
+        let text = backup_screen(&app);
+        assert!(
+            text.contains("t edit table") || text.contains("Tools:"),
+            "{text}"
+        );
+        ikey(&mut app, KeyCode::Char('t'));
+        let text = backup_screen(&app);
+        assert!(text.contains("Edit Partition Table"), "{text}");
+        ikey(&mut app, KeyCode::Char('?'));
+        let text = backup_screen(&app);
+        assert!(text.contains("Validate"), "{text}");
+        ikey(&mut app, KeyCode::Esc);
+        ikey(&mut app, KeyCode::Esc);
+        ikey(&mut app, KeyCode::Char('s'));
+        let text = backup_screen(&app);
+        assert!(
+            text.contains("Resize Partitions") && text.contains("Preview"),
+            "{text}"
+        );
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().dialog_open());
     }
 
     /// Walk the wizard's class list to a given class the way the arrow keys do.

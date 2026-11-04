@@ -8,8 +8,10 @@
 //! disk, per partition, HFV, the CHD estimate) with Physical Disk Export (the shared writer
 //! window), the remote Back Up Image, and Browse (the Explorer). A disk opens through the
 //! controller, which elevates as the GUI does (macOS shows its administrator dialog); when that
-//! open fails the table is read again without elevation and listed read-only.
-//! See docs/phase2_commander_plan.md § "Slice 26".
+//! open fails the table is read again without elevation and listed read-only. The GUI's Inspect
+//! dialogs open over the grid: Edit Partition Table and Add Partition (`table_edit.rs`), Resize
+//! Partitions (`resize.rs`), and Resize Alto Disk, Expand HFS Volume and Convert Floppy Container
+//! (`dialogs.rs`). See docs/phase2_commander_plan.md § "Slice 26" and § "Slice 27".
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +24,14 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::ask::Ask;
+use super::dialogs::{
+    DRow, DialogKey, DialogWindow, HINTS_ALTO_RESIZE, HINTS_EXPAND_HFS, HINTS_FLOPPY_CONVERT,
+};
+use super::resize::{ResizeKey, ResizeWindow, HINTS_RESIZE};
+use super::table_edit::{TableKey, TableWindow, HINTS_TABLE_EDIT};
 use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
 use super::{centered_rect, hint, App, FilePicker, KeyHint, PartRow, PickKind, PickResult};
+use crate::controller::alto_resize::{AltoResizeAction, AltoResizeController};
 #[cfg(feature = "chd")]
 use crate::controller::app::chd::{
     codec_choices, codec_label, hunk_presets, modes_for, unit_size_for, ChdOptionsControl,
@@ -31,6 +39,8 @@ use crate::controller::app::chd::{
 };
 use crate::controller::app::{DiskDevice, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
+use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
+use crate::controller::floppy_convert::{FloppyConvertAction, FloppyConvertController};
 use crate::controller::inspect::{
     expand_image_bytes, format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile,
     ExportFormat, HostRequest, InspectAction, InspectController, InspectServices, InspectSource,
@@ -39,6 +49,7 @@ use crate::controller::inspect::{
 };
 #[cfg(feature = "remote")]
 use crate::controller::remote_pick::{RemotePickAction, RemotePickController};
+use crate::controller::resize::{ResizeAction, ResizeController};
 use crate::controller::{Controller as _, Effect, PickSpec};
 
 /// Which controller asked a question.
@@ -48,6 +59,10 @@ pub(super) enum Who {
     Inspect,
     Writer,
     Remote,
+    Resize,
+    Alto,
+    Hfs,
+    Floppy,
 }
 
 /// A window of the screen's own, drawn over the grid.
@@ -74,10 +89,10 @@ pub(super) enum ERow {
     Physical,
 }
 
-/// What a confirmed picker answers.
+/// What a confirmed picker answers: the controller that asked, or the writer's image field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pick {
-    Inspect(&'static str),
+    Of(Who, &'static str),
     WriterImage,
 }
 
@@ -96,6 +111,12 @@ pub(super) const HINTS_INSPECT_SOURCE: &[KeyHint] = &[
     hint("i", "CHD Info"),
     hint("u", "Back up the remote image to a folder"),
     hint("R", "Remote: connect, or pick another remote image"),
+    hint("t", "Edit Partition Table"),
+    hint("a", "Add Partition into the largest free gap"),
+    hint("s", "Resize Partitions"),
+    hint("H", "Expand HFS Volume (APM disk or flat HFV)"),
+    hint("A", "Resize Alto Disk (Diablo 31 / 44)"),
+    hint("f", "Convert Floppy Container (XDF / HDM / DIM / D88)"),
     hint("o", "Open another image, backup folder or Clonezilla image"),
     hint("Esc", "Close the source (cancels a running export first)"),
 ];
@@ -133,6 +154,16 @@ pub(super) struct InspectState {
     pub(super) remote: RemotePickController,
     #[cfg_attr(not(feature = "remote"), allow(dead_code))]
     remote_sel: usize,
+    /// The Inspect dialogs' controllers and their windows' cursors.
+    pub(super) resize: ResizeController,
+    pub(super) rwin: ResizeWindow,
+    pub(super) twin: TableWindow,
+    pub(super) alto: AltoResizeController,
+    pub(super) hfs: ExpandHfsController,
+    pub(super) floppy: FloppyConvertController,
+    pub(super) dwin: DialogWindow,
+    /// Add Partition applies (refreshed after every action; the check reads the disk size).
+    can_add: bool,
     /// The disk's facts for the header, when the source came from the disk list.
     pub(super) disk: Option<Box<DiskDevice>>,
     /// A disk's rows read without elevation, after the controller's open failed.
@@ -182,6 +213,14 @@ impl InspectState {
             #[cfg(feature = "remote")]
             remote: RemotePickController::new(Arc::new(NoNotify)),
             remote_sel: 0,
+            resize: ResizeController::new(Arc::new(NoNotify)),
+            rwin: ResizeWindow::default(),
+            twin: TableWindow::default(),
+            alto: AltoResizeController::new(Arc::new(NoNotify)),
+            hfs: ExpandHfsController::new(Arc::new(NoNotify)),
+            floppy: FloppyConvertController::new(Arc::new(NoNotify)),
+            dwin: DialogWindow::default(),
+            can_add: false,
             disk: None,
             plain: None,
             plain_for: None,
@@ -234,6 +273,13 @@ impl InspectState {
             || !self.ctl.browse_jobs().is_empty()
             || self.writer.is_writing()
             || self.writer.opening().is_some()
+            || self.ctl.summarizing_hfs()
+            || self.resize.is_running()
+            || self.alto.opening().is_some()
+            || self.alto.is_writing()
+            || self.hfs.is_running()
+            || self.floppy.probing()
+            || self.floppy.is_running()
             || remote
     }
 
@@ -257,16 +303,40 @@ impl InspectState {
         self.after();
     }
 
+    pub(super) fn zact(&mut self, action: ResizeAction) {
+        let fx = self.resize.apply(action);
+        self.absorb(Who::Resize, fx);
+        self.after();
+    }
+
+    pub(super) fn aact(&mut self, action: AltoResizeAction) {
+        let fx = self.alto.apply(action);
+        self.absorb(Who::Alto, fx);
+        self.after();
+    }
+
+    pub(super) fn hact(&mut self, action: ExpandHfsAction) {
+        let fx = self.hfs.apply(action);
+        self.absorb(Who::Hfs, fx);
+        self.after();
+    }
+
+    pub(super) fn fact(&mut self, action: FloppyConvertAction) {
+        let fx = self.floppy.apply(action);
+        self.absorb(Who::Floppy, fx);
+        self.after();
+    }
+
     /// Turn the controllers' effects into the screen's pickers and questions.
     fn absorb(&mut self, who: Who, fx: Vec<Effect>) {
         for e in fx {
             match e {
-                Effect::PickFile(spec) => self.open_picker(spec, false),
-                Effect::PickFolder(spec) => self.open_picker(spec, true),
+                Effect::PickFile(spec) => self.open_picker(who, spec, false),
+                Effect::PickFolder(spec) => self.open_picker(who, spec, true),
                 Effect::Confirm(spec) => self.ask = Some(Ask::Confirm(who, spec)),
                 Effect::AskText(spec) => self.ask = Some(Ask::text(who, spec)),
                 Effect::Message(msg) => self.log.push(msg),
-                // None of the three controllers asks for these.
+                // None of the screen's controllers asks for these.
                 Effect::AskPassword(_)
                 | Effect::Choose(_)
                 | Effect::OpenUrl(_)
@@ -277,7 +347,7 @@ impl InspectState {
         }
     }
 
-    fn open_picker(&mut self, spec: PickSpec, folder: bool) {
+    fn open_picker(&mut self, who: Who, spec: PickSpec, folder: bool) {
         let kind = if folder {
             PickKind::Dir
         } else if spec.save {
@@ -297,7 +367,7 @@ impl InspectState {
                 .unwrap_or_default();
             p.input = dir.join(spec.file_name.as_str()).display().to_string();
         }
-        self.picker = Some((Pick::Inspect(spec.purpose), p));
+        self.picker = Some((Pick::Of(who, spec.purpose), p));
     }
 
     /// Carry out the controllers' requests and keep their latest log lines.
@@ -323,8 +393,10 @@ impl InspectState {
                 }
                 // No other TUI screen shares the backup folder.
                 HostRequest::BackupClosed => {}
-                HostRequest::ExpandHfs(_) => {
-                    self.note = Some("Expand HFS is not in the terminal yet.".to_string())
+                HostRequest::ExpandHfs(source) => {
+                    let fx = self.hfs.apply(ExpandHfsAction::Open(*source));
+                    self.absorb(Who::Hfs, fx);
+                    self.dwin.reset(DRow::HfsFormat);
                 }
             }
         }
@@ -344,11 +416,20 @@ impl InspectState {
                 self.absorb(Who::Inspect, fx);
             }
         }
+        // A resize rewrote the table under the grid: read it again.
+        if self.resize.take_disk_changed() {
+            let fx = self.ctl.apply(InspectAction::DiskChanged);
+            self.absorb(Who::Inspect, fx);
+        }
         let lines: Vec<String> = self
             .ctl
             .take_log()
             .into_iter()
             .chain(self.writer.take_log())
+            .chain(self.resize.take_log())
+            .chain(self.alto.take_log())
+            .chain(self.hfs.take_log())
+            .chain(self.floppy.take_log())
             .map(|(_, msg)| msg)
             .collect();
         self.log.extend(lines);
@@ -358,6 +439,7 @@ impl InspectState {
         }
         let rows = self.row_count();
         self.sel = self.sel.min(rows.saturating_sub(1));
+        self.can_add = self.ctl.can_add_partition();
     }
 
     /// The Explorer's title for the selected partition.
@@ -393,6 +475,28 @@ impl InspectState {
         self.ctl.partitions().get(self.sel).map(|p| p.index)
     }
 
+    /// A picker's answer, to the controller that asked; a cancel is `None`.
+    fn picked(&mut self, pick: Pick, path: Option<PathBuf>) {
+        match pick {
+            Pick::Of(Who::Inspect, purpose) => self.act(InspectAction::Picked { purpose, path }),
+            Pick::Of(Who::Alto, purpose) => self.aact(AltoResizeAction::Picked { purpose, path }),
+            Pick::Of(Who::Hfs, purpose) => self.hact(ExpandHfsAction::Picked { purpose, path }),
+            Pick::Of(Who::Floppy, purpose) => {
+                self.fact(FloppyConvertAction::Picked { purpose, path })
+            }
+            // The writer, the remote picker and Resize ask for no file.
+            Pick::Of(Who::Writer, _) | Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
+            Pick::WriterImage => {
+                if let Some(path) = path {
+                    self.win.image = path.display().to_string();
+                    if let Some(a) = self.win.image_target() {
+                        self.wact(a);
+                    }
+                }
+            }
+        }
+    }
+
     /// Answer the open question.
     fn answer(&mut self, yes: bool, text: Option<String>) {
         let Some(ask) = self.ask.take() else {
@@ -424,8 +528,13 @@ impl InspectState {
                 purpose: spec.purpose,
                 text,
             }),
-            // The Inspect controller asks no text; the remote picker asks no y / n.
-            Ask::Text { .. } | Ask::Confirm(Who::Remote, _) => {}
+            // The Inspect controller asks no text; the others ask no y / n.
+            Ask::Text { .. }
+            | Ask::Confirm(Who::Remote, _)
+            | Ask::Confirm(Who::Resize, _)
+            | Ask::Confirm(Who::Alto, _)
+            | Ask::Confirm(Who::Hfs, _)
+            | Ask::Confirm(Who::Floppy, _) => {}
         }
     }
 
@@ -753,6 +862,81 @@ impl InspectState {
         }
     }
 
+    // --- the Inspect dialogs -------------------------------------------------------------
+
+    fn table_key(&mut self, code: KeyCode) {
+        let Some(view) = self.ctl.table_editor() else {
+            return;
+        };
+        match self.twin.key(&view, code) {
+            TableKey::Done => {}
+            TableKey::Edit(edit) => self.act(InspectAction::Table(edit)),
+            TableKey::Apply if view.can_apply => self.act(InspectAction::ApplyTableEdits),
+            TableKey::Apply => {}
+            TableKey::Close => self.act(InspectAction::CloseEditor),
+        }
+        if let Some(view) = self.ctl.table_editor() {
+            self.twin.settle(&view);
+        }
+    }
+
+    fn resize_key(&mut self, code: KeyCode) {
+        match self.rwin.key(&self.resize, code) {
+            ResizeKey::Done => {}
+            ResizeKey::Act(a) => self.zact(a),
+        }
+        self.rwin.settle(&self.resize);
+    }
+
+    /// A key in whichever of the small dialogs is up.
+    fn dialog_key(&mut self, code: KeyCode) {
+        let key = if self.hfs.is_open() {
+            self.dwin.hfs_key(&self.hfs, code)
+        } else if self.alto.is_open() {
+            self.dwin.alto_key(&self.alto, code)
+        } else {
+            self.dwin.floppy_key(&self.floppy, code)
+        };
+        match key {
+            DialogKey::Done => {}
+            DialogKey::Alto(a) => self.aact(a),
+            DialogKey::Hfs(a) => self.hact(a),
+            DialogKey::Floppy(a) => self.fact(a),
+        }
+    }
+
+    /// The table editor's cursor is on a free-text field, where `?` is a character.
+    fn typing(&self) -> bool {
+        use super::table_edit::TRow;
+        self.ctl.editor_open() && matches!(self.twin.sel, TRow::Type(_) | TRow::AddType)
+    }
+
+    /// A dialog of the screen's own is up over the grid.
+    pub(super) fn dialog_open(&self) -> bool {
+        self.ctl.editor_open()
+            || self.resize.is_open()
+            || self.alto.is_open()
+            || self.hfs.is_open()
+            || self.floppy.is_open()
+    }
+
+    fn open_table_editor(&mut self, add: bool) {
+        self.twin = TableWindow::default();
+        if add {
+            self.act(InspectAction::AddPartition);
+            self.twin.sel = super::table_edit::TRow::Add;
+        } else {
+            self.act(InspectAction::EditTable);
+        }
+    }
+
+    fn open_resize(&mut self) {
+        if let Some(plan) = self.ctl.resize_plan() {
+            self.zact(ResizeAction::Open(Box::new(plan)));
+            self.rwin.reset(&self.resize);
+        }
+    }
+
     // --- the grid -----------------------------------------------------------------------
 
     /// One key on the grid; `false` lets it fall through (tab switching, quit, open).
@@ -836,8 +1020,43 @@ impl InspectState {
                 self.act(InspectAction::BackupRemote)
             }
             KeyCode::Char('R') if InspectController::remote_available() => self.open_remote(),
+            KeyCode::Char('t') if self.ctl.can_edit_table() => self.open_table_editor(false),
+            KeyCode::Char('a') if self.ctl.can_edit_table() => {
+                if self.ctl.can_add_partition() {
+                    self.open_table_editor(true);
+                } else {
+                    self.note = Some(self.ctl.add_partition_hint());
+                }
+            }
+            KeyCode::Char('s') if self.ctl.can_edit_table() && !self.resize.is_running() => {
+                self.open_resize()
+            }
+            KeyCode::Char('H') => match (self.selected(), actions) {
+                (Some(i), Some(a)) if a.expand_hfs => self.act(InspectAction::ExpandHfs(i)),
+                _ => self.note = Some("Expand HFS takes a classic HFS partition.".into()),
+            },
+            KeyCode::Char('A') => match actions {
+                Some(a) if a.resize_alto => match self.ctl.alto_resize_source() {
+                    Ok(path) => {
+                        self.dwin.reset(DRow::AltoTarget);
+                        self.aact(AltoResizeAction::Open(path));
+                    }
+                    Err(e) => self.note = Some(e),
+                },
+                _ => self.note = Some("Resize Alto Disk takes an Alto pack image.".into()),
+            },
+            KeyCode::Char('f') => match self.ctl.floppy_convert_source() {
+                Some(path) => {
+                    self.dwin.reset(DRow::FloppySource);
+                    self.fact(FloppyConvertAction::Open(Some(path)));
+                }
+                None => {
+                    self.note =
+                        Some("Convert Floppy Container takes an XDF, HDM, DIM or D88 image.".into())
+                }
+            },
             // A tool that does not apply here says so rather than reaching the disk list's keys.
-            KeyCode::Char(c) if "rexBwiuR".contains(c) => {
+            KeyCode::Char(c) if "rexBwiuRtas".contains(c) => {
                 self.note = Some("That tool does not apply to this source.".into())
             }
             KeyCode::Esc => {
@@ -870,6 +1089,21 @@ impl App {
         if s.ctl.fsck_view().is_some() || s.ctl.chd_info_text().is_some() {
             return Some(("Inspect - window", HINTS_INSPECT_WINDOW));
         }
+        if s.ctl.editor_open() {
+            return Some(("Inspect - partition table", HINTS_TABLE_EDIT));
+        }
+        if s.resize.is_open() {
+            return Some(("Inspect - resize", HINTS_RESIZE));
+        }
+        if s.hfs.is_open() {
+            return Some(("Inspect - expand HFS", HINTS_EXPAND_HFS));
+        }
+        if s.alto.is_open() {
+            return Some(("Inspect - resize Alto", HINTS_ALTO_RESIZE));
+        }
+        if s.floppy.is_open() {
+            return Some(("Inspect - convert floppy", HINTS_FLOPPY_CONVERT));
+        }
         s.source_open()
             .then_some(("Inspect - partitions", HINTS_INSPECT_SOURCE))
     }
@@ -900,6 +1134,15 @@ impl App {
         }
         if s.window.is_some() || s.ctl.fsck_view().is_some() || s.ctl.chd_info_text().is_some() {
             return Some(vec![("Enter", "Act"), ("Esc", "Close"), ("?", "Keys")]);
+        }
+        if s.dialog_open() {
+            return Some(vec![
+                ("Up/Dn", "Row"),
+                ("<-/->", "Change"),
+                ("Enter", "Act"),
+                ("Esc", "Close"),
+                ("?", "Keys"),
+            ]);
         }
         if !s.source_open() {
             return None;
@@ -981,27 +1224,11 @@ impl App {
             match picker.handle_key(code) {
                 Some(PickResult::Cancel) => {
                     s.picker = None;
-                    if let Pick::Inspect(purpose) = pick {
-                        s.act(InspectAction::Picked {
-                            purpose,
-                            path: None,
-                        });
-                    }
+                    s.picked(pick, None);
                 }
                 Some(PickResult::Confirm(path)) => {
                     s.picker = None;
-                    match pick {
-                        Pick::Inspect(purpose) => s.act(InspectAction::Picked {
-                            purpose,
-                            path: Some(path),
-                        }),
-                        Pick::WriterImage => {
-                            s.win.image = path.display().to_string();
-                            if let Some(a) = s.win.image_target() {
-                                s.wact(a);
-                            }
-                        }
-                    }
+                    s.picked(pick, Some(path));
                 }
                 None => {}
             }
@@ -1026,6 +1253,10 @@ impl App {
                 _ => {}
             }
             return true;
+        }
+        // `?` and F1 reach the key list from every window, unless `?` is typed into a field.
+        if code == KeyCode::F(1) || (code == KeyCode::Char('?') && !s.typing()) {
+            return false;
         }
         if s.writer.is_open() {
             if s.writer.is_writing() {
@@ -1079,6 +1310,21 @@ impl App {
             s.chd_info_key(code);
             return true;
         }
+        if s.ctl.editor_open() {
+            s.table_key(code);
+            self.after_inspect();
+            return true;
+        }
+        if s.resize.is_open() {
+            s.resize_key(code);
+            self.after_inspect();
+            return true;
+        }
+        if s.hfs.is_open() || s.alto.is_open() || s.floppy.is_open() {
+            s.dialog_key(code);
+            self.after_inspect();
+            return true;
+        }
         if !s.source_open() {
             // The disk list: only the remote window is the screen's own.
             if code == KeyCode::Char('R') && InspectController::remote_available() {
@@ -1111,6 +1357,14 @@ impl App {
             let fx = s.remote.tick();
             s.absorb(Who::Remote, fx);
         }
+        let fx = s.resize.tick();
+        s.absorb(Who::Resize, fx);
+        let fx = s.alto.tick();
+        s.absorb(Who::Alto, fx);
+        let fx = s.hfs.tick();
+        s.absorb(Who::Hfs, fx);
+        let fx = s.floppy.tick();
+        s.absorb(Who::Floppy, fx);
         s.after();
         if s.writing && !s.writer.is_writing() {
             s.writing = false;
@@ -1265,8 +1519,26 @@ impl App {
                 popup,
             );
         }
+        if let Some(view) = s.ctl.table_editor() {
+            self.draw_table_editor(frame, area, &view, &s.twin);
+        }
+        if s.resize.is_open() {
+            self.draw_resize(frame, area, &s.resize, &s.rwin);
+        }
+        if s.alto.is_open() {
+            self.draw_alto_resize(frame, area, &s.alto, &s.dwin);
+        }
+        if s.hfs.is_open() {
+            self.draw_expand_hfs(frame, area, &s.hfs, &s.dwin);
+        }
+        if s.floppy.is_open() {
+            self.draw_floppy_convert(frame, area, &s.floppy, &s.dwin);
+        }
         if s.writer.is_open() {
             self.draw_writer(frame, area, "Physical Disk Export", &s.writer, &s.win);
+        }
+        if let Some(snap) = s.resize.progress() {
+            self.draw_job_box(frame, area, "Resizing (Esc asks to cancel)", &snap);
         }
         for snap in s.ctl.tool_jobs() {
             self.draw_job_box(frame, area, snap.label.as_str(), &snap);
@@ -1408,6 +1680,9 @@ impl App {
         }
         if c.remote_backup_running() {
             lines.push(Line::styled("Backing up the remote image...", pal.dim()));
+        }
+        if c.summarizing_hfs() {
+            lines.push(Line::styled("Reading the HFS volume...", pal.dim()));
         }
         lines.push(Line::raw(""));
         for msg in &s.log {
@@ -1572,6 +1847,12 @@ impl App {
         if a.defragment {
             keys.push("d defragment");
         }
+        if a.expand_hfs {
+            keys.push("H expand HFS");
+        }
+        if a.resize_alto {
+            keys.push("A resize Alto");
+        }
         if !keys.is_empty() {
             out.push_str(&keys.join("  "));
         }
@@ -1593,6 +1874,18 @@ impl App {
         }
         if c.can_make_bootable() {
             keys.push("B make bootable");
+        }
+        if c.can_edit_table() {
+            keys.push("t edit table");
+        }
+        if s.can_add {
+            keys.push("a add partition");
+        }
+        if c.can_edit_table() && !s.resize.is_running() {
+            keys.push("s resize");
+        }
+        if c.floppy_convert_source().is_some() {
+            keys.push("f convert floppy");
         }
         if c.table_summary().is_some_and(|t| t.byte_order.is_some()) {
             keys.push("w swap words");
@@ -1947,7 +2240,7 @@ impl App {
     fn draw_inspect_remote(&self, _frame: &mut Frame, _area: Rect, _s: &InspectState) {}
 
     /// A window over `area`, scrolled so the `focus` line shows.
-    fn draw_inspect_popup(
+    pub(super) fn draw_inspect_popup(
         &self,
         frame: &mut Frame,
         area: Rect,

@@ -34,6 +34,32 @@ pub fn mbr_with_gap(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// A 64 MiB IRIX disk: an SGI volume header and one EFS partition.
+pub fn sgi_efs_disk(dir: &std::path::Path) -> std::path::PathBuf {
+    use crate::partition::sgi_hdd_builder::{build_sgi_efs_hdd, SgiHddOptions};
+    let (img, _) = build_sgi_efs_hdd(&SgiHddOptions::new(64 << 20, "tui")).expect("SGI disk");
+    let path = dir.join("irix.img");
+    std::fs::write(&path, img).expect("write irix.img");
+    path
+}
+
+/// A blank Diablo 31 Alto pack saved as a PDI.
+pub fn alto_pack(dir: &std::path::Path) -> std::path::PathBuf {
+    let geometry = crate::model::alto_resize::AltoTarget::Diablo31.geometry();
+    let disk = fs_xerox::alto::write::create_blank(geometry).expect("blank Alto pack");
+    let path = dir.join("pack.pdi");
+    std::fs::write(&path, fs_xerox::alto::pdi::write(&disk)).expect("write pack.pdi");
+    path
+}
+
+/// A flat 4 MiB classic-HFS volume (a BasiliskII `.hfv`).
+pub fn hfs_volume(dir: &std::path::Path) -> std::path::PathBuf {
+    let bytes = fs_mac::hfs::create_blank_hfs(4 * MIB as u64, 4096, "Work").expect("blank HFS");
+    let path = dir.join("vol.hfv");
+    std::fs::write(&path, bytes).expect("write vol.hfv");
+    path
+}
+
 /// A blank 1.2 MB X68000 XDF floppy.
 pub fn blank_xdf(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("disk.xdf");
