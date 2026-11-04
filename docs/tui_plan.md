@@ -79,8 +79,10 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   prefills the palette (convert / resize / expand / partition table).
 - [x] **Command palette** — `:` runs any `rb-cli` verb (alt-screen suspended);
   also the execution path for the Explorer/Optical/Archives launchers.
-- [x] **Optical / Archives image ops** — `i` on Optical opens a browse/extract/
-  info/convert/new launcher; `c` on Archives prefills `archive create`.
+- [x] **Optical / Archives image ops** — `i` on Optical opened a browse/extract/
+  info/convert/new launcher (gone since Phase 2 slice 28: the Optical screen
+  converts, browses and shows CHD Info itself); `c` on Archives prefills
+  `archive create`.
 - [x] **Device targets** — Backup source *and* **Restore target** can be a
   physical disk (target-type chooser + destructive-write confirmation).
 - [x] **Settings** — `update::UpdateConfig` editor (two persisted toggles) plus

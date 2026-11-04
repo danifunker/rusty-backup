@@ -2143,7 +2143,96 @@ drives the same ones. The remote image picker came with slice 26.
 - Build Disk in the TUI: its own top-level section later (`docs/build_disk_plan.md`).
 - The layout bars are text lines (a terminal has no bar widget or hover help).
 - Resize's Cancel still only logs: `apply_resize` has no stop point (slice 15, as in the GUI).
-- TUI parity continues with Optical (convert, CHD rip, Browse Contents).
+- TUI parity continues with Optical (convert, CHD rip, Browse Contents): slice 28.
+
+## Slice 28: TUI Optical parity
+
+After slice 16 the TUI Optical screen ripped a local drive to ISO or BIN/CUE and its `i` menu
+pre-filled `rb-cli optical` command lines for everything else; Inspect reported an optical image
+it found but did not hand it over (slice 26 Left). The screen now drives the controller the egui
+Optical tab uses at its feature set, except the CD-DA player (GUI only: audio playback needs a
+desktop audio stack; not planned for the TUI).
+
+### Steps
+
+1. (0e6d6583) Controller lift, so both shells offer the same choices:
+   - `OpticalController::start_refusal` (no drive / image, the detect still running, an image
+     that does not open, the image's own format, CHD without the `chd` feature, no output),
+     `start_label`, `format_refusal`, `remote_available`; `can_start` is `start_refusal` being
+     `None`, and Start logs "Cannot start: <why>" instead of running. Without `chd` the CHD
+     output is not offered and CHD Info refuses (`CHD_NOT_BUILT`); CHD Info is not offered while
+     it reads. The remote dialog's accessors exist in every build (false / empty without
+     `remote`).
+   - `controller::commander::extract_applies` (forks, ProDOS names, QNX text by volume; the
+     rule Extract already used) and `extract_fork_modes` (Native only on macOS).
+   - Key map: the Explorer binds Choose partition (Primary+P), Extract to a folder (Primary+X;
+     the view asks for the options first, as Export does) and List the tree (Primary+D,
+     `ListTree`). The GUI's file-manager map is unchanged.
+   - Tests: `start_names_what_it_waits_for_and_refuses_the_images_own_format`,
+     `an_image_that_does_not_open_is_not_converted`, `each_volume_offers_its_own_extract_options`;
+     `tests/ui_scenarios/optical_start_rules.toml` (its control failed on a wrong refusal).
+2. (6dc8c9fa) The TUI Optical screen, `src/cli/verbs/tui_app/optical.rs` (the old rip steps,
+   the `i` launcher and their test leave `tui_app.rs`):
+   - One form, rows following the controller: Source (Left / Right: physical drive or image
+     file), Drive (Left / Right through the list; `r` Refresh, `e` Eject, `R` Add remote daemon:
+     address typed, Up / Down through the recent addresses, Enter connects) or Image (Enter or
+     `o`: the picker with the Optical recent list), the disc line (format, filesystem, volume,
+     size, game; "Detecting the disc..." or the error), `b` Browse Contents, `c` Close Disc, `i`
+     CHD Info (a scrolling window), Action, Output format (Left / Right through the offered
+     formats; a refused one says why), the CHD rows (Default / MiSTer / Custom, hunk, four
+     codecs; an off-unit hunk refused before Start), File (typed, Tab browses with the suggested
+     name), Eject after ripping (rip only), Start (Enter or `s`; the controller's refusal beside
+     it). A run shows the bottom bar; Esc cancels it, then closes the finished bar; the result
+     and the last log lines stay on the form.
+   - Browse Contents opens the disc in the Explorer over `optical::disc_browser` ("Disc Browser"
+     window, read-only): Ctrl+P picks the filesystem (hybrid sides, boot areas), the game line
+     under the listing, Ctrl+X Extract (a window with the fork modes, ProDOS names or QNX text
+     the volume offers; Enter picks a mode and asks for the folder; existing files reviewed; a
+     failed entry asks Skip / Continue with all errors / Stop and lists the skipped), Ctrl+D the
+     tree listing (a scrolling window; `s` saves it), Ctrl+E Export, F3 File Info, the View
+     menu. `HostRequest::CloseBrowser` closes it; closing it (Esc, a tab switch) sends
+     `BrowserClosed`. Extract and the tree window work in the Inspect Explorer too.
+   - Inspect hands an optical image its open found to the Optical tab and switches there (as
+     the GUI does); a build without `optical` says it has no Optical tab.
+   - `?` lists the form's and the windows' keys (`HINTS_OPTICAL`, `HINTS_OPTICAL_WINDOW`); `?`
+     is typed, not taken, in the File field and the remote address.
+   - Every `Effect` the controller emits and every `HostRequest` is matched with no `_` arm.
+   - Tests: `the_optical_screen_converts_an_image_to_bin_cue` (the image picker and recent
+     list, the own-format refusal, the format step, the typed output, the run, its bar and
+     result), `the_optical_screen_converts_to_chd_and_shows_chd_info` (cfg `chd`),
+     `browse_contents_opens_the_disc_and_extracts_lists_and_closes_it` (filesystem picker, an
+     AppleDouble and a MacBinary extract, the failed-entry prompt and skipped list, the tree
+     saved, Close reported), `closing_the_disc_from_the_screen_closes_its_browser`,
+     `an_optical_disc_opened_on_inspect_moves_to_the_optical_tab`,
+     `the_drive_rows_remote_window_and_refusals_follow_the_controller`,
+     `the_optical_screen_and_its_windows_draw_in_a_small_terminal` (80x24). They assert on
+     controller state, files and log lines, not on wrapped text beside a path.
+3. (this commit) Docs: this section, `docs/platform_matrix.md` "Inspect tab", "Optical tab",
+   "Disc browser" and "TUI Explorer", `docs/tui_plan.md`.
+
+### Behaviour changes
+
+- TUI: the Optical screen is one form for drives and image files (it was drive -> options ->
+  run for drives only); it converts, rips to CHD, shows CHD Info, connects remote daemons,
+  ejects and browses the disc. The `i` image-operations launcher is gone (`:` still runs any
+  `rb-cli optical` verb; the New Disk tab builds CD-ROMs).
+- TUI: no output path is filled in for you (the old screen defaulted `~/disc.iso`); Tab offers
+  the controller's suggested name beside the image.
+- TUI: an optical image opened on Inspect switches to the Optical tab with it (it was a note).
+- TUI: the Explorer gains Ctrl+X Extract (with the volume's options and the slice-21 prompt),
+  Ctrl+D the tree window and Ctrl+P the partition picker.
+- GUI: Start Convert stays disabled while the image is detected, when it did not open, and when
+  the output is the image's own format (each ran into "Unsupported conversion"); CHD Info is
+  disabled while it reads. A build without `chd` never offers CHD output.
+- CLI: none (`rb-cli optical` keeps its verbs).
+
+### Left
+
+- The CD-DA player: GUI only (desktop audio stack), not planned for the TUI.
+- A remote daemon's drive is rip-only in both shells (the pane has no remote disc source).
+- A terminal has no drag-and-drop; the disc browser closes on a tab switch, as the Inspect
+  Explorer does.
+- TUI parity is complete except Build Disk (`docs/build_disk_plan.md`).
 
 ## Decisions taken 2026-11-02 (assumed accepted)
 
@@ -2157,10 +2246,11 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-27 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
-  have the GUI's feature set (slices 24, 25; Build Disk planned separately), and the TUI Inspect
+- Slices 1-28 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
+  have the GUI's feature set (slices 24, 25; Build Disk planned separately), the TUI Inspect
   screen its disk tools, Calc min and Export (slice 26) and its dialogs: the table editor, Add
-  Partition, Resize, Alto resize, Expand HFS and floppy convert (slice 27). `src/gui` and the whole TUI are enforced at 0 engine references
+  Partition, Resize, Alto resize, Expand HFS and floppy convert (slice 27), and the TUI Optical
+  screen the Optical tab's (slice 28; not the CD-DA player). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -2184,9 +2274,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    publish `rb-fsexporter` 0.1.1.
 3. **TUI parity gaps** the controllers already support (Backup done in slice 24, Restore and
    the disk writer in slice 25, Inspect disk tools / Calc min / Export in slice 26, the Inspect
-   dialogs in slice 27; next Optical convert / CHD rip / Browse Contents): add them before
-   Phase 2 closes (user decision 2026-11-04: full parity except the CD-DA player and Build
-   Disk, `docs/build_disk_plan.md`).
+   dialogs in slice 27, Optical in slice 28): done (user decision 2026-11-04: full parity
+   except the CD-DA player and Build Disk, `docs/build_disk_plan.md`, which comes next).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
 5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
