@@ -83,6 +83,17 @@ pub fn elevation_gate() -> ElevationGate {
     }
 }
 
+/// Whether this process runs as root / administrator (raw device access needs it).
+pub fn running_elevated() -> bool {
+    crate::os::is_elevated()
+}
+
+/// True only when the host OS version was read and is older than `major.minor`.
+pub fn host_known_older_than(major: u32, minor: u32) -> bool {
+    let host = crate::os::host_version::HostVersion::detect();
+    host.version.is_some() && !host.at_least(major, minor)
+}
+
 /// Whether physical-device controls are usable now (Windows needs elevation to list them).
 pub fn physical_devices_available() -> bool {
     if !crate::os::PHYSICAL_DEVICES_ENABLED {

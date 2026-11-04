@@ -624,6 +624,52 @@ pub fn is_floppy_container_file(path: &Path) -> bool {
     crate::rbformats::containers::is_floppy_container(kind)
 }
 
+/// One partition of a table read by [`read_table_unelevated`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainPartition {
+    pub type_name: String,
+    /// The table's own type string (an Amiga DosType, an APM type), when it has one.
+    pub type_string: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// A table read with a plain open: its name and partitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainTable {
+    pub type_name: String,
+    pub partitions: Vec<PlainPartition>,
+}
+
+/// The size of `path`; a block device reports 0 in its metadata, so seek to its end instead.
+pub fn size_unelevated(path: &Path) -> std::io::Result<u64> {
+    let m = std::fs::metadata(path)?;
+    if m.len() > 0 {
+        return Ok(m.len());
+    }
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::End(0))
+}
+
+/// Read `path`'s partition table with a plain open (never elevates); `None` when it has none.
+pub fn read_table_unelevated(path: &Path) -> std::io::Result<Option<PlainTable>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    Ok(PartitionTable::detect(&mut reader)
+        .ok()
+        .map(|pt| PlainTable {
+            type_name: pt.type_name().to_string(),
+            partitions: pt
+                .partitions()
+                .iter()
+                .map(|p| PlainPartition {
+                    type_name: p.type_name.clone(),
+                    type_string: p.partition_type_string.clone(),
+                    size_bytes: p.size_bytes,
+                })
+                .collect(),
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

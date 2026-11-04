@@ -46,9 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
+use crate::controller::app::{format_size, RateTracker};
 use crate::device::{enumerate_devices, DiskDevice};
-use crate::model::rate_tracker::RateTracker;
-use disk_core::display::format_size;
 
 mod commander;
 mod explorer;
@@ -683,8 +682,7 @@ fn low_color_terminal() -> bool {
         return true;
     }
     // Only on a version we positively read: an unknown one keeps colour rather than dropping it.
-    let host = crate::os::host_version::HostVersion::detect();
-    cfg!(target_vendor = "apple") && host.version.is_some() && !host.at_least(10, 6)
+    cfg!(target_vendor = "apple") && crate::controller::app::host_known_older_than(10, 6)
 }
 
 /// Semantic 16-color palette. Colors *reinforce* meaning already carried by
@@ -954,8 +952,8 @@ fn cylinder_args(
 ) -> crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
     crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
         common,
-        heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
-        sectors: crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+        heads: crate::controller::new_disk::DEFAULT_HEADS,
+        sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
     }
 }
 
@@ -1825,10 +1823,8 @@ const SETTINGS_TOGGLES: usize = 2;
 /// What a finished [`TuiTask`] does to the app, run on the UI thread.
 type TaskDone = Box<dyn FnOnce(&mut App) + Send>;
 
-/// A slow TUI operation on a worker thread; the screen keeps drawing and the result lands in `tick`.
-struct TuiTask {
-    job: crate::model::job::Job<TaskDone>,
-}
+/// A slow TUI operation off the UI thread; the screen keeps drawing and the result lands in `tick`.
+type TuiTask = crate::controller::task::ShellTask<TaskDone>;
 
 struct App {
     palette: Palette,
@@ -1884,7 +1880,7 @@ struct App {
     help_scroll: usize,
     should_quit: bool,
     /// A slow operation running as a job behind a "Working" box; keys wait until it ends.
-    task: Option<TuiTask>,
+    task: TuiTask,
 }
 
 impl App {
@@ -1893,7 +1889,7 @@ impl App {
         let mut app = App {
             palette: Palette::detect(),
             border: choose_border_set(),
-            elevated: crate::os::is_elevated(),
+            elevated: crate::controller::app::running_elevated(),
             active,
             scroll: 0,
             selection: 0,
@@ -1918,7 +1914,7 @@ impl App {
             show_help: false,
             help_scroll: 0,
             should_quit: false,
-            task: None,
+            task: TuiTask::new(Arc::new(crate::controller::task::NoNotify)),
         };
         app.on_tab_changed();
         app
@@ -2023,9 +2019,9 @@ impl App {
             return;
         }
         // A running task owns the keyboard: Esc asks it to stop, everything else waits.
-        if let Some(task) = &self.task {
-            if key.code == KeyCode::Esc && task.job.snapshot().can_cancel {
-                task.job.cancel();
+        if self.task.is_active() {
+            if key.code == KeyCode::Esc {
+                self.task.cancel();
             }
             return;
         }
@@ -2232,7 +2228,7 @@ impl App {
 
     /// Open an image *or* a raw device as the Inspect tab's image view.
     ///
-    /// `size` is looked up via [`readable_size`] so block devices come out at
+    /// `size` is looked up via [`size_unelevated`](crate::controller::inspect::size_unelevated) so block devices come out at
     /// their true size instead of the zero `metadata` reports for them. Pass
     /// `disk` when opening from the disk list so the view can show the hardware
     /// facts alongside the partition table.
@@ -2240,7 +2236,7 @@ impl App {
         // Sizing a device and reading its table happen on the worker; a slow disk keeps the screen live.
         self.start_task("Reading the partition table", move |job| {
             job.set_can_cancel(false);
-            let size = readable_size(&path);
+            let size = crate::controller::inspect::size_unelevated(path.as_path());
             // An image file is read by the Inspect controller; a device keeps the plain, unelevated read.
             let inspected = (disk.is_none() && path.is_file())
                 .then(|| inspected_rows(path.clone()))
@@ -2886,9 +2882,8 @@ impl App {
                                 size,
                                 name,
                                 fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
-                                heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
-                                sectors:
-                                    crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+                                heads: crate::controller::new_disk::DEFAULT_HEADS,
+                                sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
                                 inodes: None,
                                 bytes_per_inode: None,
                                 // The TUI's "new disk" flow formats only; it
@@ -3017,9 +3012,9 @@ impl App {
                 ),
                 CdTarget::MacHfs | CdTarget::MacHfsPlus => {
                     let fs = if target == CdTarget::MacHfs {
-                        crate::partition::mac_cd_builder::MacCdFs::Hfs
+                        crate::controller::new_disk::MacCdFs::Hfs
                     } else {
-                        crate::partition::mac_cd_builder::MacCdFs::HfsPlus
+                        crate::controller::new_disk::MacCdFs::HfsPlus
                     };
                     crate::cli::verbs::new_mac_cdrom::run(
                         fs,
@@ -4659,18 +4654,14 @@ impl App {
     fn start_task(
         &mut self,
         label: impl Into<String>,
-        body: impl FnOnce(&crate::model::job::JobCtx) -> anyhow::Result<TaskDone> + Send + 'static,
+        body: impl FnOnce(&crate::controller::task::JobCtx) -> anyhow::Result<TaskDone> + Send + 'static,
     ) {
-        if self.task.is_some() {
-            self.report_task_status("Another operation is still running.".to_string());
-            return;
+        let started = self
+            .task
+            .start(label, move |ctx| with_stderr_only_suppressed(|| body(ctx)));
+        if let Err(busy) = started {
+            self.report_task_status(busy.to_string());
         }
-        let job = crate::model::job::Job::spawn(
-            label,
-            Arc::new(crate::model::job::NoNotify),
-            move |ctx| with_stderr_only_suppressed(|| body(ctx)),
-        );
-        self.task = Some(TuiTask { job });
     }
 
     /// Put a task's status on the screen's line.
@@ -4697,40 +4688,31 @@ impl App {
     /// Tests: wait for the running task and apply it, as `tick` would.
     #[cfg(test)]
     fn finish_task(&mut self) {
-        while self.task.as_ref().is_some_and(|t| t.job.is_running()) {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        self.task.wait();
         self.poll_task();
     }
 
     /// Apply a finished task, or report how it ended.
     fn poll_task(&mut self) {
-        use crate::model::job::Status;
-        let Some(task) = &self.task else {
-            return;
-        };
-        let snap = task.job.snapshot();
-        if snap.is_running() {
-            return;
-        }
-        let done = task.job.take_result();
-        self.task = None;
-        match (snap.status, done) {
-            (Status::Done, Some(apply)) => apply(self),
-            (Status::Failed(e), _) => {
-                self.report_task_status(format!("{} failed: {e}", snap.label))
+        use crate::controller::task::TaskEnd;
+        match self.task.poll() {
+            Some(TaskEnd::Done(apply)) => apply(self),
+            Some(TaskEnd::Failed { label, error }) => {
+                self.report_task_status(format!("{label} failed: {error}"))
             }
-            (Status::Cancelled, _) => self.report_task_status(format!("{} cancelled.", snap.label)),
-            _ => {}
+            Some(TaskEnd::Cancelled { label }) => {
+                self.report_task_status(format!("{label} cancelled."))
+            }
+            None => {}
         }
     }
 
     /// The "Working" box over everything while a task runs: step, bar, speed and time.
     fn draw_task(&self, frame: &mut Frame, area: Rect) {
-        let Some(task) = &self.task else {
+        let Some(snap) = self.task.snapshot() else {
             return;
         };
-        self.draw_job_box(frame, area, "Working", &task.job.snapshot());
+        self.draw_job_box(frame, area, "Working", &snap);
     }
 
     /// A job's step, bar, speed and time in a centred box titled `title`.
@@ -4739,7 +4721,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         title: &str,
-        snap: &crate::model::job::Snapshot,
+        snap: &crate::controller::task::Snapshot,
     ) {
         let what = if snap.phase.is_empty() {
             &snap.label
@@ -7180,62 +7162,37 @@ fn looks_textual(bytes: &[u8]) -> bool {
 /// disk. `Ok(_)` always has at least one row (a table-less image is reported as
 /// one whole-volume row).
 fn parse_partitions(path: &std::path::Path, total: u64) -> std::io::Result<Vec<PartRow>> {
-    use crate::partition::PartitionTable;
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    Ok(match PartitionTable::detect(&mut reader) {
-        Ok(pt) => {
-            let parts = pt.partitions();
-            if parts.is_empty() {
-                return Ok(vec![PartRow {
-                    selector: None,
-                    label: format!("Whole volume ({})", pt.type_name()),
-                    fs_hint: pt.type_name().to_string(),
-                    size: total,
-                }]);
-            }
-            parts
-                .iter()
-                .enumerate()
-                .map(|(k, p)| {
-                    let n = (k + 1) as u32;
-                    let fs_hint = p
-                        .partition_type_string
-                        .clone()
-                        .unwrap_or_else(|| p.type_name.clone());
-                    PartRow {
-                        selector: Some(n.into()),
-                        label: format!("#{n}  {}", p.type_name),
-                        fs_hint,
-                        size: p.size_bytes,
-                    }
-                })
-                .collect()
-        }
+    let Some(table) = crate::controller::inspect::read_table_unelevated(path)? else {
         // No detectable table: a raw single-volume image (superfloppy).
-        Err(_) => vec![PartRow {
+        return Ok(vec![PartRow {
             selector: None,
             label: "Whole volume (no partition table)".to_string(),
             fs_hint: String::new(),
             size: total,
-        }],
-    })
-}
-
-/// Size of a path that `std::fs::metadata` cannot measure.
-///
-/// A block device reports `len() == 0`, so the image view sized every disk at
-/// zero and a table-less device came out as a "Whole volume" of 0 bytes. Seeking
-/// to the end asks the kernel instead, which works on Linux and macOS without
-/// an ioctl per platform.
-fn readable_size(path: &std::path::Path) -> std::io::Result<u64> {
-    let m = std::fs::metadata(path)?;
-    if m.len() > 0 {
-        return Ok(m.len());
+        }]);
+    };
+    if table.partitions.is_empty() {
+        return Ok(vec![PartRow {
+            selector: None,
+            label: format!("Whole volume ({})", table.type_name),
+            fs_hint: table.type_name,
+            size: total,
+        }]);
     }
-    use std::io::{Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::End(0))
+    Ok(table
+        .partitions
+        .into_iter()
+        .enumerate()
+        .map(|(k, p)| {
+            let n = (k + 1) as u32;
+            PartRow {
+                selector: Some(n.into()),
+                label: format!("#{n}  {}", p.type_name),
+                fs_hint: p.type_string.unwrap_or(p.type_name),
+                size: p.size_bytes,
+            }
+        })
+        .collect())
 }
 
 /// Rows a full-screen list shows at once: the PageUp / PageDown step.
@@ -7443,8 +7400,7 @@ mod tests {
     /// ordinary Linux system disk (ESP + root).
     fn mbr_with_ext(dir: &std::path::Path) -> std::path::PathBuf {
         const START: u32 = 2048;
-        let vol =
-            fs_unix::ext_format::create_blank_ext4(16 * 1024 * 1024, "ROOT").expect("blank ext4");
+        let vol = crate::controller::test_fixtures::blank_ext4(16 * 1024 * 1024, "ROOT");
         let img = dir.join("disk.img");
         let mut bytes = vec![0u8; START as usize * 512 + vol.len()];
         bytes[START as usize * 512..].copy_from_slice(&vol);
@@ -7627,7 +7583,7 @@ mod tests {
         use crate::controller::Controller as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let img = dir.path().join("vol.img");
-        let bytes = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
+        let bytes = crate::controller::test_fixtures::blank_fat(2 * 1024 * 1024, Some("T"));
         std::fs::write(&img, &bytes).unwrap();
         let mut b = BackupController::new(BackupServices {
             jobs: crate::controller::backup::JobRegistry::new(),
@@ -7814,20 +7770,18 @@ mod tests {
     #[test]
     fn a_task_lands_in_tick_and_a_panicking_one_reports_its_failure() {
         let wait = |app: &mut App| {
-            while app.task.as_ref().is_some_and(|t| t.job.is_running()) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
+            app.task.wait();
             app.poll_task();
         };
         let mut app = App::new_on(DEFAULT_TAB);
         app.start_task("Counting", |_| {
             Ok(Box::new(|app: &mut App| app.status = Some("counted".into())) as TaskDone)
         });
-        assert!(app.task.is_some());
+        assert!(app.task.is_active());
         app.start_task("Second", |_| Ok(Box::new(|_: &mut App| {}) as TaskDone));
         wait(&mut app);
         assert_eq!(app.status.as_deref(), Some("counted"));
-        assert!(app.task.is_none());
+        assert!(!app.task.is_active());
 
         app.start_task("Exploding", |_| -> anyhow::Result<TaskDone> {
             panic!("boom")
@@ -8016,9 +7970,8 @@ mod tests {
         app.finish_task();
         let w = app.newdisk.as_ref().unwrap();
         assert!(!w.is_error, "{:?}", w.status);
-        let mut f = std::fs::File::open(&iso).unwrap();
         assert!(
-            part_tables::next::detect(&mut f).is_some(),
+            crate::controller::test_fixtures::has_next_label(iso.as_path()),
             "a NeXT label at block 0"
         );
     }

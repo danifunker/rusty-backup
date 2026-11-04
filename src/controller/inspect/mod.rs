@@ -39,6 +39,10 @@ pub use tools::{FsckView, ResizePlan};
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::export_runner::PartitionExportConfig;
+/// A device's table and size read without elevating, for a shell's quick device view.
+pub use crate::model::inspect_runner::{
+    read_table_unelevated, size_unelevated, PlainPartition, PlainTable,
+};
 pub use crate::model::job::{JobRegistry, NoNotify};
 pub use crate::model::partition_editor::PartitionEditor;
 pub use crate::rbformats::chd_options::ChdProfile;

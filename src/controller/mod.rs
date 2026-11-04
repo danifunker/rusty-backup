@@ -31,6 +31,7 @@ pub mod floppy_convert;
 pub mod inspect;
 pub mod keys;
 pub mod log;
+pub mod new_disk;
 #[cfg(feature = "optical")]
 pub mod optical;
 pub mod partition_edit;
@@ -40,6 +41,9 @@ pub mod resize;
 pub mod restore;
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 pub mod settings;
+pub mod task;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 /// A job's outcome once it ended: its result, or why it failed or was cancelled.
 pub(crate) fn job_outcome<R: Send + 'static>(

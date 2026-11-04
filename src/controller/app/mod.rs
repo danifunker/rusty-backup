@@ -13,9 +13,9 @@ mod update;
 
 pub use shell::{
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate,
-    no_devices_hint, physical_devices_available, picker_start_folder, unelevated_device_note,
-    AppTab, DiskDevice, DropRoute, DropTargets, ElevationGate, ShareStep,
-    PHYSICAL_DEVICES_DISABLED,
+    host_known_older_than, no_devices_hint, physical_devices_available, picker_start_folder,
+    running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
+    ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
 };
 #[cfg(feature = "gui")]
 pub use update::{InstallState, UpdateInfo};
