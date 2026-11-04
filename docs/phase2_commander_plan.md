@@ -1857,6 +1857,114 @@ partition).
   `docs/platform_matrix.md`).
 - TUI parity continues with Restore, Inspect and Optical (Next steps item 3).
 
+## Slice 25: TUI Restore parity
+
+After slice 13 the TUI Restore screen restored a backup folder, `.cbk` or Clonezilla image to an
+image file or a device with Original / Minimum sizes for every partition and Original / 1 MB
+alignment, and poured an image source through the disk writer with its own y / n prompt. Build
+Disk stays out by the user's decision (2026-11-04): it gets its own top-level section later
+(`docs/build_disk_plan.md`).
+
+### Steps
+
+1. (5badc963) Controller lift, so both shells offer the same choices:
+   - `model::restore_plan`: `SizeRow::mode_choices(is_last)` (Minimum below the original, Fill on
+     the last row only), `custom_bounds_mib` (the minimum up to 2 TiB, `size_mode::CUSTOM_MIB_MAX`)
+     and `custom_mib_effective` (a Custom size outside them is clamped in `effective_size` and
+     `choice`); `ALIGN_SECTORS_MAX` (custom alignment capped at 65535 on entry, floored at 1 when
+     used, restore and new disk alike).
+   - `RestoreController`: `size_mode_choices`, a switch into Custom starts at the original size
+     (what the egui size cell seeded), `SetExpandMib` capped at `expand_cap_mib`,
+     `remote_available()` and `SetRemote` logging `REMOTE_NOT_BUILT` in a build without `remote`,
+     `default_target_image()` (also the Save As name of a full-disk image target).
+   - Write Image File's probe is `WriteOpen::probe_image`: the decoded size and, for a table-less
+     volume, `superfloppy` and its `fs_hint`; `HostRequest::WriteImage(WriteOpen)` hands it to the
+     shell's writer. `WriteOpen::synthesize` says whether the table starts ticked (Inspect's
+     export: yes, as before; Write Image File: no). `write_image_superfloppy()` for the form.
+   - `DiskWriteController`: `size_choices()` (Original / Custom / Fill), `custom_bounds_mib()`,
+     a switch into Custom starts at the source's size. The egui Restore grid takes Fill from
+     `size_mode_choices`.
+   - Tests: `size_rows_offer_their_modes_and_clamp_a_custom_size`,
+     `alignment_and_free_space_fields_are_clamped`, `the_remote_target_turns_on_only_when_built`,
+     `write_image_measures_the_source_and_hands_it_to_the_shell` (now a superfloppy),
+     `the_synthesized_size_offers_three_modes_and_seeds_custom`,
+     `write_image_file_finds_a_superfloppy_and_leaves_the_table_unticked`;
+     `tests/ui_scenarios/restore_sizes_alignment_write_image.toml` (its control failed on a wrong
+     expected Custom size).
+2. (9b384097) Two fixes the TUI flows found: New Disk to an image file that does not exist yet
+   (both shells' Save As pickers never create it) failed with "No such file or directory"; the
+   engine now creates it at the new disk's size. The writer's image-file target with a
+   synthesized table was refused ("Partition end ... exceeds target disk size (0 bytes)"); it
+   grows to hold the table, the volume and a GPT's backup header
+   (`an_image_file_grows_to_hold_a_synthesized_table`).
+3. (f4f344ee) The TUI Restore screen moves to `src/cli/verbs/tui_app/restore.rs`: one form per
+   mode (the egui tab's layout), rows following the controller:
+   - Mode row (Left / Right: Full Disk, Single Partition, New Disk, Write Image File).
+   - Full Disk: Backup (Enter or `o` picks a folder, `.cbk` or Clonezilla image, `c` closes it;
+     the summary lines under it), Remote (Space; host typed, Enter connects, each listed drive
+     Enter picks, or a file name Enter uses), Target kind (device / image file), Device (Enter
+     opens the chooser, `c` closes the drive; the system-disk warning) or Image file (typed,
+     Tab browses; defaults beside the backup), "Target: x | Source was: y", Free space (Space;
+     MiB typed up to the cap; Leave / Extend last; a Current / After line), Alignment (Original
+     with the backup's label / 1 MB / Custom, sectors typed), one size row per partition (Left /
+     Right through its modes, Custom MiB typed, shown with its range when clamped), the total and
+     the layout-fit warning, Start (`s` from any non-text row) with the controller's reason.
+   - Single Partition: Backup or image source, source partition, Device, Scan, the scanned
+     partitions (Enter picks; too small / OK). New Disk: the same sources, target kind, device or
+     image file, Table, Alignment (with the start LBA), sectors, Bootable (MBR).
+   - Write Image File: Image (Enter picks; decoded size, superfloppy note, probe), then "Choose
+     target and write..." (or `s`) opens the Write Image File window over a headless
+     `DiskWriteController`: target disk (chooser) or image file (typed, Enter sets it, Tab
+     browses), Write to (whole disk or each partition, Left / Right, with the fit warning),
+     Synthesize partition table (Space) with Table, Alignment, sectors, Type (presets with Left /
+     Right, or a byte typed in hex) and Size (Original / Custom / Fill, MiB typed), Write (Enter
+     or `w`), Esc closes.
+   - Every `Effect` both controllers emit is matched with no `_` arm: their pickers are the TUI
+     file picker (Save for a target), `Confirm` a y / n box with the controller's message (the
+     restore names the target and each partition's size), `AskText` the typed device name with
+     the controller's validator (Enter only on the exact name).
+   - Run: the bar, the step, the last log lines, the result; Esc cancels (restore or write), then
+     returns to the form. The device list's refresh reconciles both controllers' targets.
+   - `?` lists the form's, the window's and the run's keys (`HINTS_RESTORE_*`).
+   - Tests: `the_restore_full_disk_form_restores_a_backup` (target kind, size modes and Custom MiB,
+     Custom alignment, free space with extend-last and its preview, the confirmation, a byte-equal
+     restore), `the_restore_new_disk_mode_writes_a_fresh_table` (GPT / MBR, bootable, the image
+     created), `the_restore_single_partition_mode_scans_and_picks_a_partition` (chooser, scan, fit,
+     the confirmation's wording, `n` writes nothing), `the_restore_write_image_mode_writes_through_the_writer`
+     (a superfloppy wrapped in an MBR with a typed type byte into an image file; then into one
+     partition of a disk-image device behind its typed name, a wrong name refused),
+     `the_restore_remote_target_opens_or_is_absent`, `the_restore_forms_draw_in_a_small_terminal`
+     (80x24, every mode).
+4. (this commit) Docs: this section, `docs/platform_matrix.md` "Restore tab", "Physical Disk
+   Export / Write Image File" and the partition window's Build Disk note.
+
+### Behaviour changes
+
+- TUI: the Restore screen is one form per mode (the GUI's modes) instead of source -> options;
+  the image-source toggle is the Write Image File mode.
+- TUI: a full-disk target starts as "Write to device", as in the GUI (the screen started on the
+  image file); the image path still defaults beside the backup.
+- TUI: each partition has its own size mode (Original, Minimum when smaller, Custom, Fill on the
+  last) instead of one Original / Minimum for all; Custom alignment is offered.
+- TUI: the restore confirmation is the controller's (the target and each partition's new size,
+  y / n); the screen's own "OVERWRITE the entire device" y / n is gone, and an image-file target
+  is now asked too.
+- TUI: a device write from Write Image File asks for the device's name typed exactly (the
+  controller's prompt), and an image-file target asks before overwriting; both were one `y`.
+- GUI: Write Image File of a table-less volume offers "Synthesize partition table" (unticked; it
+  was disabled as "source already has one"), so the bytes written by default are unchanged.
+- GUI: Save As for a full-disk image target suggests `<backup>_restored.img`.
+- Both: New Disk to a new image file works (step 2).
+- CLI: none.
+
+### Left
+
+- Build Disk in the TUI: planned in `docs/build_disk_plan.md` as its own top-level section.
+- The free-space preview is a Current / After text line, not bars; a terminal has no drops.
+- `rb-cli restore` keeps its own `RestoreConfig` (slice 13's Left).
+- TUI parity continues with Inspect (disk tools, Calc min, Export; its Physical Disk Export can
+  reuse this screen's writer window), the Inspect dialogs and Optical (Next steps item 3).
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -1869,8 +1977,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-24 done; every GUI picker is async (slice 23); the TUI Backup screen has the GUI's
-  feature set (slice 24). `src/gui` and the whole TUI are enforced at 0 engine references
+- Slices 1-25 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
+  have the GUI's feature set (slices 24, 25; Build Disk planned separately). `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -1892,8 +2000,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 2. **Slice 20: the TUI's last 20 references** (done, above): the whole TUI is enforced.
    **Slice 21** (done, above): one AppleDouble rule, and a failed entry asks the user;
    publish `rb-fsexporter` 0.1.1.
-3. **TUI parity gaps** the controllers already support (Backup done in slice 24; Restore
-   single-partition / new-disk; Inspect disk tools / Calc min / Export; Optical convert /
+3. **TUI parity gaps** the controllers already support (Backup done in slice 24, Restore and
+   the disk writer in slice 25; Inspect disk tools / Calc min / Export; Optical convert /
    Browse Contents; Inspect dialogs): add them before Phase 2 closes (user decision
    2026-11-04: full parity except the CD-DA player and Build Disk, `docs/build_disk_plan.md`).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
