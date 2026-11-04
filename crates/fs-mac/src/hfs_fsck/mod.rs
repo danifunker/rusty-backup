@@ -239,7 +239,7 @@ pub(crate) fn check_hfs_integrity(
 
     let header = BTreeHeader::read(catalog_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || catalog_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || catalog_data.len() < node_size {
         if !is_empty_volume {
             errors.push(hfs_issue(
                 HfsFsckCode::HeaderNodeBadKind,
@@ -426,7 +426,7 @@ pub(crate) fn repair_hfs(
     }
     let header = BTreeHeader::read(catalog_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || catalog_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || catalog_data.len() < node_size {
         if !is_empty_volume {
             report
                 .fixes_failed

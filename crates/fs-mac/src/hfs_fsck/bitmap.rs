@@ -46,7 +46,7 @@ pub(super) fn collect_overflow_extents(extents_data: &[u8]) -> Vec<(u32, u32, St
     // Read B-tree header
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || extents_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || extents_data.len() < node_size {
         return result;
     }
 
@@ -129,7 +129,7 @@ fn collect_bad_block_extents(extents_data: &[u8]) -> Vec<(u32, u32)> {
 
     let header = BTreeHeader::read(extents_data);
     let node_size = header.node_size as usize;
-    if node_size == 0 || extents_data.len() < node_size {
+    if node_size < crate::hfs_common::BTREE_MIN_NODE_SIZE || extents_data.len() < node_size {
         return result;
     }
 
