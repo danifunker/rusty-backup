@@ -145,9 +145,13 @@ stderr_contains = ["no HFS filesystem"]
 # visible difference between expected and actual.
 #
 # The counts are exact on purpose. "Recursive found more" would pass if
-# recursion silently degraded from a subtree to one extra file; pinning 10 and
-# 30 against a sha256-pinned fixture says precisely what each mode covers, and
+# recursion silently degraded from a subtree to one extra file; pinning 5 and
+# 15 against a sha256-pinned fixture says precisely what each mode covers, and
 # a change in either direction is worth a failure.
+#
+# They were 10 / 30 / 20 until opticaldiscs 0.16.1: the ISO 9660 side listed
+# each Mac file's associated file (its resource fork) as a second entry. One
+# entry per file now, the fork going to an AppleDouble sidecar: 5 / 15 / 10.
 
 [[case]]
 id = "optical.extract.path-dir-stops-at-one-level"
@@ -161,11 +165,11 @@ args = [
   "--path", "/Install 1",
 ]
 expect_exit = 0
-stderr_contains = ["extracted 10 entry/entries"]
+stderr_contains = ["extracted 5 entry/entries"]
 
 [[case]]
 id = "optical.extract.path-dir-recursive-descends"
-description = "F-007: the same path with --recursive pulls the nested subtree too — 30 entries against the same disc"
+description = "F-007: the same path with --recursive pulls the nested subtree too — 15 entries against the same disc"
 fixture = "optical.hfs.opentransport.cd"
 timeout_ms = 300000
 [[case.step]]
@@ -176,7 +180,7 @@ args = [
   "--recursive",
 ]
 expect_exit = 0
-stderr_contains = ["extracted 30 entry/entries"]
+stderr_contains = ["extracted 15 entry/entries"]
 
 [[case]]
 id = "optical.extract.nested-dir-addressable-directly"
@@ -190,4 +194,4 @@ args = [
   "--path", "/Install 1/Open Transport Files",
 ]
 expect_exit = 0
-stderr_contains = ["extracted 20 entry/entries"]
+stderr_contains = ["extracted 10 entry/entries"]
