@@ -94,8 +94,9 @@ pub struct CopyOptions {
     /// CBM, Apple/Atari DOS, MFS, …). Without it, copying a tree into a
     /// flat filesystem is a hard error.
     pub flatten: bool,
-    /// Carry each source entry's modification date onto the copy (archive expansion). Off by
-    /// default, so `cp` stamps the time of the copy; QNX 2 to QNX 2 always keeps dates.
+    /// Carry each source entry's dates onto the copy (archive expansion, `cp -p`). HFS/MFS to
+    /// HFS keeps the raw catalog create/modify/backup dates; other pairs keep the modification
+    /// date. Off by default, so `cp` stamps the time of the copy; QNX 2 to QNX 2 always keeps dates.
     pub preserve_times: bool,
 }
 
@@ -380,6 +381,7 @@ fn copy_recursive(
                 .preserve_times
                 .then(|| source_times(src_entry))
                 .flatten();
+            let created_dir = find_child(dst, dst_parent, &name)?.is_none();
             let dir_entry = ensure_directory(src_caps, src_entry, dst, dst_parent, &name, times)?;
             stats.dirs += 1;
             for child in list_children(src, src_entry)? {
@@ -395,6 +397,12 @@ fn copy_recursive(
                     stats,
                     log,
                 )?;
+            }
+            // Stamp the folder's own dates last, so nothing written into it
+            // afterwards can touch them. A folder merged into (one that already
+            // existed) keeps its own dates.
+            if opts.preserve_times && created_dir {
+                apply_mac_dates(dst, &dir_entry, src_entry, log);
             }
             Ok(())
         }
@@ -530,6 +538,10 @@ fn copy_file(
         }
     }
 
+    if opts.preserve_times {
+        apply_mac_dates(dst, &created, src_entry, log);
+    }
+
     stats.files += 1;
     stats.bytes = stats.bytes.saturating_add(len);
     if name != desired_name {
@@ -540,6 +552,31 @@ fn copy_file(
     }
     record_dropped(&dropped, &src_entry.path, stats, log);
     Ok(())
+}
+
+/// Write the source's raw classic-Mac catalog dates `(create, modify, backup)`
+/// onto `created` byte for byte. `create_file` / `create_directory` only take a
+/// Unix mtime, which loses the creation and backup dates and round-trips the
+/// modify date through the host time zone; `set_dates` writes the catalog words
+/// verbatim. Only HFS and MFS sources carry `mac_dates` (both in local time, as
+/// HFS stores them), and only HFS implements `set_dates`, so every other pair
+/// is a silent no-op that keeps the mtime path.
+fn apply_mac_dates(
+    dst: &mut dyn EditableFilesystem,
+    created: &FileEntry,
+    src_entry: &FileEntry,
+    log: &dyn Fn(&str),
+) {
+    let Some((create, modify, backup)) = src_entry.mac_dates else {
+        return;
+    };
+    match dst.set_dates(created, create, modify, backup) {
+        Ok(()) | Err(disk_core::filesystem::FilesystemError::Unsupported(_)) => {}
+        Err(e) => log(&format!(
+            "Warning: could not keep dates on {}: {e}",
+            src_entry.path
+        )),
+    }
 }
 
 /// An entry's modification date as Unix time: its own Unix mtime, else its classic-Mac date,
@@ -935,6 +972,109 @@ mod tests {
             copied.finder_flags,
             Some(0x2000),
             "fdFlags must survive disk-to-disk cp"
+        );
+    }
+
+    /// `cp --preserve-times` from HFS to HFS keeps the raw catalog create,
+    /// modify and backup dates of files and folders exactly, so a pack built
+    /// by copying stays byte-faithful to its source. Without the option the
+    /// copy is stamped with the time of the copy, as before.
+    #[test]
+    fn copy_preserve_times_keeps_raw_mac_dates_hfs_to_hfs() {
+        use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
+        use std::io::Cursor;
+
+        // Distinct, early-1990s values that can't be mistaken for "now".
+        const FILE_DATES: (u32, u32, u32) = (2_750_000_000, 2_760_000_000, 2_770_000_000);
+        const DIR_DATES: (u32, u32, u32) = (2_740_000_000, 2_745_000_000, 0);
+
+        let mut src = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Src").unwrap()),
+            0,
+        )
+        .unwrap();
+        let sroot = src.root().unwrap();
+        let dir = src
+            .create_directory(&sroot, "Games", &CreateDirectoryOptions::default())
+            .unwrap();
+        let body = b"app";
+        let fe = src
+            .create_file(
+                &dir,
+                "Game",
+                &mut Cursor::new(body.as_slice()),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        src.set_dates(&fe, FILE_DATES.0, FILE_DATES.1, FILE_DATES.2)
+            .unwrap();
+        src.set_dates(&dir, DIR_DATES.0, DIR_DATES.1, DIR_DATES.2)
+            .unwrap();
+        let src_dir = src
+            .list_directory(&sroot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Games")
+            .unwrap();
+        assert_eq!(src_dir.mac_dates, Some(DIR_DATES));
+
+        let mut copy = |preserve_times: bool| {
+            let mut dst = HfsFilesystem::open(
+                Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Dst").unwrap()),
+                0,
+            )
+            .unwrap();
+            let droot = dst.root().unwrap();
+            let mut stats = CopyStats::default();
+            copy_into(
+                &mut src,
+                &src_dir,
+                &mut dst,
+                &droot,
+                "Games",
+                &CopyOptions {
+                    recursive: true,
+                    preserve_times,
+                    ..CopyOptions::default()
+                },
+                &mut stats,
+                &|_| {},
+            )
+            .unwrap();
+            let ddir = dst
+                .list_directory(&droot)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "Games")
+                .unwrap();
+            let dfile = dst
+                .list_directory(&ddir)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "Game")
+                .unwrap();
+            (ddir.mac_dates, dfile.mac_dates)
+        };
+
+        let (dir_dates, file_dates) = copy(true);
+        assert_eq!(
+            dir_dates,
+            Some(DIR_DATES),
+            "folder dates must survive cp -p"
+        );
+        assert_eq!(
+            file_dates,
+            Some(FILE_DATES),
+            "file dates must survive cp -p"
+        );
+
+        let (dir_dates, file_dates) = copy(false);
+        assert_ne!(dir_dates, Some(DIR_DATES), "plain cp stamps the copy time");
+        assert_ne!(
+            file_dates,
+            Some(FILE_DATES),
+            "plain cp stamps the copy time"
         );
     }
 

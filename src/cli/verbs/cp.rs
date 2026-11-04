@@ -68,6 +68,12 @@ pub struct CpArgs {
     #[arg(long, short = 'r')]
     pub recursive: bool,
 
+    /// Keep each source entry's dates instead of stamping the time of the
+    /// copy. HFS/MFS to HFS keeps the raw catalog create, modify and backup
+    /// dates exactly; other pairs keep the modification date.
+    #[arg(long = "preserve-times", short = 'p')]
+    pub preserve_times: bool,
+
     /// Overwrite existing destination entries. Mutually exclusive with
     /// `--skip-existing`.
     #[arg(long, conflicts_with = "skip_existing")]
@@ -182,7 +188,7 @@ pub fn run(args: CpArgs) -> Result<()> {
             AttrPolicyArg::Skip => AttrPolicy::Skip,
         },
         flatten: args.flatten,
-        preserve_times: false,
+        preserve_times: args.preserve_times,
     };
     let case_insensitive = !args.case_sensitive; // default-insensitive, like get
 

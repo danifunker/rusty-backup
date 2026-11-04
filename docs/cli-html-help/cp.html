@@ -25,6 +25,8 @@
 <dl class="args">
 <dt><code>-r / --recursive</code></dt>
 <dd>Recursively copy directories. Without this, directory sources / matches are skipped with a warning</dd>
+<dt><code>-p / --preserve-times</code></dt>
+<dd>Keep each source entry's dates instead of stamping the time of the copy. HFS/MFS to HFS keeps the raw catalog create, modify and backup dates exactly; other pairs keep the modification date</dd>
 <dt><code>--force</code></dt>
 <dd>Overwrite existing destination entries. Mutually exclusive with `--skip-existing`</dd>
 <dt><code>--skip-existing</code></dt>

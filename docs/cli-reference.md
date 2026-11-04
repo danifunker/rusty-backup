@@ -604,6 +604,7 @@ Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
 **Options**
 
 - `-r` / `--recursive` — Recursively copy directories. Without this, directory sources / matches are skipped with a warning
+- `-p` / `--preserve-times` — Keep each source entry's dates instead of stamping the time of the copy. HFS/MFS to HFS keeps the raw catalog create, modify and backup dates exactly; other pairs keep the modification date
 - `--force` — Overwrite existing destination entries. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip when a destination entry already exists. Mutually exclusive with `--force`. Without either, an existing destination is an error
 - `--exclude` — Exclude source paths matching this glob. Repeatable. Exclude wins
