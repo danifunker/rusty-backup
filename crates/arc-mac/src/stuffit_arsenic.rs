@@ -105,9 +105,7 @@ impl Model {
 
     fn reset(&mut self) {
         self.total_frequency = self.increment * self.num_symbols as i64;
-        for f in &mut self.freq {
-            *f = self.increment;
-        }
+        self.freq.fill(self.increment);
     }
 
     fn increase(&mut self, idx: usize) {

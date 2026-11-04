@@ -1,5 +1,7 @@
 // Hide console window on Windows release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
 
 mod gui;
 

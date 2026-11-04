@@ -65,7 +65,7 @@ impl Filesystem for Mem {
         Ok(kids.iter().map(|p| self.nodes[p].0.clone()).collect())
     }
     fn read_file(&mut self, entry: &FileEntry, max: usize) -> Result<Vec<u8>, FilesystemError> {
-        if self.broken.iter().any(|b| *b == entry.path) {
+        if self.broken.contains(&entry.path) {
             return Err(FilesystemError::Parse("bad sector".into()));
         }
         let mut d = self.nodes[&entry.path].1.clone();

@@ -18,6 +18,9 @@
 //! far more of the corpus than the local content match can. If both flags are
 //! given, the CRC index is tried first and `--names` is the fallback.
 
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
+
 use std::collections::HashMap;
 use std::fs;
 

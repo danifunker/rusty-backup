@@ -824,8 +824,8 @@ mod tests {
             let decode = |f: &ForkInfo| {
                 decompress_fork(&bh.data_fork, f).unwrap_or_else(|err| panic!("{}: {err}", e.name))
             };
-            let data = e.data.as_ref().map(&decode).unwrap_or_default();
-            let rsrc = e.rsrc.as_ref().map(&decode).unwrap_or_default();
+            let data = e.data.as_ref().map(decode).unwrap_or_default();
+            let rsrc = e.rsrc.as_ref().map(decode).unwrap_or_default();
             // > ~128 KB of fork data guarantees the LZH stream crossed a block.
             if data.len() >= 150_000 || rsrc.len() >= 150_000 {
                 saw_multiblock_fork = true;

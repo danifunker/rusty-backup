@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "arc-mac"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "rb-fsexporter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "disk-core",

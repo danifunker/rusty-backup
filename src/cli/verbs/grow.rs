@@ -91,7 +91,7 @@ fn drain_chd(status: Arc<Mutex<ChdExpandStatus>>) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, cur, total, finished, error) = match status.lock() {
             Ok(mut s) => (
-                s.log_messages.drain(..).collect::<Vec<String>>(),
+                std::mem::take(&mut s.log_messages),
                 s.current_bytes,
                 s.total_bytes,
                 s.finished,

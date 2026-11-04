@@ -1,3 +1,6 @@
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
+
 pub mod backup;
 pub mod bulk_buf_reader;
 pub mod cli;

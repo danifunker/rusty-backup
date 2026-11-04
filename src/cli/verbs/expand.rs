@@ -137,7 +137,7 @@ fn drain(status: Arc<Mutex<ExpandStatus>>) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, step, finished, error) = match status.lock() {
             Ok(mut s) => (
-                s.log_messages.drain(..).collect::<Vec<String>>(),
+                std::mem::take(&mut s.log_messages),
                 s.current_step.clone(),
                 s.finished,
                 s.error.clone(),

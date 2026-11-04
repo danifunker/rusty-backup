@@ -14,6 +14,9 @@
 // Usage:
 //   cargo run --release --example gho_hive_splice -- PATH.GHO CORRUPT_HIVE OUT_HIVE
 
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
+
 use dsk_ghost::gho::GhoReader;
 
 fn rd_u32(b: &[u8], o: usize) -> u32 {
