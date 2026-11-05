@@ -21,8 +21,8 @@ use ratatui::Frame;
 use super::{bytes_to_lines, centered_rect, App, FilePicker, PickKind, PickResult};
 use crate::controller::commander::{
     export_choices, format_size, purpose, BrowserPaneAction, BrowserPaneController,
-    CommanderAction, CommanderController, DetailField, DisplayRow, FileDetail, HashAlgo,
-    OnConflict, RowKind, Side, ViewItemKind, MAX_CONSECUTIVE_FAILURES,
+    CommanderAction, CommanderController, DetailField, DetailMetadata, DisplayRow, FileDetail,
+    HashAlgo, OnConflict, RowKind, Side, ViewItemKind, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ChoiceSpec, ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
@@ -42,6 +42,8 @@ enum Modal {
         spec: TextSpec,
         input: String,
         edited: bool,
+        /// The dictionary entry Up / Down last put in the field (type/creator, ProDOS type).
+        suggest: Option<usize>,
     },
     Password {
         spec: PasswordSpec,
@@ -219,15 +221,24 @@ impl CommanderView {
                     input: spec.initial.clone(),
                     spec,
                     edited: false,
+                    suggest: None,
                 }),
                 Effect::AskPassword(spec) => Some(Modal::Password {
                     spec,
                     input: String::new(),
                 }),
-                Effect::CopyToClipboard(text) => Some(Modal::Show {
-                    title: "Copy (no clipboard in a terminal)".into(),
-                    text,
-                }),
+                Effect::CopyToClipboard(text) => {
+                    let sent = super::osc52_copy(text.as_str());
+                    let title = if sent {
+                        "Copied to the terminal's clipboard (OSC 52, if it allows that)"
+                    } else {
+                        "Copy (too long for the terminal's clipboard)"
+                    };
+                    Some(Modal::Show {
+                        title: title.into(),
+                        text,
+                    })
+                }
                 Effect::OpenUrl(url) => Some(Modal::Show {
                     title: "Open in a browser".into(),
                     text: url,
@@ -474,9 +485,9 @@ impl CommanderView {
                 (Window::Checksums, KeyCode::Char('c')) => Some(A::CopyChecksums),
                 (Window::Log, KeyCode::Char('c')) => Some(A::CopyLog),
                 (Window::Log, KeyCode::Char('x')) => Some(A::ClearLog),
-                (Window::Detail, KeyCode::Char('m')) => Some(A::EditDetail(DetailField::Mode)),
-                (Window::Detail, KeyCode::Char('o')) => Some(A::EditDetail(DetailField::Owner)),
-                (Window::Detail, KeyCode::Char('x')) => Some(A::EditDetail(DetailField::Xattr)),
+                (Window::Detail, KeyCode::Char(c)) if detail_field_for(c).is_some() => {
+                    detail_field_for(c).map(A::EditDetail)
+                }
                 (Window::Detail, KeyCode::Char('r')) => {
                     self.show_rsrc = !self.show_rsrc;
                     self.scroll = 0;
@@ -576,7 +587,25 @@ impl CommanderView {
                 spec,
                 input,
                 edited,
+                suggest,
             } => match code {
+                // Up / Down step through the field's dictionary, when it has one.
+                KeyCode::Up | KeyCode::Down => {
+                    let list = self.ctl.suggestions_for(spec.purpose);
+                    if !list.is_empty() {
+                        let n = list.len();
+                        let next = match (*suggest, code == KeyCode::Down) {
+                            (None, true) => 0,
+                            (None, false) => n - 1,
+                            (Some(i), true) => (i + 1) % n,
+                            (Some(i), false) => (i + n - 1) % n,
+                        };
+                        *suggest = Some(next);
+                        *input = list[next].0.clone();
+                        *edited = true;
+                    }
+                    None
+                }
                 KeyCode::Esc => Some(A::Answered {
                     purpose: spec.purpose,
                     text: None,
@@ -588,11 +617,13 @@ impl CommanderView {
                 KeyCode::Backspace => {
                     input.pop();
                     *edited = true;
+                    *suggest = None;
                     None
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     input.push(c);
                     *edited = true;
+                    *suggest = None;
                     None
                 }
                 _ => None,
@@ -852,7 +883,7 @@ impl App {
         let hint = ctl.key_hint(Command::QuickView);
         let (title, mut lines) = match ctl.quick_view_detail() {
             Some(d) => {
-                let lines = detail_lines(d, false).into_iter();
+                let lines = detail_lines(d, None, false).into_iter();
                 let lines = lines.map(|l| Line::raw(format!(" {l}"))).collect();
                 (format!("Quick view: {}", printable(&d.entry.name)), lines)
             }
@@ -1127,7 +1158,8 @@ impl App {
             }
             Some(Window::Detail) => {
                 let Some(d) = ctl.detail() else { return };
-                let mut lines = detail_lines(d, v.show_rsrc)
+                let meta = ctl.detail_metadata();
+                let mut lines = detail_lines(d, meta.as_ref(), v.show_rsrc)
                     .into_iter()
                     .map(|l| Line::raw(format!(" {l}")))
                     .collect::<Vec<_>>();
@@ -1135,13 +1167,20 @@ impl App {
                     lines.push(Line::raw(""));
                     lines.push(Line::styled(format!(" {result}"), pal.accent()));
                 }
-                let foot = match (d.editable, d.rsrc_preview.is_some()) {
-                    (true, true) => "m mode   o owner   x xattr   r fork   Esc close",
-                    (true, false) => "m mode   o owner   x xattr   Esc close",
-                    (false, true) => "r fork   Esc close",
-                    (false, false) => "Esc close",
-                };
-                (format!("File Info: {}", d.entry.name), lines, foot.into())
+                let mut keys: Vec<String> = ctl
+                    .detail_fields()
+                    .into_iter()
+                    .map(|f| format!("{} {}", detail_key(f), f.label()))
+                    .collect();
+                if d.rsrc_preview.is_some() {
+                    keys.push("r fork".into());
+                }
+                keys.push("Esc close".into());
+                (
+                    format!("File Info: {}", d.entry.name),
+                    lines,
+                    keys.join("   "),
+                )
             }
             Some(Window::Checksums) => {
                 let Some(c) = ctl.checksums() else { return };
@@ -1423,6 +1462,7 @@ impl App {
                 spec,
                 input,
                 edited,
+                suggest,
             } => {
                 let error = match (&spec.error, *edited) {
                     (Some(e), false) => Some(e.clone()),
@@ -1437,10 +1477,19 @@ impl App {
                     Some(e) => Line::styled(format!(" {e}"), pal.warn()),
                     None => Line::raw(""),
                 });
-                let enter = if ok {
-                    format!(" Enter {}   Esc cancel", spec.ok_label)
+                let list = v.ctl.suggestions_for(spec.purpose);
+                if let Some(label) = suggest.and_then(|i| list.get(i)).map(|s| s.1.clone()) {
+                    lines.push(Line::styled(format!(" {label}"), pal.dim()));
+                }
+                let browse = if list.is_empty() {
+                    ""
                 } else {
-                    " Esc cancel".to_string()
+                    "   Up/Down the list"
+                };
+                let enter = if ok {
+                    format!(" Enter {}   Esc cancel{browse}", spec.ok_label)
+                } else {
+                    format!(" Esc cancel{browse}")
                 };
                 lines.push(Line::styled(enter, pal.dim()));
                 let title = format!("{}{}", spec.title, whose(spec.purpose));
@@ -1538,8 +1587,31 @@ fn row_text(row: &DisplayRow, marked: bool, name_w: usize) -> String {
 /// Bytes of a fork File Info draws (it reads more; a terminal shows a screenful at a time).
 const PREVIEW_DRAWN: usize = 64 * 1024;
 
+/// The File Info window's key for each field it can prompt for.
+const DETAIL_KEYS: [(char, DetailField); 8] = [
+    ('m', DetailField::Mode),
+    ('o', DetailField::Owner),
+    ('x', DetailField::Xattr),
+    ('t', DetailField::TypeCreator),
+    ('p', DetailField::ProdosType),
+    ('c', DetailField::Created),
+    ('d', DetailField::Modified),
+    ('b', DetailField::Backup),
+];
+
+fn detail_field_for(c: char) -> Option<DetailField> {
+    DETAIL_KEYS.iter().find(|(k, _)| *k == c).map(|(_, f)| *f)
+}
+
+fn detail_key(field: DetailField) -> char {
+    DETAIL_KEYS
+        .iter()
+        .find(|(_, f)| *f == field)
+        .map_or('?', |(k, _)| *k)
+}
+
 /// File Info as text: the entry's metadata, extended attributes and a preview of one fork.
-fn detail_lines(d: &FileDetail, rsrc: bool) -> Vec<String> {
+fn detail_lines(d: &FileDetail, meta: Option<&DetailMetadata>, rsrc: bool) -> Vec<String> {
     let e = &d.entry;
     let mut out = vec![
         format!("Name:  {}", printable(&e.name)),
@@ -1563,6 +1635,35 @@ fn detail_lines(d: &FileDetail, rsrc: bool) -> Vec<String> {
     }
     if let Some(m) = &e.modified {
         out.push(format!("Mtime: {m}"));
+    }
+    if let Some(tc) = meta.and_then(|m| m.type_creator.as_ref()) {
+        let about = tc
+            .description
+            .map(|d| format!("  ({d})"))
+            .unwrap_or_default();
+        out.push(format!(
+            "Type / creator: {} / {}{about}",
+            printable(&tc.type_text),
+            printable(&tc.creator_text)
+        ));
+    }
+    if let Some(p) = meta.and_then(|m| m.prodos.as_ref()) {
+        let name = if p.known {
+            format!("{} - {}", p.abbr, p.description)
+        } else {
+            "unknown type".to_string()
+        };
+        out.push(format!(
+            "ProDOS type: ${:02X} {name}, aux ${:04X}",
+            p.type_byte, p.aux_type
+        ));
+    }
+    if let Some(dates) = meta.and_then(|m| m.dates.as_ref()) {
+        let none = || "-".to_string();
+        let [c, m, b] = dates;
+        out.push(format!("Created:  {}", c.clone().unwrap_or_else(none)));
+        out.push(format!("Modified: {}", m.clone().unwrap_or_else(none)));
+        out.push(format!("Backup:   {}", b.clone().unwrap_or_else(none)));
     }
     if let Some(rs) = e.resource_fork_size.filter(|n| *n > 0) {
         out.push(format!("Rsrc:  {}", format_size(rs)));
@@ -2015,6 +2116,63 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert!(view(&app).ctl.pane(side).has_folder_tree());
         assert!(screen(&app).contains("Tree"), "{}", screen(&app));
+    }
+
+    fn text_input(app: &App) -> String {
+        match &view(app).modal {
+            Some(Modal::Text { input, .. }) => input.clone(),
+            _ => panic!("no text prompt"),
+        }
+    }
+
+    /// File Info's `t` prompt steps the type/creator dictionary; `b` stages a backup date.
+    #[test]
+    fn file_info_stages_the_type_creator_and_a_date_through_its_prompts() {
+        use crate::controller::commander::screen::purpose as screen_purpose;
+        let dir = tempfile::tempdir().unwrap();
+        let img = crate::controller::test_fixtures::hfs_volume_with_text(dir.path());
+        let mut app = commander_app();
+        open_image(&mut app, &img);
+        let side = view(&app).ctl.active();
+        cursor_to(&mut app, "README");
+        app.on_key(key(KeyCode::F(3)));
+        settle(&mut app);
+        let fields = view(&app).ctl.detail_fields();
+        assert!(fields.contains(&DetailField::TypeCreator), "{fields:?}");
+        let d = view(&app).ctl.detail().unwrap();
+        let meta = view(&app).ctl.detail_metadata();
+        let text = detail_lines(d, meta.as_ref(), false).join("\n");
+        assert!(text.contains("Type / creator: TEXT / ttxt"), "{text}");
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(text_input(&app), "TEXT ttxt");
+        app.on_key(key(KeyCode::Down));
+        let list = view(&app)
+            .ctl
+            .suggestions_for(screen_purpose::DETAIL_TYPE_CREATOR);
+        assert_eq!(text_input(&app), list[0].0);
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(text_input(&app), list[list.len() - 1].0);
+        app.on_key(key(KeyCode::Enter));
+        settle(&mut app);
+        assert_eq!(staged(&app, side), 1);
+        let tc = view(&app)
+            .ctl
+            .detail_metadata()
+            .unwrap()
+            .type_creator
+            .unwrap();
+        let want = &list[list.len() - 1].0;
+        assert_eq!(&format!("{} {}", tc.type_text, tc.creator_text), want);
+        app.on_key(key(KeyCode::Char('b')));
+        for _ in 0..40 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        typing(&mut app, "1999-12-31 23:59:00");
+        app.on_key(key(KeyCode::Enter));
+        settle(&mut app);
+        assert_eq!(staged(&app, side), 2);
+        let dates = view(&app).ctl.detail_metadata().unwrap().dates.unwrap();
+        assert_eq!(dates[2].as_deref(), Some("1999-12-31 23:59:00"));
     }
 
     #[test]

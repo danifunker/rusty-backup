@@ -101,6 +101,47 @@ struct PartRow {
     size: u64,
 }
 
+/// Terminals refuse OSC 52 payloads past roughly 100 KB, so longer text is only shown.
+const OSC52_MAX: usize = 74 * 1024;
+
+/// Ask the terminal to put `text` on the clipboard (OSC 52); best effort, `false` when too long.
+fn osc52_copy(text: &str) -> bool {
+    if text.len() > OSC52_MAX {
+        return false;
+    }
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    // Tests run without a terminal; the sequence is only written to a real one.
+    if !cfg!(test) {
+        use std::io::Write as _;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(seq.as_bytes());
+        let _ = out.flush();
+    }
+    true
+}
+
+/// Standard base64 with padding, for the OSC 52 payload.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18u32, 12, 6, 0].iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(ABC[((n >> shift) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Render raw bytes for the View overlay: as text lines, or a hex dump when the
 /// content looks binary.
 fn bytes_to_lines(bytes: &[u8]) -> Vec<String> {
@@ -4871,6 +4912,17 @@ mod tests {
         ikey(&mut app, KeyCode::Enter);
         inspect_settle(&mut app);
         assert!(app.explorer.is_some());
+    }
+
+    #[test]
+    fn osc52_payloads_are_base64_and_capped() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"hello world"), "aGVsbG8gd29ybGQ=");
+        assert!(osc52_copy("short"));
+        assert!(!osc52_copy(&"x".repeat(OSC52_MAX + 1)));
     }
 
     /// A backup opened on Inspect is shared with Restore, and closing it on Restore closes both.
