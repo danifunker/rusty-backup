@@ -66,7 +66,9 @@ fn on_error_stop_ends_at_the_first_failure_and_is_the_default_without_a_terminal
     let dir = tempfile::tempdir().unwrap();
     let disc = rock_ridge(dir.path());
     for mode in [Some("stop"), None] {
-        let out = dir.path().join(format!("out-{mode:?}"));
+        let out = dir
+            .path()
+            .join(format!("out-{}", mode.unwrap_or("default")));
         let (ok, err) = extract(&disc, &out, mode);
         assert!(!ok, "{mode:?}: {err}");
         assert!(err.contains("extraction stopped at /"), "{mode:?}: {err}");
