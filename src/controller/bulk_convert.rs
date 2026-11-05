@@ -228,6 +228,8 @@ pub struct BulkConvertController {
     pending_chd: Option<ChdOptions>,
     scan_error: Option<String>,
     scan: Option<Job<std::io::Result<Vec<ScannedFile>>>>,
+    /// The format the running (or last) scan filtered for.
+    scan_format: ExportFormat,
     run: Option<Job<BulkResult>>,
     status: Arc<Mutex<Option<Arc<Mutex<BulkConvertStatus>>>>>,
     lines: Arc<Mutex<Vec<(LogLevel, String)>>>,
@@ -251,6 +253,7 @@ impl BulkConvertController {
             pending_chd: None,
             scan_error: None,
             scan: None,
+            scan_format: ExportFormat::Vhd,
             run: None,
             status: Arc::new(Mutex::new(None)),
             lines: Arc::new(Mutex::new(Vec::new())),
@@ -399,6 +402,7 @@ impl BulkConvertController {
             return;
         };
         let format = self.format;
+        self.scan_format = format;
         self.scan = Some(Job::spawn(
             "Scanning the source folder...",
             Arc::clone(&self.notify),
@@ -426,6 +430,11 @@ impl BulkConvertController {
                 }
                 self.files = files;
                 self.phase = BulkPhase::Review;
+                // The format changed while it ran: list the folder again for the new one.
+                if self.scan_format != self.format {
+                    self.extension = self.format.extension().to_string();
+                    self.start_scan();
+                }
             }
             Err(e) => self.scan_error = Some(format!("Scan failed: {e}")),
         }
