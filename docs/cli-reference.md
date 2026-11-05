@@ -431,6 +431,33 @@ Usage: show <IMAGE>
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
 
+### `build`
+
+Build a disk in one step: a partition table with each partition formatted, filled from an image or left empty, or one bare volume; to an image file or a device (`--yes`). The command-line form of the Build Disk tab: `build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`
+
+```
+Usage: build [OPTIONS] <TARGET>
+```
+
+**Arguments**
+
+- `<TARGET>` — The image file to create, or a device path (`/dev/sdX`, `/dev/diskN`, `\\.\PhysicalDriveN`) to build on. A device needs `--yes` and is built at its own size
+
+**Options**
+
+- `--size` — Disk (or volume) size for an image target, e.g. `64M`, `2G`. Ignored for a device and for a fixed-geometry volume
+- `--table` — Partition table to write. Leave it out for one bare volume (give `--fs`)
+- `--partition` — A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition
+- `--format` — Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one
+- `--fill` — Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works
+- `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
+- `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
+- `--sectors` — Sectors per track for the cylinder-aligned tables
+- `--fs` — With no `--table`: the filesystem of the one bare volume
+- `--label` — With no `--table`: the volume label
+- `--force` — Overwrite an existing image file
+- `--yes` — Required to build on a device; everything on it is erased
+
 ### `cbk`
 
 Pack a backup folder into a single `.cbk` container, or unpack one (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly

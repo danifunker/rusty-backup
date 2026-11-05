@@ -19,6 +19,7 @@ mod cli_atarist;
 mod cli_bbcmicro;
 mod cli_bbcmicro_dsd;
 mod cli_bk0011m;
+mod cli_build;
 mod cli_cbm;
 mod cli_coco;
 mod cli_coco_os9;

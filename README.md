@@ -374,8 +374,10 @@ The app has five tabs:
   label rules before it lets you go on, and a device build asks you to type
   the device path first. On a device every byte of a formatted partition is
   written, so old data on a used card cannot show through. The CLI
-  equivalents are `rb-cli new volume` and
-  `rb-cli new hd {mbr|gpt|apm|...} IMG --size 2G --partition 512M:0C:DOS --partition rest --fill 1=dos.img`.
+  equivalent is `rb-cli build`, for example
+  `rb-cli build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`,
+  or `rb-cli build /dev/sdX --table rdb --partition 500M --partition rest --format 1=pfs3:Work --format 2=sfs --yes`
+  for an SD card.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox

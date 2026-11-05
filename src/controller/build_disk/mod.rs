@@ -526,20 +526,14 @@ impl BuildDiskController {
             _ => "No output chosen".to_string(),
         });
         match self.kind {
-            DiskKind::Volume => v.push(format!(
-                "One {} volume, label {:?}",
-                self.volume.kind.display_name(),
-                self.volume.opts.label
-            )),
+            DiskKind::Volume => v.push(format!("One {} volume", self.volume.describe())),
             DiskKind::Partitioned => {
                 v.push(format!("{} partition table", self.builder.kind.label()));
                 if let Ok(placed) = self.builder.plan() {
                     for (i, (row, p)) in self.builder.rows.iter().zip(placed.iter()).enumerate() {
                         let content = match (&row.source, &row.format) {
                             (Some(path), _) => format!("from {}", path.display()),
-                            (None, Some(f)) => {
-                                format!("{} {:?}", f.kind.display_name(), f.opts.label)
-                            }
+                            (None, Some(f)) => f.describe(),
                             (None, None) => "empty".to_string(),
                         };
                         v.push(format!(
@@ -807,9 +801,9 @@ impl BuildDiskController {
         if let Some(done) = self.job.as_ref().and_then(job_outcome) {
             self.finished = self.job.take().map(|j| j.snapshot());
             let outcome = done.and_then(|r| r);
-            match &outcome {
-                Ok(()) => self.push(LogLevel::Info, "Disk build complete"),
-                Err(e) => self.push(LogLevel::Error, format!("Disk build failed: {e}")),
+            // The runner logs its own completion line.
+            if let Err(e) = &outcome {
+                self.push(LogLevel::Error, format!("Disk build failed: {e}"));
             }
             self.outcome = Some(outcome);
         }

@@ -70,6 +70,15 @@ impl RowFormat {
         RowFormat { kind, opts }
     }
 
+    /// The filesystem and, when it has one, its label: `FAT12 / FAT16 / FAT32 "DOS"`.
+    pub fn describe(&self) -> String {
+        if self.kind.caps().label_max == 0 {
+            self.kind.display_name().to_string()
+        } else {
+            format!("{} {:?}", self.kind.display_name(), self.opts.label)
+        }
+    }
+
     /// The options and label are ones this filesystem takes.
     pub fn check(&self) -> Result<(), String> {
         format::check_options(self.kind, &self.opts).map_err(|e| format!("{e:#}"))?;

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli build</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>build</span></nav>
+<h1><code>rb-cli build</code></h1>
+<p>Build a disk in one step: a partition table with each partition formatted, filled from an image or left empty, or one bare volume; to an image file or a device (`--yes`). The command-line form of the Build Disk tab: `build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`</p>
+<h2>Usage</h2>
+<pre><code>Usage: build [OPTIONS] &lt;TARGET&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;TARGET&gt;</code></dt>
+<dd>The image file to create, or a device path (`/dev/sdX`, `/dev/diskN`, `\\.\PhysicalDriveN`) to build on. A device needs `--yes` and is built at its own size</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disk (or volume) size for an image target, e.g. `64M`, `2G`. Ignored for a device and for a fixed-geometry volume</dd>
+<dt><code>--table</code></dt>
+<dd>Partition table to write. Leave it out for one bare volume (give `--fs`)</dd>
+<dt><code>--partition</code></dt>
+<dd>A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition</dd>
+<dt><code>--format</code></dt>
+<dd>Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one</dd>
+<dt><code>--fill</code></dt>
+<dd>Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works</dd>
+<dt><code>--align</code></dt>
+<dd>Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default</dd>
+<dt><code>--heads</code></dt>
+<dd>Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)</dd>
+<dt><code>--sectors</code></dt>
+<dd>Sectors per track for the cylinder-aligned tables</dd>
+<dt><code>--fs</code></dt>
+<dd>With no `--table`: the filesystem of the one bare volume</dd>
+<dt><code>--label</code></dt>
+<dd>With no `--table`: the volume label</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing image file</dd>
+<dt><code>--yes</code></dt>
+<dd>Required to build on a device; everything on it is erased</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>
