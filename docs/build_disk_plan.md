@@ -1,6 +1,6 @@
 # Build Disk: build any disk we support
 
-Feature plan, not yet started. Read
+Feature plan; work is on branch `add-build-disk` (cut from `main` 2026-11-05). Read
 [CONTRIBUTING.md § Architecture policy (MVC)](../CONTRIBUTING.md#architecture-policy-mvc--read-before-adding-any-code)
 first; it is binding. The user asked for full TUI parity including Build Disk,
 and for the feature to be planned before it is built.
@@ -265,8 +265,8 @@ Each phase ships on its own: tests green, `scripts/check-boundaries.sh`, GUI bui
 | # | Phase | Tests |
 |---|---|---|
 | 1 | G1: format dispatch in `model::format`. `rb-cli new floppy / volume` call it; byte-identical output. | existing `new-volume*.toml` tier-1 cases, plus a model test that hashes every `FsKind`'s blank volume before and after |
-| 2 | `controller::build_disk` over `DiskBuilder`; Restore's Build Disk forwards to it; GUI unchanged on screen. | `tests/ui_scenarios/restore_build_disk.toml` still passes; new `build_disk_basic.toml` |
-| 3 | TUI Build Disk screen on the controller: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list and its `NewCommand` building. | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
+| 2 | `controller::build_disk` over `DiskBuilder` with the wizard's step machine (§ 7), and the GUI's top-level **Build Disk** tab drawing it. It covers today's capability (partitioned disk, empty or image rows, image or device target); Restore's Build Disk mode moves here and leaves the Restore tab. | `tests/ui_scenarios/restore_build_disk.toml` moves to `build_disk_basic.toml`; wizard step tests (Next blocked with a reason, Back keeps entries) |
+| 3 | TUI Build Disk screen on the same steps: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list, its `NewWizard` and its `NewCommand` building. | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
 | 4 | G2 + per-row **Format** content: format each row during the build, GUI and TUI. `new hd --partition SIZE:TYPE:NAME --format N=FS[:LABEL]` on the CLI. Start with the stream-capable filesystems. | tier-1 cases per scheme: build, then `fsck` and `ls` each partition; emulator scenarios: `fat.win7-blank`-style for MBR+FAT / NTFS, `ufs1-be.solaris-blank` on a Sun label, `ufs43.nextstep-blank` on a NeXT label, FS-UAE for RDB+PFS3 / SFS |
 | 5 | Bare-volume builds in the same controller (scheme = None), a GUI New Disk dialog, every `FsKind` in the TUI (CP/M preset picker, Oric, HPFS, PFS3, SFS, EFS v1, XFS, BFS, OFS, UFS x3). | ui_scenario per class; existing `new-volume` CLI cases |
 | 6 | G5: container output in the build (CHD, VHD, QCOW2, VMDK, 2MG, WOZ, DC42, ATR, D88 ...). | tier-4 `convert.toml`-style cases; `chdman info` and MAME for CHD; `qemu-img check` |
@@ -328,3 +328,33 @@ mention creation), `docs/cli-reference.md`, `docs/platform_matrix.md`, and
    cap. Real-world maxima were given from memory; confirm each when its writer is done.
 8. **Targets:** an image file (in any container) or a physical disk, as today's Build Disk
    does; a physical disk needs its device name typed to confirm.
+
+## 7. The wizard (asked 2026-11-05)
+
+The user asked for Build Disk to be a wizard in the GUI. The steps are controller state
+(`BuildDiskController::step()`, `steps()`, `next_blocked() -> Option<String>`), so the TUI walks the
+same steps and a scenario test drives both. The CLI's `rb-cli build` skips the steps and fills
+the same `BuildRequest`; the same validators run.
+
+| # | Step | Shown for | What it asks | Next is blocked when |
+|---|---|---|---|---|
+| 1 | **Kind** | always | Floppy, single volume (no table), partitioned disk, or a preset (X68000, SGI EFS, Mac / NeXT CD, ...) | never |
+| 2 | **Disk** | floppy: format + geometry; volume: filesystem + size; partitioned: scheme + size + alignment / heads / sectors; preset: its few fields | the base shape | size outside the fs / scheme limits (the reason is shown) |
+| 3 | **Partitions** | partitioned, presets with rows | rows: size, type, name, content (empty, format with a filesystem, source image; host folder from phase 9), with the layout bar | the layout does not place, or a row's fs does not fit its size |
+| 4 | **Filesystem options** | any row or volume that formats | label and per-fs options (FAT type, cluster size, HFS+ case, ext journal, CP/M DPB, ...) per formatted row | a label breaks its fs's rules |
+| 5 | **Output** | always | image file (path + container: raw, CHD, VHD, ...) or a physical disk: an SD / CF card in a reader, a USB stick, any disk the device list shows (the Restore tab's list, with its identity check). A device fixes the disk size to its capacity, so step 2's size follows the card and `rest` fills it | no path or device; a container that cannot hold this content |
+| 6 | **Review** | always | a summary of every choice, the warnings (fs vs scheme pairings, a missing Amiga handler), and for a device the typed device-name confirmation | the device name does not match |
+| 7 | **Build** | always | progress and log of the one build job; on success "Open in Inspect" and "Build another" | (running) |
+
+Rules:
+
+- **Back never loses entries.** Changing Kind or scheme keeps what still applies (rows survive
+  a scheme change when their sizes still place; types are re-proposed per scheme).
+- The GUI shows the steps as a list on the left; any step already reached can be clicked.
+  Steps that don't apply to the chosen kind are hidden, not greyed out.
+- `next_blocked()` is the same text the GUI shows under a disabled Next and the TUI shows in
+  its status line.
+- Every step's widgets get ids under `build_disk.*` for the scenario runner.
+- Phases fill the steps in over time: phase 2 has Kind = partitioned disk only, with rows
+  holding empty or image content; phase 4 adds formatted rows and step 4; phase 5 the floppy
+  and volume kinds; phase 6 the containers in step 5; phase 9 the presets and host folders.
