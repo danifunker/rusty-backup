@@ -50,8 +50,14 @@ fn on_error_skip_carries_on_and_lists_the_skipped_entries() {
     let (ok, err) = extract(&disc, &out, Some("skip"));
     assert!(ok, "{err}");
     assert!(err.contains("warning: skipping /empty.dat:"), "{err}");
-    assert!(err.contains("skipped 3 entry/entries:"), "{err}");
-    assert!(err.contains("  /colon_name.txt: "), "{err}");
+    // A case-insensitive destination renames the second `colon_name.txt` instead.
+    if err.contains("info: case-collision: colon_name.txt -> colon_name.txt~1") {
+        assert!(err.contains("skipped 2 entry/entries:"), "{err}");
+        assert!(out.join("colon_name.txt~1").is_file(), "{err}");
+    } else {
+        assert!(err.contains("skipped 3 entry/entries:"), "{err}");
+        assert!(err.contains("  /colon_name.txt: "), "{err}");
+    }
     assert!(out.join("docs").is_dir(), "the rest was extracted");
 }
 

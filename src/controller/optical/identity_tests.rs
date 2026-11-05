@@ -286,6 +286,8 @@ pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
             Some((_, want)) if want == d => {}
             // Native forks only write on macOS; elsewhere the golden records the refusal.
             Some((_, "ERR")) if mac_native(c) && d != "ERR" => {}
+            // Windows has no symlinks and no `:` in names, and the Rock Ridge disc has both.
+            Some(_) if cfg!(windows) && c.starts_with("rr") && c.contains(" extract ") => {}
             Some((_, want)) => bad.push(format!("{c}: {d} (want {want})")),
             None => bad.push(format!("{c}: not in GOLDEN")),
         }

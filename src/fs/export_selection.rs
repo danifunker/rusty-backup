@@ -363,8 +363,10 @@ fn export_zip_file(
     let out = std::fs::File::create(out_path)
         .with_context(|| format!("creating {}", out_path.display()))?;
     let mut zw = zip::ZipWriter::new(out);
+    // Unix "made by" on every host, so an export is byte-identical everywhere.
     let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+        .compression_method(zip::CompressionMethod::Deflated)
+        .system(zip::System::Unix);
     let mut summary = ExportSummary::default();
     let base = common_parent(entries);
     for e in entries {
