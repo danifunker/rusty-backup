@@ -17,7 +17,7 @@ use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     cpm_presets, format_size, parse_size_field, purpose, BuildDiskAction, BuildDiskController,
-    DiskKind, FormatOptions, FsKind, FsOption, RowContent, Step, TableKind,
+    DiskKind, FormatOptions, FsKind, FsOption, NoNotify, RowContent, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -74,7 +74,7 @@ pub(super) struct BuildDiskState {
 impl Default for BuildDiskState {
     fn default() -> Self {
         BuildDiskState {
-            ctl: BuildDiskController::new(Arc::new(crate::model::job::NoNotify)),
+            ctl: BuildDiskController::new(Arc::new(NoNotify)),
             sel: 0,
             edit: None,
             picker: None,
