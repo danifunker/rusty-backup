@@ -300,7 +300,17 @@ pub fn extract_partition_sync(
         ctx.compacted,
         progress_cb,
         cancel_check,
-    )
+    )?;
+    if ctx.compacted {
+        // A packed volume's header still claims the packed size: grow it to the partition, as a restore does.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_path)?;
+        let mut log = |m: &str| log::info!("{m}");
+        crate::fs::resize_filesystem_for(&mut f, 0, ctx.original_size, &mut log)?;
+    }
+    Ok(())
 }
 
 /// Synchronous recompress of `temp_path` back into `ctx.archive_path`, plus the
@@ -401,3 +411,53 @@ pub fn compute_file_checksum(
 }
 
 crate::model::worker::finished_with_error!(ArchiveEditProgress);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packed FAT backup opens for editing at its partition size, with its free space back.
+    #[test]
+    fn a_compacted_fat_backup_is_edited_at_its_partition_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = 2 * 1024 * 1024u64;
+        let img = dir.path().join("vol.img");
+        std::fs::write(&img, fs_pc::fat::create_blank_fat(size, Some("T")).unwrap()).unwrap();
+        let (mut packed, result) =
+            crate::fs::compact_partition_reader(File::open(&img).unwrap(), 0, 0x01, None, false)
+                .expect("FAT compacts");
+        assert!(result.compacted_size < size, "the stream is packed");
+        let packed_path = dir.path().join("packed.img");
+        let mut out = File::create(&packed_path).unwrap();
+        std::io::copy(&mut packed, &mut out).unwrap();
+        drop(out);
+        let files = compress_file_to_archive(
+            &packed_path,
+            &dir.path().join("partition-0"),
+            "zstd",
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        let ctx = ArchiveEditContext {
+            archive_path: dir.path().join(&files[0]),
+            compression_type: "zstd".into(),
+            original_size: size,
+            compacted: true,
+            metadata_path: PathBuf::new(),
+            partition_index: 0,
+            checksum_type: "sha256".into(),
+        };
+        let temp = dir.path().join("edit.img");
+        extract_partition_sync(&ctx, &temp, &mut |_| {}, &|| false).unwrap();
+        let session = crate::model::browse_session::BrowseSession {
+            source_path: Some(temp),
+            ..Default::default()
+        };
+        let fs = session.open().unwrap();
+        let free = fs.total_size() - fs.used_size();
+        assert!(free > size / 2, "free {free} of {}", fs.total_size());
+    }
+}
