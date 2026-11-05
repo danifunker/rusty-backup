@@ -424,11 +424,7 @@ fn a_pane_prompt_answer_returns_to_the_pane_that_asked() {
 }
 
 fn ctrl(c: char) -> CommanderAction {
-    let mods = Mods {
-        ctrl: true,
-        ..Mods::default()
-    };
-    A::Key(Key::Char(c), mods)
+    A::Key(Key::Char(c), ctrl_mods())
 }
 
 #[test]
@@ -548,9 +544,8 @@ fn keymap_problems_reach_the_status_and_the_log() {
 
 fn ctrl_shift(c: char) -> CommanderAction {
     let mods = Mods {
-        ctrl: true,
         shift: true,
-        ..Mods::default()
+        ..ctrl_mods()
     };
     A::Key(Key::Char(c), mods)
 }
@@ -684,9 +679,12 @@ fn tab_visits_a_folder_tree_then_its_list_then_the_other_pane() {
     assert!(!ctl.pane(Side::Right).tree_focused());
 }
 
+/// The `Primary` modifier: Cmd on macOS, Ctrl elsewhere.
 fn ctrl_mods() -> Mods {
+    let mac = cfg!(target_os = "macos");
     Mods {
-        ctrl: true,
+        ctrl: !mac,
+        cmd: mac,
         ..Mods::default()
     }
 }

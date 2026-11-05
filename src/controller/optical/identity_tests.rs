@@ -260,6 +260,10 @@ const PANE_DIFFERS: &[(&str, &str)] = &[
     ("rr-prep fs0 preview /link", "none"),
 ];
 
+fn mac_native(case: &str) -> bool {
+    cfg!(target_os = "macos") && case.ends_with(" Native")
+}
+
 /// Check `got` against `GOLDEN`, `differs` excepted (or print it with `RB_IDENTITY_PRINT=1`).
 pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
     if std::env::var("RB_IDENTITY_PRINT").is_ok() {
@@ -275,6 +279,8 @@ pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
         }
         match GOLDEN.iter().find(|(g, _)| g == c) {
             Some((_, want)) if want == d => {}
+            // Native forks only write on macOS; elsewhere the golden records the refusal.
+            Some((_, "ERR")) if mac_native(c) && d != "ERR" => {}
             Some((_, want)) => bad.push(format!("{c}: {d} (want {want})")),
             None => bad.push(format!("{c}: not in GOLDEN")),
         }
