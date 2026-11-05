@@ -3380,6 +3380,21 @@ fn write_u32(buf: &mut [u8], o: usize, v: u32) {
 /// - `numreserved` is computed from the actual BM-block count needed,
 ///   floored at 32 (the original budget) and with 8 blocks of headroom.
 pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let mut cur = std::io::Cursor::new(Vec::new());
+    let len = write_blank_pfs3_into(&mut cur, 0, total_sectors, name)?;
+    let mut img = cur.into_inner();
+    img.resize(len as usize, 0);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_pfs3`]: writes the boot block and the used reserved
+/// blocks at `at_offset` (a few MiB at most) and returns the volume's length.
+pub fn write_blank_pfs3_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    total_sectors: u32,
+    name: &str,
+) -> Result<u64, FilesystemError> {
     // Bump resblksize when the volume is large enough that BM blocks
     // exceed `indexperblock` at the small size. 1024-byte reserved
     // blocks give indexperblock=253; at 8096 sectors per BM that
@@ -3468,7 +3483,8 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     let rb_to_sector = |idx: u32| -> u32 { first_reserved + idx * rscluster };
     let rb_to_offset = |idx: u32| -> usize { rb_to_sector(idx) as usize * 512 };
 
-    let mut img = vec![0u8; total_sectors as usize * 512];
+    // Everything written lies before the first unused reserved block; the rest reads as zero.
+    let mut img = vec![0u8; rb_to_offset(used_rb)];
 
     // === Boot block at HW sector 0 ===
     img[0..4].copy_from_slice(b"PFS\x01");
@@ -3601,7 +3617,9 @@ pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, File
     write_u32(&mut img, db + 16, 0); // parent
                                      // entries at +20: empty (first byte already 0)
 
-    Ok(img)
+    w.seek(SeekFrom::Start(at_offset))?;
+    w.write_all(&img)?;
+    Ok(u64::from(total_sectors) * 512)
 }
 
 // === PFS3 in-place resize ===================================================
@@ -4161,6 +4179,247 @@ fn pfs3_write_rootblock(
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
+        // Bump resblksize when the volume is large enough that BM blocks
+        // exceed `indexperblock` at the small size. 1024-byte reserved
+        // blocks give indexperblock=253; at 8096 sectors per BM that
+        // covers volumes up to ~1 GB in a single MI. Beyond that, jump
+        // to 4096-byte reserved blocks (indexperblock=1021, 32672 sectors
+        // per BM, single MI handles ~33 GB volumes).
+        const RESBLK_BUMP_THRESHOLD_SECTORS: u32 = 2_000_000; // ~1 GB
+        let resblksize: u32 = if total_sectors > RESBLK_BUMP_THRESHOLD_SECTORS {
+            4096
+        } else {
+            PFS3_BLANK_RESBLKSIZE
+        };
+        let rscluster = resblksize / HW_SECTOR_U32;
+        let first_reserved = PFS3_BLANK_FIRST_RESERVED;
+        let longsperbmb = (resblksize - 12) / 4;
+        let sectors_per_bmb = longsperbmb * 32;
+        let indexperblock = (resblksize - 12) / 4;
+        let anodesperblock = (resblksize - 16) / 12;
+
+        // Compute numreserved from estimated need. The dependency on
+        // data_sectors (= total - last_reserved - 1) is weak —
+        // last_reserved grows linearly with numreserved but reserved
+        // overhead lands well under 1% of total_sectors at the budgets
+        // below — so a one-shot upper-bound estimate is safe.
+        //
+        // Budget categories:
+        //   6 fixed: root, ext, mi, ib0, ab0, rootdir
+        //   no_bmb:  one BM block per `sectors_per_bmb` data sectors
+        //   no_ab:   estimated anodeblocks for the file/dir population.
+        //            Worst-case Amiga workload: ~1 entry per 4 KB of data
+        //            (real images run 5-10 KB/entry; 4 KB is conservative).
+        //   no_ib_extra: indexblocks beyond the first one (added by
+        //                `alloc_new_indexblock` when an AB chain crosses
+        //                an IB boundary).
+        //   headroom: 16 blocks of allocator slack.
+        let approx_no_bmb = (total_sectors as u64).div_ceil(sectors_per_bmb as u64);
+        let est_anodes = (total_sectors as u64).div_ceil(8); // sectors / 8 = ~1 per 4 KB
+        let approx_no_ab = est_anodes.div_ceil(anodesperblock as u64);
+        let approx_no_ib_extra = approx_no_ab
+            .div_ceil(indexperblock as u64)
+            .saturating_sub(1);
+        let required_reserved = 6u64 + approx_no_bmb + approx_no_ab + approx_no_ib_extra + 16;
+        // small_indexblocks has 99 slots; if `approx_no_ib_extra + 1 > 99`
+        // we'd need supermode (not yet implemented in the writer). Cap
+        // accordingly and error out below if the math demands more.
+        let numreserved = required_reserved.max(PFS3_BLANK_NUMRESERVED as u64) as u32;
+        let last_reserved = first_reserved + rscluster * numreserved - 1;
+
+        // Need at least last_reserved + 1 data sector beyond.
+        if total_sectors < last_reserved + 8 {
+            return Err(parse_err(format!(
+                "PFS3 formatter: total_sectors {} too small (need > {})",
+                total_sectors,
+                last_reserved + 8
+            )));
+        }
+
+        let bitmap_start_sector = last_reserved + 1;
+        let data_sectors = total_sectors - bitmap_start_sector;
+        let no_bmb = data_sectors.div_ceil(sectors_per_bmb);
+        if no_bmb > indexperblock {
+            return Err(parse_err(format!(
+                "PFS3 formatter: disk too large for single MI block ({} BM > {} index slots); \
+                 multi-MI / supermode formatting not yet implemented",
+                no_bmb, indexperblock
+            )));
+        }
+        let anodesperblock = (resblksize - 16) / 12;
+
+        // Reserved-block index assignments.
+        let rb_idx_root = 0u32;
+        let rb_idx_ext = 1u32;
+        let rb_idx_mi = 2u32;
+        let rb_idx_bm0 = 3u32;
+        let rb_idx_ib0 = rb_idx_bm0 + no_bmb;
+        let rb_idx_ab0 = rb_idx_ib0 + 1;
+        let rb_idx_rootdir = rb_idx_ab0 + 1;
+        let used_rb = rb_idx_rootdir + 1;
+        if used_rb > numreserved {
+            return Err(parse_err(format!(
+                "PFS3 formatter: reserved-block budget exceeded ({} > {})",
+                used_rb, numreserved
+            )));
+        }
+
+        let rb_to_sector = |idx: u32| -> u32 { first_reserved + idx * rscluster };
+        let rb_to_offset = |idx: u32| -> usize { rb_to_sector(idx) as usize * 512 };
+
+        let mut img = vec![0u8; total_sectors as usize * 512];
+
+        // === Boot block at HW sector 0 ===
+        img[0..4].copy_from_slice(b"PFS\x01");
+
+        // === Rootblock at RB 0 ===
+        let rb = rb_to_offset(rb_idx_root);
+        img[rb..rb + 4].copy_from_slice(b"PFS\x01");
+        let options =
+            MODE_HARDDISK | MODE_SPLITTED_ANODES | MODE_EXTENSION | MODE_DATESTAMP | MODE_LONGFN;
+        write_u32(&mut img, rb + 4, options);
+        write_u32(&mut img, rb + 8, 1); // datestamp
+                                        // creationday/min/tick at 12..18: zero
+        img[rb + 18] = 0xf0; // protection
+        let n = name.as_bytes();
+        let n_len = n.len().min(31);
+        img[rb + 20] = n_len as u8;
+        img[rb + 21..rb + 21 + n_len].copy_from_slice(&n[..n_len]);
+        write_u32(&mut img, rb + 52, last_reserved);
+        write_u32(&mut img, rb + 56, first_reserved);
+        let reserved_free = numreserved - used_rb;
+        write_u32(&mut img, rb + 60, reserved_free);
+        write_u16(&mut img, rb + 64, resblksize as u16);
+        write_u16(&mut img, rb + 66, 1); // rblkcluster: 1 reserved block
+        write_u32(&mut img, rb + 68, data_sectors); // blocks_free
+                                                    // alwaysfree at 72: 0
+                                                    // roving_ptr at 76: 0
+                                                    // deldir at 80: 0
+        write_u32(&mut img, rb + 84, total_sectors); // disksize (HW sectors)
+        write_u32(&mut img, rb + 88, rb_to_sector(rb_idx_ext)); // extension blocknr
+                                                                // not_used at 92: 0
+                                                                // Small layout starts at offset 96:
+                                                                //   bitmapindex[5] @ 96..116
+                                                                //   indexblocks[99] @ 116..512
+        write_u32(&mut img, rb + 96, rb_to_sector(rb_idx_mi));
+        write_u32(&mut img, rb + 116, rb_to_sector(rb_idx_ib0));
+
+        // === Reserved bitmap immediately after the rootblock (offset 512) ===
+        let bm_res = rb + 512;
+        write_u16(&mut img, bm_res, ID_BITMAPBLOCK);
+        write_u32(&mut img, bm_res + 4, 1); // datestamp
+                                            // seqnr at +8: 0
+                                            // bitmap[] starts at +12: bit i (MSB-first within each u32) = reserved
+                                            // block i is FREE when 1, ALLOCATED when 0 (AmigaDOS convention).
+                                            // We mark blocks 0..used_rb allocated and the rest free.
+        let words = numreserved.div_ceil(32) as usize;
+        for w in 0..words {
+            let mut word: u32 = 0;
+            for bit in 0..32u32 {
+                let res_idx = w as u32 * 32 + bit;
+                if res_idx >= numreserved {
+                    break;
+                }
+                if res_idx >= used_rb {
+                    word |= 1u32 << (31 - bit);
+                }
+            }
+            write_u32(&mut img, bm_res + 12 + w * 4, word);
+        }
+
+        // === Rootblock extension at RB 1 ===
+        let ext = rb_to_offset(rb_idx_ext);
+        write_u16(&mut img, ext, ID_EXTENSIONBLOCK);
+        write_u32(&mut img, ext + 8, 1); // datestamp
+                                         // fnsize at +56: long-filename ceiling. Standard PFS3 is 32
+                                         // (=> 31 chars + NUL); we use the LONGFN max of 107 to match
+                                         // real-world AmigaVision-style volumes whose direntries carry
+                                         // names > 30 bytes. `build_direntry` enforces the same cap.
+        write_u16(&mut img, ext + 56, 107);
+
+        // === Bitmap-index block (MI) at RB 2 ===
+        let mi = rb_to_offset(rb_idx_mi);
+        write_u16(&mut img, mi, ID_BITMAPINDEXBLOCK);
+        write_u32(&mut img, mi + 4, 1); // datestamp
+                                        // seqnr at +8: 0
+                                        // index[N] starts at +12; populate with BM block sectors.
+        for i in 0..no_bmb {
+            write_u32(
+                &mut img,
+                mi + 12 + i as usize * 4,
+                rb_to_sector(rb_idx_bm0 + i),
+            );
+        }
+
+        // === Data bitmap (BM) blocks ===
+        // Each BM holds `longsperbmb` u32 words; all 1s = all free.
+        for i in 0..no_bmb {
+            let bm = rb_to_offset(rb_idx_bm0 + i);
+            write_u16(&mut img, bm, ID_BITMAPBLOCK);
+            write_u32(&mut img, bm + 4, 1); // datestamp
+            write_u32(&mut img, bm + 8, i); // seqnr
+            for w in 0..longsperbmb as usize {
+                write_u32(&mut img, bm + 12 + w * 4, 0xFFFF_FFFF);
+            }
+        }
+
+        // === Anode-index block (IB) at rb_idx_ib0 ===
+        let ib = rb_to_offset(rb_idx_ib0);
+        write_u16(&mut img, ib, ID_INDEXBLOCK);
+        write_u32(&mut img, ib + 4, 1); // datestamp
+                                        // seqnr at +8: 0
+                                        // index[0] = anodeblock 0 sector
+        write_u32(&mut img, ib + 12, rb_to_sector(rb_idx_ab0));
+
+        // === Anodeblock 0 (AB) at rb_idx_ab0 ===
+        let ab = rb_to_offset(rb_idx_ab0);
+        write_u16(&mut img, ab, ID_ANODEBLOCK);
+        write_u32(&mut img, ab + 4, 1); // datestamp
+                                        // seqnr at +8: 0
+                                        // Anodes 0..4: blocknr=0xFFFFFFFF (taken sentinel, per AllocAnode).
+        for slot in 0..ANODE_ROOTDIR as usize {
+            let aoff = ab + 16 + slot * 12;
+            write_u32(&mut img, aoff, 0); // clustersize
+            write_u32(&mut img, aoff + 4, 0xFFFF_FFFF); // blocknr sentinel
+            write_u32(&mut img, aoff + 8, 0); // next
+        }
+        // Anode 5 (ROOTDIR): clustersize=1, blocknr=rootdir sector, next=0.
+        let aoff_root = ab + 16 + ANODE_ROOTDIR as usize * 12;
+        write_u32(&mut img, aoff_root, 1);
+        write_u32(&mut img, aoff_root + 4, rb_to_sector(rb_idx_rootdir));
+        write_u32(&mut img, aoff_root + 8, 0);
+        // Anodes 6..anodesperblock-1: zero = free (already zeroed).
+        let _ = anodesperblock;
+
+        // === Root dirblock (DB) at rb_idx_rootdir ===
+        let db = rb_to_offset(rb_idx_rootdir);
+        write_u16(&mut img, db, ID_DIRBLOCK);
+        write_u32(&mut img, db + 4, 1); // datestamp
+                                        // not_used_2 at +8: 0 (2 UWORDs)
+        write_u32(&mut img, db + 12, ANODE_ROOTDIR); // anodenr
+        write_u32(&mut img, db + 16, 0); // parent
+                                         // entries at +20: empty (first byte already 0)
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        // The last size takes the 4 KiB reserved-block path, and 1 GiB in RAM on the old side.
+        let big: &[u32] = if cfg!(target_pointer_width = "64") {
+            &[2_100_000]
+        } else {
+            &[]
+        };
+        for &sectors in [2048u32, 20_000, 200_000].iter().chain(big) {
+            let old = old_create_blank_pfs3(sectors, "Work").unwrap();
+            let new = create_blank_pfs3(sectors, "Work").unwrap();
+            assert!(old == new, "{sectors} sectors differ");
+        }
+    }
     use super::*;
 
     #[test]

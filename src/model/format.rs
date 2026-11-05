@@ -299,15 +299,15 @@ impl FsKind {
             FsKind::Xfs => c(32 * MIB, 16 * TIB, true, 12),
             FsKind::Affs => FsCaps {
                 options: &[AffsVariant],
-                ..c(32 * KIB, 2 * TIB, false, 30)
+                ..c(32 * KIB, 2 * TIB, true, 30)
             },
-            FsKind::Pfs3 => c(MIB, 2 * TIB, false, 30),
-            FsKind::Sfs => c(32 * KIB, 2 * TIB, false, 30),
+            FsKind::Pfs3 => c(MIB, 2 * TIB, true, 30),
+            FsKind::Sfs => c(32 * KIB, 2 * TIB, true, 30),
             FsKind::Ntfs => FsCaps {
                 options: &[ClusterSize, SectorSize],
                 ..c(2 * MIB, 16 * TIB, true, 32)
             },
-            FsKind::Hpfs => c(MIB, 64 * GIB, false, 11),
+            FsKind::Hpfs => c(MIB, 64 * GIB, true, 11),
             FsKind::Ext => c(256 * KIB, 16 * TIB, true, 16),
             FsKind::Ext3 | FsKind::Ext4 => c(8 * MIB, 16 * TIB, true, 16),
             FsKind::Prodos => c(8 * KIB, 32 * MIB, false, 15),
@@ -344,9 +344,9 @@ impl FsKind {
             FsKind::Oric => fixed(178_432, 8),
             FsKind::Bfs => FsCaps {
                 options: &[BlockSize, BigEndian],
-                ..c(72 * MIB, 2 * TIB, false, 31)
+                ..c(72 * MIB, 2 * TIB, true, 31)
             },
-            FsKind::Ofs => c(64 * KIB, 2 * TIB, false, 31),
+            FsKind::Ofs => c(64 * KIB, 2 * TIB, true, 31),
             FsKind::Mfs => FsCaps {
                 floppy: true,
                 volume: false,
@@ -580,25 +580,27 @@ pub fn format_into<W: Write + Seek>(
             let len = fs_xfs::xfs::format::write_blank_xfs(w, 0, size, label)?;
             Ok(done(len, format!("XFS v5, volume {label:?}")))
         }
-        FsKind::Affs => in_ram(w, "AFFS", label, || {
-            fs_amiga::affs::create_blank_affs(size, opts.affs_variant, label)
-        }),
-        FsKind::Pfs3 => in_ram(w, "PFS3", label, || {
-            Ok(fs_amiga::pfs3::create_blank_pfs3(
-                blocks_512(size, "PFS3")?,
-                label,
-            )?)
-        }),
-        FsKind::Sfs => in_ram(w, "SFS", label, || {
-            Ok(fs_amiga::sfs::create_blank_sfs(
-                blocks_512(size, "SFS")?,
-                label,
-            )?)
-        }),
+        FsKind::Affs => {
+            let len = fs_amiga::affs::write_blank_affs_into(w, 0, size, opts.affs_variant, label)?;
+            Ok(done(
+                len,
+                format!("AFFS DOS\\{}, volume {label:?}", opts.affs_variant),
+            ))
+        }
+        FsKind::Pfs3 => {
+            let len =
+                fs_amiga::pfs3::write_blank_pfs3_into(w, 0, blocks_512(size, "PFS3")?, label)?;
+            Ok(done(len, format!("PFS3, volume {label:?}")))
+        }
+        FsKind::Sfs => {
+            let len = fs_amiga::sfs::write_blank_sfs_into(w, 0, blocks_512(size, "SFS")?, label)?;
+            Ok(done(len, format!("SFS, volume {label:?}")))
+        }
         FsKind::Ntfs => format_ntfs(w, size, opts),
-        FsKind::Hpfs => in_ram(w, "HPFS", label, || {
-            Ok(fs_hpfs::hpfs::create_blank_hpfs(size, label)?)
-        }),
+        FsKind::Hpfs => {
+            let len = fs_hpfs::hpfs::write_blank_hpfs_into(w, 0, size, label)?;
+            Ok(done(len, format!("HPFS, volume {label:?}")))
+        }
         FsKind::Ext => {
             let len = fs_unix::ext_format::write_blank_ext2(w, 0, size, label)?;
             Ok(done(len, format!("ext2, volume {label:?}")))
@@ -655,15 +657,13 @@ pub fn format_into<W: Write + Seek>(
                 fs_unix::bfs::BfsEndian::Little
             };
             let bs = opts.block_size.unwrap_or(1024);
-            in_ram(w, "BFS", label, || {
-                Ok(fs_unix::bfs_write::create_blank_bfs(
-                    size, bs, label, endian,
-                )?)
-            })
+            let len = fs_unix::bfs_write::write_blank_bfs_into(w, 0, size, bs, label, endian)?;
+            Ok(done(len, format!("BFS, block size {bs}, volume {label:?}")))
         }
-        FsKind::Ofs => in_ram(w, "BeOS OFS", label, || {
-            Ok(fs_unix::ofs_write::create_blank_ofs(size, label)?)
-        }),
+        FsKind::Ofs => {
+            let len = fs_unix::ofs_write::write_blank_ofs_into(w, 0, size, label)?;
+            Ok(done(len, format!("BeOS OFS, volume {label:?}")))
+        }
         FsKind::Mfs => in_ram(w, "MFS", label, || {
             fs_mac::mfs::create_blank_mfs(size, label).map_err(|e| anyhow!("{e}"))
         }),
