@@ -372,7 +372,9 @@ The app has five tabs:
   Backup can create, filled from a source image, or left empty; its type
   follows the filesystem. The wizard checks each filesystem's size limits and
   label rules before it lets you go on, and a device build asks you to type
-  the device path first. On a device every byte of a formatted partition is
+  the device path first. An image file can be saved raw or encoded into VHD,
+  QCOW2, VMDK, CHD, 2MG, DiskCopy 4.2, WOZ or MOOF; the file name's extension
+  picks one. On a device every byte of a formatted partition is
   written, so old data on a used card cannot show through. The CLI
   equivalent is `rb-cli build`, for example
   `rb-cli build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`,

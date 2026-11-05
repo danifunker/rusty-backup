@@ -24,6 +24,7 @@ pub use crate::device::DiskDevice;
 pub use crate::model::format::{FormatOptions, FsCaps, FsKind, FsOption};
 pub use crate::model::job::NoNotify;
 pub use crate::partition::type_catalog::TableKind;
+pub use crate::rbformats::export::ExportFormat;
 pub use disk_core::display::format_size;
 
 /// A label the user typed on `old`, kept when switching to `fs` if it fits there.
@@ -32,6 +33,63 @@ fn typed_label(old: &RowFormat, fs: FsKind) -> Option<String> {
     let max = fs.caps().label_max;
     let typed = label != RowFormat::new(old.kind).opts.label;
     (typed && max > 0 && label.len() <= max).then(|| label.to_string())
+}
+
+/// The containers an image output can be encoded into, raw first.
+pub fn containers() -> Vec<ExportFormat> {
+    let mut v = vec![
+        ExportFormat::Raw,
+        ExportFormat::Vhd,
+        ExportFormat::VhdDynamic,
+        ExportFormat::Qcow2,
+        ExportFormat::VmdkSparse,
+    ];
+    if cfg!(feature = "chd") {
+        v.push(ExportFormat::Chd);
+    }
+    v.extend([
+        ExportFormat::TwoMg,
+        ExportFormat::Dc42,
+        ExportFormat::Woz,
+        ExportFormat::Moof,
+    ]);
+    v
+}
+
+/// The container a file name's extension asks for, if it names one.
+pub fn container_for_path(path: &Path) -> Option<ExportFormat> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "img" | "raw" | "bin" | "hdf" | "dsk" | "hfv" | "iso" => ExportFormat::Raw,
+        "vhd" => ExportFormat::Vhd,
+        "qcow2" => ExportFormat::Qcow2,
+        "vmdk" => ExportFormat::VmdkSparse,
+        "chd" if cfg!(feature = "chd") => ExportFormat::Chd,
+        "2mg" => ExportFormat::TwoMg,
+        "dc42" | "image" => ExportFormat::Dc42,
+        "woz" => ExportFormat::Woz,
+        "moof" => ExportFormat::Moof,
+        _ => return None,
+    })
+}
+
+/// Why `fmt` cannot hold a disk of `size` bytes, for the containers fixed to floppy sizes.
+fn container_refuses(fmt: ExportFormat, size: u64) -> Option<String> {
+    let sizes: &[u64] = match fmt {
+        ExportFormat::Woz => &[143_360, 409_600, 819_200],
+        ExportFormat::Moof => &[409_600, 819_200],
+        ExportFormat::Dc42 => &[409_600, 737_280, 819_200, 1_474_560],
+        _ => return None,
+    };
+    (!sizes.contains(&size)).then(|| {
+        let list: Vec<String> = sizes.iter().map(|s| format_size(*s)).collect();
+        format!(
+            "{} holds only floppies of {}, not {}",
+            fmt.description(),
+            list.join(" / "),
+            format_size(size)
+        )
+    })
 }
 
 /// The CP/M disk formats a CP/M volume can take, by preset name.
@@ -150,6 +208,8 @@ pub enum BuildDiskAction {
     GoTo(Step),
     SetKind(DiskKind),
     SetOutputIsDevice(bool),
+    /// The container an image output is encoded into.
+    SetContainer(ExportFormat),
     SelectDevice {
         row: usize,
         device: DiskDevice,
@@ -208,6 +268,7 @@ pub struct BuildDiskController {
     output_is_device: bool,
     device: Option<(usize, DiskDevice)>,
     image: Option<PathBuf>,
+    container: ExportFormat,
     confirm_text: String,
     source_row: Option<usize>,
     probe: Option<(usize, Job<(PathBuf, u64)>)>,
@@ -229,6 +290,7 @@ impl BuildDiskController {
             output_is_device: false,
             device: None,
             image: None,
+            container: ExportFormat::Raw,
             confirm_text: String::new(),
             source_row: None,
             probe: None,
@@ -294,6 +356,11 @@ impl BuildDiskController {
 
     pub fn image(&self) -> Option<&Path> {
         self.image.as_deref()
+    }
+
+    /// The container an image output is encoded into (a device is always raw).
+    pub fn container(&self) -> ExportFormat {
+        self.container
     }
 
     pub fn size_text(&self) -> &str {
@@ -506,6 +573,15 @@ impl BuildDiskController {
                 return Some(format!("{}: {e}", step.label()));
             }
         }
+        if !self.output_is_device {
+            if let Some(why) = self
+                .disk_size()
+                .ok()
+                .and_then(|size| container_refuses(self.container, size))
+            {
+                return Some(why);
+            }
+        }
         match self.confirm_expected() {
             Some(want) if self.confirm_text != want => {
                 Some(format!("Type the device path `{want}` to confirm."))
@@ -522,7 +598,14 @@ impl BuildDiskController {
             (Some((_, d)), true, _) => {
                 format!("Write to {} ({size}), erasing it", d.display_name())
             }
-            (_, false, Some(p)) => format!("Save as {} ({size})", p.display()),
+            (_, false, Some(p)) if self.container == ExportFormat::Raw => {
+                format!("Save as {} ({size})", p.display())
+            }
+            (_, false, Some(p)) => format!(
+                "Save as {} ({size}), encoded as {}",
+                p.display(),
+                self.container.description()
+            ),
             _ => "No output chosen".to_string(),
         });
         match self.kind {
@@ -653,7 +736,12 @@ impl BuildDiskController {
             return;
         };
         match which {
-            purpose::OUTPUT_IMAGE => self.image = Some(path),
+            purpose::OUTPUT_IMAGE => {
+                if let Some(c) = container_for_path(path.as_path()) {
+                    self.container = c;
+                }
+                self.image = Some(path);
+            }
             purpose::ROW_SOURCE => {
                 let Some(row) = self.source_row.take() else {
                     return;
@@ -751,6 +839,7 @@ impl BuildDiskController {
             LogLevel::Info,
             format!("Building on {} ({})", target.display(), format_size(size)),
         );
+        let container = (!self.output_is_device).then_some(self.container);
         let sink = Arc::clone(&self.log);
         self.outcome = None;
         self.finished = None;
@@ -760,7 +849,7 @@ impl BuildDiskController {
             Arc::clone(&self.notify),
             move |ctx| {
                 ctx.set_phase("Writing the disk...");
-                let status = crate::model::provision_runner::start_build(request);
+                let status = crate::model::provision_runner::start_build(request, container);
                 let mut logged = 0;
                 crate::model::worker::wait_spawned(ctx, &status, |s, ctx| {
                     if let Ok(mut l) = sink.lock() {
@@ -869,6 +958,7 @@ impl Controller for BuildDiskController {
             _ if !editable => {}
             BuildDiskAction::SetKind(k) => self.kind = k,
             BuildDiskAction::SetOutputIsDevice(on) => self.output_is_device = on,
+            BuildDiskAction::SetContainer(c) => self.container = c,
             BuildDiskAction::SelectDevice { row, device } => {
                 self.device = Some((row, device));
                 self.confirm_text.clear();

@@ -116,3 +116,68 @@ fn refusals_name_the_reason() {
     ]);
     assert!(!ok && out.contains("only 1"), "{out}");
 }
+
+/// The target's extension picks the container; each one opens through Inspect.
+#[test]
+fn containers_follow_the_extension_and_open() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, magic, at_end) in [
+        ("disk.chd", &b"MComprHD"[..], false),
+        ("disk.vhd", &b"conectix"[..], true),
+        ("disk.qcow2", &b"QFI\xfb"[..], false),
+    ] {
+        let img = dir.path().join(name);
+        let s = img.to_str().unwrap();
+        run(&[
+            "build",
+            s,
+            "--size",
+            "32M",
+            "--table",
+            "mbr",
+            "--format",
+            "1=fat:CONT",
+        ]);
+        let bytes = std::fs::read(&img).unwrap();
+        let found = if at_end {
+            bytes[bytes.len() - 512..].starts_with(magic)
+        } else {
+            bytes.starts_with(magic)
+        };
+        assert!(found, "{name} has no {magic:?} header");
+        let info = run(&["inspect", s]);
+        assert!(info.contains("MBR"), "{name}: {info}");
+        assert!(
+            !dir.path().join(format!("{name}.rbtmp.img")).exists(),
+            "the temp raw is gone"
+        );
+    }
+}
+
+#[test]
+fn a_floppy_container_is_refused_for_a_disk_it_cannot_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("big.woz");
+    let (ok, out) = run_raw(&[
+        "build",
+        img.to_str().unwrap(),
+        "--size",
+        "16M",
+        "--fs",
+        "prodos",
+    ]);
+    assert!(!ok && out.contains("WOZ"), "{out}");
+    let dc = dir.path().join("mac.dc42");
+    run(&[
+        "build",
+        dc.to_str().unwrap(),
+        "--size",
+        "800K",
+        "--fs",
+        "hfs",
+        "--label",
+        "Mac",
+    ]);
+    let info = run(&["inspect", dc.to_str().unwrap()]);
+    assert!(info.contains("HFS"), "{info}");
+}

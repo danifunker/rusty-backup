@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
-    cpm_presets, format_size, ids, parse_size_field, BuildDiskAction, BuildDiskController,
-    DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, RowContent, Step,
+    containers, cpm_presets, format_size, ids, parse_size_field, BuildDiskAction,
+    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, RowContent, Step,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -236,6 +236,28 @@ impl BuildDiskTab {
                     self.act(BuildDiskAction::PickOutputImage);
                 }
             });
+            let cur = self.ctl.container();
+            let mut picked = None;
+            ui.horizontal(|ui| {
+                ui.label("Format:");
+                egui::ComboBox::from_id_salt("build_disk_container")
+                    .selected_text(cur.description())
+                    .show_ui(ui, |ui| {
+                        for c in containers() {
+                            if ui.selectable_label(c == cur, c.description()).clicked() {
+                                picked = Some(c);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "The disk is built raw, then encoded into this container. The file \
+                         name's extension picks one when you save.",
+                    );
+            });
+            if let Some(c) = picked {
+                self.act(BuildDiskAction::SetContainer(c));
+            }
             return;
         }
         let current = self

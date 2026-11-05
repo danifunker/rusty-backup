@@ -14,7 +14,8 @@ use clap::{Args, ValueEnum};
 
 use crate::cli::logging::log_stderr;
 use crate::controller::build_disk::{
-    purpose, BuildDiskAction as A, BuildDiskController, DiskKind, FsKind, NoNotify, Step, TableKind,
+    containers, purpose, BuildDiskAction as A, BuildDiskController, DiskKind, ExportFormat, FsKind,
+    NoNotify, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::Controller as _;
@@ -52,6 +53,40 @@ impl BuildTable {
             BuildTable::Next => TableKind::Next,
             BuildTable::SolarisX86 => TableKind::SolarisX86,
             BuildTable::Atari => TableKind::Atari,
+        }
+    }
+}
+
+/// The containers `build` can encode an image into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BuildContainer {
+    Raw,
+    Vhd,
+    #[value(name = "vhd-dynamic")]
+    VhdDynamic,
+    Qcow2,
+    Vmdk,
+    Chd,
+    #[value(name = "2mg")]
+    TwoMg,
+    Dc42,
+    Woz,
+    Moof,
+}
+
+impl BuildContainer {
+    fn format(self) -> ExportFormat {
+        match self {
+            BuildContainer::Raw => ExportFormat::Raw,
+            BuildContainer::Vhd => ExportFormat::Vhd,
+            BuildContainer::VhdDynamic => ExportFormat::VhdDynamic,
+            BuildContainer::Qcow2 => ExportFormat::Qcow2,
+            BuildContainer::Vmdk => ExportFormat::VmdkSparse,
+            BuildContainer::Chd => ExportFormat::Chd,
+            BuildContainer::TwoMg => ExportFormat::TwoMg,
+            BuildContainer::Dc42 => ExportFormat::Dc42,
+            BuildContainer::Woz => ExportFormat::Woz,
+            BuildContainer::Moof => ExportFormat::Moof,
         }
     }
 }
@@ -113,6 +148,12 @@ pub struct BuildArgs {
     /// With no `--table`: the volume label.
     #[arg(long)]
     pub label: Option<String>,
+
+    /// Container to encode an image target into: raw, vhd, vhd-dynamic,
+    /// qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the
+    /// target's extension names (`.chd`, `.vhd`, ...), else raw.
+    #[arg(long, value_enum)]
+    pub container: Option<BuildContainer>,
 
     /// Overwrite an existing image file.
     #[arg(long)]
@@ -188,6 +229,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         );
     }
     act(&mut c, A::SetSize(args.size.clone()));
+    if let Some(k) = args.container {
+        if device {
+            bail!("--container is for an image target; a device is written raw");
+        }
+        let fmt = k.format();
+        if !containers().contains(&fmt) {
+            bail!("this build has no {} support", fmt.description());
+        }
+        act(&mut c, A::SetContainer(fmt));
+    }
 
     match args.table {
         None => {

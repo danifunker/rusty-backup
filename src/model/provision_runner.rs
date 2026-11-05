@@ -28,6 +28,7 @@ use crate::model::physical_write_runner::{self, PhysicalWriteStatus, WriteExtent
 use crate::os::{open_target_preserving, SectorAlignedWriter};
 use crate::partition::provision::{self, Geometry, Placed};
 use crate::partition::type_catalog::TableKind;
+use crate::rbformats::export::ExportFormat;
 
 /// Inputs for a build-a-disk job.
 #[derive(Debug, Clone)]
@@ -132,40 +133,134 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
     status
 }
 
-/// Spawn any build: a partitioned disk or a bare volume.
-pub fn start_build(req: BuildRequest) -> Arc<Mutex<PhysicalWriteStatus>> {
-    match req {
-        BuildRequest::Partitioned(p) => start_provision(p),
+impl BuildRequest {
+    pub fn target_path(&self) -> &std::path::Path {
+        match self {
+            BuildRequest::Partitioned(p) => p.target_path.as_path(),
+            BuildRequest::Volume { target_path, .. } => target_path.as_path(),
+        }
+    }
+
+    fn set_target(&mut self, path: PathBuf) {
+        match self {
+            BuildRequest::Partitioned(p) => p.target_path = path,
+            BuildRequest::Volume { target_path, .. } => *target_path = path,
+        }
+    }
+
+    fn total_bytes(&self) -> u64 {
+        match self {
+            BuildRequest::Partitioned(p) => p.total_source_bytes(),
+            BuildRequest::Volume {
+                target_path,
+                size,
+                full_write,
+                ..
+            } => {
+                if writes_in_full(target_path.as_path(), *full_write) {
+                    *size
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// Spawn any build: a partitioned disk or a bare volume, encoded into `container` when given.
+pub fn start_build(
+    req: BuildRequest,
+    container: Option<ExportFormat>,
+) -> Arc<Mutex<PhysicalWriteStatus>> {
+    let status = new_status(req.total_bytes());
+    let status_thread = Arc::clone(&status);
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "build disk", move || {
+        let _wake = crate::os::wakelock::acquire("Rusty Backup: build disk");
+        let result = run_build(req, container, Arc::clone(&status_thread));
+        if let Ok(mut s) = status_thread.lock() {
+            s.finished = true;
+            if let Err(e) = result {
+                s.error = Some(format!("{e:#}"));
+            }
+        }
+        Ok(())
+    });
+    status
+}
+
+/// Run a build inline: raw straight to the target, or raw to a temp beside it, then encoded.
+pub fn run_build(
+    mut req: BuildRequest,
+    container: Option<ExportFormat>,
+    status: Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<()> {
+    let raw = |req: &BuildRequest, status: Arc<Mutex<PhysicalWriteStatus>>| match req {
+        BuildRequest::Partitioned(p) => run_worker(p, status),
         BuildRequest::Volume {
             target_path,
             size,
             format,
             full_write,
-        } => {
-            let full = writes_in_full(target_path.as_path(), full_write);
-            let total = if full { size } else { 0 };
-            let status = new_status(total);
-            let status_thread = Arc::clone(&status);
-            crate::model::worker::spawn_guarded(Arc::clone(&status), "build volume", move || {
-                let _wake = crate::os::wakelock::acquire("Rusty Backup: build disk");
-                let result = run_volume(
-                    target_path.as_path(),
-                    size,
-                    &format,
-                    full,
-                    Arc::clone(&status_thread),
-                );
-                if let Ok(mut s) = status_thread.lock() {
-                    s.finished = true;
-                    if let Err(e) = result {
-                        s.error = Some(format!("{e:#}"));
-                    }
-                }
-                Ok(())
-            });
-            status
-        }
+        } => run_volume(
+            target_path.as_path(),
+            *size,
+            format,
+            writes_in_full(target_path.as_path(), *full_write),
+            status,
+        ),
+    };
+    let Some(fmt) = container.filter(|c| *c != ExportFormat::Raw) else {
+        return raw(&req, status);
+    };
+    let dest = req.target_path().to_path_buf();
+    if crate::os::is_device_path(dest.as_path()) {
+        anyhow::bail!(
+            "a device is written raw; {} is an image format",
+            fmt.description()
+        );
     }
+    let mut tmp = dest.clone().into_os_string();
+    tmp.push(".rbtmp.img");
+    let tmp = PathBuf::from(tmp);
+    req.set_target(tmp.clone());
+    let built = raw(&req, Arc::clone(&status));
+    let result = built.and_then(|()| encode(fmt, tmp.as_path(), dest.as_path(), &status));
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Encode the built raw image at `raw` into `fmt` at `dest`, reporting on `status`.
+fn encode(
+    fmt: ExportFormat,
+    raw: &std::path::Path,
+    dest: &std::path::Path,
+    status: &Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<()> {
+    let size = std::fs::metadata(raw).map(|m| m.len()).unwrap_or(0);
+    if let Ok(mut s) = status.lock() {
+        s.log_messages.push(format!(
+            "Encoding {} to {}",
+            fmt.description(),
+            dest.display()
+        ));
+        s.current_bytes = 0;
+        s.total_bytes = size;
+    }
+    let progress = |n: u64| {
+        if let Ok(mut s) = status.lock() {
+            s.current_bytes = n;
+        }
+    };
+    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
+    let log = |m: &str| {
+        if let Ok(mut s) = status.lock() {
+            s.log_messages.push(m.to_string());
+        }
+    };
+    crate::model::bulk_convert_runner::convert_image(
+        fmt, raw, dest, None, false, progress, cancel, log,
+    )
+    .with_context(|| format!("encoding {}", fmt.description()))
 }
 
 /// Format one volume across the whole target.

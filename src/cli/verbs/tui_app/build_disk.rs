@@ -16,8 +16,9 @@ use ratatui::Frame;
 use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
-    cpm_presets, format_size, parse_size_field, purpose, BuildDiskAction, BuildDiskController,
-    DiskKind, FormatOptions, FsKind, FsOption, NoNotify, RowContent, Step, TableKind,
+    containers, cpm_presets, format_size, parse_size_field, purpose, BuildDiskAction,
+    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, NoNotify, RowContent, Step,
+    TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -40,6 +41,7 @@ pub(super) enum Row {
     Kind,
     OutputKind,
     OutputImage,
+    Container,
     OutputDevice,
     Table,
     Size,
@@ -156,11 +158,11 @@ impl BuildDiskState {
             Step::Kind => vec![Row::Kind],
             Step::Output => {
                 let mut r = vec![Row::OutputKind];
-                r.push(if c.output_is_device() {
-                    Row::OutputDevice
+                if c.output_is_device() {
+                    r.push(Row::OutputDevice);
                 } else {
-                    Row::OutputImage
-                });
+                    r.extend([Row::OutputImage, Row::Container]);
+                }
                 r
             }
             Step::Disk => {
@@ -355,6 +357,10 @@ impl BuildDiskState {
             Row::OutputKind => {
                 let on = !c.output_is_device();
                 self.act(BuildDiskAction::SetOutputIsDevice(on));
+            }
+            Row::Container => {
+                let k = cycle(containers().as_slice(), c.container(), forward);
+                self.act(BuildDiskAction::SetContainer(k));
             }
             Row::Table => {
                 let v = c.table_view();
@@ -681,6 +687,10 @@ impl App {
                     c.image()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(Enter to choose)".into()),
+                ),
+                Row::Container => (
+                    "Format".into(),
+                    format!("< {} >", c.container().description()),
                 ),
                 Row::OutputDevice => (
                     "Device".into(),

@@ -455,6 +455,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--sectors` — Sectors per track for the cylinder-aligned tables
 - `--fs` — With no `--table`: the filesystem of the one bare volume
 - `--label` — With no `--table`: the volume label
+- `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw
 - `--force` — Overwrite an existing image file
 - `--yes` — Required to build on a device; everything on it is erased
 
