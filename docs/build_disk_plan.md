@@ -166,6 +166,9 @@ All of these belong in the model or a crate, never in a shell.
 | G1 | **Format dispatch in the model.** Move `FsKind`, its option bag (`NewArgs`) and `format_image` out of `src/cli/verbs/new.rs` into `src/model/format.rs` (`FsKind` as a plain enum, no clap derive; the CLI keeps a `ValueEnum` mirror). Add per-fs capabilities: min / max size, fixed geometry, label rules, options, stream or `Vec`. | `src/model` | M |
 | G2 | **Format into an extent.** `format_into(&mut W, offset, len, FsKind, opts)` so the builder can format partition N on an image or a device. Stream formatters write straight through. `Vec` formatters write the buffer at the offset, with a size cap (refuse above, for example, 2 GiB rather than eat RAM). | `src/model`, plus `write_*_into` variants in crates | M |
 | G3 | **Streaming writers** for the large `Vec`-only filesystems: HPFS, PFS3, SFS, AFFS, BFS, OFS (the floppy-sized ones can stay `Vec`). Each writes only metadata through `Write + Seek` with memory bounded by one bitmap band / block, never the volume. The old `create_blank_*` becomes a wrapper that streams into a `Cursor`, and a test proves the bytes match the old output before the old code goes. | `fs-hpfs`, `fs-amiga`, `fs-unix` (publish + bump) | M each |
+| G13 | **Layout donor**: read an existing disk's table into rows plus its verbatim head region; the label schemes resize through `restore_patch`. | `src/model`, `src/partition` | M |
+| G14 | **More disc expansion**: ZIP (and Mac zips), MacBinary / AppleSingle single files, disk-image contents; `--expand-gunzip` on every CD format. | `src/fs/dir_import.rs` | S-M |
+| G15 | **CD audio mastering**: audio-only and mixed-mode discs from WAV / AIFF / FLAC, to BIN/CUE or CHD-CD. | a crate + `src/model` | M-L |
 | G12 | **ISO 9660 mastering** (with Joliet and Rock Ridge, and an HFS hybrid): no writer exists today; the CD presets are HFS / HFS+ / EFS / UFS. | a crate (new, or `opticaldiscs`) | L |
 | G4 | **Wire the U rows**: exFAT, CBM, DFS, RS-DOS, DragonDOS, Human68k, Alto BFS (and Pilot if wanted) into G1's dispatch with their geometry options. | `src/model` | S each |
 | G5 | **Container output as a build step**: build to a temp raw or straight to the sink, then encode through `ExportFormat` (CHD behind `chd`), the floppy encoders and fixed VHD. Lift the VHD footer out of `new_partitioned_hd.rs`. | `src/model` | M |
@@ -269,6 +272,7 @@ Each phase ships on its own: tests green, `scripts/check-boundaries.sh`, GUI bui
 | 2 | `controller::build_disk` over `DiskBuilder` with the wizard's step machine (§ 7), and the GUI's top-level **Build Disk** tab drawing it. It covers today's capability (partitioned disk, empty or image rows, image or device target); Restore's Build Disk mode moves here and leaves the Restore tab. | `tests/ui_scenarios/restore_build_disk.toml` moves to `build_disk_basic.toml`; wizard step tests (Next blocked with a reason, Back keeps entries) |
 | 3 | TUI Build Disk screen on the same steps: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list, its `NewWizard` and its `NewCommand` building. | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
 | 3b | G3: streaming writers for HPFS, AFFS, PFS3, SFS, BFS, OFS, each byte-identical to today's blank volume, each published. | per fs: old-vs-new hash test; its existing fsck oracle on a 4 GiB blank volume built with a small memory limit (`ulimit -v`) |
+| 4b | G13: start from a donor disk's layout (copy / format blank / empty per row, verbatim head region, new disk size). | SGI vh donor -> larger disk, IRIX mounts it (Iris); RDB donor with handlers -> FS-UAE; MBR / APM donors; Review lists copied vs regenerated |
 | 4 | G2 + per-row **Format** content: format each row during the build, GUI and TUI. `new hd --partition SIZE:TYPE:NAME --format N=FS[:LABEL]` on the CLI. Start with the stream-capable filesystems. | tier-1 cases per scheme: build, then `fsck` and `ls` each partition; emulator scenarios: `fat.win7-blank`-style for MBR+FAT / NTFS, `ufs1-be.solaris-blank` on a Sun label, `ufs43.nextstep-blank` on a NeXT label, FS-UAE for RDB+PFS3 / SFS |
 | 5 | Bare-volume builds in the same controller (scheme = None), a GUI New Disk dialog, every `FsKind` in the TUI (CP/M preset picker, Oric, HPFS, PFS3, SFS, EFS v1, XFS, BFS, OFS, UFS x3). | ui_scenario per class; existing `new-volume` CLI cases |
 | 6 | G5: container output in the build (CHD, VHD, QCOW2, VMDK, 2MG, WOZ, DC42, ATR, D88 ...). | tier-4 `convert.toml`-style cases; `chdman info` and MAME for CHD; `qemu-img check` |
@@ -351,6 +355,54 @@ the same `BuildRequest`; the same validators run.
 | 6 | **Review** | always | a summary of every choice, the warnings (fs vs scheme pairings, a missing Amiga handler), and for a device the typed device-name confirmation | the device name does not match |
 | 7 | **Build** | always | progress and log of the one build job; on success "Open in Inspect" and "Build another" | (running) |
 
+### Starting from an existing disk's layout (asked 2026-11-05)
+
+Step 2 for a partitioned disk asks **Start from: a blank table, or an existing disk's layout**.
+The donor is an image, a backup or a physical disk. Example: build a bigger SGI disk from a
+small working one, keeping its volume header (sash, ide and the other volume-header files),
+its swap and its slot layout, with a new disk size.
+
+- The donor's table is read with the existing parsers, and its **head region rides
+  verbatim** (SGI volume header and its files, RDB and its filesystem handlers, the X68000
+  IPL, NeXT boot blocks, Sun boot slices). The resize uses `partition::restore_patch`, the
+  same code that resizes these labels on restore today. MBR / GPT / APM tables are rewritten
+  by the `provision` writers; APM driver partitions (`Apple_Driver43`, `Apple_Patches`, ...)
+  are copied as rows.
+- Each donor partition becomes a row, with its **content** picked per row:
+  - **Copy**: the donor's bytes. This is the default for special partitions such as the
+    volume header, drivers, boot slices and RDB handlers. A filesystem that can resize grows
+    or shrinks to the row's size; one that can't keeps its size, and the rest of the row is
+    padded.
+  - **Format blank**: same filesystem and label as the donor. This is the default for data
+    partitions.
+  - **Empty**.
+- Whole-disk entries (SGI slot 10 `volume`, Sun slice 2 `backup`) are not rows: they are
+  regenerated to the new disk size.
+- The rows stay editable, so sizes can change and rows can be added where the scheme has
+  free slots. `rest` goes on the last data row by default.
+- Review lists what came from the donor and what was regenerated.
+
+This adds **G13: layout donor** (`model::disk_builder::DiskBuilder::from_donor`, reading a
+table into rows plus the verbatim head region; the build runs `restore_patch` for the label
+schemes) as phase 4b.
+
+### Checking that each filesystem supports what is asked
+
+The wizard only offers what the model says works, and tests check that the model is right:
+
+- **Capabilities in the model (G1):** per `FsKind`, the minimum and maximum size, block /
+  cluster choices, label rules, the schemes it pairs with, and whether it can format,
+  resize, and be populated (has an editor). The size field, the filesystem list per scheme,
+  the "Copy and resize" choice and the label field all read these.
+- **A capability test** builds every `FsKind` at its minimum, a middle size and its maximum
+  (streamed and sparse), then runs our fsck and the fs's oracle where one exists. A claimed
+  limit that fails is a test failure, not a user bug report.
+- **A pairing test** builds each natural pairing in § 1d (scheme x fs), then `fsck` + `ls` +
+  a `put` / `get` round trip on every partition. The real-OS emulator scenarios
+  (`regression-tests/emulator/`) cover the pairings that have an emulator.
+- A capability that is not proven is not offered. For a donor row, the wizard checks
+  `can_resize` before it offers "Copy and resize".
+
 ### Optical discs take their content at creation
 
 A hard disk is **created, then populated**: the build formats blank partitions (or pours in a
@@ -362,11 +414,49 @@ kind with its own steps, not a partitioned disk with a CD geometry:
 | # | Step | What it asks | Next is blocked when |
 |---|---|---|---|
 | 1 | Kind | optical disc | - |
-| 2 | Disc format | Mac HFS, Mac HFS+, SGI EFS, NeXT UFS today; ISO 9660 (+ Joliet / Rock Ridge, + HFS hybrid) when G12 lands | - |
-| 3 | Content | one or more host folders (and the `.tardist` expand / flatten options for SGI) | no content chosen: a disc is never built empty from this flow |
+| 2 | Disc format | Mac HFS, Mac HFS+, SGI EFS, NeXT UFS today; ISO 9660 (+ Joliet / Rock Ridge, + HFS hybrid) when G12 lands; format options here (HFS block size, UFS bytes per inode) | - |
+| 3 | Content | the **disc label** (validated live against the format's rules: HFS 27 bytes, ISO 9660 levels, ...), one or more host folders, and the **expansion options** below | no content chosen; a label that breaks the format's rules |
 | 4 | Output | `.iso`, or CHD (CD) / BIN+CUE from phase 6; never a physical disk | no path |
 | 5 | Review | the fitted size, and whether it fits a 74 / 80-minute CD or needs a DVD | - |
 | 6 | Build | progress; then "Open in Inspect" | (running) |
+
+**Expansion on a disc (survey 2026-11-05).** `fs::dir_import` is shared by all three CD
+builders. Today it does the following:
+
+| Input | Today | Notes |
+|---|---|---|
+| tar and its compressed forms (`.tar`, `.tgz`, `.tar.gz` / `.bz2` / `.xz` / `.zst`, `.gtar`, ...), IRIX `.tardist` | yes, `--expand-archives` (SGI, Mac, NeXT) | one folder per archive, or `--flatten-folders` into the root (SGI, NeXT) |
+| gzip without a tar inside | yes, `--expand-gunzip` (NeXT only) | should be on every format |
+| StuffIt `.sit` / `.sea`, Compact Pro `.cpt`, BinHex `.hqx` (and `.sit.hqx`), MAR `.mar` | yes, `--expand-archives` | through `arc-mac`; forks land as forks on HFS / HFS+, as AppleDouble on the others |
+| AppleDouble sidecars (`._x`, `__MACOSX`) | yes, `--include-appledouble` | merged into the file's forks on HFS |
+| ZIP (`.zip`; Mac zips with `__MACOSX`) | **no** | the `zip` crate and `arc-mac::maczip` are already here: S |
+| MacBinary `.bin` and AppleSingle as single files | **no** | decode into a forked file on HFS: S (`arc-mac::macbinary`) |
+| Disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`) | **no** | copy a volume's files onto the disc through the engine's own readers: M, and useful for Mac CDs |
+| LhA / LZH (Amiga, Japanese PC) | **no** | needs a decoder: M |
+| 7z, RAR | no | not planned (dependencies, licensing) |
+
+In the wizard these are checkboxes on the Content step, each listing the types it covers:
+expand archives, strip gzip only, decode Mac single-file encodings, merge AppleDouble,
+flatten into the root, plus the SGI and NeXT permission option. Each format offers only the
+options that make sense for it: forks matter on HFS / HFS+, and "flatten" is for `inst`
+trees. The ZIP, MacBinary / AppleSingle and disk-image rows are **G14**.
+
+### CD audio mastering (later; asked 2026-11-05)
+
+Audio tracks are possible only on CD output. They need a track-aware container (BIN/CUE, or
+CHD for CD), never `.iso`, so the step appears only when the Output step can hold tracks.
+This is **G15**, after phase 6 (containers):
+
+- **Disc shapes:** audio-only (Red Book) and mixed mode (data track 1 plus audio tracks,
+  the common game / multimedia shape). Enhanced CD / CD Extra (audio first, data in a
+  second session) needs multisession and comes later, if at all.
+- **Inputs:** WAV and AIFF (parsers we write: S), FLAC (a pure-Rust decoder that builds on
+  Rust 1.73: to check). 44.1 kHz 16-bit stereo, or resampled with a warning. Track order,
+  2-second pregaps, optional CD-Text titles.
+- **Steps:** a **Tracks** step after Content (an ordered list of tracks with their lengths),
+  and Review shows the total minutes against 74 / 80.
+- **Checking:** our own CD-DA reader (`optical::cd_audio`) reads the tracks back, and each
+  track is compared byte for byte with its PCM; MAME / an emulator reads the CHD.
 
 The CLI keeps `optical new <format> --from-dir` (with `--size auto`) and gains the same
 through `rb-cli build`. A blank disc stays possible from the CLI only, for `import` / `put`
