@@ -45,7 +45,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
+use crate::cli::verbs::new::{HdCommand, NewCommand};
 use crate::controller::app::{format_size, RateTracker};
 use crate::controller::app::{DiskDevice, RecentMode};
 
@@ -915,8 +915,6 @@ enum WizStep {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiskClass {
-    Floppy,
-    Volume,
     Hd,
     Cdrom,
 }
@@ -927,19 +925,9 @@ enum DiskClass {
 /// `--partitions`, EFS inode density — remain CLI-only.
 const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     (
-        "Floppy",
-        DiskClass::Floppy,
-        "Bare floppy-geometry volume: FAT / HFS and the fixed-geometry retro filesystems.",
-    ),
-    (
-        "Volume",
-        DiskClass::Volume,
-        "Bare single volume of any size (a superfloppy): NTFS, ext, HFS+, EFS, ...",
-    ),
-    (
-        "Hard disk",
+        "Bootable hard disk",
         DiskClass::Hd,
-        "Partition-table-wrapped, self-bootable HDD image (Sharp X68000, SGI IRIX).",
+        "A ready-to-boot preset: Sharp X68000 (Human68k) or SGI IRIX (EFS). Any other disk: Build Disk.",
     ),
     (
         "CD-ROM",
@@ -972,78 +960,11 @@ const CD_TARGETS: &[(&str, CdTarget)] = &[
 enum HdPlatform {
     X68k,
     SgiEfs,
-    /// Generic tables. The wizard builds one partition filling the disk;
-    /// multi-partition layouts stay on the CLI, which takes `--partition`.
-    Mbr,
-    Gpt,
-    Apm,
-    /// Partition table only — no EFS format, no IPL stub, unlike the two above.
-    SgiTable,
-    X68kTable,
-    Rdb,
-    Sun,
-    Atari,
-}
-
-/// Wrap the shared args with the default cylinder geometry, for the two
-/// tables whose partitions land on cylinder boundaries.
-fn cylinder_args(
-    common: crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs,
-) -> crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
-    crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
-        common,
-        heads: crate::controller::new_disk::DEFAULT_HEADS,
-        sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
-    }
 }
 
 const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("Sharp X68000 (Human68k)", HdPlatform::X68k),
     ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
-    ("MBR (DOS / PC), one partition", HdPlatform::Mbr),
-    ("GPT (UEFI), one partition", HdPlatform::Gpt),
-    ("APM (Apple / PowerPC), one partition", HdPlatform::Apm),
-    (
-        "SGI volume header (IRIX), one partition",
-        HdPlatform::SgiTable,
-    ),
-    ("X68000 table only, one partition", HdPlatform::X68kTable),
-    ("Amiga RDB, one partition", HdPlatform::Rdb),
-    ("Sun disk label (SPARC), one slice", HdPlatform::Sun),
-    ("Atari ST AHDI, one partition", HdPlatform::Atari),
-];
-
-/// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
-/// because it requires a `--cpm-preset` (use the CLI: `rb-cli new floppy cpm`).
-const FLOPPY_FS: &[(&str, FloppyFs)] = &[
-    ("FAT12 / FAT16", FloppyFs::Fat),
-    ("HFS (Mac OS Standard)", FloppyFs::Hfs),
-    ("Atari DOS 2.0S", FloppyFs::Atari),
-    ("Apple DOS 3.3", FloppyFs::AppleDos),
-    ("OS-9 / NitrOS-9", FloppyFs::Os9),
-    ("UCSD p-System", FloppyFs::Ucsd),
-    ("TR-DOS (ZX Spectrum)", FloppyFs::Trdos),
-    ("TI-99/4A", FloppyFs::Ti99),
-    ("MFS (Mac, pre-HFS)", FloppyFs::Mfs),
-    ("Acorn ADFS (E-format)", FloppyFs::Adfs),
-    ("Minix V1", FloppyFs::Minix),
-];
-
-/// Filesystems offered under `new volume` in the wizard.
-const VOLUME_FS: &[(&str, VolumeFs)] = &[
-    ("HFS (Mac OS Standard)", VolumeFs::Hfs),
-    ("HFS+ / HFSX", VolumeFs::Hfsplus),
-    ("HFV (BasiliskII, <= 2047 MB)", VolumeFs::Hfv),
-    ("FAT12 / 16 / 32", VolumeFs::Fat),
-    ("NTFS", VolumeFs::Ntfs),
-    ("ext2", VolumeFs::Ext),
-    ("ext3", VolumeFs::Ext3),
-    ("ext4", VolumeFs::Ext4),
-    ("Amiga FFS / OFS", VolumeFs::Affs),
-    ("ProDOS (<= ~32 MiB)", VolumeFs::Prodos),
-    ("IRIX EFS", VolumeFs::Efs),
-    ("Minix V2", VolumeFs::Minix2),
-    ("Minix V3", VolumeFs::Minix3),
 ];
 
 /// The details form's text fields: path, size, name — plus, for a CD-ROM, an
@@ -1105,7 +1026,7 @@ impl Default for NewWizard {
             fs_sel: 0,
             field: 0,
             path: String::new(),
-            size: "800K".to_string(),
+            size: "32M".to_string(),
             name: "rusty-backup".to_string(),
             from_dir: String::new(),
             expand_archives: false,
@@ -1129,17 +1050,15 @@ impl NewWizard {
     /// but only while it still holds another class's default — so a size the
     /// user typed is never clobbered by arrowing through the class list.
     fn seed_size_for_class(&mut self) {
-        const DEFAULTS: [&str; 4] = ["800K", "64M", "32M", "600M"];
+        const DEFAULTS: [&str; 2] = ["32M", "600M"];
         let cur = self.size.trim();
         // `auto` is a size the CD class can produce for itself, so treat it as
         // a default too — otherwise arrowing off CD-ROM and back would leave a
         // stale `auto` on a class that can't use it.
         if cur.is_empty() || cur.eq_ignore_ascii_case("auto") || DEFAULTS.contains(&cur) {
             self.size = match self.class() {
-                DiskClass::Floppy => DEFAULTS[0],
-                DiskClass::Volume => DEFAULTS[1],
-                DiskClass::Hd => DEFAULTS[2],
-                DiskClass::Cdrom => DEFAULTS[3],
+                DiskClass::Hd => DEFAULTS[0],
+                DiskClass::Cdrom => DEFAULTS[1],
             }
             .to_string();
         }
@@ -1161,8 +1080,6 @@ impl NewWizard {
 
     fn fs_count(&self) -> usize {
         match self.class() {
-            DiskClass::Floppy => FLOPPY_FS.len(),
-            DiskClass::Volume => VOLUME_FS.len(),
             // The "filesystem" step picks the target platform / disc layout for
             // a hard disk or a CD.
             DiskClass::Hd => HD_PLATFORMS.len(),
@@ -1171,8 +1088,6 @@ impl NewWizard {
     }
     fn fs_label(&self, i: usize) -> &'static str {
         match self.class() {
-            DiskClass::Floppy => FLOPPY_FS[i.min(FLOPPY_FS.len() - 1)].0,
-            DiskClass::Volume => VOLUME_FS[i.min(VOLUME_FS.len() - 1)].0,
             DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
             DiskClass::Cdrom => CD_TARGETS[i.min(CD_TARGETS.len() - 1)].0,
         }
@@ -2051,116 +1966,46 @@ impl App {
             self.newdisk_create_cdrom(target, path, size, name, from_dir, expand);
             return;
         }
-        let cmd = match w.class() {
-            DiskClass::Floppy => NewCommand::Floppy(FloppyArgs {
-                fs: FLOPPY_FS[w.fs_sel.min(FLOPPY_FS.len() - 1)].1,
-                image: path.clone(),
-                size,
-                name,
-                block_size: None,
-                catalog_size: None,
-                extents_size: None,
-                cpm_preset: None,
-                // The TUI wizard has no FAT32 toggle yet; size-based selection
-                // is the existing behaviour. `rb-cli new ... --fat32` forces it.
-                fat32: false,
-            }),
-            DiskClass::Volume => NewCommand::Volume(VolumeArgs {
-                fs: VOLUME_FS[w.fs_sel.min(VOLUME_FS.len() - 1)].1,
-                image: path.clone(),
-                size,
-                name,
-                block_size: None,
-                big_endian: false,
-                catalog_size: None,
-                extents_size: None,
-                case_sensitive: false,
-                min_catalog: None,
-                affs_variant: 1,
-                fat32: false,
-                inodes: None,
-                bytes_per_inode: None,
-                cluster_size: None,
-                sector_size: None,
-            }),
-            // Handled above — a disc goes through `optical new`, not `new`.
-            DiskClass::Cdrom => unreachable!("CD-ROM dispatched before this match"),
-            // Hard disks build with their defaults; the donor-clone and custom
-            // partition-layout options stay on the CLI (`rb-cli new hd ...`).
-            DiskClass::Hd => {
-                let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
-                NewCommand::Hd {
-                    cmd: match platform {
-                        // Same defaults the CLI's clap definitions carry:
-                        // SASI variant, the printing IPL stub, one partition.
-                        HdPlatform::X68k => {
-                            HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
-                                image: path.clone(),
-                                size,
-                                variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
-                                stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
-                                partitions: 1,
-                                system_disk: None,
-                                boot_sector_donor: None,
-                                builtin_boot_sector: false,
-                            })
-                        }
-                        HdPlatform::SgiEfs => {
-                            HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
-                                image: path.clone(),
-                                size,
-                                name,
-                                fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
-                                heads: crate::controller::new_disk::DEFAULT_HEADS,
-                                sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
-                                inodes: None,
-                                bytes_per_inode: None,
-                                // The TUI's "new disk" flow formats only; it
-                                // has no folder picker, so populating stays a
-                                // separate `import` step.
-                                from_dir: None,
-                                expand_archives: false,
-                                expand_gunzip: false,
-                                expand_images: false,
-                                flatten_folders: false,
-                                force: false,
-                                no_permissions: false,
-                                include_appledouble: false,
-                            })
-                        }
-                        HdPlatform::Mbr
-                        | HdPlatform::Gpt
-                        | HdPlatform::Apm
-                        | HdPlatform::SgiTable
-                        | HdPlatform::X68kTable
-                        | HdPlatform::Rdb
-                        | HdPlatform::Sun
-                        | HdPlatform::Atari => {
-                            // One partition over the whole disk, at the CLI's
-                            // default type and alignment.
-                            let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
-                                image: path.clone(),
-                                size: size.clone(),
-                                partitions: vec!["rest".to_string()],
-                                fills: Vec::new(),
-                                filesystems: Vec::new(),
-                                align: "1M".to_string(),
-                                force: false,
-                            };
-                            match platform {
-                                HdPlatform::Mbr => HdCommand::Mbr(args),
-                                HdPlatform::Gpt => HdCommand::Gpt(args),
-                                HdPlatform::X68kTable => HdCommand::X68kTable(args),
-                                HdPlatform::Atari => HdCommand::Atari(args),
-                                HdPlatform::SgiTable => HdCommand::Sgi(cylinder_args(args)),
-                                HdPlatform::Rdb => HdCommand::Rdb(cylinder_args(args)),
-                                HdPlatform::Sun => HdCommand::Sun(cylinder_args(args)),
-                                _ => HdCommand::Apm(args),
-                            }
-                        }
-                    },
+        // Only the bootable presets are here; any other disk is built in the Build Disk tab.
+        let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
+        let cmd = NewCommand::Hd {
+            cmd: match platform {
+                HdPlatform::X68k => {
+                    HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
+                        image: path.clone(),
+                        size,
+                        variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
+                        stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
+                        partitions: 1,
+                        system_disk: None,
+                        boot_sector_donor: None,
+                        builtin_boot_sector: false,
+                    })
                 }
-            }
+                HdPlatform::SgiEfs => {
+                    HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
+                        image: path.clone(),
+                        size,
+                        name,
+                        fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
+                        heads: crate::controller::new_disk::DEFAULT_HEADS,
+                        sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
+                        inodes: None,
+                        bytes_per_inode: None,
+                        // The TUI's "new disk" flow formats only; it
+                        // has no folder picker, so populating stays a
+                        // separate `import` step.
+                        from_dir: None,
+                        expand_archives: false,
+                        expand_gunzip: false,
+                        expand_images: false,
+                        flatten_folders: false,
+                        force: false,
+                        no_permissions: false,
+                        include_appledouble: false,
+                    })
+                }
+            },
         };
         // A task: building (and filling) a big image takes a while. `new::run` logs
         // advisories to stderr, which the task silences so they don't land on the alt-screen.
@@ -2824,11 +2669,9 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disks build with their defaults - the table-only entries get \
-                     one partition over the whole disk, empty. Donor-cloning and \
-                     multi-partition layouts need the CLI \
-                     (`rb-cli new hd <table> --partition ...`). \
-                     CD-ROM images: the Optical tab.",
+                    "The presets build with their defaults; donor-cloning needs the CLI \
+                     (`rb-cli new hd x68k --system-disk ...`). Floppies, bare volumes \
+                     and partitioned disks of any kind: the Build Disk tab.",
                     self.palette.dim(),
                 ));
                 lines.push(Line::raw(""));
@@ -3470,14 +3313,12 @@ impl App {
 
     fn newdisk_content(&self) -> Text<'static> {
         self.stub(
-            "Create a blank disk image - the home for all `new` operations.",
+            "Bootable presets and CD-ROM images; any other disk is the Build Disk tab.",
             &[
-                "Floppy   - FAT/HFS + the retro filesystems at floppy geometry.",
-                "Volume   - a bare superfloppy (NTFS, ext4, HFS+, ...) any size.",
-                "Hard disk- a partition-table-wrapped bootable image (x68k, SGI).",
-                "CD-ROM   - an optical image (via the Optical tab).",
+                "Bootable hard disk - Sharp X68000 (Human68k) or SGI IRIX (EFS).",
+                "CD-ROM   - an SGI / Mac / NeXT disc, optionally filled from a folder.",
             ],
-            "M-create - drives `new floppy/volume/hd` + `optical new`.",
+            "Drives `new hd x68k / sgi-efs` and `optical new`.",
         )
     }
 
@@ -5530,9 +5371,7 @@ mod tests {
             wizard_on(DiskClass::Cdrom).field_count(),
             WIZ_FIELD_IMAGES + 1
         );
-        for other in [DiskClass::Floppy, DiskClass::Volume, DiskClass::Hd] {
-            assert_eq!(wizard_on(other).field_count(), WIZ_FIELDS);
-        }
+        assert_eq!(wizard_on(DiskClass::Hd).field_count(), WIZ_FIELDS);
     }
 
     /// Space flips the expand-archives toggle on its own row, and stays an
@@ -5641,8 +5480,6 @@ mod tests {
     /// would choke on it.
     #[test]
     fn size_default_follows_the_selected_class() {
-        assert_eq!(wizard_on(DiskClass::Floppy).size, "800K");
-        assert_eq!(wizard_on(DiskClass::Volume).size, "64M");
         assert_eq!(wizard_on(DiskClass::Hd).size, "32M");
         assert_eq!(wizard_on(DiskClass::Cdrom).size, "600M");
 
@@ -5651,13 +5488,13 @@ mod tests {
         w.size = "auto".to_string();
         w.class_sel = NEW_CLASSES
             .iter()
-            .position(|c| c.1 == DiskClass::Volume)
+            .position(|c| c.1 == DiskClass::Hd)
             .unwrap();
         w.seed_size_for_class();
-        assert_eq!(w.size, "64M", "'auto' must not leak onto a non-CD class");
+        assert_eq!(w.size, "32M", "'auto' must not leak onto a non-CD class");
 
         // A size the user typed is still never clobbered.
-        let mut w = wizard_on(DiskClass::Floppy);
+        let mut w = wizard_on(DiskClass::Hd);
         w.size = "1440K".to_string();
         w.class_sel = NEW_CLASSES
             .iter()

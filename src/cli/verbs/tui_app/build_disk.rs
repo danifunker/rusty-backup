@@ -51,7 +51,7 @@ pub(super) enum Row {
     PType(usize),
     PName(usize),
     PContent(usize),
-    AddRow,
+    AddPartition,
     Label(Option<usize>),
     Opt(Option<usize>, FsOption),
     Confirm,
@@ -196,7 +196,7 @@ impl BuildDiskState {
                     r.push(Row::PContent(i));
                 }
                 if v.can_add_row {
-                    r.push(Row::AddRow);
+                    r.push(Row::AddPartition);
                 }
                 r
             }
@@ -538,7 +538,7 @@ impl App {
                     s.device_sel = s.ctl.device_row().unwrap_or(0);
                 }
                 Some(Row::OutputImage) => s.act(BuildDiskAction::PickOutputImage),
-                Some(Row::AddRow) => s.act(BuildDiskAction::Table(BuildAction::AddRow)),
+                Some(Row::AddPartition) => s.act(BuildDiskAction::Table(BuildAction::AddRow)),
                 Some(r) => match s.text_of(r) {
                     Some(t) => s.edit = Some(t),
                     None => {
@@ -766,7 +766,7 @@ impl App {
                         }
                     },
                 ),
-                Row::AddRow => ("".into(), "[ Add partition ]".into()),
+                Row::AddPartition => ("".into(), "[ Add partition ]".into()),
                 Row::Label(r) => (
                     "  Label".into(),
                     opts(*r).map(|o| o.label).unwrap_or_default(),
