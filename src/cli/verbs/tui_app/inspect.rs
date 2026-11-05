@@ -1197,6 +1197,20 @@ impl App {
         self.after_inspect();
     }
 
+    /// Open a payload the Archives screen wrote; `guard` keeps its temp folder alive.
+    pub(super) fn inspect_open_payload(&mut self, path: PathBuf, guard: tempfile::TempDir) {
+        let s = self.inspect_state();
+        s.disk = None;
+        s.plain = None;
+        s.plain_for = None;
+        s.sel = 0;
+        s.act(InspectAction::Open(InspectSource::Image {
+            path,
+            temp: Some(guard),
+        }));
+        self.after_inspect();
+    }
+
     /// Open the backup folder Restore shares (not recorded in the recent list, as the GUI's).
     pub(super) fn inspect_load_backup(&mut self, folder: PathBuf) {
         let s = self.inspect_state();

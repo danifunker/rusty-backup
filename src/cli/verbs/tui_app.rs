@@ -49,6 +49,7 @@ use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, Volume
 use crate::controller::app::{format_size, RateTracker};
 use crate::controller::app::{DiskDevice, RecentMode};
 
+mod archives;
 mod ask;
 mod backup;
 mod commander;
@@ -64,6 +65,7 @@ mod shell;
 mod table_edit;
 mod writer;
 
+use archives::ArchiveState;
 use backup::BackupState;
 use inspect::InspectState;
 #[cfg(feature = "optical")]
@@ -1218,132 +1220,6 @@ impl BulkState {
             path: Some(path),
         });
     }
-}
-
-/// Fork container formats for archive extraction.
-const ARCHIVE_FORK_FORMATS: &[(&str, crate::controller::archives::ForkFormat)] = {
-    use crate::controller::archives::ForkFormat as F;
-    &[
-        ("BinHex (.hqx)", F::BinHex),
-        ("MacBinary (.bin)", F::MacBinary),
-        ("AppleDouble", F::AppleDouble),
-        ("Raw (.rsrc)", F::Raw),
-    ]
-};
-
-/// The Archives screen: open a classic Mac archive (`.sit` / `.sea` / `.cpt` /
-/// `.mar` / `.hqx`), list its entries, and extract to the host preserving forks,
-/// through a headless `controller::archives::ArchivesController`.
-struct ArchiveState {
-    ctl: crate::controller::archives::ArchivesController,
-    /// The app's recent-files store; a successful open is recorded through it.
-    recent: crate::controller::app::RecentHandle,
-    picker: Option<FilePicker>,
-    /// When true, a picker confirm chooses the extract destination folder.
-    picker_dest: bool,
-    archive_path: String,
-    /// Pre-rendered entry lines for display.
-    entries: Vec<String>,
-    list_sel: usize,
-    fork_fmt_sel: usize,
-    status: Option<String>,
-    is_error: bool,
-    /// An open or an extraction was started and its outcome is not shown yet.
-    awaiting_open: Option<std::path::PathBuf>,
-    awaiting_extract: bool,
-}
-
-impl ArchiveState {
-    fn new(recent: crate::controller::app::RecentHandle) -> Self {
-        use crate::controller::archives::{ArchivesController, NoNotify};
-        ArchiveState {
-            ctl: ArchivesController::new(Arc::new(NoNotify)),
-            recent,
-            picker: None,
-            picker_dest: false,
-            archive_path: String::new(),
-            entries: Vec::new(),
-            list_sel: 0,
-            fork_fmt_sel: 0,
-            status: None,
-            is_error: false,
-            awaiting_open: None,
-            awaiting_extract: false,
-        }
-    }
-}
-
-impl ArchiveState {
-    fn act(&mut self, action: crate::controller::archives::ArchivesAction) {
-        use crate::controller::Controller as _;
-        let _ = self.ctl.apply(action);
-    }
-
-    /// Drain the controller and turn a finished open or extraction into the status line.
-    fn poll(&mut self) {
-        use crate::controller::Controller as _;
-        let _ = self.ctl.tick();
-        let _ = self.ctl.take_log();
-        // Recent files are recorded below on a successful open, as this screen always did.
-        let _ = self.ctl.take_requests();
-        if self.awaiting_open.is_some() && !self.ctl.is_loading() {
-            let path = self.awaiting_open.take().unwrap_or_default();
-            if let Some(e) = self.ctl.load_error() {
-                self.status = Some(format!("Cannot open archive: {}", e.detail));
-                self.is_error = true;
-            } else if self.ctl.is_loaded() {
-                self.recent
-                    .remember(RecentMode::Archives, path.to_string_lossy().as_ref());
-                self.archive_path = path.display().to_string();
-                self.entries = self.ctl.rows().iter().map(archive_row_line).collect();
-                self.list_sel = 0;
-                self.status = Some(format!("Opened ({} entries).", self.entries.len()));
-                self.is_error = false;
-            }
-        }
-        if self.awaiting_extract && !self.ctl.is_extracting() {
-            self.awaiting_extract = false;
-            match self.ctl.last_extract() {
-                Some(Ok((stats, dest))) => {
-                    self.status = Some(format!(
-                        "Extracted {} file(s){} to {}",
-                        stats.files,
-                        if stats.skipped > 0 {
-                            format!(" ({} skipped)", stats.skipped)
-                        } else {
-                            String::new()
-                        },
-                        dest.display()
-                    ));
-                    self.is_error = false;
-                }
-                Some(Err(e)) => {
-                    self.status = Some(format!("Extract failed: {}", e.detail));
-                    self.is_error = true;
-                }
-                None => {}
-            }
-        }
-    }
-}
-
-/// One archive entry as the screen lists it.
-fn archive_row_line(e: &crate::controller::archives::ArchiveEntryRow) -> String {
-    if e.is_dir {
-        return format!("DIR   {}/", e.path);
-    }
-    let data = e
-        .data_len
-        .map(|n| format!("data {}", format_size(n)))
-        .unwrap_or_default();
-    let rsrc = e
-        .rsrc_len
-        .map(|n| format!("rsrc {}", format_size(n)))
-        .unwrap_or_default();
-    format!(
-        "FILE  {:<34} {:>4} {:>4}  {}  {}",
-        e.path, e.type_code, e.creator, data, rsrc
-    )
 }
 
 /// What a finished [`TuiTask`] does to the app, run on the UI thread.
@@ -2661,147 +2537,6 @@ impl App {
         });
     }
 
-    /// Archives screen keys. Returns `true` when consumed.
-    fn handle_archive_key(&mut self, code: KeyCode) -> bool {
-        if self.archive.is_none() {
-            self.archive = Some(ArchiveState::new(self.shell.recent_handle()));
-        }
-        // Archive / destination picker (modal).
-        if self
-            .archive
-            .as_ref()
-            .map(|a| a.picker.is_some())
-            .unwrap_or(false)
-        {
-            let for_dest = self.archive.as_ref().unwrap().picker_dest;
-            let res = self
-                .archive
-                .as_mut()
-                .unwrap()
-                .picker
-                .as_mut()
-                .unwrap()
-                .handle_key(code);
-            match res {
-                Some(PickResult::Cancel) => self.archive.as_mut().unwrap().picker = None,
-                Some(PickResult::Confirm(path)) => {
-                    self.archive.as_mut().unwrap().picker = None;
-                    if for_dest {
-                        self.archive_extract(path);
-                    } else {
-                        self.load_archive(path);
-                    }
-                }
-                None => {}
-            }
-            return true;
-        }
-
-        let loaded = self
-            .archive
-            .as_ref()
-            .map(|a| a.ctl.is_loaded())
-            .unwrap_or(false);
-        let page = page_step() as isize;
-        let a = self.archive.as_mut().unwrap();
-        if !loaded {
-            return match code {
-                KeyCode::Enter | KeyCode::Char('o') => {
-                    let recent = a.recent.list(RecentMode::Archives);
-                    a.picker = Some(
-                        FilePicker::new(PickKind::File, "Open a Mac archive").with_recent(recent),
-                    );
-                    a.picker_dest = false;
-                    true
-                }
-                // `c` prefills the `:` palette with `archive create` (from host
-                // files — the supported create form; the palette runs it through
-                // shared CLI dispatch). Creating from image contents stays a
-                // stage-to-host-then-archive job, deferred.
-                KeyCode::Char('c') => {
-                    self.palette_input =
-                        Some("archive create \"<OUTPUT.sit>\" <HOST_FILE> ...".to_string());
-                    true
-                }
-                _ => false,
-            };
-        }
-        // Archive loaded: browse the entry list, choose format, extract.
-        let n = a.entries.len() as isize;
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                a.list_sel = a.list_sel.saturating_sub(1);
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                a.list_sel = ((a.list_sel as isize + 1).min(n - 1).max(0)) as usize;
-                true
-            }
-            KeyCode::PageUp => {
-                a.list_sel = (a.list_sel as isize - page).max(0) as usize;
-                true
-            }
-            KeyCode::PageDown => {
-                a.list_sel = ((a.list_sel as isize + page).min(n - 1).max(0)) as usize;
-                true
-            }
-            KeyCode::Home => {
-                a.list_sel = 0;
-                true
-            }
-            KeyCode::End => {
-                a.list_sel = (n - 1).max(0) as usize;
-                true
-            }
-            KeyCode::Char('f') => {
-                a.fork_fmt_sel = (a.fork_fmt_sel + 1) % ARCHIVE_FORK_FORMATS.len();
-                true
-            }
-            KeyCode::Char('e') => {
-                a.picker = Some(FilePicker::new(PickKind::Dir, "Extract to folder"));
-                a.picker_dest = true;
-                a.status = None;
-                true
-            }
-            KeyCode::Esc => {
-                // Close the archive, back to the open prompt.
-                *a = ArchiveState::new(a.recent.clone());
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Open a Mac archive in the controller; the list is rendered when the job ends.
-    fn load_archive(&mut self, path: std::path::PathBuf) {
-        let Some(a) = self.archive.as_mut() else {
-            return;
-        };
-        a.act(crate::controller::archives::ArchivesAction::Open(
-            path.clone(),
-        ));
-        a.awaiting_open = Some(path);
-        a.status = Some("Opening the archive...".to_string());
-        a.is_error = false;
-    }
-
-    /// Extract the open archive to `dest` in the chosen fork format.
-    fn archive_extract(&mut self, dest: std::path::PathBuf) {
-        use crate::controller::archives::ArchivesAction;
-        let Some(a) = self.archive.as_mut() else {
-            return;
-        };
-        if !a.ctl.is_loaded() || a.ctl.is_extracting() {
-            return;
-        }
-        let format = ARCHIVE_FORK_FORMATS[a.fork_fmt_sel.min(ARCHIVE_FORK_FORMATS.len() - 1)].1;
-        a.act(ArchivesAction::SetFormat(format));
-        a.act(ArchivesAction::ExtractAllTo(dest));
-        a.awaiting_extract = true;
-        a.status = Some("Extracting...".to_string());
-        a.is_error = false;
-    }
-
     /// Commander screen keys. Returns `true` when consumed.
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
@@ -2827,9 +2562,7 @@ impl App {
         self.restore_tick();
         self.inspect_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
-        if let Some(a) = self.archive.as_mut() {
-            a.poll();
-        }
+        self.archive_tick();
         // Drive the bulk-convert controller and mirror its file count and bytes.
         if let Some(b) = self.bulk.as_mut() {
             use crate::controller::Controller as _;
@@ -3693,82 +3426,6 @@ impl App {
     }
 
     /// The Commander dual-pane file manager.
-    /// The Archives screen: open a Mac archive, list its entries, extract.
-    fn draw_archive(&self, frame: &mut Frame, area: Rect, a: &ArchiveState) {
-        let mut lines: Vec<Line> = Vec::new();
-        if !a.ctl.is_loaded() {
-            lines.push(Line::styled(
-                "Open a classic Mac archive (.sit / .sea / .cpt / .mar / .hqx):",
-                self.palette.accent(),
-            ));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("  Enter / o  ", self.palette.accent()),
-                Span::raw("choose an archive file"),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  c         ", self.palette.accent()),
-                Span::raw("create an archive from host files (via the command line)"),
-            ]));
-            if let Some(s) = &a.status {
-                lines.push(Line::raw(""));
-                let style = if a.is_error {
-                    self.palette.warn()
-                } else {
-                    self.palette.dim()
-                };
-                lines.push(Line::styled(format!("  {s}"), style));
-            }
-            frame.render_widget(
-                Paragraph::new(Text::from(lines))
-                    .block(self.pane_block("Archives", true))
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
-            if let Some(picker) = &a.picker {
-                picker.draw(frame, area, self.palette, self.border);
-            }
-            return;
-        }
-
-        // Loaded: header + scrollable entry list.
-        let title = format!(
-            "Archives  {}  [{} entries]  fork: {}",
-            basename(&a.archive_path),
-            a.entries.len(),
-            ARCHIVE_FORK_FORMATS[a.fork_fmt_sel].0
-        );
-        let visible = area.height.saturating_sub(4) as usize;
-        let start = a.list_sel.saturating_sub(visible.saturating_sub(1));
-        for (i, line) in a.entries.iter().enumerate().skip(start).take(visible) {
-            let sel = i == a.list_sel;
-            let style = if sel {
-                self.palette
-                    .accent()
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            lines.push(Line::styled(format!(" {line}"), style));
-        }
-        if let Some(s) = &a.status {
-            lines.push(Line::raw(""));
-            let style = if a.is_error {
-                self.palette.warn()
-            } else {
-                self.palette.accent()
-            };
-            lines.push(Line::styled(format!(" {s}"), style));
-        }
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, true)),
-            area,
-        );
-        if let Some(picker) = &a.picker {
-            picker.draw(frame, area, self.palette, self.border);
-        }
-    }
-
     /// The physical-disk chooser overlay used by the Backup source step.
     /// Shared physical-disk chooser overlay (Backup source + Restore target).
     fn draw_device_pick(&self, frame: &mut Frame, area: Rect, device_sel: usize, title: &str) {
@@ -4070,6 +3727,9 @@ impl App {
         }
         if self.current() == TabId::Settings {
             return self.settings_key_context();
+        }
+        if self.current() == TabId::Archives {
+            return self.archives_key_context();
         }
         ("Tabs", HINTS_TAB)
     }
@@ -4955,33 +4615,6 @@ mod tests {
             let b = app.backup.as_ref().unwrap();
             assert!(b.log.iter().any(|l| l == REMOTE_NOT_BUILT));
         }
-    }
-
-    #[test]
-    fn the_archives_screen_opens_and_extracts_through_the_controller() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sit = crate::controller::archives::sample_archive(dir.path(), &[("readme", b"hello")]);
-        let mut app = App::headless_on(BACKUP_TAB);
-        app.archive = Some(ArchiveState::new(app.shell.recent_handle()));
-        app.load_archive(sit.clone());
-        app.archive.as_mut().unwrap().ctl.wait_idle();
-        app.tick();
-        let a = app.archive.as_ref().unwrap();
-        assert_eq!(a.status.as_deref(), Some("Opened (1 entries)."));
-        let recent = app.shell.recent(RecentMode::Archives);
-        assert_eq!(recent, [sit.to_string_lossy().into_owned()]);
-        assert!(a.entries[0].starts_with("FILE  readme"), "{:?}", a.entries);
-        let out = dir.path().join("out");
-        app.archive.as_mut().unwrap().fork_fmt_sel = 3;
-        app.archive_extract(out.clone());
-        app.archive.as_mut().unwrap().ctl.wait_idle();
-        app.tick();
-        let a = app.archive.as_ref().unwrap();
-        assert_eq!(
-            a.status.as_deref(),
-            Some(format!("Extracted 1 file(s) to {}", out.display()).as_str())
-        );
-        assert_eq!(std::fs::read(out.join("readme")).unwrap(), b"hello");
     }
 
     #[test]
