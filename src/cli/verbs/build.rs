@@ -15,7 +15,7 @@ use clap::{Args, ValueEnum};
 use crate::cli::logging::log_stderr;
 use crate::controller::build_disk::{
     containers, purpose, BuildDiskAction as A, BuildDiskController, DiskKind, ExportFormat, FsKind,
-    NoNotify, Step, TableKind,
+    NoNotify, PresetKind, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::Controller as _;
@@ -55,6 +55,14 @@ impl BuildTable {
             BuildTable::Atari => TableKind::Atari,
         }
     }
+}
+
+/// The bootable presets `build` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BuildPreset {
+    X68k,
+    #[value(name = "sgi-efs")]
+    SgiEfs,
 }
 
 /// The containers `build` can encode an image into.
@@ -157,6 +165,24 @@ pub struct BuildArgs {
     #[arg(long)]
     pub fs: Option<String>,
 
+    /// Build a fixed bootable preset instead of a table or a volume:
+    /// `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS
+    /// root). The same disks `new hd x68k` / `new hd sgi-efs` make.
+    #[arg(long, value_enum, conflicts_with_all = ["table", "fs"])]
+    pub preset: Option<BuildPreset>,
+
+    /// `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI.
+    #[arg(long)]
+    pub scsi: bool,
+
+    /// `--preset x68k`: how many Human68k partitions, 1 to 8.
+    #[arg(long, default_value_t = 1)]
+    pub x68k_partitions: usize,
+
+    /// `--preset x68k`: a Human68k system floppy cloned into partition 1.
+    #[arg(long)]
+    pub system_disk: Option<PathBuf>,
+
     /// With no `--table`: the volume label.
     #[arg(long)]
     pub label: Option<String>,
@@ -258,6 +284,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
         act(&mut c, A::SetContainer(fmt));
     }
 
+    if let Some(p) = args.preset {
+        act(&mut c, A::SetKind(DiskKind::Preset));
+        let mut view = c.preset().clone();
+        view.kind = match p {
+            BuildPreset::X68k => PresetKind::X68k,
+            BuildPreset::SgiEfs => PresetKind::SgiEfs,
+        };
+        view.x68k_scsi = args.scsi;
+        view.x68k_partitions = args.x68k_partitions;
+        view.x68k_system_disk = args.system_disk.clone();
+        if let Some(label) = &args.label {
+            view.sgi_label = label.clone();
+        }
+        act(&mut c, A::SetPreset(view));
+        return finish(c);
+    }
     match args.table {
         None => {
             let fs = args.fs.as_deref().ok_or_else(|| {
@@ -294,7 +336,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
 
-    // Walk the steps the way a user would; the first refusal is the error.
+    finish(c)
+}
+
+/// Walk the steps the way a user would (the first refusal is the error), then build.
+fn finish(mut c: BuildDiskController) -> Result<()> {
+    let act = |c: &mut BuildDiskController, a: A| {
+        c.apply(a);
+    };
     while c.step() != Step::Review {
         if let Some(why) = c.next_blocked() {
             bail!("{}: {why}", c.step().label());

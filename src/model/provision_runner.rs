@@ -103,6 +103,88 @@ pub enum BuildRequest {
         /// As [`ProvisionRequest::full_write`].
         full_write: bool,
     },
+    /// One of the fixed bootable builders, as `rb-cli new hd x68k / sgi-efs` runs it.
+    Preset {
+        target_path: PathBuf,
+        size: u64,
+        preset: Preset,
+    },
+}
+
+/// The fixed-shape bootable disks Build Disk offers as presets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preset {
+    /// Sharp X68000: the IPL stub, the X68000 table and Human68k partitions.
+    X68k {
+        scsi: bool,
+        partitions: usize,
+        /// A Human68k system floppy cloned into partition 1.
+        system_disk: Option<PathBuf>,
+    },
+    /// SGI IRIX: a volume header and an EFS root.
+    SgiEfs { label: String },
+}
+
+impl Preset {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Preset::X68k { .. } => "Sharp X68000 bootable disk (Human68k)",
+            Preset::SgiEfs { .. } => "SGI IRIX bootable disk (EFS)",
+        }
+    }
+}
+
+/// Build `preset` into a new file at `out` of `size` bytes.
+fn run_preset(
+    out: &std::path::Path,
+    size: u64,
+    preset: &Preset,
+    log: &mut dyn FnMut(&str),
+) -> Result<()> {
+    match preset {
+        Preset::X68k {
+            scsi,
+            partitions,
+            system_disk,
+        } => {
+            use crate::partition::x68k_hdd_builder::{
+                build_x68k_hdd, BootSectorSource, HddVariant,
+            };
+            let variant = if *scsi {
+                HddVariant::Scsi
+            } else {
+                HddVariant::Sasi
+            };
+            let s = build_x68k_hdd(
+                out,
+                size / (1024 * 1024),
+                variant,
+                crate::partition::x68k_ipl::IplStub::Print,
+                *partitions,
+                system_disk.as_deref(),
+                BootSectorSource::None,
+            )?;
+            log(&format!(
+                "Wrote a {} X68000 disk: {} Human68k partition(s) of {}",
+                s.variant.name(),
+                s.partition_count,
+                disk_core::display::format_size(s.partition_bytes),
+            ));
+        }
+        Preset::SgiEfs { label } => {
+            use crate::partition::sgi_hdd_builder::{write_sgi_efs_hdd, SgiHddOptions};
+            let opts = SgiHddOptions::new(size, label.as_str());
+            let mut file = std::fs::File::create(out)
+                .with_context(|| format!("creating {}", out.display()))?;
+            let layout = write_sgi_efs_hdd(&mut file, &opts)?;
+            file.set_len(layout.disk_bytes)?;
+            log(&format!(
+                "Wrote an SGI volume header and an EFS root ({} cylinders)",
+                layout.cylinders
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A target that may hold old data (a device) gets every byte of a formatted volume written,
@@ -178,14 +260,18 @@ impl BuildRequest {
     pub fn target_path(&self) -> &std::path::Path {
         match self {
             BuildRequest::Partitioned(p) => p.target_path.as_path(),
-            BuildRequest::Volume { target_path, .. } => target_path.as_path(),
+            BuildRequest::Volume { target_path, .. } | BuildRequest::Preset { target_path, .. } => {
+                target_path.as_path()
+            }
         }
     }
 
     fn set_target(&mut self, path: PathBuf) {
         match self {
             BuildRequest::Partitioned(p) => p.target_path = path,
-            BuildRequest::Volume { target_path, .. } => *target_path = path,
+            BuildRequest::Volume { target_path, .. } | BuildRequest::Preset { target_path, .. } => {
+                *target_path = path
+            }
         }
     }
 
@@ -199,6 +285,15 @@ impl BuildRequest {
                 ..
             } => {
                 if writes_in_full(target_path.as_path(), *full_write) {
+                    *size
+                } else {
+                    0
+                }
+            }
+            BuildRequest::Preset {
+                target_path, size, ..
+            } => {
+                if crate::os::is_device_path(target_path.as_path()) {
                     *size
                 } else {
                     0
@@ -249,6 +344,11 @@ pub fn run_build(
             writes_in_full(target_path.as_path(), *full_write),
             status,
         ),
+        BuildRequest::Preset {
+            target_path,
+            size,
+            preset,
+        } => run_preset_on(target_path.as_path(), *size, preset, status),
     };
     let Some(fmt) = container.filter(|c| *c != ExportFormat::Raw) else {
         return raw(&req, status);
@@ -268,6 +368,52 @@ pub fn run_build(
     let result = built.and_then(|()| encode(fmt, tmp.as_path(), dest.as_path(), &status));
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// A preset onto a file directly, or onto a device through a temp image written in full.
+fn run_preset_on(
+    target: &std::path::Path,
+    size: u64,
+    preset: &Preset,
+    status: Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<()> {
+    let push = |m: &str| {
+        if let Ok(mut s) = status.lock() {
+            s.log_messages.push(m.to_string());
+        }
+    };
+    let mut log = |m: &str| push(m);
+    if !crate::os::is_device_path(target) {
+        run_preset(target, size, preset, &mut log)?;
+        push("Disk build complete");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir().context("creating a temporary folder")?;
+    let tmp = dir.path().join("preset.img");
+    run_preset(tmp.as_path(), size, preset, &mut log)?;
+    let handle = open_target_preserving(target)
+        .with_context(|| format!("opening target {} for writing", target.display()))?;
+    let mut dev = SectorAlignedWriter::new(handle.file);
+    let mut progress = |n: u64| {
+        if let Ok(mut s) = status.lock() {
+            s.current_bytes = n;
+        }
+    };
+    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
+    let mut wlog = |m: &str| push(m);
+    physical_write_runner::write_image_into(
+        &mut dev,
+        tmp.as_path(),
+        WriteExtent::whole_disk(size),
+        0,
+        &mut progress,
+        &cancel,
+        &mut wlog,
+    )?;
+    dev.flush().context("flushing target after build")?;
+    dev.sync_all().context("syncing the target")?;
+    push("Disk build complete");
+    Ok(())
 }
 
 /// Encode the built raw image at `raw` into `fmt` at `dest`, reporting on `status`.

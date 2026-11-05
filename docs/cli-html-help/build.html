@@ -39,6 +39,14 @@
 <dd>Sectors per track for the cylinder-aligned tables</dd>
 <dt><code>--fs</code></dt>
 <dd>With no `--table`: the filesystem of the one bare volume</dd>
+<dt><code>--preset</code></dt>
+<dd>Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make</dd>
+<dt><code>--scsi</code></dt>
+<dd>`--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI</dd>
+<dt><code>--x68k-partitions</code></dt>
+<dd>`--preset x68k`: how many Human68k partitions, 1 to 8</dd>
+<dt><code>--system-disk</code></dt>
+<dd>`--preset x68k`: a Human68k system floppy cloned into partition 1</dd>
 <dt><code>--label</code></dt>
 <dd>With no `--table`: the volume label</dd>
 <dt><code>--geometry</code></dt>

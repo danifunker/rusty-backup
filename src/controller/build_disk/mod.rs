@@ -116,6 +116,7 @@ pub mod purpose {
     pub const OUTPUT_IMAGE: &str = "build_disk.output_image";
     pub const ROW_SOURCE: &str = "build_disk.row_source";
     pub const RDB_HANDLER: &str = "build_disk.rdb_handler";
+    pub const SYSTEM_DISK: &str = "build_disk.system_disk";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -177,17 +178,52 @@ pub enum DiskKind {
     Partitioned,
     /// One filesystem filling the whole disk, no table (a superfloppy or a floppy).
     Volume,
+    /// A fixed-shape bootable disk (X68000, SGI IRIX).
+    Preset,
 }
 
 impl DiskKind {
-    pub const ALL: [DiskKind; 2] = [DiskKind::Partitioned, DiskKind::Volume];
+    pub const ALL: [DiskKind; 3] = [DiskKind::Partitioned, DiskKind::Volume, DiskKind::Preset];
 
     pub fn label(self) -> &'static str {
         match self {
             DiskKind::Partitioned => "Partitioned disk",
             DiskKind::Volume => "Single volume (no partition table)",
+            DiskKind::Preset => "Bootable preset (X68000, SGI IRIX)",
         }
     }
+}
+
+/// The presets, as the Disk step lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetKind {
+    X68k,
+    SgiEfs,
+}
+
+impl PresetKind {
+    pub const ALL: [PresetKind; 2] = [PresetKind::X68k, PresetKind::SgiEfs];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PresetKind::X68k => "Sharp X68000 (IPL, X68000 table, Human68k)",
+            PresetKind::SgiEfs => "SGI IRIX (volume header, EFS root)",
+        }
+    }
+}
+
+/// A preset's fields, for the Disk step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetView {
+    pub kind: PresetKind,
+    /// X68000: SCSI (1024-byte sectors) rather than SASI (256-byte).
+    pub x68k_scsi: bool,
+    /// X68000: Human68k partitions, 1 to 8.
+    pub x68k_partitions: usize,
+    /// X68000: the Human68k system floppy cloned into partition 1.
+    pub x68k_system_disk: Option<PathBuf>,
+    /// SGI: the EFS volume label (6 bytes).
+    pub sgi_label: String,
 }
 
 /// What a row holds after the build.
@@ -234,6 +270,10 @@ pub enum BuildDiskAction {
     },
     SetVolumeFs(FsKind),
     SetVolumeOptions(FormatOptions),
+    /// The preset and its fields, edited as one.
+    SetPreset(PresetView),
+    /// "Choose..." for the X68000 preset's system floppy.
+    PickSystemDisk,
     SetConfirmText(String),
     /// "Add handler...": pick the AmigaDOS load file for this DosType (RDB only).
     AddHandler(String),
@@ -268,6 +308,7 @@ pub struct BuildDiskController {
     kind: DiskKind,
     builder: DiskBuilder,
     volume: RowFormat,
+    preset: PresetView,
     size_text: String,
     output_is_device: bool,
     device: Option<(usize, DiskDevice)>,
@@ -293,6 +334,13 @@ impl BuildDiskController {
             kind: DiskKind::Partitioned,
             builder: DiskBuilder::new(TableKind::Mbr, 0),
             volume: RowFormat::new(FsKind::Fat),
+            preset: PresetView {
+                kind: PresetKind::X68k,
+                x68k_scsi: false,
+                x68k_partitions: 1,
+                x68k_system_disk: None,
+                sgi_label: "irix".to_string(),
+            },
             size_text: "512M".to_string(),
             output_is_device: false,
             device: None,
@@ -334,13 +382,15 @@ impl BuildDiskController {
     /// The steps for the current kind, in order.
     pub fn steps(&self) -> Vec<Step> {
         let mut v = vec![Step::Kind, Step::Output, Step::Disk];
-        if self.kind == DiskKind::Partitioned {
-            v.push(Step::Partitions);
-            if self.builder.rows.iter().any(|r| r.format.is_some()) {
-                v.push(Step::Options);
+        match self.kind {
+            DiskKind::Partitioned => {
+                v.push(Step::Partitions);
+                if self.builder.rows.iter().any(|r| r.format.is_some()) {
+                    v.push(Step::Options);
+                }
             }
-        } else {
-            v.push(Step::Options);
+            DiskKind::Volume => v.push(Step::Options),
+            DiskKind::Preset => {}
         }
         v.push(Step::Review);
         v.push(Step::Build);
@@ -433,6 +483,10 @@ impl BuildDiskController {
         self.volume.kind
     }
 
+    pub fn preset(&self) -> &PresetView {
+        &self.preset
+    }
+
     /// The filesystems a volume or row can be formatted with, in a stable order.
     pub fn filesystems(&self) -> &'static [FsKind] {
         &FsKind::ALL
@@ -459,6 +513,7 @@ impl BuildDiskController {
                 format!("Volume ({})", self.volume.kind.display_name()),
                 &self.volume,
             )],
+            DiskKind::Preset => Vec::new(),
             DiskKind::Partitioned => self
                 .builder
                 .rows
@@ -591,6 +646,40 @@ impl BuildDiskController {
         match self.kind {
             DiskKind::Partitioned => None,
             DiskKind::Volume => self.volume.fits(size).err(),
+            DiskKind::Preset => self.preset_blocked(size),
+        }
+    }
+
+    /// The size the preset is built at: a device's size rounded down to what the preset takes.
+    fn preset_size(&self, size: u64) -> u64 {
+        match self.preset.kind {
+            PresetKind::X68k => size / (1024 * 1024) * (1024 * 1024),
+            PresetKind::SgiEfs => size,
+        }
+    }
+
+    fn preset_blocked(&self, size: u64) -> Option<String> {
+        let p = &self.preset;
+        match p.kind {
+            PresetKind::X68k => {
+                if !(1..=8).contains(&p.x68k_partitions) {
+                    return Some("An X68000 disk has 1 to 8 partitions.".to_string());
+                }
+                if !self.output_is_device && size % (1024 * 1024) != 0 {
+                    return Some("An X68000 disk is a whole number of MiB.".to_string());
+                }
+                (self.preset_size(size) < 4 * 1024 * 1024)
+                    .then(|| "An X68000 disk needs at least 4 MiB.".to_string())
+            }
+            PresetKind::SgiEfs => {
+                let opts = crate::partition::sgi_hdd_builder::SgiHddOptions::new(
+                    size,
+                    p.sgi_label.as_str(),
+                );
+                crate::partition::sgi_hdd_builder::compute_sgi_layout(&opts)
+                    .err()
+                    .map(|e| format!("{e:#}"))
+            }
         }
     }
 
@@ -649,6 +738,23 @@ impl BuildDiskController {
         });
         match self.kind {
             DiskKind::Volume => v.push(format!("One {} volume", self.volume.describe())),
+            DiskKind::Preset => {
+                let p = &self.preset;
+                v.push(p.kind.label().to_string());
+                match p.kind {
+                    PresetKind::X68k => {
+                        v.push(format!(
+                            "{} controller, {} Human68k partition(s)",
+                            if p.x68k_scsi { "SCSI" } else { "SASI" },
+                            p.x68k_partitions
+                        ));
+                        if let Some(d) = &p.x68k_system_disk {
+                            v.push(format!("System disk cloned in: {}", d.display()));
+                        }
+                    }
+                    PresetKind::SgiEfs => v.push(format!("EFS label {:?}", p.sgi_label)),
+                }
+            }
             DiskKind::Partitioned => {
                 v.push(format!("{} partition table", self.builder.kind.label()));
                 for (t, p) in &self.handlers {
@@ -735,6 +841,10 @@ impl BuildDiskController {
         let name = match self.kind {
             DiskKind::Volume => format!("{}.img", self.volume.kind.id()),
             DiskKind::Partitioned => "disk.img".to_string(),
+            DiskKind::Preset => match self.preset.kind {
+                PresetKind::X68k => "x68000.hds".to_string(),
+                PresetKind::SgiEfs => "irix.img".to_string(),
+            },
         };
         vec![Effect::PickFile(PickSpec {
             purpose: purpose::OUTPUT_IMAGE,
@@ -790,6 +900,7 @@ impl BuildDiskController {
                 }
                 self.image = Some(path);
             }
+            purpose::SYSTEM_DISK => self.preset.x68k_system_disk = Some(path),
             purpose::RDB_HANDLER => {
                 if let Some(t) = self.handler_for.take() {
                     self.handlers.retain(|(d, _)| !d.eq_ignore_ascii_case(&t));
@@ -865,6 +976,23 @@ impl BuildDiskController {
             return;
         };
         let request = match self.kind {
+            DiskKind::Preset => {
+                let p = &self.preset;
+                crate::model::provision_runner::BuildRequest::Preset {
+                    target_path: target.clone(),
+                    size: self.preset_size(size),
+                    preset: match p.kind {
+                        PresetKind::X68k => crate::model::provision_runner::Preset::X68k {
+                            scsi: p.x68k_scsi,
+                            partitions: p.x68k_partitions,
+                            system_disk: p.x68k_system_disk.clone(),
+                        },
+                        PresetKind::SgiEfs => crate::model::provision_runner::Preset::SgiEfs {
+                            label: p.sgi_label.clone(),
+                        },
+                    },
+                }
+            }
             DiskKind::Volume => crate::model::provision_runner::BuildRequest::Volume {
                 target_path: target.clone(),
                 size,
@@ -1048,6 +1176,25 @@ impl Controller for BuildDiskController {
                 }
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
+            BuildDiskAction::SetPreset(p) => self.preset = p,
+            BuildDiskAction::PickSystemDisk => {
+                return vec![Effect::PickFile(PickSpec {
+                    purpose: purpose::SYSTEM_DISK,
+                    title: "Human68k system floppy (.dim, .xdf, .hdm, .d88)".to_string(),
+                    filters: vec![
+                        (
+                            "X68000 floppies".to_string(),
+                            ["dim", "xdf", "hdm", "d88"]
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect(),
+                        ),
+                        ("All Files".to_string(), vec!["*".to_string()]),
+                    ],
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
             BuildDiskAction::SetConfirmText(t) => self.confirm_text = t,
             BuildDiskAction::AddHandler(dostype) => {
                 if !self.takes_handlers() {

@@ -259,3 +259,42 @@ fn an_rdb_build_embeds_its_handler_and_boot_flag() {
     ]);
     assert!(!ok && out.contains("AmigaDOS load file"), "{out}");
 }
+
+/// The presets make the disks `new hd x68k` / `new hd sgi-efs` make.
+#[test]
+fn presets_match_the_new_hd_builders() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&["build", &p("a.hds"), "--size", "40M", "--preset", "x68k"]);
+    run(&["new", "hd", "x68k", &p("b.hds"), "--size", "40M"]);
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "64M",
+        "--preset",
+        "sgi-efs",
+        "--label",
+        "irix",
+    ]);
+    run(&[
+        "new",
+        "hd",
+        "sgi-efs",
+        &p("b.img"),
+        "--size",
+        "64M",
+        "--name",
+        "irix",
+    ]);
+    for (a, b) in [("a.hds", "b.hds"), ("a.img", "b.img")] {
+        let la = std::fs::metadata(p(a)).unwrap().len();
+        assert_eq!(la, std::fs::metadata(p(b)).unwrap().len(), "{a}");
+        let ia = run(&["inspect", &p(a)]).replace(&p(a), "X");
+        let ib = run(&["inspect", &p(b)]).replace(&p(b), "X");
+        assert_eq!(ia, ib, "{a} vs {b}");
+        fsck_clean(&format!("{}@1", p(a)));
+    }
+    let (ok, out) = run_raw(&["build", &p("c.hds"), "--size", "1500K", "--preset", "x68k"]);
+    assert!(!ok && out.contains("MiB"), "{out}");
+}

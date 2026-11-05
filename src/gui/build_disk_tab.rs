@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, ids, parse_size_field, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, RowContent, Step,
+    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, PresetKind,
+    RowContent, Step,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -197,6 +198,10 @@ impl BuildDiskTab {
                     "One filesystem across the whole disk with no partition table: a floppy, \
                      a superfloppy, or a bare volume for an emulator."
                 }
+                DiskKind::Preset => {
+                    "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or \
+                     an SGI IRIX disk with its volume header and an EFS root."
+                }
             };
             if ui
                 .radio(self.ctl.kind() == kind, kind.label())
@@ -344,6 +349,56 @@ impl BuildDiskTab {
 
     fn disk_step(&mut self, ui: &mut egui::Ui) {
         match self.ctl.kind() {
+            DiskKind::Preset => {
+                let mut p = self.ctl.preset().clone();
+                let before = p.clone();
+                for k in PresetKind::ALL {
+                    ui.radio_value(&mut p.kind, k, k.label());
+                }
+                ui.add_space(4.0);
+                match p.kind {
+                    PresetKind::X68k => {
+                        ui.horizontal(|ui| {
+                            ui.label("Controller:");
+                            ui.radio_value(&mut p.x68k_scsi, false, "SASI (256-byte sectors)");
+                            ui.radio_value(&mut p.x68k_scsi, true, "SCSI (1024-byte sectors)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Human68k partitions:");
+                            ui.add(egui::DragValue::new(&mut p.x68k_partitions).range(1..=8));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("System disk:");
+                            match &p.x68k_system_disk {
+                                Some(d) => ui.label(d.display().to_string()),
+                                None => ui.label(egui::RichText::new("(none: seed files)").weak()),
+                            };
+                            if ui
+                                .button("Choose...")
+                                .on_hover_text("A Human68k system floppy cloned into partition 1")
+                                .clicked()
+                            {
+                                self.act(BuildDiskAction::PickSystemDisk);
+                            }
+                            if p.x68k_system_disk.is_some() && ui.small_button("Clear").clicked() {
+                                p.x68k_system_disk = None;
+                            }
+                        });
+                    }
+                    PresetKind::SgiEfs => {
+                        ui.horizontal(|ui| {
+                            ui.label("EFS label:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut p.sgi_label).desired_width(80.0),
+                            );
+                        });
+                    }
+                }
+                if p != before {
+                    self.act(BuildDiskAction::SetPreset(p));
+                }
+                self.size_row(ui, None);
+            }
             DiskKind::Volume => {
                 let fs = self.ctl.volume_fs();
                 ui.horizontal(|ui| {

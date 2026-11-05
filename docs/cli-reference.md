@@ -456,6 +456,10 @@ Usage: build [OPTIONS] <TARGET>
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables
 - `--fs` — With no `--table`: the filesystem of the one bare volume
+- `--preset` — Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make
+- `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
+- `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
+- `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
 - `--label` — With no `--table`: the volume label
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
 - `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw

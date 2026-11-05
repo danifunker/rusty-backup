@@ -366,7 +366,8 @@ The app has five tabs:
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
 - **Build Disk** — a wizard that makes a new disk from nothing: a partitioned
   disk (MBR / GPT / APM / RDB / SGI volume header / SGI disk label / Sun /
-  NeXT / Solaris x86 / X68000 / Atari AHDI) or one bare volume, saved as an
+  NeXT / Solaris x86 / X68000 / Atari AHDI), one bare volume, or a bootable
+  preset (a Sharp X68000 Human68k disk, an SGI IRIX EFS disk), saved as an
   image file or written straight to a physical disk such as an SD or CF card.
   Each partition is formatted blank with any of the 39 filesystems Rusty
   Backup can create, filled from a source image, or left empty; its type

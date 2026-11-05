@@ -17,8 +17,8 @@ use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, NoNotify, RowContent, Step,
-    TableKind,
+    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, NoNotify, PresetKind,
+    RowContent, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -49,6 +49,11 @@ pub(super) enum Row {
     Heads,
     Sectors,
     VolumeFs,
+    Preset,
+    X68kScsi,
+    X68kParts,
+    SystemDisk,
+    SgiLabel,
     PSize(usize),
     PType(usize),
     PName(usize),
@@ -173,6 +178,18 @@ impl BuildDiskState {
             Step::Disk => {
                 let mut r = Vec::new();
                 match c.kind() {
+                    DiskKind::Preset => {
+                        r.push(Row::Preset);
+                        match c.preset().kind {
+                            PresetKind::X68k => {
+                                r.extend([Row::X68kScsi, Row::X68kParts, Row::SystemDisk])
+                            }
+                            PresetKind::SgiEfs => r.push(Row::SgiLabel),
+                        }
+                        if !c.output_is_device() {
+                            r.push(Row::Size);
+                        }
+                    }
                     DiskKind::Volume => {
                         r.push(Row::VolumeFs);
                         if !c.output_is_device() && !c.volume_fs().caps().fixed_size {
@@ -283,6 +300,8 @@ impl BuildDiskState {
                 size(self.opts_of(r)?.cluster_bytes.map(u64::from))
             }
             Row::Confirm => c.confirm_text().to_string(),
+            Row::X68kParts => c.preset().x68k_partitions.to_string(),
+            Row::SgiLabel => c.preset().sgi_label.clone(),
             _ => return None,
         })
     }
@@ -354,6 +373,18 @@ impl BuildDiskState {
                 self.set_opts(r, o);
             }
             Row::Confirm => self.act(BuildDiskAction::SetConfirmText(text)),
+            Row::X68kParts => {
+                if let Ok(n) = text.trim().parse() {
+                    let mut p = self.ctl.preset().clone();
+                    p.x68k_partitions = n;
+                    self.act(BuildDiskAction::SetPreset(p));
+                }
+            }
+            Row::SgiLabel => {
+                let mut p = self.ctl.preset().clone();
+                p.sgi_label = text;
+                self.act(BuildDiskAction::SetPreset(p));
+            }
             _ => {}
         }
     }
@@ -382,6 +413,16 @@ impl BuildDiskState {
             Row::VolumeFs => {
                 let k = cycle(&FsKind::ALL, c.volume_fs(), forward);
                 self.act(BuildDiskAction::SetVolumeFs(k));
+            }
+            Row::Preset => {
+                let mut p = c.preset().clone();
+                p.kind = cycle(&PresetKind::ALL, p.kind, forward);
+                self.act(BuildDiskAction::SetPreset(p));
+            }
+            Row::X68kScsi => {
+                let mut p = c.preset().clone();
+                p.x68k_scsi = !p.x68k_scsi;
+                self.act(BuildDiskAction::SetPreset(p));
             }
             Row::PBoot(i) => {
                 let on = !c.table_view().rows.get(i).is_some_and(|r| r.bootable);
@@ -583,6 +624,7 @@ impl App {
                 }
                 Some(Row::OutputImage) => s.act(BuildDiskAction::PickOutputImage),
                 Some(Row::AddPartition) => s.act(BuildDiskAction::Table(BuildAction::AddRow)),
+                Some(Row::SystemDisk) => s.act(BuildDiskAction::PickSystemDisk),
                 Some(Row::Handler(i)) => s.act(BuildDiskAction::RemoveHandler(i)),
                 Some(Row::AddHandler(i)) => {
                     if let Some(t) = s.ctl.handlers_missing().get(i).cloned() {
@@ -783,6 +825,25 @@ impl App {
                         format!("< {} >  {range}", c.volume_fs().display_name()),
                     )
                 }
+                Row::Preset => ("Preset".into(), format!("< {} >", c.preset().kind.label())),
+                Row::X68kScsi => (
+                    "Controller".into(),
+                    if c.preset().x68k_scsi {
+                        "< SCSI (1024-byte sectors) >".into()
+                    } else {
+                        "< SASI (256-byte sectors) >".into()
+                    },
+                ),
+                Row::X68kParts => ("Partitions".into(), c.preset().x68k_partitions.to_string()),
+                Row::SystemDisk => (
+                    "System disk".into(),
+                    c.preset()
+                        .x68k_system_disk
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none: seed files; Enter to choose)".into()),
+                ),
+                Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
                 Row::PSize(p) => (
                     "  Size".into(),
                     v.rows
