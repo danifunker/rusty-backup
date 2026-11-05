@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "fs-tar"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bzip2",

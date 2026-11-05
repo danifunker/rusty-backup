@@ -39,12 +39,12 @@ builders. Today it does the following:
 | Input | Today | Notes |
 |---|---|---|
 | tar and its compressed forms (`.tar`, `.tgz`, `.tar.gz` / `.bz2` / `.xz` / `.zst`, `.gtar`, ...), IRIX `.tardist` | yes, `--expand-archives` (SGI, Mac, NeXT) | one folder per archive, or `--flatten-folders` into the root (SGI, NeXT) |
-| gzip without a tar inside | yes, `--expand-gunzip` (NeXT only) | should be on every format |
+| gzip without a tar inside | yes, `--expand-gunzip` on every CD format and `import` | every format since 2026-11-05 |
 | StuffIt `.sit` / `.sea`, Compact Pro `.cpt`, BinHex `.hqx` (and `.sit.hqx`), MAR `.mar` | yes, `--expand-archives` | through `arc-mac`; forks land as forks on HFS / HFS+, as AppleDouble on the others |
 | AppleDouble sidecars (`._x`, `__MACOSX`) | yes, `--include-appledouble` | merged into the file's forks on HFS |
-| ZIP (`.zip`; Mac zips with `__MACOSX` or `Mac3` fields) | **no** | app only: the `zip` crate (2.4.2 on the 1.73 builds, 9 elsewhere) and `arc-mac::maczip::{is_maczip, parse}` are already there: S |
-| MacBinary `.bin` and AppleSingle as single files | **no** | MacBinary: app only, through `arc-mac::macbinary::{is_macbinary, parse}`. AppleSingle: **`fs-mac` gains `parse_applesingle`** next to `parse_appledouble` (same entry table, magic `0x00051600`, adds the data fork); bump + publish: S |
-| Disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`) | **no** | app only: `dir_import` learns a source tree that is a filesystem opened by `model::source_reader` (forks and Finder info carried), not just a host folder: M, and useful for Mac CDs |
+| ZIP (`.zip`; macOS `__MACOSX` / `._name` forks joined; Info-ZIP MacZip through `arc-mac`) | yes, `--expand-archives` (2026-11-05) | `fs_tar::zip_import`, streamed member by member |
+| MacBinary `.bin` and AppleSingle as single files | yes, always on HFS / HFS+ targets (AppleSingle since 2026-11-05) | `fs_mac::resource_fork::detect_resource_fork`; other targets keep the file as it is |
+| Disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) | yes, `--expand-images` (2026-11-05) | `fs::image_import`, through the Commander's descend code; one folder per image, a subfolder per partition; an image with nothing browsable is copied as a file |
 | LhA / LZH (Amiga, Japanese PC) | **no** | needs a decoder: M |
 | 7z, RAR | no | not planned (dependencies, licensing) |
 
@@ -52,7 +52,7 @@ In the wizard these are checkboxes on the Content step, each listing the types i
 expand archives, strip gzip only, decode Mac single-file encodings, merge AppleDouble,
 flatten into the root, plus the SGI and NeXT permission option. Each format offers only the
 options that make sense for it: forks matter on HFS / HFS+, and "flatten" is for `inst`
-trees. The ZIP, MacBinary / AppleSingle and disk-image rows are **G14**.
+trees. The ZIP, MacBinary / AppleSingle and disk-image rows were **G14** in the Build Disk plan, done 2026-11-05.
 
 ## CD audio mastering (asked 2026-11-05)
 

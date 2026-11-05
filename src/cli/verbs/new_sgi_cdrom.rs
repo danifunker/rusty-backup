@@ -46,13 +46,23 @@ pub struct NewSgiCdromArgs {
     /// With `--from-dir`: unpack archives found in the tree into a directory
     /// named after each, instead of copying them in verbatim. Tar is detected
     /// by content, so IRIX `.tardist` files count; classic Mac archives
-    /// (`.sit`, `.cpt`, `.hqx`, …) are unpacked too.
+    /// (`.sit`, `.cpt`, `.hqx`, …) and ZIP are unpacked too.
     ///
     /// Off by default: a software-distribution disc usually wants its
     /// archives left intact so the target system's installer can consume
     /// them (on IRIX, `inst` reads a `.tardist` as-is).
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
+
+    /// With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`).
+    /// With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files.
+    #[arg(long = "expand-gunzip", requires = "from_dir")]
+    pub expand_gunzip: bool,
+
+    /// With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+    /// `.hfv`, ...) into a folder named after each, forks included, instead of the image.
+    #[arg(long = "expand-images", requires = "from_dir")]
+    pub expand_images: bool,
 
     /// With `--expand-archives`: unpack each archive into the volume root
     /// rather than a subdirectory named after it, so every archive shares one
@@ -155,16 +165,15 @@ fn resolve_disc_size(args: &NewSgiCdromArgs) -> Result<u64> {
     let Some(dir) = &args.from_dir else {
         anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
     };
-    let (files, dirs, bytes) =
-        crate::fs::dir_import::measure_dir(dir, args.expand_archives, args.flatten_folders)
-            .with_context(|| format!("measuring {}", dir.display()))?;
+    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir_for(dir, &import_options(args))
+        .with_context(|| format!("measuring {}", dir.display()))?;
     // EFS allocates in 512-byte blocks.
     let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
     log_stderr(format!(
         "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disc",
         bytes / (1024 * 1024),
-        if args.expand_archives {
-            " (archives measured expanded)"
+        if args.expand_archives || args.expand_gunzip || args.expand_images {
+            " (measured as it will land)"
         } else {
             ""
         },
@@ -176,7 +185,7 @@ fn resolve_disc_size(args: &NewSgiCdromArgs) -> Result<u64> {
 /// Import `dir` into the freshly-formatted disc's EFS partition.
 fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
     use crate::cli::resolve::resolve_partition_rw_forced;
-    use crate::fs::dir_import::{import_dir, DirImportOptions};
+    use crate::fs::dir_import::import_dir;
 
     if !dir.is_dir() {
         anyhow::bail!("--from-dir: not a directory: {}", dir.display());
@@ -190,7 +199,20 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
     let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
-    let opts = DirImportOptions {
+    let opts = import_options(args);
+    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
+        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    commit.commit()?;
+
+    super::import::summarize(dir, "/", &stats, args.expand_archives);
+    Ok(())
+}
+
+/// The import settings, shared by `--size auto` and the import so the disc fits what lands.
+fn import_options(args: &NewSgiCdromArgs) -> crate::fs::dir_import::DirImportOptions {
+    crate::fs::dir_import::DirImportOptions {
         shared: super::import::shared_options(
             args.force,
             false,
@@ -200,14 +222,7 @@ fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
-        expand_gunzip: false,
-    };
-    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
-        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
-    fs.sync_metadata()
-        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-    commit.commit()?;
-
-    super::import::summarize(dir, "/", &stats, args.expand_archives);
-    Ok(())
+        expand_gunzip: args.expand_gunzip,
+        expand_disk_images: args.expand_images,
+    }
 }

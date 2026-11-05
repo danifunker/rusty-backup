@@ -64,8 +64,16 @@ pub fn measure_mac_archive_expanded(path: &Path) -> Result<(u64, u64, u64)> {
     Ok(totals)
 }
 
+/// `(files, dirs, bytes)` under an open filesystem's root, both forks counted.
+pub(crate) fn measure_filesystem(fs: &mut dyn Filesystem) -> Result<(u64, u64, u64)> {
+    let root = fs.root().map_err(|e| anyhow!("reading the root: {e}"))?;
+    let mut totals = (0u64, 0u64, 0u64);
+    measure_dir_into(fs, &root, &mut totals)?;
+    Ok(totals)
+}
+
 fn measure_dir_into(
-    fs: &mut ArchiveFilesystem,
+    fs: &mut dyn Filesystem,
     dir: &FileEntry,
     totals: &mut (u64, u64, u64),
 ) -> Result<()> {
@@ -106,12 +114,30 @@ pub fn import_mac_archive_from_path_into(
 ) -> Result<ImportStats> {
     let mut src = ArchiveFilesystem::open_path(path)
         .map_err(|e| anyhow!("opening {}: {e}", path.display()))?;
-    let root = src
-        .root()
-        .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
+    import_filesystem_into(
+        &mut src,
+        path.display().to_string().as_str(),
+        efs,
+        dest,
+        opts,
+        progress,
+    )
+}
+
+/// Copy everything under `src`'s root into `dest`, forks and Finder info included; `what`
+/// names the source in errors. Shared by Mac archives and disk images.
+pub(crate) fn import_filesystem_into(
+    src: &mut dyn Filesystem,
+    what: &str,
+    efs: &mut dyn EditableFilesystem,
+    dest: &FileEntry,
+    opts: &ImportOptions,
+    progress: &dyn Fn(&ImportStats),
+) -> Result<ImportStats> {
+    let root = src.root().map_err(|e| anyhow!("reading {}: {e}", what))?;
     let children = src
         .list_directory(&root)
-        .map_err(|e| anyhow!("listing {}: {e}", path.display()))?;
+        .map_err(|e| anyhow!("listing {}: {e}", what))?;
 
     let copy_opts = CopyOptions {
         recursive: true,
@@ -132,16 +158,16 @@ pub fn import_mac_archive_from_path_into(
     let mut copied = CopyStats::default();
     for child in &children {
         copy_into(
-            &mut src,
+            src,
             child,
             efs,
             dest,
             &child.name,
             &copy_opts,
             &mut copied,
-            &|msg: &str| log::debug!("expand {}: {msg}", path.display()),
+            &|msg: &str| log::debug!("expand {}: {msg}", what),
         )
-        .with_context(|| format!("copying {} out of {}", child.name, path.display()))?;
+        .with_context(|| format!("copying {} out of {}", child.name, what))?;
         fold(&copied, &mut stats);
         progress(&stats);
     }

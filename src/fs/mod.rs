@@ -14,6 +14,7 @@ use fs_8bit::dfs;
 use fs_cpm::cpm;
 use fs_cpm::cpm_diskdefs;
 pub mod dir_import;
+pub mod image_import;
 use fs_8bit::dragondos;
 use fs_unix::efs;
 use fs_unix::efs_resize;

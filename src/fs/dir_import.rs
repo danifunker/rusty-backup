@@ -71,6 +71,10 @@ pub struct DirImportOptions {
     /// Strip one gzip layer, keeping any tar inside: `x.tgz` lands as `x.tar`, `foo.gz` as `foo`.
     /// [`Self::expand_archives`] runs first, so with both only non-tar gzip files reach this.
     pub expand_gunzip: bool,
+
+    /// Copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a
+    /// folder named after each, instead of copying the image in; see [`super::image_import`].
+    pub expand_disk_images: bool,
 }
 
 /// The name `--expand-gunzip` gives a gzip file: `.tgz` becomes `.tar`, `.gz` is dropped.
@@ -127,6 +131,8 @@ fn gunzip_scan(path: &Path) -> Result<(u64, Option<u64>)> {
 enum ArchiveFlavor {
     Tar,
     Mac,
+    Zip,
+    DiskImage,
 }
 
 /// Classify a host file for expansion. Tar first: its `ustar` sniff reads a
@@ -134,6 +140,12 @@ enum ArchiveFlavor {
 fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
     if fs_tar::tar_import::looks_like_tar_archive(path) {
         Some(ArchiveFlavor::Tar)
+    } else if is_zip(path) {
+        // Info-ZIP's MacZip carries forks in `Mac3` fields, which only arc-mac reads.
+        Some(match is_maczip(path) {
+            true => ArchiveFlavor::Mac,
+            false => ArchiveFlavor::Zip,
+        })
     } else if crate::fs::mac_archive_import::looks_like_mac_archive(path) {
         Some(ArchiveFlavor::Mac)
     } else {
@@ -141,11 +153,47 @@ fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
     }
 }
 
-/// `(files, dirs, bytes)` the archive expands to, per flavor.
-fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<(u64, u64, u64)> {
+/// A `.zip` by name and by signature; a zip-wrapped disk image is still a zip here.
+fn is_zip(path: &Path) -> bool {
+    let named = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    named && fs_tar::zip_import::looks_like_zip(path)
+}
+
+/// Largest zip read whole to look for MacZip fields; MacZip archives are floppy-era small.
+const MACZIP_PROBE_MAX: u64 = 256 * 1024 * 1024;
+
+fn is_maczip(path: &Path) -> bool {
+    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MACZIP_PROBE_MAX);
+    small
+        && std::fs::read(path)
+            .map(|b| arc_mac::maczip::is_maczip(b.as_slice()))
+            .unwrap_or(false)
+}
+
+/// What a host file expands as under `opts`, if anything.
+fn expansion(path: &Path, opts: &DirImportOptions) -> Option<ArchiveFlavor> {
+    if opts.expand_archives {
+        if let Some(f) = archive_flavor(path) {
+            return Some(f);
+        }
+    }
+    (opts.expand_disk_images && super::image_import::looks_like_disk_image(path))
+        .then_some(ArchiveFlavor::DiskImage)
+}
+
+/// `(files, dirs, bytes)` the archive expands to, per flavor; `None` for an image with no
+/// browsable volume, which is copied in as a file.
+fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<Option<(u64, u64, u64)>> {
     match flavor {
-        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded(path),
-        ArchiveFlavor::Mac => crate::fs::mac_archive_import::measure_mac_archive_expanded(path),
+        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded(path).map(Some),
+        ArchiveFlavor::Mac => {
+            crate::fs::mac_archive_import::measure_mac_archive_expanded(path).map(Some)
+        }
+        ArchiveFlavor::Zip => fs_tar::zip_import::measure_zip_expanded(path).map(Some),
+        ArchiveFlavor::DiskImage => super::image_import::measure_image_expanded(path),
     }
 }
 
@@ -180,6 +228,7 @@ fn expanded_dir_name(file_name: &str) -> String {
         ".cpt",
         ".hqx",
         ".mar",
+        ".zip",
     ] {
         if lower.ends_with(suffix) {
             let stem = &file_name[..file_name.len() - suffix.len()];
@@ -189,6 +238,14 @@ fn expanded_dir_name(file_name: &str) -> String {
         }
     }
     file_name.to_string()
+}
+
+/// Folder name for an expanded disk image: the name without its last extension.
+fn image_dir_name(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+        _ => file_name.to_string(),
+    }
 }
 
 /// One host entry, flattened out of the recursive walk.
@@ -404,11 +461,7 @@ fn import_dir_inner(
                 )?;
             }
             HostKind::File { size } => {
-                if let Some(flavor) = opts
-                    .expand_archives
-                    .then(|| archive_flavor(&e.host))
-                    .flatten()
-                {
+                if let Some(flavor) = expansion(&e.host, opts) {
                     if expand_archive(efs, &mut sink, &e, flavor, opts, progress)? {
                         progress(&sink.stats);
                         continue;
@@ -547,8 +600,21 @@ fn expand_archive(
     // and unpack under that.
     let mut comps = e.comps.clone();
     let last = comps.len() - 1;
+    // A disk image with nothing browsable is copied in as it is.
+    let vols = match flavor {
+        ArchiveFlavor::DiskImage => {
+            let v = super::image_import::volumes(&e.host);
+            if v.is_empty() {
+                return Ok(false);
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
     if opts.flatten_archives {
         comps.truncate(last);
+    } else if flavor == ArchiveFlavor::DiskImage {
+        comps[last] = image_dir_name(file_name.as_str());
     } else {
         comps[last] = expanded_dir_name(&file_name);
     }
@@ -573,6 +639,22 @@ fn expand_archive(
             efs,
             &dir,
             &e.host,
+            &opts.shared,
+            report,
+        ),
+        ArchiveFlavor::Zip => fs_tar::zip_import::import_zip_from_path_into(
+            efs,
+            &dir,
+            e.host.as_path(),
+            &opts.shared,
+            report,
+        ),
+        ArchiveFlavor::DiskImage => super::image_import::import_image_into(
+            efs,
+            sink,
+            comps.as_slice(),
+            e.host.as_path(),
+            vols.as_slice(),
             &opts.shared,
             report,
         ),
@@ -623,13 +705,12 @@ pub fn preflight_dir(
                 }
             }
             HostKind::File { size } => {
-                if let Some(flavor) = opts
-                    .expand_archives
-                    .then(|| archive_flavor(&e.host))
-                    .flatten()
-                {
+                let expanded = match expansion(&e.host, opts) {
+                    Some(flavor) => measure_expanded(flavor, &e.host)?,
+                    None => None,
+                };
+                if let Some((f, d, b)) = expanded {
                     // Count what the archive becomes, not the archive.
-                    let (f, d, b) = measure_expanded(flavor, &e.host)?;
                     pf.files += f;
                     // Plus the directory it unpacks into, unless flattened —
                     // then it shares the one that already exists.
@@ -680,7 +761,7 @@ pub fn measure_dir(root: &Path, expand_archives: bool, flatten: bool) -> Result<
 /// [`measure_dir`] driven by the import options themselves, so `--expand-gunzip`
 /// files are measured decompressed too.
 pub fn measure_dir_for(root: &Path, opts: &DirImportOptions) -> Result<(u64, u64, u64)> {
-    let (expand_archives, flatten) = (opts.expand_archives, opts.flatten_archives);
+    let flatten = opts.flatten_archives;
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut bytes = 0u64;
@@ -688,8 +769,11 @@ pub fn measure_dir_for(root: &Path, opts: &DirImportOptions) -> Result<(u64, u64
         match e.kind {
             HostKind::Dir => dirs += 1,
             HostKind::File { size } => {
-                if let Some(flavor) = expand_archives.then(|| archive_flavor(&e.host)).flatten() {
-                    let (f, d, b) = measure_expanded(flavor, &e.host)?;
+                let expanded = match expansion(&e.host, opts) {
+                    Some(flavor) => measure_expanded(flavor, &e.host)?,
+                    None => None,
+                };
+                if let Some((f, d, b)) = expanded {
                     files += f;
                     dirs += d + u64::from(!flatten);
                     bytes += b;
@@ -1376,5 +1460,139 @@ mod tests {
         let projected = projected_volume_bytes(files, dirs, bytes, 512);
         assert!(projected > bytes);
         assert_eq!(projected % (1024 * 1024), 0);
+    }
+
+    fn blank_hfs() -> Box<dyn EditableFilesystem> {
+        let img = fs_mac::hfs::create_blank_hfs(8 * 1024 * 1024, 512, "T").unwrap();
+        crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap()
+    }
+
+    fn names(efs: &mut dyn EditableFilesystem, path: &[&str]) -> Vec<String> {
+        let dir = entry_at(efs, path);
+        let mut v: Vec<String> = efs
+            .list_directory(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A zip the way macOS Finder writes one: the fork in `__MACOSX/Docs/._HELLO.TXT`.
+    fn write_finder_zip(path: &Path) {
+        use std::io::Write as _;
+        let o = zip::write::SimpleFileOptions::default();
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        w.start_file("Docs/HELLO.TXT", o).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.start_file("__MACOSX/Docs/._HELLO.TXT", o).unwrap();
+        let ad = fs_mac::resource_fork::build_appledouble(
+            b"TEXT",
+            b"ttxt",
+            fs_mac::resource_fork::MacFileDates::default(),
+            b"RSRC",
+        );
+        w.write_all(&ad).unwrap();
+        w.finish().unwrap();
+    }
+
+    fn opts(archives: bool, images: bool) -> DirImportOptions {
+        DirImportOptions {
+            expand_archives: archives,
+            expand_disk_images: images,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_finder_zip_expands_with_its_forks_and_no_macosx_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_finder_zip(&tmp.path().join("app.zip"));
+        let mut efs = blank_hfs();
+        let root = efs.root().unwrap();
+        let stats = import_dir(&mut *efs, &root, tmp.path(), &opts(true, false), &|_| {}).unwrap();
+        efs.sync_metadata().unwrap();
+        assert_eq!(stats.archives_expanded, 1);
+        assert_eq!(names(&mut *efs, &["app"]), ["Docs"]);
+        let hello = entry_at(&mut *efs, &["app", "Docs", "HELLO.TXT"]);
+        assert_eq!(hello.resource_fork_size, Some(4), "{hello:?}");
+        assert_eq!(hello.type_code, Some(*b"TEXT"));
+        let (files, _, bytes) = measure_dir_for(tmp.path(), &opts(true, false)).unwrap();
+        assert_eq!(files, 1);
+        assert!(bytes >= 5, "content and fork are measured: {bytes}");
+    }
+
+    #[test]
+    fn an_applesingle_file_lands_as_a_forked_file_under_its_mac_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"TEXT");
+        finfo[4..8].copy_from_slice(b"ttxt");
+        let entries: [(u32, &[u8]); 4] =
+            [(1, b"hello"), (2, b"RSRC"), (3, b"Read Me"), (9, &finfo)];
+        let mut bytes = vec![0x00, 0x05, 0x16, 0x00, 0x00, 0x02, 0x00, 0x00];
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        let mut offset = 26 + 12 * entries.len() as u32;
+        for (id, body) in entries {
+            bytes.extend_from_slice(&id.to_be_bytes());
+            bytes.extend_from_slice(&offset.to_be_bytes());
+            bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            offset += body.len() as u32;
+        }
+        for (_, body) in entries {
+            bytes.extend_from_slice(body);
+        }
+        std::fs::write(tmp.path().join("readme.as"), bytes).unwrap();
+        let mut efs = blank_hfs();
+        let root = efs.root().unwrap();
+        import_dir(&mut *efs, &root, tmp.path(), &opts(false, false), &|_| {}).unwrap();
+        efs.sync_metadata().unwrap();
+        let f = entry_at(&mut *efs, &["Read Me"]);
+        assert_eq!((f.size, f.resource_fork_size), (5, Some(4)), "{f:?}");
+    }
+
+    /// A FAT floppy image holding one file.
+    fn write_fat_image(path: &Path) {
+        let img = fs_pc::fat::create_blank_fat(1440 * 1024, Some("FLOPPY")).unwrap();
+        std::fs::write(path, img).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut fs = crate::fs::open_editable_filesystem(file, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        let mut data: &[u8] = b"from the floppy";
+        fs.create_file(&root, "HELLO.TXT", &mut data, 15, &Default::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+    }
+
+    #[test]
+    fn a_disk_image_expands_into_a_folder_and_junk_stays_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fat_image(&tmp.path().join("floppy.img"));
+        std::fs::write(tmp.path().join("junk.img"), vec![0x5au8; 4096]).unwrap();
+
+        // Without the option an image is just a file.
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        import_dir(&mut *efs, &root, tmp.path(), &opts(true, false), &|_| {}).unwrap();
+        assert_eq!(names(&mut *efs, &[]), ["floppy.img", "junk.img"]);
+
+        let mut efs = blank_next_ufs();
+        let root = efs.root().unwrap();
+        let stats = import_dir(&mut *efs, &root, tmp.path(), &opts(false, true), &|_| {}).unwrap();
+        efs.sync_metadata().unwrap();
+        assert_eq!(stats.archives_expanded, 1);
+        assert_eq!(names(&mut *efs, &[]), ["floppy", "junk.img"]);
+        let mut out = Vec::new();
+        let hello = entry_at(&mut *efs, &["floppy", "HELLO.TXT"]);
+        efs.write_file_to(&hello, &mut out).unwrap();
+        assert_eq!(out, b"from the floppy");
+        let (files, _, _) = measure_dir_for(tmp.path(), &opts(false, true)).unwrap();
+        assert_eq!(files, 2, "the floppy's file plus junk.img");
     }
 }

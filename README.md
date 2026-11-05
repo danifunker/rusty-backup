@@ -57,7 +57,7 @@ rb-cli du  disk.dsk "/System Folder" --json   # recursive both-fork (data+resour
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
 rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
-rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs + .sit/.cpt/.hqx it finds
+rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs, .zip and .sit/.cpt/.hqx it finds
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli convert disk.scp ./out --format raw   # flux capture (.scp / .hfe / KryoFlux / .emu) -> decoded sector image
@@ -80,7 +80,9 @@ rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff \
 rb-cli optical new mac-hfs mac.iso --size 600M --name "My CD"     # classic Mac CD-ROM (APM + HFS)
 rb-cli optical new mac-hfsplus mac.iso --size auto --from-dir ./mac-stuff  # HFS+ (Mac OS 8.1+), filled
 rb-cli optical new mac-hfs mac.iso --size auto --from-dir ./mac-stuff \
-       --expand-archives     # unstuff every .sit/.cpt/.hqx onto the disc, forks intact
+       --expand-archives     # unstuff every .sit/.cpt/.hqx/.zip onto the disc, forks intact
+rb-cli optical new mac-hfs mac.iso --size auto --from-dir ./floppies \
+       --expand-images       # copy the files out of every .dsk/.img/.dmg/.hfv onto the disc
 rb-cli optical new next-ufs next.iso --size auto --from-dir ./next-stuff  # NeXTSTEP CD (NeXT label + 4.3BSD UFS)
 rb-cli optical new next-ufs next.iso --size auto --from-dir ./next-stuff \
        --expand-gunzip       # .tar.gz -> .tar, .gz -> plain file; tars and .pkg left intact
@@ -508,8 +510,13 @@ The app has five tabs:
   scriptable counterpart. The same decoders back `--expand-archives` on
   `rb-cli import` and `optical new`, which unstuffs a folder's archives
   straight into the image — forks and Finder type/creator intact — instead
-  of copying them in packed. `--expand-gunzip` is the lighter option: it
-  strips only a gzip layer (`x.tar.gz` lands as `x.tar`).
+  of copying them in packed; a macOS-made `.zip` lands with the forks its
+  `__MACOSX` sidecars carry. `--expand-gunzip` is the lighter option: it
+  strips only a gzip layer (`x.tar.gz` lands as `x.tar`). `--expand-images`
+  copies the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+  `.hfv`, ...) instead of the image, one folder per image (a subfolder per
+  partition). MacBinary and AppleSingle files always land as real forked
+  files on an HFS / HFS+ target.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
 restore-tab partition list) use a shared **Size Mode** radio set

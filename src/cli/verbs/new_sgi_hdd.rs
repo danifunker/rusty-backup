@@ -46,11 +46,21 @@ pub struct NewSgiHddArgs {
     #[arg(long = "from-dir")]
     pub from_dir: Option<PathBuf>,
 
-    /// With `--from-dir`: unpack tar archives found in the tree into a
+    /// With `--from-dir`: unpack tar and ZIP archives found in the tree into a
     /// directory named after each, instead of copying them in verbatim.
     /// Detected by content, so IRIX `.tardist` files count.
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
+
+    /// With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`).
+    /// With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files.
+    #[arg(long = "expand-gunzip", requires = "from_dir")]
+    pub expand_gunzip: bool,
+
+    /// With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+    /// `.hfv`, ...) into a folder named after each, forks included, instead of the image.
+    #[arg(long = "expand-images", requires = "from_dir")]
+    pub expand_images: bool,
 
     /// With `--expand-archives`: unpack each archive into the volume root
     /// rather than a subdirectory named after it, so every archive shares one
@@ -117,14 +127,14 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
             anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
         };
         let (files, dirs, bytes) =
-            crate::fs::dir_import::measure_dir(dir, args.expand_archives, args.flatten_folders)
+            crate::fs::dir_import::measure_dir_for(dir, &import_options(&args))
                 .with_context(|| format!("measuring {}", dir.display()))?;
         let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
         log_stderr(format!(
             "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disk",
             bytes / (1024 * 1024),
-            if args.expand_archives {
-                " (archives measured expanded)"
+            if args.expand_archives || args.expand_gunzip || args.expand_images {
+                " (measured as it will land)"
             } else {
                 ""
             },
@@ -201,7 +211,7 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
 /// Import `dir` into the freshly-formatted disk's EFS root partition.
 fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
     use crate::cli::resolve::resolve_partition_rw_forced;
-    use crate::fs::dir_import::{import_dir, DirImportOptions};
+    use crate::fs::dir_import::import_dir;
 
     if !dir.is_dir() {
         anyhow::bail!("--from-dir: not a directory: {}", dir.display());
@@ -213,7 +223,20 @@ fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
     let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
-    let opts = DirImportOptions {
+    let opts = import_options(args);
+    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
+        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    commit.commit()?;
+
+    super::import::summarize(dir, "/", &stats, args.expand_archives);
+    Ok(())
+}
+
+/// The import settings, shared by `--size auto` and the import so the disk fits what lands.
+fn import_options(args: &NewSgiHddArgs) -> crate::fs::dir_import::DirImportOptions {
+    crate::fs::dir_import::DirImportOptions {
         shared: super::import::shared_options(
             args.force,
             false,
@@ -223,14 +246,7 @@ fn populate(args: &NewSgiHddArgs, dir: &std::path::Path) -> Result<()> {
         ),
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
-        expand_gunzip: false,
-    };
-    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
-        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
-    fs.sync_metadata()
-        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-    commit.commit()?;
-
-    super::import::summarize(dir, "/", &stats, args.expand_archives);
-    Ok(())
+        expand_gunzip: args.expand_gunzip,
+        expand_disk_images: args.expand_images,
+    }
 }

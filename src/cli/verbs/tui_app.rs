@@ -1051,8 +1051,19 @@ const WIZ_FIELDS: usize = 3;
 /// non-text row, so the key handler special-cases it.
 const WIZ_FIELD_EXPAND: usize = 4;
 
-/// Index of the expand-gunzip toggle, a row only the NeXT target has (`--expand-gunzip`).
+/// Index of the expand-gunzip toggle (`--expand-gunzip`).
 const WIZ_FIELD_GUNZIP: usize = 5;
+
+/// Index of the expand-images toggle (`--expand-images`), the last CD-ROM row.
+const WIZ_FIELD_IMAGES: usize = 6;
+
+/// The CD-ROM expansion toggles, as the builders' `--expand-*` flags take them.
+#[derive(Clone, Copy)]
+struct Expand {
+    archives: bool,
+    gunzip: bool,
+    images: bool,
+}
 
 struct NewWizard {
     step: WizStep,
@@ -1071,8 +1082,10 @@ struct NewWizard {
     /// copying them in packed; `--expand-archives` on either CD verb. Also
     /// changes what `--size auto` measures (what the archives unpack to).
     expand_archives: bool,
-    /// Strip only the gzip layer of `.gz` files in [`Self::from_dir`]; `--expand-gunzip` (NeXT only).
+    /// Strip only the gzip layer of `.gz` files in [`Self::from_dir`]; `--expand-gunzip`.
     expand_gunzip: bool,
+    /// Copy the files out of disk images in [`Self::from_dir`]; `--expand-images`.
+    expand_images: bool,
     /// Tab-to-browse picker for the path field.
     picker: Option<FilePicker>,
     /// Result of the last create attempt (success or error text).
@@ -1093,6 +1106,7 @@ impl Default for NewWizard {
             from_dir: String::new(),
             expand_archives: false,
             expand_gunzip: false,
+            expand_images: false,
             picker: None,
             status: None,
             is_error: false,
@@ -1132,8 +1146,7 @@ impl NewWizard {
     /// stops at name.
     fn field_count(&self) -> usize {
         match self.class() {
-            DiskClass::Cdrom if self.cd_target() == CdTarget::NextUfs => WIZ_FIELD_GUNZIP + 1,
-            DiskClass::Cdrom => WIZ_FIELD_EXPAND + 1,
+            DiskClass::Cdrom => WIZ_FIELD_IMAGES + 1,
             _ => WIZ_FIELDS,
         }
     }
@@ -1951,7 +1964,7 @@ impl App {
                         1 => w.size.pop(),
                         2 => w.name.pop(),
                         // The toggle rows hold no text to erase.
-                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => None,
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP | WIZ_FIELD_IMAGES => None,
                         _ => w.from_dir.pop(),
                     };
                     true
@@ -1969,13 +1982,18 @@ impl App {
                     w.expand_gunzip = !w.expand_gunzip;
                     true
                 }
+                KeyCode::Char(' ') if w.field == WIZ_FIELD_IMAGES => {
+                    w.status = None;
+                    w.expand_images = !w.expand_images;
+                    true
+                }
                 KeyCode::Char(c) if !c.is_control() => {
                     w.status = None;
                     match w.field {
                         0 => w.path.push(c),
                         1 => w.size.push(c),
                         2 => w.name.push(c),
-                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => {}
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP | WIZ_FIELD_IMAGES => {}
                         _ => w.from_dir.push(c),
                     }
                     true
@@ -2007,9 +2025,12 @@ impl App {
         // `NewCommand`.
         if w.class() == DiskClass::Cdrom {
             let target = w.cd_target();
-            let expand = w.expand_archives;
-            let gunzip = w.expand_gunzip && target == CdTarget::NextUfs;
-            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand, gunzip);
+            let expand = Expand {
+                archives: w.expand_archives,
+                gunzip: w.expand_gunzip,
+                images: w.expand_images,
+            };
+            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand);
             return;
         }
         let cmd = match w.class() {
@@ -2081,6 +2102,8 @@ impl App {
                                 // separate `import` step.
                                 from_dir: None,
                                 expand_archives: false,
+                                expand_gunzip: false,
+                                expand_images: false,
                                 flatten_folders: false,
                                 force: false,
                                 no_permissions: false,
@@ -2155,7 +2178,6 @@ impl App {
     /// meaningful for an IRIX `inst` distribution and near-meaningless
     /// elsewhere, so it would be a fourth row that misleads on two of the
     /// three targets.
-    #[allow(clippy::too_many_arguments)]
     fn newdisk_create_cdrom(
         &mut self,
         target: CdTarget,
@@ -2163,9 +2185,13 @@ impl App {
         size: String,
         name: String,
         from_dir: String,
-        expand_archives: bool,
-        expand_gunzip: bool,
+        expand: Expand,
     ) {
+        let Expand {
+            archives: expand_archives,
+            gunzip: expand_gunzip,
+            images: expand_images,
+        } = expand;
         let from = (!from_dir.is_empty()).then(|| expand_tilde(&from_dir));
         if let Some(d) = &from {
             if !d.is_dir() {
@@ -2194,6 +2220,8 @@ impl App {
                         bytes_per_inode: None,
                         from_dir: from,
                         expand_archives,
+                        expand_gunzip,
+                        expand_images,
                         flatten_folders: false,
                         force: false,
                         no_permissions: false,
@@ -2214,6 +2242,8 @@ impl App {
                             name,
                             from_dir: from,
                             expand_archives,
+                            expand_gunzip,
+                            expand_images,
                             force: false,
                             include_appledouble: false,
                             block_size: None,
@@ -2228,6 +2258,7 @@ impl App {
                         from_dir: from,
                         expand_archives,
                         expand_gunzip,
+                        expand_images,
                         flatten_folders: false,
                         force: false,
                         no_permissions: false,
@@ -2894,16 +2925,20 @@ impl App {
                         WIZ_FIELD_EXPAND,
                         "Expand:",
                         w.expand_archives,
-                        "unpack .tar / .sit / .cpt / .hqx into the disc",
+                        "unpack .tar / .zip / .sit / .cpt / .hqx into the disc",
                     ));
-                    if w.cd_target() == CdTarget::NextUfs {
-                        lines.push(toggle(
-                            WIZ_FIELD_GUNZIP,
-                            "Gunzip:",
-                            w.expand_gunzip,
-                            "strip the gzip layer only (.tar.gz -> .tar)",
-                        ));
-                    }
+                    lines.push(toggle(
+                        WIZ_FIELD_GUNZIP,
+                        "Gunzip:",
+                        w.expand_gunzip,
+                        "strip the gzip layer only (.tar.gz -> .tar)",
+                    ));
+                    lines.push(toggle(
+                        WIZ_FIELD_IMAGES,
+                        "Images:",
+                        w.expand_images,
+                        "copy the files out of .dsk / .img / .dmg / .hfv",
+                    ));
                 }
                 lines.push(Line::raw(""));
                 if let Some(s) = &w.status {
@@ -5454,7 +5489,7 @@ mod tests {
     fn cdrom_class_exposes_the_source_folder_field() {
         assert_eq!(
             wizard_on(DiskClass::Cdrom).field_count(),
-            WIZ_FIELD_EXPAND + 1
+            WIZ_FIELD_IMAGES + 1
         );
         for other in [DiskClass::Floppy, DiskClass::Volume, DiskClass::Hd] {
             assert_eq!(wizard_on(other).field_count(), WIZ_FIELDS);
@@ -5506,13 +5541,13 @@ mod tests {
         w
     }
 
-    /// Only the NeXT target has the gunzip row; Space flips it and it holds no text.
+    /// Every CD target has the gunzip and images rows; Space flips each and they hold no text.
     #[test]
-    fn next_cd_target_adds_a_gunzip_toggle_row() {
-        assert_eq!(wizard_on_next_cd().field_count(), WIZ_FIELD_GUNZIP + 1);
+    fn cd_targets_have_gunzip_and_images_toggle_rows() {
+        assert_eq!(wizard_on_next_cd().field_count(), WIZ_FIELD_IMAGES + 1);
         assert_eq!(
             wizard_on(DiskClass::Cdrom).field_count(),
-            WIZ_FIELD_EXPAND + 1
+            WIZ_FIELD_IMAGES + 1
         );
 
         let mut app = App::new_on(DEFAULT_TAB);
@@ -5528,6 +5563,13 @@ mod tests {
         assert!(
             w.expand_gunzip && !w.expand_archives,
             "only the gunzip row flipped"
+        );
+        app.newdisk.as_mut().unwrap().field = WIZ_FIELD_IMAGES;
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        let w = app.newdisk.as_ref().unwrap();
+        assert!(
+            w.expand_images && !w.expand_archives,
+            "the images row flipped"
         );
         app.handle_newdisk_key(KeyCode::Char('x'));
         app.handle_newdisk_key(KeyCode::Backspace);

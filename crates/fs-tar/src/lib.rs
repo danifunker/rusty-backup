@@ -23,6 +23,8 @@ pub mod tar_export;
 pub mod tar_import;
 #[cfg(feature = "zip")]
 mod zip_compat;
+#[cfg(feature = "zip")]
+pub mod zip_import;
 mod zstd_compat;
 
 #[cfg(test)]

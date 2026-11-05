@@ -111,7 +111,7 @@ pub fn build_appledouble(
     let mut buf = vec![0u8; total];
 
     // Magic number
-    BigEndian::write_u32(&mut buf[0..4], 0x00051607);
+    BigEndian::write_u32(&mut buf[0..4], APPLEDOUBLE_MAGIC);
     // Version 2
     BigEndian::write_u32(&mut buf[4..8], 0x00020000);
     // Filler: 16 bytes of zeros (already zero)
@@ -253,7 +253,9 @@ pub use disk_core::filesystem::ImportedResourceFork;
 /// 1. **Native** (macOS only): `host_path/..namedfork/rsrc`
 /// 2. **AppleDouble**: `._<filename>` sidecar next to the file
 /// 3. **MacBinary**: the file itself is a `.bin` MacBinary container
-/// 4. **Separate .rsrc**: `<filename>.rsrc` sidecar next to the file
+/// 4. **AppleSingle**: the file itself is an AppleSingle container
+/// 5. **BinHex**: the file itself is a `.hqx` container
+/// 6. **Separate .rsrc**: `<filename>.rsrc` sidecar next to the file
 ///
 /// Returns `None` if no resource fork is found.
 pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResourceFork> {
@@ -304,6 +306,19 @@ pub fn detect_resource_fork(host_path: &std::path::Path) -> Option<ImportedResou
             if macbinary_header_ok(&head) {
                 if let Ok(mb_data) = std::fs::read(host_path) {
                     if let Some(parsed) = parse_macbinary(&mb_data) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3b. AppleSingle: peek only the magic, since a small one is under 128 bytes.
+    if is_regular_file(host_path) {
+        if let Some(magic) = read_magic(host_path) {
+            if magic == APPLESINGLE_MAGIC {
+                if let Ok(bytes) = std::fs::read(host_path) {
+                    if let Some(parsed) = parse_applesingle(&bytes) {
                         return Some(parsed);
                     }
                 }
@@ -411,31 +426,33 @@ pub fn is_resource_fork_sidecar(host_path: &std::path::Path) -> bool {
     false
 }
 
-/// Parse an AppleDouble file and extract the resource fork and Finder info.
+/// Magic of an AppleDouble sidecar (forks and Finder info, no data fork).
+const APPLEDOUBLE_MAGIC: u32 = 0x00051607;
+/// Magic of an AppleSingle file (the same entry table, plus the data fork and name).
+const APPLESINGLE_MAGIC: u32 = 0x00051600;
+
+/// The entries an AppleDouble / AppleSingle header points at.
+#[derive(Default)]
+struct AppleEntries {
+    data_fork: Option<Vec<u8>>,
+    rsrc: Option<Vec<u8>>,
+    name: Option<String>,
+    type_code: Option<[u8; 4]>,
+    creator_code: Option<[u8; 4]>,
+    finder_flags: Option<u16>,
+}
+
+/// Walk the entry table shared by both formats; `None` when the magic is not `magic`.
 ///
-/// AppleDouble layout:
-/// - `[0..4]` magic `0x00051607`
-/// - `[4..8]` version `0x00020000`
-/// - `[8..24]` filler (16 bytes)
-/// - `[24..26]` number of entries (u16 BE)
-/// - For each entry: `[+0..4]` entry ID, `[+4..8]` offset, `[+8..12]` length
-///   - Entry ID 2 = resource fork
-///   - Entry ID 9 = Finder info (type/creator at bytes 0-3 / 4-7)
-pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
-    if data.len() < 26 {
+/// Layout: `[0..4]` magic, `[4..8]` version, `[8..24]` filler, `[24..26]` entry count (u16 BE),
+/// then 12-byte descriptors (`id`, `offset`, `length`). Entry 1 is the data fork, 2 the
+/// resource fork, 3 the real name, 9 Finder info (type, creator, fdFlags).
+fn parse_apple_entries(data: &[u8], magic: u32) -> Option<AppleEntries> {
+    if data.len() < 26 || BigEndian::read_u32(&data[0..4]) != magic {
         return None;
     }
-    // Check magic
-    if BigEndian::read_u32(&data[0..4]) != 0x00051607 {
-        return None;
-    }
-
     let num_entries = BigEndian::read_u16(&data[24..26]) as usize;
-    let mut rsrc_data: Option<Vec<u8>> = None;
-    let mut finder_flags: Option<u16> = None;
-    let mut type_code: Option<[u8; 4]> = None;
-    let mut creator_code: Option<[u8; 4]> = None;
-
+    let mut out = AppleEntries::default();
     for i in 0..num_entries {
         let desc_off = 26 + i * 12;
         if desc_off + 12 > data.len() {
@@ -444,53 +461,68 @@ pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
         let entry_id = BigEndian::read_u32(&data[desc_off..desc_off + 4]);
         let offset = BigEndian::read_u32(&data[desc_off + 4..desc_off + 8]) as usize;
         let length = BigEndian::read_u32(&data[desc_off + 8..desc_off + 12]) as usize;
-
-        if offset + length > data.len() {
+        let Some(body) = offset
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .map(|end| &data[offset..end])
+        else {
             continue;
-        }
-
+        };
         match entry_id {
-            2 => {
-                // Resource fork
-                rsrc_data = Some(data[offset..offset + length].to_vec());
-            }
-            9
-                // Finder info: type at +0, creator at +4, fdFlags at +8
-                if length >= 8 => {
-                    let mut tc = [0u8; 4];
-                    let mut cc = [0u8; 4];
-                    tc.copy_from_slice(&data[offset..offset + 4]);
-                    cc.copy_from_slice(&data[offset + 4..offset + 8]);
-                    if tc != [0; 4] {
-                        type_code = Some(tc);
-                    }
-                    if cc != [0; 4] {
-                        creator_code = Some(cc);
-                    }
-                    if length >= 10 {
-                        finder_flags =
-                            Some(BigEndian::read_u16(&data[offset + 8..offset + 10]));
-                    }
+            1 => out.data_fork = Some(body.to_vec()),
+            2 => out.rsrc = Some(body.to_vec()),
+            3 if !body.is_empty() => out.name = Some(crate::hfs::decode_mac_filename(body)),
+            9 if length >= 8 => {
+                let tc: [u8; 4] = body[0..4].try_into().ok()?;
+                let cc: [u8; 4] = body[4..8].try_into().ok()?;
+                out.type_code = (tc != [0; 4]).then_some(tc);
+                out.creator_code = (cc != [0; 4]).then_some(cc);
+                if length >= 10 {
+                    out.finder_flags = Some(BigEndian::read_u16(&body[8..10]));
                 }
+            }
             _ => {}
         }
     }
+    Some(out)
+}
 
-    // Accept the sidecar if it carries either a resource fork OR Finder info.
-    // Files with type/creator but no rsrc (e.g. plain text, bookmark files)
-    // still need to round-trip their FInfo.
-    let rsrc = rsrc_data.unwrap_or_default();
-    if rsrc.is_empty() && type_code.is_none() && creator_code.is_none() {
+/// Parse an AppleDouble sidecar into its resource fork and Finder info.
+///
+/// `None` unless it carries a resource fork or Finder info: files with type / creator but no
+/// fork (plain text, bookmark files) still need their FInfo to round-trip.
+pub fn parse_appledouble(data: &[u8]) -> Option<ImportedResourceFork> {
+    let e = parse_apple_entries(data, APPLEDOUBLE_MAGIC)?;
+    let rsrc = e.rsrc.unwrap_or_default();
+    if rsrc.is_empty() && e.type_code.is_none() && e.creator_code.is_none() {
         return None;
     }
-
     Some(ImportedResourceFork {
         data: rsrc,
         data_fork: None,
-        type_code,
-        creator_code,
+        type_code: e.type_code,
+        creator_code: e.creator_code,
         name: None,
-        finder_flags,
+        finder_flags: e.finder_flags,
+    })
+}
+
+/// Parse an AppleSingle file: both forks, the Finder info and the Mac name in one file.
+///
+/// Like MacBinary it is a whole-file wrapper, so `data_fork` is always set (empty when the
+/// file has none) and the caller writes that instead of the wrapper's bytes.
+pub fn parse_applesingle(data: &[u8]) -> Option<ImportedResourceFork> {
+    let e = parse_apple_entries(data, APPLESINGLE_MAGIC)?;
+    if e.data_fork.is_none() && e.rsrc.is_none() && e.type_code.is_none() {
+        return None;
+    }
+    Some(ImportedResourceFork {
+        data: e.rsrc.unwrap_or_default(),
+        data_fork: Some(e.data_fork.unwrap_or_default()),
+        type_code: e.type_code,
+        creator_code: e.creator_code,
+        name: e.name,
+        finder_flags: e.finder_flags,
     })
 }
 
@@ -512,6 +544,14 @@ fn read_header_128(path: &std::path::Path) -> Option<[u8; 128]> {
     let mut f = std::fs::File::open(path).ok()?;
     f.read_exact(&mut head).ok()?;
     Some(head)
+}
+
+/// The first four bytes as a big-endian `u32`, or `None` for a shorter file.
+fn read_magic(path: &std::path::Path) -> Option<u32> {
+    use std::io::Read as _;
+    let mut head = [0u8; 4];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    Some(u32::from_be_bytes(head))
 }
 
 /// Header-only precondition for [`parse_macbinary`]: every check that function
@@ -976,5 +1016,59 @@ mod tests {
 
         assert!(!is_regular_file(&fifo));
         assert!(detect_resource_fork(&fifo).is_none());
+    }
+
+    /// An AppleSingle file the way `macutil` / A/UX write one: data, resource, name, FInfo.
+    fn applesingle(data: &[u8], rsrc: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"TEXT");
+        finfo[4..8].copy_from_slice(b"ttxt");
+        finfo[8..10].copy_from_slice(&0x0100u16.to_be_bytes());
+        let entries: [(u32, &[u8]); 4] = [(1, data), (2, rsrc), (3, name), (9, &finfo)];
+        let mut out = Vec::new();
+        out.extend_from_slice(&APPLESINGLE_MAGIC.to_be_bytes());
+        out.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        let mut offset = 26 + 12 * entries.len();
+        for (id, body) in entries {
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            offset += body.len();
+        }
+        for (_, body) in entries {
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    #[test]
+    fn applesingle_unwraps_to_both_forks_and_its_mac_name() {
+        let bytes = applesingle(b"hello", b"RSRC", b"Read Me");
+        let f = parse_applesingle(&bytes).expect("parses");
+        assert_eq!(f.data_fork.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(f.data, b"RSRC");
+        assert_eq!(f.name.as_deref(), Some("Read Me"));
+        assert_eq!(
+            (f.type_code, f.creator_code),
+            (Some(*b"TEXT"), Some(*b"ttxt"))
+        );
+        assert_eq!(f.finder_flags, Some(0x0100));
+        // The sidecar parser does not take a single file, nor the other way round.
+        assert!(parse_appledouble(&bytes).is_none());
+        let ad = build_appledouble(b"TEXT", b"ttxt", MacFileDates::default(), b"R");
+        assert!(parse_applesingle(&ad).is_none());
+    }
+
+    #[test]
+    fn a_host_applesingle_file_is_detected_as_its_own_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readme.as");
+        std::fs::write(&path, applesingle(b"hello", b"", b"Read Me")).unwrap();
+        let f = detect_resource_fork(&path).expect("detected");
+        assert_eq!(f.data_fork.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(f.name.as_deref(), Some("Read Me"));
+        assert!(f.data.is_empty());
     }
 }
