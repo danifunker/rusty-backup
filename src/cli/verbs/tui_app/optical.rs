@@ -707,7 +707,9 @@ impl App {
         };
         let disc_open = self.explorer.as_ref().is_some_and(|e| e.is_disc());
         if std::mem::take(&mut o.close_browser) && disc_open {
-            self.explorer = None;
+            if let Some(ex) = self.explorer.take() {
+                ex.release();
+            }
         }
         if let Some(src) = o.browse.take() {
             let label = match o.ctl.disc() {

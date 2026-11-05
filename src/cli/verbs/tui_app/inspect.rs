@@ -1461,7 +1461,9 @@ impl App {
             return;
         };
         if std::mem::take(&mut s.close_explorer) {
-            self.explorer = None;
+            if let Some(ex) = self.explorer.take() {
+                ex.release();
+            }
         }
         let browse = s.browse.take();
         let upgrade = s.upgrade.take();

@@ -1662,6 +1662,15 @@ impl App {
     /// then quit.
     /// Quit, unless Commander holds staged edits: then its controller asks first, on its tab.
     fn request_quit(&mut self) {
+        // Edit Mode's writes on a copy are saved or dropped by its question first.
+        if let Some(ex) = self
+            .explorer
+            .as_mut()
+            .filter(|e| e.has_unsaved_mode_edits())
+        {
+            ex.request_mode_close();
+            return;
+        }
         if !self
             .commander
             .as_ref()
@@ -1772,7 +1781,7 @@ impl App {
     fn on_tab_changed(&mut self) {
         self.selection = 0;
         self.open_picker = None;
-        self.explorer = None;
+        self.drop_explorer();
         self.status = None;
         if self.current() == TabId::Inspect {
             self.load_devices_once();
@@ -2325,7 +2334,14 @@ impl App {
             self.should_quit = true;
         }
         if ex.closed() {
-            self.explorer = None;
+            self.drop_explorer();
+        }
+    }
+
+    /// Close the Explorer; a copy its Edit Mode made (archive temp, CHD diff) goes with it.
+    fn drop_explorer(&mut self) {
+        if let Some(ex) = self.explorer.take() {
+            ex.release();
         }
     }
 
@@ -4996,6 +5012,72 @@ mod tests {
         }
         ikey(&mut app, KeyCode::F(12));
         assert!(!app.show_help && !app.should_quit);
+    }
+
+    fn explorer_settle(app: &mut App) {
+        let start = std::time::Instant::now();
+        loop {
+            app.tick();
+            if !app.explorer.as_ref().is_some_and(|e| e.is_working()) {
+                app.tick();
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "a job never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn explorer_names(app: &App) -> Vec<String> {
+        let ex = app.explorer.as_ref().expect("the Explorer is open");
+        let pane = ex.ctl.pane(crate::controller::commander::Side::Left);
+        pane.rows().iter().map(|r| r.name.clone()).collect()
+    }
+
+    /// A zstd backup partition: read-only until Ctrl+W, a new folder written to the copy, and
+    /// the close question's Apply recompresses it, so the next browse lists the folder.
+    #[test]
+    fn the_explorer_edits_a_zstd_backup_partition_in_edit_mode() {
+        let ctrl =
+            |c: char| crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (folder, _) = restore_fixture(dir.path());
+        let mut app = inspect_on(&folder);
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        explorer_settle(&mut app);
+        let ex = app.explorer.as_ref().expect("browsing");
+        assert!(ex.edits_through_modes());
+        assert!(ex.explorer_title().contains("Ctrl+W Edit Mode"));
+        assert!(ex
+            .ctl
+            .pane(crate::controller::commander::Side::Left)
+            .is_read_only());
+        app.on_key(ctrl('w'));
+        explorer_settle(&mut app);
+        assert!(app.explorer.as_ref().unwrap().ctl.edit_mode());
+        app.on_key(ctrl('n'));
+        ikeys(&mut app, "EDITED");
+        ikey(&mut app, KeyCode::Enter);
+        explorer_settle(&mut app);
+        assert!(explorer_names(&app).contains(&"EDITED".to_string()));
+        assert!(app.explorer.as_ref().unwrap().has_unsaved_mode_edits());
+        // q asks through the same question instead of quitting.
+        ikey(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit);
+        assert!(app.explorer.as_ref().unwrap().ctl.unsaved_shown());
+        ikey(&mut app, KeyCode::Esc);
+        ikey(&mut app, KeyCode::Esc);
+        assert!(app.explorer.as_ref().unwrap().ctl.unsaved_shown());
+        ikey(&mut app, KeyCode::Char('a'));
+        explorer_settle(&mut app);
+        assert!(app.explorer.is_none(), "saved, then closed");
+        ikey(&mut app, KeyCode::Enter);
+        inspect_settle(&mut app);
+        explorer_settle(&mut app);
+        assert!(explorer_names(&app).contains(&"EDITED".to_string()));
     }
 
     /// A disk the controller cannot open falls back to the plain read, which reports why.

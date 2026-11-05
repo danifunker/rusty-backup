@@ -10,6 +10,11 @@
 //! ProDOS and QNX options) and the tree window serve every Explorer. The Optical tab's disc
 //! browser is the same window over `optical::disc_browser` (`PaneProfile::optical`, read-only,
 //! a filesystem picker and the game line), opened by [`CommanderView::disc_open`].
+//!
+//! A source edited through a copy (a zstd backup partition decompressed to a temp file, a CHD
+//! over a diff; `BrowseOpen::edits_through_modes`) opens through the controller's Inspect modes:
+//! read-only until Ctrl+W enters Edit Mode, each edit written to the copy at once, and leaving
+//! Edit Mode (or closing) saves it, after the Discard / Apply / Cancel question.
 
 use std::path::PathBuf;
 
@@ -27,7 +32,7 @@ use crate::controller::browser::{
 };
 use crate::controller::commander::{
     extract_applies, extract_fork_modes, CommanderAction, CommanderController, ExtractOptions,
-    ResourceForkMode, Side,
+    ModeAction, ResourceForkMode, Side, UnsavedChoice,
 };
 use crate::controller::inspect::{BrowseEdit, BrowseOpen, BrowseSession};
 use crate::controller::keys::KeyMap;
@@ -50,6 +55,10 @@ pub(super) struct ExplorerState {
     /// The last tree listing and its scroll, while its window is up.
     tree: Option<(String, usize)>,
     extract: Option<ExtractMenu>,
+    /// Opened through the controller's Inspect modes (Edit Mode on a copy).
+    modes: bool,
+    /// The last Edit Mode notice or error, under the listing.
+    mode_note: Option<String>,
 }
 
 /// The Extract window: the options the volume offers, then Extract.
@@ -243,15 +252,29 @@ impl CommanderView {
         let (keymap, problems) = load_keymap();
         let mut services = PaneServices::headless();
         services.recent = super::commander::recent_store();
+        let modes = open.edits_through_modes();
         let mut profile = PaneProfile::explorer();
-        profile.read_only = !matches!(open.edit, BrowseEdit::InPlace);
+        profile.read_only = !modes && !matches!(open.edit, BrowseEdit::InPlace);
         let mut ctl = CommanderController::single(services, keymap, profile);
         ctl.report_keymap_problems(problems);
         let title = match &open.label_prefix {
             Some(prefix) => format!("{prefix}  {label}"),
             None => label,
         };
-        ctl.open_fixed_session(open.session.clone(), title.as_str());
+        let mut fx = Vec::new();
+        if modes {
+            fx = ctl.open_inspect(open.session.clone(), title.as_str());
+            match open.edit {
+                BrowseEdit::Archive(ctx) => ctl.inspect_edit_archive(ctx),
+                BrowseEdit::InPlace => ctl.inspect_edit_in_place(),
+                BrowseEdit::ReadOnly => {}
+            }
+            if let Some(folder) = open.backup_folder {
+                ctl.inspect_backup_folder(folder);
+            }
+        } else {
+            ctl.open_fixed_session(open.session.clone(), title.as_str());
+        }
         let mut v = CommanderView::with_ctl(ctl);
         v.ex = Some(ExplorerState {
             label: title,
@@ -264,7 +287,10 @@ impl CommanderView {
             disc: false,
             tree: None,
             extract: None,
+            modes,
+            mode_note: None,
         });
+        v.run(fx);
         v
     }
 
@@ -289,6 +315,8 @@ impl CommanderView {
             disc: true,
             tree: None,
             extract: None,
+            modes: false,
+            mode_note: None,
         });
         v.run(fx);
         v
@@ -306,7 +334,37 @@ impl CommanderView {
         } else {
             "Explorer"
         };
-        format!("{what}  {}", self.explorer_label())
+        let mode = if !self.edits_through_modes() {
+            ""
+        } else if self.ctl.edit_mode() {
+            "  [Edit Mode - Ctrl+W saves]"
+        } else {
+            "  [read-only - Ctrl+W Edit Mode]"
+        };
+        format!("{what}  {}{mode}", self.explorer_label())
+    }
+
+    /// Opened through the controller's Inspect modes: Edit Mode works on a copy.
+    pub(super) fn edits_through_modes(&self) -> bool {
+        self.ex.as_ref().is_some_and(|e| e.modes)
+    }
+
+    /// Writes in Edit Mode that leaving it (or closing) would save or drop.
+    pub(super) fn has_unsaved_mode_edits(&self) -> bool {
+        self.edits_through_modes() && self.ctl.has_unsaved_edits()
+    }
+
+    /// Close through the modes' question (a quit or a hand-off while Edit Mode holds writes).
+    pub(super) fn request_mode_close(&mut self) {
+        self.send(CommanderAction::Mode(ModeAction::RequestClose));
+        self.explorer_tick();
+    }
+
+    /// Let go of the source: a CHD diff or archive temp the modes made is removed after the readers.
+    pub(super) fn release(self) {
+        if self.edits_through_modes() {
+            self.ctl.close_inspect();
+        }
     }
 
     /// Extract the cursor entry: at once, or after the Extract window when the volume has options.
@@ -443,8 +501,12 @@ impl CommanderView {
         let Some(session) = ex.session.as_mut().filter(|s| s.zstd_cache.is_some()) else {
             return;
         };
-        session.source_path = Some(path);
+        session.source_path = Some(path.clone());
         session.zstd_cache = None;
+        if ex.modes {
+            self.send(CommanderAction::Mode(ModeAction::UpgradeSeekable(path)));
+            return;
+        }
         let (session, label) = (session.clone(), ex.label.clone());
         self.ctl.open_fixed_session(session, label.as_str());
     }
@@ -472,7 +534,15 @@ impl CommanderView {
         };
         let tree = self.ctl.host_pane().take_tree_text();
         let form = self.ctl.pane(Side::Left).metadata_form().cloned();
+        let notice = self.ctl.take_mode_notice();
+        let error = self.ctl.take_mode_error();
+        if self.ctl.take_close_request() {
+            self.closed = true;
+        }
         let Some(ex) = self.ex.as_mut() else { return };
+        if let Some(said) = error.or(notice) {
+            ex.mode_note = Some(said);
+        }
         if let Some(doc) = doc {
             ex.editor = Some(TextEditor::new(doc));
         }
@@ -505,6 +575,24 @@ impl CommanderView {
             return Some(self.editor_key(key));
         }
         let code = key.code;
+        // Edit Mode's unsaved-writes question: Discard / Apply / Cancel.
+        if self.ctl.unsaved_shown() {
+            let choice = match code {
+                KeyCode::Char('d') => Some(UnsavedChoice::Discard),
+                KeyCode::Char('a') | KeyCode::Enter => Some(UnsavedChoice::Apply),
+                KeyCode::Esc | KeyCode::Char('c') => Some(UnsavedChoice::Cancel),
+                _ => None,
+            };
+            if let Some(c) = choice {
+                self.send(CommanderAction::Mode(ModeAction::Unsaved(c)));
+                self.explorer_tick();
+            }
+            return Some(true);
+        }
+        // An Edit Mode job (decompress, recompress, CHD open or flatten) holds the keys.
+        if self.edits_through_modes() && self.ctl.mode_working().is_some() {
+            return Some(true);
+        }
         if let Some(lines) = self
             .ctl
             .pane(Side::Left)
@@ -688,8 +776,14 @@ impl App {
         } else {
             self.draw_cmd_pane(frame, rows[0], v, Side::Left);
         }
+        let note = v.ex.as_ref().and_then(|e| e.mode_note.clone());
+        let (line, style) = match note {
+            Some(n) if n.starts_with("Error") || n.starts_with("Cannot") => (n, pal.warn()),
+            Some(n) => (n, pal.accent()),
+            None => (ctl.status().to_string(), pal.dim()),
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {}", ctl.status()), pal.dim())),
+            Paragraph::new(Line::styled(format!(" {line}"), style)),
             rows[2],
         );
     }
@@ -701,6 +795,23 @@ impl App {
         let pane = v.ctl.pane(Side::Left);
         if let Some(snap) = pane.tool_working() {
             self.draw_job_box(frame, area, "Working", &snap);
+        }
+        if let Some(snap) = v.ctl.mode_working().filter(|_| ex.modes) {
+            self.draw_job_box(frame, area, "Edit Mode", &snap);
+        }
+        if v.ctl.unsaved_shown() {
+            let mut lines = vec![Line::raw(
+                " Edit Mode holds changes that are not saved to the source yet:",
+            )];
+            for l in pane.staged_summary() {
+                lines.push(Line::raw(format!("   {l}")));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " a Apply (save)   d Discard   Esc Cancel",
+                pal.accent(),
+            ));
+            self.draw_cmd_box_auto(frame, area, 70, "Unsaved Changes", lines);
         }
         if let Some(r) = pane.tool_report() {
             let h = area.height.saturating_sub(4).clamp(8, 22);

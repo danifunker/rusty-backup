@@ -77,7 +77,7 @@ pub(super) struct CommanderView {
     edit_sel: usize,
     scroll: usize,
     scroll_window: Option<Window>,
-    closed: bool,
+    pub(super) closed: bool,
     /// The controller passed a quit (no staged edits, or the user discarded them).
     quit: bool,
     /// Held while jobs run, whose engine code may print to stderr.
@@ -688,8 +688,17 @@ impl CommanderView {
             return hints.filter(|(k, _)| !k.is_empty()).collect();
         }
         if self.ctl.is_single() {
-            let hints = explorer.iter().map(|(c, d)| (self.ctl.key_hint(*c), *d));
-            return hints.filter(|(k, _)| !k.is_empty()).collect();
+            let mut hints: Vec<(String, &'static str)> = Vec::new();
+            if self.edits_through_modes() {
+                let what = if self.ctl.edit_mode() {
+                    "Save"
+                } else {
+                    "Edit Mode"
+                };
+                hints.push((self.ctl.key_hint(Command::EditMode), what));
+            }
+            hints.extend(explorer.iter().map(|(c, d)| (self.ctl.key_hint(*c), *d)));
+            return hints.into_iter().filter(|(k, _)| !k.is_empty()).collect();
         }
         let cmds = [
             (Command::SwitchPane, "Pane"),
