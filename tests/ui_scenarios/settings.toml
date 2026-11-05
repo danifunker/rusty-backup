@@ -4,7 +4,7 @@ vm = "settings"
 
 [[step]]
 action = "Open"
-expect = { open = true, update_check = true, recent_count = 2, status = "" }
+expect = { open = true, update_check = true, recent_count = 2, status = "", clear_label = "Clear Recent Files (2)" }
 
 [[step]]
 action = "SetUpdateCheck"
@@ -20,7 +20,7 @@ expect = { status = "~Settings saved successfully!" }
 
 [[step]]
 action = "ClearRecent"
-expect = { recent_count = 0, status = "Cleared 2 recent files." }
+expect = { recent_count = 0, status = "Cleared 2 recent files.", clear_label = "Clear Recent Files" }
 
 [[step]]
 action = "Close"

@@ -1722,7 +1722,7 @@ impl Target for ArchivesTarget {
 
 /// `SettingsController` over an in-memory config with two recent files. Actions: `Open`,
 /// `SetUpdateCheck` (bool), `SetRepoUrl`, `ClearRecent`, `Save`, `Close`. Probes: `open`,
-/// `update_check`, `repo_url`, `recent_count`, `status`, `cleared`.
+/// `update_check`, `repo_url`, `recent_count`, `status`, `clear_label`.
 struct SettingsTarget(rusty_backup::controller::settings::SettingsController);
 
 impl SettingsTarget {
@@ -1764,6 +1764,7 @@ impl Target for SettingsTarget {
             "repo_url" => Value::String(self.0.repo_url().to_string()),
             "recent_count" => Value::Integer(self.0.recent_count() as i64),
             "status" => Value::String(self.0.status().unwrap_or("").to_string()),
+            "clear_label" => Value::String(self.0.clear_recent_label()),
             other => return Err(format!("SettingsController has no probe {other:?}")),
         })
     }
