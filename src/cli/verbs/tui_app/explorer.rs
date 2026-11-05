@@ -11,10 +11,12 @@
 //! browser is the same window over `optical::disc_browser` (`PaneProfile::optical`, read-only,
 //! a filesystem picker and the game line), opened by [`CommanderView::disc_open`].
 //!
-//! A source edited through a copy (a zstd backup partition decompressed to a temp file, a CHD
-//! over a diff; `BrowseOpen::edits_through_modes`) opens through the controller's Inspect modes:
-//! read-only until Ctrl+W enters Edit Mode, each edit written to the copy at once, and leaving
-//! Edit Mode (or closing) saves it, after the Discard / Apply / Cancel question.
+//! Every writable Inspect partition opens through the controller's Inspect modes, as the egui
+//! browse view does. A source edited in place enters Edit Mode by itself once listed (a SquashFS
+//! asks for its size budget first), so edits are written at once as before. A source edited
+//! through a copy (a zstd backup partition decompressed to a temp file, a CHD over a diff;
+//! `BrowseOpen::edits_through_modes`) stays read-only until Ctrl+W, each edit is written to the
+//! copy, and leaving Edit Mode (or closing) saves it after the Discard / Apply / Cancel question.
 
 use std::path::PathBuf;
 
@@ -31,8 +33,8 @@ use crate::controller::browser::{
     BrowserPaneAction, LineEnding, MetadataFields, PaneProfile, PaneServices, TextDoc, TextShape,
 };
 use crate::controller::commander::{
-    extract_applies, extract_fork_modes, CommanderAction, CommanderController, ExtractOptions,
-    ModeAction, ResourceForkMode, Side, UnsavedChoice,
+    extract_applies, extract_fork_modes, format_size, BudgetAction, BudgetMode, CommanderAction,
+    CommanderController, ExtractOptions, ModeAction, ResourceForkMode, Side, UnsavedChoice,
 };
 use crate::controller::inspect::{BrowseEdit, BrowseOpen, BrowseSession};
 use crate::controller::keys::KeyMap;
@@ -55,8 +57,12 @@ pub(super) struct ExplorerState {
     /// The last tree listing and its scroll, while its window is up.
     tree: Option<(String, usize)>,
     extract: Option<ExtractMenu>,
-    /// Opened through the controller's Inspect modes (Edit Mode on a copy).
+    /// Opened through the controller's Inspect modes.
     modes: bool,
+    /// Edit Mode works on a copy (zstd temp, CHD diff), entered with Ctrl+W.
+    copy: bool,
+    /// An in-place source enters Edit Mode once its listing is loaded.
+    auto_edit: bool,
     /// The last Edit Mode notice or error, under the listing.
     mode_note: Option<String>,
 }
@@ -252,9 +258,10 @@ impl CommanderView {
         let (keymap, problems) = load_keymap();
         let mut services = PaneServices::headless();
         services.recent = super::commander::recent_store();
-        let modes = open.edits_through_modes();
+        let copy = open.edits_through_modes();
+        let modes = !matches!(open.edit, BrowseEdit::ReadOnly);
         let mut profile = PaneProfile::explorer();
-        profile.read_only = !modes && !matches!(open.edit, BrowseEdit::InPlace);
+        profile.read_only = !modes;
         let mut ctl = CommanderController::single(services, keymap, profile);
         ctl.report_keymap_problems(problems);
         let title = match &open.label_prefix {
@@ -288,6 +295,8 @@ impl CommanderView {
             tree: None,
             extract: None,
             modes,
+            copy,
+            auto_edit: modes && !copy,
             mode_note: None,
         });
         v.run(fx);
@@ -316,6 +325,8 @@ impl CommanderView {
             tree: None,
             extract: None,
             modes: false,
+            copy: false,
+            auto_edit: false,
             mode_note: None,
         });
         v.run(fx);
@@ -334,7 +345,7 @@ impl CommanderView {
         } else {
             "Explorer"
         };
-        let mode = if !self.edits_through_modes() {
+        let mode = if !self.ex.as_ref().is_some_and(|e| e.copy) {
             ""
         } else if self.ctl.edit_mode() {
             "  [Edit Mode - Ctrl+W saves]"
@@ -344,9 +355,14 @@ impl CommanderView {
         format!("{what}  {}{mode}", self.explorer_label())
     }
 
-    /// Opened through the controller's Inspect modes: Edit Mode works on a copy.
+    /// Opened through the controller's Inspect modes.
     pub(super) fn edits_through_modes(&self) -> bool {
         self.ex.as_ref().is_some_and(|e| e.modes)
+    }
+
+    /// Edit Mode works on a copy that Ctrl+W saves (a compressed backup, a CHD).
+    pub(super) fn edits_a_copy(&self) -> bool {
+        self.ex.as_ref().is_some_and(|e| e.copy)
     }
 
     /// Writes in Edit Mode that leaving it (or closing) would save or drop.
@@ -534,6 +550,17 @@ impl CommanderView {
         };
         let tree = self.ctl.host_pane().take_tree_text();
         let form = self.ctl.pane(Side::Left).metadata_form().cloned();
+        let listed = self.ctl.pane(Side::Left).listing.is_loaded();
+        let start_edit = self
+            .ex
+            .as_ref()
+            .is_some_and(|e| e.auto_edit && listed && !self.ctl.is_working());
+        if start_edit {
+            if let Some(ex) = self.ex.as_mut() {
+                ex.auto_edit = false;
+            }
+            self.send(CommanderAction::Mode(ModeAction::ToggleEditMode));
+        }
         let notice = self.ctl.take_mode_notice();
         let error = self.ctl.take_mode_error();
         if self.ctl.take_close_request() {
@@ -585,6 +612,38 @@ impl CommanderView {
             };
             if let Some(c) = choice {
                 self.send(CommanderAction::Mode(ModeAction::Unsaved(c)));
+                self.explorer_tick();
+            }
+            return Some(true);
+        }
+        // The SquashFS size budget asked before Edit Mode.
+        if let Some(form) = self.ctl.size_budget().copied() {
+            let mib = match form.mode() {
+                BudgetMode::Absolute => Some(form.absolute_mib()),
+                BudgetMode::Headroom => Some(form.headroom_mib()),
+                BudgetMode::Fit => None,
+            };
+            let set = |n: u64| match form.mode() {
+                BudgetMode::Absolute => Some(BudgetAction::SetAbsoluteMib(n)),
+                BudgetMode::Headroom => Some(BudgetAction::SetHeadroomMib(n)),
+                BudgetMode::Fit => None,
+            };
+            let modes = [BudgetMode::Fit, BudgetMode::Absolute, BudgetMode::Headroom];
+            let at = modes.iter().position(|m| *m == form.mode()).unwrap_or(0);
+            let edit = match code {
+                KeyCode::Up => Some(BudgetAction::SetMode(modes[(at + 2) % 3])),
+                KeyCode::Down => Some(BudgetAction::SetMode(modes[(at + 1) % 3])),
+                KeyCode::Char(c) if c.is_ascii_digit() => mib.and_then(|n| {
+                    let d = u64::from(c.to_digit(10).unwrap_or(0));
+                    set(n.saturating_mul(10).saturating_add(d).min(1 << 30))
+                }),
+                KeyCode::Backspace => mib.and_then(|n| set(n / 10)),
+                KeyCode::Enter => Some(BudgetAction::Start),
+                KeyCode::Esc => Some(BudgetAction::Cancel),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                self.send(CommanderAction::Mode(ModeAction::Budget(edit)));
                 self.explorer_tick();
             }
             return Some(true);
@@ -798,6 +857,73 @@ impl App {
         }
         if let Some(snap) = v.ctl.mode_working().filter(|_| ex.modes) {
             self.draw_job_box(frame, area, "Edit Mode", &snap);
+        }
+        if let Some(form) = v.ctl.size_budget() {
+            let plan = form.plan();
+            let mark = |m: BudgetMode| if form.mode() == m { "(*)" } else { "( )" };
+            let mut lines = vec![
+                Line::raw(" SquashFS has no free space and rebuilds the whole image on a save:"),
+                Line::raw(" choose how large the result may be."),
+                Line::raw(""),
+                Line::raw(format!(" Image occupies   {}", format_size(plan.image_len))),
+                Line::raw(format!(
+                    " File content     {} uncompressed",
+                    format_size(plan.content_len)
+                )),
+                Line::raw(format!(" Compressed to    {}", plan.describe_ratio())),
+                Line::raw(match (plan.capacity, plan.headroom) {
+                    (Some(cap), Some(head)) => format!(
+                        " Room available   {} ({} unused)",
+                        format_size(cap),
+                        format_size(head)
+                    ),
+                    _ => " Room available   unbounded - this file is the filesystem".to_string(),
+                }),
+                Line::raw(""),
+                Line::styled(
+                    format!(
+                        " {} Fit - accept whatever it becomes",
+                        mark(BudgetMode::Fit)
+                    ),
+                    pal.accent(),
+                ),
+                Line::styled(
+                    format!(
+                        " {} At most {} MiB",
+                        mark(BudgetMode::Absolute),
+                        form.absolute_mib()
+                    ),
+                    pal.accent(),
+                ),
+                Line::styled(
+                    format!(
+                        " {} Grow by at most {} MiB",
+                        mark(BudgetMode::Headroom),
+                        form.headroom_mib()
+                    ),
+                    pal.accent(),
+                ),
+                Line::raw(""),
+                Line::raw(match form.ceiling() {
+                    Some(c) => format!(" Ceiling: {}", format_size(c)),
+                    None => " Ceiling: none beyond what the container allows".to_string(),
+                }),
+            ];
+            if form.over_capacity() {
+                lines.push(Line::styled(
+                    format!(
+                        " That is more than the {} available where this image lives.",
+                        format_size(plan.capacity.unwrap_or(0))
+                    ),
+                    pal.warn(),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " Up/Down choose   0-9 MiB   Enter start editing   Esc stay read-only",
+                pal.dim(),
+            ));
+            self.draw_cmd_box_auto(frame, area, 76, "SquashFS size budget", lines);
         }
         if v.ctl.unsaved_shown() {
             let mut lines = vec![Line::raw(
@@ -1309,5 +1435,63 @@ mod tests {
         ed.move_to(0, 0);
         ed.follow_cursor(10);
         assert_eq!(ed.scroll, 0, "scrolling back up follows too");
+    }
+    /// An in-place source enters Edit Mode once listed; a SquashFS asks for its size budget first.
+    #[test]
+    fn a_squashfs_volume_asks_for_its_size_budget_before_edit_mode() {
+        use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let fat = explorer_app(&fat_volume(dir.path()));
+        assert!(
+            view(&fat).ctl.edit_mode(),
+            "a FAT image is editable at once"
+        );
+        assert!(!view(&fat).ctl.pane(Side::Left).is_read_only());
+        let img = dir.path().join("vol.sqfs");
+        let root = BuildNode::dir(
+            "",
+            0o755,
+            vec![BuildNode::file("a.txt", 0o644, b"hi".to_vec())],
+        );
+        let mut out = std::fs::File::create(&img).unwrap();
+        write_squashfs(&mut out, &root, &BuildOptions::default()).unwrap();
+        drop(out);
+        let open = BrowseOpen {
+            session: BrowseSession {
+                source_path: Some(img),
+                ..Default::default()
+            },
+            edit: BrowseEdit::InPlace,
+            label_prefix: None,
+            backup_folder: None,
+        };
+        let mut app = App::new_on(DEFAULT_TAB);
+        app.explorer = Some(CommanderView::explorer_open(open, "Whole volume".into()));
+        settle(&mut app);
+        let form = view(&app)
+            .ctl
+            .size_budget()
+            .copied()
+            .expect("the budget is asked");
+        assert_eq!(form.mode(), BudgetMode::Fit);
+        assert!(!view(&app).ctl.edit_mode());
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(
+            view(&app).ctl.size_budget().unwrap().mode(),
+            BudgetMode::Absolute
+        );
+        press(&mut app, key(KeyCode::Down));
+        let headroom = view(&app).ctl.size_budget().unwrap();
+        assert_eq!(headroom.mode(), BudgetMode::Headroom);
+        let before = headroom.headroom_mib();
+        press(&mut app, key(KeyCode::Backspace));
+        press(&mut app, key(KeyCode::Char('8')));
+        assert_eq!(
+            view(&app).ctl.size_budget().unwrap().headroom_mib(),
+            before / 10 * 10 + 8
+        );
+        press(&mut app, key(KeyCode::Enter));
+        assert!(view(&app).ctl.size_budget().is_none());
+        assert!(view(&app).ctl.edit_mode(), "Start enters Edit Mode");
     }
 }

@@ -689,7 +689,7 @@ impl CommanderView {
         }
         if self.ctl.is_single() {
             let mut hints: Vec<(String, &'static str)> = Vec::new();
-            if self.edits_through_modes() {
+            if self.edits_a_copy() {
                 let what = if self.ctl.edit_mode() {
                     "Save"
                 } else {
