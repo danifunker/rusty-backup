@@ -1652,8 +1652,8 @@ fn detail_lines(d: &FileDetail, meta: Option<&DetailMetadata>, rsrc: bool) -> Ve
             .unwrap_or_default();
         out.push(format!(
             "Type / creator: {} / {}{about}",
-            printable(&tc.type_text),
-            printable(&tc.creator_text)
+            printable(tc.type_text.as_str()),
+            printable(tc.creator_text.as_str())
         ));
     }
     if let Some(p) = meta.and_then(|m| m.prodos.as_ref()) {
@@ -1668,11 +1668,10 @@ fn detail_lines(d: &FileDetail, meta: Option<&DetailMetadata>, rsrc: bool) -> Ve
         ));
     }
     if let Some(dates) = meta.and_then(|m| m.dates.as_ref()) {
-        let none = || "-".to_string();
-        let [c, m, b] = dates;
-        out.push(format!("Created:  {}", c.clone().unwrap_or_else(none)));
-        out.push(format!("Modified: {}", m.clone().unwrap_or_else(none)));
-        out.push(format!("Backup:   {}", b.clone().unwrap_or_else(none)));
+        let date = |i: usize| dates[i].clone().unwrap_or_else(|| "-".to_string());
+        out.push(format!("Created:  {}", date(0)));
+        out.push(format!("Modified: {}", date(1)));
+        out.push(format!("Backup:   {}", date(2)));
     }
     if let Some(rs) = e.resource_fork_size.filter(|n| *n > 0) {
         out.push(format!("Rsrc:  {}", format_size(rs)));

@@ -331,7 +331,12 @@ impl App {
         let _ = b.ctl.take_log();
         b.clamp();
         if let Some(p) = b.ctl.progress() {
-            b.op = format!("{}/{}  {}", p.index, p.total_files, basename(&p.file));
+            b.op = format!(
+                "{}/{}  {}",
+                p.index,
+                p.total_files,
+                basename(p.file.as_str())
+            );
             if let Some(prog) = self.progress.as_ref() {
                 if let Ok(mut sh) = prog.shared.lock() {
                     sh.current = p.bytes;
@@ -727,7 +732,7 @@ impl App {
                         ));
                         for c in conflicts.iter().take(5) {
                             lines.push(Line::styled(
-                                format!("    - {}", basename(&c.dest.to_string_lossy())),
+                                format!("    - {}", basename(c.dest.to_string_lossy().as_ref())),
                                 self.palette.warn(),
                             ));
                         }
@@ -752,7 +757,7 @@ impl App {
                     }
                     let f = &b.files()[i];
                     let tick = if f.selected { "[x]" } else { "[ ]" };
-                    let name = basename(&f.path.to_string_lossy());
+                    let name = basename(f.path.to_string_lossy().as_ref());
                     let st = if row == cur {
                         style(row)
                     } else if f.selected {

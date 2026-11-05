@@ -429,7 +429,7 @@ impl App {
         let rows = a.ctl.rows();
         let title = format!(
             "Archives  {}  [{} of {} files ticked]  fork: {}",
-            basename(&a.archive_path),
+            basename(a.archive_path.as_str()),
             a.ctl.selected_file_count(),
             a.ctl.file_count(),
             ARCHIVE_FORK_FORMATS[a.fork_fmt_sel].0

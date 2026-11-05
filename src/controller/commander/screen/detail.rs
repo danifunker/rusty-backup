@@ -142,7 +142,7 @@ fn parse_type_creator(text: &str) -> Result<([u8; 4], [u8; 4]), String> {
         }
     };
     let fits = |s: &str| !s.is_empty() && s.len() <= 4 && s.is_ascii();
-    if !fits(&t) || !fits(&c) {
+    if !fits(t.as_str()) || !fits(c.as_str()) {
         return Err(bad());
     }
     Ok((
@@ -206,7 +206,11 @@ impl CommanderController {
         let hfs = e.is_file() && (e.type_code.is_some() || e.creator_code.is_some());
         let dates = e.mac_dates.map(|_| {
             let (c, m, b) = metadata::hfs_dates(queue, e);
-            [c, m, b].map(metadata::hfs_date_text)
+            [
+                metadata::hfs_date_text(c),
+                metadata::hfs_date_text(m),
+                metadata::hfs_date_text(b),
+            ]
         });
         Some(DetailMetadata {
             type_creator: hfs.then(|| metadata::hfs_type_creator(queue, e)),
@@ -366,7 +370,7 @@ impl CommanderController {
                 None => MetadataEdit::RemoveXattr { entry, name },
             }),
             DetailField::TypeCreator => {
-                parse_type_creator(&text).map(|(type_code, creator_code)| {
+                parse_type_creator(text.as_str()).map(|(type_code, creator_code)| {
                     MetadataEdit::TypeCreator {
                         entry,
                         type_code,
@@ -375,15 +379,17 @@ impl CommanderController {
                 })
             }
             DetailField::ProdosType => {
-                parse_prodos(&text).map(|(type_byte, aux_type)| MetadataEdit::ProdosType {
+                parse_prodos(text.as_str()).map(|(type_byte, aux_type)| MetadataEdit::ProdosType {
                     entry,
                     type_byte,
                     aux_type,
                 })
             }
-            DetailField::Created => parse_date(&text).map(|s| self.dates_edit(entry, 0, s)),
-            DetailField::Modified => parse_date(&text).map(|s| self.dates_edit(entry, 1, s)),
-            DetailField::Backup => parse_date(&text).map(|s| self.dates_edit(entry, 2, s)),
+            DetailField::Created => parse_date(text.as_str()).map(|s| self.dates_edit(entry, 0, s)),
+            DetailField::Modified => {
+                parse_date(text.as_str()).map(|s| self.dates_edit(entry, 1, s))
+            }
+            DetailField::Backup => parse_date(text.as_str()).map(|s| self.dates_edit(entry, 2, s)),
         };
         match edit {
             Ok(edit) => {
