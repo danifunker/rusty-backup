@@ -676,13 +676,15 @@ mod tests {
         // A stale id is ignored, so an answer can't land on the next question.
         job.answer(q.id + 1, 9);
         job.answer(q.id, 2);
-        let q2 = wait_for_question(&job);
-        let q2 = match q2.id == q.id {
-            true => {
-                std::thread::sleep(Duration::from_millis(50));
-                wait_for_question(&job)
+        // The answered question can linger until the worker wakes; wait for the next one.
+        let start = Instant::now();
+        let q2 = loop {
+            let q2 = wait_for_question(&job);
+            if q2.id != q.id {
+                break q2;
             }
-            false => q2,
+            assert!(start.elapsed() < Duration::from_secs(10), "stuck on a");
+            std::thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(q2.subject, "b");
         job.answer(q2.id, 0);
