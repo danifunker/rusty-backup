@@ -352,7 +352,20 @@ impl CommanderView {
         } else {
             "  [read-only - Ctrl+W Edit Mode]"
         };
-        format!("{what}  {}{mode}", self.explorer_label())
+        let space = match self.ctl.space().filter(|_| self.edits_through_modes()) {
+            Some(sp) => match sp.after {
+                Some(_) if sp.overflows => {
+                    format!(
+                        "  Free {} - the staged edits do not fit",
+                        format_size(sp.free)
+                    )
+                }
+                Some(after) => format!("  Free {} -> {}", format_size(sp.free), format_size(after)),
+                None => format!("  Free {}", format_size(sp.free)),
+            },
+            None => String::new(),
+        };
+        format!("{what}  {}{mode}{space}", self.explorer_label())
     }
 
     /// Opened through the controller's Inspect modes.
