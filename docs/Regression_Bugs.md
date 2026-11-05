@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| [R-081](#r-081) | Medium | `libchdman-rs` 0.289.x (vendored MAME `chd.cpp`) | A CHD of a source of 8 KiB or less aborts the process: `compress_v5_map` asserts `!bitbuf.overflow()` because its buffer leaves no room for the Huffman tree when there are only one or two hunks. MAME 0.285's release `chdman` writes a CHD that fails `chdman verify` for the same inputs. OPEN: needs a libchdman-rs patch and release |
+| ~~[R-080](#r-080)~~ | ~~Medium~~ **FIXED** | `src/restore/superfloppy_wrap.rs`, `src/model/{backup_loader,text_edit}.rs` | ~~A bare SquashFS image opened in Inspect fails to Browse ("bad MDB signature"): "squashfs" contains "hfs", so its row got MBR type 0xAF and opened as HFS; the same match chose the Apple HFS GPT type and Mac Roman text~~ — SquashFS is matched first (0x83, Linux filesystem GUID, UTF-8), 2026-11-04 |
 | ~~[R-079](#r-079)~~ | ~~**High**~~ **FIXED** | `crates/fs-pc` (NTFS directory listing) | ~~An NT4 NTFS volume hides every file in MFT records 16-23: NT4 Terminal Server's `WTSRV` (record 17) and its 3,600 files were missing from browse, backup sizing and extract~~ — only the fixed metafiles 0-15 are hidden, 2026-11-04 |
 | ~~[R-078](#r-078)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (HFS `last_data_byte`) | ~~`restore --size minimum` of a classic HFS volume fails: the recorded minimum is one allocation block short, because it leaves no room for the alternate MDB and the sector after it~~ — the minimum ends 1024 bytes past the last allocated block; HFS+ no longer skips the block before its alternate header, 2026-11-04 |
 | ~~[R-077](#r-077)~~ | ~~Medium~~ **FIXED** | `crates/disk-core` (`times`), `src/fs/copy.rs` | ~~A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC~~ — FAT, exFAT, Human68k and ProDOS dates are local wall-clock time too, 2026-11-04 |
@@ -101,6 +103,31 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found during Phase 2 slice 29, 2026-11-04
+
+### R-081 — a CHD of an image of 8 KiB or less aborts the process {#r-081}
+
+**OPEN.** `rb-cli convert z.img out --format chd` with an 8 KiB (or 4 KiB) source dies in
+libchdman's MAME code: `chd.cpp:2258 compress_v5_map(): Assertion '!bitbuf.overflow()'`.
+The buffer is sized as 16 header bytes plus up to `12 + max(lengthbits+16, selfbits,
+parentbits)` bits per hunk, with no allowance for the Huffman tree written at its start,
+so with one or two hunks the tree alone overflows it. 12 KiB and larger work. MAME
+0.285's `chdman` (assertions compiled out) writes a CHD that `chdman verify` rejects.
+Fix: allow the tree's size in `nbits_needed` in libchdman-rs's vendored `chd.cpp` (and
+report upstream), then a libchdman-rs release with rebuilt prebuilts. Until then a
+guard could refuse CHD output under 12 KiB.
+
+### R-080 — a bare SquashFS image does not browse from Inspect {#r-080}
+
+**FIXED 2026-11-04.** `superfloppy_wrap::mbr_type_byte_for_fs` matched substrings, and
+"squashfs" contains "hfs", so a partition-less SquashFS image got MBR type 0xAF and the
+Browse session opened it as HFS ("bad MDB signature: 0x0000"). `gpt_guid_for_fs`,
+`backup_loader::infer_fat_type_byte` and `text_edit::conventional_encoding_for` had the
+same trap (Apple HFS GUID, 0xAF, Mac Roman). SquashFS is now matched first: 0x83, the
+Linux filesystem GUID, UTF-8. `rb-cli` was unaffected (it opens by detection). Tests:
+`controller::inspect::tests::a_squashfs_image_browses_as_squashfs_not_hfs` (fails before
+the fix with that error), the `superfloppy_wrap` and `text_edit` mapping tests.
 
 ## Found on the user's NT4 Terminal Server Edition disk, 2026-11-04
 

@@ -341,3 +341,30 @@ fn add_partition_needs_a_gap_and_the_dialog_sources_follow_the_image() {
     fat.apply(InspectAction::Close);
     assert!(fat.alto_resize_source().is_err());
 }
+
+#[test]
+fn a_squashfs_image_browses_as_squashfs_not_hfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::controller::test_fixtures::squashfs_volume(dir.path());
+    let mut ctl = controller();
+    ctl.apply(InspectAction::Load(InspectSource::Image {
+        path: img,
+        temp: None,
+    }));
+    settle(&mut ctl);
+    ctl.take_requests();
+    let index = ctl.partitions()[0].index;
+    ctl.apply(InspectAction::Browse(index));
+    let Some(HostRequest::OpenBrowse(open)) = ctl.take_requests().into_iter().next() else {
+        panic!("no browse request");
+    };
+    let mut fs = open.session.open().expect("opens as SquashFS");
+    let root = fs.root().unwrap();
+    let names: Vec<String> = fs
+        .list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["a.txt"]);
+}

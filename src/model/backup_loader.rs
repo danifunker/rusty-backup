@@ -390,7 +390,7 @@ pub fn infer_fat_type_byte(name: &str) -> u8 {
         0x01
     } else if lower.contains("fat") {
         0x0C
-    } else if lower.contains("linux") || lower.contains("ext") {
+    } else if lower.contains("linux") || lower.contains("ext") || lower.contains("squashfs") {
         0x83
     } else if lower.contains("hfs") {
         0xAF
