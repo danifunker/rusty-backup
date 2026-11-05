@@ -536,7 +536,7 @@ fn apply_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::mbr::{build_minimal_mbr, Mbr};
+    use part_tables::mbr::{build_minimal_mbr, Mbr};
 
     /// An MBR with entries 0 and 2 populated and entry 1 zeroed. `partitions()`
     /// lists two, but their `index`es are 0 and 2 — the gap the remap exists for.

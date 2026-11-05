@@ -22,9 +22,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use rusty_backup::fs::cpm::CpmFilesystem;
-use rusty_backup::fs::cpm_diskdefs::ALTAIR_8IN;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_cpm::cpm::CpmFilesystem;
+use fs_cpm::cpm_diskdefs::ALTAIR_8IN;
 use std::io::Cursor;
 
 fn cli_bin() -> PathBuf {

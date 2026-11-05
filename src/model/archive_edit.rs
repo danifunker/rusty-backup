@@ -73,34 +73,40 @@ pub fn start_extract(
     }));
 
     let progress_thread = Arc::clone(&progress);
-    std::thread::spawn(move || {
-        let _wake = crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
-        let cancel = {
-            let p = Arc::clone(&progress_thread);
-            move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-        };
-        let result = decompress_partition_to_file(
-            &archive_path,
-            &compression_type,
-            &temp_path,
-            original_size,
-            compacted,
-            &mut |bytes| {
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.current = bytes;
+    crate::model::worker::spawn_guarded(
+        Arc::clone(&progress),
+        "decompress for editing",
+        move || {
+            let _wake =
+                crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
+            let cancel = {
+                let p = Arc::clone(&progress_thread);
+                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+            };
+            let result = decompress_partition_to_file(
+                &archive_path,
+                &compression_type,
+                &temp_path,
+                original_size,
+                compacted,
+                &mut |bytes| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.current = bytes;
+                    }
+                },
+                &cancel,
+            );
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                if let Err(e) = result {
+                    p.error = Some(format!("{e:#}"));
+                    // Clean up temp file on error
+                    let _ = std::fs::remove_file(&temp_path);
                 }
-            },
-            &cancel,
-        );
-        if let Ok(mut p) = progress_thread.lock() {
-            p.finished = true;
-            if let Err(e) = result {
-                p.error = Some(format!("{e:#}"));
-                // Clean up temp file on error
-                let _ = std::fs::remove_file(&temp_path);
             }
-        }
-    });
+            Ok(())
+        },
+    );
 
     progress
 }
@@ -132,82 +138,148 @@ pub fn start_compress(
     }));
 
     let progress_thread = Arc::clone(&progress);
-    std::thread::spawn(move || {
-        let _wake =
-            crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
-        let cancel = {
-            let p = Arc::clone(&progress_thread);
-            move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-        };
+    crate::model::worker::spawn_guarded(
+        Arc::clone(&progress),
+        "recompress after editing",
+        move || {
+            let _wake =
+                crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
+            let cancel = {
+                let p = Arc::clone(&progress_thread);
+                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
+            };
 
-        // Compute checksum of the temp file before compressing.
-        let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
+            // Compute checksum of the temp file before compressing.
+            let checksum_result = compute_file_checksum(&temp_path, &checksum_type);
 
-        let archive_base = archive_path.with_extension("");
-        log::info!(
-            "Compressing {} -> {} (type={})",
-            temp_path.display(),
-            archive_base.display(),
-            compression_type
-        );
-        let result = compress_file_to_archive(
-            &temp_path,
-            &archive_base,
-            &compression_type,
-            None,
-            &mut |bytes| {
-                if let Ok(mut p) = progress_thread.lock() {
-                    p.current = bytes;
-                }
-            },
-            &cancel,
-            &mut |msg| log::info!("{}", msg),
-        );
-
-        if let Ok(mut p) = progress_thread.lock() {
-            p.finished = true;
-            match result {
-                Ok(new_files) => {
-                    log::info!("Compress succeeded: {:?}", new_files);
-                    // Remove old archive file if extension changed.
-                    if archive_path.exists() {
-                        let new_path = archive_path
-                            .parent()
-                            .unwrap_or(Path::new("."))
-                            .join(&new_files[0]);
-                        if new_path != archive_path {
-                            let _ = std::fs::remove_file(&archive_path);
-                        }
+            let archive_base = archive_path.with_extension("");
+            log::info!(
+                "Compressing {} -> {} (type={})",
+                temp_path.display(),
+                archive_base.display(),
+                compression_type
+            );
+            let result = compress_file_to_archive(
+                &temp_path,
+                &archive_base,
+                &compression_type,
+                None,
+                &mut |bytes| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.current = bytes;
                     }
+                },
+                &cancel,
+                &mut |msg| log::info!("{}", msg),
+            );
 
-                    // Update metadata checksum (skip for standalone container
-                    // files where metadata_path is empty).
-                    if !metadata_path.as_os_str().is_empty() {
-                        if let Ok(checksum) = checksum_result {
-                            if let Err(e) = backup_metadata::update_partition_checksum(
-                                &metadata_path,
-                                partition_index,
-                                &checksum,
-                                Some(&new_files),
-                            ) {
-                                p.error = Some(format!(
-                                    "Saved archive but failed to update metadata: {e}"
-                                ));
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                match result {
+                    Ok(new_files) => {
+                        log::info!("Compress succeeded: {:?}", new_files);
+                        // Remove old archive file if extension changed.
+                        if archive_path.exists() {
+                            let new_path = archive_path
+                                .parent()
+                                .unwrap_or(Path::new("."))
+                                .join(&new_files[0]);
+                            if new_path != archive_path {
+                                let _ = std::fs::remove_file(&archive_path);
                             }
                         }
-                    }
 
-                    let _ = std::fs::remove_file(&temp_path);
-                }
-                Err(e) => {
-                    p.error = Some(format!("{e:#}"));
-                    // Keep temp file on error so user can retry.
+                        // Update metadata checksum (skip for standalone container
+                        // files where metadata_path is empty).
+                        if !metadata_path.as_os_str().is_empty() {
+                            if let Ok(checksum) = checksum_result {
+                                if let Err(e) = backup_metadata::update_partition_checksum(
+                                    &metadata_path,
+                                    partition_index,
+                                    &checksum,
+                                    Some(&new_files),
+                                ) {
+                                    p.error = Some(format!(
+                                        "Saved archive but failed to update metadata: {e}"
+                                    ));
+                                }
+                            }
+                        }
+
+                        let _ = std::fs::remove_file(&temp_path);
+                    }
+                    Err(e) => {
+                        p.error = Some(format!("{e:#}"));
+                        // Keep temp file on error so user can retry.
+                    }
                 }
             }
-        }
-    });
+            Ok(())
+        },
+    );
 
     progress
+}
+
+/// A `.woz` image edited through the decode -> edit -> re-encode flow.
+pub fn woz_context(path: &Path) -> ArchiveEditContext {
+    let original_size = dsk_apple::woz::WozReader::open(path)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    ArchiveEditContext {
+        archive_path: path.to_path_buf(),
+        compression_type: "woz".to_string(),
+        original_size,
+        compacted: false,
+        metadata_path: PathBuf::new(),
+        partition_index: 0,
+        checksum_type: String::new(),
+    }
+}
+
+/// Where the decompressed copy being edited lives: `<stem>-edit.img` beside the archive.
+pub fn edit_temp_path(ctx: &ArchiveEditContext) -> PathBuf {
+    let parent = ctx.archive_path.parent().unwrap_or(Path::new("."));
+    let stem = ctx.archive_path.file_stem().unwrap_or_default();
+    parent.join(format!("{}-edit.img", stem.to_string_lossy()))
+}
+
+/// Decompress into `temp_path` as a job; a failure removes the partial temp.
+pub fn extract_for_edit(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    job: &crate::model::job::JobCtx,
+) -> Result<(), String> {
+    let _wake = crate::os::wakelock::acquire("Rusty Backup: decompress partition for editing");
+    job.set_can_cancel(false);
+    let total = ctx.original_size;
+    let r = extract_partition_sync(ctx, temp_path, &mut |b| job.set_bytes(b, total), &|| false);
+    r.map_err(|e| {
+        let _ = std::fs::remove_file(temp_path);
+        format!("{e:#}")
+    })
+}
+
+/// Recompress `temp_path` back into the archive as a job, then remove it; a failure keeps it.
+pub fn compress_after_edit(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    job: &crate::model::job::JobCtx,
+) -> Result<(), String> {
+    let _wake = crate::os::wakelock::acquire("Rusty Backup: recompress partition after editing");
+    job.set_can_cancel(false);
+    let total = std::fs::metadata(temp_path).map(|m| m.len()).unwrap_or(0);
+    let mut log = |m: &str| log::info!("{m}");
+    let r = recompress_partition_sync(
+        ctx,
+        temp_path,
+        &mut |b| job.set_bytes(b, total),
+        &|| false,
+        &mut log,
+    );
+    r.map_err(|e| format!("{e:#}"))?;
+    let _ = std::fs::remove_file(temp_path);
+    Ok(())
 }
 
 /// Synchronous decompress of `ctx.archive_path` into `temp_path` (zero-padded
@@ -228,7 +300,17 @@ pub fn extract_partition_sync(
         ctx.compacted,
         progress_cb,
         cancel_check,
-    )
+    )?;
+    if ctx.compacted {
+        // A packed volume's header still claims the packed size: grow it to the partition, as a restore does.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_path)?;
+        let mut log = |m: &str| log::info!("{m}");
+        crate::fs::resize_filesystem_for(&mut f, 0, ctx.original_size, &mut log)?;
+    }
+    Ok(())
 }
 
 /// Synchronous recompress of `temp_path` back into `ctx.archive_path`, plus the
@@ -325,5 +407,57 @@ pub fn compute_file_checksum(
             Ok(format!("{:08x}", hasher.finalize()))
         }
         other => Err(format!("unsupported checksum type: {other}").into()),
+    }
+}
+
+crate::model::worker::finished_with_error!(ArchiveEditProgress);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packed FAT backup opens for editing at its partition size, with its free space back.
+    #[test]
+    fn a_compacted_fat_backup_is_edited_at_its_partition_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = 2 * 1024 * 1024u64;
+        let img = dir.path().join("vol.img");
+        std::fs::write(&img, fs_pc::fat::create_blank_fat(size, Some("T")).unwrap()).unwrap();
+        let (mut packed, result) =
+            crate::fs::compact_partition_reader(File::open(&img).unwrap(), 0, 0x01, None, false)
+                .expect("FAT compacts");
+        assert!(result.compacted_size < size, "the stream is packed");
+        let packed_path = dir.path().join("packed.img");
+        let mut out = File::create(&packed_path).unwrap();
+        std::io::copy(&mut packed, &mut out).unwrap();
+        drop(out);
+        let files = compress_file_to_archive(
+            &packed_path,
+            &dir.path().join("partition-0"),
+            "zstd",
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        let ctx = ArchiveEditContext {
+            archive_path: dir.path().join(&files[0]),
+            compression_type: "zstd".into(),
+            original_size: size,
+            compacted: true,
+            metadata_path: PathBuf::new(),
+            partition_index: 0,
+            checksum_type: "sha256".into(),
+        };
+        let temp = dir.path().join("edit.img");
+        extract_partition_sync(&ctx, &temp, &mut |_| {}, &|| false).unwrap();
+        let session = crate::model::browse_session::BrowseSession {
+            source_path: Some(temp),
+            ..Default::default()
+        };
+        let fs = session.open().unwrap();
+        let free = fs.total_size() - fs.used_size();
+        assert!(free > size / 2, "free {free} of {}", fs.total_size());
     }
 }

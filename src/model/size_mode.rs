@@ -7,6 +7,9 @@
 //!
 //! See `gui/size_mode_row.rs` for the matching widget.
 
+/// The largest Custom size a size row offers, in MiB (2 TiB).
+pub const CUSTOM_MIB_MAX: u32 = 2_097_152;
+
 /// Per-partition size choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SizeMode {
@@ -27,6 +30,17 @@ pub enum SizeMode {
 }
 
 impl SizeMode {
+    /// The mode's short name, as a size row shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeMode::Original => "Original",
+            SizeMode::Minimum => "Minimum",
+            SizeMode::MinPlus20 => "Min+20%",
+            SizeMode::Custom => "Custom",
+            SizeMode::FillRemaining => "Fill",
+        }
+    }
+
     /// Resolve to an effective byte size. `FillRemaining` returns 0 — the
     /// caller is expected to compute the actual fill value from the disk
     /// budget. `MinPlus20` returns `min(minimum * 1.2, original)` rounded up

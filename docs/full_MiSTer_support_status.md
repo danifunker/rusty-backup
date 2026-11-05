@@ -101,7 +101,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   both m68k and Intel) and the Solaris x86 VTOC nested inside an MBR partition
   — every one of them can now be **written** from scratch as well as parsed
   (`rb-cli new hd <table>`). The pre-IRIX SGI disk label (IRIS 2000 / 3000) is
-  parsed and its slots edited, but not written from scratch. On Unisys ICON /
+  parsed and its slots edited, but not written from scratch. The pre-1986 Apple
+  `TS` partition map (early HD SC Setup disks, some early Mac CD-ROMs) is parsed
+  and backed up whole, not edited or written. On Unisys ICON /
   LEXICON hard disks the MBR's types 07 / 08 / 09 are read as QNX 2 partitions
   1-3 with 1-based starts.
 - **Containers:** Sun QIC tape images (`.qic`, the Sun-2 / Sun-3 cores' `SUN2TAPE`

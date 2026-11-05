@@ -4,8 +4,8 @@
 //! [`EditQueue`](crate::model::edit_queue::EditQueue) (delete + copy-in);
 //! nothing touches disk until Apply. [`apply_edits`] is the leaf that opens the
 //! pane's source read-write, replays the queue, syncs, and commits the container
-//! — the same shape as the browse view's `apply_staged_edits`; [`spawn_apply`]
-//! threads it behind an [`ApplyStatus`] so a slow write never blocks the frame.
+//! — the same shape as the browse view's `apply_staged_edits`; [`apply_in_job`]
+//! runs it as a job so a slow write never blocks the frame.
 //!
 //! The cross-pane copy has four backends by source/destination kind:
 //! [`stage_copy`] (image->image, extract to temp + stage) and
@@ -15,21 +15,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use anyhow::{bail, Context, Result};
 
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::Filesystem;
-use crate::fs::fork_export::{export_file_with_fork, primary_output_path, safe_name};
 use crate::fs::replace::OnConflict;
-use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
 use crate::model::edit_queue::{apply_edit, EditQueue, QueueScan, StagedEdit};
 use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 #[cfg(feature = "remote")]
 use crate::remote::RemoteConnection;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
+use fs_mac::fork_export::{primary_output_path, safe_name};
+use fs_mac::resource_fork::{ImportedResourceFork, ResourceForkMode};
 
 /// Apply `edits` to `session`'s source in order, stopping at the first failure.
 /// What landed is synced and committed; the error names how many applied.
@@ -139,6 +138,107 @@ pub fn apply_edits_reporting(
     Ok(outcome)
 }
 
+/// The volume details a browse view refreshes after an apply.
+pub struct VolumeAfter {
+    pub blessed: Option<(u64, String)>,
+    pub total: u64,
+    pub used: u64,
+}
+
+/// What [`apply_queue`] did; the edits always come back so the caller can restage what didn't land.
+pub enum QueueApply {
+    /// Adds onto existing names were found and nothing was written; ask, then apply again.
+    Conflicts {
+        edits: Vec<StagedEdit>,
+        conflicts: Vec<(String, String)>,
+    },
+    /// The run finished: `outcome` says which edits landed (it stops at the first failure).
+    Applied {
+        edits: Vec<StagedEdit>,
+        outcome: ApplyOutcome,
+        volume: Option<VolumeAfter>,
+    },
+    /// Opening, syncing or committing failed; `restage` is false once edits may be on the volume.
+    Failed {
+        edits: Vec<StagedEdit>,
+        message: String,
+        restage: bool,
+    },
+}
+
+/// The browse view's Apply: check for name conflicts (unless already reviewed), apply in order
+/// stopping at the first failure, and read back the volume details; meant to run as a job.
+pub fn apply_queue(
+    session: &BrowseSession,
+    edits: Vec<StagedEdit>,
+    check_conflicts: bool,
+    job: &crate::model::job::JobCtx,
+) -> QueueApply {
+    use crate::model::job::{Progress, Unit};
+    job.set_can_cancel(false);
+    if check_conflicts {
+        job.set_phase("Checking for name conflicts...");
+        if let Ok(mut fs) = session.open() {
+            let mut queue = super::edit_queue::EditQueue::default();
+            for e in &edits {
+                queue.push(e.clone());
+            }
+            let conflicts = queue.scan_against(&mut *fs).conflicts;
+            if !conflicts.is_empty() {
+                return QueueApply::Conflicts { edits, conflicts };
+            }
+        }
+    }
+    let total = edits.len() as u64;
+    job.set_phase("Writing...");
+    let result = apply_edits_reporting(session, &edits, false, |p| {
+        job.set_phase(format!("Writing {}", edit_label(p.edit)));
+        job.set_progress(Progress::Determinate {
+            done: p.index as u64 + 1,
+            total,
+            unit: Unit::Items,
+        });
+    });
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let (message, restage) = match e.to_string().as_str() {
+                "opening source for editing" => (
+                    format!("Error opening filesystem: {}", e.root_cause()),
+                    true,
+                ),
+                "writing filesystem metadata" => {
+                    (format!("Error saving to disk: {}", e.root_cause()), false)
+                }
+                "committing container edits" => (
+                    format!("Error writing container: {}", e.root_cause()),
+                    false,
+                ),
+                _ => (format!("Error: {e:#}"), false),
+            };
+            return QueueApply::Failed {
+                edits,
+                message,
+                restage,
+            };
+        }
+    };
+    let volume = if outcome.failed.is_empty() {
+        session.open().ok().map(|mut fs| VolumeAfter {
+            blessed: fs.blessed_system_folder(),
+            total: fs.total_size(),
+            used: fs.used_size(),
+        })
+    } else {
+        None
+    };
+    QueueApply::Applied {
+        edits,
+        outcome,
+        volume,
+    }
+}
+
 /// The Apply preflight's verdict for a staged queue, from a fresh read-only open.
 #[derive(Debug, Default, Clone)]
 pub struct ApplyPreflight {
@@ -169,42 +269,35 @@ pub fn preflight_apply(session: &BrowseSession, edits: &[StagedEdit]) -> Result<
     let mut fs = session
         .open()
         .context("opening the destination to check the staged edits")?;
+    Ok(preflight_fs(fs.as_mut(), edits))
+}
+
+/// [`preflight_apply`] for a remote image, read through a fresh daemon connection.
+#[cfg(feature = "remote")]
+pub fn preflight_remote_apply(
+    addr: &str,
+    image_path: &str,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    edits: &[StagedEdit],
+) -> Result<ApplyPreflight> {
+    let (mut fs, _, _) = crate::remote::fs::RemoteFilesystem::open(addr, image_path, partition)
+        .context("opening the remote image to check the staged edits")?;
+    Ok(preflight_fs(&mut fs, edits))
+}
+
+fn preflight_fs(fs: &mut dyn Filesystem, edits: &[StagedEdit]) -> ApplyPreflight {
     let mut queue = EditQueue::new();
     for e in edits {
         queue.push(e.clone());
     }
-    let scan = queue.scan_against(fs.as_mut());
+    let scan = queue.scan_against(fs);
     let unit = fs.allocation_unit().unwrap_or(512);
-    Ok(ApplyPreflight {
+    ApplyPreflight {
         fs_type: fs.fs_type().to_string(),
         scan,
         bytes_needed: queue.bytes_needed(unit),
         bytes_free: fs.total_size().saturating_sub(fs.used_size()),
-    })
-}
-
-/// Shared state for a [`spawn_apply_preflight`] worker.
-#[derive(Default)]
-pub struct PreflightStatus {
-    pub finished: bool,
-    pub result: Option<std::result::Result<ApplyPreflight, String>>,
-}
-
-/// Run [`preflight_apply`] off the UI thread; a big queue walks many folders.
-pub fn spawn_apply_preflight(
-    session: BrowseSession,
-    edits: Vec<StagedEdit>,
-) -> Arc<Mutex<PreflightStatus>> {
-    let status = Arc::new(Mutex::new(PreflightStatus::default()));
-    let worker = Arc::clone(&status);
-    thread::spawn(move || {
-        let result = preflight_apply(&session, &edits).map_err(|e| format!("{e:#}"));
-        if let Ok(mut g) = worker.lock() {
-            g.result = Some(result);
-            g.finished = true;
-        }
-    });
-    status
+    }
 }
 
 /// Destination folder of a copy-in edit (the only edits that nest under staged folders).
@@ -241,7 +334,7 @@ pub struct EditProgress<'a> {
 
 /// Total bytes that will actually be written for an edit queue: the sum of
 /// every `AddFile.size` (deletes / renames / mkdir contribute nothing). This
-/// is what the ApplyStatus progress bar tracks against.
+/// is what an apply job's progress bar tracks against.
 fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
     edits
         .iter()
@@ -254,7 +347,7 @@ fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
 
 /// Human-readable label for one edit, shown as the "Writing X" line while
 /// that edit is in flight. Kept short and stable across edit shapes.
-fn edit_label(edit: &StagedEdit) -> String {
+pub fn edit_label(edit: &StagedEdit) -> String {
     match edit {
         StagedEdit::AddFile { parent, name, .. } => join_path(&parent.path, name),
         StagedEdit::CreateDirectory { parent, name, .. } => join_path(&parent.path, name),
@@ -342,6 +435,7 @@ pub struct StageCopyStatus {
 ///
 /// A live wrapper-mount fs can't be reopened this way, so those copies stay on
 /// the synchronous [`stage_copy`] path (they're small, local sources).
+#[derive(Clone)]
 pub enum StageSource {
     /// Reopen a local image through its browse session.
     Session(BrowseSession),
@@ -380,11 +474,20 @@ impl StageSource {
             StageSource::Reopen(recipe) => recipe.open(),
         }
     }
+
+    /// The disc a browser pane's disc source reopens (the extractor opens it with its dates).
+    #[cfg(feature = "optical")]
+    pub fn disc(&self) -> Option<&crate::model::optical_browse::DiscChoice> {
+        match self {
+            StageSource::Reopen(crate::model::commander_descend::ReopenRecipe::Disc(d)) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 /// How a wrapper-open worker gets the wrapper file's bytes to mount. Materializing
 /// a large `.toast` / `.chd` / `.iso` and probing it can take seconds, so the
-/// pane runs this off the UI thread behind a spinner ([`spawn_wrapper_open`]).
+/// pane runs this as a job behind a spinner ([`prepare_wrapper`]).
 pub enum WrapperOpenPlan {
     /// A host file — opened by its real path (no extraction; also the only form
     /// multi-file optical formats like bin/cue can use).
@@ -404,75 +507,42 @@ pub struct WrapperExtract {
     pub entry: FileEntry,
 }
 
-/// Progress + result of an off-thread wrapper open. `result` carries a
-/// [`PreparedMount`] to install, or a short error string.
-#[derive(Default)]
-pub struct WrapperOpenStatus {
-    pub phase: String,
-    pub finished: bool,
-    pub result: Option<std::result::Result<PreparedMount, String>>,
-}
-
-/// Open a wrapper (`file_name`, classified as `kind`) off the UI thread. The
-/// pane polls the returned handle each frame, shows a spinner with `phase`, and
-/// installs the [`PreparedMount`] via `WrapperTree::install_prepared` on finish.
-pub fn spawn_wrapper_open(
+/// Mount a wrapper (`file_name`, classified as `kind`) for `WrapperTree::install_prepared`; meant to run as a job.
+pub fn prepare_wrapper(
     plan: WrapperOpenPlan,
     kind: DescendKind,
-    file_name: String,
-) -> Arc<Mutex<WrapperOpenStatus>> {
-    let status = Arc::new(Mutex::new(WrapperOpenStatus {
-        phase: "Reading...".to_string(),
-        finished: false,
-        result: None,
-    }));
-    let st = Arc::clone(&status);
-    thread::spawn(move || {
-        let result = run_wrapper_open(plan, kind, file_name, &st);
-        if let Ok(mut g) = st.lock() {
-            g.result = Some(result);
-            g.finished = true;
-        }
-    });
-    status
-}
-
-fn run_wrapper_open(
-    plan: WrapperOpenPlan,
-    kind: DescendKind,
-    file_name: String,
-    status: &Arc<Mutex<WrapperOpenStatus>>,
-) -> std::result::Result<PreparedMount, String> {
+    file_name: &str,
+    job: &crate::model::job::JobCtx,
+) -> Result<PreparedMount> {
+    job.set_phase("Reading...");
     let source = match plan {
         WrapperOpenPlan::HostPath(path) => WrapperSource::Path(path),
         WrapperOpenPlan::Bytes(bytes) => WrapperSource::Bytes(bytes),
         WrapperOpenPlan::Extract(ex) => {
             let WrapperExtract { base, entry } = *ex;
-            let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
-            let large = entry.size > crate::fs::mem_archive::INLINE_MAX;
+            let mut fs = base.open()?;
+            let large = entry.size > fs_tar::mem_archive::INLINE_MAX;
             if large || matches!(kind, DescendKind::DiskImage | DescendKind::Optical) {
                 // Stream to disk so a multi-GB image or archive never sits in RAM.
                 let (dir, path) =
-                    crate::model::commander_descend::materialize_streamed(&file_name, |f| {
+                    crate::model::commander_descend::materialize_streamed(file_name, |f| {
                         let mut w = std::io::BufWriter::new(f);
                         fs.write_file_to(&entry, &mut w)?;
                         std::io::Write::flush(&mut w)?;
                         Ok(())
                     })
-                    .map_err(|e| format!("reading '{}': {e:#}", entry.name))?;
+                    .with_context(|| format!("reading '{}'", entry.name))?;
                 WrapperSource::TempFile(dir, path)
             } else {
                 let mut buf = Vec::new();
                 fs.write_file_to(&entry, &mut buf)
-                    .map_err(|e| format!("reading '{}': {e}", entry.name))?;
+                    .map_err(|e| anyhow::anyhow!("reading '{}': {e}", entry.name))?;
                 WrapperSource::Bytes(buf)
             }
         }
     };
-    if let Ok(mut g) = status.lock() {
-        g.phase = "Opening...".to_string();
-    }
-    WrapperTree::prepare(source, &file_name, kind).map_err(|e| format!("{e:#}"))
+    job.set_phase("Opening...");
+    WrapperTree::prepare(source, file_name, kind)
 }
 
 /// Off-thread [`stage_copy`]: reopens the source on a worker, extracts each file
@@ -488,7 +558,7 @@ pub fn spawn_stage_copy(
 ) -> Arc<Mutex<StageCopyStatus>> {
     let status = Arc::new(Mutex::new(StageCopyStatus::default()));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "stage copy", move || {
         let result = run_stage_copy(
             source,
             &entries,
@@ -504,6 +574,7 @@ pub fn spawn_stage_copy(
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -692,6 +763,49 @@ pub fn stage_host_to_image(entries: &[FileEntry], dest_parent: &FileEntry) -> Ve
     edits
 }
 
+/// Stage host files for a volume of `fs_type`: forks only into HFS / HFS+, and ProDOS takes
+/// CiderPress `#TTAAAA` name suffixes as the file's type and aux (what the Inspect tab always did).
+pub fn stage_host_for(
+    entries: &[FileEntry],
+    dest_parent: &FileEntry,
+    fs_type: &str,
+) -> Vec<StagedEdit> {
+    let mut edits = stage_host_to_image(entries, dest_parent);
+    let forks = matches!(fs_type, "HFS" | "HFS+" | "HFSX");
+    for edit in edits.iter_mut() {
+        let StagedEdit::AddFile {
+            name,
+            host_path,
+            size,
+            prodos_type,
+            prodos_aux,
+            resource_fork,
+            ..
+        } = edit
+        else {
+            continue;
+        };
+        if !forks && resource_fork.take().is_some() {
+            *name = host_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            *size = std::fs::metadata(&*host_path)
+                .map(|m| m.len())
+                .unwrap_or(*size);
+        }
+        if fs_type == "ProDOS" {
+            if let Some((stem, tt, aa)) = fs_apple2::prodos_types::decode_cp_suffix(name.as_str()) {
+                let stem = stem.to_string();
+                *name = stem;
+                *prodos_type = Some(tt);
+                *prodos_aux = Some(aa);
+            }
+        }
+    }
+    edits
+}
+
 fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut Vec<StagedEdit>) {
     for entry in entries {
         if entry.is_directory() {
@@ -711,14 +825,14 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
             let host_path = PathBuf::from(&entry.path);
             // A sidecar is consumed as part of its primary file below; staging
             // it as well would land resource-fork bytes as their own file.
-            if crate::fs::resource_fork::is_resource_fork_sidecar(&host_path) {
+            if fs_mac::resource_fork::is_resource_fork_sidecar(&host_path) {
                 continue;
             }
             // Mac files reach a host folder in one of four containers (native
             // fork, `._name`, `.bin`, `.hqx`). Reading them here is what makes
             // a Commander drag from the host pane preserve forks the way the
             // Inspect tab's import already did (R-041).
-            let resource_fork = crate::fs::resource_fork::detect_resource_fork(&host_path);
+            let resource_fork = fs_mac::resource_fork::detect_resource_fork(&host_path);
             // A whole-file container carries the real Mac name and the data
             // fork; `apply_edit` writes those bytes instead of the wrapper.
             let name = resource_fork
@@ -815,6 +929,8 @@ pub enum HostCopyJob {
     /// `dest` is the folder or the archive file per `format.is_single_file()`.
     /// Boxed to keep the enum's variants close in size.
     ExportSelection(Box<ExportJob>),
+    /// Extract one entry (a folder with its contents) to a host folder.
+    Extract(Box<crate::model::extract::ExtractJob>),
 }
 
 /// Payload for [`HostCopyJob::ExportSelection`].
@@ -854,6 +970,8 @@ pub struct HostCopyStatus {
     /// Host paths the copy passed over (symlinks, sockets, devices), for the
     /// completion message; a silent omission looked like a complete copy.
     pub skipped: Vec<String>,
+    /// The entry (and its error) at which the user chose Stop; the run ended there.
+    pub stopped: Option<String>,
 }
 
 /// Record a source entry the copy will not carry over.
@@ -869,9 +987,87 @@ impl HostCopyJob {
         match &mut self {
             HostCopyJob::ImageToHost { on_conflict, .. }
             | HostCopyJob::HostToHost { on_conflict, .. } => *on_conflict = on,
+            HostCopyJob::Extract(job) => job.on_conflict = on,
             _ => {}
         }
         self
+    }
+}
+
+/// What a finished [`host_copy_in_job`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostCopyDone {
+    pub copied: usize,
+    /// Host paths passed over (special files, or existing ones under `OnConflict::Skip`).
+    pub skipped: Vec<String>,
+    /// The entry at which the user chose Stop (an extraction's failed entry), with its error.
+    pub stopped: Option<String>,
+}
+
+/// Run a [`HostCopyJob`] as a job body, reporting through `ctx`.
+pub fn host_copy_in_job(job: HostCopyJob, ctx: &crate::model::job::JobCtx) -> Result<HostCopyDone> {
+    let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+    let last = std::cell::RefCell::new(String::new());
+    let mirror = |s: &mut HostCopyStatus, ctx: &crate::model::job::JobCtx| {
+        if ctx.is_cancelled() {
+            s.cancel_requested = true;
+        }
+        mirror_progress(ctx, &last, &s.current_file, s.bytes_done, s.bytes_total);
+    };
+    let copied = crate::model::worker::run_mirrored(ctx, &status, mirror, || {
+        run_host_copy(job, &status, Some(ctx))
+    })?;
+    let mut g = crate::model::worker::lock_status(&status);
+    Ok(HostCopyDone {
+        copied,
+        skipped: std::mem::take(&mut g.skipped),
+        stopped: g.stopped.take(),
+    })
+}
+
+/// Off-thread [`stage_copy`] as a job body: reopens `source` and extracts into `temp_dir`.
+pub fn stage_copy_in_job(
+    source: StageSource,
+    entries: Vec<FileEntry>,
+    dest_parent: FileEntry,
+    temp_dir: PathBuf,
+    keep_dates: bool,
+    ctx: &crate::model::job::JobCtx,
+) -> Result<Vec<StagedEdit>> {
+    let status = Arc::new(Mutex::new(StageCopyStatus::default()));
+    let last = std::cell::RefCell::new(String::new());
+    let mirror = |s: &mut StageCopyStatus, ctx: &crate::model::job::JobCtx| {
+        if ctx.is_cancelled() {
+            s.cancel_requested = true;
+        }
+        mirror_progress(ctx, &last, &s.current_file, s.bytes_done, s.bytes_total);
+    };
+    crate::model::worker::run_mirrored(ctx, &status, mirror, || {
+        run_stage_copy(
+            source,
+            &entries,
+            &dest_parent,
+            &temp_dir,
+            keep_dates,
+            &status,
+        )
+    })
+}
+
+/// Phase and byte progress from a copy status; the phase is only set when the file changes.
+pub(crate) fn mirror_progress(
+    ctx: &crate::model::job::JobCtx,
+    last: &std::cell::RefCell<String>,
+    current: &str,
+    done: u64,
+    total: u64,
+) {
+    if !current.is_empty() && *last.borrow() != current {
+        *last.borrow_mut() = current.to_string();
+        ctx.set_phase(format!("Copying {current}"));
+    }
+    if total > 0 {
+        ctx.set_bytes(done, total);
     }
 }
 
@@ -881,8 +1077,8 @@ impl HostCopyJob {
 pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
-        let result = run_host_copy(job, &status_thread);
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "host copy", move || {
+        let result = run_host_copy(job, &status_thread, None);
         if let Ok(mut g) = status_thread.lock() {
             match result {
                 Ok(n) => g.copied = n,
@@ -890,11 +1086,16 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
             }
             g.finished = true;
         }
+        Ok(())
     });
     status
 }
 
-fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+fn run_host_copy(
+    job: HostCopyJob,
+    status: &Arc<Mutex<HostCopyStatus>>,
+    ask: Option<&crate::model::job::JobCtx>,
+) -> Result<usize> {
     match job {
         HostCopyJob::ImageToHost {
             source,
@@ -916,6 +1117,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
                 fork_mode,
                 on_conflict,
                 status,
+                ask,
             )
         }
         HostCopyJob::HostToHost {
@@ -971,6 +1173,7 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             upload_host_entries_to_remote_host(&entries, &mut conn, &dest_parent, status)
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
+        HostCopyJob::Extract(job) => crate::model::extract::run(*job, status, ask),
     }
 }
 
@@ -1036,6 +1239,7 @@ pub fn export_fs_entries_to_host(
         fork_mode,
         OnConflict::Replace,
         &status,
+        None,
     )
 }
 
@@ -1089,26 +1293,6 @@ fn resolve_host_conflict(
             Ok(false)
         }
         OnConflict::Fail => bail!("{} already exists", target.display()),
-    }
-}
-
-/// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
-/// filesystem synchronously — the small/local fallback that mirrors the
-/// synchronous copy path. `dest` is a folder or an archive file per `format`.
-pub fn export_now(
-    fs: &mut dyn Filesystem,
-    entries: &[FileEntry],
-    dest: &Path,
-    format: crate::fs::export_selection::ExportFormat,
-    fork_mode: ResourceForkMode,
-) -> Result<crate::fs::export_selection::ExportSummary> {
-    use crate::fs::export_selection::{export_to_file, export_to_folder};
-    let noprog = |_: &str, _: usize, _: u64| {};
-    let never = || false;
-    if format.is_single_file() {
-        export_to_file(fs, entries, dest, format, &noprog, &never)
-    } else {
-        export_to_folder(fs, entries, dest, format, fork_mode, &noprog, &never)
     }
 }
 
@@ -1183,9 +1367,9 @@ fn scan_host_dir(dir: &Path) -> (usize, u64) {
     (files, bytes)
 }
 
-/// Extract image `entries` into `dest_dir`, recursing directories and
-/// preserving resource forks per `fork_mode` (via the shared
-/// [`export_file_with_fork`]).
+/// Extract image `entries` into `dest_dir` through the `rb-fsexporter` crate: folders recursed,
+/// forks per `fork_mode`, symlinks and special files left out, `on_conflict` per file. A failed
+/// entry is put to `ask`'s user (skip, skip all, stop); without one it stops the copy.
 fn copy_image_entries_to_host(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
@@ -1193,39 +1377,82 @@ fn copy_image_entries_to_host(
     fork_mode: ResourceForkMode,
     on_conflict: OnConflict,
     status: &Arc<Mutex<HostCopyStatus>>,
+    ask: Option<&crate::model::job::JobCtx>,
 ) -> Result<usize> {
-    let mut count = 0;
+    let mut opts = rb_fsexporter::Options::new(fork_mode);
+    opts.symlinks = rb_fsexporter::Symlinks::Skip;
+    opts.on_error = rb_fsexporter::OnError::Stop;
+    opts.existing = match on_conflict {
+        OnConflict::Replace => rb_fsexporter::Existing::Overwrite,
+        OnConflict::Skip => rb_fsexporter::Existing::Skip,
+        OnConflict::Fail => rb_fsexporter::Existing::Fail,
+    };
+    let mut host = CopyHost {
+        status,
+        count: 0,
+        asker: crate::model::extract::ErrorAsker::new(ask, status),
+    };
     for entry in entries {
-        if is_cancelled(status) {
+        let Err(e) = rb_fsexporter::extract(fs, entry, dest_dir, &opts, &mut host) else {
+            continue;
+        };
+        if e.is::<rb_fsexporter::Cancelled>() || is_cancelled(status) {
             return Err(cancelled_err());
         }
-        if entry.is_directory() {
-            let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(&entry.name));
-            std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
-            let children = fs
-                .list_directory(entry)
-                .with_context(|| format!("listing '{}'", entry.name))?;
-            count +=
-                copy_image_entries_to_host(fs, &children, &sub, fork_mode, on_conflict, status)?;
-        } else if entry.is_file() {
-            let name = safe_name(entry);
-            let target = primary_output_path(entry, dest_dir, &name, fork_mode);
-            if !resolve_host_conflict(&target, on_conflict, status)? {
-                continue;
-            }
-            if let Ok(mut g) = status.lock() {
-                g.current_file = entry.path.clone();
-            }
-            export_file_with_fork(fs, entry, dest_dir, &name, fork_mode)
-                .with_context(|| format!("extracting '{}'", entry.name))?;
-            count += 1;
-            if let Ok(mut g) = status.lock() {
-                g.copied = count;
-                g.bytes_done = g.bytes_done.saturating_add(entry.size);
-            }
+        if host.asker.stopped() {
+            break;
+        }
+        let e = e.context(format!("extracting '{}'", entry.name));
+        match host.asker.decide(entry.path.as_str(), &e) {
+            None => return Err(e),
+            Some(rb_fsexporter::ErrorChoice::Stop) => break,
+            Some(_) => host.asker.skipped(entry.path.as_str(), &e),
         }
     }
-    Ok(count)
+    Ok(host.count)
+}
+
+/// An image-to-host copy as the extractor's host, reporting through the copy status.
+struct CopyHost<'a> {
+    status: &'a Arc<Mutex<HostCopyStatus>>,
+    count: usize,
+    asker: crate::model::extract::ErrorAsker<'a>,
+}
+
+impl rb_fsexporter::Host for CopyHost<'_> {
+    fn cancelled(&self) -> bool {
+        is_cancelled(self.status)
+    }
+
+    fn started(&mut self, entry: &FileEntry) {
+        if let Ok(mut g) = self.status.lock() {
+            g.current_file = entry.path.clone();
+        }
+    }
+
+    fn wrote(&mut self, entry: &FileEntry, _bytes: u64, _total: &rb_fsexporter::Summary) {
+        self.count += 1;
+        if let Ok(mut g) = self.status.lock() {
+            g.copied = self.count;
+            g.bytes_done = g.bytes_done.saturating_add(entry.size);
+        }
+    }
+
+    fn on_error(
+        &mut self,
+        entry: &FileEntry,
+        err: &anyhow::Error,
+    ) -> Option<rb_fsexporter::ErrorChoice> {
+        self.asker.decide(entry.path.as_str(), err)
+    }
+
+    fn failed(&mut self, entry: &FileEntry, err: &anyhow::Error) {
+        self.asker.skipped(entry.path.as_str(), err);
+    }
+
+    fn exists(&mut self, path: &Path) {
+        note_skipped(self.status, path, "already exists");
+    }
 }
 
 /// Copy host `entries` into `dest_dir`, recursing directories.
@@ -1380,8 +1607,14 @@ fn upload_image_entries_to_remote_host(
             // Materialize the file (+ any fork sidecar) locally, then stream
             // whatever export produced to the daemon.
             let temp = tempfile::tempdir().context("staging remote upload")?;
-            export_file_with_fork(fs, entry, temp.path(), &safe_name(entry), fork_mode)
-                .with_context(|| format!("encoding '{}'", entry.name))?;
+            fs_mac::fork_export::export_file_with_fork(
+                fs,
+                entry,
+                temp.path(),
+                &safe_name(entry),
+                fork_mode,
+            )
+            .with_context(|| format!("encoding '{}'", entry.name))?;
             upload_dir_files_to_remote(conn, temp.path(), dest_parent)?;
             count += 1;
             if let Ok(mut g) = status.lock() {
@@ -1533,65 +1766,57 @@ pub fn upload_fs_entries_to_remote(
     upload_image_entries_to_remote_host(fs, entries, &mut conn, dest_parent, fork_mode, &status)
 }
 
-/// Shared state between the GUI and the [`spawn_apply`] worker.
-///
-/// Byte/file counters drive the same Commander progress modal
-/// [`HostCopyStatus`] does; `bytes_total` is the sum of every `AddFile` edit
-/// in the queue (deletes / renames / mkdir contribute nothing) so the bar
-/// reflects the actual write cost, not the raw edit count.
-#[derive(Default)]
-pub struct ApplyStatus {
-    pub finished: bool,
-    /// Set when the apply failed; the pane surfaces it and keeps the queue.
-    pub error: Option<String>,
-    /// Edits completed so far (any kind).
-    pub edits_done: usize,
-    /// Total edits in the queue, from a pre-scan.
-    pub edits_total: usize,
-    /// Bytes written so far (only `AddFile` edits contribute).
-    pub bytes_done: u64,
-    /// Total bytes to write, summed over every `AddFile` edit's `size`.
-    pub bytes_total: u64,
-    /// The edit currently being applied, for the modal's "Writing X" line.
-    pub current_edit: String,
-    /// Per-edit result of a local apply, set when it finishes without a fatal error.
-    pub outcome: Option<ApplyOutcome>,
+/// Write the queue as a job, continuing past failed items; progress counts bytes (or edits when none).
+pub fn apply_in_job(
+    session: &BrowseSession,
+    edits: &[StagedEdit],
+    job: &crate::model::job::JobCtx,
+) -> Result<ApplyOutcome> {
+    job.set_can_cancel(false);
+    job.set_phase("Writing...");
+    apply_edits_reporting(session, edits, true, job_progress(edits, job))
 }
 
-/// Run [`apply_edits`] on a worker thread. The returned status flips `finished`
-/// when done, with `error` set on failure, and updates per-edit counters live
-/// so the Commander progress modal can render percent + rate + ETA.
-pub fn spawn_apply(
-    session: BrowseSession,
-    edits: Vec<StagedEdit>,
-    keep_going: bool,
-) -> Arc<Mutex<ApplyStatus>> {
-    let status = Arc::new(Mutex::new(ApplyStatus::default()));
-    if let Ok(mut g) = status.lock() {
-        g.edits_total = edits.len();
-        g.bytes_total = edits_total_bytes(&edits);
-    }
-    let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
-        let status_cb = Arc::clone(&status_thread);
-        let result = apply_edits_reporting(&session, &edits, keep_going, move |p| {
-            if let Ok(mut g) = status_cb.lock() {
-                g.edits_done = p.index + 1;
-                g.current_edit = edit_label(p.edit);
-                if let StagedEdit::AddFile { size, .. } = p.edit {
-                    g.bytes_done = g.bytes_done.saturating_add(*size);
-                }
-            }
-        });
-        if let Ok(mut g) = status_thread.lock() {
-            match result {
-                Ok(outcome) => g.outcome = Some(outcome),
-                Err(e) => g.error = Some(format!("{e:#}")),
-            }
-            g.finished = true;
+/// A per-edit callback that reports bytes written (or edits done when none carry bytes).
+fn job_progress<'a>(
+    edits: &[StagedEdit],
+    job: &'a crate::model::job::JobCtx,
+) -> impl FnMut(EditProgress<'_>) + 'a {
+    use crate::model::job::{Progress, Unit};
+    let bytes_total = edits_total_bytes(edits);
+    let count = edits.len() as u64;
+    let mut bytes_done = 0u64;
+    move |p: EditProgress<'_>| {
+        if let StagedEdit::AddFile { size, .. } = p.edit {
+            bytes_done = bytes_done.saturating_add(*size);
         }
-    });
-    status
+        job.set_phase(format!("Writing {}", edit_label(p.edit)));
+        let (done, total, unit) = if bytes_total > 0 {
+            (bytes_done, bytes_total, Unit::Bytes)
+        } else {
+            (p.index as u64 + 1, count, Unit::Items)
+        };
+        job.set_progress(Progress::Determinate { done, total, unit });
+    }
+}
+
+/// Upload a remote image's staged copies as a job; the daemon applies all of them or none.
+#[cfg(feature = "remote")]
+pub fn remote_apply_in_job(
+    addr: &str,
+    image_path: &str,
+    partition: Option<crate::cli::img_at::PartSelector>,
+    edits: &[StagedEdit],
+    job: &crate::model::job::JobCtx,
+) -> Result<ApplyOutcome> {
+    job.set_can_cancel(false);
+    job.set_phase("Uploading...");
+    remote_apply(addr, image_path, partition, edits, job_progress(edits, job))?;
+    Ok(ApplyOutcome {
+        applied_indices: (0..edits.len()).collect(),
+        failed: Vec::new(),
+        stopped_at: None,
+    })
 }
 
 /// A 4-byte HFS OSType as the string the daemon's `StageUpload` carries. Lossy
@@ -1636,8 +1861,10 @@ fn remote_apply(
                     resource_fork,
                     hfs_type_override,
                     hfs_creator_override,
+                    on_conflict,
                     ..
                 } => {
+                    let force = matches!(on_conflict, OnConflict::Replace);
                     let type_code = hfs_type_override
                         .as_ref()
                         .or_else(|| resource_fork.as_ref().and_then(|r| r.type_code.as_ref()))
@@ -1657,7 +1884,7 @@ fn remote_apply(
                             &wire_parent_path(&parent.path),
                             name,
                             host_path,
-                            false,
+                            force,
                             type_code,
                             creator_code,
                             fork_bytes,
@@ -1695,7 +1922,7 @@ fn wire_parent_path(path: &str) -> String {
 /// Synchronously apply `edits` (AddFile / CreateDirectory) to the remote image
 /// at `(image_path, partition)` on the daemon at `addr`, over the Family-F
 /// stage->apply path. The blocking entry point the TUI uses; the GUI drives the
-/// worker-threaded [`spawn_remote_apply`] instead.
+/// [`remote_apply_in_job`] instead.
 #[cfg(feature = "remote")]
 pub fn apply_edits_to_remote_image(
     addr: &str,
@@ -1706,46 +1933,32 @@ pub fn apply_edits_to_remote_image(
     remote_apply(addr, image_path, partition, edits, |_| {})
 }
 
-/// Run [`remote_apply`] on a worker thread, reusing [`ApplyStatus`] so the pane
-/// polls it exactly like a local apply.
-#[cfg(feature = "remote")]
-pub fn spawn_remote_apply(
-    addr: String,
-    image_path: String,
-    partition: Option<crate::cli::img_at::PartSelector>,
-    edits: Vec<StagedEdit>,
-) -> Arc<Mutex<ApplyStatus>> {
-    let status = Arc::new(Mutex::new(ApplyStatus::default()));
-    if let Ok(mut g) = status.lock() {
-        g.edits_total = edits.len();
-        g.bytes_total = edits_total_bytes(&edits);
-    }
-    let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
-        let status_cb = Arc::clone(&status_thread);
-        let result = remote_apply(&addr, &image_path, partition, &edits, move |p| {
-            if let Ok(mut g) = status_cb.lock() {
-                g.edits_done = p.index + 1;
-                g.current_edit = edit_label(p.edit);
-                if let StagedEdit::AddFile { size, .. } = p.edit {
-                    g.bytes_done = g.bytes_done.saturating_add(*size);
-                }
-            }
-        });
-        if let Ok(mut g) = status_thread.lock() {
-            if let Err(e) = result {
-                g.error = Some(format!("{e:#}"));
-            }
-            g.finished = true;
-        }
-    });
-    status
-}
+crate::model::worker::finished_with_error!(HostCopyStatus, StageCopyStatus);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::entry::FileEntry;
+
+    #[test]
+    fn stage_host_for_reads_prodos_suffixes_and_keeps_forks_to_hfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("PROG#060800");
+        std::fs::write(&file, b"x").unwrap();
+        let host = FileEntry::new_file("PROG#060800".into(), file.display().to_string(), 1, 0);
+        let root = FileEntry::root();
+        let named = |fs: &str| match &stage_host_for(std::slice::from_ref(&host), &root, fs)[0] {
+            StagedEdit::AddFile {
+                name,
+                prodos_type,
+                prodos_aux,
+                ..
+            } => (name.clone(), *prodos_type, *prodos_aux),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(named("ProDOS"), ("PROG".into(), Some(0x06), Some(0x0800)));
+        assert_eq!(named("FAT16"), ("PROG#060800".into(), None, None));
+    }
+    use disk_core::entry::FileEntry;
 
     /// X12: a host copy wrote over existing files without asking. The
     /// preflight names them and the copy honours Skip and Overwrite.
@@ -1800,14 +2013,14 @@ mod tests {
 
     /// A blank flat HFS image on disk with `/Existing` (file) and `/Plug-ins` (folder).
     fn hfs_session() -> (tempfile::NamedTempFile, BrowseSession) {
-        use crate::fs::filesystem::{
+        use disk_core::filesystem::{
             CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
         };
-        let mut img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Dest").unwrap();
+        let mut img = fs_mac::hfs::create_blank_hfs(8 << 20, 4096, "Dest").unwrap();
         let file = tempfile::Builder::new().suffix(".hfv").tempfile().unwrap();
         {
             let mut fs =
-                crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
+                fs_mac::hfs::HfsFilesystem::open(std::io::Cursor::new(&mut img), 0).unwrap();
             let root = fs.root().unwrap();
             let mut data: &[u8] = b"old";
             fs.create_file(
@@ -1894,6 +2107,92 @@ mod tests {
         assert_eq!(queue.len(), 3);
     }
 
+    fn run_apply_queue(session: &BrowseSession, edits: Vec<StagedEdit>, check: bool) -> QueueApply {
+        let session = session.clone();
+        let job = crate::model::job::Job::spawn(
+            "apply",
+            Arc::new(crate::model::job::NoNotify),
+            move |job| Ok(apply_queue(&session, edits, check, job)),
+        );
+        job.wait();
+        job.take_result().unwrap()
+    }
+
+    #[test]
+    fn apply_queue_asks_first_stops_at_a_failure_and_reports_the_volume() {
+        let (_img, session) = hfs_session();
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"abc").unwrap();
+
+        // A name collision is found before anything is written, and the edits come back.
+        match run_apply_queue(&session, vec![add("/", "Existing", host.path())], true) {
+            QueueApply::Conflicts { edits, conflicts } => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!(
+                    conflicts,
+                    [("/Existing".to_string(), "Existing".to_string())]
+                );
+            }
+            _ => panic!("expected the conflict"),
+        }
+
+        // Without the check, the run stops at the failing add and reports where.
+        let edits = vec![
+            mkdir("/", "First"),
+            add("/", "Existing", host.path()),
+            add("/", "After", host.path()),
+        ];
+        match run_apply_queue(&session, edits, false) {
+            QueueApply::Applied {
+                edits,
+                outcome,
+                volume,
+            } => {
+                assert_eq!(edits.len(), 3);
+                assert_eq!(outcome.applied_indices, [0]);
+                assert_eq!(outcome.failed[0].index, 1);
+                assert!(volume.is_none());
+            }
+            _ => panic!("expected an applied run"),
+        }
+
+        // A clean run reads the volume back.
+        match run_apply_queue(&session, vec![add("/", "New", host.path())], true) {
+            QueueApply::Applied {
+                outcome, volume, ..
+            } => {
+                assert!(outcome.failed.is_empty());
+                let v = volume.expect("volume details after a clean apply");
+                assert!(v.used > 0 && v.total >= v.used);
+            }
+            _ => panic!("expected an applied run"),
+        }
+    }
+
+    #[test]
+    fn apply_queue_keeps_the_edits_staged_when_the_source_will_not_open() {
+        let session = BrowseSession {
+            source_path: Some(PathBuf::from("/nonexistent/disk.hfv")),
+            partition_type_string: Some("Apple_HFS".into()),
+            ..Default::default()
+        };
+        match run_apply_queue(&session, vec![mkdir("/", "x")], false) {
+            QueueApply::Failed {
+                edits,
+                message,
+                restage,
+            } => {
+                assert_eq!(edits.len(), 1);
+                assert!(restage);
+                assert!(
+                    message.starts_with("Error opening filesystem:"),
+                    "{message}"
+                );
+            }
+            _ => panic!("expected a failure"),
+        }
+    }
+
     #[test]
     fn preflight_finds_conflicts_blocked_and_missing_folders() {
         let (_img, session) = hfs_session();
@@ -1923,12 +2222,12 @@ mod tests {
     /// delete-plus-add batch through `apply_edits` and confirm the result lands.
     #[test]
     fn apply_edits_deletes_and_adds_on_a_real_image() {
-        use crate::fs::filesystem::CreateFileOptions;
+        use disk_core::filesystem::CreateFileOptions;
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
         // Seed image: KEEP.TXT + GONE.TXT at the root.
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("OPS")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("OPS")).unwrap();
         let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
         {
@@ -2007,11 +2306,11 @@ mod tests {
     /// place on a real FAT image (the M6.3 staging path).
     #[test]
     fn apply_edits_renames_in_place_on_a_real_image() {
-        use crate::fs::filesystem::CreateFileOptions;
+        use disk_core::filesystem::CreateFileOptions;
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("REN")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("REN")).unwrap();
         let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
         {
@@ -2075,12 +2374,12 @@ mod tests {
     /// volume, apply onto a blank one, and confirm the whole subtree lands.
     #[test]
     fn stage_copy_recreates_a_subtree_on_another_volume() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
         // Source: /TOP.TXT and /SUB/INNER.TXT.
-        let src_flat = crate::fs::fat::create_blank_fat(737280, Some("SRC")).unwrap();
+        let src_flat = fs_pc::fat::create_blank_fat(737280, Some("SRC")).unwrap();
         let src_img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(src_img.path(), &src_flat).unwrap();
         {
@@ -2115,7 +2414,7 @@ mod tests {
         }
 
         // Destination: a blank FAT volume.
-        let dst_flat = crate::fs::fat::create_blank_fat(737280, Some("DST")).unwrap();
+        let dst_flat = fs_pc::fat::create_blank_fat(737280, Some("DST")).unwrap();
         let dst_img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(dst_img.path(), &dst_flat).unwrap();
         let dst_session = BrowseSession {
@@ -2189,7 +2488,7 @@ mod tests {
         let edits = stage_host_to_image(&host_entries, &FileEntry::root());
 
         // Apply onto a blank FAT image.
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("DST")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("DST")).unwrap();
         let dst = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(dst.path(), &flat).unwrap();
         let session = BrowseSession {
@@ -2214,11 +2513,11 @@ mod tests {
     /// image -> host: extract a file + subtree from a FAT volume to a host dir.
     #[test]
     fn copy_image_to_host_extracts_tree() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("SRC")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("SRC")).unwrap();
         let img = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(img.path(), &flat).unwrap();
         {
@@ -2264,6 +2563,7 @@ mod tests {
             ResourceForkMode::DataForkOnly,
             OnConflict::Replace,
             &status,
+            None,
         )
         .expect("extract");
         assert_eq!(n, 2);

@@ -6,12 +6,29 @@
 //! Mode's File Info window stage identical edits. Each widget is read-only
 //! when `edit_mode` is false and a full editor (text fields + dictionary
 //! pulldown + Set/Reset) when true. Instead of touching a `BrowseView`, they
-//! take the staging queue, the per-entry editor scratch state, and a
-//! human-readable result string by mutable reference — so any caller that
-//! owns an `EditQueue` can host them.
+//! take a [`MetadataSink`] (an `EditQueue` stages directly; Commander's sends the
+//! [`MetadataEdit`] to its controller), the per-entry editor scratch state, and a
+//! human-readable result string by mutable reference.
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
+use rusty_backup::controller::commander::metadata as rules;
+use rusty_backup::controller::commander::{EditQueue, FileEntry, IdNameMap, MetadataEdit, Xattr};
+
+/// Where an editor's change goes: straight onto a queue, or back to a controller as an action.
+pub trait MetadataSink {
+    fn queue(&self) -> &EditQueue;
+    /// Stage `edit`; `Some` is the result line to show now.
+    fn stage(&mut self, edit: MetadataEdit) -> Option<String>;
+}
+
+impl MetadataSink for EditQueue {
+    fn queue(&self) -> &EditQueue {
+        self
+    }
+
+    fn stage(&mut self, edit: MetadataEdit) -> Option<String> {
+        Some(self.stage_metadata(edit))
+    }
+}
 
 /// Inline editor state for an HFS/HFS+ file's type and creator codes.
 #[derive(Debug, Clone)]
@@ -42,14 +59,15 @@ pub fn render_hfs_type_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    queue: &mut EditQueue,
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<HfsTypeEditorState>,
     result: &mut Option<String>,
 ) {
-    let (cur_t, cur_c) = queue.resolved_hfs_type_creator(entry);
-    let cur_t_str = String::from_utf8_lossy(&cur_t).to_string();
-    let cur_c_str = String::from_utf8_lossy(&cur_c).to_string();
-    let cur_desc = rusty_backup::fs::hfs_common::describe_type_creator(&cur_t, &cur_c);
+    let cur = rules::hfs_type_creator(sink.queue(), entry);
+    let (cur_t, cur_c) = (cur.type_code, cur.creator_code);
+    let cur_t_str = cur.type_text;
+    let cur_c_str = cur.creator_text;
+    let cur_desc = cur.description;
 
     if !edit_mode {
         ui.horizontal(|ui| {
@@ -128,11 +146,9 @@ pub fn render_hfs_type_row(
                         }
                         ui.separator();
                     }
-                    for e in rusty_backup::fs::hfs_common::known_type_creators() {
-                        let label =
-                            format!("{}/{} - {}", e.type_str(), e.creator_str(), e.description);
+                    for (label, t, c) in rules::known_type_creators() {
                         if ui.selectable_label(false, label).clicked() {
-                            picked = Some((e.type_code, e.creator_code));
+                            picked = Some((t, c));
                         }
                     }
                 });
@@ -142,8 +158,8 @@ pub fn render_hfs_type_row(
             }
 
             // Encode current text into 4-byte arrays (space-padded).
-            let typed_t = rusty_backup::fs::hfs_common::encode_fourcc(&state.type_input);
-            let typed_c = rusty_backup::fs::hfs_common::encode_fourcc(&state.creator_input);
+            let typed_t = rules::encode_fourcc(&state.type_input);
+            let typed_c = rules::encode_fourcc(&state.creator_input);
             let changed = typed_t != cur_t || typed_c != cur_c;
 
             if ui
@@ -171,68 +187,18 @@ pub fn render_hfs_type_row(
     }
 
     if let Some((t, c)) = stage_action {
-        if queue.set_pending_hfs_override(&entry.path, t, c) {
-            *result = Some(format!(
-                "Updated pending '{}' to {}/{}",
-                entry.name,
-                String::from_utf8_lossy(&t),
-                String::from_utf8_lossy(&c),
-            ));
-        } else {
-            queue.replace_set_type_creator(entry, t, c);
-            *result = Some(format!(
-                "Staged type/creator {}/{} on '{}'",
-                String::from_utf8_lossy(&t),
-                String::from_utf8_lossy(&c),
-                entry.name,
-            ));
+        let edit = MetadataEdit::TypeCreator {
+            entry: entry.clone(),
+            type_code: t,
+            creator_code: c,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
         }
     }
 }
 
-/// Resolve the effective ProDOS (type_byte, aux_type) for an entry,
-/// considering any pending `AddFile` overrides. Returns `(0x00, 0x0000)`
-/// when nothing is known.
-pub fn resolved_prodos_type(queue: &EditQueue, entry: &FileEntry) -> (u8, u16) {
-    // 1) Pending AddFile override
-    for edit in queue.iter() {
-        if let StagedEdit::AddFile {
-            parent,
-            name,
-            prodos_type,
-            prodos_aux,
-            ..
-        } = edit
-        {
-            let path = if parent.path == "/" {
-                format!("/{name}")
-            } else {
-                format!("{}/{name}", parent.path)
-            };
-            if path != entry.path {
-                continue;
-            }
-            let t = prodos_type.unwrap_or(0);
-            let a = prodos_aux.unwrap_or(0);
-            return (t, a);
-        }
-    }
-    // 2) A staged SetProdosType on an existing file wins over the on-disk value.
-    if let Some((t, a)) = queue.iter().rev().find_map(|e| match e {
-        StagedEdit::SetProdosType {
-            entry: e2,
-            type_byte,
-            aux_type,
-        } if e2.path == entry.path => Some((*type_byte, *aux_type)),
-        _ => None,
-    }) {
-        return (t, a);
-    }
-    // 3) On-disk catalog value: the ProDOS file type byte.
-    let t = entry.prodos_file_type.unwrap_or(0);
-    let a = entry.aux_type.unwrap_or(0);
-    (t, a)
-}
+pub use rules::resolved_prodos_type;
 
 /// Render the ProDOS type/aux row beneath the file-info header. Read-only
 /// when not in edit mode; full editor (type pulldown + 2-char/4-char hex
@@ -241,16 +207,15 @@ pub fn render_prodos_type_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    queue: &mut EditQueue,
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<ProdosTypeEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::prodos_types as pt;
-
-    let (cur_t, cur_a) = resolved_prodos_type(queue, entry);
-    let cur_known = pt::is_known_type(cur_t);
-    let cur_abbr = pt::type_abbr(cur_t);
-    let cur_desc = pt::type_description(cur_t);
+    let cur = rules::prodos_type(sink.queue(), entry);
+    let (cur_t, cur_a) = (cur.type_byte, cur.aux_type);
+    let cur_known = cur.known;
+    let cur_abbr = cur.abbr;
+    let cur_desc = cur.description;
 
     if !edit_mode {
         ui.horizontal(|ui| {
@@ -289,10 +254,9 @@ pub fn render_prodos_type_row(
                 .selected_text(combo_label)
                 .width(320.0)
                 .show_ui(ui, |ui| {
-                    for (byte, info) in &pt::all_types() {
-                        let label = format!("${:02X} {} - {}", byte, info.abbr, info.description);
-                        if ui.selectable_label(*byte == cur_t, label).clicked() {
-                            picked = Some(*byte);
+                    for (byte, label) in rules::prodos_type_choices() {
+                        if ui.selectable_label(byte == cur_t, label).clicked() {
+                            picked = Some(byte);
                         }
                     }
                 });
@@ -317,22 +281,16 @@ pub fn render_prodos_type_row(
                     .font(egui::TextStyle::Monospace),
             );
 
-            let parsed_t = u8::from_str_radix(state.type_input.trim(), 16).ok();
-            let parsed_a = u16::from_str_radix(state.aux_input.trim(), 16).ok();
-            let valid = parsed_t.is_some() && parsed_a.is_some();
-            let changed = match (parsed_t, parsed_a) {
-                (Some(t), Some(a)) => t != cur_t || a != cur_a,
-                _ => false,
-            };
+            let parsed = rules::parse_prodos_type(&state.type_input, &state.aux_input);
+            let valid = parsed.is_some();
+            let changed = parsed.is_some_and(|(t, a)| t != cur_t || a != cur_a);
 
             if ui
                 .add_enabled(valid && changed, egui::Button::new("Set"))
                 .on_hover_text("Stage type/aux change")
                 .clicked()
             {
-                if let (Some(t), Some(a)) = (parsed_t, parsed_a) {
-                    stage_action = Some((t, a));
-                }
+                stage_action = parsed;
             }
             if ui
                 .button("Reset")
@@ -358,14 +316,13 @@ pub fn render_prodos_type_row(
     }
 
     if let Some((t, a)) = stage_action {
-        if queue.set_pending_prodos_override(&entry.path, t, a) {
-            *result = Some(format!(
-                "Updated pending '{}' to ${t:02X}/${a:04X}",
-                entry.name,
-            ));
-        } else {
-            queue.replace_set_prodos_type(entry, t, a);
-            *result = Some(format!("Staged type ${t:02X}/${a:04X} on '{}'", entry.name,));
+        let edit = MetadataEdit::ProdosType {
+            entry: entry.clone(),
+            type_byte: t,
+            aux_type: a,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
         }
     }
 }
@@ -382,24 +339,18 @@ pub struct HfsDatesEditorState {
 
 /// Render the HFS create/modify/backup date rows. Read-only labels when not in
 /// edit mode; three editable `YYYY-MM-DD HH:MM:SS` (UTC) fields + a Set button
-/// staging a [`StagedEdit::SetDates`] when edit mode is on. Dates are sourced
+/// staging a [`MetadataEdit::Dates`] when edit mode is on. Dates are sourced
 /// from `entry.mac_dates` (overlaid by any pending staged value).
 pub fn render_hfs_dates_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    queue: &mut EditQueue,
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<HfsDatesEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::hfs_common::{format_mac_date, parse_mac_date_checked};
-
-    // Effective current dates: a staged edit wins over the on-disk values.
-    let (cur_c, cur_m, cur_b) = queue
-        .pending_dates_for(&entry.path)
-        .or(entry.mac_dates)
-        .unwrap_or((0, 0, 0));
-    let fmt = |secs: u32| format_mac_date(secs).unwrap_or_else(|| "(none)".to_string());
+    let (cur_c, cur_m, cur_b) = rules::hfs_dates(sink.queue(), entry);
+    let fmt = |secs: u32| rules::hfs_date_text(secs).unwrap_or_else(|| "(none)".to_string());
 
     if !edit_mode {
         ui.label(format!(
@@ -412,7 +363,7 @@ pub fn render_hfs_dates_row(
     }
 
     // Seed editor for a freshly-selected entry. Zero -> empty field.
-    let blank = |secs: u32| format_mac_date(secs).unwrap_or_default();
+    let blank = |secs: u32| rules::hfs_date_text(secs).unwrap_or_default();
     let needs_seed = editor
         .as_ref()
         .map(|s| s.entry_path != entry.path)
@@ -450,18 +401,12 @@ pub fn render_hfs_dates_row(
                 }
             });
 
-        let r_c = parse_mac_date_checked(&state.create);
-        let r_m = parse_mac_date_checked(&state.modify);
-        let r_b = parse_mac_date_checked(&state.backup);
-        // First failing field, labelled so the user knows which date is wrong.
-        let field_err = [("Created", &r_c), ("Modified", &r_m), ("Backup", &r_b)]
-            .iter()
-            .find_map(|(label, r)| r.as_ref().err().map(|e| format!("{label}: {e}")));
+        let parsed = rules::parse_hfs_dates(&state.create, &state.modify, &state.backup);
+        let field_err = parsed.as_ref().err().cloned();
         let valid = field_err.is_none();
-        let changed = match (&r_c, &r_m, &r_b) {
-            (Ok(c), Ok(m), Ok(b)) => (*c, *m, *b) != (cur_c, cur_m, cur_b),
-            _ => false,
-        };
+        let changed = parsed
+            .as_ref()
+            .is_ok_and(|dates| *dates != (cur_c, cur_m, cur_b));
 
         ui.horizontal(|ui| {
             if ui
@@ -469,9 +414,7 @@ pub fn render_hfs_dates_row(
                 .on_hover_text("Stage create/modify/backup date change")
                 .clicked()
             {
-                if let (Ok(c), Ok(m), Ok(b)) = (&r_c, &r_m, &r_b) {
-                    stage_action = Some((*c, *m, *b));
-                }
+                stage_action = parsed.as_ref().ok().copied();
             }
             if ui.button("Reset").clicked() {
                 reset_action = true;
@@ -491,8 +434,15 @@ pub fn render_hfs_dates_row(
     }
 
     if let Some((c, m, b)) = stage_action {
-        queue.replace_set_dates(entry, c, m, b);
-        *result = Some(format!("Staged date change on '{}'", entry.name));
+        let edit = MetadataEdit::Dates {
+            entry: entry.clone(),
+            create: c,
+            modify: m,
+            backup: b,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
+        }
     }
 }
 
@@ -506,22 +456,17 @@ pub struct ExtPermsEditorState {
 
 /// Render the ext Unix-permission editor. Read-only `rwx` label when not in
 /// edit mode; an octal field + Set button staging a
-/// [`StagedEdit::SetPermissions`] when edit mode is on. Sources the current
+/// [`MetadataEdit::Permissions`] when edit mode is on. Sources the current
 /// mode from `entry.mode` (overlaid by any pending staged value).
 pub fn render_ext_permissions_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    queue: &mut EditQueue,
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<ExtPermsEditorState>,
     result: &mut Option<String>,
 ) {
-    // Effective current perms: a staged edit wins over the on-disk value.
-    let cur = queue
-        .pending_permissions_for(&entry.path)
-        .or(entry.mode)
-        .map(|m| m & 0o7777)
-        .unwrap_or(0);
+    let cur = rules::permissions(sink.queue(), entry);
 
     if !edit_mode {
         if let Some(mode_str) = entry.mode_string() {
@@ -553,9 +498,7 @@ pub fn render_ext_permissions_row(
                     .char_limit(4)
                     .font(egui::TextStyle::Monospace),
             );
-            let parsed = u32::from_str_radix(state.octal.trim(), 8)
-                .ok()
-                .filter(|m| *m <= 0o7777);
+            let parsed = rules::parse_permissions(&state.octal);
             let valid = parsed.is_some();
             let changed = parsed.map(|m| m != cur).unwrap_or(false);
             if ui
@@ -581,8 +524,13 @@ pub fn render_ext_permissions_row(
     }
 
     if let Some(mode) = stage_action {
-        queue.replace_set_permissions(entry, mode);
-        *result = Some(format!("Staged permissions {mode:o} on '{}'", entry.name));
+        let edit = MetadataEdit::Permissions {
+            entry: entry.clone(),
+            mode,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
+        }
     }
 }
 
@@ -596,21 +544,17 @@ pub struct OwnerEditorState {
 
 /// Render the owner (uid/gid) row: read-only text when not in edit mode
 /// (resolved to names via `id_names` when available), two numeric fields + Set
-/// when editing. Stages a [`StagedEdit::SetOwner`]. Unix filesystems only.
+/// when editing. Stages a [`MetadataEdit::Owner`]. Unix filesystems only.
 pub fn render_owner_row(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    id_names: Option<&rusty_backup::fs::id_names::IdNameMap>,
-    queue: &mut EditQueue,
+    id_names: Option<&IdNameMap>,
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<OwnerEditorState>,
     result: &mut Option<String>,
 ) {
-    // A staged owner edit wins over the on-disk value.
-    let (cur_uid, cur_gid) = queue
-        .pending_owner_for(&entry.path)
-        .or_else(|| Some((entry.uid?, entry.gid?)))
-        .unwrap_or((0, 0));
+    let (cur_uid, cur_gid) = rules::owner(sink.queue(), entry);
 
     if !edit_mode {
         let shown = match (&entry.owner_label, id_names) {
@@ -653,12 +597,7 @@ pub fn render_owner_row(
                     .desired_width(64.0)
                     .font(egui::TextStyle::Monospace),
             );
-            let parsed = state
-                .uid
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .zip(state.gid.trim().parse::<u32>().ok());
+            let parsed = rules::parse_owner(&state.uid, &state.gid);
             let changed = parsed.map(|p| p != (cur_uid, cur_gid)).unwrap_or(false);
             if ui
                 .add_enabled(parsed.is_some() && changed, egui::Button::new("Set"))
@@ -682,8 +621,14 @@ pub fn render_owner_row(
         }
     }
     if let Some((uid, gid)) = stage {
-        queue.replace_set_owner(entry, uid, gid);
-        *result = Some(format!("Staged owner {uid}:{gid} on '{}'", entry.name));
+        let edit = MetadataEdit::Owner {
+            entry: entry.clone(),
+            uid,
+            gid,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
+        }
     }
 }
 
@@ -702,31 +647,17 @@ pub struct XattrEditorState {
 /// (read-only), and in edit mode a hex/text value field + Set + Delete per
 /// attribute plus an Add row. `xattrs` is the on-disk set; pending staged edits
 /// are overlaid so the user sees their queued changes. Stages
-/// [`StagedEdit::SetXattr`] / [`StagedEdit::RemoveXattr`].
+/// [`MetadataEdit::SetXattr`] / [`MetadataEdit::RemoveXattr`].
 pub fn render_xattr_section(
     ui: &mut egui::Ui,
     entry: &FileEntry,
     edit_mode: bool,
-    xattrs: &[rusty_backup::fs::xattr::Xattr],
-    queue: &mut EditQueue,
+    xattrs: &[Xattr],
+    sink: &mut dyn MetadataSink,
     editor: &mut Option<XattrEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::xattr::{self, Xattr};
-
-    // Overlay: start from on-disk, apply pending sets/removes.
-    let pending = queue.pending_xattrs_for(&entry.path);
-    let mut effective: Vec<Xattr> = xattrs.to_vec();
-    for (name, val) in &pending {
-        effective.retain(|x| &x.name != name);
-        if let Some(v) = val {
-            effective.push(Xattr {
-                name: name.clone(),
-                value: v.clone(),
-            });
-        }
-    }
-    effective.sort_by(|a, b| a.name.cmp(&b.name));
+    let effective = rules::effective_xattrs(sink.queue(), entry, xattrs);
 
     if effective.is_empty() && !edit_mode {
         return;
@@ -778,7 +709,7 @@ pub fn render_xattr_section(
                         .font(egui::TextStyle::Monospace),
                 );
                 if ui.button("Set").clicked() {
-                    match xattr::parse_value(field) {
+                    match rules::parse_xattr_value(field) {
                         Ok(v) => stage_set = Some((x.name.clone(), v)),
                         Err(e) => err = Some(e),
                     }
@@ -803,13 +734,13 @@ pub fn render_xattr_section(
                     .desired_width(180.0)
                     .font(egui::TextStyle::Monospace),
             );
-            let name_ok = xattr::has_valid_namespace(state.new_name.trim());
+            let name_ok = rules::valid_xattr_name(state.new_name.trim());
             if ui
                 .add_enabled(name_ok, egui::Button::new("Add"))
                 .on_hover_text("Name must start with user. / trusted. / security. / system.")
                 .clicked()
             {
-                match xattr::parse_value(&state.new_value) {
+                match rules::parse_xattr_value(&state.new_value) {
                     Ok(v) => stage_set = Some((state.new_name.trim().to_string(), v)),
                     Err(e) => err = Some(e),
                 }
@@ -821,15 +752,26 @@ pub fn render_xattr_section(
     }
 
     if let Some((name, value)) = stage_set {
-        queue.replace_set_xattr(entry, &name, value);
-        *result = Some(format!("Staged xattr {name} on '{}'", entry.name));
+        let edit = MetadataEdit::SetXattr {
+            entry: entry.clone(),
+            name,
+            value,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
+        }
         if let Some(state) = editor.as_mut() {
             state.new_name.clear();
             state.new_value.clear();
         }
     }
     if let Some(name) = stage_remove {
-        queue.replace_remove_xattr(entry, &name);
-        *result = Some(format!("Staged xattr removal {name} on '{}'", entry.name));
+        let edit = MetadataEdit::RemoveXattr {
+            entry: entry.clone(),
+            name,
+        };
+        if let Some(msg) = sink.stage(edit) {
+            *result = Some(msg);
+        }
     }
 }

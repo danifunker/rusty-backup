@@ -20,8 +20,8 @@
 
 use std::io::{Cursor, Read};
 
-use rusty_backup::fs::cbm::CbmFilesystem;
-use rusty_backup::fs::filesystem::{EditableFilesystem, Filesystem};
+use disk_core::filesystem::{EditableFilesystem, Filesystem};
+use fs_8bit::cbm::CbmFilesystem;
 
 fn load(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");

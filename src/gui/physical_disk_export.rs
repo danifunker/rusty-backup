@@ -1,246 +1,146 @@
-//! "Physical Disk Export" sub-window launched from the Inspect tab's
-//! Export Disk Image popup.
+//! The "Physical Disk Export" window: a shell over `controller::disk_write`.
 //!
-//! Lets the user stream the currently-loaded raw image directly to a physical
-//! disk. When the source is a superfloppy (no partition table), surfaces a
-//! "Synthesize partition table" group with table kind / alignment /
-//! fs-type-byte / partition size controls so emulators and BIOS-era machines
-//! can recognize the result. For sources that already have an MBR/GPT/APM/SGI
-//! table, the synthesize group is grayed and the action becomes a byte-for-byte
-//! direct write.
-//!
-//! Engine code lives in `restore::superfloppy_wrap`; threading and Status
-//! lives in `model::physical_write_runner`. This file is the view only — it
-//! holds form state, polls the runner's Status, and renders.
+//! The Inspect tab's Export popup and the Restore tab's Write Image File hand it an image; it
+//! draws the controller's source, target, partition list and synthesize form, maps widgets to
+//! [`DiskWriteAction`]s, answers the device-name prompt through an [`EffectHost`] and shows the
+//! write's job. Rules and the write live in the controller (docs/phase2_commander_plan.md
+//! § "Slice 14").
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use rusty_backup::device::DiskDevice;
-use rusty_backup::model::physical_write_runner::{
-    self, PhysicalWriteRequest, PhysicalWriteSource, PhysicalWriteStatus, WriteExtent,
+use rusty_backup::controller::disk_write::{
+    format_size, DiskWriteAction, DiskWriteController, DiskWriteServices, JobRegistry, SizeMode,
+    TableKind, WrapAlign, WriteOpen, TYPE_BYTE_PRESETS,
 };
-use rusty_backup::model::size_mode::SizeMode;
-use rusty_backup::partition::PartitionTable;
-use rusty_backup::restore::superfloppy_wrap::{self, WrapAlignment, WrapParams, WrapTable};
+use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::{Controller, Effect};
 
 use super::context::TabContext;
+use super::effects::{EffectHost, Reply};
 use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 
-/// Information about the currently-loaded source needed to drive the
-/// sub-window. The Inspect tab assembles this on demand.
-#[derive(Clone)]
-pub struct PhysicalDiskExportSource {
-    pub path: PathBuf,
-    pub size_bytes: u64,
-    pub fs_hint: String,
-    pub has_partition_table: bool,
-}
-
-/// Table-kind choice in the UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableKind {
-    Mbr,
-    Gpt,
-}
-
-/// Alignment choice in the UI. Matches `WrapAlignment` but is a plain enum
-/// for radio binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AlignmentChoice {
-    DosTraditional,
-    Modern1MB,
-    Custom,
-}
-
-/// Sub-window state. Held by `InspectTab`.
 pub struct PhysicalDiskExport {
-    pub open: bool,
-    /// Index into `ctx.devices` for the chosen target.
-    selected_device: Option<usize>,
-    confirm_text: String,
-    synthesize: bool,
-    table_kind: TableKind,
-    alignment: AlignmentChoice,
-    custom_alignment_sectors: u64,
-    type_byte: u8,
-    size_mode: SizeMode,
-    custom_size_mib: u32,
-    write_status: Option<Arc<Mutex<PhysicalWriteStatus>>>,
-    /// Rate / ETA estimator for the disk-write progress bar.
-    write_rate: super::progress::RateTracker,
-    /// Source snapshot taken when the sub-window was opened.
-    source: Option<PhysicalDiskExportSource>,
-    last_error: Option<String>,
-    /// `None` writes the whole disk; `Some(i)` writes into that partition only.
-    target_partition: Option<usize>,
-    /// Partitions on the selected device, re-read when the selection changes.
-    target_partitions: Vec<rusty_backup::partition::PartitionInfo>,
-    /// Identity of the device `target_partitions` was read from.
-    scanned_device: Option<rusty_backup::device::DeviceIdentity>,
+    ctl: DiskWriteController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
 }
 
 impl Default for PhysicalDiskExport {
     fn default() -> Self {
         Self {
-            open: false,
-            selected_device: None,
-            confirm_text: String::new(),
-            synthesize: false,
-            table_kind: TableKind::Mbr,
-            alignment: AlignmentChoice::Modern1MB,
-            custom_alignment_sectors: 2048,
-            type_byte: 0x07,
-            size_mode: SizeMode::Original,
-            custom_size_mib: 0,
-            write_status: None,
-            write_rate: super::progress::RateTracker::default(),
-            source: None,
-            last_error: None,
-            target_partition: None,
-            target_partitions: Vec::new(),
-            scanned_device: None,
+            ctl: DiskWriteController::new(DiskWriteServices {
+                jobs: JobRegistry::new(),
+                notify: std::sync::Arc::new(super::ui_logger::EguiWake),
+            }),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
         }
     }
-}
-
-/// Action returned to the parent each frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Stay,
-    Close,
 }
 
 impl PhysicalDiskExport {
-    /// A device write is in flight; the restore tab's controls stay locked.
+    /// A device write is in flight; the hosting tab's controls stay locked.
     pub fn is_writing(&self) -> bool {
-        self.write_status
-            .as_ref()
-            .and_then(|s| s.lock().ok().map(|g| !g.finished))
-            .unwrap_or(false)
+        self.ctl.is_writing()
     }
 
-    /// Open the sub-window for a given source. Seeds defaults from the
-    /// heuristic when the source is a superfloppy.
-    pub fn open_for(
-        &mut self,
-        source: PhysicalDiskExportSource,
-        partition_table: Option<&PartitionTable>,
-    ) {
-        let hidden_sectors = partition_table.and_then(|pt| match pt {
-            PartitionTable::None { .. } => detect_hidden_sectors_from_source(&source),
-            _ => None,
-        });
+    /// Open the window for an image another screen hands over.
+    pub fn open_for(&mut self, open: WriteOpen) {
+        self.act(DiskWriteAction::Open(open));
+    }
 
-        let suggested = superfloppy_wrap::suggest_wrap_params(
-            &source.fs_hint,
-            source.size_bytes,
-            // We don't know the target size yet — pass source size so the
-            // heuristic doesn't force GPT prematurely. UI re-runs the
-            // forced-GPT check once the user picks a device.
-            source.size_bytes.max(1),
-            hidden_sectors,
-        );
-        let (kind, type_byte, align) = match suggested.table {
-            WrapTable::Mbr {
-                type_byte,
-                alignment,
-                ..
-            } => (TableKind::Mbr, type_byte, alignment),
-            WrapTable::Gpt { alignment, .. } => (
-                TableKind::Gpt,
-                superfloppy_wrap::mbr_type_byte_for_fs(&source.fs_hint),
-                alignment,
-            ),
-        };
-        self.synthesize = !source.has_partition_table;
-        self.table_kind = kind;
-        self.alignment = match align {
-            WrapAlignment::DosTraditional => AlignmentChoice::DosTraditional,
-            WrapAlignment::Modern1MB => AlignmentChoice::Modern1MB,
-            WrapAlignment::Custom(n) => {
-                self.custom_alignment_sectors = n;
-                AlignmentChoice::Custom
+    fn act(&mut self, action: DiskWriteAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
+    }
+
+    /// Drain the controller (also while the window is hidden), so a write's end is seen.
+    pub fn poll(&mut self, tab_ctx: &mut TabContext) {
+        self.ctl.reconcile_devices(tab_ctx.devices);
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        for (level, msg) in self.ctl.take_log() {
+            match level {
+                LogLevel::Info => tab_ctx.log.info(msg),
+                LogLevel::Warning => tab_ctx.log.warn(msg),
+                LogLevel::Error => tab_ctx.log.error(msg),
             }
-        };
-        self.type_byte = type_byte;
-        self.size_mode = SizeMode::Original;
-        self.custom_size_mib = (source.size_bytes / (1024 * 1024)).max(1) as u32;
-        self.source = Some(source);
-        // A new source starts with no target: the last dialog's device index
-        // may name another disk by now.
-        self.selected_device = None;
-        self.target_partition = None;
-        self.target_partitions.clear();
-        self.scanned_device = None;
-        self.confirm_text.clear();
-        self.write_status = None;
-        self.last_error = None;
-        self.open = true;
-    }
-
-    pub fn show(&mut self, egui_ctx: &egui::Context, tab_ctx: &TabContext) -> Action {
-        if !self.open {
-            return Action::Close;
         }
-        // Snapshot the source so we don't borrow self mutably during render.
-        let source = match self.source.clone() {
-            Some(s) => s,
-            None => {
-                self.open = false;
-                return Action::Close;
-            }
-        };
+    }
 
-        let mut close_requested = false;
+    pub fn show(&mut self, egui_ctx: &egui::Context, tab_ctx: &mut TabContext) {
+        self.poll(tab_ctx);
+        if !self.ctl.is_open() {
+            return;
+        }
         egui::Window::new("Physical Disk Export")
             .collapsible(false)
             .resizable(true)
             .default_width(560.0)
             .show(egui_ctx, |ui| {
-                self.render_source_block(ui, &source);
+                if let Some(snap) = self.ctl.opening() {
+                    super::progress::show_job(ui, &snap);
+                    return;
+                }
+                self.render_source_block(ui);
                 ui.separator();
 
-                if self.write_status.is_some() {
+                if self.ctl.has_run() {
                     self.render_progress(ui);
-                    if ui.button("Close").clicked() && self.write_finished() {
-                        close_requested = true;
-                    }
                     return;
                 }
 
                 self.render_device_picker(ui, tab_ctx.devices);
                 ui.add_space(4.0);
 
-                ui.add_enabled_ui(!source.has_partition_table, |ui| {
-                    let group_label = if source.has_partition_table {
-                        "Synthesize partition table (source already has one - disabled)"
-                    } else {
+                let can_synth = self.ctl.can_synthesize();
+                ui.add_enabled_ui(can_synth, |ui| {
+                    let group_label = if can_synth {
                         "Synthesize partition table"
+                    } else {
+                        "Synthesize partition table (source already has one - disabled)"
                     };
-                    ui.checkbox(&mut self.synthesize, group_label);
-                    ui.add_enabled_ui(self.synthesize, |ui| {
-                        self.render_synthesize_controls(ui, &source);
-                    });
+                    let mut on = self.ctl.form().synthesize;
+                    if ui.checkbox(&mut on, group_label).changed() {
+                        self.act(DiskWriteAction::SetSynthesize(on));
+                    }
+                    ui.add_enabled_ui(on, |ui| self.render_synthesize_controls(ui));
                 });
 
-                if let Some(err) = &self.last_error {
+                if let Some(err) = self.ctl.error() {
                     ui.add_space(4.0);
                     ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
 
                 ui.separator();
-                self.render_action_row(ui, tab_ctx.devices, &source, &mut close_requested);
+                self.render_action_row(ui);
             });
-
-        if close_requested {
-            self.open = false;
-            return Action::Close;
-        }
-        Action::Stay
+        self.run_effects(egui_ctx, tab_ctx);
     }
 
-    fn render_source_block(&self, ui: &mut egui::Ui, source: &PhysicalDiskExportSource) {
+    fn run_effects(&mut self, egui_ctx: &egui::Context, tab_ctx: &mut TabContext) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(egui_ctx, fx, &mut messages);
+        replies.extend(self.effects.show(egui_ctx, "disk_write"));
+        for msg in messages {
+            tab_ctx.log.info(msg);
+        }
+        for reply in replies {
+            let action = match reply {
+                Reply::Picked { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
+                Reply::Confirmed { purpose, yes } => DiskWriteAction::Confirmed { purpose, yes },
+                Reply::Answered { purpose, text } => DiskWriteAction::Answered { purpose, text },
+            };
+            self.act(action);
+        }
+        if !self.pending_fx.is_empty() {
+            egui_ctx.request_repaint();
+        }
+    }
+
+    fn render_source_block(&self, ui: &mut egui::Ui) {
+        let Some(source) = self.ctl.source() else {
+            return;
+        };
         ui.label(egui::RichText::new("Source").strong());
         ui.label(format!("Path: {}", source.path.display()));
         let table_desc = if source.has_partition_table {
@@ -254,11 +154,16 @@ impl PhysicalDiskExport {
         ));
     }
 
-    fn render_device_picker(&mut self, ui: &mut egui::Ui, devices: &[DiskDevice]) {
+    fn render_device_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        devices: &[rusty_backup::device::DiskDevice],
+    ) {
+        let selected = self.ctl.target_row();
+        let mut picked = None;
         ui.horizontal(|ui| {
             ui.label("Target disk:");
-            let current_label = self
-                .selected_device
+            let current_label = selected
                 .and_then(|i| devices.get(i))
                 .map(|d| d.display_name())
                 .unwrap_or_else(|| "Select a device...".to_string());
@@ -267,138 +172,144 @@ impl PhysicalDiskExport {
                 .width(380.0)
                 .show_ui(ui, |ui| {
                     for (i, device) in devices.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_device,
-                            Some(i),
-                            device.display_name(),
-                        );
+                        if ui
+                            .selectable_label(selected == Some(i), device.display_name())
+                            .clicked()
+                        {
+                            picked = Some(i);
+                        }
                     }
                 });
         });
+        if let Some(row) = picked {
+            if let Some(device) = devices.get(row) {
+                self.act(DiskWriteAction::SelectDevice {
+                    row,
+                    device: device.clone(),
+                });
+            }
+        }
     }
 
-    fn render_synthesize_controls(&mut self, ui: &mut egui::Ui, source: &PhysicalDiskExportSource) {
+    fn render_synthesize_controls(&mut self, ui: &mut egui::Ui) {
+        let form = *self.ctl.form();
+        let size = self.ctl.source().map_or(0, |s| s.size_bytes);
+        let mut actions = Vec::new();
         ui.horizontal(|ui| {
             ui.label("Table:");
-            ui.radio_value(&mut self.table_kind, TableKind::Mbr, "MBR");
-            ui.radio_value(&mut self.table_kind, TableKind::Gpt, "GPT");
+            for (kind, label) in [(TableKind::Mbr, "MBR"), (TableKind::Gpt, "GPT")] {
+                if ui.radio(form.table_kind == kind, label).clicked() {
+                    actions.push(DiskWriteAction::SetTableKind(kind));
+                }
+            }
         });
 
         ui.horizontal(|ui| {
             ui.label("Alignment:");
-            ui.radio_value(
-                &mut self.alignment,
-                AlignmentChoice::DosTraditional,
-                "DOS legacy (LBA 63)",
-            );
-            ui.radio_value(
-                &mut self.alignment,
-                AlignmentChoice::Modern1MB,
-                "Modern (LBA 2048)",
-            );
-            ui.radio_value(&mut self.alignment, AlignmentChoice::Custom, "Custom");
-            if self.alignment == AlignmentChoice::Custom {
-                ui.add(
-                    egui::DragValue::new(&mut self.custom_alignment_sectors)
-                        .speed(1.0)
-                        .range(1..=u64::MAX)
-                        .suffix(" sectors"),
-                );
+            for (align, label) in [
+                (WrapAlign::DosTraditional, "DOS legacy (LBA 63)"),
+                (WrapAlign::Modern1MB, "Modern (LBA 2048)"),
+                (WrapAlign::Custom, "Custom"),
+            ] {
+                if ui.radio(form.alignment == align, label).clicked() {
+                    actions.push(DiskWriteAction::SetAlignment(align));
+                }
+            }
+            if form.alignment == WrapAlign::Custom {
+                let mut n = form.custom_alignment_sectors;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut n)
+                            .speed(1.0)
+                            .range(1..=u64::MAX)
+                            .suffix(" sectors"),
+                    )
+                    .changed()
+                {
+                    actions.push(DiskWriteAction::SetCustomAlignment(n));
+                }
             }
         });
 
         ui.horizontal(|ui| {
             ui.label("Partition type:");
-            type_byte_picker(ui, &mut self.type_byte, &source.fs_hint);
+            let mut byte = form.type_byte;
+            type_byte_picker(ui, &mut byte);
+            if byte != form.type_byte {
+                actions.push(DiskWriteAction::SetTypeByte(byte));
+            }
         });
 
         ui.horizontal(|ui| {
             ui.label("Partition size:");
-            // Treat source size as both "original" and "minimum" — there's no
-            // compaction in this path; the user can grow but can't shrink past
-            // the source data.
+            // The source size is both "original" and "minimum": nothing is compacted here.
+            let mut mode: SizeMode = form.size_mode;
+            let mut custom = form.custom_size_mib;
             size_mode_row(
                 ui,
-                &mut self.size_mode,
-                &mut self.custom_size_mib,
-                source.size_bytes,
-                source.size_bytes,
+                &mut mode,
+                &mut custom,
+                size,
+                size,
                 SizeModeRowOptions {
                     allow_fill: true,
                     ..Default::default()
                 },
             );
+            if mode != form.size_mode || custom != form.custom_size_mib {
+                actions.push(DiskWriteAction::SetSize {
+                    mode,
+                    custom_mib: custom,
+                });
+            }
         });
+        for a in actions {
+            self.act(a);
+        }
     }
 
-    fn render_action_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        devices: &[DiskDevice],
-        source: &PhysicalDiskExportSource,
-        close_requested: &mut bool,
-    ) {
-        let device = self.selected_device.and_then(|i| devices.get(i));
-        let ready = device.is_some();
-        let device_name = device
-            .map(|d| d.display_name())
-            .unwrap_or_else(|| "(no device)".to_string());
-
-        self.render_target_region(ui, device);
-
-        let confirm_hint = if self.target_partition.is_some() {
+    fn render_action_row(&mut self, ui: &mut egui::Ui) {
+        self.render_target_region(ui);
+        let hint = if self.ctl.target_partition().is_some() {
             "Writing replaces the contents of the selected partition."
         } else {
             "Writing erases all data on the selected device."
         };
-        ui.label(egui::RichText::new(format!(
-            "Confirm: type the device name `{}` to enable Write",
-            device_name
-        )))
-        .on_hover_text(confirm_hint);
-        ui.add_enabled(
-            ready,
-            egui::TextEdit::singleline(&mut self.confirm_text).hint_text(&device_name),
-        );
-
-        let confirmed = ready && self.confirm_text == device_name;
         ui.horizontal(|ui| {
-            let write_btn = ui.add_enabled(confirmed, egui::Button::new("Write to disk"));
-            if write_btn.clicked() {
-                if let Some(dev) = device {
-                    self.start_write(source, dev);
-                }
+            let write = ui
+                .add_enabled(self.ctl.can_write(), egui::Button::new("Write to disk..."))
+                .on_hover_text(hint);
+            if write.clicked() {
+                self.act(DiskWriteAction::Write);
             }
             if ui.button("Cancel").clicked() {
-                *close_requested = true;
+                self.act(DiskWriteAction::Close);
             }
         });
     }
 
-    /// Whole-disk vs single-partition target, with the partition list read off
-    /// the selected device.
-    fn render_target_region(&mut self, ui: &mut egui::Ui, device: Option<&DiskDevice>) {
-        let Some(dev) = device else { return };
-
-        let identity = dev.identity();
-        if self.scanned_device.as_ref() != Some(&identity) {
-            self.target_partitions = read_device_partitions(&dev.path);
-            self.scanned_device = Some(identity);
-            self.target_partition = None;
+    /// Whole-disk vs single-partition target, with the partition list read off the device.
+    fn render_target_region(&mut self, ui: &mut egui::Ui) {
+        let Some(size) = self.ctl.target_device().map(|d| d.size_bytes) else {
+            return;
+        };
+        if let Some(snap) = self.ctl.target_scan() {
+            super::progress::show_job(ui, &snap);
+            return;
         }
-
+        let current = self.ctl.target_partition();
+        let mut chosen = None;
         ui.separator();
         ui.label(egui::RichText::new("Write to").strong());
-        ui.radio_value(
-            &mut self.target_partition,
-            None,
-            format!(
-                "Entire disk ({}) - replaces the partition table",
-                rusty_backup::partition::format_size(dev.size_bytes),
-            ),
+        let whole = format!(
+            "Entire disk ({}) - replaces the partition table",
+            format_size(size)
         );
-
-        if self.target_partitions.is_empty() {
+        if ui.radio(current.is_none(), whole).clicked() {
+            chosen = Some(None);
+        }
+        let parts = self.ctl.target_partitions();
+        if parts.is_empty() {
             ui.label(
                 egui::RichText::new(
                     "No partition table detected on the target, so only a \
@@ -406,263 +317,52 @@ impl PhysicalDiskExport {
                 )
                 .weak(),
             );
-            return;
-        }
-
-        // Synthesizing a table is a whole-disk operation; the two are exclusive.
-        for p in &self.target_partitions {
-            let label = format!(
-                "Partition {} - {} ({}) at LBA {}",
-                p.index + 1,
-                p.type_name,
-                rusty_backup::partition::format_size(p.size_bytes),
-                p.start_lba,
-            );
-            ui.radio_value(&mut self.target_partition, Some(p.index), label);
-        }
-
-        if let (Some(idx), Some(src)) = (self.target_partition, self.source.as_ref()) {
-            if let Some(p) = self.target_partitions.iter().find(|p| p.index == idx) {
-                if src.size_bytes > p.size_bytes {
-                    ui.colored_label(
-                        super::theme::danger(ui.visuals()),
-                        format!(
-                            "Source is {} but the partition holds {}",
-                            rusty_backup::partition::format_size(src.size_bytes),
-                            rusty_backup::partition::format_size(p.size_bytes),
-                        ),
-                    );
+        } else {
+            for p in &parts {
+                if ui
+                    .radio(current == Some(p.index), p.label.as_str())
+                    .clicked()
+                {
+                    chosen = Some(Some(p.index));
                 }
             }
+            if let Some(warning) = self.ctl.partition_warning() {
+                ui.colored_label(super::theme::danger(ui.visuals()), warning);
+            }
+            ui.separator();
         }
-        ui.separator();
+        if let Some(idx) = chosen {
+            self.act(DiskWriteAction::SetTargetPartition(idx));
+        }
     }
 
     fn render_progress(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.write_status.as_ref().and_then(|s| {
-            s.lock().ok().map(|g| {
-                (
-                    g.finished,
-                    g.error.clone(),
-                    g.current_bytes,
-                    g.total_bytes,
-                    g.cancel_requested,
-                )
-            })
-        });
-        if let Some((finished, error, current, total, cancel_requested)) = snapshot {
-            let frac = if total > 0 {
-                (current as f32 / total as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let text = if total > 0 {
-                self.write_rate.record(current, "Writing to disk");
-                let suffix = self.write_rate.suffix(current, total);
-                format!(
-                    "{} / {} ({:.0}%){}",
-                    rusty_backup::partition::format_size(current),
-                    rusty_backup::partition::format_size(total),
-                    frac * 100.0,
-                    suffix,
-                )
-            } else {
-                "preparing...".to_string()
-            };
-            ui.add(egui::ProgressBar::new(frac).text(text));
-            if finished {
-                if let Some(err) = error {
-                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
-                } else {
-                    ui.label("Write complete.");
-                }
-            } else if !cancel_requested {
-                if ui.button("Cancel write").clicked() {
-                    if let Some(s) = &self.write_status {
-                        if let Ok(mut g) = s.lock() {
-                            g.cancel_requested = true;
-                        }
-                    }
-                }
-            } else {
-                ui.label("Cancelling...");
+        if let Some(snap) = self.ctl.progress() {
+            if super::progress::show_job(ui, &snap) {
+                self.act(DiskWriteAction::Cancel);
             }
         }
-    }
-
-    fn write_finished(&self) -> bool {
-        self.write_status
-            .as_ref()
-            .and_then(|s| s.lock().ok().map(|g| g.finished))
-            .unwrap_or(false)
-    }
-
-    fn start_write(&mut self, source: &PhysicalDiskExportSource, device: &DiskDevice) {
-        let target_size = device.size_bytes;
-
-        // Writing into one partition leaves the table alone, so none of the
-        // synthesize / alignment machinery below applies.
-        if let Some(idx) = self.target_partition {
-            let Some(part) = self.target_partitions.iter().find(|p| p.index == idx) else {
-                self.last_error = Some("Selected partition is no longer present".to_string());
-                return;
-            };
-            if source.size_bytes > part.size_bytes {
-                self.last_error = Some(format!(
-                    "Source is {} but partition {} holds only {}",
-                    rusty_backup::partition::format_size(source.size_bytes),
-                    part.index + 1,
-                    rusty_backup::partition::format_size(part.size_bytes),
-                ));
-                return;
+        match self.ctl.result() {
+            Some(Ok(_)) => {
+                ui.label("Write complete.");
             }
-            let req = PhysicalWriteRequest {
-                source: PhysicalWriteSource::Image(source.path.clone()),
-                target_device_path: device.path.clone(),
-                target_size_bytes: target_size,
-                extent: WriteExtent::partition_at(part.byte_offset(), part.size_bytes),
-                wrap: None,
-            };
-            self.last_error = None;
-            self.write_status = Some(physical_write_runner::start_physical_write(req));
-            self.write_rate.reset();
-            return;
-        }
-
-        let first_lba = self.resolved_alignment().first_partition_lba();
-        let first_byte = first_lba * 512;
-
-        // Validate partition size fits.
-        let partition_size =
-            self.resolved_partition_size(source.size_bytes, target_size, first_byte);
-        if partition_size < source.size_bytes {
-            self.last_error = Some(format!(
-                "Partition size ({} bytes) is smaller than source filesystem ({} bytes)",
-                partition_size, source.size_bytes,
-            ));
-            return;
-        }
-        if first_byte + partition_size > target_size {
-            self.last_error = Some(format!(
-                "Partition end ({} bytes) exceeds target disk size ({} bytes)",
-                first_byte + partition_size,
-                target_size,
-            ));
-            return;
-        }
-
-        let wrap = if self.synthesize {
-            Some(self.build_wrap_params(source, partition_size, target_size))
-        } else {
-            None
-        };
-        let req = PhysicalWriteRequest {
-            source: PhysicalWriteSource::Image(source.path.clone()),
-            target_device_path: device.path.clone(),
-            target_size_bytes: target_size,
-            extent: WriteExtent::whole_disk(target_size),
-            wrap,
-        };
-        self.last_error = None;
-        self.write_status = Some(physical_write_runner::start_physical_write(req));
-        self.write_rate.reset();
-    }
-
-    fn resolved_alignment(&self) -> WrapAlignment {
-        match self.alignment {
-            AlignmentChoice::DosTraditional => WrapAlignment::DosTraditional,
-            AlignmentChoice::Modern1MB => WrapAlignment::Modern1MB,
-            AlignmentChoice::Custom => WrapAlignment::Custom(self.custom_alignment_sectors),
-        }
-    }
-
-    fn resolved_partition_size(&self, source_size: u64, target_size: u64, first_byte: u64) -> u64 {
-        let chosen = self
-            .size_mode
-            .effective_size(source_size, source_size, self.custom_size_mib);
-        let raw = if self.size_mode == SizeMode::FillRemaining {
-            target_size.saturating_sub(first_byte)
-        } else {
-            chosen
-        };
-        // Round down to sector boundary.
-        (raw / 512) * 512
-    }
-
-    fn build_wrap_params(
-        &self,
-        source: &PhysicalDiskExportSource,
-        partition_size: u64,
-        target_size: u64,
-    ) -> WrapParams {
-        let alignment = self.resolved_alignment();
-        let table = match self.table_kind {
-            TableKind::Mbr => WrapTable::Mbr {
-                type_byte: self.type_byte,
-                bootable: false,
-                alignment,
-            },
-            TableKind::Gpt => {
-                let suggested = superfloppy_wrap::suggest_wrap_params(
-                    &source.fs_hint,
-                    source.size_bytes,
-                    target_size,
-                    None,
-                );
-                match suggested.table {
-                    WrapTable::Gpt {
-                        type_guid, name, ..
-                    } => WrapTable::Gpt {
-                        type_guid,
-                        name,
-                        alignment,
-                    },
-                    // Suggest fell back to MBR; force GPT with a default GUID
-                    // by rebuilding from the heuristic with a forced-large
-                    // target. Should not happen in practice.
-                    WrapTable::Mbr { .. } => {
-                        let forced = superfloppy_wrap::suggest_wrap_params(
-                            &source.fs_hint,
-                            source.size_bytes,
-                            u64::MAX,
-                            None,
-                        );
-                        match forced.table {
-                            WrapTable::Gpt {
-                                type_guid, name, ..
-                            } => WrapTable::Gpt {
-                                type_guid,
-                                name,
-                                alignment,
-                            },
-                            _ => unreachable!(),
-                        }
-                    }
-                }
+            Some(Err(e)) => {
+                ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {e}"));
             }
-        };
-        WrapParams {
-            table,
-            partition_size_bytes: partition_size,
-            target_size_bytes: target_size,
-            source_fs_hint: source.fs_hint.clone(),
+            None => {}
+        }
+        if ui
+            .add_enabled(!self.ctl.is_writing(), egui::Button::new("Close"))
+            .clicked()
+        {
+            self.act(DiskWriteAction::Close);
         }
     }
 }
 
-/// Render a partition-type-byte combo: a dropdown of common types plus a raw
-/// hex DragValue for override.
-fn type_byte_picker(ui: &mut egui::Ui, type_byte: &mut u8, fs_hint: &str) {
-    let presets: &[(u8, &str)] = &[
-        (0x01, "0x01 FAT12"),
-        (0x06, "0x06 FAT16"),
-        (0x07, "0x07 NTFS/exFAT"),
-        (0x0B, "0x0B FAT32 (CHS)"),
-        (0x0C, "0x0C FAT32 (LBA)"),
-        (0x83, "0x83 Linux"),
-        (0xAF, "0xAF HFS/HFS+"),
-    ];
-    let label = presets
+/// A partition-type-byte combo: the common types plus a raw hex field for any other byte.
+fn type_byte_picker(ui: &mut egui::Ui, type_byte: &mut u8) {
+    let label = TYPE_BYTE_PRESETS
         .iter()
         .find(|(b, _)| b == type_byte)
         .map(|(_, n)| (*n).to_string())
@@ -670,7 +370,7 @@ fn type_byte_picker(ui: &mut egui::Ui, type_byte: &mut u8, fs_hint: &str) {
     egui::ComboBox::from_id_salt("physical_disk_export_typebyte")
         .selected_text(label)
         .show_ui(ui, |ui| {
-            for (byte, name) in presets {
+            for (byte, name) in TYPE_BYTE_PRESETS {
                 ui.selectable_value(type_byte, *byte, *name);
             }
         });
@@ -687,33 +387,4 @@ fn type_byte_picker(ui: &mut egui::Ui, type_byte: &mut u8, fs_hint: &str) {
     {
         *type_byte = hex_val;
     }
-    let _ = fs_hint; // hint used only by `open_for`; kept here for future tooltip
-}
-
-/// Probe the source's VBR for the `hidden_sectors` field at offset 0x1C.
-/// Reads only the first 512 bytes; returns `None` on any error.
-/// Partitions on `device`, or empty when it has no readable table.
-fn read_device_partitions(device: &std::path::Path) -> Vec<rusty_backup::partition::PartitionInfo> {
-    let Ok(mut reader) =
-        rusty_backup::model::source_reader::open_peeled_read_with_entry(device, None, None)
-    else {
-        return Vec::new();
-    };
-    match rusty_backup::partition::PartitionTable::detect(&mut reader) {
-        Ok(table) => table
-            .partitions()
-            .into_iter()
-            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-fn detect_hidden_sectors_from_source(source: &PhysicalDiskExportSource) -> Option<u32> {
-    use std::fs::File;
-    use std::io::Read;
-    let mut f = File::open(&source.path).ok()?;
-    let mut sector = [0u8; 512];
-    f.read_exact(&mut sector).ok()?;
-    Some(u32::from_le_bytes(sector[0x1C..0x20].try_into().ok()?))
 }

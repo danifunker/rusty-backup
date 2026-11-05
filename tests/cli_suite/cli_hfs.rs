@@ -46,7 +46,7 @@ fn hfs_round_trip_put_get_rm() {
 
     // Library should be able to re-open what we wrote.
     {
-        use rusty_backup::fs::hfs::HfsFilesystem;
+        use fs_mac::hfs::HfsFilesystem;
         let f = std::fs::File::open(&img).unwrap();
         let fs = HfsFilesystem::open(f, 0).expect("re-open HFS image");
         assert_eq!(fs.volume_summary().volume_name, "Bench");

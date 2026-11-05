@@ -6,6 +6,7 @@ mod bulk_convert_dialog;
 mod chd_options_ui;
 mod commander;
 mod context;
+mod effects;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod file_detail;
@@ -20,6 +21,7 @@ mod optical_tab;
 mod partition_bar;
 mod partition_editor_modal;
 mod physical_disk_export;
+mod picker;
 mod progress;
 mod remote_browser;
 mod resize_popup;
@@ -28,178 +30,73 @@ mod settings_dialog;
 mod size_mode_row;
 mod source_picker;
 mod squashfs_budget_dialog;
-// The palette lives in the lib so `optical::browse_view` can reach it too;
-// re-exported here so `super::theme::` resolves throughout the GUI.
-pub(crate) use rusty_backup::theme;
+pub(crate) mod theme;
 pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
 use backup_tab::BackupTab;
-use bulk_convert_dialog::{BulkConvertDialog, DialogAction as BulkConvertAction};
+use bulk_convert_dialog::BulkConvertDialog;
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
-use progress::{LogPanel, ProgressState};
+use progress::ProgressState;
 use restore_tab::RestoreTab;
-use rusty_backup::model::status::{BulkConvertLogLevel, BulkConvertStatus};
+use rusty_backup::controller::app::{
+    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate, AppAction,
+    AppController, AppTab, DropRoute, DropTargets, ElevationGate, InstallState, RecentHandle,
+    RecentMode, ShareStep, UpdateInfo,
+};
+use rusty_backup::controller::{Controller, Effect};
 use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
-
-use rusty_backup::device::{self, DiskDevice};
-use rusty_backup::update::{check_for_updates, RecentMode, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
 use elevation_dialog::{ElevationAction, ElevationDialog};
 
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 
-/// Create an `rfd::FileDialog` pre-configured to start in the real user's home
-/// directory. This ensures file dialogs open in the right place even when the
-/// app is running elevated via pkexec.
-fn bytes_human(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if n >= GB {
-        format!("{:.2} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{} B", n)
-    }
-}
+pub(crate) use rusty_backup::controller::app::{
+    no_devices_hint, physical_devices_available, unelevated_device_note,
+};
 
-/// Hint shown in a device dropdown when no physical devices are listed. On
-/// Windows the empty list usually means the process isn't elevated yet, so we
-/// point the user at the top-bar gate; when already elevated (or on other
-/// platforms) it just reports that none were detected.
-fn no_devices_hint() -> &'static str {
-    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
-        return "Physical devices are not available in this build. Use disk image files.";
-    }
-    #[cfg(windows)]
-    {
-        if rusty_backup::os::windows::is_elevated() {
-            "No physical devices detected."
-        } else {
-            "Click \"Show Physical Devices\" (top bar) to access disks."
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        "No physical devices detected."
-    }
-}
-
-/// Label for the top-bar elevation button. Windows hides physical devices
-/// entirely until elevated; Linux lists them but cannot open them unprivileged.
-fn elevation_button_label() -> &'static str {
-    #[cfg(windows)]
-    {
-        "Show Physical Devices"
-    }
-    #[cfg(not(windows))]
-    {
-        "Unlock Physical Devices"
-    }
-}
-
-/// Hover text for the top-bar elevation button. Both platforms relaunch the
-/// whole process; only the mechanism and the wording differ.
-fn elevation_button_hover() -> &'static str {
-    #[cfg(windows)]
-    {
-        "Restart with administrator privileges to access physical disk devices \
-         (will prompt for elevation)."
-    }
-    #[cfg(not(windows))]
-    {
-        "Restart with root privileges (pkexec) to read and write physical disk \
-         devices. Disk image files do not need this."
-    }
-}
-
-/// Warning shown next to a physical-device picker while unprivileged, naming
-/// the remedy. Windows may not list devices at all; Linux lists but cannot open.
-fn unelevated_device_note() -> &'static str {
-    #[cfg(windows)]
-    {
-        "Note: physical devices need administrator privileges. Without it they may \
-         not be listed, and Edit Mode will fail. Click \"Show Physical Devices\" in \
-         the top bar. Disk image files are unaffected."
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "Note: physical devices need root privileges to open, so Edit Mode and \
-         device backups will fail. Click \"Unlock Physical Devices\" in the top bar \
-         to restart as root. Disk image files are unaffected."
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        "Note: physical devices need root privileges (sudo). Without it they may \
-         not be listed, and Edit Mode will fail. Disk image files are unaffected."
-    }
-}
-
-/// Whether physical-device access is available right now. On Windows this means
-/// the process is elevated (raw disk + SCSI optical access need admin); on other
-/// platforms it is always true. Used to gray out physical-source controls until
-/// the user elevates via the top-bar "Show Physical Devices" button.
-fn physical_devices_available() -> bool {
-    if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        rusty_backup::os::windows::is_elevated()
-    }
-    #[cfg(not(windows))]
-    {
-        true
-    }
-}
-
-/// Record `path` in the per-mode recent-files MRU (persisted in config.json)
-/// and return the updated newest-first list for `mode`. Mirrors the Optical
-/// tab's `remember_daemon_addr` write-through: config.json is the source of
-/// truth and each tab keeps an in-memory mirror it refreshes from this return
-/// value. Loading + saving on every open is cheap (a small JSON file) and keeps
-/// the history durable across runs without an eframe `save()` hook.
-pub(crate) fn push_recent(mode: RecentMode, path: &std::path::Path) -> Vec<String> {
-    rusty_backup::update::push_recent(mode, &path.display().to_string())
-}
-
-/// The persisted recent-files list for `mode` (newest first). Used to seed a
-/// tab's in-memory mirror at construction.
-pub(crate) fn load_recent(mode: RecentMode) -> Vec<String> {
-    rusty_backup::update::load_recent(mode)
-}
-
-/// A merged recent list for Commander: the newest 3 entries from each mode's
-/// list (deduped, category order Inspect→Restore→Optical→Archives→Commander).
-/// Commander opens any of them (image / backup folder), so one combined
-/// quick-pick beats five separate ones.
-pub(crate) fn load_recent_merged() -> Vec<String> {
-    let cfg = UpdateConfig::load();
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for mode in [
-        RecentMode::Inspect,
-        RecentMode::Restore,
-        RecentMode::Optical,
-        RecentMode::Archives,
-        RecentMode::Commander,
-        RecentMode::Backup,
-    ] {
-        for p in cfg.recent_files.list(mode).iter().take(3) {
-            if seen.insert(p.clone()) {
-                out.push(p.clone());
+/// Carry out view-model effects; no `_` arm, so a new `Effect` fails to compile here until handled.
+pub(crate) fn run_effects(ctx: &egui::Context, effects: Vec<Effect>) {
+    for effect in effects {
+        match effect {
+            Effect::CopyToClipboard(text) => ctx.copy_text(text),
+            Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Effect::Message(text) => log::info!("{text}"),
+            // Answered effects go through the asking controller's `effects::EffectHost`.
+            Effect::PickFile(spec) | Effect::PickFolder(spec) => {
+                log::error!("picker {:?} has no EffectHost to answer it", spec.purpose)
             }
+            Effect::Confirm(spec) => {
+                log::error!("confirm {:?} has no EffectHost to answer it", spec.purpose)
+            }
+            Effect::Choose(spec) => {
+                log::error!("choice {:?} has no EffectHost to answer it", spec.purpose)
+            }
+            Effect::AskPassword(spec) => {
+                log::error!("no egui handler yet for password {:?}", spec.purpose)
+            }
+            Effect::AskText(spec) => {
+                log::error!(
+                    "text prompt {:?} has no EffectHost to answer it",
+                    spec.purpose
+                )
+            }
+            Effect::CloseScreen => log::error!("CloseScreen has no screen to close here"),
+            Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
-    out
+}
+
+/// Record `path` in `mode`'s recent files through the app's store and return the new list.
+pub(crate) fn push_recent(
+    recent: &RecentHandle,
+    mode: RecentMode,
+    path: &std::path::Path,
+) -> Vec<String> {
+    recent.remember(mode, &path.display().to_string())
 }
 
 /// A dedicated "Recent" dropdown (its own popup, so it never gets clipped inside
@@ -259,304 +156,25 @@ pub(crate) fn recent_combo(
     chosen
 }
 
-fn file_dialog() -> rfd::FileDialog {
-    let dialog = rfd::FileDialog::new();
-    #[cfg(target_os = "linux")]
-    let dialog = if let Some(home) = rusty_backup::os::linux::real_user_home() {
-        dialog.set_directory(home)
-    } else {
-        dialog
-    };
-    dialog
-}
-
-/// Prepare a disk image path for file-based access by downstream GUI
-/// worker code. Returns a path to a raw, seekable image — possibly the
-/// original (no work needed) or a tempfile.
-///
-/// Handles three wrapper formats whose raw stream isn't seekable / flat:
-/// - `.adz` / `.hdz` — gzip-decompressed to a tempfile (gzip isn't
-///   seekable).
-/// - `.msa` — Atari ST Magic Shadow Archiver, decoded to a flat `.st`
-///   tempfile.
-/// - `.d88` — Sharp Japanese-emulator floppy container (X68000 / PC-88 /
-///   PC-98 / MSX / FM-7), decoded to a flat raw-sector tempfile.
-///
-/// Everything else — including `.gho`/`.ghs`, `.imz`, `.chd` — passes
-/// through unchanged, since the inspect worker opens those via
-/// [`open_disk_image_for_reading`] (streaming `Read + Seek` readers,
-/// no tempfile).
-///
-/// The output file lives inside a fresh `tempfile::tempdir`; callers
-/// must hold the returned `TempDir` (second tuple element) for the
-/// duration they need the materialized file.
-pub fn prepare_disk_image_path(
-    path: &std::path::Path,
-    decode_floppy_containers: bool,
-) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase());
-
-    // GHO/GHS and IMZ have streaming Read+Seek readers (GhoReader,
-    // ImzReader) — the inspect worker opens them via open_read, so
-    // the path passes through unchanged. No tempfile needed.
-
-    // `decode_floppy_containers` controls the floppy-wrapper formats
-    // (.msa/.d88/.xdf/.hdm/.dim). The Backup / Restore tabs pass `true`: they
-    // need a flat sector stream to compress / write. The Inspect tab (and the
-    // drag-drop / file-association open path) pass `false` so the original
-    // container is opened directly — the read paths are container-aware via
-    // source_reader::open_read, and editing persists back into the container
-    // through BrowseSession::open_editable's ContainerEditSession. Pre-decoding
-    // to a throwaway tempfile would orphan edits and hide the real file name.
-    // The gzip-wrapped Amiga images (.adz/.hdz) decode to flat sectors only for
-    // the Backup/Restore path (`decode_floppy_containers`); the browse/inspect/
-    // commander path leaves them as containers so `source_reader::open_read`
-    // peels the gzip and edits re-gzip back in place (BrowseSession's gzip
-    // ContainerEditSession), rather than orphaning edits in a throwaway .adf.
-    let target_ext = match ext.as_deref() {
-        Some("adz") if decode_floppy_containers => "adf",
-        Some("hdz") if decode_floppy_containers => "hdf",
-        Some("msa") if decode_floppy_containers => "st",
-        Some("d88") if decode_floppy_containers => "img",
-        Some("xdf") | Some("hdm") | Some("dim") if decode_floppy_containers => "img",
-        _ => return Ok((path.to_path_buf(), None)),
-    };
-    let tmp = tempfile::tempdir()?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
-
-    if target_ext == "st" {
-        // MSA → flat raw sectors, written to a tempfile so the rest of the
-        // GUI pipeline (which addresses partitions by byte offset on a
-        // path) sees a plain `.st` image.
-        let bytes = std::fs::read(path)?;
-        let flat = rusty_backup::rbformats::containers::msa::decode_msa_bytes(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
-        std::fs::write(&out_path, &flat)?;
-        log::info!(
-            "Materialized {} -> {} ({} bytes, MSA decoded)",
-            path.display(),
-            out_path.display(),
-            flat.len()
-        );
-        return Ok((out_path, Some(tmp)));
+/// An rfd dialog starting in the real user's home, even when running elevated through pkexec.
+fn file_dialog() -> rfd::AsyncFileDialog {
+    let dialog = rfd::AsyncFileDialog::new();
+    match rusty_backup::controller::app::picker_start_folder() {
+        Some(home) => dialog.set_directory(home),
+        None => dialog,
     }
-    if target_ext == "img" && ext.as_deref() == Some("d88") {
-        // D88 → flat raw sectors. Same shape as MSA: small floppy
-        // (~1.5 MB max for 2HD), in-memory decode, tempfile drop-in.
-        let bytes = std::fs::read(path)?;
-        let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
-        std::fs::write(&out_path, &flat)?;
-        log::info!(
-            "Materialized {} -> {} ({} bytes, D88 decoded)",
-            path.display(),
-            out_path.display(),
-            flat.len()
-        );
-        return Ok((out_path, Some(tmp)));
-    }
-    if target_ext == "img" && matches!(ext.as_deref(), Some("xdf") | Some("hdm") | Some("dim")) {
-        let bytes = std::fs::read(path)?;
-        let (flat, label) = match ext.as_deref() {
-            Some("xdf") => (
-                rusty_backup::rbformats::containers::xdf::decode_xdf_bytes(&bytes)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
-                    })?
-                    .0,
-                "XDF",
-            ),
-            Some("hdm") => (
-                rusty_backup::rbformats::containers::hdm::decode_hdm_bytes(&bytes)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
-                    })?
-                    .0,
-                "HDM",
-            ),
-            Some("dim") => (
-                rusty_backup::rbformats::containers::dim::decode_dim_bytes(&bytes)
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
-                    })?
-                    .0,
-                "DIM",
-            ),
-            _ => unreachable!("guarded by outer match arm"),
-        };
-        std::fs::write(&out_path, &flat)?;
-        log::info!(
-            "Materialized {} -> {} ({} bytes, {} decoded)",
-            path.display(),
-            out_path.display(),
-            flat.len(),
-            label
-        );
-        return Ok((out_path, Some(tmp)));
-    }
-
-    // Gzip-wrapped Amiga images (.adz / .hdz).
-    let mut input = std::fs::File::open(path)?;
-    // Spot-check the gzip magic so we surface a clear error if the
-    // user renamed something to .adz that isn't actually gzipped.
-    let mut magic = [0u8; 2];
-    use std::io::Read;
-    input.read_exact(&mut magic)?;
-    if magic != [0x1F, 0x8B] {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{} does not start with gzip magic 1f 8b", path.display()),
-        ));
-    }
-    use std::io::Seek;
-    input.seek(std::io::SeekFrom::Start(0))?;
-    let mut decoder = flate2::read::GzDecoder::new(input);
-    let mut out = std::fs::File::create(&out_path)?;
-    std::io::copy(&mut decoder, &mut out)?;
-    out.sync_all()?;
-    log::info!(
-        "Materialized {} -> {} ({} bytes)",
-        path.display(),
-        out_path.display(),
-        out.metadata().map(|m| m.len()).unwrap_or(0)
-    );
-    Ok((out_path, Some(tmp)))
-}
-
-/// Open a disk image file for streaming reads, dispatching on container
-/// type:
-///
-/// - `.chd` → `ChdReader` (decompresses hunks on demand)
-/// - `.gho` / `.ghs` → `GhoReader` (streams SECTOR mode, builds an
-///   in-RAM virtual FAT image for file-aware mode)
-/// - `.imz` → `ImzReader` (streams ZIP-wrapped floppy image)
-/// - anything else → buffered `File`
-///
-/// No tempfile is created for any of the streaming containers; only
-/// gzip-wrapped Amiga images need [`prepare_disk_image_path`]
-/// first (since gzip isn't seekable).
-///
-/// This is the GUI's entry point for opening image FILES (not raw
-/// devices — those still need [`rusty_backup::os::open_source_for_reading`]
-/// for elevation / volume locking).
-#[allow(dead_code)] // First caller lands in the GUI worker refactor.
-pub fn open_disk_image_for_reading(
-    path: &std::path::Path,
-) -> std::io::Result<Box<dyn rusty_backup::rbformats::ReadSeek>> {
-    rusty_backup::model::source_reader::open_read(path)
-        .map_err(|e| rusty_backup::compat::io_other(format!("{e:#}")))
-}
-
-#[cfg(test)]
-mod materialize_tests {
-    use super::*;
-    use std::io::Write as _;
-
-    #[test]
-    fn materialize_passes_raw_adf_through() {
-        let tmp = tempfile::tempdir().unwrap();
-        let raw = tmp.path().join("disk.adf");
-        std::fs::write(&raw, b"raw bytes").unwrap();
-        let (out, guard) = prepare_disk_image_path(&raw, true).unwrap();
-        assert_eq!(out, raw);
-        assert!(guard.is_none());
-    }
-
-    #[test]
-    fn materialize_decompresses_adz() {
-        let payload: &[u8] = b"PAYLOAD bytes for an adz round-trip";
-        let tmp = tempfile::tempdir().unwrap();
-        let adz_path = tmp.path().join("disk.adz");
-        // Write a tiny gzipped file.
-        let f = std::fs::File::create(&adz_path).unwrap();
-        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        enc.write_all(payload).unwrap();
-        enc.finish().unwrap();
-        let (out, guard) = prepare_disk_image_path(&adz_path, true).unwrap();
-        assert!(guard.is_some(), "decompressed path needs a tempdir guard");
-        assert_eq!(out.extension().and_then(|s| s.to_str()), Some("adf"));
-        let actual = std::fs::read(&out).unwrap();
-        assert_eq!(actual, payload);
-    }
-
-    #[test]
-    fn materialize_rejects_non_gzip_adz() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adz = tmp.path().join("bogus.adz");
-        std::fs::write(&adz, b"not gzip data").unwrap();
-        let err = prepare_disk_image_path(&adz, true).unwrap_err();
-        assert!(err.to_string().contains("gzip magic"));
-    }
-
-    #[test]
-    fn imz_passes_through_unchanged() {
-        // IMZ has a streaming reader (ImzReader); prepare_disk_image_path
-        // passes it through unchanged — the worker opens it via
-        // open_disk_image_for_reading.
-        let tmp = tempfile::tempdir().unwrap();
-        let imz_path = tmp.path().join("floppy.imz");
-        std::fs::write(&imz_path, b"PK\x03\x04anything").unwrap();
-        let (out, guard) = prepare_disk_image_path(&imz_path, true).unwrap();
-        assert_eq!(out, imz_path);
-        assert!(guard.is_none());
-    }
-
-    #[test]
-    fn gho_passes_through_unchanged() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gho_path = tmp.path().join("test.gho");
-        std::fs::write(&gho_path, [0xFE, 0xEF, 0x01, 0x00]).unwrap();
-        let (out, guard) = prepare_disk_image_path(&gho_path, true).unwrap();
-        assert_eq!(out, gho_path);
-        assert!(guard.is_none());
-    }
-
-    #[test]
-    fn hfv_passes_through_unchanged() {
-        // HFV is a flat raw HFS volume opened directly at offset 0 by the
-        // superfloppy path; prepare_disk_image_path must not materialize or
-        // rewrite it. Covers both .hfv and .HFV.
-        let tmp = tempfile::tempdir().unwrap();
-        for name in ["disk.hfv", "DISK.HFV"] {
-            let hfv_path = tmp.path().join(name);
-            std::fs::write(&hfv_path, b"\x00\x00\x00\x00").unwrap();
-            let (out, guard) = prepare_disk_image_path(&hfv_path, true).unwrap();
-            assert_eq!(out, hfv_path);
-            assert!(guard.is_none());
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Tab {
-    Backup,
-    Restore,
-    Inspect,
-    Optical,
-    Archives,
 }
 
 /// Main application state.
 pub struct RustyBackupApp {
-    active_tab: Tab,
     backup_tab: BackupTab,
     restore_tab: RestoreTab,
     inspect_tab: InspectTab,
     optical_tab: OpticalTab,
     archives_tab: ArchivesTab,
-    log_panel: LogPanel,
+    /// App-wide view-model: the log, the jobs, recent files, the tab, devices and updates.
+    app: AppController,
     progress: ProgressState,
-    devices: Vec<DiskDevice>,
-    update_info: Arc<Mutex<Option<UpdateInfo>>>,
-    update_dismissed: bool,
-    /// In-app self-update worker status (Windows only). `None` until the user
-    /// clicks "Download & Install Update".
-    #[cfg(windows)]
-    update_run: Option<Arc<Mutex<rusty_backup::model::update_runner::UpdateRunStatus>>>,
     settings_dialog: SettingsDialog,
     #[cfg(target_os = "linux")]
     elevation_dialog: ElevationDialog,
@@ -564,12 +182,8 @@ pub struct RustyBackupApp {
     /// Loaded lazily on first use (the egui context isn't available at
     /// construction time).
     shield_texture: Option<egui::TextureHandle>,
-    /// Shared backup folder path between restore and inspect tabs
-    loaded_backup_folder: Option<PathBuf>,
-    /// Bulk Convert dialog state (None = closed).
-    bulk_convert_dialog: Option<BulkConvertDialog>,
-    /// Background bulk-convert worker progress (None = idle).
-    bulk_convert_status: Option<Arc<Mutex<BulkConvertStatus>>>,
+    /// The Bulk Convert dialog and its running conversion.
+    bulk_convert: BulkConvertDialog,
     /// File path passed on the command line (Windows file-association
     /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
     /// launch). Taken on the first `logic()` tick, routed into the
@@ -583,81 +197,28 @@ pub struct RustyBackupApp {
 
 impl Default for RustyBackupApp {
     fn default() -> Self {
-        let mut log = LogPanel::default();
-        log.info("Rusty Backup started");
+        let mut app = AppController::new(Arc::new(ui_logger::EguiWake));
+        app.log.info("Rusty Backup started");
+        app.load_devices();
+        app.start_update_check();
 
-        let devices = device::enumerate_devices();
-        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
-            log.info(
-                "This build works on disk image files only; physical device access is disabled.",
-            );
-        } else if devices.is_empty() {
-            log.warn("No disk devices detected. You can still open image files.");
-        } else {
-            log.info(format!("Found {} device(s)", devices.len()));
-        }
-
-        // Physical devices are enumerated from /sys/block unprivileged, so the
-        // list is populated either way; only opening them needs root.
-        #[cfg(target_os = "linux")]
-        let elevation_dialog = {
-            if rusty_backup::os::is_elevated() {
-                log.info("Running with administrator privileges");
-            } else if !devices.is_empty() {
-                log.warn(
-                    "Running unprivileged: physical devices cannot be opened. Click \
-                     'Unlock Physical Devices' in the top bar to restart as root. \
-                     Disk image files are unaffected.",
-                );
-            }
-            ElevationDialog::default()
-        };
-
-        let backup_tab = BackupTab::default();
-
-        let mut optical_tab = OpticalTab::default();
-        optical_tab.refresh_drives();
-        if optical_tab.drive_count() > 0 {
-            log.info(format!(
-                "Found {} optical drive(s)",
-                optical_tab.drive_count()
-            ));
-        }
-
-        // Start update check in background
-        let update_info = Arc::new(Mutex::new(None));
-        let update_info_clone = Arc::clone(&update_info);
-        thread::spawn(move || {
-            let config = UpdateConfig::load();
-            if config.update_check.enabled {
-                let current_version = env!("APP_VERSION");
-                if let Ok(info) = check_for_updates(&config.update_check, current_version) {
-                    *update_info_clone.lock().unwrap() = Some(info);
-                }
-            }
-        });
+        // The scan runs in a job; "Found N optical drive(s)" is logged when it ends.
+        let mut optical_tab = OpticalTab::new(app.recent_handle());
+        optical_tab.find_drives();
 
         Self {
-            active_tab: Tab::Inspect,
-            backup_tab,
-            restore_tab: RestoreTab::default(),
-            inspect_tab: InspectTab::default(),
+            backup_tab: BackupTab::new(app.recent_handle()),
+            restore_tab: RestoreTab::new(app.recent_handle()),
+            inspect_tab: InspectTab::new(app.recent_handle()),
             optical_tab,
-            archives_tab: ArchivesTab::default(),
-            log_panel: log,
+            archives_tab: ArchivesTab::new(app.recent_handle()),
+            settings_dialog: SettingsDialog::new(app.recent_handle()),
+            app,
             progress: ProgressState::default(),
-            devices,
-            update_info,
-            update_dismissed: false,
-            #[cfg(windows)]
-            update_run: None,
-            settings_dialog: SettingsDialog::default(),
             #[cfg(target_os = "linux")]
-            elevation_dialog,
+            elevation_dialog: ElevationDialog::default(),
             shield_texture: None,
-            loaded_backup_folder: None,
-            bulk_convert_dialog: None,
-            bulk_convert_status: None,
+            bulk_convert: BulkConvertDialog::default(),
             pending_initial_image: None,
             commander: None,
         }
@@ -681,77 +242,16 @@ impl RustyBackupApp {
         }
     }
 
-    /// Open a path in the Inspect tab and switch to it. Used by both the
-    /// command-line initial-image hand-off (one-shot at app start) and
-    /// the drag-and-drop handler (any time during the session).
-    ///
-    /// Routes through [`prepare_disk_image_path`] so wrapper formats with
-    /// no native seekable view (`.adz` / `.hdz` / `.msa` / `.d88` / `.xdf`
-    /// / `.hdm` / `.dim`) are decompressed to a flat tempfile first. Same
-    /// path the "Open File..." button uses — keeps DnD / double-click
-    /// behavior identical to the picker.
+    /// Open a path in the Inspect tab and switch to it: the command-line hand-off and drops.
+    /// A wrapper (`.adz`, `.hdz`, ...) is decoded in the Inspect open's job, as Open File does.
     fn open_in_inspect(&mut self, path: PathBuf) {
-        self.log_panel.info(format!("Opening {}", path.display()));
-        // Inspect: open floppy containers directly (don't pre-decode) so edits
-        // persist back into the container. See prepare_disk_image_path.
-        match prepare_disk_image_path(&path, false) {
-            Ok((materialized, guard)) => {
-                self.inspect_tab
-                    .load_image_with_tempdir(materialized, guard);
-            }
-            Err(e) => {
-                self.log_panel.warn(format!(
-                    "Failed to materialize {}: {} - opening raw bytes",
-                    path.display(),
-                    e
-                ));
-                self.inspect_tab.load_image_with_tempdir(path, None);
-            }
-        }
-        self.active_tab = Tab::Inspect;
+        self.app.log.info(format!("Opening {}", path.display()));
+        self.inspect_tab.open_file(path);
+        self.app.select_tab(AppTab::Inspect);
     }
-}
-
-/// Whether the physical-device elevation gate applies, and its current state.
-/// `NeedsElevation`/`Elevated` are only constructed on Windows and Linux; on
-/// macOS `elevation_gate()` always returns `NotApplicable`.
-#[derive(Clone, Copy, PartialEq)]
-enum ElevationGate {
-    /// Not a gated platform (macOS escalates per operation via authopen) — the
-    /// normal "Refresh Devices" control applies. Constructed only on macOS.
-    #[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
-    NotApplicable,
-    /// Not elevated — show the shielded elevation button.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-    NeedsElevation,
-    /// Already elevated — devices are available, show "Refresh Devices".
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-    Elevated,
-    /// A `no-physical-devices` build: no elevation and no device list to refresh.
-    Disabled,
 }
 
 impl RustyBackupApp {
-    /// Current elevation-gate state. The button + device-list behavior key off
-    /// this; macOS is always `NotApplicable`.
-    fn elevation_gate(&self) -> ElevationGate {
-        if !rusty_backup::os::PHYSICAL_DEVICES_ENABLED {
-            return ElevationGate::Disabled;
-        }
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            if rusty_backup::os::is_elevated() {
-                ElevationGate::Elevated
-            } else {
-                ElevationGate::NeedsElevation
-            }
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            ElevationGate::NotApplicable
-        }
-    }
-
     /// Lazily load (once) and return the stylized shield texture for the
     /// elevation button.
     fn shield_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
@@ -768,103 +268,63 @@ impl RustyBackupApp {
         tex
     }
 
-    /// Drain bulk-convert worker log messages into the GUI log panel and
-    /// clear the status handle when the worker finishes.
-    fn poll_bulk_convert(&mut self) {
-        let status_arc = match &self.bulk_convert_status {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-        let Ok(mut status) = status_arc.lock() else {
-            return;
-        };
-        for (level, msg) in status.log_messages.drain(..) {
-            match level {
-                BulkConvertLogLevel::Info => self.log_panel.info(msg),
-                BulkConvertLogLevel::Warn => self.log_panel.warn(msg),
-                BulkConvertLogLevel::Error => self.log_panel.error(msg),
-            }
-        }
-        if status.finished {
-            drop(status);
-            self.bulk_convert_status = None;
-        }
-    }
-
     /// Render the update-banner action buttons. On Windows with a matched
     /// release asset this offers in-app "Download & Install Update" (download
     /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
     /// or a missing asset) it opens the releases page in a browser.
     fn show_update_actions(&mut self, ui: &mut egui::Ui, info: &UpdateInfo) {
-        #[cfg(windows)]
-        {
-            use rusty_backup::model::update_runner::{self, UpdateRunState};
-
-            if info.asset_url.is_some() {
-                let run_state = self.update_run.as_ref().map(|s| {
-                    s.lock()
-                        .map(|g| g.state.clone())
-                        .unwrap_or(UpdateRunState::Idle)
-                });
-
-                match run_state {
-                    None => {
-                        if ui.button("Download & Install Update").clicked() {
-                            let status =
-                                Arc::new(Mutex::new(update_runner::UpdateRunStatus::default()));
-                            update_runner::spawn(info.clone(), Arc::clone(&status));
-                            self.update_run = Some(status);
-                            self.log_panel.info("Downloading update...");
-                        }
-                        if ui.button("View Release").clicked() {
-                            let _ = webbrowser::open(&info.releases_url);
-                        }
+        let mut actions = Vec::new();
+        let mut view_release = false;
+        if self.app.can_install_update() {
+            match self.app.install_state() {
+                None => {
+                    if ui.button("Download & Install Update").clicked() {
+                        actions.push(AppAction::InstallUpdate);
                     }
-                    Some(UpdateRunState::Idle) | Some(UpdateRunState::Downloading { .. }) => {
-                        let frac = self
-                            .update_run
-                            .as_ref()
-                            .and_then(|s| s.lock().ok().and_then(|g| g.progress_fraction()));
-                        ui.add(egui::Spinner::new());
-                        if let Some(f) = frac {
-                            ui.add(
-                                egui::ProgressBar::new(f)
-                                    .desired_width(140.0)
-                                    .show_percentage(),
-                            );
-                        } else {
-                            ui.label("Downloading update...");
-                        }
-                        ui.ctx().request_repaint();
-                    }
-                    Some(UpdateRunState::Ready) => {
-                        ui.label(
-                            egui::RichText::new("Update installed.")
-                                .color(theme::success(ui.visuals())),
+                    view_release = ui.button("View Release").clicked();
+                }
+                Some(InstallState::Downloading(frac)) => {
+                    ui.add(egui::Spinner::new());
+                    if let Some(f) = frac {
+                        ui.add(
+                            egui::ProgressBar::new(f)
+                                .desired_width(140.0)
+                                .show_percentage(),
                         );
-                        if ui.button("Restart now").clicked() {
-                            rusty_backup::update::restart_app();
-                        }
+                    } else {
+                        ui.label("Downloading update...");
                     }
-                    Some(UpdateRunState::Failed(e)) => {
-                        ui.label(
-                            egui::RichText::new(format!("Update failed: {e}"))
-                                .color(theme::danger(ui.visuals())),
-                        );
-                        if ui.button("Retry").clicked() {
-                            self.update_run = None;
-                        }
-                        if ui.button("View Release").clicked() {
-                            let _ = webbrowser::open(&info.releases_url);
-                        }
+                    ui.ctx().request_repaint();
+                }
+                Some(InstallState::Ready) => {
+                    ui.label(
+                        egui::RichText::new("Update installed.")
+                            .color(theme::success(ui.visuals())),
+                    );
+                    if ui.button("Restart now").clicked() {
+                        actions.push(AppAction::RestartApp);
                     }
                 }
-                return;
+                Some(InstallState::Failed(e)) => {
+                    ui.label(
+                        egui::RichText::new(format!("Update failed: {e}"))
+                            .color(theme::danger(ui.visuals())),
+                    );
+                    if ui.button("Retry").clicked() {
+                        actions.push(AppAction::RetryUpdate);
+                    }
+                    view_release = ui.button("View Release").clicked();
+                }
             }
+        } else {
+            view_release = ui.button("View Release").clicked();
         }
-
-        if ui.button("View Release").clicked() {
+        if view_release {
             let _ = webbrowser::open(&info.releases_url);
+        }
+        for a in actions {
+            let fx = self.app.apply(a);
+            run_effects(ui.ctx(), fx);
         }
     }
 }
@@ -872,20 +332,21 @@ impl RustyBackupApp {
 impl RustyBackupApp {
     /// Another tab (not `tab`) with a disk job in flight; one job at a time
     /// keeps two drives from being hammered and the shared progress bar honest.
-    fn busy_elsewhere(&self, tab: Tab) -> Option<&'static str> {
-        let jobs: [(Tab, bool, &'static str); 3] = [
-            (Tab::Backup, self.backup_tab.is_running(), "Backup"),
-            (Tab::Restore, self.restore_tab.is_running(), "Restore"),
-            (Tab::Optical, self.optical_tab.is_running(), "Optical"),
+    fn busy_elsewhere(&self, tab: AppTab) -> Option<&'static str> {
+        let on = |running: bool, name: &'static str| running.then_some(name);
+        let running = [
+            (AppTab::Backup, on(self.backup_tab.is_running(), "Backup")),
+            (
+                AppTab::Restore,
+                on(self.restore_tab.is_running(), "Restore"),
+            ),
+            (
+                AppTab::Optical,
+                on(self.optical_tab.is_running(), "Optical"),
+            ),
+            (AppTab::Inspect, self.inspect_tab.running_job()),
         ];
-        jobs.iter()
-            .find(|(owner, running, _)| *running && *owner != tab)
-            .map(|(_, _, name)| *name)
-            .or(if self.bulk_convert_status.is_some() {
-                Some("Bulk Convert")
-            } else {
-                None
-            })
+        busy_elsewhere(tab, &running, self.bulk_convert.is_running())
     }
 }
 
@@ -901,9 +362,18 @@ impl eframe::App for RustyBackupApp {
             || self.backup_tab.is_running()
             || self.restore_tab.is_running()
             || self.optical_tab.is_running()
-            || self.bulk_convert_status.is_some()
+            || self.bulk_convert.is_running()
         {
             ctx.request_repaint();
+        }
+
+        // Closing the window with staged Commander edits asks first; a yes closes it again.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(cmd) = self.commander.as_mut() {
+                if cmd.hold_quit(ctx) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
         }
 
         // One-shot: drain the file path handed in on the command line
@@ -932,52 +402,32 @@ impl eframe::App for RustyBackupApp {
         });
         if let Some(path) = dropped {
             if let Some(cmd) = self.commander.as_mut() {
-                // Commander overlay takes over the frame; hand the drop to the
-                // active pane (opens it as an image / host folder there).
-                cmd.open_dropped_path(path);
+                // Commander takes over the frame; the active pane opens the drop.
+                cmd.open_dropped_path(ctx, path);
             } else {
-                match self.active_tab {
-                    // Inspect: only steal the drop to open a NEW source when
-                    // nothing is loaded. Once a source is loaded the drop belongs
-                    // to BrowseView::handle_dropped_files (drag-to-add into the
-                    // open volume while in edit mode) — re-opening here would
-                    // clobber the loaded source and make drag-to-add impossible.
-                    Tab::Inspect => {
-                        if self.inspect_tab.is_remote_session() {
-                            self.log_panel.warn(format!(
-                                "Ignored dropped file {}: a remote session is open; close it first",
-                                path.display()
-                            ));
-                        } else if !self.inspect_tab.has_loaded_source() {
-                            self.open_in_inspect(path);
-                        }
-                    }
-                    // Optical: don't clobber an open disc browse (optical
-                    // browsing has no drag-to-add of its own).
-                    Tab::Optical => {
-                        if !self.optical_tab.is_browsing() {
-                            self.optical_tab.open_image(path);
-                        }
-                    }
-                    Tab::Archives => self.archives_tab.open_path(path),
-                    Tab::Restore => self.restore_tab.open_dropped(path),
-                    Tab::Backup => self.backup_tab.open_image(path),
+                let targets = DropTargets {
+                    inspect_remote: self.inspect_tab.is_remote_session(),
+                    inspect_loaded: self.inspect_tab.has_loaded_source(),
+                    optical_browsing: self.optical_tab.is_browsing(),
+                };
+                match self.app.route_drop(path, targets) {
+                    DropRoute::Inspect(path) => self.open_in_inspect(path),
+                    DropRoute::Optical(path) => self.optical_tab.open_image(path),
+                    DropRoute::Archives(path) => self.archives_tab.open_path(path),
+                    DropRoute::Restore(path) => self.restore_tab.open_dropped(path),
+                    DropRoute::Backup(path) => self.backup_tab.open_image(path),
+                    DropRoute::Ignore => {}
                 }
             }
         }
 
-        // Drain `log` crate records (incl. worker-thread log::info! from the
-        // GHO reader) into the panel so they're visible in the UI.
-        for (level, msg) in ui_logger::drain() {
-            match level {
-                log::Level::Error => self.log_panel.error(msg),
-                log::Level::Warn => self.log_panel.warn(msg),
-                _ => self.log_panel.info(msg),
-            }
-        }
+        // Drains worker-thread `log::info!` records (the GHO reader's scan, say) into the log panel.
+        // A finished Refresh Devices replaces the list; a finished update check sets the banner.
+        let effects = self.app.tick();
+        run_effects(ctx, effects);
 
-        // Drain bulk-convert worker logs into the panel and clear when done.
-        self.poll_bulk_convert();
+        // Drain bulk-convert worker logs into the panel.
+        self.bulk_convert.poll(&mut self.app.log);
     }
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -994,14 +444,18 @@ impl eframe::App for RustyBackupApp {
         // Top panel: tab bar
         egui::Panel::top("tab_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, Tab::Backup, "Backup");
-                ui.selectable_value(&mut self.active_tab, Tab::Restore, "Restore");
-                ui.selectable_value(&mut self.active_tab, Tab::Inspect, "Inspect");
-                ui.selectable_value(&mut self.active_tab, Tab::Optical, "Optical");
-                ui.selectable_value(&mut self.active_tab, Tab::Archives, "Archives");
+                let mut tab = self.app.active_tab();
+                ui.selectable_value(&mut tab, AppTab::Backup, "Backup");
+                ui.selectable_value(&mut tab, AppTab::Restore, "Restore");
+                ui.selectable_value(&mut tab, AppTab::Inspect, "Inspect");
+                ui.selectable_value(&mut tab, AppTab::Optical, "Optical");
+                ui.selectable_value(&mut tab, AppTab::Archives, "Archives");
+                if tab != self.app.active_tab() {
+                    self.app.apply(AppAction::SelectTab(tab));
+                }
                 ui.separator();
                 if ui.button("Commander Mode").clicked() {
-                    self.commander = Some(commander::CommanderMode::new());
+                    self.commander = Some(commander::CommanderMode::new(self.app.jobs().clone()));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1010,12 +464,12 @@ impl eframe::App for RustyBackupApp {
                     ui.separator();
 
                     // Close Backup button (if backup loaded)
-                    if self.loaded_backup_folder.is_some() {
+                    if self.app.shared_backup().is_some() {
                         if ui.button("Close Backup").clicked() {
-                            self.loaded_backup_folder = None;
+                            self.app.close_shared_backup();
                             self.restore_tab.clear_backup();
                             self.inspect_tab.clear_backup();
-                            self.log_panel.info("Backup closed");
+                            self.app.log.info("Backup closed");
                         }
                         ui.separator();
                     }
@@ -1027,7 +481,7 @@ impl eframe::App for RustyBackupApp {
 
                     // The single global gate for physical devices: the GUI always
                     // launches un-elevated, and this relaunches it via UAC/pkexec.
-                    match self.elevation_gate() {
+                    match elevation_gate() {
                         ElevationGate::NeedsElevation => {
                             let tint = ui.visuals().widgets.active.fg_stroke.color;
                             let shield = self.shield_texture(ui.ctx());
@@ -1044,45 +498,30 @@ impl eframe::App for RustyBackupApp {
                                 ))
                                 .on_hover_text(elevation_button_hover());
                             if resp.clicked() {
-                                #[cfg(windows)]
-                                {
-                                    self.log_panel
-                                        .info("Requesting administrator privileges...");
-                                    if let Err(e) = rusty_backup::os::windows::request_elevation() {
-                                        self.log_panel.error(format!(
-                                            "Elevation request failed or was cancelled: {e}"
-                                        ));
-                                    }
-                                }
-                                // Linux confirms first: the relaunch discards any
-                                // unsaved edits, so the dialog says so.
-                                #[cfg(target_os = "linux")]
-                                {
-                                    self.elevation_dialog.open();
-                                }
+                                self.app.apply(AppAction::RequestElevation);
                             }
                             ui.separator();
                         }
                         ElevationGate::Disabled => {
                             ui.label(egui::RichText::new("Image files only").weak())
-                                .on_hover_text(rusty_backup::os::PHYSICAL_DEVICES_DISABLED);
+                                .on_hover_text(
+                                    rusty_backup::controller::app::PHYSICAL_DEVICES_DISABLED,
+                                );
                             ui.separator();
                         }
                         ElevationGate::NotApplicable | ElevationGate::Elevated => {
-                            if ui.button("Refresh Devices").clicked() {
-                                self.devices = device::enumerate_devices();
-                                self.log_panel.info(format!(
-                                    "Refreshed: {} device(s) found",
-                                    self.devices.len()
-                                ));
-                                ui.ctx().request_repaint();
+                            if self.app.devices_refreshing().is_some() {
+                                ui.spinner();
+                                ui.label("Looking for devices...");
+                            } else if ui.button("Refresh Devices").clicked() {
+                                self.app.apply(AppAction::RefreshDevices);
                             }
                         }
                     }
                     ui.separator();
 
                     // Bulk Convert — convert every disk image in a folder.
-                    let bulk_running = self.bulk_convert_status.is_some();
+                    let bulk_running = self.bulk_convert.is_running();
                     if ui
                         .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
                         .on_hover_text(
@@ -1091,138 +530,62 @@ impl eframe::App for RustyBackupApp {
                         )
                         .clicked()
                     {
-                        self.bulk_convert_dialog = Some(BulkConvertDialog::default());
+                        self.bulk_convert.open();
                     }
                     if bulk_running && ui.button("Cancel Bulk").clicked() {
-                        if let Some(ref s) = self.bulk_convert_status {
-                            if let Ok(mut g) = s.lock() {
-                                g.cancel_requested = true;
-                            }
-                        }
-                        self.log_panel
-                            .warn("Bulk convert cancellation requested...");
+                        self.bulk_convert.cancel();
                     }
                 });
             });
         });
 
         // Bulk Convert dialog (modal-ish window, always reachable).
-        if let Some(ref mut dlg) = self.bulk_convert_dialog {
-            match dlg.show(ctx) {
-                BulkConvertAction::Start {
-                    files,
-                    extension,
-                    chd_options,
-                    bincue_multi_bin,
-                } => {
-                    if let Some(out) = dlg.output_folder.clone() {
-                        let format = dlg.format;
-                        let count = files.len();
-                        self.bulk_convert_dialog = None;
-                        self.log_panel.info(format!(
-                            "Starting bulk convert: {count} file(s) -> {} ({}, .{extension})",
-                            out.display(),
-                            format.description(),
-                        ));
-                        self.bulk_convert_status = Some(bulk_convert_dialog::start_bulk_convert(
-                            files,
-                            out,
-                            format,
-                            extension,
-                            chd_options,
-                            bincue_multi_bin,
-                        ));
-                    }
-                }
-                BulkConvertAction::Cancel => {
-                    self.bulk_convert_dialog = None;
-                }
-                BulkConvertAction::None => {}
-            }
-        }
+        self.bulk_convert.show(ctx, &mut self.app.log);
 
-        // Bulk Convert progress strip — visible from any tab while running.
-        if let Some(ref status_arc) = self.bulk_convert_status {
-            if let Ok(s) = status_arc.lock() {
-                if !s.finished {
-                    let frac = if s.current_total_bytes > 0 {
-                        (s.current_bytes as f32 / s.current_total_bytes as f32).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let text = if s.current_total_bytes > 0 {
-                        format!(
-                            "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
-                            s.current_index,
-                            s.total_files,
-                            s.current_file,
-                            bytes_human(s.current_bytes),
-                            bytes_human(s.current_total_bytes),
-                            frac * 100.0,
-                        )
-                    } else {
-                        format!(
-                            "Bulk Convert: [{}/{}] {} - preparing...",
-                            s.current_index, s.total_files, s.current_file,
-                        )
-                    };
-                    egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
-                        ui.add(egui::ProgressBar::new(frac).text(text));
-                    });
-                }
-            }
+        // Bulk Convert progress strip, visible from any tab while running.
+        if let Some((frac, text)) = self.bulk_convert.strip() {
+            egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
+                ui.add(egui::ProgressBar::new(frac).text(text));
+            });
         }
 
         // Update notification banner (if update available and not dismissed).
-        // Clone the info into an owned local first so the mutex guard is dropped
-        // before the closure (which needs unique access to `self`).
-        let banner_info: Option<UpdateInfo> = if self.update_dismissed {
-            None
-        } else {
-            self.update_info.lock().ok().and_then(|g| g.clone())
-        };
-        if let Some(info) = banner_info {
-            if info.is_outdated {
-                egui::Panel::top("update_banner").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Update")
-                                .color(theme::warning(ui.visuals()))
-                                .strong(),
-                        );
-                        ui.label(format!(
-                            "available: v{} -> v{}",
-                            info.current_version, info.latest_version
-                        ));
-                        self.show_update_actions(ui, &info);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Dismiss update notification").clicked() {
-                                self.update_dismissed = true;
-                            }
-                        });
+        if let Some(info) = self.app.update_banner().cloned() {
+            egui::Panel::top("update_banner").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Update")
+                            .color(theme::warning(ui.visuals()))
+                            .strong(),
+                    );
+                    ui.label(format!(
+                        "available: v{} -> v{}",
+                        info.current_version, info.latest_version
+                    ));
+                    self.show_update_actions(ui, &info);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Dismiss update notification").clicked() {
+                            self.app.apply(AppAction::DismissUpdate);
+                        }
                     });
                 });
-            }
+            });
         }
         // (end update banner)
 
         // Elevation dialog (Linux)
         #[cfg(target_os = "linux")]
         {
-            let action = self.elevation_dialog.show(ctx);
-            match action {
+            // Linux asks first: the relaunch discards any unsaved edits.
+            if self.app.take_elevation_prompt() {
+                self.elevation_dialog.open();
+            }
+            match self.elevation_dialog.show(ctx) {
                 ElevationAction::Elevate => {
-                    self.log_panel
-                        .info("Relaunching with elevated privileges...");
-                    if let Err(e) = rusty_backup::os::linux::relaunch_with_elevation() {
-                        self.log_panel.error(format!("Failed to elevate: {}", e));
-                    }
+                    self.app.apply(AppAction::ConfirmElevation(true));
                 }
                 ElevationAction::Cancel => {
-                    self.log_panel.warn(
-                        "Elevation cancelled. Physical devices stay unavailable; \
-                         image files are unaffected.",
-                    );
+                    self.app.apply(AppAction::ConfirmElevation(false));
                 }
                 ElevationAction::None => {}
             }
@@ -1238,89 +601,90 @@ impl eframe::App for RustyBackupApp {
                 if self.progress.active {
                     ui.separator();
                 }
-                self.log_panel.show(ui);
+                progress::show_log(ui, &mut self.app);
             });
 
         // Poll the tabs that are not showing: a job keeps reporting on the
         // shared progress bar and its completion is not missed after a switch.
+        let active = self.app.active_tab();
         {
-            let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
-            if !matches!(self.active_tab, Tab::Backup) {
+            let (devices, log) = self.app.devices_and_log();
+            let mut ctx = context::TabContext::new(devices, log);
+            if active != AppTab::Backup {
                 self.backup_tab
                     .poll_background(&mut ctx, &mut self.progress);
             }
-            if !matches!(self.active_tab, Tab::Restore) {
+            if active != AppTab::Restore {
                 self.restore_tab
                     .poll_background(&mut ctx, &mut self.progress);
             }
         }
-        if !matches!(self.active_tab, Tab::Optical) {
+        if active != AppTab::Optical {
             self.optical_tab
-                .poll_background(&mut self.log_panel, &mut self.progress);
+                .poll_background(&mut self.app.log, &mut self.progress);
+        }
+        if active != AppTab::Inspect {
+            let (devices, log) = self.app.devices_and_log();
+            let mut ctx = context::TabContext::new(devices, log);
+            self.inspect_tab.poll_background(&mut ctx);
         }
 
         // Central panel: active tab content
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
-            Tab::Backup => {
-                let busy = self.busy_elsewhere(Tab::Backup);
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
-                    .busy_elsewhere(busy);
+        egui::CentralPanel::default().show(ctx, |ui| match active {
+            AppTab::Backup => {
+                let busy = self.busy_elsewhere(AppTab::Backup);
+                let (devices, log) = self.app.devices_and_log();
+                let mut ctx = context::TabContext::new(devices, log).busy_elsewhere(busy);
                 self.backup_tab.show(ui, &mut ctx, &mut self.progress);
             }
-            Tab::Restore => {
-                // Share backup folder between tabs
-                if let Some(new_backup) = self.restore_tab.get_loaded_backup() {
-                    if self.loaded_backup_folder.as_ref() != Some(&new_backup) {
-                        self.loaded_backup_folder = Some(new_backup.clone());
-                        self.inspect_tab.load_backup(&new_backup);
-                    }
-                } else if !self.restore_tab.has_backup() && !self.restore_tab.has_other_source() {
-                    // Only an empty tab adopts the shared folder; a tab the user
-                    // pointed at an image must not have it re-installed each frame.
-                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
-                        self.restore_tab.load_backup(folder);
-                    }
+            AppTab::Restore => {
+                // Share the backup folder: publish a new one, or adopt it only when empty, so a
+                // tab the user pointed at an image does not have it re-installed each frame.
+                let empty = !self.restore_tab.has_backup() && !self.restore_tab.has_other_source();
+                match self
+                    .app
+                    .share_backup(self.restore_tab.get_loaded_backup(), empty)
+                {
+                    ShareStep::Publish(folder) => self.inspect_tab.load_backup(&folder),
+                    ShareStep::Adopt(folder) => self.restore_tab.load_backup(&folder),
+                    ShareStep::Nothing => {}
                 }
 
-                let busy = self.busy_elsewhere(Tab::Restore);
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel)
-                    .busy_elsewhere(busy);
+                let busy = self.busy_elsewhere(AppTab::Restore);
+                let (devices, log) = self.app.devices_and_log();
+                let mut ctx = context::TabContext::new(devices, log).busy_elsewhere(busy);
                 self.restore_tab.show(ui, &mut ctx, &mut self.progress);
             }
-            Tab::Inspect => {
-                // The inspect tab's own "Close Backup" button signals the
-                // intent to fully close. Honor it before the share-state
-                // logic below — otherwise the auto-reopen branch would
-                // immediately re-load the backup from `loaded_backup_folder`
-                // on the very next frame.
+            AppTab::Inspect => {
+                // The tab's own Close Backup closes it everywhere, before the share below
+                // could re-load it from the shared folder on the next frame.
                 if self.inspect_tab.take_close_backup_request() {
-                    self.loaded_backup_folder = None;
+                    self.app.close_shared_backup();
                     self.restore_tab.clear_backup();
                 }
 
-                // Share backup folder between tabs
-                if let Some(new_backup) = self.inspect_tab.get_loaded_backup() {
-                    if self.loaded_backup_folder.as_ref() != Some(&new_backup) {
-                        self.loaded_backup_folder = Some(new_backup.clone());
-                        self.restore_tab.load_backup(&new_backup);
-                    }
-                } else if !self.inspect_tab.has_backup() && !self.inspect_tab.has_loaded_source() {
-                    // Same rule: an image or device open in Inspect stays open.
-                    if let Some(folder) = self.loaded_backup_folder.as_ref() {
-                        self.inspect_tab.load_backup(folder);
-                    }
+                // Same rule: an image or device open in Inspect stays open.
+                let empty = !self.inspect_tab.has_backup() && !self.inspect_tab.has_loaded_source();
+                match self
+                    .app
+                    .share_backup(self.inspect_tab.get_loaded_backup(), empty)
+                {
+                    ShareStep::Publish(folder) => self.restore_tab.load_backup(&folder),
+                    ShareStep::Adopt(folder) => self.inspect_tab.load_backup(&folder),
+                    ShareStep::Nothing => {}
                 }
 
-                let mut ctx = context::TabContext::new(&self.devices, &mut self.log_panel);
+                let (devices, log) = self.app.devices_and_log();
+                let mut ctx = context::TabContext::new(devices, log);
                 self.inspect_tab.show(ui, &mut ctx);
             }
-            Tab::Optical => {
-                let busy = self.busy_elsewhere(Tab::Optical);
+            AppTab::Optical => {
+                let busy = self.busy_elsewhere(AppTab::Optical);
                 self.optical_tab
-                    .show(ui, &mut self.log_panel, &mut self.progress, busy);
+                    .show(ui, &mut self.app.log, &mut self.progress, busy);
             }
-            Tab::Archives => {
-                self.archives_tab.show(ui, &mut self.log_panel);
+            AppTab::Archives => {
+                self.archives_tab.show(ui, &mut self.app.log);
             }
         });
 
@@ -1331,14 +695,14 @@ impl eframe::App for RustyBackupApp {
         if let Some(open) = self.archives_tab.take_pending_inspect_open() {
             self.inspect_tab
                 .load_image_with_tempdir(open.path, Some(open.guard));
-            self.active_tab = Tab::Inspect;
+            self.app.select_tab(AppTab::Inspect);
         }
 
         // The reverse: a Mac archive picked in the Inspect source dropdown isn't
         // a disk image, so hand it to the Archives tab and switch there.
         if let Some(path) = self.inspect_tab.take_open_archive_request() {
             self.archives_tab.open_path(path);
-            self.active_tab = Tab::Archives;
+            self.app.select_tab(AppTab::Archives);
         }
 
         // Likewise, an optical disc opened in Inspect (an ISO 9660 CD, a hybrid
@@ -1346,7 +710,7 @@ impl eframe::App for RustyBackupApp {
         // open worker flags it, so open it in the Optical tab and switch there.
         if let Some(path) = self.inspect_tab.take_open_optical_request() {
             self.optical_tab.open_image(path);
-            self.active_tab = Tab::Optical;
+            self.app.select_tab(AppTab::Optical);
         }
 
         // Show settings dialog if open

@@ -497,6 +497,8 @@ fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
     (minutes, seconds, frames)
 }
 
+crate::model::worker::finished_with_error!(RipProgress);
+
 #[cfg(test)]
 mod tests {
     use super::*;

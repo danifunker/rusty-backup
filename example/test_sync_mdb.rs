@@ -1,6 +1,6 @@
 // Open a fresh blank HFS image, call sync_metadata, check primary vs alt MDB byte 10.
-use rusty_backup::fs::filesystem::EditableFilesystem;
-use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+use disk_core::filesystem::EditableFilesystem;
+use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
 use std::io::Cursor;
 
 fn main() {

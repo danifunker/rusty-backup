@@ -30,9 +30,9 @@ use std::sync::{Arc, Mutex};
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::model::provision_runner::{self, ProvisionRequest};
-use crate::partition::format_size;
 use crate::partition::provision::{self, Geometry, PartSpec};
 use crate::partition::type_catalog::TableKind;
+use disk_core::display::format_size;
 
 #[derive(Debug, Subcommand)]
 pub enum PartitionedHdCommand {
@@ -231,7 +231,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         for (dostype, image) in &handlers {
             log_stderr(format!(
                 "embedded {} handler ({}) in the RDB FileSystemHeader chain",
-                crate::partition::rdb::format_dos_type(*dostype),
+                part_tables::rdb::format_dos_type(*dostype),
                 format_size(image.len() as u64),
             ));
         }
@@ -248,11 +248,8 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
             .append(true)
             .open(&args.image)
             .with_context(|| format!("reopening {}", args.image.display()))?;
-        std::io::Write::write_all(
-            &mut img,
-            &crate::rbformats::vhd::build_vhd_footer(disk_size),
-        )
-        .context("appending the VHD footer")?;
+        std::io::Write::write_all(&mut img, &dsk_vm::vhd::build_vhd_footer(disk_size))
+            .context("appending the VHD footer")?;
         log_stderr("appended a fixed-VHD footer (Disk Management can attach the file)");
     }
 
@@ -320,7 +317,7 @@ fn parse_filesystems(specs: &[String], kind: TableKind) -> Result<Vec<(u32, Vec<
         let (type_text, path) = spec
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--filesystem wants DOSTYPE=PATH, got '{spec}'"))?;
-        let dostype = crate::partition::rdb::parse_dos_type(type_text).ok_or_else(|| {
+        let dostype = part_tables::rdb::parse_dos_type(type_text).ok_or_else(|| {
             anyhow::anyhow!(
                 "bad Amiga DosType '{type_text}' in --filesystem (try `partmap types --table rdb`)"
             )

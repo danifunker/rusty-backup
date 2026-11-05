@@ -16,7 +16,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use rusty_backup::fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus;
+use fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus;
 use rusty_backup::os::SectorAlignedReader;
 use rusty_backup::partition::PartitionTable;
 

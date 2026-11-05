@@ -13,7 +13,7 @@ use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 
 use crate::fs;
-use crate::partition::{self, PartitionInfo};
+use crate::partition::PartitionInfo;
 
 use super::{log, set_operation, BackupProgress, LogLevel};
 
@@ -117,9 +117,9 @@ pub(super) fn analyze_partitions(
                              data={} stream={} original={} mode={}",
                             part.index,
                             result.clusters_used,
-                            partition::format_size(result.data_size),
-                            partition::format_size(result.compacted_size),
-                            partition::format_size(result.original_size),
+                            disk_core::display::format_size(result.data_size),
+                            disk_core::display::format_size(result.compacted_size),
+                            disk_core::display::format_size(result.original_size),
                             if result.compacted_size == result.original_size {
                                 "layout-preserving (free blocks -> zeros)"
                             } else {
@@ -187,7 +187,7 @@ pub(super) fn analyze_partitions(
                                      full {} instead of just its used extent",
                                     part.index,
                                     part.type_name,
-                                    partition::format_size(part.size_bytes),
+                                    disk_core::display::format_size(part.size_bytes),
                                 ),
                             );
                             None
@@ -201,7 +201,7 @@ pub(super) fn analyze_partitions(
                                 "Partition-{}: cannot reopen source to find its trim point \
                                  ({e}); imaging the full {}",
                                 part.index,
-                                partition::format_size(part.size_bytes),
+                                disk_core::display::format_size(part.size_bytes),
                             ),
                         );
                         None
@@ -233,7 +233,7 @@ pub(super) fn analyze_partitions(
                     format!(
                         "Partition-{}: reusing precomputed defragmented minimum {} (skipped volume walk)",
                         part.index,
-                        partition::format_size(v),
+                        disk_core::display::format_size(v),
                     ),
                 );
             }
@@ -290,7 +290,7 @@ pub(super) fn analyze_partitions(
                         format!(
                             "Partition-{}: defragmented minimum {}",
                             part.index,
-                            partition::format_size(d)
+                            disk_core::display::format_size(d)
                         ),
                     );
                 } else {

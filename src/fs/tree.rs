@@ -4,9 +4,9 @@
 //! - `format_tree` — file/directory names with sizes
 //! - `format_tree_with_ids` — same, plus filesystem IDs (CNID for HFS, inode for ext, etc.)
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Format a GNU tree-style listing of all files and directories.
 ///
@@ -140,7 +140,7 @@ fn walk_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::entry::EntryType;
+    use disk_core::entry::EntryType;
 
     struct MockFs;
 

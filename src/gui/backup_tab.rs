@@ -1,257 +1,62 @@
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+//! The Backup tab: the egui shell of `controller::backup::BackupController`.
+//!
+//! The tab draws the source picker, the partition grid, the options form, the VHD options window
+//! and the Remote Drive window from the controller's accessors, maps clicks to `BackupAction`s,
+//! answers the controller's pickers through an `EffectHost`, moves its log lines into the log
+//! panel and mirrors a running backup onto the shared progress bar. The CHD options control is
+//! widget state; its choice travels with Start.
 
-use rusty_backup::backup::{
-    metadata::SizePolicy, BackupConfig, BackupProgress, ChecksumType, CompressionType,
-    LogLevel as BackupLogLevel,
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
+use rusty_backup::controller::backup::{
+    format_size, BackupAction, BackupController, BackupServices, ChdChoice, ChdProfile,
+    ChecksumType, CompactCell, CompressionType, HostRequest, MinCell, SPLIT_MIB_MAX, SPLIT_MIB_MIN,
 };
-use rusty_backup::fs;
-use rusty_backup::rbformats::chd_options::{
-    codec_label, parse_codec_string, ChdOptions, ChdProfile,
-};
-use rusty_backup::update::UpdateConfig;
+use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::{Controller as _, Effect};
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
-use rusty_backup::model::size_mode::SizeMode;
-use rusty_backup::model::status::VhdExportStatus;
-use rusty_backup::partition::PartitionSizeOverride;
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
-use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
-
 use super::context::TabContext;
+use super::effects::{EffectHost, Reply};
 use super::progress::ProgressState;
 
-/// State for the Backup tab.
+fn new_controller() -> BackupController {
+    BackupController::new(BackupServices {
+        jobs: rusty_backup::controller::backup::JobRegistry::new(),
+        notify: Arc::new(super::ui_logger::EguiWake),
+    })
+}
+
 pub struct BackupTab {
-    /// In-memory mirror of the Backup mode's recent-image MRU (config.json),
-    /// seeded at construction and refreshed on each image open; drives the
-    /// "Recent..." quick-pick beside the source dropdown.
+    ctl: BackupController,
+    /// Pickers the controller asks for.
+    effects: EffectHost,
+    /// Effects from a call made outside `show`, run on the next frame.
+    pending_fx: Vec<Effect>,
+    /// In-memory mirror of the Backup recent-image list (config.json), for the Recent dropdown.
     recent_files: Vec<String>,
-    selected_device_idx: Option<usize>,
-    image_file_path: Option<PathBuf>,
-    /// Holds the decompressed `.adz` / `.hdz` payload alive for the
-    /// lifetime of `image_file_path` when it points at a synthesized
-    /// tempfile.
-    amiga_tempdir: Option<tempfile::TempDir>,
-    destination_folder: Option<PathBuf>,
-    backup_name: String,
-    sector_by_sector: bool,
-    /// When `false` (default), a FAT volume's swap/page files are imaged
-    /// full-size but zeroed (§6 Level-1, the cb-dos `/KEEPSWAP` sibling); when
-    /// `true`, swap is imaged verbatim. Drives the "Keep swap/page-file content"
-    /// checkbox.
-    keep_swap: bool,
-    resize_partitions: bool,
-    split_archives: bool,
-    split_size_mib: u32,
-    checksum_type: ChecksumType,
-    compression_type: CompressionType,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
     chd_hd_control: ChdOptionsControl,
-    backup_running: bool,
-    backup_progress: Option<Arc<Mutex<BackupProgress>>>,
-    /// Auto-loaded partition info for the selected source
-    source_partitions: Vec<PartitionInfo>,
-    /// Which partitions are selected for backup (by partition index)
-    selected_partitions: HashSet<usize>,
-    /// Minimum sizes per partition (indexed by partition index), from filesystem analysis
-    partition_min_sizes: std::collections::HashMap<usize, u64>,
-    /// Defragmented-minimum sizes per partition (HFS+/HFSX only — the smaller
-    /// value the clone pipeline can achieve when defrag is opted in).
-    partition_defrag_min_sizes: std::collections::HashMap<usize, u64>,
-    /// Fragmentation percent per partition (HFS+/HFS, populated after the
-    /// min-size walk completes). Drives the auto-check threshold on the
-    /// per-partition Defrag checkbox.
-    partition_fragmentation: std::collections::HashMap<usize, f32>,
-    /// User-controlled per-partition Defrag toggle. Auto-checked when
-    /// fragmentation >= 90%. Only meaningful for filesystems with a
-    /// defragmenting writer (HFS+/HFSX); the disabled checkbox shown on
-    /// other layout-preserving filesystems writes here but the backup
-    /// engine ignores it (until those FSes get a real clone pipeline).
-    partition_defrag_enabled: std::collections::HashMap<usize, bool>,
-    /// Tracks which partition indices have already had their default
-    /// (frag >= 90%) auto-applied. Prevents re-overriding the user's
-    /// explicit toggle when min-size is re-run.
-    partition_defrag_default_applied: std::collections::HashSet<usize>,
-    /// Partitions whose minimum size requires an expensive volume walk; the
-    /// VHD-export popup surfaces a "Calc min" button per index.
-    deferred_min_sizes: std::collections::HashMap<usize, &'static str>,
-    /// Currently-running per-partition min-size worker threads.
-    pending_min_size_calcs: std::collections::HashMap<
-        usize,
-        Arc<Mutex<rusty_backup::model::min_size_runner::MinSizeStatus>>,
-    >,
-    /// Last phase string logged for each in-flight min-size calc, so we
-    /// can emit a log line on each transition without spamming.
-    last_logged_min_size_phase: std::collections::HashMap<usize, String>,
-    /// Open file handle for the source (kept alive so min-size workers can clone it).
-    source_file: Option<Arc<File>>,
-    /// Device path this tab escalated, so Close Source can release that one
-    /// cached descriptor and let the drive eject.
-    open_device_path: Option<PathBuf>,
-    /// Human-readable description of the partition table type for the
-    /// currently-loaded source (e.g. "MBR", "GPT", "APM"). Shown above
-    /// the partition list.
-    source_partition_table_desc: Option<String>,
-    /// When the user clicks Start Backup with `resize_partitions` on but one
-    /// or more selected partitions still need their min-size walked, we
-    /// fire those calcs and arm this flag. As soon as the pending set is
-    /// empty `show()` clears the flag and calls `start_backup` for real.
-    pending_backup_after_min_sizes: bool,
-    partition_load_error: Option<String>,
-    /// Change detection for auto-load
-    prev_device_idx: Option<usize>,
-    /// Identity of the device behind `prev_device_idx` when it was loaded.
-    prev_device_identity: Option<rusty_backup::device::DeviceIdentity>,
-    prev_image_path: Option<PathBuf>,
-    /// VHD backup popup state
-    vhd_popup_open: bool,
-    vhd_whole_disk: bool,
-    vhd_partition_configs: Vec<VhdPartitionConfig>,
-    /// VHD whole-disk export status (runs independently from run_backup)
-    vhd_export_status: Option<Arc<Mutex<VhdExportStatus>>>,
-    /// Remote-source state: when active, the backup source is a physical drive
-    /// (or image) on an `rb-cli serve` daemon, pulled over the block tier.
-    #[cfg(feature = "remote")]
-    remote: RemoteSourceState,
+    /// The shared progress bar shows this tab's job.
+    showing_bar: bool,
 }
 
-/// Backup-tab state for a remote source (a drive/image on a daemon).
-///
-/// A small state machine: open the connect dialog -> connect+list devices on a
-/// worker -> pick a device -> load its partition table over the wire -> the
-/// usual partition-selection UI drives a `run_backup_from(BackupSource::Remote)`.
-/// Network ops run on a worker thread surfaced through `status`.
-#[cfg(feature = "remote")]
-#[derive(Default)]
-struct RemoteSourceState {
-    /// `Some` while the connect dialog is open; holds the host:port input.
-    dialog_addr: Option<String>,
-    /// The live shared connection once connected.
-    conn: Option<Arc<Mutex<rusty_backup::remote::RemoteConnection>>>,
-    /// `addr` we connected to, for display labels.
-    addr: Option<String>,
-    /// Devices advertised by the daemon (after a successful connect).
-    devices: Vec<rusty_backup::remote::protocol::WireDevice>,
-    /// The picked source: `(device_path, display_label)`. `Some` => remote
-    /// source is the active backup source.
-    selected: Option<(String, String)>,
-    /// Background connect/list/load worker status.
-    status: Option<Arc<Mutex<RemoteOpStatus>>>,
-    /// Last error, shown inline.
-    error: Option<String>,
-}
-
-/// One pending remote network op (connect+list, or load-source) for the Backup
-/// tab. The worker fills exactly one of the result fields, then `finished`.
-#[cfg(feature = "remote")]
-#[derive(Default)]
-struct RemoteOpStatus {
-    finished: bool,
-    error: Option<String>,
-    /// connect+list result.
-    connected: Option<(
-        Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
-        Vec<rusty_backup::remote::protocol::WireDevice>,
-    )>,
-    /// load-source result.
-    loaded: Option<rusty_backup::model::backup_remote::RemoteSourceInfo>,
-}
-
-impl rusty_backup::model::worker::WorkerStatus for RemoteOpStatus {
-    fn fail(&mut self, message: String) {
-        self.error = Some(message);
-        self.finished = true;
-    }
-}
-
-/// Per-partition size config for VHD backup popup.
-#[derive(Debug, Clone)]
-struct VhdPartitionConfig {
-    index: usize,
-    type_name: String,
-    start_lba: u64,
-    original_size: u64,
-    minimum_size: u64,
-    choice: SizeMode,
-    custom_size_mib: u32,
-    /// Filesystem name when the minimum size requires an expensive walk
-    /// (deferred at popup-open time). Cleared when the user clicks "Calc min"
-    /// and the worker finishes successfully.
-    deferred_fs: Option<&'static str>,
-}
-
-impl VhdPartitionConfig {
-    fn effective_size(&self) -> u64 {
-        self.choice
-            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
-    }
-}
-
-impl Default for BackupTab {
-    fn default() -> Self {
+impl BackupTab {
+    pub fn new(recent: RecentHandle) -> Self {
+        let mut chd = ChdOptionsControl::new(ChdProfile::Hd);
+        // The last Custom codecs and hunk size wait in the Custom slot.
+        chd.custom = BackupController::saved_chd_custom(chd.custom.clone());
         Self {
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Backup),
-            selected_device_idx: None,
-            image_file_path: None,
-            amiga_tempdir: None,
-            destination_folder: None,
-            backup_name: String::new(),
-            sector_by_sector: false,
-            keep_swap: false,
-            resize_partitions: true,
-            split_archives: true,
-            split_size_mib: 4000,
-            checksum_type: ChecksumType::Sha256,
-            compression_type: CompressionType::Zstd,
-            chd_hd_control: {
-                let mut ctl = ChdOptionsControl::new(ChdProfile::Hd);
-                // Restore last-used custom codec/hunk choices so users don't
-                // re-tune every launch. Defaults/MiSTer presets are pure
-                // functions so we don't persist mode — restored values land
-                // in the Custom slot, ready to apply once the user flips into
-                // Custom mode.
-                let cfg = UpdateConfig::load();
-                if let Some(spec) = cfg.last_chd_codecs.as_deref() {
-                    if let Ok(codecs) = parse_codec_string(spec) {
-                        ctl.custom.codecs = codecs;
-                    }
-                }
-                if let Some(hs) = cfg.last_chd_hunk_size {
-                    if hs % 512 == 0 {
-                        ctl.custom.hunk_size = hs;
-                    }
-                }
-                ctl
-            },
-            backup_running: false,
-            backup_progress: None,
-            source_partitions: Vec::new(),
-            selected_partitions: HashSet::new(),
-            partition_min_sizes: std::collections::HashMap::new(),
-            partition_defrag_min_sizes: std::collections::HashMap::new(),
-            partition_fragmentation: std::collections::HashMap::new(),
-            partition_defrag_enabled: std::collections::HashMap::new(),
-            partition_defrag_default_applied: std::collections::HashSet::new(),
-            deferred_min_sizes: std::collections::HashMap::new(),
-            pending_min_size_calcs: std::collections::HashMap::new(),
-            last_logged_min_size_phase: std::collections::HashMap::new(),
-            source_file: None,
-            open_device_path: None,
-            source_partition_table_desc: None,
-            pending_backup_after_min_sizes: false,
-            partition_load_error: None,
-            prev_device_idx: None,
-            prev_device_identity: None,
-            prev_image_path: None,
-            vhd_popup_open: false,
-            vhd_whole_disk: true,
-            vhd_partition_configs: Vec::new(),
-            vhd_export_status: None,
-            #[cfg(feature = "remote")]
-            remote: RemoteSourceState::default(),
+            ctl: new_controller(),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+            recent_files: recent.list(RecentMode::Backup),
+            recent,
+            chd_hd_control: chd,
+            showing_bar: false,
         }
     }
 }
@@ -259,39 +64,115 @@ impl Default for BackupTab {
 impl BackupTab {
     /// A backup or whole-disk VHD export is in flight.
     pub fn is_running(&self) -> bool {
-        self.backup_running || self.vhd_export_status.is_some()
+        self.ctl.is_running()
     }
 
-    /// Drain the workers while another tab is showing, so a job keeps
-    /// reporting and its completion is not missed after a tab switch.
+    /// Drain the controller while another tab shows, so a job keeps reporting and its end is seen.
     pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
-        self.poll_progress(ctx, progress);
-        self.poll_vhd_export(ctx, progress);
-        #[cfg(feature = "remote")]
-        self.poll_remote(ctx);
-        self.poll_min_size_calcs(ctx);
+        self.poll(ctx, progress);
+    }
+
+    /// Open `path` as the source (drag-and-drop); a wrapped image is decoded first.
+    pub fn open_image(&mut self, path: PathBuf) {
+        self.act(BackupAction::OpenImage {
+            path,
+            rename: false,
+        });
+    }
+
+    /// Drop the in-memory recent list after Settings cleared the persisted one.
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
+    }
+
+    /// Send an action; its effects run on the next frame.
+    fn act(&mut self, action: BackupAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
+        self.carry_out_requests();
+    }
+
+    fn carry_out_requests(&mut self) {
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(path) => {
+                    self.recent_files = super::push_recent(&self.recent, RecentMode::Backup, &path)
+                }
+            }
+        }
+    }
+
+    fn poll(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        self.carry_out_requests();
+        for (level, msg) in self.ctl.take_log() {
+            match level {
+                LogLevel::Info => ctx.log.info(msg),
+                LogLevel::Warning => ctx.log.warn(msg),
+                LogLevel::Error => ctx.log.error(msg),
+            }
+        }
+        match self.ctl.progress() {
+            Some(bar) => {
+                progress.active = true;
+                progress.operation = bar.operation;
+                progress.current_bytes = bar.current_bytes;
+                progress.total_bytes = bar.total_bytes;
+                progress.full_size_bytes = bar.full_size_bytes;
+                progress.record_sample();
+                self.showing_bar = true;
+            }
+            None if self.showing_bar => {
+                progress.active = false;
+                self.showing_bar = false;
+            }
+            None => {}
+        }
+    }
+
+    /// Run the effects waiting; picker answers go back to the controller.
+    fn run_effects(&mut self, ui: &egui::Ui, ctx: &mut TabContext) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ui.ctx(), fx, &mut messages);
+        replies.extend(self.effects.show(ui.ctx(), "backup"));
+        for msg in messages {
+            ctx.log.info(msg);
+        }
+        for reply in replies {
+            let action = match reply {
+                Reply::Picked { purpose, path } => BackupAction::Picked { purpose, path },
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => continue,
+            };
+            self.act(action);
+        }
+        if !self.pending_fx.is_empty() {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn source_label(&self, ctx: &TabContext) -> String {
+        if let Some(d) = self.ctl.remote_label() {
+            format!("Remote: {d}")
+        } else if let Some(path) = self.ctl.image_path() {
+            format!("Image: {}", path.display())
+        } else if let Some(idx) = self.ctl.device_slot() {
+            ctx.devices
+                .get(idx)
+                .map(|d| d.display_name())
+                .unwrap_or_else(|| "Unknown".into())
+        } else {
+            "Select a device or image...".into()
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
-        // Poll background backup thread
-        self.poll_progress(ctx, progress);
-
-        // Poll a pending remote connect / device-load worker
-        #[cfg(feature = "remote")]
-        self.poll_remote(ctx);
-
-        // Poll any pending per-partition minimum-size calculations
-        self.poll_min_size_calcs(ctx);
-
-        // If the user clicked Start Backup while min-size calcs were still
-        // pending, kick off the real backup as soon as the last one lands.
-        if self.pending_backup_after_min_sizes
-            && self.pending_min_size_calcs.is_empty()
-            && !self.backup_running
-        {
-            self.pending_backup_after_min_sizes = false;
-            self.start_backup(ctx);
-        }
+        self.ctl.reconcile_devices(ctx.devices);
+        self.poll(ctx, progress);
 
         ui.heading("Backup Disk");
         ui.add_space(8.0);
@@ -302,47 +183,44 @@ impl BackupTab {
                 super::context::busy_elsewhere_notice(tab),
             );
         }
-        let controls_enabled = !self.backup_running && ctx.busy_elsewhere.is_none();
+        let running = self.ctl.is_running();
+        let controls_enabled = !running && ctx.busy_elsewhere.is_none();
 
-        // Source device / image
+        self.show_source(ui, ctx, controls_enabled);
+        #[cfg(feature = "remote")]
+        self.show_remote_window(ui);
+        self.show_partitions(ui, controls_enabled);
+        self.show_options(ui, controls_enabled);
+
+        ui.add_space(16.0);
+        self.show_buttons(ui, ctx);
+        if self.ctl.vhd_open() {
+            self.show_vhd_window(ui, ctx);
+        }
+        self.run_effects(ui, ctx);
+    }
+
+    fn show_source(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, controls_enabled: bool) {
+        let mut actions = Vec::new();
         ui.horizontal(|ui| {
             ui.label("Source:");
             ui.add_enabled_ui(controls_enabled, |ui| {
-                #[cfg(feature = "remote")]
-                let remote_label = self.remote.selected.as_ref().map(|(_, d)| d.clone());
-                #[cfg(not(feature = "remote"))]
-                let remote_label: Option<String> = None;
-
-                let current_label = if let Some(d) = &remote_label {
-                    format!("Remote: {d}")
-                } else if let Some(path) = &self.image_file_path {
-                    format!("Image: {}", path.display())
-                } else if let Some(idx) = self.selected_device_idx {
-                    ctx.devices
-                        .get(idx)
-                        .map(|d| d.display_name())
-                        .unwrap_or_else(|| "Unknown".into())
-                } else {
-                    "Select a device or image...".into()
-                };
-
+                let current_label = self.source_label(ctx);
+                let slot = self.ctl.device_slot();
                 egui::ComboBox::from_id_salt("backup_source")
                     .selected_text(&current_label)
                     .width(400.0)
-                    .height(400.0) // Allow more items to be visible without scrolling
+                    .height(400.0)
                     .show_ui(ui, |ui| {
                         for (i, device) in ctx.devices.iter().enumerate() {
                             if ui
-                                .selectable_value(
-                                    &mut self.selected_device_idx,
-                                    Some(i),
-                                    device.display_name(),
-                                )
+                                .selectable_label(slot == Some(i), device.display_name())
                                 .clicked()
                             {
-                                self.image_file_path = None;
-                                self.amiga_tempdir = None;
-                                self.update_backup_name(ctx);
+                                actions.push(BackupAction::SelectDevice {
+                                    slot: i,
+                                    device: device.clone(),
+                                });
                             }
                         }
                         if ctx.devices.is_empty() {
@@ -354,85 +232,41 @@ impl BackupTab {
                         }
                         ui.separator();
                         if ui
-                            .selectable_label(self.image_file_path.is_some(), "Open Image File...")
+                            .selectable_label(self.ctl.image_path().is_some(), "Open Image File...")
                             .clicked()
                         {
-                            if let Some(path) = super::file_dialog()
-                                .add_filter(
-                                    "Disk Images",
-                                    rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                                )
-                                .add_filter(
-                                    "Mac archives",
-                                    rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-                                )
-                                .add_filter("All Files", &["*"])
-                                .pick_file()
-                            {
-                                self.selected_device_idx = None;
-                                self.recent_files = super::push_recent(
-                                    rusty_backup::update::RecentMode::Backup,
-                                    &path,
-                                );
-                                // Backup decodes floppy containers to a flat
-                                // image (true): it needs a raw sector stream to
-                                // compress.
-                                match super::prepare_disk_image_path(&path, true) {
-                                    Ok((materialized, guard)) => {
-                                        self.image_file_path = Some(materialized);
-                                        self.amiga_tempdir = guard;
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to decompress {}: {}",
-                                            path.display(),
-                                            e
-                                        );
-                                        self.image_file_path = Some(path);
-                                        self.amiga_tempdir = None;
-                                    }
-                                }
-                                self.update_backup_name(ctx);
-                            }
+                            actions.push(BackupAction::PickImage);
                         }
                         #[cfg(feature = "remote")]
                         {
                             ui.separator();
                             if ui
-                                .selectable_label(self.remote_active(), "Remote Drive...")
+                                .selectable_label(self.ctl.remote_active(), "Remote Drive...")
                                 .on_hover_text(
                                     "Back up a physical drive on a remote machine running \
                                      `rb-cli serve` (pulled over the network)",
                                 )
                                 .clicked()
                             {
-                                // Open the connect dialog (host:port).
-                                self.remote.dialog_addr =
-                                    Some(self.remote.addr.clone().unwrap_or_default());
+                                actions.push(BackupAction::RemoteOpen);
                             }
                         }
                     });
                 if let Some(path) = super::recent_combo(ui, "backup_recent", &self.recent_files, 5)
                 {
-                    self.open_image(path);
-                    self.update_backup_name(ctx);
+                    actions.push(BackupAction::OpenImage { path, rename: true });
                 }
             });
-            #[cfg(feature = "remote")]
-            if self.remote_active()
+            if self.ctl.remote_active()
                 && controls_enabled
                 && ui
                     .button("X")
                     .on_hover_text("Disconnect / clear the remote source")
                     .clicked()
             {
-                self.clear_remote();
+                actions.push(BackupAction::RemoteClear);
             }
-
-            // Release a selected LOCAL device or image so the drive can be
-            // safely removed and the partition selection reset. (Remote
-            // sources use the "X" button above.)
-            if (self.selected_device_idx.is_some() || self.image_file_path.is_some())
+            if self.ctl.has_local_source()
                 && controls_enabled
                 && ui
                     .button("Close Drive")
@@ -442,58 +276,13 @@ impl BackupTab {
                     )
                     .clicked()
             {
-                self.close_source();
+                actions.push(BackupAction::CloseSource);
             }
         });
 
-        // When the user picks a LOCAL device/image while a remote source was
-        // active, drop the remote source so the two don't fight.
-        #[cfg(feature = "remote")]
-        if self.remote_active()
-            && (self.selected_device_idx.is_some() || self.image_file_path.is_some())
-        {
-            self.clear_remote();
-        }
-
-        // Remote connect dialog + device picker.
-        #[cfg(feature = "remote")]
-        self.show_remote_picker(ui, ctx);
-
-        // Auto-load partition info when source changes (local sources only —
-        // a remote source loads its own partitions via the device picker).
-        if !self.backup_running && !self.remote_active() {
-            // "Refresh Devices" can put another disk, or nothing, at this index.
-            let mut device_identity =
-                rusty_backup::device::identity_at(ctx.devices, self.selected_device_idx);
-            if self.selected_device_idx.is_some() && device_identity.is_none() {
-                ctx.log
-                    .warn("The selected source device is no longer listed; clearing it.");
-                self.selected_device_idx = None;
-                device_identity = None;
-            }
-            let source_changed = self.selected_device_idx != self.prev_device_idx
-                || device_identity != self.prev_device_identity
-                || self.image_file_path != self.prev_image_path;
-            if source_changed {
-                self.prev_device_idx = self.selected_device_idx;
-                self.prev_device_identity = device_identity;
-                self.prev_image_path = self.image_file_path.clone();
-                // A Start Backup waiting on the old source's minimum sizes must
-                // not fire on the new one the moment its (empty) map clears.
-                self.pending_backup_after_min_sizes = false;
-                self.load_partition_preview(ctx);
-            }
-        }
-
-        // Devices are not auto-scanned (that would prompt for elevation on every
-        // dropdown change); the button stays so a swapped card can be re-read.
-        if !self.backup_running
-            && self.selected_device_idx.is_some()
-            && self.image_file_path.is_none()
-        {
-            let populated =
-                !self.source_partitions.is_empty() || self.partition_load_error.is_some();
-            let (label, hint) = if populated {
+        // Devices are not auto-scanned (that would prompt for elevation on every pick).
+        if self.ctl.can_scan_device() {
+            let (label, hint) = if self.ctl.device_scanned() {
                 (
                     "Reload partition info",
                     "Read the partition table again, e.g. after swapping the card in this reader",
@@ -507,42 +296,50 @@ impl BackupTab {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button(label).on_hover_text(hint).clicked() {
-                    self.scan_source_partitions(ctx);
+                    actions.push(BackupAction::ScanPartitions);
                 }
             });
         }
-
-        if !self.source_partitions.is_empty() {
+        if let Some(snap) = self.ctl.decoding() {
             ui.add_space(4.0);
-            if let Some(desc) = &self.source_partition_table_desc {
+            super::progress::show_job(ui, &snap);
+        }
+        if let Some(snap) = self.ctl.scanning() {
+            ui.add_space(4.0);
+            if super::progress::show_job(ui, &snap) {
+                actions.push(BackupAction::CancelScan);
+            }
+        }
+        for a in actions {
+            self.act(a);
+        }
+    }
+
+    fn show_partitions(&mut self, ui: &mut egui::Ui, controls_enabled: bool) {
+        let mut actions = Vec::new();
+        if self.ctl.has_partitions() {
+            ui.add_space(4.0);
+            if let Some(desc) = self.ctl.table_desc() {
+                let n = self.ctl.partition_count();
                 ui.label(format!(
                     "Partition table: {} ({} partition{})",
                     desc,
-                    self.source_partitions.len(),
-                    if self.source_partitions.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
+                    n,
+                    if n == 1 { "" } else { "s" },
                 ));
             }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Partitions:").strong());
                 ui.add_enabled_ui(controls_enabled, |ui| {
                     if ui.small_button("All").clicked() {
-                        for part in &self.source_partitions {
-                            if !part.is_extended_container {
-                                self.selected_partitions.insert(part.index);
-                            }
-                        }
+                        actions.push(BackupAction::SelectAll);
                     }
                     if ui.small_button("None").clicked() {
-                        self.selected_partitions.clear();
+                        actions.push(BackupAction::SelectNone);
                     }
                 });
             });
-            let mut min_size_calc_request: Option<usize> = None;
-            let mut defrag_toggles: Vec<(usize, bool)> = Vec::new();
+            let rows = self.ctl.rows();
             ui.add_enabled_ui(controls_enabled, |ui| {
                 egui::Grid::new("backup_partitions_grid")
                     .num_columns(7)
@@ -566,146 +363,100 @@ impl BackupTab {
                             );
                         ui.end_row();
 
-                        for (pos, part) in self.source_partitions.iter().enumerate() {
-                            if part.is_extended_container {
-                                continue;
-                            }
-                            let mut selected = self.selected_partitions.contains(&part.index);
+                        for row in &rows {
+                            let mut selected = row.selected;
                             if ui.checkbox(&mut selected, "").changed() {
-                                if selected {
-                                    self.selected_partitions.insert(part.index);
-                                } else {
-                                    self.selected_partitions.remove(&part.index);
-                                }
+                                actions.push(BackupAction::SetPartition(row.index, selected));
                             }
-                            // Position, matching `inspect`'s `#` and `--partitions N`;
-                            // selection still keys on the slot in `part.index`.
-                            ui.label(format!("{}", pos + 1));
-                            ui.label(&part.type_name);
-                            ui.label(partition::format_size(part.size_bytes));
-
-                            // Min-size cell: value (toggle-aware), spinner, "Calc min" button,
-                            // or blank.
-                            let effective = self.effective_min_size(
-                                part.index,
-                                part.gate_type_byte(),
-                                part.partition_type_string.as_deref(),
-                            );
-                            if let Some(min) = effective.filter(|&sz| sz < part.size_bytes) {
-                                ui.label(partition::format_size(min));
-                            } else if let Some(pending) =
-                                self.pending_min_size_calcs.get(&part.index)
-                            {
-                                let phase = pending
-                                    .lock()
-                                    .map(|s| s.phase.clone())
-                                    .unwrap_or_else(|_| "...".to_string());
-                                ui.add(egui::Spinner::new()).on_hover_text(phase);
-                            } else if self.deferred_min_sizes.contains_key(&part.index) {
-                                if ui
-                                    .small_button("Calc min")
-                                    .on_hover_text(
-                                        "Compute minimum size (requires a filesystem walk)",
-                                    )
-                                    .clicked()
-                                {
-                                    min_size_calc_request = Some(part.index);
+                            ui.label(format!("{}", row.position));
+                            ui.label(&row.type_name);
+                            ui.label(format_size(row.size_bytes));
+                            match &row.min {
+                                MinCell::Size(min) => {
+                                    ui.label(format_size(*min));
                                 }
-                            } else {
-                                ui.label("");
-                            }
-
-                            // Fragmentation %
-                            match self.partition_fragmentation.get(&part.index).copied() {
-                                Some(pct) => {
-                                    ui.label(format!("{:.0}%", pct));
+                                MinCell::Pending(phase) => {
+                                    ui.add(egui::Spinner::new()).on_hover_text(phase.as_str());
                                 }
-                                None => {
+                                MinCell::CanCalc => {
+                                    if ui
+                                        .small_button("Calc min")
+                                        .on_hover_text(
+                                            "Compute minimum size (requires a filesystem walk)",
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(BackupAction::CalcMin(row.index));
+                                    }
+                                }
+                                MinCell::Empty => {
                                     ui.label("");
                                 }
                             }
-
-                            // Defrag checkbox: only shown for layout-preserving
-                            // filesystems where defrag would matter; disabled
-                            // (with "not implemented" tooltip) when the FS
-                            // doesn't have a clone pipeline yet.
-                            let is_layout = fs::is_layout_preserving_fs(
-                                part.gate_type_byte(),
-                                part.partition_type_string.as_deref(),
-                            );
-                            // Compact/Defrag is live when the FS has a registered
-                            // defragmenting writer (HFS+/HFSX/PFS3) OR the engine
-                            // computed a packed minimum that beats the in-place
-                            // trim (exFAT today; NTFS once its packer lands).
-                            let available = self.defrag_clone_available(
-                                part.index,
-                                part.gate_type_byte(),
-                                part.partition_type_string.as_deref(),
-                            );
-                            if is_layout || available {
-                                let mut enabled = self
-                                    .partition_defrag_enabled
-                                    .get(&part.index)
-                                    .copied()
-                                    .unwrap_or(false);
-                                let resp = ui
-                                    .add_enabled(available, egui::Checkbox::new(&mut enabled, ""));
-                                if !available {
-                                    resp.on_hover_text(
-                                        "Compact Space not yet implemented for this filesystem",
-                                    );
-                                } else if resp.changed() {
-                                    defrag_toggles.push((part.index, enabled));
+                            match row.fragmentation {
+                                Some(pct) => ui.label(format!("{:.0}%", pct)),
+                                None => ui.label(""),
+                            };
+                            match row.compact {
+                                CompactCell::Hidden => {
+                                    ui.label("");
                                 }
-                            } else {
-                                ui.label("");
+                                CompactCell::NotImplemented => {
+                                    let mut off = false;
+                                    ui.add_enabled(false, egui::Checkbox::new(&mut off, ""))
+                                        .on_hover_text(
+                                            "Compact Space not yet implemented for this filesystem",
+                                        );
+                                }
+                                CompactCell::Toggle(on) => {
+                                    let mut on = on;
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        actions.push(BackupAction::SetCompact(row.index, on));
+                                    }
+                                }
                             }
                             ui.end_row();
                         }
                     });
             });
-            for (idx, val) in defrag_toggles {
-                self.partition_defrag_enabled.insert(idx, val);
-            }
-            if let Some(idx) = min_size_calc_request {
-                self.start_min_size_calc(idx, ctx);
-            }
             ui.add_space(4.0);
         }
-        if let Some(err) = &self.partition_load_error {
+        if let Some(err) = self.ctl.load_error() {
             ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
-
-        // Keep the UI ticking while background min-size workers run so the
-        // spinner animates and results appear without requiring mouse input.
-        if !self.pending_min_size_calcs.is_empty() {
+        // Phase changes of a walk do not wake the UI, so keep the spinner moving.
+        if self.ctl.min_jobs_running() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(80));
         }
+        for a in actions {
+            self.act(a);
+        }
+    }
 
-        // Destination folder
+    fn show_options(&mut self, ui: &mut egui::Ui, controls_enabled: bool) {
+        let mut actions = Vec::new();
         ui.horizontal(|ui| {
             ui.label("Destination:");
             ui.add_enabled_ui(controls_enabled, |ui| {
                 let label = self
-                    .destination_folder
-                    .as_ref()
+                    .ctl
+                    .destination()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "No folder selected".into());
                 ui.label(&label);
                 if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog().pick_folder() {
-                        self.destination_folder = Some(path);
-                    }
+                    actions.push(BackupAction::PickDestination);
                 }
             });
         });
-
-        // Backup name
         ui.horizontal(|ui| {
             ui.label("Backup Name:");
             ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.text_edit_singleline(&mut self.backup_name);
+                let mut name = self.ctl.name().to_string();
+                if ui.text_edit_singleline(&mut name).changed() {
+                    actions.push(BackupAction::SetName(name));
+                }
             });
         });
 
@@ -713,25 +464,24 @@ impl BackupTab {
         ui.label(egui::RichText::new("Options").strong());
         ui.separator();
 
+        let opts = self.ctl.options().clone();
         ui.add_enabled_ui(controls_enabled, |ui| {
-            // Output format
             ui.horizontal(|ui| {
                 ui.label("Output Format:");
-                ui.radio_value(
-                    &mut self.compression_type,
-                    CompressionType::Chd,
-                    "CHD (Hard Disk)",
-                );
-                // DVD CHD is intentionally NOT offered here — DVDs are
-                // optical media, handled by the Optical tab. The backup
-                // tab is for hard disks only.
-                ui.radio_value(&mut self.compression_type, CompressionType::Vhd, "VHD");
-                ui.radio_value(&mut self.compression_type, CompressionType::Zstd, "zstd");
-                ui.radio_value(&mut self.compression_type, CompressionType::None, "None");
+                // DVD CHD is the Optical tab's: this tab backs up hard disks.
+                let formats = [
+                    (CompressionType::Chd, "CHD (Hard Disk)"),
+                    (CompressionType::Vhd, "VHD"),
+                    (CompressionType::Zstd, "zstd"),
+                    (CompressionType::None, "None"),
+                ];
+                for (kind, label) in formats {
+                    if ui.radio(opts.compression == kind, label).clicked() {
+                        actions.push(BackupAction::SetFormat(kind));
+                    }
+                }
             });
-
-            // CHD codec / hunk-size knobs (only visible when CHD is selected)
-            if matches!(self.compression_type, CompressionType::Chd) {
+            if opts.compression == CompressionType::Chd {
                 ui.label(
                     egui::RichText::new("Output: single CHD file (chdman/MAME compatible).")
                         .small()
@@ -745,218 +495,135 @@ impl BackupTab {
                 );
             }
 
-            // Sector-by-sector option
-            ui.checkbox(
-                &mut self.sector_by_sector,
-                "Sector-by-sector copy (includes all blank space)",
-            );
-
-            // Resize option. Sector-by-sector preserves the source byte-for-
-            // byte (free space + unrecognized regions), so resizing would
-            // defeat the point — force-disabled and unchecked while it's on.
-            if self.sector_by_sector {
-                self.resize_partitions = false;
+            let mut sbs = opts.sector_by_sector;
+            if ui
+                .checkbox(&mut sbs, "Sector-by-sector copy (includes all blank space)")
+                .changed()
+            {
+                actions.push(BackupAction::SetSectorBySector(sbs));
             }
-            ui.add_enabled_ui(!self.sector_by_sector, |ui| {
+            ui.add_enabled_ui(opts.size_options_editable(), |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.resize_partitions,
-                        "Resize partitions to minimum size",
-                    );
-                    if self.sector_by_sector {
+                    let mut resize = opts.resize;
+                    if ui
+                        .checkbox(&mut resize, "Resize partitions to minimum size")
+                        .changed()
+                    {
+                        actions.push(BackupAction::SetResize(resize));
+                    }
+                    if !opts.size_options_editable() {
                         ui.label("(not available with sector-by-sector copy)");
                     }
                 });
             });
-
-            // Swap/page-file exclusion (FAT). On by default: swap files are kept
-            // full-size but zeroed so the codec crushes them. Not applicable to a
-            // sector-by-sector copy (which images every block verbatim).
-            ui.add_enabled_ui(!self.sector_by_sector, |ui| {
+            ui.add_enabled_ui(opts.size_options_editable(), |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.keep_swap,
-                        "Keep swap/page-file content (don't exclude)",
-                    )
-                    .on_hover_text(
-                        "By default a FAT volume's swap/page files (WIN386.SWP, \
-                         386SPART.PAR, PAGEFILE.SYS, HIBERFIL.SYS, SWAPPER.DAT) are \
-                         imaged full-size but zeroed -- they reinitialize on boot, \
-                         and the codec crushes the zeros. Check to image them as-is.",
-                    );
-                    if self.sector_by_sector {
+                    let mut keep = opts.keep_swap;
+                    if ui
+                        .checkbox(&mut keep, "Keep swap/page-file content (don't exclude)")
+                        .on_hover_text(
+                            "By default a FAT volume's swap/page files (WIN386.SWP, \
+                             386SPART.PAR, PAGEFILE.SYS, HIBERFIL.SYS, SWAPPER.DAT) are \
+                             imaged full-size but zeroed -- they reinitialize on boot, \
+                             and the codec crushes the zeros. Check to image them as-is.",
+                        )
+                        .changed()
+                    {
+                        actions.push(BackupAction::SetKeepSwap(keep));
+                    }
+                    if !opts.size_options_editable() {
                         ui.label("(not available with sector-by-sector copy)");
                     }
                 });
             });
-
-            // Split archives. Hidden for CHD/DVD (chdman + MAME don't
-            // recognise split CHDs); disabled with a note for VHD (always
-            // one .vhd file).
-            let split_hidden = matches!(
-                self.compression_type,
-                CompressionType::Chd | CompressionType::Dvd
-            );
-            let split_enabled =
-                !split_hidden && !matches!(self.compression_type, CompressionType::Vhd);
-            if !split_hidden {
+            if opts.split_shown() {
+                let editable = opts.split_editable();
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(split_enabled, |ui| {
-                        ui.checkbox(&mut self.split_archives, "Split archives");
-                        if self.split_archives && split_enabled {
+                    ui.add_enabled_ui(editable, |ui| {
+                        let mut split = opts.split;
+                        if ui.checkbox(&mut split, "Split archives").changed() {
+                            actions.push(BackupAction::SetSplit(split));
+                        }
+                        if opts.split && editable {
                             ui.label("Split size (MiB):");
-                            ui.add(
-                                egui::DragValue::new(&mut self.split_size_mib).range(100..=64000),
-                            );
+                            let mut mib = opts.split_mib;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut mib)
+                                        .range(SPLIT_MIB_MIN..=SPLIT_MIB_MAX),
+                                )
+                                .changed()
+                            {
+                                actions.push(BackupAction::SetSplitMib(mib));
+                            }
                         }
                     });
-                    if !split_enabled && matches!(self.compression_type, CompressionType::Vhd) {
+                    if !editable {
                         ui.label("(not available for VHD)");
                     }
                 });
             }
-
-            // Checksum type
             ui.horizontal(|ui| {
                 ui.label("Checksum:");
-                ui.radio_value(&mut self.checksum_type, ChecksumType::Sha256, "SHA-256");
-                ui.radio_value(&mut self.checksum_type, ChecksumType::Crc32, "CRC32");
+                for (kind, label) in [
+                    (ChecksumType::Sha256, "SHA-256"),
+                    (ChecksumType::Crc32, "CRC32"),
+                ] {
+                    if ui.radio(opts.checksum == kind, label).clicked() {
+                        actions.push(BackupAction::SetChecksum(kind));
+                    }
+                }
             });
         });
+        for a in actions {
+            self.act(a);
+        }
+    }
 
-        ui.add_space(16.0);
+    /// The CHD options Start carries, from the options control.
+    fn chd_choice(&self) -> Option<ChdChoice> {
+        (self.ctl.options().compression == CompressionType::Chd).then(|| ChdChoice {
+            options: self.chd_hd_control.effective(ChdProfile::Hd),
+            custom: self.chd_hd_control.mode == ChdOptionsMode::Custom,
+        })
+    }
 
-        // Poll VHD export thread
-        self.poll_vhd_export(ctx, progress);
-
-        // Action buttons
-        let vhd_exporting = self.vhd_export_status.is_some();
+    fn show_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        let mut actions = Vec::new();
         ui.horizontal(|ui| {
-            if !self.backup_running && !vhd_exporting {
-                let has_source = self.selected_device_idx.is_some()
-                    || self.image_file_path.is_some()
-                    || self.remote_active();
-                let has_partitions =
-                    self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
-                let chd_ok = match self.compression_type {
-                    CompressionType::Chd => self.chd_hd_control.is_valid(ChdProfile::Hd),
-                    _ => true,
-                };
-                let can_start = has_source
-                    && self.destination_folder.is_some()
-                    && !self.backup_name.is_empty()
-                    && has_partitions
-                    && chd_ok;
-
-                let button_label = if self.pending_backup_after_min_sizes {
+            if !self.ctl.is_running() {
+                let chd_ok = self.ctl.options().compression != CompressionType::Chd
+                    || self.chd_hd_control.is_valid(ChdProfile::Hd);
+                let waiting = self.ctl.start_pending();
+                let label = if waiting {
                     "Computing minimum sizes..."
                 } else {
                     "Start Backup"
                 };
-                let button_enabled =
-                    can_start && !self.pending_backup_after_min_sizes && ctx.busy_elsewhere.is_none();
-                if ui
-                    .add_enabled(button_enabled, egui::Button::new(button_label))
-                    .clicked()
-                {
-                    if self.remote_active() {
-                        // A remote source routes through run_backup_from (the
-                        // whole-disk VHD popup stays local-only). For a CHD
-                        // resize-to-minimum, expensive filesystems still need a
-                        // walk over the wire first — kick those deferred calcs
-                        // and let show()'s poll loop start the backup once they
-                        // land, mirroring the local CHD branch below.
-                        if self.compression_type == CompressionType::Chd
-                            && !self.sector_by_sector
-                            && self.resize_partitions
-                            && self.has_deferred_selected_partitions()
-                        {
-                            self.kick_off_pending_min_size_calcs(ctx);
-                            self.pending_backup_after_min_sizes = true;
-                        } else {
-                            self.start_backup(ctx);
-                        }
-                    } else if self.compression_type == CompressionType::Vhd {
-                        // Scan partitions if not already loaded
-                        if self.source_partitions.is_empty() {
-                            self.scan_source_partitions(ctx);
-                        }
-                        self.init_vhd_configs();
-                        self.vhd_popup_open = true;
-                    } else if self.compression_type == CompressionType::Chd
-                        && !self.sector_by_sector
-                        && self.resize_partitions
-                        && self.has_deferred_selected_partitions()
-                    {
-                        // Resize-to-min was requested but one or more selected
-                        // partitions still need a filesystem walk. Fire those
-                        // calcs now; the poll loop in show() will call
-                        // start_backup once they all land.
-                        self.kick_off_pending_min_size_calcs(ctx);
-                        self.pending_backup_after_min_sizes = true;
-                    } else {
-                        self.start_backup(ctx);
-                    }
+                let enabled = self.ctl.can_start() && chd_ok && ctx.busy_elsewhere.is_none();
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    actions.push(BackupAction::Start(self.chd_choice()));
                 }
-                if self.pending_backup_after_min_sizes {
+                if waiting {
                     ui.add(egui::Spinner::new())
                         .on_hover_text("Waiting for minimum-size calculations to finish");
                     if ui.button("Cancel").clicked() {
-                        // Calcs already running keep running (their results
-                        // still populate `partition_min_sizes` and are useful
-                        // later); we just stop auto-launching the backup.
-                        self.pending_backup_after_min_sizes = false;
-                        ctx.log.info("Auto-backup canceled; minimum-size calculations will still complete in the background");
+                        actions.push(BackupAction::CancelPendingStart);
                     }
                 }
             } else if ui.button("Cancel").clicked() {
-                if let Some(ref progress_arc) = self.backup_progress {
-                    if let Ok(mut p) = progress_arc.lock() {
-                        p.cancel_requested = true;
-                    }
-                }
-                if let Some(ref status) = self.vhd_export_status {
-                    if let Ok(mut s) = status.lock() {
-                        s.cancel_requested = true;
-                    }
-                }
-                ctx.log.warn("Cancellation requested...");
+                actions.push(BackupAction::Cancel);
             }
         });
-
-        // VHD backup popup
-        if self.vhd_popup_open {
-            self.show_vhd_popup(ui, ctx);
+        for a in actions {
+            self.act(a);
         }
     }
 
-    fn init_vhd_configs(&mut self) {
-        self.vhd_partition_configs.clear();
-        for part in &self.source_partitions {
-            if part.is_extended_container {
-                continue;
-            }
-            let min_size = self
-                .partition_min_sizes
-                .get(&part.index)
-                .copied()
-                .unwrap_or(part.size_bytes);
-            let deferred_fs = self.deferred_min_sizes.get(&part.index).copied();
-
-            self.vhd_partition_configs.push(VhdPartitionConfig {
-                index: part.index,
-                type_name: part.type_name.clone(),
-                start_lba: part.start_lba,
-                original_size: part.size_bytes,
-                minimum_size: min_size,
-                choice: SizeMode::Original,
-                custom_size_mib: (part.size_bytes / (1024 * 1024)) as u32,
-                deferred_fs,
-            });
-        }
-    }
-
-    fn show_vhd_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+    fn show_vhd_window(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        let mut actions = Vec::new();
+        let whole = self.ctl.vhd_whole_disk();
+        let rows = self.ctl.vhd_rows().to_vec();
         egui::Window::new("VHD Backup Options")
             .collapsible(false)
             .resizable(true)
@@ -964,22 +631,17 @@ impl BackupTab {
             .show(ui.ctx(), |ui| {
                 ui.label("Configure VHD output.");
                 ui.add_space(4.0);
-
-                ui.radio_value(
-                    &mut self.vhd_whole_disk,
-                    true,
-                    "Whole Disk (single .vhd file)",
-                );
-                ui.radio_value(
-                    &mut self.vhd_whole_disk,
-                    false,
-                    "Per Partition (one .vhd per partition)",
-                );
-
+                if ui.radio(whole, "Whole Disk (single .vhd file)").clicked() {
+                    actions.push(BackupAction::VhdWholeDisk(true));
+                }
+                if ui
+                    .radio(!whole, "Per Partition (one .vhd per partition)")
+                    .clicked()
+                {
+                    actions.push(BackupAction::VhdWholeDisk(false));
+                }
                 ui.add_space(8.0);
-
-                // Per-partition sizing
-                if !self.vhd_partition_configs.is_empty() {
+                if !rows.is_empty() {
                     ui.label(egui::RichText::new("Partition Sizes:").strong());
                     egui::Grid::new("vhd_backup_partition_sizes")
                         .striped(true)
@@ -990,53 +652,51 @@ impl BackupTab {
                             ui.label(egui::RichText::new("Size Mode").strong());
                             ui.label(egui::RichText::new("Size (MiB)").strong());
                             ui.end_row();
-
-                            let mut min_calc_request: Option<usize> = None;
-                            for cfg in &mut self.vhd_partition_configs {
-                                ui.label(format!("{}", cfg.index));
-                                ui.label(&cfg.type_name);
-
-                                let pending_phase = self
-                                    .pending_min_size_calcs
-                                    .get(&cfg.index)
-                                    .and_then(|s| s.lock().ok().map(|st| st.phase.clone()));
-                                let deferred = if let Some(phase) = &pending_phase {
+                            for row in &rows {
+                                ui.label(format!("{}", row.index));
+                                ui.label(&row.type_name);
+                                let phase = self.ctl.min_phase(row.index);
+                                let deferred = if let Some(phase) = &phase {
                                     Some(super::size_mode_row::DeferredMin::Pending {
                                         phase: phase.as_str(),
                                     })
                                 } else {
-                                    cfg.deferred_fs.map(|fs_name| {
+                                    row.deferred_fs.map(|fs_name| {
                                         super::size_mode_row::DeferredMin::Available { fs_name }
                                     })
                                 };
+                                let mut mode = row.mode;
+                                let mut custom = row.custom_mib;
                                 let action = super::size_mode_row::size_mode_row(
                                     ui,
-                                    &mut cfg.choice,
-                                    &mut cfg.custom_size_mib,
-                                    cfg.original_size,
-                                    cfg.minimum_size,
+                                    &mut mode,
+                                    &mut custom,
+                                    row.original_size,
+                                    row.minimum_size,
                                     super::size_mode_row::SizeModeRowOptions {
-                                        max_size: Some(cfg.original_size),
+                                        max_size: Some(row.original_size),
                                         deferred,
                                         ..Default::default()
                                     },
                                 );
+                                if mode != row.mode || custom != row.custom_mib {
+                                    actions.push(BackupAction::VhdSize {
+                                        index: row.index,
+                                        mode,
+                                        custom_mib: custom,
+                                    });
+                                }
                                 if action
                                     == super::size_mode_row::SizeModeRowAction::CalcMinRequested
                                 {
-                                    min_calc_request = Some(cfg.index);
+                                    actions.push(BackupAction::CalcMin(row.index));
                                 }
                                 ui.end_row();
-                            }
-                            if let Some(part_index) = min_calc_request {
-                                self.start_min_size_calc(part_index, ctx);
                             }
                         });
                     ui.add_space(4.0);
                 }
-
                 ui.add_space(8.0);
-
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
@@ -1045,1171 +705,26 @@ impl BackupTab {
                         )
                         .clicked()
                     {
-                        self.vhd_popup_open = false;
-                        if self.vhd_whole_disk {
-                            self.start_vhd_whole_disk(ctx);
-                        } else {
-                            // Per-partition uses the normal backup flow
-                            self.start_backup(ctx);
-                        }
+                        actions.push(BackupAction::VhdStart);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.vhd_popup_open = false;
+                        actions.push(BackupAction::VhdClose);
                     }
                 });
             });
-    }
-
-    fn start_vhd_whole_disk(&mut self, ctx: &mut TabContext) {
-        let source_path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source selected");
-                return;
-            }
-        };
-
-        let dest_dir = match &self.destination_folder {
-            Some(d) => d.clone(),
-            None => {
-                ctx.log.error("No destination folder selected");
-                return;
-            }
-        };
-
-        // Build destination path
-        let dest_path = dest_dir.join(format!("{}.vhd", self.backup_name));
-
-        // Build partition size overrides
-        let overrides: Vec<PartitionSizeOverride> = self
-            .vhd_partition_configs
-            .iter()
-            .map(|cfg| {
-                PartitionSizeOverride::size_only(
-                    cfg.index,
-                    cfg.start_lba,
-                    cfg.original_size,
-                    cfg.effective_size(),
-                )
-            })
-            .collect();
-
-        let total_bytes: u64 = overrides.iter().map(|o| o.export_size).sum();
-
-        let status = Arc::new(Mutex::new(VhdExportStatus {
-            finished: false,
-            error: None,
-            current_bytes: 0,
-            total_bytes,
-            cancel_requested: false,
-            log_messages: Vec::new(),
-        }));
-        self.vhd_export_status = Some(Arc::clone(&status));
-        self.backup_running = true;
-
-        ctx.log.info(format!(
-            "Starting whole-disk VHD backup: {} -> {}",
-            source_path.display(),
-            dest_path.display()
-        ));
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&status),
-            "whole-disk VHD backup",
-            move || {
-                let _wake =
-                    rusty_backup::os::wakelock::acquire("Rusty Backup: whole-disk VHD backup");
-                let status2 = Arc::clone(&status);
-                let status3 = Arc::clone(&status);
-                export_whole_disk_vhd(
-                    &source_path,
-                    None,
-                    None,
-                    &overrides,
-                    &dest_path,
-                    move |bytes| {
-                        if let Ok(mut s) = status2.lock() {
-                            s.current_bytes = bytes;
-                        }
-                    },
-                    move || status3.lock().map(|s| s.cancel_requested).unwrap_or(false),
-                    |msg| {
-                        if let Ok(mut s) = status.lock() {
-                            s.log_messages.push(msg.to_string());
-                        }
-                    },
-                )?;
-                rusty_backup::model::worker::lock_status(&status).finished = true;
-                Ok(())
-            },
-        );
-    }
-
-    fn poll_vhd_export(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
-        let status_arc = match &self.vhd_export_status {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-
-        let mut status = rusty_backup::model::worker::lock_status(&status_arc);
-
-        // Drain log messages
-        for msg in status.log_messages.drain(..) {
-            ctx.log.info(msg);
-        }
-
-        // Update progress bar
-        progress_state.active = !status.finished;
-        progress_state.operation = "Exporting VHD...".to_string();
-        progress_state.current_bytes = status.current_bytes;
-        progress_state.total_bytes = status.total_bytes;
-        progress_state.full_size_bytes = 0;
-        progress_state.record_sample();
-
-        if status.finished {
-            if let Some(err) = &status.error {
-                ctx.log.error(format!("VHD backup failed: {err}"));
-            } else {
-                ctx.log.info("VHD backup completed successfully.");
-            }
-            drop(status);
-            self.vhd_export_status = None;
-            self.backup_running = false;
+        for a in actions {
+            self.act(a);
         }
     }
 
-    /// True if any selected (non-extended) partition has a deferred minimum
-    /// size that hasn't been computed yet. Used to decide whether to fire
-    /// background calcs before kicking off a resize-to-minimum CHD backup.
-    fn has_deferred_selected_partitions(&self) -> bool {
-        self.source_partitions.iter().any(|part| {
-            !part.is_extended_container
-                && self.selected_partitions.contains(&part.index)
-                && !self.partition_min_sizes.contains_key(&part.index)
-                && self.deferred_min_sizes.contains_key(&part.index)
-        })
-    }
-
-    /// Fire `start_min_size_calc` for every selected partition that still
-    /// has a deferred min size and isn't already running. Safe to call when
-    /// some calcs are already in flight — duplicates are filtered out by
-    /// `start_min_size_calc` itself.
-    fn kick_off_pending_min_size_calcs(&mut self, ctx: &mut TabContext) {
-        let indices: Vec<usize> = self
-            .source_partitions
-            .iter()
-            .filter(|p| {
-                !p.is_extended_container
-                    && self.selected_partitions.contains(&p.index)
-                    && !self.partition_min_sizes.contains_key(&p.index)
-                    && self.deferred_min_sizes.contains_key(&p.index)
-            })
-            .map(|p| p.index)
-            .collect();
-        for idx in indices {
-            self.start_min_size_calc(idx, ctx);
-        }
-    }
-
-    /// Spawn a worker thread to compute the minimum size for a deferred partition.
-    fn start_min_size_calc(&mut self, part_index: usize, ctx: &mut TabContext) {
-        if self.pending_min_size_calcs.contains_key(&part_index) {
+    /// The "Remote Drive" window: connect lists the daemon's drives; a pick becomes the source.
+    #[cfg(feature = "remote")]
+    fn show_remote_window(&mut self, ui: &mut egui::Ui) {
+        if !self.ctl.remote_dialog_open() {
             return;
         }
-        let Some(part) = self
-            .source_partitions
-            .iter()
-            .find(|p| p.index == part_index)
-            .cloned()
-        else {
-            return;
-        };
-
-        // Remote source: compute over a block reader against the daemon's
-        // physical-**device** handle (a Backup-tab remote source is a drive, so
-        // `is_device: true` — the image-file opener would misbehave on a device
-        // path). The runner builds its own RemoteBlockReader on the shared
-        // connection. Done before the local path/CHD/GHO dispatch below.
-        #[cfg(feature = "remote")]
-        if self.remote_active() {
-            let Some((conn, rpath)) = self
-                .remote
-                .conn
-                .clone()
-                .zip(self.remote.selected.as_ref().map(|(p, _)| p.clone()))
-            else {
-                ctx.log.error(format!(
-                    "Cannot calculate minimum size for partition {part_index}: remote source not connected",
-                ));
-                return;
-            };
-            let fs_name = self
-                .deferred_min_sizes
-                .get(&part_index)
-                .copied()
-                .unwrap_or_else(|| {
-                    fs::fs_name_for(part.gate_type_byte(), part.partition_type_string.as_deref())
-                });
-            ctx.log.info(format!(
-                "Calculating minimum size for partition {part_index} ({fs_name}) over the wire...",
-            ));
-            let req = rusty_backup::model::min_size_runner::MinSizeRequest {
-                source: rusty_backup::model::min_size_runner::MinSizeSource::Remote {
-                    conn,
-                    path: rpath,
-                    is_device: true,
-                },
-                partition_offset: part.byte_offset(),
-                partition_type: part.partition_type_byte,
-                partition_type_string: part.partition_type_string.clone(),
-                partition_size: part.size_bytes,
-                partition_index: part_index,
-            };
-            let status = rusty_backup::model::min_size_runner::spawn(req);
-            self.pending_min_size_calcs.insert(part_index, status);
-            return;
-        }
-
-        let path = self.source_path(ctx);
-        let is_device = path
-            .as_ref()
-            .map(|p| {
-                let s = p.to_string_lossy();
-                s.starts_with("/dev/") || s.starts_with("\\\\.\\")
-            })
-            .unwrap_or(false);
-
-        let source = match path.as_deref() {
-            Some(p) if rusty_backup::model::source_reader::is_chd_path(p) => {
-                rusty_backup::model::min_size_runner::MinSizeSource::Chd(p.to_path_buf())
-            }
-            Some(p) if rusty_backup::model::source_reader::is_gho_path(p) => {
-                rusty_backup::model::min_size_runner::MinSizeSource::Gho(p.to_path_buf())
-            }
-            _ => {
-                let Some(file_arc) = self.source_file.clone() else {
-                    ctx.log.error(format!(
-                        "Cannot calculate minimum size for partition {part_index}: no open source handle",
-                    ));
-                    return;
-                };
-                rusty_backup::model::min_size_runner::MinSizeSource::File {
-                    file: file_arc,
-                    use_sector_aligned: is_device,
-                }
-            }
-        };
-
-        let fs_name = self
-            .deferred_min_sizes
-            .get(&part_index)
-            .copied()
-            .unwrap_or("unknown");
-        ctx.log.info(format!(
-            "Calculating minimum size for partition {part_index} ({fs_name})...",
-        ));
-
-        let req = rusty_backup::model::min_size_runner::MinSizeRequest {
-            source,
-            partition_offset: part.start_lba * 512,
-            partition_type: part.partition_type_byte,
-            partition_type_string: part.partition_type_string.clone(),
-            partition_size: part.size_bytes,
-            partition_index: part_index,
-        };
-        let status = rusty_backup::model::min_size_runner::spawn(req);
-        self.pending_min_size_calcs.insert(part_index, status);
-    }
-
-    /// Poll all pending min-size workers; on completion, move results into
-    /// `partition_min_sizes` and refresh any matching `vhd_partition_configs`.
-    /// Effective per-partition min size, honouring the per-partition Defrag
-    /// checkbox: when defrag is enabled AND this filesystem has a
-    /// defragmenting writer, prefer the (smaller) defragmented floor;
-    /// otherwise use the in-place trim point. Falls back through.
-    fn effective_min_size(
-        &self,
-        idx: usize,
-        partition_type: u8,
-        partition_type_string: Option<&str>,
-    ) -> Option<u64> {
-        let in_place = self.partition_min_sizes.get(&idx).copied();
-        let defrag = self.partition_defrag_min_sizes.get(&idx).copied();
-        let has_clone = self.defrag_clone_available(idx, partition_type, partition_type_string);
-        let enabled = self
-            .partition_defrag_enabled
-            .get(&idx)
-            .copied()
-            .unwrap_or(false);
-        if has_clone && enabled {
-            defrag.or(in_place)
-        } else {
-            in_place.or(defrag)
-        }
-    }
-
-    /// Whether the per-partition Compact/Defrag toggle should be live for this
-    /// partition: either the FS has a registered defragmenting writer
-    /// (HFS+/HFSX/PFS3 via [`fs::has_defragmenting_writer`]), or the engine
-    /// computed a packed defragmented minimum that actually beats the in-place
-    /// trim (exFAT today; NTFS once its packer lands). Confined to the backup
-    /// tab so VHD-export / shrink-target paths (which don't run the clone) are
-    /// unaffected. The size-based arm requires the per-partition min-size walk
-    /// to have completed, so the toggle appears once the Min Size cell resolves.
-    fn defrag_clone_available(
-        &self,
-        idx: usize,
-        partition_type: u8,
-        partition_type_string: Option<&str>,
-    ) -> bool {
-        if fs::has_defragmenting_writer(partition_type, partition_type_string) {
-            return true;
-        }
-        matches!(
-            (
-                self.partition_defrag_min_sizes.get(&idx),
-                self.partition_min_sizes.get(&idx),
-            ),
-            (Some(&d), Some(&p)) if d < p
-        )
-    }
-
-    /// Common post-min-size-walk bookkeeping shared between the auto-load
-    /// path (`load_partitions`) and the worker-poll path. Stores in-place
-    /// plus defrag floors, fragmentation %, and auto-checks the Compact
-    /// Space toggle when compacting would save at least
-    /// [`Self::COMPACT_AUTOCHECK_SAVINGS_PCT`] of the in-place trim size on
-    /// a clone-capable filesystem. The user can still toggle the box
-    /// manually to override the default — e.g. to squeeze the backup onto
-    /// a slightly-smaller destination disk when the auto threshold didn't
-    /// fire.
-    #[allow(clippy::too_many_arguments)] // post-walk bookkeeping needs all the per-partition results
-    fn record_min_size_result(
-        &mut self,
-        idx: usize,
-        in_place: Option<u64>,
-        defragmented: Option<u64>,
-        fragmentation_percent: Option<f32>,
-        partition_size: u64,
-        partition_type: u8,
-        partition_type_string: Option<&str>,
-    ) {
-        let in_place_clamped = in_place.map(|v| v.min(partition_size));
-        let defrag_clamped = defragmented.map(|v| v.min(partition_size));
-        if let Some(v) = in_place_clamped {
-            self.partition_min_sizes.insert(idx, v);
-        }
-        if let Some(v) = defrag_clamped {
-            self.partition_defrag_min_sizes.insert(idx, v);
-        }
-        if let Some(pct) = fragmentation_percent {
-            self.partition_fragmentation.insert(idx, pct);
-        }
-        // Auto-check criterion: clone-capable FS AND space savings >=
-        // threshold. File fragmentation % is shown for context but isn't
-        // the decision signal — a volume with 0% file fragmentation can
-        // still have meaningful inter-file holes that compaction recovers.
-        if !self.partition_defrag_default_applied.contains(&idx)
-            && self.defrag_clone_available(idx, partition_type, partition_type_string)
-        {
-            if let (Some(ip), Some(df)) = (in_place_clamped, defrag_clamped) {
-                if ip > 0 && df < ip {
-                    let savings_pct = 100.0 * (ip - df) as f32 / ip as f32;
-                    if savings_pct >= Self::COMPACT_AUTOCHECK_SAVINGS_PCT {
-                        self.partition_defrag_enabled.insert(idx, true);
-                    }
-                }
-            }
-        }
-        self.partition_defrag_default_applied.insert(idx);
-    }
-
-    /// Minimum space-savings (% of in-place trim size) at which Compact
-    /// Space is auto-checked. 5% catches volumes with a few GiB of holes
-    /// on a 30+ GiB partition while staying off for the common case of a
-    /// nearly-perfectly-packed disk where compaction would just be a long
-    /// no-op.
-    const COMPACT_AUTOCHECK_SAVINGS_PCT: f32 = 5.0;
-
-    fn poll_min_size_calcs(&mut self, ctx: &mut TabContext) {
-        // Emit a log line whenever a worker's `phase` string changes, so
-        // long HFS+ catalog walks don't look like a hang. The phase set is
-        // small (Opening filesystem -> Computing last data byte ->
-        // Computing defragmented minimum) plus the one-shot
-        // "open_filesystem failed: <err>" leak from `partition_minimum_size`.
-        let phase_updates: Vec<(usize, Vec<String>)> = self
-            .pending_min_size_calcs
-            .iter()
-            .filter_map(|(idx, status)| {
-                status.lock().ok().map(|mut s| {
-                    let drained = std::mem::take(&mut s.phase_log);
-                    (*idx, drained)
-                })
-            })
-            .collect();
-        for (idx, phases) in phase_updates {
-            for phase in phases {
-                if phase.is_empty() {
-                    continue;
-                }
-                ctx.log.info(format!("Partition {idx}: {phase}"));
-                self.last_logged_min_size_phase.insert(idx, phase);
-            }
-        }
-        let finished_indices: Vec<usize> = self
-            .pending_min_size_calcs
-            .iter()
-            .filter_map(|(idx, status)| status.lock().ok().filter(|s| s.finished).map(|_| *idx))
-            .collect();
-        for idx in finished_indices {
-            if let Some(status_arc) = self.pending_min_size_calcs.remove(&idx) {
-                if let Ok(s) = status_arc.lock() {
-                    if let Some(err) = &s.error {
-                        ctx.log.error(format!(
-                            "Minimum size calculation failed for partition {idx}: {err}",
-                        ));
-                    } else {
-                        let part = self.source_partitions.iter().find(|p| p.index == idx);
-                        let (part_size, ptype, pstring) = part
-                            .map(|p| {
-                                (
-                                    p.size_bytes,
-                                    p.partition_type_byte,
-                                    p.partition_type_string.clone(),
-                                )
-                            })
-                            .unwrap_or((u64::MAX, 0, None));
-                        let frag_pct = s.fragmentation_percent;
-                        let last_phase = s.phase.clone();
-                        let in_place = s.result;
-                        let defrag = s.defragmented_min;
-                        drop(s);
-                        self.record_min_size_result(
-                            idx,
-                            in_place,
-                            defrag,
-                            frag_pct,
-                            part_size,
-                            ptype,
-                            pstring.as_deref(),
-                        );
-                        if let Some(min) = self.effective_min_size(idx, ptype, pstring.as_deref()) {
-                            let suffix = if self
-                                .partition_defrag_enabled
-                                .get(&idx)
-                                .copied()
-                                .unwrap_or(false)
-                            {
-                                " (space compacted via clone)"
-                            } else {
-                                ""
-                            };
-                            let frag = frag_pct
-                                .map(|p| format!(", fragmentation {:.1}%", p))
-                                .unwrap_or_default();
-                            ctx.log.info(format!(
-                                "Partition {idx}: minimum size {} (computed){suffix}{frag}",
-                                partition::format_size(min),
-                            ));
-                            for cfg in &mut self.vhd_partition_configs {
-                                if cfg.index == idx {
-                                    cfg.minimum_size = min;
-                                    cfg.deferred_fs = None;
-                                }
-                            }
-                        } else {
-                            let s_phase = last_phase;
-                            ctx.log.info(format!(
-                                "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {s_phase})",
-                            ));
-                        }
-                    }
-                }
-                self.deferred_min_sizes.remove(&idx);
-                self.last_logged_min_size_phase.remove(&idx);
-            }
-        }
-    }
-
-    /// Scan source partition table and compute minimum partition sizes.
-    /// For devices, this uses OS-level elevation (may prompt for credentials).
-    fn scan_source_partitions(&mut self, ctx: &mut TabContext) {
-        self.source_partitions.clear();
-        self.selected_partitions.clear();
-        self.partition_min_sizes.clear();
-        self.partition_defrag_min_sizes.clear();
-        self.partition_fragmentation.clear();
-        self.partition_defrag_enabled.clear();
-        self.partition_defrag_default_applied.clear();
-        self.deferred_min_sizes.clear();
-        self.pending_min_size_calcs.clear();
-        self.source_file = None;
-        self.source_partition_table_desc = None;
-        self.partition_load_error = None;
-
-        let path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => return,
-        };
-
-        ctx.log
-            .info(format!("Scanning partitions on {}...", path.display()));
-
-        let path_str = path.to_string_lossy();
-        let is_device = path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\");
-
-        // Remember what we escalate, so Close Source can hand the device back
-        // (the descriptor is cached process-wide and would block an eject).
-        self.open_device_path = if is_device { Some(path.clone()) } else { None };
-
-        // Open file (with elevation for devices)
-        let open_result: Result<rusty_backup::os::SourceHandle, String> = if is_device {
-            match rusty_backup::os::open_source_for_reading(&path) {
-                Ok(elevated) => {
-                    let (file, _guard) = elevated.into_parts();
-                    // Note: _guard is dropped here but the file handle remains valid
-                    Ok(file)
-                }
-                Err(e) => Err(format!("Cannot access device: {e}")),
-            }
-        } else {
-            File::open(&path)
-                .map(Into::into)
-                .map_err(|e| format!("Cannot open source: {e}"))
-        };
-
-        let file = match open_result {
-            Ok(f) => f,
-            Err(msg) => {
-                self.partition_load_error = Some(msg.clone());
-                ctx.log.error(msg);
-                return;
-            }
-        };
-
-        // Kept so the probes below can still clone the handle once `file` moves into the reader.
-        let source_handle = file.try_clone().ok();
-        // A device cannot answer seek(End); carry the length the OS reports instead.
-        let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-            Box::new(rusty_backup::os::known_len_source(file, &path))
-        } else {
-            Box::new(BufReader::new(file))
-        };
-        match PartitionTable::detect(&mut reader) {
-            Ok(table) => {
-                self.source_partitions = table.partitions();
-                self.select_all_partitions();
-                let table_desc = if matches!(table, PartitionTable::None { .. }) {
-                    "No partition table (superfloppy)".to_string()
-                } else {
-                    match table.byte_order_name() {
-                        Some(order) => format!("{} ({order})", table.type_name()),
-                        None => table.type_name().to_string(),
-                    }
-                };
-                self.source_partition_table_desc = Some(table_desc.clone());
-                ctx.log.info(format!(
-                    "Found {} partition(s) ({})",
-                    self.source_partitions.len(),
-                    table_desc,
-                ));
-
-                // Compute minimum partition sizes using filesystem analysis.
-                // Cheap filesystems (FAT/NTFS/exFAT) compute eagerly here; expensive
-                // ones (HFS/HFS+/ext/btrfs/ProDOS) defer until the user clicks
-                // "Calc min" in the per-partition resize popup.
-                let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
-                    .source_partitions
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.index,
-                            p.start_lba * 512,
-                            p.size_bytes,
-                            p.partition_type_byte,
-                            p.partition_type_string.clone(),
-                            p.is_extended_container,
-                        )
-                    })
-                    .collect();
-                for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes {
-                    if ext_container {
-                        continue;
-                    }
-                    let Some(Ok(clone)) = source_handle.as_ref().map(|f| f.try_clone()) else {
-                        continue;
-                    };
-                    // AFFS / Atari / DFS / CBM size themselves via seek(End), which a device refuses.
-                    let probe: Box<dyn rusty_backup::rbformats::ReadSeek> = if is_device {
-                        Box::new(rusty_backup::os::known_len_source(clone, &path))
-                    } else {
-                        Box::new(BufReader::new(clone))
-                    };
-                    let result = fs::partition_minimum_size(
-                        probe,
-                        offset,
-                        type_byte,
-                        type_str.as_deref(),
-                        size_bytes,
-                        false,
-                        None,
-                        &|_| {},
-                    );
-                    match result {
-                        fs::MinimumResult::Computed {
-                            in_place,
-                            defragmented,
-                            fragmentation_percent,
-                        } => {
-                            self.record_min_size_result(
-                                idx,
-                                in_place,
-                                defragmented,
-                                fragmentation_percent,
-                                size_bytes,
-                                type_byte,
-                                type_str.as_deref(),
-                            );
-                            if let Some(min) =
-                                self.effective_min_size(idx, type_byte, type_str.as_deref())
-                            {
-                                let suffix = if self
-                                    .partition_defrag_enabled
-                                    .get(&idx)
-                                    .copied()
-                                    .unwrap_or(false)
-                                {
-                                    " (space compacted via clone)"
-                                } else {
-                                    ""
-                                };
-                                let frag = fragmentation_percent
-                                    .map(|p| format!(", fragmentation {:.1}%", p))
-                                    .unwrap_or_default();
-                                ctx.log.info(format!(
-                                    "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                    partition::format_size(min),
-                                    partition::format_size(size_bytes),
-                                ));
-                            }
-                        }
-                        fs::MinimumResult::Deferred { fs_name } => {
-                            ctx.log.info(format!(
-                                "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                            ));
-                            self.deferred_min_sizes.insert(idx, fs_name);
-                        }
-                    }
-                }
-                // Stash the open source file so worker threads can clone it later.
-                if let Some(Ok(f)) = source_handle
-                    .as_ref()
-                    .map(|f| f.try_clone().and_then(|h| h.into_file()))
-                {
-                    self.source_file = Some(Arc::new(f));
-                }
-            }
-            Err(e) => {
-                self.partition_load_error = Some(format!("Could not read partition table: {e}"));
-                ctx.log.error(format!("Partition scan failed: {e}"));
-            }
-        }
-    }
-
-    fn load_partition_preview(&mut self, ctx: &mut TabContext) {
-        self.source_partitions.clear();
-        self.selected_partitions.clear();
-        self.partition_min_sizes.clear();
-        self.partition_defrag_min_sizes.clear();
-        self.partition_fragmentation.clear();
-        self.partition_defrag_enabled.clear();
-        self.partition_defrag_default_applied.clear();
-        self.deferred_min_sizes.clear();
-        self.pending_min_size_calcs.clear();
-        self.source_partition_table_desc = None;
-        self.partition_load_error = None;
-
-        let path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Only auto-load for image files (not raw devices which need elevation)
-        let path_str = path.to_string_lossy();
-        if path_str.starts_with("/dev/") || path_str.starts_with("\\\\.\\") {
-            // Device path -- skip auto-load to avoid permission prompts
-            return;
-        }
-
-        match File::open(&path) {
-            Ok(file) => {
-                // Detect image format (VHD, 2MG, DMG, or raw)
-                let detect_result =
-                    match rusty_backup::rbformats::detect_image_format_with_path(file, Some(&path))
-                    {
-                        Ok(format) => {
-                            let desc = format.description();
-                            ctx.log.info(format!("Detected format: {}", desc));
-                            match File::open(&path) {
-                                Ok(f2) => {
-                                    match rusty_backup::rbformats::wrap_image_reader(f2, format) {
-                                        Ok((mut reader, _size)) => {
-                                            PartitionTable::detect(&mut reader)
-                                        }
-                                        Err(e) => {
-                                            // Fallback to raw
-                                            ctx.log.warn(format!("Format wrap failed: {e}"));
-                                            match File::open(&path) {
-                                                Ok(f3) => {
-                                                    let mut r = BufReader::new(f3);
-                                                    PartitionTable::detect(&mut r)
-                                                }
-                                                Err(e) => Err(e.into()),
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => Err(e.into()),
-                            }
-                        }
-                        Err(_) => {
-                            // Fallback to raw read
-                            match File::open(&path) {
-                                Ok(f2) => {
-                                    let mut r = BufReader::new(f2);
-                                    PartitionTable::detect(&mut r)
-                                }
-                                Err(e) => Err(e.into()),
-                            }
-                        }
-                    };
-
-                match detect_result {
-                    Ok(table) => {
-                        self.source_partitions = table.partitions();
-                        self.select_all_partitions();
-                        let table_desc = if matches!(table, PartitionTable::None { .. }) {
-                            "No partition table (superfloppy)".to_string()
-                        } else {
-                            table.type_name().to_string()
-                        };
-                        self.source_partition_table_desc = Some(table_desc.clone());
-                        ctx.log.info(format!(
-                            "Source has {} partition(s) ({})",
-                            self.source_partitions.len(),
-                            table_desc,
-                        ));
-
-                        // Compute cheap minimum sizes, defer expensive ones.
-                        // Re-open the file for each probe so each partition's
-                        // call gets an independent seek cursor; format wrapping
-                        // (DMG/VHDX dynamic) is intentionally skipped here —
-                        // raw VHD and plain images have their tables at the
-                        // expected offsets.
-                        let probes: Vec<(usize, u64, u64, u8, Option<String>, bool)> = self
-                            .source_partitions
-                            .iter()
-                            .map(|p| {
-                                (
-                                    p.index,
-                                    p.start_lba * 512,
-                                    p.size_bytes,
-                                    p.partition_type_byte,
-                                    p.partition_type_string.clone(),
-                                    p.is_extended_container,
-                                )
-                            })
-                            .collect();
-                        for (idx, offset, size_bytes, type_byte, type_str, ext_container) in probes
-                        {
-                            if ext_container {
-                                continue;
-                            }
-                            let probe_reader = match File::open(&path) {
-                                Ok(f) => BufReader::new(f),
-                                Err(_) => continue,
-                            };
-                            let result = fs::partition_minimum_size(
-                                probe_reader,
-                                offset,
-                                type_byte,
-                                type_str.as_deref(),
-                                size_bytes,
-                                false,
-                                None,
-                                &|_| {},
-                            );
-                            match result {
-                                fs::MinimumResult::Computed {
-                                    in_place,
-                                    defragmented,
-                                    fragmentation_percent,
-                                } => {
-                                    self.record_min_size_result(
-                                        idx,
-                                        in_place,
-                                        defragmented,
-                                        fragmentation_percent,
-                                        size_bytes,
-                                        type_byte,
-                                        type_str.as_deref(),
-                                    );
-                                    if let Some(min) =
-                                        self.effective_min_size(idx, type_byte, type_str.as_deref())
-                                    {
-                                        let suffix = if self
-                                            .partition_defrag_enabled
-                                            .get(&idx)
-                                            .copied()
-                                            .unwrap_or(false)
-                                        {
-                                            " (space compacted via clone)"
-                                        } else {
-                                            ""
-                                        };
-                                        let frag = fragmentation_percent
-                                            .map(|p| format!(", fragmentation {:.1}%", p))
-                                            .unwrap_or_default();
-                                        ctx.log.info(format!(
-                                            "Partition {idx}: minimum size {} (original {}){suffix}{frag}",
-                                            partition::format_size(min),
-                                            partition::format_size(size_bytes),
-                                        ));
-                                    }
-                                }
-                                fs::MinimumResult::Deferred { fs_name } => {
-                                    ctx.log.info(format!(
-                                        "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                                    ));
-                                    self.deferred_min_sizes.insert(idx, fs_name);
-                                }
-                            }
-                        }
-
-                        // Stash an unwrapped raw handle so the worker thread
-                        // can clone it later. For image files this is the raw
-                        // (still-wrapped) file; the worker will re-detect the
-                        // format if needed.
-                        if let Ok(f) = File::open(&path) {
-                            self.source_file = Some(Arc::new(f));
-                        }
-                    }
-                    Err(e) => {
-                        self.partition_load_error =
-                            Some(format!("Could not read partition table: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.partition_load_error = Some(format!("Cannot open source: {e}"));
-            }
-        }
-    }
-
-    /// Select all non-extended partitions for backup (called after partition list loads).
-    fn select_all_partitions(&mut self) {
-        self.selected_partitions.clear();
-        for part in &self.source_partitions {
-            if !part.is_extended_container {
-                self.selected_partitions.insert(part.index);
-            }
-        }
-    }
-
-    fn source_path(&self, ctx: &TabContext) -> Option<PathBuf> {
-        if let Some(path) = &self.image_file_path {
-            Some(path.clone())
-        } else if let Some(idx) = self.selected_device_idx {
-            ctx.devices.get(idx).map(|d| d.path.clone())
-        } else {
-            None
-        }
-    }
-
-    fn update_backup_name(&mut self, ctx: &TabContext) {
-        let path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Try to get device size and first volume label
-        let device = self
-            .selected_device_idx
-            .and_then(|idx| ctx.devices.get(idx));
-
-        let size_bytes = device
-            .map(|d| d.size_bytes)
-            .or_else(|| std::fs::metadata(&path).ok().map(|m| m.len()));
-
-        let volume_label = device
-            .and_then(|d| d.partitions.first())
-            .map(|p| p.name.as_str())
-            .filter(|n| !n.is_empty());
-
-        self.backup_name =
-            rusty_backup::backup::format::generate_backup_name(&path, size_bytes, volume_label);
-    }
-
-    /// Returns the ChdOptions matching the active compression type, or
-    /// `None` when the selected output isn't a CHD profile.
-    fn chd_options_for_compression(&self) -> Option<ChdOptions> {
-        match self.compression_type {
-            CompressionType::Chd => Some(self.chd_hd_control.effective(ChdProfile::Hd)),
-            _ => None,
-        }
-    }
-
-    /// Persist only when the user is in Custom mode — Default/MiSTer are pure
-    /// functions of the profile and don't need round-tripping.
-    fn maybe_persist_chd_options(&self) {
-        let custom = match self.compression_type {
-            CompressionType::Chd if self.chd_hd_control.mode == ChdOptionsMode::Custom => {
-                Some(&self.chd_hd_control.custom)
-            }
-            _ => None,
-        };
-        if let Some(opts) = custom {
-            self.persist_chd_options(opts);
-        }
-    }
-
-    /// Persist the active CHD codec/hunk-size choice to `config.json`.
-    /// Called at backup start so future launches restore the user's pick.
-    fn persist_chd_options(&self, opts: &ChdOptions) {
-        let mut cfg = UpdateConfig::load();
-        cfg.last_chd_codecs = Some(
-            opts.codecs
-                .iter()
-                .map(|c| codec_label(*c))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        cfg.last_chd_hunk_size = Some(opts.hunk_size);
-        let _ = cfg.save();
-    }
-
-    /// Whether a remote source (drive/image on a daemon) is the active backup
-    /// source. When true, the local device/image source machinery is bypassed.
-    #[cfg(feature = "remote")]
-    fn remote_active(&self) -> bool {
-        self.remote.selected.is_some()
-    }
-    #[cfg(not(feature = "remote"))]
-    fn remote_active(&self) -> bool {
-        false
-    }
-
-    /// Spawn a worker to connect to `addr` and list the daemon's devices.
-    #[cfg(feature = "remote")]
-    fn spawn_remote_connect(&mut self, addr: String) {
-        let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
-        self.remote.status = Some(Arc::clone(&status));
-        self.remote.error = None;
-        self.remote.addr = Some(addr.clone());
-        let status_done = Arc::clone(&status);
-        rusty_backup::model::worker::spawn_guarded(status, "remote connect", move || {
-            let (conn, devices) =
-                rusty_backup::model::backup_remote::connect_and_list_devices(&addr)?;
-            let mut s = rusty_backup::model::worker::lock_status(&status_done);
-            s.connected = Some((conn, devices));
-            s.finished = true;
-            Ok(())
-        });
-    }
-
-    /// Spawn a worker to open a remote device + parse its partition table.
-    #[cfg(feature = "remote")]
-    fn spawn_remote_load(
-        &mut self,
-        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
-        path: String,
-    ) {
-        let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
-        self.remote.status = Some(Arc::clone(&status));
-        self.remote.error = None;
-        let status_done = Arc::clone(&status);
-        rusty_backup::model::worker::spawn_guarded(status, "remote load", move || {
-            // Backup targets a physical drive on the daemon -> is_device = true.
-            let info = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true)?;
-            let mut s = rusty_backup::model::worker::lock_status(&status_done);
-            s.loaded = Some(info);
-            s.finished = true;
-            Ok(())
-        });
-    }
-
-    /// Drain a finished remote connect/load worker into tab state.
-    #[cfg(feature = "remote")]
-    fn poll_remote(&mut self, ctx: &mut TabContext) {
-        let status = match &self.remote.status {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-        let (connected, loaded, error) = {
-            let mut s = rusty_backup::model::worker::lock_status(&status);
-            if !s.finished {
-                return;
-            }
-            (s.connected.take(), s.loaded.take(), s.error.take())
-        };
-        self.remote.status = None;
-
-        if let Some(err) = error {
-            self.remote.error = Some(err.clone());
-            ctx.log.error(format!("Remote: {err}"));
-            return;
-        }
-        if let Some((conn, devices)) = connected {
-            ctx.log.info(format!(
-                "Connected to remote daemon ({} device{})",
-                devices.len(),
-                if devices.len() == 1 { "" } else { "s" }
-            ));
-            self.remote.conn = Some(conn);
-            self.remote.devices = devices;
-        }
-        if let Some(info) = loaded {
-            ctx.log.info(format!(
-                "Remote source: {} ({} partition{})",
-                info.table_desc,
-                info.partitions.len(),
-                if info.partitions.len() == 1 { "" } else { "s" }
-            ));
-            // Reuse the standard partition-selection state.
-            let is_superfloppy = info.is_superfloppy;
-            self.source_partitions = info.partitions;
-            self.source_partition_table_desc = Some(info.table_desc);
-            self.partition_load_error = None;
-            self.select_all_partitions();
-
-            // Populate the per-partition Min Size / Frag / Compact columns just
-            // like a local source. Cheap filesystems (FAT/NTFS/exFAT — a couple
-            // of ranged bitmap reads) compute eagerly over the wire; expensive
-            // ones (HFS/HFS+/ext/btrfs/ProDOS — a full catalog walk that would
-            // be many round-trips on a slow link) defer behind a per-row "Calc
-            // min" button. Partitions with no recognizable filesystem are
-            // skipped (no worker), except a superfloppy whose single offset-0
-            // partition bears an FS under a type byte of 0. Mirrors the local
-            // load_partitions eager/deferred split.
-            let mut to_defer: Vec<(usize, &'static str)> = Vec::new();
-            let mut to_kick: Vec<usize> = Vec::new();
-            for part in &self.source_partitions {
-                if part.is_extended_container {
-                    continue;
-                }
-                let type_byte = part.gate_type_byte();
-                let type_str = part.partition_type_string.as_deref();
-                if !is_superfloppy && fs::fs_name_for(type_byte, type_str) == "unknown" {
-                    continue;
-                }
-                if fs::is_expensive_minimum(type_byte, type_str) {
-                    to_defer.push((part.index, fs::fs_name_for(type_byte, type_str)));
-                } else {
-                    to_kick.push(part.index);
-                }
-            }
-            for (idx, fs_name) in to_defer {
-                self.deferred_min_sizes.insert(idx, fs_name);
-            }
-            for idx in to_kick {
-                self.start_min_size_calc(idx, ctx);
-            }
-        }
-    }
-
-    /// Clear all remote-source state (back to a local source).
-    #[cfg(feature = "remote")]
-    fn clear_remote(&mut self) {
-        self.remote = RemoteSourceState::default();
-        self.source_partitions.clear();
-        self.selected_partitions.clear();
-        self.source_partition_table_desc = None;
-    }
-
-    /// Release the currently-selected LOCAL source (physical device or image
-    /// file): drop the open file handle so the OS releases the drive, and
-    /// clear every piece of derived partition state. Mirrors the per-source
-    /// reset in `load_partition_preview` plus the selection itself, returning
-    /// the tab to its "Select a device or image..." state.
-    /// Open `path` as the image-file backup source (drag-and-drop router).
-    /// Mirrors the "Open Image File..." picker: floppy containers are decoded to
-    /// a flat image (Backup needs a raw sector stream to compress). `show()`
-    /// loads the partition preview on the next frame via the
-    /// `image_file_path != prev_image_path` check, and drops any active remote
-    /// source so the two don't fight.
-    pub fn open_image(&mut self, path: PathBuf) {
-        self.selected_device_idx = None;
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Backup, &path);
-        match super::prepare_disk_image_path(&path, true) {
-            Ok((materialized, guard)) => {
-                self.image_file_path = Some(materialized);
-                self.amiga_tempdir = guard;
-            }
-            Err(e) => {
-                log::error!("Failed to decompress {}: {}", path.display(), e);
-                self.image_file_path = Some(path);
-                self.amiga_tempdir = None;
-            }
-        }
-    }
-
-    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
-    /// the persisted lists; the mirror otherwise only reloads at construction).
-    pub(crate) fn clear_recent_files(&mut self) {
-        self.recent_files.clear();
-    }
-
-    fn close_source(&mut self) {
-        self.selected_device_idx = None;
-        self.image_file_path = None;
-        self.amiga_tempdir = None;
-        // Dropping the Arc<File> here releases the OS handle on the drive so it
-        // can be safely ejected (min-size workers hold their own clones).
-        self.source_file = None;
-        if let Some(path) = self.open_device_path.take() {
-            rusty_backup::os::release_elevated_devices(Some(&path.to_string_lossy()));
-        }
-        self.source_partitions.clear();
-        self.selected_partitions.clear();
-        self.partition_min_sizes.clear();
-        self.partition_defrag_min_sizes.clear();
-        self.partition_fragmentation.clear();
-        self.partition_defrag_enabled.clear();
-        self.partition_defrag_default_applied.clear();
-        self.deferred_min_sizes.clear();
-        // The workers hold their own handle on the drive; ask them to stop at
-        // their next phase so Close Drive actually releases it.
-        for status in self.pending_min_size_calcs.values() {
-            if let Ok(mut s) = status.lock() {
-                s.cancel_requested = true;
-            }
-        }
-        self.pending_min_size_calcs.clear();
-        self.last_logged_min_size_phase.clear();
-        self.source_partition_table_desc = None;
-        self.partition_load_error = None;
-        self.pending_backup_after_min_sizes = false;
-        // Keep prev_* in sync with the now-empty selection so the
-        // source-changed detector in `show()` doesn't immediately re-fire.
-        self.prev_device_idx = None;
-        self.prev_device_identity = None;
-        self.prev_image_path = None;
-    }
-
-    /// The "Remote Drive" connect dialog + device picker. Shown while
-    /// `remote.dialog_addr` is `Some`. Connect lists the daemon's drives;
-    /// picking one loads its partition table over the wire and activates it as
-    /// the backup source.
-    #[cfg(feature = "remote")]
-    fn show_remote_picker(&mut self, ui: &mut egui::Ui, _ctx: &mut TabContext) {
-        if self.remote.dialog_addr.is_none() {
-            return;
-        }
-        let busy = self.remote.status.is_some();
-        let mut do_connect: Option<String> = None;
-        let mut pick: Option<(String, u64)> = None;
-        let mut close = false;
-
+        let mut actions = Vec::new();
+        let busy = self.ctl.remote_busy();
         egui::Window::new("Remote Drive")
             .collapsible(false)
             .resizable(false)
@@ -2217,45 +732,38 @@ impl BackupTab {
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
-                    let addr = self.remote.dialog_addr.as_mut().unwrap();
-                    ui.add(
-                        egui::TextEdit::singleline(addr)
-                            .hint_text("192.168.1.50:7341")
-                            .desired_width(220.0),
-                    );
+                    let mut addr = self.ctl.remote_address().to_string();
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut addr)
+                                .hint_text("192.168.1.50:7341")
+                                .desired_width(220.0),
+                        )
+                        .changed()
+                    {
+                        actions.push(BackupAction::RemoteSetAddress(addr));
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!busy, |ui| {
                         if ui.button("Connect").clicked() {
-                            let a = self
-                                .remote
-                                .dialog_addr
-                                .clone()
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
-                            if !a.is_empty() {
-                                do_connect = Some(if a.contains(':') {
-                                    a
-                                } else {
-                                    format!("{a}:7341")
-                                });
-                            }
+                            actions.push(BackupAction::RemoteConnect);
                         }
                     });
                     if busy {
                         ui.add(egui::Spinner::new());
                     }
                     if ui.button("Close").clicked() {
-                        close = true;
+                        actions.push(BackupAction::RemoteClose);
                     }
                 });
-                if let Some(err) = &self.remote.error {
+                if let Some(err) = self.ctl.remote_error() {
                     ui.colored_label(super::theme::danger(ui.visuals()), err);
                 }
-                if self.remote.conn.is_some() {
+                if self.ctl.remote_listed() {
                     ui.separator();
-                    if self.remote.devices.is_empty() {
+                    let drives = self.ctl.remote_drives();
+                    if drives.is_empty() {
                         ui.label(
                             "No physical drives reported. The daemon may need to run as root.",
                         );
@@ -2264,467 +772,20 @@ impl BackupTab {
                         egui::ScrollArea::vertical()
                             .max_height(220.0)
                             .show(ui, |ui| {
-                                for d in &self.remote.devices {
-                                    let mut label = format!(
-                                        "{} ({})",
-                                        d.path,
-                                        rusty_backup::partition::format_size(d.size_bytes)
-                                    );
-                                    if !d.media.is_empty() {
-                                        label.push_str(&format!(" - {}", d.media));
-                                    }
-                                    if d.is_removable {
-                                        label.push_str(" [removable]");
-                                    }
-                                    if ui.selectable_label(false, label).clicked() {
-                                        pick = Some((d.path.clone(), d.size_bytes));
+                                for d in drives {
+                                    if ui.selectable_label(false, d.label.as_str()).clicked() {
+                                        actions.push(BackupAction::RemotePick {
+                                            path: d.path,
+                                            size: d.size_bytes,
+                                        });
                                     }
                                 }
                             });
                     }
                 }
             });
-
-        if let Some(addr) = do_connect {
-            self.spawn_remote_connect(addr);
-        }
-        if let Some((path, size)) = pick {
-            if let Some(conn) = self.remote.conn.clone() {
-                let addr = self.remote.addr.clone().unwrap_or_default();
-                let display = format!("rb://{addr}{path}");
-                self.backup_name = rusty_backup::backup::format::generate_backup_name(
-                    std::path::Path::new(&path),
-                    Some(size),
-                    None,
-                );
-                self.remote.selected = Some((path.clone(), display));
-                self.spawn_remote_load(conn, path);
-            }
-            self.remote.dialog_addr = None;
-        }
-        if close {
-            self.remote.dialog_addr = None;
-        }
-    }
-
-    /// Pull a backup of the remote drive over the block tier. Zstd / Raw / VHD
-    /// stream the per-partition data directly; CHD and shrink-to-minimum
-    /// materialize the remote disk to a local temp first, then run the normal
-    /// local pipeline — so per-partition sizing (custom/minimum sizes + the
-    /// Compact toggle) is honored identically to a local source.
-    #[cfg(feature = "remote")]
-    fn start_remote_backup(
-        &mut self,
-        ctx: &mut TabContext,
-        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
-        path: String,
-        display: String,
-    ) {
-        let destination_dir = match &self.destination_folder {
-            Some(d) => d.clone(),
-            None => {
-                ctx.log.error("No destination folder selected");
-                return;
-            }
-        };
-        let is_chd = matches!(
-            self.compression_type,
-            CompressionType::Chd | CompressionType::Dvd
-        );
-
-        let partition_filter = if self.selected_partitions.len()
-            < self
-                .source_partitions
-                .iter()
-                .filter(|p| !p.is_extended_container)
-                .count()
-        {
-            Some(self.selected_partitions.iter().copied().collect())
-        } else {
-            None
-        };
-
-        // Same per-partition sizing the local path assembles. For a remote
-        // CHD / shrink backup the engine materializes to a local temp and runs
-        // the local pipeline, so the chosen target sizes + Compact opt-ins flow
-        // through unchanged. (Computed minimums come from the eager / "Calc
-        // min" worker runs on the loaded remote partitions.)
-        let (size_policy, partition_target_sizes, defrag_set, precomputed_minimum_sizes) =
-            self.build_partition_sizing();
-
-        let config = BackupConfig {
-            source_path: PathBuf::from(&path),
-            destination_dir,
-            backup_name: self.backup_name.clone(),
-            compression: self.compression_type,
-            checksum: self.checksum_type,
-            // CHD/DVD are single-file and can't be split.
-            split_size_mib: if self.split_archives && !is_chd {
-                Some(self.split_size_mib)
-            } else {
-                None
-            },
-            sector_by_sector: self.sector_by_sector,
-            partition_filter,
-            // CHD codec/hunk options when the output is a CHD profile.
-            chd_options: self.chd_options_for_compression(),
-            size_policy,
-            partition_target_sizes,
-            // CHD + shrink-to-minimum work for a remote drive too: the engine
-            // materializes the remote disk to a local temp first, then runs the
-            // normal local pipeline (HFS+/PFS3 defrag-clone included).
-            shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
-            precomputed_minimum_sizes,
-            defrag_partition_indices: Some(defrag_set),
-            defrag_fat: false,
-            keep_swap: self.keep_swap,
-        };
-
-        let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
-        self.backup_progress = Some(Arc::clone(&progress_arc));
-        self.backup_running = true;
-        ctx.log.info(format!(
-            "Starting remote backup: {display} -> {}",
-            config.destination_dir.join(&config.backup_name).display()
-        ));
-
-        let source = rusty_backup::backup::BackupSource::Remote {
-            conn,
-            path,
-            display,
-            is_device: true,
-        };
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote drive backup");
-            let progress_for_panic = Arc::clone(&progress_arc);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress_arc))
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
-                    }
-                }
-                Err(_) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some("remote backup worker panicked".to_string());
-                        p.finished = true;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Assemble the per-partition sizing inputs shared by the local and remote
-    /// backup-config builders: the single-file-CHD size policy + explicit
-    /// per-partition target sizes, the per-partition Compact (defrag-clone)
-    /// opt-in set, and the toggle-aware precomputed effective minimums.
-    ///
-    /// A pure function of the current partition selection and per-partition
-    /// toggles — independent of whether the backup source is a local path or a
-    /// remote drive. A remote CHD / shrink-to-minimum backup materializes the
-    /// disk to a local temp and runs the *same* pipeline, so it honors these
-    /// identically; that's why both `start_backup` and `start_remote_backup`
-    /// feed the engine the same four values.
-    #[allow(clippy::type_complexity)]
-    fn build_partition_sizing(
-        &self,
-    ) -> (
-        Option<SizePolicy>,
-        Option<Vec<(usize, u64)>>,
-        std::collections::HashSet<usize>,
-        Option<Vec<(usize, u64)>>,
-    ) {
-        // Single-file CHD: derive size_policy + per-partition target sizes
-        // from the simple "Resize partitions to minimum size" checkbox. When
-        // the box is on, every partition with a known minimum gets MinPlus20;
-        // partitions whose minimum hasn't been computed fall back to Original.
-        //
-        // HFS+/HFSX partitions are intentionally *skipped* from the list:
-        // their shrink is performed by the HFS+ defrag-clone pipeline that
-        // `run_backup` activates via `shrink_to_minimum`. The clone uses the
-        // partition's defragmented minimum (a true lower bound) — emitting a
-        // MinPlus20-of-the-in-place-trim entry here would either no-op
-        // (MinPlus20 >= original collapses to original) or override the
-        // clone target.
-        let resize_for_chd = matches!(self.compression_type, CompressionType::Chd)
-            && !self.sector_by_sector
-            && self.resize_partitions;
-        let (size_policy, partition_target_sizes) = if resize_for_chd {
-            let mut targets: Vec<(usize, u64)> = Vec::new();
-            let mut used_min_plus_20 = false;
-            for part in &self.source_partitions {
-                if part.is_extended_container {
-                    continue;
-                }
-                // HFS+/HFSX partitions with the per-partition Defrag toggle
-                // ON are handled by the clone pipeline (via
-                // `defrag_partition_indices`), so don't seed a target_size
-                // here — the clone emits its own size. With Defrag OFF, fall
-                // through to the in-place trim path: seed a target so the
-                // staging path resizes the partition to its in-place minimum.
-                let defrag_enabled = self
-                    .partition_defrag_enabled
-                    .get(&part.index)
-                    .copied()
-                    .unwrap_or(false);
-                let has_clone = fs::has_defragmenting_writer(
-                    part.gate_type_byte(),
-                    part.partition_type_string.as_deref(),
-                );
-                if defrag_enabled && has_clone {
-                    continue;
-                }
-                let effective = self.effective_min_size(
-                    part.index,
-                    part.gate_type_byte(),
-                    part.partition_type_string.as_deref(),
-                );
-                let target = match effective {
-                    Some(min) if min < part.size_bytes => {
-                        used_min_plus_20 = true;
-                        SizeMode::MinPlus20.effective_size(part.size_bytes, min, 0)
-                    }
-                    _ => part.size_bytes,
-                };
-                targets.push((part.index, target));
-            }
-            let policy = if used_min_plus_20 {
-                SizePolicy::MinPlus20
-            } else {
-                SizePolicy::Original
-            };
-            let targets_opt = if targets.is_empty() {
-                None
-            } else {
-                Some(targets)
-            };
-            (Some(policy), targets_opt)
-        } else {
-            (None, None)
-        };
-
-        // Per-partition defrag opt-in: only HFS+/HFSX partitions whose
-        // checkbox is checked AND whose FS has a defragmenting writer.
-        let mut defrag_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for part in &self.source_partitions {
-            if part.is_extended_container {
-                continue;
-            }
-            if !self
-                .partition_defrag_enabled
-                .get(&part.index)
-                .copied()
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if !fs::has_defragmenting_writer(
-                part.gate_type_byte(),
-                part.partition_type_string.as_deref(),
-            ) {
-                continue;
-            }
-            defrag_set.insert(part.index);
-        }
-
-        // Send the toggle-aware effective minimum (defrag if checked, else
-        // in-place) for every partition that has a precomputed value. The
-        // engine uses this to seed `defragmented_min_sizes[i]` and to
-        // short-circuit volume walks it already ran in the GUI.
-        let precomputed: Vec<(usize, u64)> = self
-            .source_partitions
-            .iter()
-            .filter(|p| !p.is_extended_container)
-            .filter_map(|p| {
-                self.effective_min_size(
-                    p.index,
-                    p.gate_type_byte(),
-                    p.partition_type_string.as_deref(),
-                )
-                .map(|sz| (p.index, sz))
-            })
-            .collect();
-        let precomputed_opt = if precomputed.is_empty() {
-            None
-        } else {
-            Some(precomputed)
-        };
-
-        (
-            size_policy,
-            partition_target_sizes,
-            defrag_set,
-            precomputed_opt,
-        )
-    }
-
-    fn start_backup(&mut self, ctx: &mut TabContext) {
-        // Remote source: pull a backup of the remote drive over the block tier.
-        #[cfg(feature = "remote")]
-        if let (Some(conn), Some((path, display))) =
-            (self.remote.conn.clone(), self.remote.selected.clone())
-        {
-            self.start_remote_backup(ctx, conn, path, display);
-            return;
-        }
-
-        let source_path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source selected");
-                return;
-            }
-        };
-
-        let destination_dir = match &self.destination_folder {
-            Some(d) => d.clone(),
-            None => {
-                ctx.log.error("No destination folder selected");
-                return;
-            }
-        };
-
-        let partition_filter = if self.selected_partitions.len()
-            < self
-                .source_partitions
-                .iter()
-                .filter(|p| !p.is_extended_container)
-                .count()
-        {
-            Some(self.selected_partitions.iter().copied().collect())
-        } else {
-            None // All selected — no filter needed
-        };
-
-        // Per-partition sizing (CHD size policy + targets, Compact opt-in set,
-        // precomputed minimums) — shared verbatim with the remote path.
-        let (size_policy, partition_target_sizes, defrag_set, precomputed_minimum_sizes) =
-            self.build_partition_sizing();
-
-        let split_disabled_for_compression = matches!(
-            self.compression_type,
-            CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
-        );
-
-        let config = BackupConfig {
-            source_path,
-            destination_dir,
-            backup_name: self.backup_name.clone(),
-            compression: self.compression_type,
-            checksum: self.checksum_type,
-            split_size_mib: if self.split_archives && !split_disabled_for_compression {
-                Some(self.split_size_mib)
-            } else {
-                None
-            },
-            sector_by_sector: self.sector_by_sector,
-            partition_filter,
-            chd_options: self.chd_options_for_compression(),
-            size_policy,
-            partition_target_sizes,
-            // For single-file CHD output the "Resize partitions to minimum
-            // size" checkbox enables the HFS+ defrag-clone pipeline (other
-            // FSes are sized via `partition_target_sizes` above). For
-            // per-partition (zstd / raw / per-partition VHD) output the
-            // same flag enables the regular HFS+ clone branch in
-            // `run_backup`. Sector-by-sector keeps it off. With the new
-            // per-partition Defrag checkbox, the actual set of partitions
-            // that get the clone is further narrowed by
-            // `defrag_partition_indices` below.
-            shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
-            precomputed_minimum_sizes,
-            defrag_partition_indices: Some(defrag_set),
-            defrag_fat: false,
-            keep_swap: self.keep_swap,
-        };
-
-        self.maybe_persist_chd_options();
-
-        let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
-        self.backup_progress = Some(Arc::clone(&progress_arc));
-        self.backup_running = true;
-
-        ctx.log.info(format!(
-            "Starting backup: {} -> {}",
-            config.source_path.display(),
-            config.destination_dir.join(&config.backup_name).display()
-        ));
-
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk backup");
-            // Catch panics from `run_backup` so the GUI poll loop always
-            // observes `finished = true`. Without this, a panic in a
-            // sub-thread (or in any of the producer/consumer threads
-            // run_backup spawns) silently kills the worker, leaving the
-            // GUI stuck at whatever progress was last written. The panic
-            // message is preserved as the displayed error so we can
-            // diagnose it from the log instead of having to attach a
-            // debugger.
-            let progress_for_panic = Arc::clone(&progress_arc);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rusty_backup::backup::run_backup(config, Arc::clone(&progress_arc))
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("{e:#}"));
-                        p.finished = true;
-                    }
-                }
-                Err(panic_payload) => {
-                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        format!("<non-string panic payload: {:?}>", panic_payload.type_id())
-                    };
-                    eprintln!("[backup-thread] PANIC: {msg}");
-                    if let Ok(mut p) = progress_for_panic.lock() {
-                        p.error = Some(format!("backup worker panicked: {msg}"));
-                        p.finished = true;
-                    }
-                }
-            }
-        });
-    }
-
-    fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
-        let progress_arc = match &self.backup_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-
-        let mut p = rusty_backup::model::worker::lock_status(&progress_arc);
-
-        // Drain log messages
-        while let Some(msg) = p.log_messages.pop_front() {
-            match msg.level {
-                BackupLogLevel::Info => ctx.log.info(msg.message),
-                BackupLogLevel::Warning => ctx.log.warn(msg.message),
-                BackupLogLevel::Error => ctx.log.error(msg.message),
-            }
-        }
-
-        // Update progress bar
-        progress_state.active = !p.finished;
-        progress_state.operation = p.operation.clone();
-        progress_state.current_bytes = p.current_bytes;
-        progress_state.total_bytes = p.total_bytes;
-        progress_state.full_size_bytes = p.full_size_bytes;
-        progress_state.record_sample();
-
-        if p.finished {
-            if let Some(err) = &p.error {
-                ctx.log.error(format!("Backup failed: {err}"));
-            }
-            self.backup_running = false;
-            self.backup_progress = None;
+        for a in actions {
+            self.act(a);
         }
     }
 }

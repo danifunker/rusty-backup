@@ -34,6 +34,7 @@ pub mod optical_hint;
 pub mod output;
 pub mod parse;
 pub mod resolve;
+pub mod status;
 pub mod tui;
 pub mod verbs;
 

@@ -1,0 +1,80 @@
+# The Backup controller's option and VHD-window rules every shell (egui, TUI) relies on:
+# sector-by-sector locks resize, a typed split size is clamped, a Custom VHD size starts at the
+# row's minimum, and a per-partition VHD backup runs.
+name = "Backup: options, VHD sizes, per-partition VHD run"
+vm = "backup"
+
+[[step]]
+action = "OpenImage"
+arg = "$blank_fat"
+settle = true
+expect = { source = "image", partitions = 1, selected = 1 }
+
+[[step]]
+action = "SetSectorBySector"
+arg = true
+expect = { resize = false }
+
+[[step]]
+action = "SetResize"
+arg = true
+expect = { resize = false }
+
+[[step]]
+action = "SetSectorBySector"
+arg = false
+
+[[step]]
+action = "SetSplitMib"
+arg = 5
+expect = { split_size = 100 }
+
+[[step]]
+action = "SetSplitMib"
+arg = 750
+expect = { split_size = 750 }
+
+[[step]]
+action = "SetSplit"
+arg = false
+expect = { split_size = 0 }
+
+[[step]]
+action = "SetDestination"
+arg = "$out"
+
+[[step]]
+action = "SetName"
+arg = "b"
+
+[[step]]
+action = "SetFormat"
+arg = "vhd"
+
+[[step]]
+action = "Start"
+expect = { vhd_open = true, vhd_mode = "Original" }
+
+[[step]]
+action = "VhdSize"
+arg = 999999
+expect = { vhd_mode = "Custom", vhd_at_minimum = true }
+
+[[step]]
+action = "VhdSize"
+arg = 3
+expect = { vhd_mode = "Custom", vhd_custom_mib = 3 }
+
+[[step]]
+action = "VhdSize"
+arg = "original"
+expect = { vhd_mode = "Original" }
+
+[[step]]
+action = "VhdWholeDisk"
+arg = false
+
+[[step]]
+action = "VhdStart"
+settle = true
+expect = { vhd_open = false, result = "ok", output = true }

@@ -1,0 +1,36 @@
+[package]
+name = "dsk-imz"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Read WinImage .imz compressed floppy images, including password-protected ones (feature `crypto`)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["winimage", "imz", "floppy", "disk-image", "retro"]
+categories = ["parser-implementations", "emulators"]
+
+[features]
+default = ["deflate"]
+# Deflate support in zip. rusty-backup turns default features off and picks the zip feature
+# set for each of its builds itself (the mrustc builds need `deflate-flate2`).
+deflate = ["zip/deflate"]
+# WinImage's password scheme. Its RustCrypto crates need Rust 1.85, so the 1.73 builds leave it off.
+crypto = ["dep:aes", "dep:cbc", "dep:flate2"]
+# Only for a Rust 1.73 toolchain, which can only build zip 2.4; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.2", default-features = false }
+anyhow = "1"
+log = "0.4"
+# zip 9 on current Rust, zip 2.4.2 on 1.73; `zip_compat` covers the one API difference.
+zip = { version = ">=2.4.2, <10", default-features = false }
+md-5 = ">=0.10, <0.12"
+# Encrypted images are extracted into a temp directory the caller keeps alive.
+tempfile = "3"
+aes = { version = "0.9", optional = true }
+cbc = { version = "0.2", optional = true }
+# A decrypted body is a raw deflate stream.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }

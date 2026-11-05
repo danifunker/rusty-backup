@@ -31,7 +31,7 @@ pub const PRODOS_DEFAULT_VOLUME_NAME: &str = "RUSTY.BACKUP";
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+use fs_pc::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FsKind {
@@ -183,6 +183,13 @@ pub enum FsKind {
     /// ignored because 4.3BSD has no volume-label field.
     #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
     Ufs43,
+    /// UFS1 as Solaris / SunOS 5 writes it: real drive geometry, cylinder
+    /// groups staggered across tracks, live rotational tables, 16-bit
+    /// `d_namlen` directory entries and Sun's `fs_state` stamp. This is what
+    /// goes inside a `new hd sun` slice; Solaris's fsck rejects a 4.4BSD
+    /// volume there. Big-endian by default (SPARC); `--name` is ignored.
+    #[value(name = "ufs-solaris", alias = "solaris")]
+    UfsSun,
 }
 
 /// The three media classes `new` creates. CD-ROM images are not here —
@@ -253,7 +260,8 @@ pub enum HdCommand {
 
     /// Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you
     /// size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`;
-    /// slice 2 is reserved for the whole-disk "backup" alias.
+    /// slice 2 is reserved for the whole-disk "backup" alias. Fill a slice
+    /// with a volume from `new volume ufs-solaris`; Solaris rejects a 4.4BSD `ufs`.
     Sun(super::new_partitioned_hd::CylinderHdArgs),
 
     /// NeXT disk label (NeXTSTEP / OPENSTEP, black m68k hardware and
@@ -392,14 +400,18 @@ pub enum VolumeFs {
     /// sectors.
     #[value(alias = "beos-ofs")]
     Ofs,
-    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). `--big-endian`
-    /// writes the SPARC / m68k byte order.
+    /// UFS1 / FFS (4.4BSD: FreeBSD, NetBSD, OpenBSD). `--big-endian` writes
+    /// the SPARC / m68k byte order. For Solaris use `ufs-solaris`.
     #[value(alias = "ufs1", alias = "ffs")]
     Ufs,
     /// UFS1 in the pre-4.4BSD (NeXTSTEP / OPENSTEP) on-disk format, which is
     /// what a `new hd next` partition needs. Big-endian by default.
     #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
     Ufs43,
+    /// UFS1 as Solaris / SunOS 5 writes it, which is what a `new hd sun`
+    /// slice needs. Big-endian by default.
+    #[value(name = "ufs-solaris", alias = "solaris")]
+    UfsSun,
 }
 
 impl VolumeFs {
@@ -427,6 +439,7 @@ impl VolumeFs {
             VolumeFs::Ofs => FsKind::Ofs,
             VolumeFs::Ufs => FsKind::Ufs,
             VolumeFs::Ufs43 => FsKind::Ufs43,
+            VolumeFs::UfsSun => FsKind::UfsSun,
         }
     }
 }
@@ -525,8 +538,8 @@ pub struct VolumeArgs {
     pub block_size: Option<u32>,
 
     /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
-    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`,
-    /// since every NeXT disk is big-endian.
+    /// MIPS) instead of the little-endian default. Implied by `ufs-43bsd`
+    /// and `ufs-solaris`, the byte order of every NeXT and SPARC disk.
     #[arg(long = "big-endian")]
     pub big_endian: bool,
 
@@ -823,17 +836,17 @@ fn format_image(args: NewArgs) -> Result<()> {
             // total_blocks <= 65535. build_blank_hfv validates the cap.
             let explicit_bs = args.block_size;
             format_and_write(&args.image, &args.size, &args.name, move |size, name| {
-                let bs = explicit_bs.unwrap_or_else(|| crate::fs::hfv::suggest_block_size(size));
-                Ok(crate::fs::hfv::build_blank_hfv(size, bs, name)?)
+                let bs = explicit_bs.unwrap_or_else(|| fs_mac::hfv::suggest_block_size(size));
+                Ok(fs_mac::hfv::build_blank_hfv(size, bs, name)?)
             })
         }
         FsKind::Fat => {
             let fat32 = args.fat32;
             format_and_write(&args.image, &args.size, &args.name, move |size, name| {
                 if fat32 {
-                    crate::fs::fat::create_blank_fat32(size, Some(name))
+                    fs_pc::fat::create_blank_fat32(size, Some(name))
                 } else {
-                    crate::fs::fat::create_blank_fat(size, Some(name))
+                    fs_pc::fat::create_blank_fat(size, Some(name))
                 }
             })
         }
@@ -841,31 +854,31 @@ fn format_image(args: NewArgs) -> Result<()> {
             &args.image,
             &args.size,
             &args.name,
-            crate::fs::efs::resolve_bytes_per_inode(
+            fs_unix::efs::resolve_bytes_per_inode(
                 parse_size(&args.size).context("parsing --size")?,
                 args.inodes,
                 args.bytes_per_inode,
             ),
         ),
         FsKind::EfsV1 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            crate::fs::efs_v1::create_blank_efs_v1(size, name)
+            fs_unix::efs_v1::create_blank_efs_v1(size, name)
         }),
         FsKind::Xfs => write_blank_xfs_image(&args.image, &args.size, &args.name),
         FsKind::Affs => {
             let variant = args.affs_variant;
             format_and_write(&args.image, &args.size, &args.name, |size, name| {
-                crate::fs::affs::create_blank_affs(size, variant, name)
+                fs_amiga::affs::create_blank_affs(size, variant, name)
             })
         }
         // Both Amiga builders count 512-byte blocks, not bytes, and both
         // already existed — they were only ever reachable from unit tests.
         FsKind::Pfs3 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             let blocks = blocks_512(size, "PFS3")?;
-            Ok(crate::fs::pfs3::create_blank_pfs3(blocks, name)?)
+            Ok(fs_amiga::pfs3::create_blank_pfs3(blocks, name)?)
         }),
         FsKind::Sfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             let blocks = blocks_512(size, "SFS")?;
-            Ok(crate::fs::sfs::create_blank_sfs(blocks, name)?)
+            Ok(fs_amiga::sfs::create_blank_sfs(blocks, name)?)
         }),
         FsKind::Ntfs => {
             let raw = parse_size(&args.size).context("parsing --size")?;
@@ -901,7 +914,7 @@ fn format_image(args: NewArgs) -> Result<()> {
             )
         }
         FsKind::Hpfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            Ok(crate::fs::hpfs::create_blank_hpfs(size, name)?)
+            Ok(fs_hpfs::hpfs::create_blank_hpfs(size, name)?)
         }),
         FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
         FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
@@ -916,29 +929,29 @@ fn format_image(args: NewArgs) -> Result<()> {
                 &args.name
             };
             format_and_write(&args.image, &args.size, name, |size, name| {
-                crate::fs::prodos::create_blank_prodos(size, name)
+                fs_apple2::prodos::create_blank_prodos(size, name)
             })
         }
         FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
-            Ok(crate::fs::atari_dos::create_blank_atari_sd())
+            Ok(fs_8bit::atari_dos::create_blank_atari_sd())
         }),
         FsKind::AppleDos => {
             format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
-                Ok(crate::fs::apple_dos::create_blank_apple_dos())
+                Ok(fs_apple2::apple_dos::create_blank_apple_dos())
             })
         }
         FsKind::Os9 => {
             let vname = sanitize_os9_volume_name(&args.name);
             format_and_write(&args.image, &args.size, &vname, |_size, name| {
-                Ok(crate::fs::os9::create_blank_os9(name)?)
+                Ok(fs_8bit::os9::create_blank_os9(name)?)
             })
         }
         FsKind::Cpm => {
             let preset_name = args.cpm_preset.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--fs cpm requires --cpm-preset <name> (e.g. amstrad_data)")
             })?;
-            let dpb = *crate::fs::cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
-                let valid: Vec<&str> = crate::fs::cpm_diskdefs::ALL_PRESETS
+            let dpb = *fs_cpm::cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                let valid: Vec<&str> = fs_cpm::cpm_diskdefs::ALL_PRESETS
                     .iter()
                     .map(|d| d.name)
                     .collect();
@@ -948,54 +961,55 @@ fn format_image(args: NewArgs) -> Result<()> {
                 )
             })?;
             format_and_write(&args.image, &args.size, &args.name, move |_size, _name| {
-                Ok(crate::fs::cpm::create_blank(dpb))
+                Ok(fs_cpm::cpm::create_blank(dpb))
             })
         }
         FsKind::Minix => {
-            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V1)
+            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V1)
         }
         FsKind::Minix2 => {
-            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V2)
+            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V2)
         }
         FsKind::Minix3 => {
-            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V3)
+            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V3)
         }
         FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
         FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
         FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
         FsKind::Oric => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
-            Ok(crate::fs::oric::create_blank_oric(false, name))
+            Ok(fs_8bit::oric::create_blank_oric(false, name))
         }),
         FsKind::Bfs => {
             let endian = if args.big_endian {
-                crate::fs::bfs::BfsEndian::Big
+                fs_unix::bfs::BfsEndian::Big
             } else {
-                crate::fs::bfs::BfsEndian::Little
+                fs_unix::bfs::BfsEndian::Little
             };
             let block_size = args.block_size.unwrap_or(1024);
             format_and_write(&args.image, &args.size, &args.name, move |size, name| {
-                Ok(crate::fs::bfs_write::create_blank_bfs(
+                Ok(fs_unix::bfs_write::create_blank_bfs(
                     size, block_size, name, endian,
                 )?)
             })
         }
         FsKind::Ofs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            Ok(crate::fs::ofs_write::create_blank_ofs(size, name)?)
+            Ok(fs_unix::ofs_write::create_blank_ofs(size, name)?)
         }),
         FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            crate::fs::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
+            fs_mac::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
         }),
         FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
-            Ok(crate::fs::adfs::create_blank_adfs(name))
+            Ok(fs_adfs::adfs::create_blank_adfs(name))
         }),
-        FsKind::Ufs => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Modern),
-        FsKind::Ufs43 => write_blank_ufs_image(&args, crate::fs::ufs::CgLayout::Bsd43),
+        FsKind::Ufs => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, false),
+        FsKind::Ufs43 => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Bsd43, false),
+        FsKind::UfsSun => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, true),
     }
 }
 
 fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
-    let img = crate::fs::ucsd::create_blank_ucsd(size, name)
+    let img = fs_apple2::ucsd::create_blank_ucsd(size, name)
         .map_err(|e| anyhow::anyhow!("formatting UCSD p-System: {e}"))?;
     crate::compat::write_sparse(image, &img)
         .with_context(|| format!("writing {}", image.display()))?;
@@ -1009,7 +1023,7 @@ fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -
 
 fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
-    let img = crate::fs::trdos::create_blank_trdos(size, name)
+    let img = fs_8bit::trdos::create_blank_trdos(size, name)
         .map_err(|e| anyhow::anyhow!("formatting TR-DOS: {e}"))?;
     crate::compat::write_sparse(image, &img)
         .with_context(|| format!("writing {}", image.display()))?;
@@ -1023,7 +1037,7 @@ fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) 
 
 fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
-    let img = crate::fs::ti99::create_blank_ti99(size, name)
+    let img = fs_8bit::ti99::create_blank_ti99(size, name)
         .map_err(|e| anyhow::anyhow!("formatting TI-99: {e}"))?;
     crate::compat::write_sparse(image, &img)
         .with_context(|| format!("writing {}", image.display()))?;
@@ -1038,10 +1052,10 @@ fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -
 fn write_blank_minix_image(
     image: &std::path::Path,
     size_str: &str,
-    version: crate::fs::minix::MinixVersion,
+    version: fs_unix::minix::MinixVersion,
 ) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
-    let img = crate::fs::minix::create_blank_minix(size, version)
+    let img = fs_unix::minix::create_blank_minix(size, version)
         .map_err(|e| anyhow::anyhow!("formatting Minix: {e}"))?;
     crate::compat::write_sparse(image, &img)
         .with_context(|| format!("writing {}", image.display()))?;
@@ -1107,15 +1121,19 @@ fn sanitize_os9_volume_name(name: &str) -> String {
 /// being materialized in RAM.
 /// UFS is streamed rather than built in memory: a blank volume is almost all
 /// zeros, and the sizes people format are the ones a `Vec` cannot hold.
-fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) -> Result<()> {
-    use crate::fs::ufs::{CgLayout, UfsEndian};
-    use crate::fs::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
+fn write_blank_ufs_image(
+    args: &NewArgs,
+    cg_layout: fs_unix::ufs::CgLayout,
+    sun: bool,
+) -> Result<()> {
+    use fs_unix::ufs::{CgLayout, UfsEndian};
+    use fs_unix::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
 
     let size = parse_size(&args.size).context("parsing --size")?;
     let block_size = u64::from(args.block_size.unwrap_or(8192));
     // Every NeXT disk is big-endian, so the 4.3BSD format defaults that way
     // rather than making --big-endian mandatory for the only case it has.
-    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43;
+    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43 || sun;
     let params = Ufs1FormatParams {
         size_bytes: size,
         block_size,
@@ -1131,8 +1149,9 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) ->
         cg_layout,
         // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
         // `fs_fsmnt` there, so a label would land inside the mount point.
-        label: (cg_layout == CgLayout::Modern).then(|| args.name.clone()),
+        label: (cg_layout == CgLayout::Modern && !sun).then(|| args.name.clone()),
         bsd43_geometry: None,
+        sun,
     };
     let mut file = std::fs::File::create(&args.image)
         .with_context(|| format!("creating {}", args.image.display()))?;
@@ -1143,7 +1162,9 @@ fn write_blank_ufs_image(args: &NewArgs, cg_layout: crate::fs::ufs::CgLayout) ->
     log_stderr(format!(
         "wrote {} ({size} bytes, UFS1 {} bsize={} fsize={} {} cylinder group(s), {} inodes)",
         args.image.display(),
-        if cg_layout == CgLayout::Bsd43 {
+        if sun {
+            "Solaris"
+        } else if cg_layout == CgLayout::Bsd43 {
             "4.3BSD"
         } else {
             "4.4BSD"
@@ -1203,9 +1224,9 @@ fn write_blank_ext_image(
     let mut file =
         std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
     let disk_bytes = match kind {
-        "ext3" => crate::fs::ext_format::write_blank_ext3(&mut file, 0, size, name),
-        "ext4" => crate::fs::ext_format::write_blank_ext4(&mut file, 0, size, name),
-        _ => crate::fs::ext_format::write_blank_ext2(&mut file, 0, size, name),
+        "ext3" => fs_unix::ext_format::write_blank_ext3(&mut file, 0, size, name),
+        "ext4" => fs_unix::ext_format::write_blank_ext4(&mut file, 0, size, name),
+        _ => fs_unix::ext_format::write_blank_ext2(&mut file, 0, size, name),
     }
     .with_context(|| format!("formatting {kind} into {}", image.display()))?;
     // Extend to the exact formatted length; the trailing region stays sparse.
@@ -1227,7 +1248,7 @@ fn write_blank_xfs_image(image: &std::path::Path, size_str: &str, name: &str) ->
     let size = parse_size(size_str).context("parsing --size")?;
     let mut file =
         std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    let disk_bytes = crate::fs::xfs::format::write_blank_xfs(&mut file, 0, size, name)
+    let disk_bytes = fs_xfs::xfs::format::write_blank_xfs(&mut file, 0, size, name)
         .with_context(|| format!("formatting XFS into {}", image.display()))?;
     file.set_len(disk_bytes)
         .with_context(|| format!("sizing {}", image.display()))?;
@@ -1261,7 +1282,7 @@ fn write_blank_efs_image(
 
     let mut file =
         std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    crate::fs::efs::write_blank_efs(&mut file, 0, total_blocks, name, bytes_per_inode)
+    fs_unix::efs::write_blank_efs(&mut file, 0, total_blocks, name, bytes_per_inode)
         .with_context(|| format!("writing {}", image.display()))?;
     // Ensure the file is exactly the requested size even though the trailing
     // blocks past the replica superblock are sparse.

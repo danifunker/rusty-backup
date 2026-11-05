@@ -325,7 +325,7 @@ pub enum Response {
     Error { message: String },
 }
 
-/// Serde-friendly mirror of [`crate::fs::entry::FileEntry`] carrying only what
+/// Serde-friendly mirror of [`disk_core::entry::FileEntry`] carrying only what
 /// the read path (`ls` / `get`) needs. The daemon owns the real `FileEntry`;
 /// the client only displays metadata and re-requests files by path, so a thin
 /// DTO avoids deriving serde across the whole engine type.
@@ -350,7 +350,7 @@ pub struct WireEntry {
     pub resource_fork_size: Option<u64>,
 }
 
-/// Entry kind over the wire — mirrors [`crate::fs::entry::EntryType`].
+/// Entry kind over the wire — mirrors [`disk_core::entry::EntryType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireKind {
     Dir,
@@ -361,8 +361,8 @@ pub enum WireKind {
 
 impl WireEntry {
     /// Project an engine `FileEntry` down to the wire shape.
-    pub fn from_entry(e: &crate::fs::entry::FileEntry) -> Self {
-        use crate::fs::entry::EntryType;
+    pub fn from_entry(e: &disk_core::entry::FileEntry) -> Self {
+        use disk_core::entry::EntryType;
         let kind = match e.entry_type {
             EntryType::Directory => WireKind::Dir,
             EntryType::File => WireKind::File,

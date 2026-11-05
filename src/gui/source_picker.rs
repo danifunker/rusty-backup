@@ -23,20 +23,15 @@ use rusty_backup::device::DiskDevice;
 pub enum SourceEvent {
     /// A physical device was picked (index into the `devices` slice).
     Device(usize),
-    /// A disk image / container file was opened. `tempdir` holds the guard for
-    /// a materialized wrapper format (e.g. `.adz` → `.adf`); `None` when the
-    /// path was passed through unchanged.
-    Image {
-        path: PathBuf,
-        tempdir: Option<tempfile::TempDir>,
-    },
-    /// A host folder was opened (to browse as a pane source).
-    HostFolder(PathBuf),
-    /// A rusty-backup backup folder was opened.
-    BackupFolder(PathBuf),
     /// The user chose "Connect to Remote..." — open the remote file-browser
     /// window. The connection details are gathered by that window, not here.
     Remote,
+    /// "Open File...": the caller runs the picker (a controller effect, or [`image_dialog`]).
+    PickImage,
+    /// "Open Local Folder...".
+    PickHostFolder,
+    /// "Open Backup Folder...".
+    PickBackupFolder,
     /// A recently-opened path was picked from the "Recent" group. The raw path
     /// is returned un-materialized; the caller routes it (image / archive /
     /// backup folder) exactly as it would a drag-and-drop, so a mixed recent
@@ -57,14 +52,6 @@ pub struct PickerConfig {
     /// Offer "Connect to Remote…" (browse an `rb-cli serve` daemon in a
     /// file-browser window).
     pub show_remote: bool,
-    /// Materialize wrapper image formats (`.adz`/`.hdz`/…) to a tempfile via
-    /// `prepare_disk_image_path`. Inspect sets this; Commander leaves it off
-    /// and lets `BrowseSession` peel the container itself.
-    pub materialize_image: bool,
-    /// Add the "Mac archives" (`.sit`/`.hqx`/…) filter group to the image file
-    /// dialog. Inspect can inspect those; the Commander panes (disk browsing
-    /// only) leave it off so non-disk archives don't clutter the picker.
-    pub include_mac_archives: bool,
     /// ComboBox width.
     pub width: f32,
     /// Render the "Recent" group as this many **fixed** rows — the newest
@@ -92,39 +79,19 @@ pub struct PickerState<'a> {
     pub recent: &'a [String],
 }
 
-/// Run the disk-image / container file dialog (Disk Images + Mac archives +
-/// All Files filters). When `materialize` is set, wrapper formats are decoded
-/// to a tempfile via `prepare_disk_image_path` (the guard rides along in the
-/// returned tuple). Returns `None` if the user cancels. Shared by the picker's
-/// "Open File…" entry and Commander's "Open…" button.
-pub fn pick_image_file(
-    materialize: bool,
-    include_mac_archives: bool,
-) -> Option<(PathBuf, Option<tempfile::TempDir>)> {
+/// The disk-image / container file dialog (Disk Images + Mac archives + All Files filters).
+pub fn image_dialog(include_mac_archives: bool) -> rfd::AsyncFileDialog {
     let mut dialog = super::file_dialog().add_filter(
         "Disk Images",
-        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+        rusty_backup::controller::app::DISK_IMAGE_EXTS,
     );
     if include_mac_archives {
         dialog = dialog.add_filter(
             "Mac archives",
-            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
+            rusty_backup::controller::app::MAC_ARCHIVE_EXTS,
         );
     }
-    let path = dialog.add_filter("All Files", &["*"]).pick_file()?;
-    if !materialize {
-        return Some((path, None));
-    }
-    // Transparently decompress .adz / .hdz (and other wrappers) so the rest of
-    // the pipeline sees a raw image. Floppy containers are NOT decoded here
-    // (false) — they open directly so edits persist back into the container.
-    match super::prepare_disk_image_path(&path, false) {
-        Ok((materialized, guard)) => Some((materialized, guard)),
-        Err(e) => {
-            log::error!("Failed to decompress {}: {}", path.display(), e);
-            Some((path, None))
-        }
-    }
+    dialog.add_filter("All Files", &["*"])
 }
 
 /// Render the source ComboBox and return the user's choice, if any. `id_salt`
@@ -217,11 +184,7 @@ pub fn show(
                     .selectable_label(state.image_active, "Open File...")
                     .clicked()
             {
-                if let Some((path, tempdir)) =
-                    pick_image_file(cfg.materialize_image, cfg.include_mac_archives)
-                {
-                    event = Some(SourceEvent::Image { path, tempdir });
-                }
+                event = Some(SourceEvent::PickImage);
             }
             if cfg.show_host_folder
                 && ui
@@ -229,18 +192,14 @@ pub fn show(
                     .on_hover_text("Browse a folder on this computer (not a backup)")
                     .clicked()
             {
-                if let Some(dir) = super::file_dialog().pick_folder() {
-                    event = Some(SourceEvent::HostFolder(dir));
-                }
+                event = Some(SourceEvent::PickHostFolder);
             }
             if cfg.show_backup_folder
                 && ui
                     .selectable_label(state.backup_active, "Open Backup Folder...")
                     .clicked()
             {
-                if let Some(dir) = super::file_dialog().pick_folder() {
-                    event = Some(SourceEvent::BackupFolder(dir));
-                }
+                event = Some(SourceEvent::PickBackupFolder);
             }
             if cfg.show_remote {
                 if cfg.show_image || cfg.show_host_folder || cfg.show_backup_folder {

@@ -1,0 +1,51 @@
+# The Inspect tab's controller: open an image, check its volume, and close it,
+# answering the unsaved-edits question first No, then Yes.
+name = "Inspect: open, check, close behind the discard question"
+vm = "inspect"
+
+[[step]]
+expect = { source = "none", partitions = 0 }
+
+[[step]]
+action = "OpenImage"
+arg = "$blank_fat"
+settle = true
+expect = { source = "image", partitions = 1, superfloppy = true, error = "", log = "~Inspecting " }
+
+[[step]]
+action = "Check"
+arg = 0
+settle = true
+expect = { check_clean = true, log = "~Filesystem check: clean" }
+
+[[step]]
+action = "SetBrowseDirty"
+arg = true
+
+[[step]]
+action = "Close"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+arg = false
+expect = { source = "image" }
+
+[[step]]
+action = "Close"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+arg = true
+expect = { source = "none", partitions = 0, log = "~Source closed." }
+
+[[step]]
+action = "SetBrowseDirty"
+arg = false
+
+[[step]]
+action = "OpenImage"
+arg = "/nonexistent/rb-ui-scenario/missing.img"
+settle = true
+expect = { source = "image", error = "~Inspect failed" }

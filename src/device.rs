@@ -16,7 +16,7 @@ pub struct DiskDevice {
 
 impl DiskDevice {
     pub fn display_name(&self) -> String {
-        let size = crate::partition::format_size(self.size_bytes);
+        let size = disk_core::display::format_size(self.size_bytes);
         let mut tags = Vec::new();
         if self.is_removable {
             tags.push("removable");

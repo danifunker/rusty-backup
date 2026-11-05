@@ -16,7 +16,8 @@
 //!
 //! Run with: cargo test --test filesystem_e2e
 
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use rusty_backup::fs::entry::FileEntryTypeDisplay as _;
 use std::io::{Cursor, Read};
 
 /// Decompress a zstd-compressed fixture file into an in-memory Vec<u8>.
@@ -41,7 +42,7 @@ fn load_fixture(name: &str) -> Vec<u8> {
 fn test_ext2_browse_root() {
     let img = load_fixture("test_ext2.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "ext2");
     assert_eq!(fs.volume_label(), Some("test_ext2"));
@@ -63,7 +64,7 @@ fn test_ext2_browse_root() {
 fn test_ext2_read_file() {
     let img = load_fixture("test_ext2.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -77,7 +78,7 @@ fn test_ext2_read_file() {
 fn test_ext2_symlink() {
     let img = load_fixture("test_ext2.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -91,7 +92,7 @@ fn test_ext2_symlink() {
 fn test_ext2_permissions() {
     let img = load_fixture("test_ext2.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -107,7 +108,7 @@ fn test_ext2_permissions() {
 fn test_ext2_nested_directory() {
     let img = load_fixture("test_ext2.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -128,7 +129,7 @@ fn test_ext2_nested_directory() {
 fn test_ext4_browse_root() {
     let img = load_fixture("test_ext4.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "ext4");
     assert_eq!(fs.volume_label(), Some("test_ext4"));
@@ -150,7 +151,7 @@ fn test_ext4_browse_root() {
 fn test_ext4_read_file() {
     let img = load_fixture("test_ext4.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -164,7 +165,7 @@ fn test_ext4_read_file() {
 fn test_ext4_symlink() {
     let img = load_fixture("test_ext4.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -178,7 +179,7 @@ fn test_ext4_symlink() {
 fn test_ext4_permissions() {
     let img = load_fixture("test_ext4.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -193,7 +194,7 @@ fn test_ext4_permissions() {
 fn test_ext4_nested_directory() {
     let img = load_fixture("test_ext4.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -214,7 +215,7 @@ fn test_ext4_nested_directory() {
 fn test_btrfs_browse_root() {
     let img = load_fixture("test_btrfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "btrfs");
     assert_eq!(fs.volume_label(), Some("test_btrfs"));
@@ -234,7 +235,7 @@ fn test_btrfs_browse_root() {
 fn test_btrfs_read_file() {
     let img = load_fixture("test_btrfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -248,7 +249,7 @@ fn test_btrfs_read_file() {
 fn test_btrfs_symlink() {
     let img = load_fixture("test_btrfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -262,7 +263,7 @@ fn test_btrfs_symlink() {
 fn test_btrfs_nested_directory() {
     let img = load_fixture("test_btrfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -295,7 +296,7 @@ fn test_ext4_compaction_round_trip() {
 
     // Verify the compacted image is still browsable
     let cursor = Cursor::new(output);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
@@ -323,7 +324,7 @@ fn test_btrfs_compaction_round_trip() {
 
     // Verify the compacted image is still browsable
     let cursor = Cursor::new(output);
-    let mut fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let hello = entries.iter().find(|e| e.name == "hello.txt").unwrap();
@@ -359,7 +360,7 @@ fn test_ext4_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ext::ExtFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_unix::ext::ExtFilesystem::open(cursor, 0).unwrap();
     assert_eq!(fs.total_size(), new_size as u64);
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -394,7 +395,7 @@ fn test_btrfs_resize_grows() {
     // Should still be browsable with new total_bytes
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let fs = rusty_backup::fs::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
+    let fs = fs_unix::btrfs::BtrfsFilesystem::open(cursor, 0).unwrap();
     assert_eq!(fs.total_size(), new_size as u64);
 }
 
@@ -444,15 +445,15 @@ fn test_detect_btrfs_auto() {
 
 /// Helper: find a file entry by name, case-insensitive (needed for FAT 8.3 names).
 fn find_entry_ci<'a>(
-    entries: &'a [rusty_backup::fs::entry::FileEntry],
+    entries: &'a [disk_core::entry::FileEntry],
     name: &str,
-) -> Option<&'a rusty_backup::fs::entry::FileEntry> {
+) -> Option<&'a disk_core::entry::FileEntry> {
     let lower = name.to_lowercase();
     entries.iter().find(|e| e.name.to_lowercase() == lower)
 }
 
 /// Helper: check if entries contain a name (case-insensitive).
-fn has_entry_ci(entries: &[rusty_backup::fs::entry::FileEntry], name: &str) -> bool {
+fn has_entry_ci(entries: &[disk_core::entry::FileEntry], name: &str) -> bool {
     find_entry_ci(entries, name).is_some()
 }
 
@@ -464,7 +465,7 @@ fn has_entry_ci(entries: &[rusty_backup::fs::entry::FileEntry], name: &str) -> b
 fn test_fat12_browse_root() {
     let img = load_fixture("test_fat12.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "FAT12");
     assert_eq!(fs.volume_label(), Some("TEST_FAT12"));
@@ -481,7 +482,7 @@ fn test_fat12_browse_root() {
 fn test_fat12_read_file() {
     let img = load_fixture("test_fat12.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -495,7 +496,7 @@ fn test_fat12_read_file() {
 fn test_fat12_nested_directory() {
     let img = load_fixture("test_fat12.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -516,7 +517,7 @@ fn test_fat12_nested_directory() {
 fn test_fat16_browse_root() {
     let img = load_fixture("test_fat16.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "FAT16");
     assert_eq!(fs.volume_label(), Some("TEST_FAT16"));
@@ -533,7 +534,7 @@ fn test_fat16_browse_root() {
 fn test_fat16_read_file() {
     let img = load_fixture("test_fat16.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -547,7 +548,7 @@ fn test_fat16_read_file() {
 fn test_fat16_nested_directory() {
     let img = load_fixture("test_fat16.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -568,7 +569,7 @@ fn test_fat16_nested_directory() {
 fn test_fat32_browse_root() {
     let img = load_fixture("test_fat32.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "FAT32");
     assert_eq!(fs.volume_label(), Some("TEST_FAT32"));
@@ -585,7 +586,7 @@ fn test_fat32_browse_root() {
 fn test_fat32_read_file() {
     let img = load_fixture("test_fat32.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -599,7 +600,7 @@ fn test_fat32_read_file() {
 fn test_fat32_nested_directory() {
     let img = load_fixture("test_fat32.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -620,7 +621,7 @@ fn test_fat32_nested_directory() {
 fn test_ntfs_browse_root() {
     let img = load_fixture("test_ntfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
 
     assert!(fs.fs_type().starts_with("NTFS"), "got: {}", fs.fs_type());
     assert_eq!(fs.volume_label(), Some("test_ntfs"));
@@ -641,7 +642,7 @@ fn test_ntfs_browse_root() {
 fn test_ntfs_read_file() {
     let img = load_fixture("test_ntfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -655,7 +656,7 @@ fn test_ntfs_read_file() {
 fn test_ntfs_nested_directory() {
     let img = load_fixture("test_ntfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -676,7 +677,7 @@ fn test_ntfs_nested_directory() {
 fn test_exfat_browse_root() {
     let img = load_fixture("test_exfat.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "exFAT");
     assert_eq!(fs.volume_label(), Some("test_exfat"));
@@ -697,7 +698,7 @@ fn test_exfat_browse_root() {
 fn test_exfat_read_file() {
     let img = load_fixture("test_exfat.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -713,7 +714,7 @@ fn test_exfat_read_file() {
 fn test_exfat_nested_directory() {
     let img = load_fixture("test_exfat.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -735,7 +736,7 @@ fn test_exfat_nested_directory() {
 fn test_hfs_browse_root() {
     let img = load_fixture("test_hfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfs::HfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "HFS");
     assert_eq!(fs.volume_label(), Some("test_hfs"));
@@ -756,7 +757,7 @@ fn test_hfs_browse_root() {
 fn test_hfs_read_file() {
     let img = load_fixture("test_hfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfs::HfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -770,7 +771,7 @@ fn test_hfs_read_file() {
 fn test_hfs_nested_directory() {
     let img = load_fixture("test_hfs.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfs::HfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -791,7 +792,7 @@ fn test_hfs_nested_directory() {
 fn test_hfsplus_browse_root() {
     let img = load_fixture("test_hfsplus.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
 
     assert_eq!(fs.fs_type(), "HFS+");
     assert_eq!(fs.volume_label(), Some("test_hfsplus"));
@@ -812,7 +813,7 @@ fn test_hfsplus_browse_root() {
 fn test_hfsplus_read_file() {
     let img = load_fixture("test_hfsplus.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -830,7 +831,7 @@ fn test_hfsplus_read_file() {
 fn test_hfsplus_nested_directory() {
     let img = load_fixture("test_hfsplus.img.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -860,7 +861,7 @@ fn test_fat12_compaction_round_trip() {
     compact.read_to_end(&mut output).unwrap();
 
     let cursor = Cursor::new(output);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let hello = find_entry_ci(&entries, "hello.txt").unwrap();
@@ -881,7 +882,7 @@ fn test_fat16_compaction_round_trip() {
     compact.read_to_end(&mut output).unwrap();
 
     let cursor = Cursor::new(output);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let hello = find_entry_ci(&entries, "hello.txt").unwrap();
@@ -902,7 +903,7 @@ fn test_fat32_compaction_round_trip() {
     compact.read_to_end(&mut output).unwrap();
 
     let cursor = Cursor::new(output);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let hello = find_entry_ci(&entries, "hello.txt").unwrap();
@@ -928,7 +929,7 @@ fn test_ntfs_compaction_round_trip() {
 
     // Verify the compacted image retains a valid NTFS superblock
     let cursor = Cursor::new(output);
-    let fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
+    let fs = fs_pc::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
     assert!(fs.fs_type().starts_with("NTFS"));
 }
 
@@ -1011,7 +1012,7 @@ fn exfat_smart_compaction_is_layout_preserving() {
 /// landed at the wrong offsets and this read returned corrupt data.
 #[test]
 fn ntfs_compaction_preserves_nonresident_file() {
-    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
     use rusty_backup::fs::{compact_partition_reader, open_editable_filesystem, open_filesystem};
 
     let img = load_fixture("test_ntfs.img.zst");
@@ -1087,7 +1088,7 @@ fn test_hfs_compaction_round_trip() {
 
     // Verify the compacted image retains a valid HFS volume
     let cursor = Cursor::new(output);
-    let fs = rusty_backup::fs::hfs::HfsFilesystem::open(cursor, 0).unwrap();
+    let fs = fs_mac::hfs::HfsFilesystem::open(cursor, 0).unwrap();
     assert_eq!(fs.fs_type(), "HFS");
 }
 
@@ -1136,7 +1137,7 @@ fn test_fat16_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(has_entry_ci(&entries, "hello.txt"));
@@ -1167,7 +1168,7 @@ fn test_fat32_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(has_entry_ci(&entries, "hello.txt"));
@@ -1201,13 +1202,13 @@ fn test_ntfs_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
 
     // The grown volume's $Bitmap must cover the new clusters with nothing leaked.
-    let report = rusty_backup::fs::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+    let report = fs_pc::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
     assert!(
         report.errors.is_empty(),
         "fsck after grow: {:?}",
@@ -1248,7 +1249,7 @@ fn test_exfat_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_pc::exfat::ExfatFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
@@ -1281,7 +1282,7 @@ fn test_hfs_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfs::HfsFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
@@ -1314,7 +1315,7 @@ fn test_hfsplus_resize_grows() {
     // Should still be browsable
     let img = cursor.into_inner();
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_mac::hfsplus::HfsPlusFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
@@ -1448,8 +1449,8 @@ fn test_prodos_superfloppy_detection() {
 /// This is the engine-level guarantee behind Phase 1/2 of docs/basilisk_hfv.md.
 #[test]
 fn test_hfv_flat_hfs_detect_open_fsck_edit() {
-    use rusty_backup::fs::filesystem::CreateFileOptions;
-    use rusty_backup::fs::hfs::create_blank_hfs;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_mac::hfs::create_blank_hfs;
     use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
     use rusty_backup::partition::PartitionTable;
 
@@ -1516,12 +1517,12 @@ fn test_hfv_flat_hfs_detect_open_fsck_edit() {
 /// Model-layer expand → flat HFV: drive the real `start_hfs_expand` worker
 /// with `ExpandOutput::FlatHfv` against a small source HFS volume and verify
 /// the output is a valid, partition-less HFV holding the source's file.
-/// Complements the unit coverage of `fs::hfv::clone_into_hfv` by exercising
+/// Complements the unit coverage of `fs_mac::hfv::clone_into_hfv` by exercising
 /// the runner's branch + file write.
 #[test]
 fn test_expand_runner_writes_flat_hfv() {
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use rusty_backup::model::hfs_expand_runner::{
         start_hfs_expand, summarize_source, ExpandOutput,
     };
@@ -1597,12 +1598,12 @@ fn test_expand_runner_writes_flat_hfv() {
 /// `Apple_HFS` partition at block 64 and zero drivers carried over.
 #[test]
 fn test_expand_runner_wraps_non_apm_source_in_apm() {
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
+    use part_tables::apm::Apm;
     use rusty_backup::model::hfs_expand_runner::{
         start_hfs_expand, summarize_source, ExpandOutput,
     };
-    use rusty_backup::partition::apm::Apm;
 
     let tmp = tempfile::tempdir().unwrap();
     let src_path = tmp.path().join("partition-0.img");
@@ -1681,8 +1682,8 @@ fn test_expand_runner_wraps_non_apm_source_in_apm() {
 /// detect→partitions() path the GUI feeds it.
 #[test]
 fn test_export_runner_per_partition_hfv() {
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use rusty_backup::model::export_runner::start_per_partition_hfv;
     use rusty_backup::partition::PartitionTable;
     use std::collections::HashMap;
@@ -1761,11 +1762,11 @@ fn test_export_runner_per_partition_hfv() {
 
 #[test]
 fn test_prodos_list_and_recurse() {
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let img = load_fixture("test_prodos.hdv.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -1814,10 +1815,10 @@ fn test_prodos_fsck_clean_on_real_volume() {
     // type 5) whose data + resource forks the bitmap walk must follow — a
     // regression guard so fsck never mistakes live fork blocks for leaked ones
     // (which --repair would otherwise free, corrupting the volume).
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let img = load_fixture("test_prodos.hdv.zst");
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
     let res = fs
         .fsck()
         .expect("ProDOS implements fsck")
@@ -1835,11 +1836,11 @@ fn test_prodos_fsck_clean_on_real_volume() {
 fn test_prodos_type_codes_populated() {
     // Verify list_directory populates FileEntry::type_code from the new
     // prodos_types table rather than returning raw hex codes.
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let img = load_fixture("test_prodos.hdv.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
@@ -1870,13 +1871,13 @@ fn test_prodos_create_file_auto_types_from_extension() {
     // With no explicit type_code in CreateFileOptions, the ProDOS writer
     // should fall back to the prodos_types extension table so that
     // "HELLO.TXT" → $04 TXT and "GAME.BAS" → $FC BAS with aux $0801.
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 
     let mut img = load_fixture("test_prodos.hdv.zst");
 
     {
         let cursor = Cursor::new(&mut img);
-        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+        let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
 
         let root = fs.root().unwrap();
         let txt = b"hello world";
@@ -1914,7 +1915,7 @@ fn test_prodos_create_file_auto_types_from_extension() {
     // Reopen and verify the aux_type bytes actually landed on disk for HELLO.BAS.
     // Directory entry layout: entry offset 31-32 = aux_type (LE u16).
     let cursor = Cursor::new(img.clone());
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     assert!(entries.iter().any(|e| e.name == "NOTE.TXT"));
@@ -1954,7 +1955,7 @@ fn test_prodos_edit_round_trip() {
     // the test that would have caught the inverted $D/$E nibbles on real
     // directories — it exercises find_free_dir_slot, write_dir_entry,
     // update_dir_file_count, and the bitmap flush path.
-    use rusty_backup::fs::filesystem::{
+    use disk_core::filesystem::{
         CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
     };
 
@@ -1963,7 +1964,7 @@ fn test_prodos_edit_round_trip() {
 
     {
         let cursor = Cursor::new(&mut img);
-        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+        let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
 
         let root = fs.root().unwrap();
         let create_opts = CreateFileOptions {
@@ -1991,7 +1992,7 @@ fn test_prodos_edit_round_trip() {
 
     // Reopen from the mutated bytes and verify state persisted.
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -2026,11 +2027,11 @@ fn test_prodos_aux_type_populated_from_catalog() {
     // `list_prodos_directory` must surface the aux_type from the 39-byte
     // catalog entry. ANTETRIS is an S16 ($B3) binary whose aux type should be
     // non-zero on the fixture.
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let img = load_fixture("test_prodos.hdv.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let root_entries = fs.list_directory(&root).unwrap();
     let antetris_dir = root_entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
@@ -2046,14 +2047,14 @@ fn test_prodos_aux_type_populated_from_catalog() {
 fn test_prodos_set_prodos_type_round_trip() {
     // Create a stub file as BIN, then change it to TXT with a specific aux
     // via set_prodos_type, sync, reopen, and verify both fields landed.
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
 
     let mut img = load_fixture("test_prodos.hdv.zst");
     let payload = b"not-really-text";
 
     {
         let cursor = Cursor::new(&mut img);
-        let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+        let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
         let root = fs.root().unwrap();
         let opts = CreateFileOptions {
             type_code: Some("$06".into()),
@@ -2078,7 +2079,7 @@ fn test_prodos_set_prodos_type_round_trip() {
     }
 
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let rbtype = entries.iter().find(|e| e.name == "RBTYPE").unwrap();
@@ -2096,11 +2097,11 @@ fn test_prodos_set_prodos_type_round_trip() {
 
 #[test]
 fn test_prodos_read_file_contents() {
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     let img = load_fixture("test_prodos.hdv.zst");
     let cursor = Cursor::new(img);
-    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
+    let mut fs = fs_apple2::prodos::ProDosFilesystem::open(cursor, 0).unwrap();
 
     let root = fs.root().unwrap();
     let root_entries = fs.list_directory(&root).unwrap();
@@ -2134,8 +2135,8 @@ fn test_prodos_read_file_contents() {
 /// Mirrors what `BrowseView::apply_staged_edits` does at runtime.
 #[test]
 fn test_pfs3_staged_edits_round_trip() {
-    use rusty_backup::fs::filesystem::EditableFilesystem;
-    use rusty_backup::fs::pfs3::{create_blank_pfs3, Pfs3Filesystem};
+    use disk_core::filesystem::EditableFilesystem;
+    use fs_amiga::pfs3::{create_blank_pfs3, Pfs3Filesystem};
     use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2238,8 +2239,8 @@ fn test_pfs3_staged_edits_round_trip() {
 /// directory + file into it, then confirm the integrity check is clean.
 #[test]
 fn test_pfs3_fsck_clean_on_file_backed_volume() {
-    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem};
-    use rusty_backup::fs::pfs3::{create_blank_pfs3, Pfs3Filesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem};
+    use fs_amiga::pfs3::{create_blank_pfs3, Pfs3Filesystem};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let img_path = tmp.path().join("check.hdf");
@@ -2283,8 +2284,8 @@ fn test_pfs3_fsck_clean_on_file_backed_volume() {
 /// detect -> open -> check -> repair chain, not just the in-module unit tests.
 #[test]
 fn test_dragondos_fsck_detect_open_repair_on_file() {
-    use rusty_backup::fs::dragondos::create_blank;
-    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_8bit::dragondos::create_blank;
     use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
     use rusty_backup::partition::PartitionTable;
 
@@ -2388,8 +2389,8 @@ fn test_dragondos_fsck_detect_open_repair_on_file() {
 /// This pins that the runner opens + checks + repairs it end to end.
 #[test]
 fn test_dragondos_fsck_via_runner_the_gui_inspect_path() {
-    use rusty_backup::fs::dragondos::create_blank;
-    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_8bit::dragondos::create_blank;
     use rusty_backup::fs::{is_checkable_retro_fs, open_editable_filesystem};
     use rusty_backup::model::fsck_runner::{run_fsck, run_repair};
 
@@ -2456,8 +2457,8 @@ fn test_dragondos_fsck_via_runner_the_gui_inspect_path() {
 /// lost granule and re-check clean.
 #[test]
 fn test_rsdos_fsck_detect_open_repair_on_file() {
-    use rusty_backup::fs::filesystem::CreateFileOptions;
-    use rusty_backup::fs::rsdos::create_blank;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_8bit::rsdos::create_blank;
     use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
     use rusty_backup::partition::PartitionTable;
 
@@ -2557,8 +2558,8 @@ fn test_rsdos_fsck_detect_open_repair_on_file() {
 /// scrambled catalogue order and re-check clean.
 #[test]
 fn test_dfs_fsck_detect_open_repair_on_file() {
-    use rusty_backup::fs::dfs::create_blank_dfs;
-    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_8bit::dfs::create_blank_dfs;
     use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
     use rusty_backup::partition::PartitionTable;
 
@@ -2671,8 +2672,8 @@ fn test_dfs_fsck_detect_open_repair_on_file() {
 #[test]
 fn test_affs_staged_edits_round_trip() {
     use byteorder::{BigEndian, ByteOrder};
-    use rusty_backup::fs::affs::AffsFilesystem;
-    use rusty_backup::fs::filesystem::EditableFilesystem;
+    use disk_core::filesystem::EditableFilesystem;
+    use fs_amiga::affs::AffsFilesystem;
     use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
 
     // Build a minimal empty FFS floppy: 1760 blocks, FFS variant, root at
@@ -2830,8 +2831,8 @@ fn test_affs_staged_edits_round_trip() {
 /// SFS volume, dispatched through `edit_queue::apply_edit`.
 #[test]
 fn test_sfs_staged_edits_round_trip() {
-    use rusty_backup::fs::filesystem::EditableFilesystem;
-    use rusty_backup::fs::sfs::{create_blank_sfs, SfsFilesystem};
+    use disk_core::filesystem::EditableFilesystem;
+    use fs_amiga::sfs::{create_blank_sfs, SfsFilesystem};
     use rusty_backup::model::edit_queue::{apply_edit, StagedEdit};
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2929,10 +2930,8 @@ fn test_sfs_staged_edits_round_trip() {
 /// directory + file into it, then confirm the integrity check is clean.
 #[test]
 fn test_sfs_fsck_clean_on_file_backed_volume() {
-    use rusty_backup::fs::filesystem::{
-        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
-    };
-    use rusty_backup::fs::sfs::{create_blank_sfs, SfsFilesystem};
+    use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+    use fs_amiga::sfs::{create_blank_sfs, SfsFilesystem};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let img_path = tmp.path().join("check.hdf");
@@ -3113,8 +3112,9 @@ fn test_synthetic_rdb_ffs_pipeline() {
 #[test]
 fn test_rdb_sfs_export_shrink_round_trip() {
     use byteorder::{BigEndian, ByteOrder};
+    use part_tables::PartitionSizeOverride;
     use rusty_backup::fs;
-    use rusty_backup::partition::{PartitionSizeOverride, PartitionTable};
+    use rusty_backup::partition::PartitionTable;
     use rusty_backup::rbformats::reconstruct_raw_rdb_disk;
 
     const BSIZE: usize = 512;
@@ -3175,8 +3175,7 @@ fn test_rdb_sfs_export_shrink_round_trip() {
     disk[BSIZE..2 * BSIZE].copy_from_slice(&part);
 
     // SFS volume at partition offset. 6400 blocks @ 512 = 3.2 MiB.
-    let sfs_img =
-        rusty_backup::fs::sfs::create_blank_sfs(part_lbas, "RdbSfsRT").expect("create_blank_sfs");
+    let sfs_img = fs_amiga::sfs::create_blank_sfs(part_lbas, "RdbSfsRT").expect("create_blank_sfs");
     assert_eq!(sfs_img.len(), part_lbas as usize * BSIZE);
     let part_off = start_lba as usize * BSIZE;
     disk[part_off..part_off + sfs_img.len()].copy_from_slice(&sfs_img);
@@ -3268,7 +3267,8 @@ fn test_rdb_sfs_export_shrink_round_trip() {
 #[test]
 fn test_rdb_multi_partition_shrink_auto_packs() {
     use byteorder::{BigEndian, ByteOrder};
-    use rusty_backup::partition::{PartitionSizeOverride, PartitionTable};
+    use part_tables::PartitionSizeOverride;
+    use rusty_backup::partition::PartitionTable;
     use rusty_backup::rbformats::reconstruct_raw_rdb_disk;
 
     const BSIZE: usize = 512;
@@ -3432,7 +3432,8 @@ fn test_rdb_multi_partition_shrink_auto_packs() {
 #[test]
 fn test_resize_filesystem_for_affs_shrink_round_trip() {
     use byteorder::{BigEndian, ByteOrder};
-    use rusty_backup::fs::{self, filesystem::Filesystem, resize_filesystem_for};
+    use disk_core::filesystem::Filesystem;
+    use rusty_backup::fs::resize_filesystem_for;
 
     const BSIZE: usize = 512;
 
@@ -3501,7 +3502,7 @@ fn test_resize_filesystem_for_affs_shrink_round_trip() {
     let mut bytes = cur.into_inner();
     bytes.truncate(new_size as usize);
     let mut cur2 = Cursor::new(bytes);
-    let fs = fs::affs::AffsFilesystem::open(&mut cur2, 0).expect("reopen");
+    let fs = fs_amiga::affs::AffsFilesystem::open(&mut cur2, 0).expect("reopen");
     assert_eq!(fs.total_blocks(), 800);
     assert_eq!(fs.root_block_num(), 400);
     assert_eq!(fs.volume_label(), Some("DispRT"));
@@ -3522,8 +3523,9 @@ fn test_resize_filesystem_for_affs_shrink_round_trip() {
 
 #[test]
 fn test_whole_disk_vhd_export_preserves_partitionless_hfv() {
-    use rusty_backup::fs::hfv::{build_blank_hfv, suggest_block_size};
-    use rusty_backup::partition::{PartitionSizeOverride, PartitionTable};
+    use fs_mac::hfv::{build_blank_hfv, suggest_block_size};
+    use part_tables::PartitionSizeOverride;
+    use rusty_backup::partition::PartitionTable;
     use rusty_backup::rbformats::vhd::export_whole_disk_vhd;
     use std::io::Seek;
 
@@ -3541,8 +3543,7 @@ fn test_whole_disk_vhd_export_preserves_partitionless_hfv() {
         Ok(PartitionTable::None { .. }) | Err(_)
     ));
     src_cur.rewind().unwrap();
-    rusty_backup::fs::hfs::HfsFilesystem::open(&mut src_cur, 0)
-        .expect("source opens as classic HFS");
+    fs_mac::hfs::HfsFilesystem::open(&mut src_cur, 0).expect("source opens as classic HFS");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let src_path = dir.path().join("Main.hfv");
@@ -3589,7 +3590,7 @@ fn test_whole_disk_vhd_export_preserves_partitionless_hfv() {
     // The exported VHD's HFS volume must still parse (MDB intact, boot blocks
     // not clobbered) — what the original report could not do.
     let mut out_cur = Cursor::new(out[..size as usize].to_vec());
-    rusty_backup::fs::hfs::HfsFilesystem::open(&mut out_cur, 0)
+    fs_mac::hfs::HfsFilesystem::open(&mut out_cur, 0)
         .expect("exported VHD still holds a valid HFS volume");
 }
 
@@ -3606,7 +3607,7 @@ fn test_whole_disk_vhd_export_preserves_partitionless_hfv() {
 
 #[test]
 fn test_hfv_source_open_unwraps_dynamic_vhd() {
-    use rusty_backup::fs::hfv::{build_blank_hfv, suggest_block_size};
+    use fs_mac::hfv::{build_blank_hfv, suggest_block_size};
     use rusty_backup::rbformats::vhd::export_whole_disk_vhd_dynamic;
     use rusty_backup::rbformats::{detect_image_format_with_path, wrap_image_reader};
     use std::io::Seek;
@@ -3636,7 +3637,7 @@ fn test_hfv_source_open_unwraps_dynamic_vhd() {
     // this is the pre-fix failure mode.
     let raw = std::io::BufReader::new(std::fs::File::open(&vhd_path).unwrap());
     assert!(
-        rusty_backup::fs::hfs::HfsFilesystem::open(raw, 0).is_err(),
+        fs_mac::hfs::HfsFilesystem::open(raw, 0).is_err(),
         "naked open of a dynamic VHD must NOT find a valid HFS MDB"
     );
 
@@ -3648,7 +3649,7 @@ fn test_hfv_source_open_unwraps_dynamic_vhd() {
     let (mut reader, _len) =
         wrap_image_reader(std::fs::File::open(&vhd_path).unwrap(), format).expect("wrap reader");
     reader.rewind().unwrap();
-    let fs = rusty_backup::fs::hfs::HfsFilesystem::open(reader, 0)
+    let fs = fs_mac::hfs::HfsFilesystem::open(reader, 0)
         .expect("container-aware open finds the HFS volume");
     assert_eq!(fs.volume_summary().volume_name, "HfvDynRT");
 }
@@ -3671,7 +3672,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[test]
 fn test_apfs_open_and_labels() {
     let img = load_fixture("test_apfs.img.zst");
-    let fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
     assert_eq!(fs.fs_type(), "APFS");
     assert_eq!(fs.volume_label(), Some("RBTEST"));
     // Container is 24 MiB; used size is the volume's allocated blocks (> 0).
@@ -3682,7 +3683,7 @@ fn test_apfs_open_and_labels() {
 #[test]
 fn test_apfs_browse_root_and_nested() {
     let img = load_fixture("test_apfs.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -3730,7 +3731,7 @@ fn test_apfs_browse_root_and_nested() {
 #[test]
 fn test_apfs_resource_fork_sizes_match_macos() {
     let img = load_fixture("test_apfs_rsrc.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
@@ -3761,9 +3762,9 @@ fn test_apfs_resource_fork_sizes_match_macos() {
 
 #[test]
 fn test_apfs_read_resource_fork_bytes() {
-    use rusty_backup::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
     let img = load_fixture("test_apfs_rsrc.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
@@ -3802,12 +3803,12 @@ fn test_apfs_read_matches_oracle_checksums() {
     }
 
     let img = load_fixture("test_apfs.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
 
     // Walk the whole tree and check every file's content hash against macOS.
     fn check(
-        fs: &mut rusty_backup::fs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
-        dir: &rusty_backup::fs::entry::FileEntry,
+        fs: &mut fs_apfs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
+        dir: &disk_core::entry::FileEntry,
         prefix: &str,
         expected: &std::collections::HashMap<String, String>,
         checked: &mut usize,
@@ -3866,7 +3867,7 @@ fn apfs_fixture_passphrase() -> String {
 fn test_apfs_encrypted_locked_without_passphrase() {
     // Container + volume metadata is plaintext, so the label shows even locked.
     let img = load_fixture("test_apfs_encrypted.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let mut fs = fs_apfs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
     assert_eq!(fs.fs_type(), "APFS");
     assert_eq!(fs.volume_label(), Some("RBBASE"));
     // Browsing a locked volume must fail with a clear (Unsupported) error, not
@@ -3874,10 +3875,7 @@ fn test_apfs_encrypted_locked_without_passphrase() {
     let root = fs.root().unwrap();
     let err = fs.list_directory(&root).unwrap_err();
     assert!(
-        matches!(
-            err,
-            rusty_backup::fs::filesystem::FilesystemError::Unsupported(_)
-        ),
+        matches!(err, disk_core::filesystem::FilesystemError::Unsupported(_)),
         "expected Unsupported (encrypted) error, got {err:?}"
     );
 }
@@ -3885,7 +3883,7 @@ fn test_apfs_encrypted_locked_without_passphrase() {
 #[test]
 fn test_apfs_encrypted_wrong_passphrase_errors() {
     let img = load_fixture("test_apfs_encrypted.img.zst");
-    let err = match rusty_backup::fs::apfs::ApfsFilesystem::open_with_passphrase(
+    let err = match fs_apfs::apfs::ApfsFilesystem::open_with_passphrase(
         Cursor::new(img),
         0,
         Some("definitely-not-the-passphrase"),
@@ -3894,10 +3892,7 @@ fn test_apfs_encrypted_wrong_passphrase_errors() {
         Err(e) => e,
     };
     assert!(
-        matches!(
-            err,
-            rusty_backup::fs::filesystem::FilesystemError::InvalidData(_)
-        ),
+        matches!(err, disk_core::filesystem::FilesystemError::InvalidData(_)),
         "wrong passphrase should be InvalidData, got {err:?}"
     );
 }
@@ -3906,12 +3901,9 @@ fn test_apfs_encrypted_wrong_passphrase_errors() {
 fn test_apfs_encrypted_unlock_browse_and_read() {
     let pass = apfs_fixture_passphrase();
     let img = load_fixture("test_apfs_encrypted.img.zst");
-    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open_with_passphrase(
-        Cursor::new(img),
-        0,
-        Some(&pass),
-    )
-    .expect("unlock with correct passphrase");
+    let mut fs =
+        fs_apfs::apfs::ApfsFilesystem::open_with_passphrase(Cursor::new(img), 0, Some(&pass))
+            .expect("unlock with correct passphrase");
     assert_eq!(fs.volume_label(), Some("RBBASE"));
 
     // Browse the decrypted catalog.
@@ -3944,8 +3936,8 @@ fn test_apfs_encrypted_unlock_browse_and_read() {
         expected.insert(path.to_string(), hash.to_string());
     }
     fn check(
-        fs: &mut rusty_backup::fs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
-        dir: &rusty_backup::fs::entry::FileEntry,
+        fs: &mut fs_apfs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
+        dir: &disk_core::entry::FileEntry,
         prefix: &str,
         expected: &std::collections::HashMap<String, String>,
         checked: &mut usize,

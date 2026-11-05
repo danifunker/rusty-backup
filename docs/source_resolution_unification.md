@@ -15,8 +15,8 @@ backup; it auto-opened an APM `Apple_Driver_IOKit` driver partition and errored)
 that were both symptoms of source-resolution logic trapped in the Inspect *view*
 rather than a shared model. The governing rule — the litmus test ("could the
 CLI / a headless test / a TUI call this without egui/crossterm?") — lives in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md) § "Presentation layers: one model, many
-UIs".
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) § "Architecture policy (MVC)" (formerly "Presentation layers: one model, many
+UIs").
 
 ## Current state: one engine, (still) three orchestrations
 
@@ -214,7 +214,7 @@ Point a fresh session at this:
 
 > **Resume: source-resolution unification, Phase 4 (Inspect adopts the resolver).**
 > Branch `commander-mode` in `/Users/dani/repos/rusty-backup` (tree clean). Read
-> `CONTRIBUTING.md` § "Presentation layers: one model, many UIs", then this whole
+> `CONTRIBUTING.md` § "Architecture policy (MVC)", then this whole
 > file (`docs/source_resolution_unification.md`) — it's the authoritative plan.
 >
 > **State:** Phases 1–3 are done + committed (capability gates → `fs/`; shared

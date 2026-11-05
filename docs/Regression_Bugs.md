@@ -19,6 +19,17 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-081](#r-081)~~ | ~~Medium~~ **FIXED** | `libchdman-rs` 0.289.x (vendored MAME `chd.cpp`) | ~~A CHD of a source of 8 KiB or less aborts the process: `compress_v5_map`'s buffer leaves no room for the Huffman tree with one or two hunks~~ — libchdman-rs 0.289.4 allows 160 bits for the tree, 2026-11-04 |
+| ~~[R-080](#r-080)~~ | ~~Medium~~ **FIXED** | `src/restore/superfloppy_wrap.rs`, `src/model/{backup_loader,text_edit}.rs` | ~~A bare SquashFS image opened in Inspect fails to Browse ("bad MDB signature"): "squashfs" contains "hfs", so its row got MBR type 0xAF and opened as HFS; the same match chose the Apple HFS GPT type and Mac Roman text~~ — SquashFS is matched first (0x83, Linux filesystem GUID, UTF-8), 2026-11-04 |
+| ~~[R-079](#r-079)~~ | ~~**High**~~ **FIXED** | `crates/fs-pc` (NTFS directory listing) | ~~An NT4 NTFS volume hides every file in MFT records 16-23: NT4 Terminal Server's `WTSRV` (record 17) and its 3,600 files were missing from browse, backup sizing and extract~~ — only the fixed metafiles 0-15 are hidden, 2026-11-04 |
+| ~~[R-078](#r-078)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (HFS `last_data_byte`) | ~~`restore --size minimum` of a classic HFS volume fails: the recorded minimum is one allocation block short, because it leaves no room for the alternate MDB and the sector after it~~ — the minimum ends 1024 bytes past the last allocated block; HFS+ no longer skips the block before its alternate header, 2026-11-04 |
+| ~~[R-077](#r-077)~~ | ~~Medium~~ **FIXED** | `crates/disk-core` (`times`), `src/fs/copy.rs` | ~~A copy between a classic-Mac volume (HFS / MFS) and FAT shifts the modification time by the host's UTC offset: HFS and MFS dates are read as local wall-clock time, FAT dates as UTC~~ — FAT, exFAT, Human68k and ProDOS dates are local wall-clock time too, 2026-11-04 |
+| ~~[R-076](#r-076)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, rotational tables) | ~~Editing a Solaris UFS volume leaves its `cg_btot` / `cg_b` rotational counts stale~~ — the editor recounts the dynamic-layout tables too, 2026-11-01 |
+| ~~[R-075](#r-075)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (`new volume ufs-43bsd`) | ~~A blank 4.3BSD UFS volume whose cylinder count is a multiple of `fs_cpg` fails NeXTSTEP 3.3's fsck ("SUMMARY INFORMATION BAD")~~ — the last group's `cg_ncyl` is `fs_ncyl % fs_cpg`, 2026-11-01 |
+| ~~[R-074](#r-074)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 edit, superblock totals) | ~~Any rb-cli edit of a UFS1 volume Solaris made corrupts its superblock: the edit also updates FreeBSD's 64-bit `fs_cstotal` at offset 1008, which Solaris's superblock does not have~~ — the 64-bit totals are written only on UFS2 or with `FS_FLAGS_UPDATED`, 2026-11-01 |
+| ~~[R-073](#r-073)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (`new volume ufs --big-endian`) | ~~A blank big-endian UFS1 volume is rejected by Solaris 9's own fsck ("BAD VALUES IN SUPER BLOCK") although `new volume ufs` names Solaris as a target~~ — new `new volume ufs-solaris` writes Solaris's own layout and passes its fsck; `ufs` no longer claims Solaris, 2026-11-01 |
+| ~~[R-072](#r-072)~~ | ~~Medium~~ **FIXED** | `crates/fs-unix` (UFS1 directory create) | ~~After `rb-cli mkdir` on a FreeBSD-made UFS1 volume, FreeBSD 15.1 `fsck_ffs -fn` asks "UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH?"~~ — the depth is now written at offset 4 on 4.4BSD-format UFS1 and survives later inode writes, 2026-11-01 |
+| ~~[R-071](#r-071)~~ | ~~**High**~~ **FIXED** | `crates/fs-unix` (UFS1 `create_blank`) | ~~A blank UFS1 volume from `rb-cli new volume ufs` fails FreeBSD 15.1 `fsck_ffs -fn`: free block counts wrong in the superblock, summary information bad, blocks missing in the bitmaps~~ — the root directory takes one fragment and the cluster summary no longer overwrites the free map, 2026-11-01 |
 | ~~[R-070](#r-070)~~ | ~~**High**~~ **FIXED** | `src/cli/verbs/restore.rs` | ~~`rb-cli restore` without `--device` treats a `/dev/...` target as an image file and create/truncates it, so a writable device is written raw with no safety preflight, no system-disk guard, no unmount, no disk claim and no write-protect check~~ — a device-shaped target without `--device` is now refused, 2026-09-08 |
 | ~~[R-069](#r-069)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs` | ~~The encrypted-DMG probe opens the source with a plain `File::open` before the raw-device check is reached, so on macOS an unprivileged `rb-cli` device verb still dies with a bare `Permission denied` and R-068's fix never runs~~ — the device check now precedes every content probe, 2026-09-08 |
 | ~~[R-068](#r-068)~~ | ~~**High**~~ **FIXED** | `src/model/source_reader.rs`, `src/os/mod.rs` | ~~The CLI opens a raw device with a plain `File::open` and never elevates, so on macOS — where privilege is escalated per operation through `authopen`, not inherited from the process — every unprivileged `rb-cli` device verb dies with a bare `Permission denied` and no way forward~~ — the CLI device path goes through `open_source_for_reading` like the GUI's, holding the disk claim for the reader's lifetime, 2026-09-08 |
@@ -92,6 +103,304 @@ finding depends on a fixture, the fixture is named.
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
 
 ---
+
+## Found during Phase 2 slice 29, 2026-11-04
+
+### R-081 — a CHD of an image of 8 KiB or less aborts the process {#r-081}
+
+**FIXED 2026-11-04 in libchdman-rs 0.289.4** (fea5b79 there; rusty-backup requires it). 4, 8
+and 12 KiB random images now convert, pass MAME 0.285's `chdman verify` and extract
+byte-identical. Test: `hd_roundtrip::tiny_images_of_one_or_two_hunks_round_trip` in
+libchdman-rs. Not yet reported upstream to MAME.
+
+Before: `rb-cli convert z.img out --format chd` with an 8 KiB (or 4 KiB) source died in
+libchdman's MAME code: `chd.cpp:2258 compress_v5_map(): Assertion '!bitbuf.overflow()'`.
+The buffer is sized as 16 header bytes plus up to `12 + max(lengthbits+16, selfbits,
+parentbits)` bits per hunk, with no allowance for the Huffman tree written at its start,
+so with one or two hunks the tree alone overflows it. 12 KiB and larger work. MAME
+0.285's `chdman` (assertions compiled out) writes a CHD that `chdman verify` rejects.
+The fix adds `16*2*5` bits (16 codes, at most 2 x 5 RLE bits each) to `nbits_needed`.
+
+### R-080 — a bare SquashFS image does not browse from Inspect {#r-080}
+
+**FIXED 2026-11-04.** `superfloppy_wrap::mbr_type_byte_for_fs` matched substrings, and
+"squashfs" contains "hfs", so a partition-less SquashFS image got MBR type 0xAF and the
+Browse session opened it as HFS ("bad MDB signature: 0x0000"). `gpt_guid_for_fs`,
+`backup_loader::infer_fat_type_byte` and `text_edit::conventional_encoding_for` had the
+same trap (Apple HFS GUID, 0xAF, Mac Roman). SquashFS is now matched first: 0x83, the
+Linux filesystem GUID, UTF-8. `rb-cli` was unaffected (it opens by detection). Tests:
+`controller::inspect::tests::a_squashfs_image_browses_as_squashfs_not_hfs` (fails before
+the fix with that error), the `superfloppy_wrap` and `text_edit` mapping tests.
+
+## Found on the user's NT4 Terminal Server Edition disk, 2026-11-04
+
+### R-079 — NT4 NTFS volumes hide the files in MFT records 16-23 {#r-079}
+
+**FIXED 2026-11-04.** The NTFS directory reader kept an index entry only when its
+MFT record was 24 or higher, on the belief that 0-23 are all system metafiles. Only
+0-15 are ($MFT .. $Extend); 16-23 are reserved by later Windows versions, but NT4
+allocated ordinary files there. On an NT4 TSE disk the system folder `WTSRV` is record
+17, so it and everything below it vanished: the root listed 8 of 9 entries and a
+walk found 926 files / 80 folders (462 MiB) instead of 4,590 / 373 (692 MiB). The
+reader now hides records 0-15 only; the allocator still hands out records from 24.
+fs-pc 0.1.2. Test: `ntfs::backup_boot_sector_tests::index_entries_in_records_16_to_23_are_listed`
+(fails with the old threshold: `WTSRV` missing). Checked against `ntfs-3g`'s `ntfsls -R`
+on the same volume: identical file and folder counts.
+
+Left: `ntfs_fsck`'s "N files checked" count still starts at record 24; it checks every
+record's clusters regardless, so only that count is low on NT4 volumes.
+
+## Found on the issue #104 Manhole CD, 2026-11-04
+
+### R-078 — a minimum-size restore of a classic HFS volume cuts its last block {#r-078}
+
+**FIXED 2026-11-04.** `HfsFilesystem::last_data_byte` now ends 1024 bytes past
+the last allocated block, where `resize_hfs_in_place` puts the alternate MDB
+and the unused sector after it (R-059), so a shrink to the recorded minimum
+keeps every allocated block. An all-free bitmap reports the whole volume
+including that tail (it used to report only the allocation blocks). fs-mac
+0.1.3. Test: `hfs::tests::last_data_byte_is_a_size_the_volume_shrinks_to`
+marks a block used and shrinks to `last_data_byte`; it failed before the fix
+("new size 1023 blocks ends before the last allocated block (1024)").
+
+HFS+ did not have the same gap (its minimum already adds the alternate
+header's block) but had a neighbour: `last_data_byte` skipped the last *two*
+allocation blocks whatever the block size, while with blocks of 1 KiB or more
+only the last one holds the alternate header. Data in the second-to-last
+block was missed, so the minimum came out short and the resize refused it.
+It now skips exactly `alt_vh_blocks()`, the range the resizer reserves. Test:
+`hfsplus::tests::last_data_byte_counts_the_block_before_the_alternate_header`.
+
+Verified on the Manhole track-1 image (cooked to 2048-byte sectors):
+`backup --format chd` records a minimum of 61378048 bytes (was 61377024),
+`restore --size minimum` shrinks the volume 63377 -> 59929 blocks, and
+`rb-cli fsck` on the restored partition is clean. The source's own
+`AllocationAreaEnd` error (the volume stops 1024 bytes short of its partition)
+is gone after the restore, since the restored partition is sized to the volume.
+
+Original report: found 2026-11-04 on the Manhole CD (GitHub #104, fixture
+`optical.hfs.ts-map-manhole.cd`). `rb-cli restore --size minimum` of a CHD
+backup of track 1 failed: the backup recorded a minimum of 61377024 bytes, which
+is `drAlBlSt` (19 sectors) + 59929 blocks of 1024 bytes and nothing after, so
+the resize made a 59928-block volume while block 59928 (the 59929th) was in use. The bare
+HFS volume gave the same minimum, so the TS map was not involved:
+`last_data_byte` returned the end of the last allocated block, and the resizer
+subtracts the 1024-byte alternate-MDB tail from the size it is given.
+
+---
+
+## Found by the FreeBSD emulator oracle and scenarios, 2026-11-01
+
+### R-076 — editing a Solaris UFS volume leaves its rotational tables stale {#r-076}
+
+**FIXED 2026-11-01.** The editor now recounts `cg_btot` / `cg_b` on any UFS1
+volume whose superblock says it keeps them in the dynamic layout
+(`fs_postblformat` 1, `fs_nrpos` 2-8; HP-UX excluded, whose superblock holds
+other data there), at the offsets each group header names. After the same
+`sol-edit` run, all five groups' tables match a recount from the free map, and
+Solaris's fsck still passes. A unit test writes a 600 KB file to a Sun-flavour
+volume and checks `cg_btot` against the free map.
+
+Original report: Solaris's UFS keeps the 4.3BSD rotational tables live in the
+dynamic cylinder-group layout: `cg_btot` (free blocks per cylinder) and `cg_b`
+(per cylinder per rotational position), at the offsets each group header names
+in `cg_btotoff` / `cg_boff`, sized by `fs_cpg` and `fs_nrpos` (16 and 8 on the
+Solaris 9 slice). rb-cli's editor recounted them only for the static 4.3BSD
+layout. After `emulator/solaris_ufs_fsck.py sol-edit`, recounting the edited
+volume from its free map shows cylinder group 0 still claiming 60 free blocks
+in cylinder 1, which the edit had filled; the Solaris-made original is
+consistent. Solaris's own fsck does not compare these tables, so the scenario
+passed, but the classic allocator (`alloccgblk`) picks a cylinder by
+`cg_btot`, walks `fs_rotbl` from `cg_b`'s position, and panics "alloccgblk:
+cyl groups corrupted" when no free block is where the counts say.
+
+### R-075 — a blank 4.3BSD UFS volume fails NeXTSTEP's fsck when its groups divide its cylinders {#r-075}
+
+**FIXED 2026-11-01.** The last group's `cg_ncyl` is now `fs_ncyl % fs_cpg` on
+the 4.3BSD flavour. NeXTSTEP 3.3's fsck then passes the blank volume, the same
+volume after mkdir / put / mv / rm, and those edits on a copy of the NeXTSTEP
+boot volume itself (26,393 files).
+
+Original report: `emulator/nextstep_ufs_fsck.py blank-pristine` (no edits at all):
+NeXTSTEP 3.3 `fsck -n` on a 32 MB `rb-cli new volume ufs-43bsd` in a `new hd
+next` label says `SUMMARY INFORMATION BAD`. Letting NeXTSTEP repair a copy
+(`fsck -y`) changed exactly one byte: the low byte of the last cylinder
+group's `cg_ncyl`, 16 to 0. 4.3BSD's newfs and fsck both set the last group's
+`cg_ncyl` to `fs_ncyl % fs_cpg`, which is 0 when the groups divide the
+cylinders exactly (64 cylinders, 16 per group here); the formatter wrote
+`fs_cpg` for every group. The NeXTSTEP reference disks it was pinned against
+both end in a partial group, so they never showed it. (Solaris's fsck counts
+the last group's real cylinders instead, and the Sun flavour does that.)
+
+### R-074 — editing a Solaris UFS volume corrupts its superblock {#r-074}
+
+**FIXED 2026-11-01.** The 64-bit totals are now updated only on UFS2, or on
+UFS1 with `FS_FLAGS_UPDATED` set. The same scenario then passes all of Solaris
+9's fsck phases with nothing to repair, and Solaris lists the files. A unit
+test clears the flag on a blank volume and checks that a mkdir leaves bytes
+1008-1039 alone.
+
+Original report: `regression-tests/emulator/solaris_ufs_fsck.py sol-edit` lets
+Solaris 9 `newfs` a 32 MB slice, has rb-cli mkdir / put / mv / rm on it, and
+boots Solaris again: `fsck -F ufs -n` reports `BAD SUPERBLOCK AT BLOCK 16: BAD
+VALUES IN SUPER BLOCK`, though the files are all there. Diffing the superblock
+before and after the edit shows two changed regions: `fs_old_cstotal` at 192
+(correct) and 32 bytes at 1008-1039. `propagate_cs` also updated FreeBSD's
+64-bit `fs_cstotal` mirror whenever the cylinder groups use the dynamic
+layout, which Solaris's do too; Solaris keeps other superblock data there.
+FreeBSD only keeps that mirror on UFS2, or on UFS1 once `FS_FLAGS_UPDATED`
+(0x80) is set in `fs_old_flags` (byte 211): it is set on FreeBSD's volumes and
+rb-cli's own, and clear on Solaris's.
+
+### R-077 — an HFS to FAT copy shifts the modification time by the host's UTC offset {#r-077}
+
+**FIXED 2026-11-04.** FAT keeps local wall-clock time, as DOS, Windows, mtools
+and Linux vfat (default `tz`) write it, so `disk-core` 0.2.1 adds
+`dos_local_to_unix` / `unix_to_dos_local` (built like the Mac pair, on the raw
+functions plus `local_utc_offset_secs()`) and FAT, Human68k and ProDOS read and
+write through them, "now" stamps included. exFAT honours its UtcOffset bytes:
+a read subtracts a valid stored offset (an invalid one means host local time),
+and a write stores local time tagged with the host offset in all three offset
+fields, as Windows does (UTC with offset 0 when the host offset is not whole
+quarter hours). The raw functions stay, documented as zone-less. Displayed
+FAT and ProDOS dates come from the raw fields and do not change. The
+`cp -p` HFS -> FAT test passes un-ignored; disk-core unit tests check the new
+conversions against `local_utc_offset_secs()` and an HFS -> FAT -> HFS round
+trip (run under UTC, EST, Kathmandu, Kiritimati and a +0:07 zone). Known
+approximation, shared with HFS and unchanged here: the offset is the host's
+current one, not the one in force on the stamped date, so a date from the
+other side of a DST change is stored an hour off what that day's clock showed
+(a copy between two zone-less volumes is unaffected).
+
+Original report: found 2026-11-04 by the `cp -p` CLI regression test
+(`tests/cli_suite/cli_cp.rs`, `preserve_times::cp_p_from_hfs_to_fat_keeps_the_modification_date`,
+`#[ignore = "R-077"]` until fixed). On a host at UTC-5, `rb-cli cp -p` of an HFS
+file whose catalog modify date reads `1991-06-17 10:40` writes a FAT file that
+reads `1991-06-17 15:40`.
+
+Both formats store wall-clock time with no zone, but `disk-core::times` treats
+them differently: `mac_local_to_unix` subtracts the host's UTC offset (HFS / MFS
+are local time), while `dos_datetime_to_unix` / `unix_to_dos_datetime` treat FAT
+as UTC. `copy::source_times` goes HFS local -> Unix UTC -> FAT as UTC, so the
+wall clock moves by the offset. Not introduced by PR #97 (which changed HFS to
+HFS only); every `preserve_times` copy from HFS / MFS to FAT, exFAT or Human68k
+does this, as does the reverse direction.
+
+Fixing it means choosing one convention for FAT (local, as DOS and Windows
+write it, or UTC, as the comment on `dos_datetime_to_unix` says our round-trip
+tools assume). That choice also changes host-to-FAT imports and FAT-to-host
+exports, so it is the maintainer's call.
+
+### R-073 — a big-endian UFS1 volume from `new volume ufs` is not a Solaris volume {#r-073}
+
+**FIXED 2026-11-01.** `rb-cli new volume ufs-solaris` (alias `solaris`)
+writes a Sun flavour of the formatter, re-derived from the slice Solaris 9's
+own `newfs` made: 16 x 63 geometry, 16 cylinders per group, groups staggered
+by 32 fragments (`fs_cgmask` -16), the dynamic `struct cg` with `cg_btot` /
+`cg_b` at its own offsets and no cluster maps, `fs_postbl` / `fs_rotbl` at
+860 / 1376 (`fs_postblformat` 1, `fs_nrpos` 8), 16-bit `d_namlen`,
+`fs_maxsymlinklen` 0, no `FS_FLAGS_UPDATED`, and `fs_state` = `FSOKAY` -
+`fs_time`. Unit tests pin the geometry and Solaris's exact rotational tables
+(`fs_postbl` 0 32 1 33 2 34 3 35, `fs_rotbl` step 4). Solaris 9's fsck passes
+a blank volume and the same volume after mkdir / put / mv / rm
+(`emulator/solaris_ufs_fsck.py blank`). One difference remains and is
+harmless: Solaris's mkfs gives that slice 3776 inodes per group where ours
+gives 4032. `new volume ufs`'s help no longer names Solaris, and `new hd
+sun` points at `ufs-solaris`.
+
+Original report: `regression-tests/emulator/solaris_ufs_fsck.py blank` formats a
+32 MB slice with `rb-cli new volume ufs --big-endian`, puts it in a Sun label
+(`new hd sun`) at SCSI target 1 of a QEMU SS-5 running Solaris 9, and runs
+`fsck -F ufs -n /dev/rdsk/c0t1d0s0`:
+
+```
+BAD SUPERBLOCK AT BLOCK 16: BAD VALUES IN SUPER BLOCK
+LOOK FOR ALTERNATE SUPERBLOCKS WITH MKFS?  no
+```
+
+A read-only mount succeeds, but `/rbtest` (which rb-cli made) is not found.
+Against a slice Solaris's own `newfs` made on the same machine, the superblock
+differs in geometry and format, not just counts:
+
+| field | rb-cli | Solaris newfs |
+|---|---|---|
+| `fs_ntrak` / `fs_nsect` / `fs_spc` | 0 / 65536 / 65536 | 16 / 63 / 1008 |
+| `fs_cpg` / `fs_ncyl` | 1 / 1 | 88 / 8076 |
+| `fs_cgoffset` / `fs_cgmask` | 0 / -1 | 32 / -16 |
+| `fs_maxsymlinklen` | 60 (4.4BSD inode format) | 0 |
+
+Solaris's fsck rejects `fs_ntrak <= 0` outright, and with `fs_maxsymlinklen`
+0 it reads directories with the pre-4.4 16-bit `d_namlen`, which is why the
+4.4BSD-format root lists nothing useful. The NeXTSTEP `ufs-43bsd` flavour has
+real geometry and the old directory format, but the static pre-Tahoe
+cylinder-group layout; Solaris uses the dynamic one (`cg_*off` offsets). A fix
+is a Solaris flavour of the formatter: Sun geometry, staggered groups, old
+inode and directory format, dynamic cylinder groups.
+
+### R-071 — a blank UFS1 volume fails FreeBSD's fsck_ffs {#r-071}
+
+**FIXED 2026-11-01.** `fsck_ffs -fnd` named both causes. The formatter gave the
+root directory a whole block (`di_blocks` 16, fragments 553-559 marked used by
+nobody) where `newfs` allocates `fragroundup(DIRBLKSIZ)`, one fragment here,
+and returns the rest of the block as free fragments counted in `cg_frsum`. And
+`cg_clustersum` starts 4 bytes early, exactly as FreeBSD's `mkfs` lays it out,
+because slot 0 is never used; we wrote that zero slot anyway, over the last
+bytes of the free map, so the final 16 fragments read as allocated. Slot 0 is
+now skipped. A blank volume, and the same volume after mkdir / put / mv / rm,
+pass FreeBSD 15.1 `fsck_ffs -fn` (`emulator/ufs_freebsd_fsck.py blank-ufs1`,
+`blank-ufs1-edit`).
+
+Original report: `rb-cli new volume ufs v.img --size 16M` (4.4BSD UFS1, little-endian),
+checked by FreeBSD 15.1-RELEASE `fsck_ffs -fn /dev/vtbd1`
+(`regression-tests/oracles/freebsd/fsck_ffs.py`):
+
+```
+** Phase 5 - Check Cyl groups
+FREE BLK COUNT(S) WRONG IN SUPERBLK
+SALVAGE? no
+SUMMARY INFORMATION BAD
+SALVAGE? no
+BLK(S) MISSING IN BIT MAPS
+SALVAGE? no
+1 files, 1 used, 15831 free (7 frags, 1978 blocks, 0.0% fragmentation)
+```
+
+So the superblock's free-block total, the cylinder-group summary (`fs_cs`) and
+the per-CG free bitmaps disagree with what FreeBSD derives from the inode
+tables, on a volume nothing has been written to. Our own `fsck` accepts it,
+because reader and writer share the same idea of the layout.
+
+Note for whoever picks this up: `fsck_ffs -n` declines every repair and still
+exits 0, so an exit-code check alone passes this volume. The oracle fails on
+any `...? no` question. Next step: compare the CG header and bitmap of this
+volume with one `newfs -O1` makes in the same VM.
+
+### R-072 — a directory rb-cli makes on UFS1 lacks FreeBSD's directory depth {#r-072}
+
+**FIXED 2026-11-01.** FreeBSD keeps the UFS1 `di_dirdepth` in a union with
+`di_freelink` at inode offset 4 (every directory in `fs.ufs1.freebsd151.hd`
+holds its depth there). The depth is now set there on mkdir, but only on
+4.4BSD-format volumes: on Solaris, SunOS, 4.3BSD / NeXTSTEP and HP-UX that
+offset is the old 16-bit uid / gid. Setting it was not enough on its own: the
+UFS1 inode writer started from a zeroed buffer, so the parent's next write
+(the `dir_insert` for `/rbtest/sub`) wiped `/rbtest`'s depth again, and with it
+atime, ctime, flags and the generation number. UFS1 now reads, modifies and
+writes back like UFS2 and HP-UX already did.
+
+Original report: `regression-tests/emulator/ufs_freebsd_fsck.py ufs1` copies
+`fs.ufs1.freebsd151.hd` (made by FreeBSD 15.1), runs `rb-cli mkdir /rbtest`,
+`mkdir /rbtest/sub`, three `put`s (one past the direct blocks), an `mv` and an
+`rm`, then FreeBSD `fsck_ffs -fn` says, in phase 2:
+
+```
+UPDATE FILESYSTEM TO TRACK DIRECTORY DEPTH? no
+```
+
+The untouched fixture passes, and the identical edits on the UFS2 fixture
+(`ufs2`, with check-hashes) pass, so this is the UFS1 directory-create path:
+FreeBSD 13+ records each directory's depth in the inode (`di_dirdepth`, in a
+spare field) and the UFS2 writer already sets it. Nothing is lost; fsck offers
+to start tracking. Fix: set the depth on UFS1 directory create as on UFS2.
 
 ## Found while adding the 1000-file churn test, 2026-09-05
 

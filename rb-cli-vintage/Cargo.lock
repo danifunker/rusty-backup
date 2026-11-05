@@ -144,6 +144,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-mac"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "dsk-apple",
+ "flate2",
+ "fs-mac",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -598,6 +610,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-core"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -616,6 +637,107 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dsk-apple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "disk-core",
+ "log",
+]
+
+[[package]]
+name = "dsk-clonezilla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "bzip2",
+ "disk-core",
+ "flate2",
+ "log",
+ "lz4_flex",
+ "lzma-rs",
+ "zstd",
+]
+
+[[package]]
+name = "dsk-dmg"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "arc-mac",
+ "base64",
+ "bzip2",
+ "disk-core",
+ "flate2",
+ "log",
+ "lzfse_rust",
+ "lzma-rs",
+]
+
+[[package]]
+name = "dsk-floppy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+]
+
+[[package]]
+name = "dsk-flux"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "dsk-ghost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "flate2",
+ "fs-pc",
+ "log",
+ "tempfile",
+]
+
+[[package]]
+name = "dsk-imz"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "log",
+ "md-5",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
+name = "dsk-tape"
+version = "0.1.1"
+dependencies = [
+ "arc-mac",
+ "disk-core",
+ "fs-tar",
+ "fs-unix",
+ "log",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
+name = "dsk-vm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "disk-core",
 ]
 
 [[package]]
@@ -675,7 +797,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -739,6 +861,162 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fs-8bit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+]
+
+[[package]]
+name = "fs-adfs"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "disk-core",
+]
+
+[[package]]
+name = "fs-amiga"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "tempfile",
+]
+
+[[package]]
+name = "fs-apfs"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-apple2"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "disk-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fs-cpm"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-hpfs"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-mac"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "chrono",
+ "disk-core",
+ "dsk-apple",
+ "filetime",
+ "fs-mac-unicode",
+ "libc",
+ "log",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "fs-mac-unicode"
+version = "0.1.0"
+
+[[package]]
+name = "fs-pc"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "disk-core",
+ "encoding_rs",
+ "tempfile",
+]
+
+[[package]]
+name = "fs-qnx"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+]
+
+[[package]]
+name = "fs-squashfs"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+ "flate2",
+ "lz4_flex",
+ "lzma-rs",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
+name = "fs-tar"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "bzip2",
+ "chrono",
+ "disk-core",
+ "flate2",
+ "fs-mac",
+ "tar",
+ "tempfile",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "fs-unix"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "crc32c",
+ "disk-core",
+ "fs-mac",
+ "log",
+]
+
+[[package]]
+name = "fs-xerox"
+version = "0.1.0"
+dependencies = [
+ "disk-core",
+ "flate2",
+ "log",
+]
+
+[[package]]
+name = "fs-xfs"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32c",
+ "disk-core",
+]
 
 [[package]]
 name = "generic-array"
@@ -940,10 +1218,12 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb-platform",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-link",
 ]
 
 [[package]]
@@ -965,6 +1245,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
+dependencies = [
+ "jiff-tzdb",
 ]
 
 [[package]]
@@ -1252,6 +1547,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "part-tables"
+version = "0.1.1"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "disk-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1305,9 +1612,13 @@ dependencies = [
 
 [[package]]
 name = "qnx2fs"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198f9fbd532b1eb9e87c18dbd855facbdb1db627ff36ee5afbc6601e5d9df02c"
+version = "0.3.4"
+dependencies = [
+ "chrono",
+ "disk-core",
+ "jiff",
+ "log",
+]
 
 [[package]]
 name = "quote"
@@ -1360,6 +1671,7 @@ name = "rb-cli-vintage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-mac",
  "base64",
  "byteorder",
  "bzip2",
@@ -1372,10 +1684,36 @@ dependencies = [
  "crossterm",
  "csv",
  "dirs",
+ "disk-core",
+ "dsk-apple",
+ "dsk-clonezilla",
+ "dsk-dmg",
+ "dsk-floppy",
+ "dsk-flux",
+ "dsk-ghost",
+ "dsk-imz",
+ "dsk-tape",
+ "dsk-vm",
  "encoding_rs",
  "env_logger",
  "filetime",
  "flate2",
+ "fs-8bit",
+ "fs-adfs",
+ "fs-amiga",
+ "fs-apfs",
+ "fs-apple2",
+ "fs-cpm",
+ "fs-hpfs",
+ "fs-mac",
+ "fs-mac-unicode",
+ "fs-pc",
+ "fs-qnx",
+ "fs-squashfs",
+ "fs-tar",
+ "fs-unix",
+ "fs-xerox",
+ "fs-xfs",
  "globset",
  "hashbrown 0.14.5",
  "home",
@@ -1392,8 +1730,10 @@ dependencies = [
  "objc2-disk-arbitration",
  "objc2-foundation",
  "objc2-io-kit",
+ "part-tables",
  "qnx2fs",
  "ratatui",
+ "rb-fsexporter",
  "rustyline",
  "self-replace",
  "serde",
@@ -1405,6 +1745,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "toml",
  "windows",
  "winreg",
  "winres",
@@ -1412,6 +1753,15 @@ dependencies = [
  "zeroize_derive",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "rb-fsexporter"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "disk-core",
+ "fs-mac",
 ]
 
 [[package]]
@@ -1504,7 +1854,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

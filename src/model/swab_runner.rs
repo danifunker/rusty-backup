@@ -8,11 +8,11 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use super::status::SwabStatus;
-use crate::partition::{format_size, PartitionTable};
+use crate::partition::PartitionTable;
 use crate::rbformats::swab;
+use disk_core::display::format_size;
 
 /// Spawn a worker that writes a word-swapped copy of `input` to `output`, or
 /// rewrites `input` itself when `output` is `None`. Returns a shared status
@@ -21,7 +21,7 @@ pub fn spawn(input: PathBuf, output: Option<PathBuf>) -> Arc<Mutex<SwabStatus>> 
     let status = Arc::new(Mutex::new(SwabStatus::default()));
     let status_clone = Arc::clone(&status);
 
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "swab16", move || {
         let target = output.clone().unwrap_or_else(|| input.clone());
         let before = describe(&input);
         log(
@@ -69,6 +69,7 @@ pub fn spawn(input: PathBuf, output: Option<PathBuf>) -> Arc<Mutex<SwabStatus>> 
         if let Ok(mut s) = status_clone.lock() {
             s.finished = true;
         }
+        Ok(())
     });
 
     status

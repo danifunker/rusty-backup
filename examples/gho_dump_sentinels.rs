@@ -5,7 +5,7 @@
 //
 // Usage: cargo run --release --example gho_dump_sentinels -- PATH.GHO
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 
 fn classify(b: &[u8]) -> String {
     if b.len() < 4 {

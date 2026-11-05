@@ -29,8 +29,8 @@ use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Streaming scan block; large enough to amortize syscalls, small enough to
 /// keep memory flat regardless of image size (per the project's large-image

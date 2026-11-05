@@ -8,8 +8,8 @@
 
 use std::io::Cursor;
 
-use rusty_backup::fs::apfs::ApfsFilesystem;
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_apfs::apfs::ApfsFilesystem;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: apfs_dump <image>");
@@ -24,7 +24,7 @@ fn main() {
     println!("used_size    = {}", fs.used_size());
 
     // Recursively print the volume's directory tree.
-    fn walk(fs: &mut dyn Filesystem, dir: &rusty_backup::fs::entry::FileEntry, depth: usize) {
+    fn walk(fs: &mut dyn Filesystem, dir: &disk_core::entry::FileEntry, depth: usize) {
         let children = match fs.list_directory(dir) {
             Ok(c) => c,
             Err(e) => {
@@ -67,7 +67,7 @@ fn main() {
         println!("--- extracting to {outdir} ---");
         fn extract(
             fs: &mut dyn Filesystem,
-            dir: &rusty_backup::fs::entry::FileEntry,
+            dir: &disk_core::entry::FileEntry,
             base: &std::path::Path,
         ) {
             let children = match fs.list_directory(dir) {

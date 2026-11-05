@@ -2,14 +2,12 @@
 //!
 //! This is wired into [`crate::gui::RustyBackupApp`] as `Option<CommanderMode>`:
 //! `Some` means the overlay is open and takes over the whole frame (the tab
-//! strip is not drawn). Each pane opens a disk image / container *or* a host-OS
-//! folder and browses it (listing, sort, multi-select, `..` / double-click
-//! navigation, delete), backed by the
-//! [`DirListing`](rusty_backup::model::dir_listing::DirListing) model. The middle
-//! column copies one pane's selection onto the other in any combination:
-//! image->image and host->image are staged onto the destination's queue, while
-//! image->host and host->host are immediate threaded host writes
-//! (`commander_ops::{stage_copy, stage_host_to_image, spawn_host_copy}`).
+//! strip is not drawn). Everything Commander does lives in
+//! [`CommanderController`] (both panes, copy, export, checksums, File Info data,
+//! the session log, the key map); this file and `pane.rs` draw it, turn clicks and
+//! keys into its actions, and carry out its effects through one [`EffectHost`],
+//! whose answers go back as `Picked` / `Confirmed` / `Answered`. The metadata
+//! editor widgets stay here and send their changes back as `StageMetadata`.
 //!
 //! NOTE: this crate uses a patched eframe whose panels are
 //! `egui::Panel::*::show_inside` rather than the stock `TopBottomPanel`. The
@@ -17,276 +15,191 @@
 //! overlay with `show_inside` against it, exactly like the rest of the GUI.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use eframe::egui;
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::export_selection::ExportFormat;
-#[allow(unused_imports)] // referenced from a doc comment below
-use rusty_backup::fs::fork_export::export_file_with_fork;
-use rusty_backup::fs::replace::OnConflict;
-use rusty_backup::fs::resource_fork::ResourceForkMode;
-use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
-use rusty_backup::model::commander_ops::{
-    self, ExportJob, HostCopyJob, HostCopyStatus, StageCopyStatus,
+use rusty_backup::controller::app::{CommanderRecent, UserConfig};
+use rusty_backup::controller::commander::{
+    format_size, BrowserPaneAction, CommanderAction, CommanderController, EditQueue, ExportFormat,
+    FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices, ResourceForkMode,
+    Side, ViewItemKind, ViewMenuItem,
 };
-use rusty_backup::partition::format_size;
+use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
+use rusty_backup::controller::Controller;
 
+use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
 use super::metadata_editor::{
-    self, ExtPermsEditorState, HfsDatesEditorState, HfsTypeEditorState, OwnerEditorState,
-    ProdosTypeEditorState, XattrEditorState,
+    self, ExtPermsEditorState, HfsDatesEditorState, HfsTypeEditorState, MetadataSink,
+    OwnerEditorState, ProdosTypeEditorState, XattrEditorState,
 };
 
-mod pane;
-mod progress;
+pub(crate) mod pane;
 
-use pane::{CommanderPane, StageOutcome};
-use progress::{ProgressAction, ProgressSnapshot, ProgressWindow};
+use pane::PaneView;
 
-/// Upper bound on bytes read off a volume to preview the selected file in the
-/// File Info window (matches the classic browse view's cap).
-const MAX_PREVIEW_SIZE: usize = 1024 * 1024;
+type A = CommanderAction;
 
-/// An open "Calculate Checksums" window: its title, the worker status it
-/// polls each frame, and a rate tracker so the progress line can show the
-/// same rate + ETA suffix the rest of the app uses.
-struct ChecksumWindow {
-    title: String,
-    status: Arc<Mutex<ChecksumStatus>>,
-    /// Sum of every selected file's size, precomputed when the window opens
-    /// so the progress bar spans the whole batch (not just the current file).
-    total_bytes: u64,
-    tracker: super::progress::RateTracker,
+/// The File Info window's widget state for one entry; rebuilt when the controller's serial changes.
+#[derive(Default)]
+pub(crate) struct DetailEditors {
+    pub(crate) serial: u64,
+    pub(crate) content: Option<FileContent>,
+    hfs: Option<HfsTypeEditorState>,
+    prodos: Option<ProdosTypeEditorState>,
+    dates: Option<HfsDatesEditorState>,
+    perms: Option<ExtPermsEditorState>,
+    owner: Option<OwnerEditorState>,
+    xattr: Option<XattrEditorState>,
 }
 
-/// An open "File Info" window: the entry it describes, its decoded preview, and
-/// the per-editor scratch state for the editable-metadata subset. Edits stage
-/// onto the owning pane's queue (resolved by `side`); host folders and read-only
-/// backups show the metadata without the editors.
-struct DetailWindow {
-    /// Which pane owns the entry (and the queue edits stage onto).
-    side: Side,
-    entry: FileEntry,
-    /// True when the owning pane accepts metadata edits (a writable image
-    /// volume). False for host folders and read-only backups, which display the
-    /// metadata without the editor rows.
-    editable: bool,
-    /// The owning pane's filesystem type, gating which editors appear.
-    fs_type: String,
-    /// Decoded preview content (text or binary), or `None` for a directory /
-    /// unreadable file.
-    content: Option<FileContent>,
-    hfs_editor: Option<HfsTypeEditorState>,
-    prodos_editor: Option<ProdosTypeEditorState>,
-    dates_editor: Option<HfsDatesEditorState>,
-    perms_editor: Option<ExtPermsEditorState>,
-    owner_editor: Option<OwnerEditorState>,
-    xattr_editor: Option<XattrEditorState>,
-    /// The entry's on-disk extended attributes, read when the window opened.
-    /// Empty on filesystems without xattr support.
-    xattrs: Vec<rusty_backup::fs::xattr::Xattr>,
-    /// Last staging status, shown in the window.
-    result: Option<String>,
-}
-
-/// Which pane is which. Kept tiny and `Copy` so it can key per-pane widget ids
-/// (Commander draws two near-identical panes in one `Ui` tree, so every
-/// stateful widget must take a side-keyed `id_salt` or egui raises an ID clash).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Side {
-    Left,
-    Right,
-}
-
-impl Side {
-    pub(crate) fn idx(self) -> usize {
-        match self {
-            Side::Left => 0,
-            Side::Right => 1,
-        }
-    }
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Side::Left => "L",
-            Side::Right => "R",
-        }
-    }
-    pub(crate) fn other(self) -> Side {
-        match self {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
+impl DetailEditors {
+    /// Empty widgets for the detail with this serial.
+    pub(crate) fn fresh(serial: u64) -> Self {
+        DetailEditors {
+            serial,
+            ..DetailEditors::default()
         }
     }
 }
 
-/// Full-page Commander Mode overlay.
-/// A host copy waiting on the "Files already exist" modal.
-struct PendingHostConflict {
-    job: HostCopyJob,
-    dest_side: Option<Side>,
-    names: Vec<String>,
+/// The editors read the pane's queue and hand their changes back for the controller to stage.
+struct ToController<'a> {
+    queue: &'a EditQueue,
+    staged: &'a mut Vec<MetadataEdit>,
 }
 
-/// Names a staged copy had to change (or leave out) for the destination filesystem.
-struct RenameNotice {
-    dest_side: Side,
-    outcome: StageOutcome,
+impl MetadataSink for ToController<'_> {
+    fn queue(&self) -> &EditQueue {
+        self.queue
+    }
+
+    fn stage(&mut self, edit: MetadataEdit) -> Option<String> {
+        self.staged.push(edit);
+        None
+    }
 }
 
 pub struct CommanderMode {
-    left: CommanderPane,
-    right: CommanderPane,
-    status: String,
-    /// Scratch dir holding files extracted for image -> image copies, kept
-    /// alive until the destination queue is applied (or the overlay closes).
-    /// Created lazily on the first copy.
-    temp: Option<tempfile::TempDir>,
-    /// Whether the unsaved-edits confirmation is showing (Close was clicked
-    /// while a pane had staged edits).
-    unsaved_close: bool,
-    /// In-flight immediate host-write copy (image->host / host->host) and the
-    /// destination side to re-list when it finishes. The side is `None` for an
-    /// "Export to hard drive" write, whose destination is an external folder
-    /// not shown in either pane (nothing to re-list).
-    pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
-    /// A host copy held back because files it would write already exist;
-    /// the modal lets the user overwrite, skip them, or cancel.
-    pending_host_conflict: Option<PendingHostConflict>,
-    /// A staged copy whose names were changed for the destination, awaiting OK / Undo.
-    rename_notice: Option<RenameNotice>,
-    /// In-flight off-thread image->image staging copy (see
-    /// [`commander_ops::spawn_stage_copy`]), plus the destination side its
-    /// finished edits push onto.
-    pending_stage_copy: Option<(Side, Arc<Mutex<StageCopyStatus>>)>,
-    /// One-shared progress modal for whichever long-running op is in flight
-    /// (host copy / stage copy / apply). Only one op runs at a time, so this
-    /// is a single [`ProgressWindow`] that reads the appropriate status.
-    progress_window: ProgressWindow,
-    /// The open "Calculate Checksums" window, if any (one at a time).
-    checksums: Option<ChecksumWindow>,
-    /// The open "File Info" window, if any (one at a time).
-    detail: Option<DetailWindow>,
-    /// When set, an image->image copy reproduces each file's original
-    /// timestamps on the destination (HFS catalog dates / Amiga datestamp)
-    /// instead of stamping the current time. Defaults on.
-    keep_dates: bool,
-    /// How resource forks are preserved when copying/exporting an image file to
-    /// a host folder (MacBinary / BinHex / AppleDouble / … via
-    /// [`export_file_with_fork`]). Ignored for host->host copies.
-    export_fork_mode: ResourceForkMode,
-    /// The default output shape for "Export to hard drive..." — loose files, a
-    /// per-file-compressed tree, or a single tar/zip/sit archive. The row menu's
-    /// "Export as" submenu can override it per action.
-    export_format: ExportFormat,
-    /// The pane the user last interacted with — the middle-column Delete acts
-    /// on it. Updated from each pane's `focused` response.
-    active: Side,
-    /// Rolling history of data-changing operations completed this Commander
-    /// session (applies, host copies / exports, immediate host deletes /
-    /// renames / new folders), each timestamped. Capped at the most recent
-    /// [`Self::MAX_LOG`] entries. Shown in the "Log" window.
-    session_log: Vec<String>,
-    /// Whether the session-log window is open.
-    show_log: bool,
-}
-
-impl Default for CommanderMode {
-    fn default() -> Self {
-        Self::new()
-    }
+    ctl: CommanderController,
+    /// Pickers, confirmations and prompts the controller asks for, answered back to it.
+    effects: EffectHost,
+    left: PaneView,
+    right: PaneView,
+    detail: DetailEditors,
+    /// The quick view's widget state, apart from the File Info window's.
+    quick: DetailEditors,
+    /// A key moved the cursor, so the active listing scrolls it into view.
+    scroll_cursor: bool,
+    close: bool,
 }
 
 impl CommanderMode {
-    pub fn new() -> Self {
-        Self {
-            left: CommanderPane::new(Side::Left),
-            right: CommanderPane::new(Side::Right),
-            status: "Commander Mode -- open a disk image in each pane; select files and \
-                     use the middle Copy buttons or right-click to stage a copy."
-                .into(),
-            temp: None,
-            unsaved_close: false,
-            pending_host_copy: None,
-            pending_host_conflict: None,
-            rename_notice: None,
-            pending_stage_copy: None,
-            progress_window: ProgressWindow::default(),
-            checksums: None,
-            detail: None,
-            keep_dates: true,
-            export_fork_mode: ResourceForkMode::MacBinary,
-            export_format: ExportFormat::LooseFiles,
-            active: Side::Left,
-            session_log: Vec::new(),
-            show_log: false,
-        }
-    }
-
-    /// Open a drag-and-dropped path in the active pane (the drag-and-drop router
-    /// in `RustyBackupApp::update` calls this while the Commander overlay is up).
-    /// A directory opens as a host folder, a file as an image source.
-    pub fn open_dropped_path(&mut self, path: PathBuf) {
-        let msg = match self.active {
-            Side::Left => self.left.open_dropped(path),
-            Side::Right => self.right.open_dropped(path),
+    /// Both panes' jobs register in `jobs`, the app's registry.
+    pub fn new(jobs: JobRegistry) -> Self {
+        let services = || PaneServices {
+            jobs: jobs.clone(),
+            notify: Arc::new(super::ui_logger::EguiWake),
+            recent: Box::new(CommanderRecent(UserConfig)),
         };
-        if !msg.is_empty() {
-            self.status = msg;
+        Self {
+            ctl: CommanderController::new(services(), services(), load_keymap()),
+            effects: EffectHost::default(),
+            left: PaneView::new(Side::Left),
+            right: PaneView::new(Side::Right),
+            detail: DetailEditors::default(),
+            quick: DetailEditors::default(),
+            scroll_cursor: false,
+            close: false,
         }
     }
 
-    /// Drop both panes' in-memory recent-files mirrors (the Settings dialog
-    /// cleared the persisted lists).
+    /// Open a drag-and-dropped path in the active pane: a folder as a host folder, a file as an image.
+    pub fn open_dropped_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.dispatch(ctx, A::OpenDropped(path));
+    }
+
+    /// The window is closing: `true` holds it while the controller asks about staged edits.
+    pub fn hold_quit(&mut self, ctx: &egui::Context) -> bool {
+        if !self.ctl.has_staged_edits() {
+            return false;
+        }
+        if !self.effects.modal_open() {
+            self.dispatch(ctx, A::RequestQuit);
+        }
+        true
+    }
+
+    /// The Settings dialog cleared the persisted recent lists.
     pub(crate) fn clear_recent_files(&mut self) {
-        self.left.clear_recent_files();
-        self.right.clear_recent_files();
+        self.ctl.apply(A::RecentCleared);
     }
 
-    /// Upper bound on retained session-log entries (rolling; oldest drop first).
-    const MAX_LOG: usize = 200;
+    fn dispatch(&mut self, ctx: &egui::Context, action: CommanderAction) {
+        let fx = self.ctl.apply(action);
+        self.run_effects(ctx, fx);
+    }
 
-    /// Timestamp a completed-operation message and append it to the rolling
-    /// session log, dropping the oldest entries past [`Self::MAX_LOG`].
-    fn record_log(&mut self, msg: String) {
-        self.session_log
-            .push(format!("[{}] {msg}", log_timestamp()));
-        if self.session_log.len() > Self::MAX_LOG {
-            let excess = self.session_log.len() - Self::MAX_LOG;
-            self.session_log.drain(0..excess);
+    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<rusty_backup::controller::Effect>) {
+        let mut messages = Vec::new();
+        let replies = self.effects.run(ctx, fx, &mut messages);
+        for m in messages {
+            log::info!("{m}");
         }
+        for reply in replies {
+            self.answer(ctx, reply);
+        }
+    }
+
+    fn answer(&mut self, ctx: &egui::Context, reply: Reply) {
+        let action = match reply {
+            Reply::Picked { purpose, path } => A::Picked { purpose, path },
+            Reply::Confirmed { purpose, yes } => A::Confirmed { purpose, yes },
+            Reply::Answered { purpose, text } => A::Answered { purpose, text },
+            Reply::Chose { purpose, choice } => A::Chose { purpose, choice },
+            Reply::CloseScreen => {
+                self.close = true;
+                return;
+            }
+        };
+        self.dispatch(ctx, action);
     }
 
     /// Render the overlay into the app's root `Ui`. Returns `true` when the
     /// user asks to close it (the caller then drops the `CommanderMode`).
     pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut close = false;
+        let ctx = ui.ctx().clone();
+        let fx = self.ctl.tick();
+        self.run_effects(&ctx, fx);
+        self.handle_keys(&ctx);
+        let mut acts: Vec<CommanderAction> = Vec::new();
 
-        self.poll_host_copy(ui.ctx());
-        self.poll_stage_copy(ui.ctx());
-        self.render_progress_modal(ui.ctx());
-        self.render_host_conflict_modal(ui.ctx());
-        self.render_rename_notice(ui.ctx());
+        self.render_progress_modal(&ctx, &mut acts);
+        Self::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
+        Self::render_skipped_report(&self.ctl, &ctx, &mut acts);
+        self.render_rename_notice(&ctx, &mut acts);
 
         egui::Panel::top("commander_top").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading("Commander Mode");
+                ui.menu_button("View", |ui| {
+                    if let Some(action) = view_menu_body(ui, &self.ctl.view_menu()) {
+                        acts.push(action);
+                        ui.close();
+                    }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        if self.left.staged_count() + self.right.staged_count() > 0 {
-                            self.unsaved_close = true;
-                        } else {
-                            close = true;
-                        }
+                        acts.push(A::RequestClose);
                     }
                     if ui
-                        .button(format!("Log ({})", self.session_log.len()))
+                        .button(format!("Log ({})", self.ctl.log().len()))
                         .on_hover_text("Operations completed this Commander session")
                         .clicked()
                     {
-                        self.show_log = !self.show_log;
+                        acts.push(A::ShowLog(!self.ctl.log_shown()));
                     }
                 });
             });
@@ -297,11 +210,21 @@ impl CommanderMode {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("Status:");
-                ui.label(&self.status);
+                ui.label(self.ctl.status());
             });
             ui.add_space(2.0);
         });
 
+        let active = self.ctl.active();
+        let scroll = std::mem::take(&mut self.scroll_cursor);
+        // The quick view takes the other pane's column; that pane's own state stays as it was.
+        let quick_on = self.ctl.quick_view().then(|| active.other());
+        if self.ctl.follow_pending()
+            || self.ctl.pane(Side::Left).is_listing_folders()
+            || self.ctl.pane(Side::Right).is_listing_folders()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             let full_h = ui.available_height();
             let full_w = ui.available_width();
@@ -317,30 +240,12 @@ impl CommanderMode {
                     egui::vec2(pane_w, full_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        let resp = self.left.show(ui);
-                        for ev in resp.log_events {
-                            self.record_log(ev);
-                        }
-                        if let Some(msg) = resp.status {
-                            self.status = msg;
-                        }
-                        if resp.copy_to_other {
-                            self.status = self.copy(Side::Left);
-                        }
-                        if resp.export_to_host {
-                            self.status = self.export(Side::Left, None);
-                        }
-                        if let Some(fmt) = resp.export_as {
-                            self.status = self.export(Side::Left, Some(fmt));
-                        }
-                        if resp.checksums {
-                            self.status = self.start_checksums(Side::Left);
-                        }
-                        if let Some(name) = resp.detail {
-                            self.status = self.open_detail(Side::Left, name);
-                        }
-                        if resp.focused {
-                            self.active = Side::Left;
+                        let mine = active == Side::Left;
+                        if quick_on == Some(Side::Left) {
+                            quick_view(ui, &self.ctl, &mut self.quick);
+                        } else {
+                            self.left
+                                .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
                         }
                     },
                 );
@@ -348,521 +253,118 @@ impl CommanderMode {
                 ui.allocate_ui_with_layout(
                     egui::vec2(mid_w, full_h),
                     egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        if let Some(msg) = self.render_middle(ui) {
-                            self.status = msg;
-                        }
-                    },
+                    |ui| render_middle(ui, &self.ctl, &mut acts),
                 );
                 ui.separator();
                 ui.allocate_ui_with_layout(
                     egui::vec2(pane_w, full_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        let resp = self.right.show(ui);
-                        for ev in resp.log_events {
-                            self.record_log(ev);
-                        }
-                        if let Some(msg) = resp.status {
-                            self.status = msg;
-                        }
-                        if resp.copy_to_other {
-                            self.status = self.copy(Side::Right);
-                        }
-                        if resp.export_to_host {
-                            self.status = self.export(Side::Right, None);
-                        }
-                        if let Some(fmt) = resp.export_as {
-                            self.status = self.export(Side::Right, Some(fmt));
-                        }
-                        if resp.checksums {
-                            self.status = self.start_checksums(Side::Right);
-                        }
-                        if let Some(name) = resp.detail {
-                            self.status = self.open_detail(Side::Right, name);
-                        }
-                        if resp.focused {
-                            self.active = Side::Right;
+                        let mine = active == Side::Right;
+                        if quick_on == Some(Side::Right) {
+                            quick_view(ui, &self.ctl, &mut self.quick);
+                        } else {
+                            self.right
+                                .show(ui, &self.ctl, mine, mine && scroll, &mut acts);
                         }
                     },
                 );
             });
         });
 
-        self.render_checksum_window(ui.ctx());
-        self.render_detail_window(ui.ctx());
-        self.render_log_window(ui.ctx());
+        Self::render_checksum_window(&self.ctl, &ctx, &mut acts);
+        self.render_detail_window(&ctx, &mut acts);
+        Self::render_log_window(&self.ctl, &ctx, &mut acts);
+        Self::render_help(&self.ctl, &ctx, &mut acts);
+        self.render_partitions(&ctx, &mut acts);
+        Self::render_view_window(&self.ctl, &ctx, &mut acts);
 
-        if self.unsaved_close {
-            let n = self.left.staged_count() + self.right.staged_count();
-            egui::Window::new("Unsaved staged edits")
+        let whose = self
+            .effects
+            .pending_purpose()
+            .and_then(|p| self.ctl.asker(p))
+            .map_or("", Side::label);
+        if let Some(reply) = self.effects.show(&ctx, whose) {
+            self.answer(&ctx, reply);
+        }
+        for action in acts {
+            self.dispatch(&ctx, action);
+        }
+        std::mem::take(&mut self.close)
+    }
+
+    /// Hands this frame's bound key presses to the controller; the key map decides what they mean.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        let modal = self.effects.modal_open() || self.ctl.modal_open();
+        if modal || ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let ctl = &self.ctl;
+        let keys: Vec<(Key, Mods)> = ctx.input_mut(|i| {
+            let mut found = Vec::new();
+            i.events.retain(|ev| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                else {
+                    return true;
+                };
+                let mods = egui_mods(*modifiers);
+                let bound = egui_key(*key).filter(|k| ctl.binds(*k, mods));
+                found.extend(bound.map(|k| (k, mods)));
+                bound.is_none()
+            });
+            found
+        });
+        if keys.is_empty() {
+            return;
+        }
+        // egui already read Tab and the arrows as focus moves this frame; a shortcut cancels that.
+        ctx.memory_mut(|m| {
+            m.move_focus(egui::FocusDirection::None);
+            m.stop_text_input();
+        });
+        self.scroll_cursor = true;
+        for (key, mods) in keys {
+            self.dispatch(ctx, A::Key(key, mods));
+        }
+    }
+
+    /// The running copy or export, else a pane's apply, as a progress window.
+    fn render_progress_modal(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        if let Some((title, snap)) = self.ctl.copy_job() {
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(format!(
-                        "{n} staged edit(s) across the panes have not been applied."
-                    ));
-                    ui.label("Apply them per-pane first, or discard.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Discard & Close").clicked() {
-                            self.left.discard_edits();
-                            self.right.discard_edits();
-                            self.unsaved_close = false;
-                            close = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.unsaved_close = false;
-                        }
-                    });
+                .show(ctx, |ui| {
+                    if super::progress::show_job(ui, &snap) {
+                        acts.push(A::CancelCopy);
+                    }
                 });
+            return;
         }
-
-        close
-    }
-
-    /// Middle action column: copy one pane's selection onto the other (any
-    /// image/host combination). Delete is reachable per-pane (right-click);
-    /// Compare is a later milestone.
-    fn render_middle(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let mut status = None;
-        ui.add_space(60.0);
-        let sz = egui::vec2(100.0, 48.0);
-
-        // A copy needs a selection on the source and a ready destination, and no
-        // host-write already in flight.
-        let idle = self.pending_host_copy.is_none();
-        let l_can = idle && self.left.has_selection() && self.right.can_receive();
-        let r_can = idle && self.right.has_selection() && self.left.can_receive();
-
-        // When a destination can't receive a copy, say why in the hover so the
-        // greyed button reads as "by design" rather than "broken": read-only
-        // media (archive / backup / remote host folder) each give a reason.
-        let l_copy_hover = match self.right.readonly_reason() {
-            Some(reason) => format!("Can't copy into the right pane - {reason}"),
-            None => "Copy the left pane's selection into the right pane".to_string(),
-        };
-        let r_copy_hover = match self.left.readonly_reason() {
-            Some(reason) => format!("Can't copy into the left pane - {reason}"),
-            None => "Copy the right pane's selection into the left pane".to_string(),
-        };
-
-        // Pictured buttons (procedurally painted — no font glyphs, no assets):
-        // stacked floppies + arrow for copy, a floppy with a red X for delete,
-        // and "101=011?" for the (disabled) compare.
-        if icon_button(ui, sz, l_can, &l_copy_hover, |p, r, c| {
-            draw_copy_icon(p, r, c, true)
-        })
-        .clicked()
-        {
-            status = Some(self.copy(Side::Left));
-        }
-        ui.add_space(6.0);
-        if icon_button(ui, sz, r_can, &r_copy_hover, |p, r, c| {
-            draw_copy_icon(p, r, c, false)
-        })
-        .clicked()
-        {
-            status = Some(self.copy(Side::Right));
-        }
-        ui.add_space(12.0);
-        // Delete acts on the active pane (the one last clicked in). Disabled when
-        // that pane is read-only (backup or archive) or a remote image (the
-        // remote write path carries copies only for now, not deletes).
-        let active = self.active;
-        let (active_has_sel, active_readonly, active_remote) = match active {
-            Side::Left => (
-                self.left.has_selection(),
-                self.left.is_backup_pane() || self.left.is_archive_pane(),
-                self.left.is_remote(),
-            ),
-            Side::Right => (
-                self.right.has_selection(),
-                self.right.is_backup_pane() || self.right.is_archive_pane(),
-                self.right.is_remote(),
-            ),
-        };
-        let del_enabled = idle && active_has_sel && !active_readonly && !active_remote;
-        let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
-        if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
-            status = Some(match active {
-                Side::Left => self.left.delete_selection(),
-                Side::Right => self.right.delete_selection(),
-            });
-        }
-        ui.add_space(12.0);
-        icon_button(
-            ui,
-            sz,
-            false,
-            "Compare - not implemented yet",
-            draw_compare_icon,
-        );
-        ui.add_space(12.0);
-        ui.checkbox(&mut self.keep_dates, "Keep original dates")
-            .on_hover_text(
-                "Reproduce each copied file's original timestamps on the \
-                 destination (HFS catalog dates / Amiga datestamp) instead of \
-                 stamping the current time. Image-to-image copies only.",
-            );
-        ui.add_space(8.0);
-        // Output shape for "Export to hard drive..." — loose files, a per-file
-        // compressed tree, or a single tar/zip/sit archive.
-        ui.label("Export as:");
-        egui::ComboBox::from_id_salt("commander_export_format")
-            .selected_text(self.export_format.label())
-            .width(150.0)
-            .show_ui(ui, |ui| {
-                for fmt in ExportFormat::ALL {
-                    ui.selectable_value(&mut self.export_format, fmt, fmt.label());
-                }
-            })
-            .response
-            .on_hover_text(
-                "How the row menu's \"Export to hard drive...\" writes the selection \
-                 out. The row menu's \"Export as\" submenu can pick a format inline.",
-            );
-        ui.add_space(4.0);
-        // Resource-fork container, used only by the "Loose files" format. When
-        // exporting a Mac file out, its resource fork is preserved in the chosen
-        // container (MacBinary / BinHex / AppleDouble / …).
-        ui.add_enabled_ui(self.export_format == ExportFormat::LooseFiles, |ui| {
-            ui.label("Forks as:");
-            egui::ComboBox::from_id_salt("commander_fork_mode")
-                .selected_text(self.export_fork_mode.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for mode in ResourceForkMode::ALL {
-                        ui.selectable_value(&mut self.export_fork_mode, mode, mode.label());
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "How to preserve a Mac file's resource fork when exporting loose \
-                     files. Tar keeps data forks only; Zip and StuffIt carry forks \
-                     natively.",
-                );
-        });
-        status
-    }
-
-    /// Copy the `from` pane's selection into the other pane's current directory.
-    /// Dispatches by source/destination kind:
-    /// - image -> image / host -> image: staged onto the destination's queue
-    ///   (Apply writes through);
-    /// - image -> host / host -> host: an immediate threaded host write.
-    fn copy(&mut self, from: Side) -> String {
-        let keep_dates = self.keep_dates;
-        let fork_mode = self.export_fork_mode;
-        let (src, dest) = match from {
-            Side::Left => (&mut self.left, &mut self.right),
-            Side::Right => (&mut self.right, &mut self.left),
-        };
-
-        let entries = src.selected_entries();
-        if entries.is_empty() {
-            return format!("Nothing selected in the {} pane to copy.", from.label());
-        }
-        if !dest.can_receive() {
-            return format!(
-                "The {} pane can't receive a copy (open a volume or folder there first).",
-                from.other().label()
-            );
-        }
-        let Some(dest_parent) = dest.cwd_entry() else {
-            return "Open a destination first.".to_string();
-        };
-        let src_host = src.is_host_pane();
-        let dest_host = dest.is_host_pane();
-        let other = from.other().label();
-
-        // Remote host destination: upload over the wire (immediate, like a local
-        // host copy). A remote host pane is a `ListingSource::Image`, so
-        // `is_host_pane()` is false — intercept it here, before the local
-        // `(src_host, dest_host)` match would misroute it to the image path.
-        if dest.is_remote_host() {
-            let Some(dest_addr) = dest.remote_addr() else {
-                return "The remote connection is unavailable; reconnect first.".to_string();
+        for side in [Side::Left, Side::Right] {
+            let Some(snap) = self.ctl.pane(side).applying() else {
+                continue;
             };
-            let dest_parent_path = dest_parent.path.clone();
-            let job = if src_host {
-                HostCopyJob::HostToRemoteHost {
-                    entries,
-                    dest_addr,
-                    dest_parent: dest_parent_path,
-                }
-            } else if let Some(source) = src.copy_stage_source() {
-                HostCopyJob::ImageToRemoteHost {
-                    source,
-                    entries,
-                    dest_addr,
-                    dest_parent: dest_parent_path,
-                    fork_mode,
-                }
-            } else {
-                // A '+'-expanded wrapper mount has no reopenable handle; uploading
-                // it over the wire isn't wired yet.
-                return "This source can't be uploaded to a remote folder yet - \
-                        copy it to a local folder first."
-                    .to_string();
-            };
-            self.pending_host_copy =
-                Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
-            return format!("Uploading to the {other} (remote) folder...");
-        }
-
-        match (src_host, dest_host) {
-            // host -> image: stage real host paths (no temp extraction).
-            (true, false) => {
-                let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
-                let out = dest.stage_edits(edits);
-                self.note_staged(from.other(), out)
-            }
-            // image -> image: extract to temp, stage onto the destination queue.
-            // Runs on a worker thread so a large multi-file copy shows the same
-            // progress modal (percent + rate + ETA) the host-copy path does, and
-            // doesn't freeze the UI while extracting.
-            (false, false) => {
-                if self.temp.is_none() {
-                    self.temp = tempfile::tempdir().ok();
-                }
-                let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
-                    return "Could not create a temp directory for the copy.".to_string();
-                };
-                // A reopenable source (local session or remote image) runs on a
-                // worker with the same progress modal (percent + rate + ETA) —
-                // the worker reopens it off the UI thread.
-                if let Some(stage_source) = src.copy_stage_source() {
-                    self.pending_stage_copy = Some((
-                        from.other(),
-                        commander_ops::spawn_stage_copy(
-                            stage_source,
-                            entries,
-                            dest_parent,
-                            temp_dir,
-                            keep_dates,
-                        ),
-                    ));
-                    self.progress_window.reset();
-                    return format!("Copying to the {other} pane...");
-                }
-                // No reopenable handle: a wrapper-tree mount (a '+'-expanded
-                // container, e.g. a floppy opened inline). It's a small, local
-                // source, so extract synchronously through its live fs and stage
-                // the result — mirroring the session-less image->host branch below.
-                let Some(src_fs) = src.fs_mut() else {
-                    return "Source volume is not open.".to_string();
-                };
-                match commander_ops::stage_copy(
-                    src_fs,
-                    &entries,
-                    &dest_parent,
-                    &temp_dir,
-                    keep_dates,
-                ) {
-                    Ok(edits) => {
-                        let out = dest.stage_edits(edits);
-                        self.note_staged(from.other(), out)
-                    }
-                    Err(e) => format!("Copy to the {other} pane failed: {e:#}"),
-                }
-            }
-            // image -> host: immediate extraction on a worker thread.
-            (false, true) => {
-                let dest_dir = PathBuf::from(&dest_parent.path);
-                // A reopenable source (local session or remote image) extracts on
-                // a worker with the same progress modal as any host copy. The
-                // completion poll re-lists the destination pane.
-                let conflicts =
-                    commander_ops::host_copy_conflicts(&entries, &dest_dir, Some(fork_mode));
-                if let Some(source) = src.copy_stage_source() {
-                    let job = HostCopyJob::ImageToHost {
-                        source,
-                        entries,
-                        dest_dir,
-                        fork_mode,
-                        on_conflict: OnConflict::Fail,
-                    };
-                    return self.start_host_copy(job, Some(from.other()), conflicts, other);
-                }
-                if !conflicts.is_empty() {
-                    return format!(
-                        "{} item(s) already exist in the {other} folder; this source copies \
-                         synchronously, so remove them or pick an empty folder first.",
-                        conflicts.len()
-                    );
-                }
-                // No reopenable handle: a wrapper-tree mount (small, local) —
-                // extract synchronously over its live fs.
-                let Some(src_fs) = src.fs_mut() else {
-                    return "Source volume is not open.".to_string();
-                };
-                match commander_ops::export_fs_entries_to_host(
-                    src_fs, &entries, &dest_dir, fork_mode,
-                ) {
-                    Ok(n) => {
-                        dest.reload_listing();
-                        format!("Copied {n} item(s) to the {other} folder.")
-                    }
-                    Err(e) => format!("Copy failed: {e:#}"),
-                }
-            }
-            // host -> host: immediate filesystem copy on a worker thread.
-            (true, true) => {
-                let dest_dir = PathBuf::from(&dest_parent.path);
-                let conflicts = commander_ops::host_copy_conflicts(&entries, &dest_dir, None);
-                let job = HostCopyJob::HostToHost {
-                    entries,
-                    dest_dir,
-                    on_conflict: OnConflict::Fail,
-                };
-                self.start_host_copy(job, Some(from.other()), conflicts, other)
-            }
+            egui::Window::new(format!("Applying {} pane edits", side.label()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| super::progress::show_job(ui, &snap));
+            return;
         }
     }
 
-    /// Export the `from` pane's selection to a host folder the user picks
-    /// (loose files / folders, not an archive — §15.3). The destination is
-    /// independent of what the other pane shows; this is the immediate host
-    /// write engine ([`commander_ops::spawn_host_copy`]) with no re-list on
-    /// completion (the picked folder isn't a pane).
-    fn export(&mut self, from: Side, format_override: Option<ExportFormat>) -> String {
-        if self.pending_host_copy.is_some() {
-            return "A copy is already in progress; wait for it to finish.".to_string();
-        }
-        let fork_mode = self.export_fork_mode;
-        let format = format_override.unwrap_or(self.export_format);
-        let src = match from {
-            Side::Left => &mut self.left,
-            Side::Right => &mut self.right,
-        };
-        let entries = src.selected_entries();
-        if entries.is_empty() {
-            return format!("Nothing selected in the {} pane to export.", from.label());
-        }
-        // A host source has no `Filesystem` to read archive members from, so only
-        // loose files are supported there — reject before prompting for a dest.
-        if src.is_host_pane() && format != ExportFormat::LooseFiles {
-            return format!(
-                "'{}' export runs from an image/volume source; a host folder can only \
-                 export as loose files.",
-                format.label()
-            );
-        }
-
-        // Single-file formats prompt for an archive filename; folder formats
-        // (loose / per-file) prompt for a destination directory.
-        let dest = if format.is_single_file() {
-            let ext = format.file_extension().unwrap_or("out");
-            let name = export_archive_name(&entries, ext);
-            let Some(p) = super::file_dialog()
-                .set_file_name(&name)
-                .add_filter(format.label(), &[ext])
-                .save_file()
-            else {
-                return "Export cancelled.".to_string();
-            };
-            p
-        } else {
-            let Some(d) = super::file_dialog().pick_folder() else {
-                return "Export cancelled.".to_string();
-            };
-            d
-        };
-
-        // Host source + loose files: an immediate host-to-host copy.
-        if src.is_host_pane() {
-            let conflicts = commander_ops::host_copy_conflicts(&entries, &dest, None);
-            let job = HostCopyJob::HostToHost {
-                entries,
-                dest_dir: dest,
-                on_conflict: OnConflict::Fail,
-            };
-            let where_to = format!("export folder ({} pane)", from.label());
-            return self.start_host_copy(job, None, conflicts, &where_to);
-        }
-        // A reopenable image source (local session, remote image, archive, or an
-        // inline disk-image/optical wrapper) exports on a worker with progress.
-        if let Some(source) = src.copy_stage_source() {
-            let job = HostCopyJob::ExportSelection(Box::new(ExportJob {
-                source,
-                entries,
-                dest,
-                format,
-                fork_mode,
-            }));
-            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
-            return format!(
-                "Exporting the {} pane selection as {}...",
-                from.label(),
-                format.label()
-            );
-        }
-        // A non-reopenable wrapper mount (small, local): export synchronously.
-        let Some(src_fs) = src.fs_mut() else {
-            return "Source volume is not open.".to_string();
-        };
-        match commander_ops::export_now(src_fs, &entries, &dest, format, fork_mode) {
-            Ok(s) => format!("Exported {} file(s) to {}.", s.files, dest.display()),
-            Err(e) => format!("Export failed: {e:#}"),
-        }
-    }
-
-    /// Spawn `job` now, or hold it behind the conflict modal when `conflicts`
-    /// names host files it would write over. Returns the status line.
-    fn start_host_copy(
-        &mut self,
-        job: HostCopyJob,
-        dest_side: Option<Side>,
-        conflicts: Vec<String>,
-        where_to: &str,
-    ) -> String {
-        if conflicts.is_empty() {
-            self.pending_host_copy = Some((dest_side, commander_ops::spawn_host_copy(job)));
-            return format!("Copying to the {where_to} folder...");
-        }
-        let n = conflicts.len();
-        self.pending_host_conflict = Some(PendingHostConflict {
-            job,
-            dest_side,
-            names: conflicts,
-        });
-        format!("{n} item(s) already exist in the {where_to} folder; choose what to do.")
-    }
-
-    /// Status line for a staged copy; queues the rename notice when names changed.
-    fn note_staged(&mut self, dest_side: Side, out: StageOutcome) -> String {
-        let side = dest_side.label();
-        let mut msg = format!(
-            "Staged copy of {} item(s) into the {side} pane. Apply to write.",
-            out.staged
-        );
-        if !out.renamed.is_empty() {
-            msg.push_str(&format!(
-                " {} renamed for {}.",
-                out.renamed.len(),
-                out.fs_type
-            ));
-        }
-        if !out.dropped.is_empty() {
-            msg.push_str(&format!(" {} left out.", out.dropped.len()));
-        }
-        if !out.renamed.is_empty() || !out.dropped.is_empty() {
-            self.rename_notice = Some(RenameNotice {
-                dest_side,
-                outcome: out,
-            });
-        }
-        msg
-    }
-
-    fn render_rename_notice(&mut self, ctx: &egui::Context) {
-        let Some(notice) = self.rename_notice.as_ref() else {
+    fn render_rename_notice(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        let Some(notice) = self.ctl.rename_notice() else {
             return;
         };
         let out = &notice.outcome;
-        let mut undo = None;
         egui::Window::new(format!("Names changed for {}", out.fs_type))
             .collapsible(false)
             .resizable(false)
@@ -910,42 +412,61 @@ impl CommanderMode {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
-                        undo = Some(false);
+                        acts.push(A::RenameNoticeOk);
                     }
                     if ui
                         .button("Undo copy")
                         .on_hover_text("Remove this copy from the staged edits")
                         .clicked()
                     {
-                        undo = Some(true);
+                        acts.push(A::RenameNoticeUndo);
                     }
                 });
             });
-        let Some(undo) = undo else {
-            return;
-        };
-        let Some(notice) = self.rename_notice.take() else {
-            return;
-        };
-        if undo {
-            let pane = match notice.dest_side {
-                Side::Left => &mut self.left,
-                Side::Right => &mut self.right,
-            };
-            self.status = if pane.unstage_since(notice.outcome.queue_start) {
-                "Copy removed from the staged edits.".to_string()
-            } else {
-                "Can't undo the copy while an apply is running.".to_string()
-            };
-            self.record_log(self.status.clone());
-        }
     }
 
-    fn render_host_conflict_modal(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_host_conflict.as_ref() else {
+    /// The entries an extraction skipped (or stopped at) after asking the user.
+    pub(crate) fn render_skipped_report(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(report) = ctl.skipped_report() else {
             return;
         };
-        let mut decision: Option<Option<OnConflict>> = None;
+        egui::Window::new(report.title.as_str())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(report.summary.as_str());
+                if !report.skipped.is_empty() {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("skipped_report")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for s in &report.skipped {
+                                ui.monospace(format!("Skipped {}", printable(s)));
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() {
+                    acts.push(A::SkippedReportOk);
+                }
+            });
+    }
+
+    pub(crate) fn render_host_conflict_modal(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(names) = ctl.host_conflict() else {
+            return;
+        };
         egui::Window::new("Files already exist")
             .collapsible(false)
             .resizable(false)
@@ -953,347 +474,93 @@ impl CommanderMode {
             .show(ctx, |ui| {
                 ui.label(format!(
                     "{} item(s) already exist in the destination folder:",
-                    pending.names.len()
+                    names.len()
                 ));
                 egui::ScrollArea::vertical()
                     .max_height(160.0)
                     .show(ui, |ui| {
-                        for name in pending.names.iter().take(50) {
+                        for name in names.iter().take(50) {
                             ui.monospace(name);
                         }
-                        if pending.names.len() > 50 {
-                            ui.label(format!("... and {} more", pending.names.len() - 50));
+                        if names.len() > 50 {
+                            ui.label(format!("... and {} more", names.len() - 50));
                         }
                     });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Overwrite").clicked() {
-                        decision = Some(Some(OnConflict::Replace));
+                        acts.push(A::HostConflict(OnConflict::Replace));
                     }
                     if ui.button("Skip existing").clicked() {
-                        decision = Some(Some(OnConflict::Skip));
+                        acts.push(A::HostConflict(OnConflict::Skip));
                     }
                     if ui.button("Cancel").clicked() {
-                        decision = Some(None);
+                        acts.push(A::HostConflictCancel);
                     }
                 });
             });
-        let Some(decision) = decision else {
-            return;
-        };
-        let Some(pending) = self.pending_host_conflict.take() else {
-            return;
-        };
-        match decision {
-            Some(on) => {
-                let job = pending.job.with_conflict(on);
-                self.pending_host_copy =
-                    Some((pending.dest_side, commander_ops::spawn_host_copy(job)));
-                self.status = "Copying...".to_string();
-            }
-            None => {
-                self.status = "Copy cancelled; nothing was written.".to_string();
-            }
-        }
-        self.record_log(self.status.clone());
     }
 
-    /// Poll an in-flight immediate host copy; on completion, re-list the
-    /// destination pane (when the destination is a pane, not an export target)
-    /// and surface the result.
-    fn poll_host_copy(&mut self, ctx: &egui::Context) {
-        let Some((dest_side, arc)) = self.pending_host_copy.clone() else {
-            return;
-        };
-        ctx.request_repaint();
-        let Ok(mut guard) = arc.lock() else {
-            return;
-        };
-        if !guard.finished {
-            return;
-        }
-        self.pending_host_copy = None;
-        let err = guard.error.take();
-        let copied = guard.copied;
-        let skipped = std::mem::take(&mut guard.skipped);
-        drop(guard);
-        self.progress_window.reset();
-
-        // Re-list the destination pane only for a cross-pane copy; an export
-        // writes to an external folder that isn't shown in either pane.
-        let where_to = match dest_side {
-            Some(Side::Left) => {
-                self.left.reload_listing();
-                "the L folder".to_string()
-            }
-            Some(Side::Right) => {
-                self.right.reload_listing();
-                "the R folder".to_string()
-            }
-            None => "the host folder".to_string(),
-        };
-        self.status = match err {
-            Some(e) => format!("Export to {where_to} failed: {e}"),
-            None if skipped.is_empty() => format!("Copied {copied} file(s) to {where_to}."),
-            None => format!(
-                "Copied {copied} file(s) to {where_to}; skipped {} (see log).",
-                skipped.len()
-            ),
-        };
-        self.record_log(self.status.clone());
-        for s in skipped {
-            self.record_log(format!("Skipped {s}"));
-        }
-    }
-
-    /// Poll an in-flight image->image stage copy; on completion, push its
-    /// edits onto the destination pane's queue and surface the result. Errors
-    /// discard the staged edits (the queue is left untouched).
-    fn poll_stage_copy(&mut self, ctx: &egui::Context) {
-        let Some((dest_side, arc)) = self.pending_stage_copy.clone() else {
-            return;
-        };
-        ctx.request_repaint();
-        let Ok(mut guard) = arc.lock() else {
-            return;
-        };
-        if !guard.finished {
-            return;
-        }
-        self.pending_stage_copy = None;
-        let err = guard.error.take();
-        let edits = std::mem::take(&mut guard.edits);
-        drop(guard);
-        self.progress_window.reset();
-
-        let dest = match dest_side {
-            Side::Left => &mut self.left,
-            Side::Right => &mut self.right,
-        };
-        self.status = match err {
-            Some(e) => format!("Copy to the {} pane failed: {e}", dest_side.label()),
-            None => {
-                let out = dest.stage_edits(edits);
-                self.note_staged(dest_side, out)
-            }
-        };
-        self.record_log(self.status.clone());
-    }
-
-    /// Render the progress modal for whichever long-running operation is in
-    /// flight, if any. Only one runs at a time — image->host copy, image->image
-    /// stage copy, or a pane's apply — and each maps to the same
-    /// [`ProgressSnapshot`] the widget consumes. Returning early keeps the
-    /// modal out of the way when everything is idle.
-    fn render_progress_modal(&mut self, ctx: &egui::Context) {
-        // 1) Host copy (image->host / host->host / Export to hard drive).
-        if let Some((_, arc)) = self.pending_host_copy.clone() {
-            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
-                title: "Copying".into(),
-                current: g.current_file.clone(),
-                items_done: g.copied,
-                items_total: g.files_total,
-                bytes_done: g.bytes_done,
-                bytes_total: g.bytes_total,
-                finished: g.finished,
-                error: g.error.clone(),
-                can_cancel: true,
-                cancel_requested: g.cancel_requested,
-            });
-            if let Some(snap) = snap {
-                if self.progress_window.show(ctx, &snap) == ProgressAction::Cancel {
-                    if let Ok(mut g) = arc.lock() {
-                        g.cancel_requested = true;
-                    }
-                }
-            }
-            return;
-        }
-        // 2) Image->image staging copy.
-        if let Some((_, arc)) = self.pending_stage_copy.clone() {
-            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
-                title: "Copying to other pane".into(),
-                current: g.current_file.clone(),
-                items_done: g.files_done,
-                items_total: g.files_total,
-                bytes_done: g.bytes_done,
-                bytes_total: g.bytes_total,
-                finished: g.finished,
-                error: g.error.clone(),
-                can_cancel: true,
-                cancel_requested: g.cancel_requested,
-            });
-            if let Some(snap) = snap {
-                if self.progress_window.show(ctx, &snap) == ProgressAction::Cancel {
-                    if let Ok(mut g) = arc.lock() {
-                        g.cancel_requested = true;
-                    }
-                }
-            }
-            return;
-        }
-        // 3) Apply queue on either pane (only one is in flight at a time — the
-        // pane refuses staging until the previous apply finishes).
-        for (side, arc_opt) in [
-            (Side::Left, self.left.pending_apply_status()),
-            (Side::Right, self.right.pending_apply_status()),
-        ] {
-            let Some(arc) = arc_opt else { continue };
-            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
-                title: format!("Applying {} pane edits", side.label()),
-                current: g.current_edit.clone(),
-                items_done: g.edits_done,
-                items_total: g.edits_total,
-                bytes_done: g.bytes_done,
-                bytes_total: g.bytes_total,
-                finished: g.finished,
-                error: g.error.clone(),
-                can_cancel: false,
-                cancel_requested: false,
-            });
-            if let Some(snap) = snap {
-                let _ = self.progress_window.show(ctx, &snap);
-            }
-            return;
-        }
-    }
-
-    /// Open a "Calculate Checksums" window over the `from` pane's selected files
-    /// (§15.2). Directories are skipped; an image source is re-opened on the
-    /// worker thread (same as export). Replaces any window already open.
-    fn start_checksums(&mut self, from: Side) -> String {
-        let src = match from {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
-        };
-        let entries = src.selected_entries();
-        let file_count = entries.iter().filter(|e| e.is_file()).count();
-        if file_count == 0 {
-            return format!(
-                "Select one or more files in the {} pane to checksum (directories are skipped).",
-                from.label()
-            );
-        }
-
-        // Precompute the batch total before entries is consumed by the job.
-        let total_bytes: u64 = entries.iter().filter(|e| e.is_file()).map(|e| e.size).sum();
-
-        let job = if src.is_host_pane() {
-            ChecksumJob::Host { entries }
-        } else if let Some(source) = src.copy_stage_source() {
-            ChecksumJob::Image { source, entries }
-        } else {
-            return "Source volume is not open.".to_string();
-        };
-        let title = if file_count == 1 {
-            "Checksums".to_string()
-        } else {
-            format!("Checksums ({file_count} files)")
-        };
-        self.checksums = Some(ChecksumWindow {
-            title,
-            status: checksum::spawn(job),
-            total_bytes,
-            tracker: super::progress::RateTracker::default(),
-        });
-        format!("Calculating checksums for {file_count} file(s)...")
-    }
-
-    /// Render the open checksum window (if any): a spinner + progress while the
-    /// worker runs, then a CRC32 / MD5 / SHA1 / SHA256 grid per file, each value
-    /// with a Copy button.
-    fn render_checksum_window(&mut self, ctx: &egui::Context) {
-        let Some(win) = self.checksums.as_mut() else {
+    /// The checksum window: the hashing job while it runs, then a CRC32 / MD5 / SHA1 / SHA256 grid.
+    pub(crate) fn render_checksum_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        let Some(c) = ctl.checksums() else {
             return;
         };
         let mut open = true;
-        let mut to_copy: Option<String> = None;
-        let mut running = false;
-        let title = win.title.clone();
-        let total_bytes = win.total_bytes;
-        egui::Window::new(&title)
+        egui::Window::new(c.title.as_str())
             .open(&mut open)
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                let Ok(st) = win.status.lock() else {
-                    return;
-                };
-                running = !st.finished;
-                if let Some(err) = &st.error {
+                if let Some(err) = &c.error {
                     ui.colored_label(super::theme::danger_muted(ui.visuals()), err);
                     return;
                 }
-                if running {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(format!(
-                            "Hashing {} ({}/{})",
-                            st.current_file,
-                            st.done_files + 1,
-                            st.total_files
-                        ));
-                    });
-                    // Batch-wide byte progress: everything hashed on prior
-                    // files (their sizes are recorded in `results`) plus the
-                    // in-flight byte counter for the current file. Fed to the
-                    // shared RateTracker so the label carries rate + ETA.
-                    let done_bytes: u64 =
-                        st.results.iter().map(|r| r.size).sum::<u64>() + st.current_bytes;
-                    if total_bytes > 0 {
-                        win.tracker.record(done_bytes, "Hashing");
-                        let frac = (done_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
-                        let suffix = win.tracker.suffix(done_bytes, total_bytes);
-                        let text = format!(
-                            "{} / {} ({:.0}%){}",
-                            format_size(done_bytes),
-                            format_size(total_bytes),
-                            frac * 100.0,
-                            suffix,
-                        );
-                        ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
-                    } else if st.current_total > 0 {
-                        let frac = st.current_bytes as f32 / st.current_total as f32;
-                        ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
-                    }
-                    ui.add_space(4.0);
+                if let Some(snap) = c.running() {
+                    super::progress::show_job(ui, &snap);
+                    return;
+                }
+                if ui.small_button("Copy all").clicked() {
+                    acts.push(A::CopyChecksums);
                 }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        for (i, fc) in st.results.iter().enumerate() {
+                        for (i, row) in c.rows.iter().enumerate() {
                             if i > 0 {
                                 ui.add_space(6.0);
                                 ui.separator();
                             }
-                            ui.strong(format!("{}  ({})", fc.name, format_size(fc.size)));
-                            if let Some(err) = &fc.error {
+                            ui.strong(format!("{}  ({})", row.name, format_size(row.size)));
+                            if let Some(err) = &row.error {
                                 ui.colored_label(
                                     super::theme::danger_muted(ui.visuals()),
                                     format!("failed: {err}"),
                                 );
                                 continue;
                             }
-                            let Some(set) = &fc.set else { continue };
+                            let Some(values) = &row.values else { continue };
                             egui::Grid::new(("cksum_grid", i))
                                 .num_columns(3)
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
-                                    for (algo, value) in [
-                                        ("CRC32", set.crc32_hex()),
-                                        ("MD5", set.md5_hex()),
-                                        ("SHA1", set.sha1_hex()),
-                                        ("SHA256", set.sha256_hex()),
-                                    ] {
-                                        ui.label(algo);
+                                    for (algo, value) in HashAlgo::ALL.iter().zip(values) {
+                                        ui.label(algo.label());
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(&value).monospace(),
+                                                egui::RichText::new(value).monospace(),
                                             )
                                             .wrap(),
                                         );
                                         if ui.small_button("Copy").clicked() {
-                                            to_copy = Some(value);
+                                            acts.push(A::CopyChecksum {
+                                                file: i,
+                                                algo: *algo,
+                                            });
                                         }
                                         ui.end_row();
                                     }
@@ -1301,214 +568,56 @@ impl CommanderMode {
                         }
                     });
             });
-
-        if let Some(text) = to_copy {
-            ctx.copy_text(text);
-        }
-        if running {
-            ctx.request_repaint();
-        }
         if !open {
-            self.checksums = None;
+            acts.push(A::CloseChecksums);
         }
     }
 
-    /// Open the File Info window over the named entry in the `from` pane (§9).
-    /// Reads up to 1 MiB for the preview and snapshots the pane's fs type so the
-    /// window can offer the right editable-metadata subset. Replaces any window
-    /// already open.
-    fn open_detail(&mut self, from: Side, name: String) -> String {
-        let pane = match from {
-            Side::Left => &mut self.left,
-            Side::Right => &mut self.right,
-        };
-        // A writable image volume gets the metadata editors; host folders,
-        // read-only backups / archives, and wrapper contents (copy out, don't
-        // edit) show the metadata without them.
-        let editable = !pane.is_host_pane()
-            && !pane.is_backup_pane()
-            && !pane.is_archive_pane()
-            && !pane.wrapper_selection_active();
-        let fs_type = pane.detail_fs_type();
-        let Some((entry, bytes)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
-            return format!("[{}] could not open File Info for '{name}'.", from.label());
-        };
-        let content = bytes.map(|data| file_detail::detect_content_type(&entry, &data));
-        let xattrs = pane.detail_xattrs(&entry);
-        let title = entry.name.clone();
-        self.detail = Some(DetailWindow {
-            side: from,
-            entry,
-            editable,
-            fs_type,
-            content,
-            hfs_editor: None,
-            prodos_editor: None,
-            dates_editor: None,
-            perms_editor: None,
-            owner_editor: None,
-            xattr_editor: None,
-            xattrs,
-            result: None,
-        });
-        format!("File Info: {title}")
-    }
-
-    /// Render the open File Info window (if any): read-only metadata rows + a
-    /// text/hex preview, plus the editable-metadata subset (HFS type/creator +
-    /// dates, ProDOS type, ext permissions) on image panes. Edits stage onto the
-    /// owning pane's queue; host panes are read-only.
-    fn render_detail_window(&mut self, ctx: &egui::Context) {
-        // Disjoint borrows: the window scratch and the owning pane's queue.
-        let CommanderMode {
-            detail,
-            left,
-            right,
-            ..
-        } = self;
-        let Some(win) = detail.as_mut() else {
+    /// The File Info window: metadata rows, the editors on a writable image pane, and a preview.
+    fn render_detail_window(&mut self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        let Some(d) = self.ctl.detail() else {
             return;
         };
-        let pane = match win.side {
-            Side::Left => left,
-            Side::Right => right,
-        };
-
-        let fs = win.fs_type.as_str();
-        let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
-        let is_classic_hfs = fs == "HFS";
-        let is_prodos = fs == "ProDOS";
-        // (Unix permission / owner / xattr rows gate on the entry carrying a
-        // POSIX mode, not on the filesystem name — see below.)
-        // Writable image panes get the editors; host folders and backups are
-        // read-only display.
-        let edit_mode = win.editable;
-
+        let ed = &mut self.detail;
+        if ed.serial != d.serial {
+            *ed = DetailEditors {
+                serial: d.serial,
+                ..DetailEditors::default()
+            };
+        }
+        // The preview arrives from a job after the window opens.
+        if ed.content.is_none() {
+            ed.content = d
+                .preview
+                .as_ref()
+                .map(|data| file_detail::detect_content_type(&d.entry, data));
+        }
+        let mut staged = Vec::new();
         let mut open = true;
-        egui::Window::new(format!("File Info: {}", win.entry.name))
+        let queue = &self.ctl.pane(d.side).queue;
+        egui::Window::new(format!("File Info: {}", d.entry.name))
             .open(&mut open)
             .resizable(true)
             .default_width(620.0)
             .show(ctx, |ui| {
-                // Read-only metadata rows (HFS/ProDOS suppress inline type/creator
-                // — they render it in a dedicated editor row below). Owner-name
-                // resolution (id_names) is Inspect-only for now; Commander shows
-                // raw uid:gid.
-                file_detail::render_metadata_rows(ui, &win.entry, is_hfs || is_prodos, None);
-
-                let queue = pane.queue_mut();
-                if is_hfs && win.entry.is_file() {
-                    ui.separator();
-                    metadata_editor::render_hfs_type_row(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        queue,
-                        &mut win.hfs_editor,
-                        &mut win.result,
-                    );
-                }
-                if is_classic_hfs {
-                    metadata_editor::render_hfs_dates_row(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        queue,
-                        &mut win.dates_editor,
-                        &mut win.result,
-                    );
-                }
-                if is_prodos && win.entry.is_file() {
-                    ui.separator();
-                    metadata_editor::render_prodos_type_row(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        queue,
-                        &mut win.prodos_editor,
-                        &mut win.result,
-                    );
-                }
-                // Unix permissions / owner / xattrs. Gated on the entry actually
-                // carrying a POSIX mode rather than on the filesystem name, so
-                // every Unix volume gets them (this used to be ext-only).
-                if win.entry.mode.is_some() {
-                    ui.separator();
-                    metadata_editor::render_ext_permissions_row(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        queue,
-                        &mut win.perms_editor,
-                        &mut win.result,
-                    );
-                    metadata_editor::render_owner_row(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        None,
-                        queue,
-                        &mut win.owner_editor,
-                        &mut win.result,
-                    );
-                    let xattrs = std::mem::take(&mut win.xattrs);
-                    metadata_editor::render_xattr_section(
-                        ui,
-                        &win.entry,
-                        edit_mode,
-                        &xattrs,
-                        queue,
-                        &mut win.xattr_editor,
-                        &mut win.result,
-                    );
-                    win.xattrs = xattrs;
-                }
-
-                if let Some(msg) = &win.result {
-                    ui.add_space(4.0);
-                    ui.colored_label(super::theme::success(ui.visuals()), msg);
-                }
-
-                // Preview (read-only).
-                ui.separator();
-                match &win.content {
-                    Some(FileContent::Text(text)) => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("commander_detail_preview")
-                            .max_height(280.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut text.as_str())
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                            });
-                    }
-                    Some(FileContent::Binary(data)) => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("commander_detail_preview")
-                            .max_height(280.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                file_detail::render_hex_view(ui, data);
-                            });
-                    }
-                    None => {}
-                }
+                detail_body(ui, d, ed, queue, &mut staged, "commander_detail")
             });
-
+        acts.extend(staged.into_iter().map(|e| A::StageMetadata(Box::new(e))));
         if !open {
-            self.detail = None;
+            acts.push(A::CloseDetail);
         }
     }
 
-    /// Render the session-log window (if open): the rolling list of completed
-    /// operations, newest at the bottom, with Copy-all / Clear controls.
-    fn render_log_window(&mut self, ctx: &egui::Context) {
-        if !self.show_log {
+    /// The session log: completed operations, newest at the bottom, with Copy all / Clear.
+    pub(crate) fn render_log_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.log_shown() {
             return;
         }
+        let log = ctl.log();
         let mut open = true;
         egui::Window::new("Session log")
             .open(&mut open)
@@ -1517,27 +626,19 @@ impl CommanderMode {
             .default_height(360.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{} operation(s) this session.",
-                        self.session_log.len()
-                    ));
+                    ui.label(format!("{} operation(s) this session.", log.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Clear").clicked() {
-                            self.session_log.clear();
+                            acts.push(A::ClearLog);
                         }
-                        if ui
-                            .add_enabled(
-                                !self.session_log.is_empty(),
-                                egui::Button::new("Copy all"),
-                            )
-                            .clicked()
-                        {
-                            ctx.copy_text(self.session_log.join("\n"));
+                        let copy = egui::Button::new("Copy all");
+                        if ui.add_enabled(!log.is_empty(), copy).clicked() {
+                            acts.push(A::CopyLog);
                         }
                     });
                 });
                 ui.separator();
-                if self.session_log.is_empty() {
+                if log.is_empty() {
                     ui.weak(
                         "No operations yet. Applied edits, host copies / exports, and \
                          immediate host deletes / renames / new folders are recorded here.",
@@ -1549,34 +650,394 @@ impl CommanderMode {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        for line in &self.session_log {
+                        for line in log {
                             ui.monospace(line);
                         }
                     });
             });
         if !open {
-            self.show_log = false;
+            acts.push(A::ShowLog(false));
+        }
+    }
+
+    /// Every shortcut with its first chord on this platform, from the controller's key map.
+    pub(crate) fn render_help(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.help_shown() {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("commander_keys")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (label, chord) in ctl.key_help() {
+                            ui.label(label);
+                            ui.monospace(chord);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.weak(ctl.key_help_footer());
+            });
+        if !open {
+            acts.push(A::ShowHelp(false));
         }
     }
 }
 
-fn log_timestamp() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
+impl CommanderMode {
+    /// The View menu as a window, for the key that opens it (the menu bar has the same entries).
+    pub(crate) fn render_view_window(
+        ctl: &CommanderController,
+        ctx: &egui::Context,
+        acts: &mut Vec<CommanderAction>,
+    ) {
+        if !ctl.view_menu_shown() {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("View")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
+            .show(ctx, |ui| {
+                if let Some(action) = view_menu_body(ui, &ctl.view_menu()) {
+                    acts.push(action);
+                    acts.push(A::ShowViewMenu(false));
+                }
+            });
+        if !open {
+            acts.push(A::ShowViewMenu(false));
+        }
+    }
+
+    /// The partition chooser the Partition shortcut opens (the source bar's combo does the same).
+    fn render_partitions(&self, ctx: &egui::Context, acts: &mut Vec<CommanderAction>) {
+        let Some(side) = self.ctl.partitions_shown() else {
+            return;
+        };
+        let pane = self.ctl.pane(side);
+        let mut open = true;
+        egui::Window::new(format!("Choose partition ({})", side.label()))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                for (i, parts) in pane.partition_label_parts().iter().enumerate() {
+                    let on = pane.selected_partition() == Some(i);
+                    let label = crate::gui::theme::format_label(ui, parts);
+                    if ui.selectable_label(on, label).clicked() {
+                        acts.push(A::Pane(side, BrowserPaneAction::SelectPartition(i)));
+                    }
+                }
+            });
+        if !open {
+            acts.push(A::ShowPartitions(false));
+        }
+    }
 }
 
-/// Default filename for a single-file export: `<stem>.<ext>` when exactly one
-/// entry is selected (its own name, minus any extension), else `export.<ext>`.
-fn export_archive_name(entries: &[FileEntry], ext: &str) -> String {
-    let stem = match entries {
-        [only] => only
-            .name
-            .rsplit_once('.')
-            .map(|(s, _)| s)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&only.name),
-        _ => "export",
+/// The View menu's entries: the active pane's listing styles, then toggles and commands.
+pub(crate) fn view_menu_body(ui: &mut egui::Ui, items: &[ViewMenuItem]) -> Option<CommanderAction> {
+    let mut chosen = None;
+    let mut styles_done = false;
+    for item in items {
+        if item.kind != ViewItemKind::Style && !styles_done {
+            styles_done = true;
+            ui.separator();
+        }
+        let label = if item.hint.is_empty() {
+            item.label.clone()
+        } else {
+            format!("{}    {}", item.label, item.hint)
+        };
+        let clicked = ui
+            .add_enabled_ui(item.enabled, |ui| match item.kind {
+                ViewItemKind::Style => ui.radio(item.checked, label).clicked(),
+                ViewItemKind::Toggle => {
+                    let mut on = item.checked;
+                    ui.checkbox(&mut on, label).clicked()
+                }
+                ViewItemKind::Command => ui.button(label).clicked(),
+            })
+            .inner;
+        if clicked {
+            chosen = Some(item.action.clone());
+        }
+    }
+    chosen
+}
+
+/// The quick view: the active pane's File Info drawn in the other pane's column.
+fn quick_view(ui: &mut egui::Ui, ctl: &CommanderController, ed: &mut DetailEditors) {
+    ui.horizontal(|ui| {
+        ui.strong("Quick view");
+        ui.weak(format!("({} to close)", ctl.key_hint(Command::QuickView)));
+    });
+    ui.separator();
+    let Some(d) = ctl.quick_view_detail() else {
+        ui.weak("No file or folder under the cursor.");
+        return;
     };
-    format!("{stem}.{ext}")
+    if ed.serial != d.serial {
+        *ed = DetailEditors {
+            serial: d.serial,
+            ..DetailEditors::default()
+        };
+    }
+    if ed.content.is_none() {
+        ed.content = d
+            .preview
+            .as_ref()
+            .map(|data| file_detail::detect_content_type(&d.entry, data));
+    }
+    ui.strong(&d.entry.name);
+    let queue = &ctl.pane(d.side).queue;
+    let mut staged = Vec::new();
+    egui::ScrollArea::vertical()
+        .id_salt("commander_quick_view")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            detail_body(ui, d, ed, queue, &mut staged, "commander_quick")
+        });
+}
+
+/// The File Info window's contents; editor changes land in `staged`.
+fn detail_body(
+    ui: &mut egui::Ui,
+    d: &FileDetail,
+    ed: &mut DetailEditors,
+    queue: &EditQueue,
+    staged: &mut Vec<MetadataEdit>,
+    id: &str,
+) {
+    detail_meta(ui, d, ed, queue, staged);
+    ui.separator();
+    detail_preview(ui, ed, id, 280.0);
+}
+
+/// File Info's metadata rows and editors, without the preview.
+pub(crate) fn detail_meta(
+    ui: &mut egui::Ui,
+    d: &FileDetail,
+    ed: &mut DetailEditors,
+    queue: &EditQueue,
+    staged: &mut Vec<MetadataEdit>,
+) {
+    let fs = d.fs_type.as_str();
+    let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
+    let is_prodos = fs == "ProDOS";
+    let edit = d.editable;
+    let entry = &d.entry;
+    // The controller reports staging results in `d.result`; the editors' own line is unused.
+    let mut unused = None;
+    let mut sink = ToController { queue, staged };
+    file_detail::render_metadata_rows(ui, entry, is_hfs || is_prodos, Some(&d.id_names));
+    if is_hfs && entry.is_file() {
+        ui.separator();
+        metadata_editor::render_hfs_type_row(ui, entry, edit, &mut sink, &mut ed.hfs, &mut unused);
+    }
+    if fs == "HFS" {
+        metadata_editor::render_hfs_dates_row(
+            ui,
+            entry,
+            edit,
+            &mut sink,
+            &mut ed.dates,
+            &mut unused,
+        );
+    }
+    if is_prodos && entry.is_file() {
+        ui.separator();
+        metadata_editor::render_prodos_type_row(
+            ui,
+            entry,
+            edit,
+            &mut sink,
+            &mut ed.prodos,
+            &mut unused,
+        );
+    }
+    // Unix rows follow the entry carrying a POSIX mode, not the filesystem's name.
+    if entry.mode.is_some() {
+        ui.separator();
+        metadata_editor::render_ext_permissions_row(
+            ui,
+            entry,
+            edit,
+            &mut sink,
+            &mut ed.perms,
+            &mut unused,
+        );
+        metadata_editor::render_owner_row(
+            ui,
+            entry,
+            edit,
+            Some(&d.id_names),
+            &mut sink,
+            &mut ed.owner,
+            &mut unused,
+        );
+        metadata_editor::render_xattr_section(
+            ui,
+            entry,
+            edit,
+            &d.xattrs,
+            &mut sink,
+            &mut ed.xattr,
+            &mut unused,
+        );
+    }
+    let budget = d.size_budget_lines();
+    if !budget.is_empty() {
+        ui.separator();
+        ui.strong("SquashFS size budget");
+        for line in budget {
+            ui.monospace(line);
+        }
+    }
+    if d.loading {
+        ui.weak("Reading...");
+    }
+    if let Some(msg) = &d.result {
+        ui.add_space(4.0);
+        ui.colored_label(super::theme::success(ui.visuals()), msg);
+    }
+}
+
+/// File Info's text or hex preview, at most `height` tall.
+pub(crate) fn detail_preview(ui: &mut egui::Ui, ed: &DetailEditors, id: &str, height: f32) {
+    match &ed.content {
+        Some(FileContent::Text(text)) => {
+            egui::ScrollArea::vertical()
+                .id_salt((id, "preview"))
+                .max_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text.as_str())
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+        }
+        Some(FileContent::Binary(data)) => {
+            egui::ScrollArea::vertical()
+                .id_salt((id, "preview"))
+                .max_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| file_detail::render_hex_view(ui, data));
+        }
+        None => {}
+    }
+}
+
+/// The middle column: copy either way, delete on the active pane, and the copy / export settings.
+fn render_middle(ui: &mut egui::Ui, ctl: &CommanderController, acts: &mut Vec<CommanderAction>) {
+    ui.add_space(60.0);
+    let sz = egui::vec2(100.0, 48.0);
+    // A greyed copy button says why in its hover, so it reads as "by design" rather than broken.
+    let copy_hover = |into: Side| match ctl.pane(into).readonly_reason() {
+        Some(reason) => {
+            let side = if into == Side::Right { "right" } else { "left" };
+            format!("Can't copy into the {side} pane - {reason}")
+        }
+        None if into == Side::Right => "Copy the left pane's selection into the right pane".into(),
+        None => "Copy the right pane's selection into the left pane".into(),
+    };
+    // Procedurally painted buttons: no font glyphs, no image assets.
+    let l_hover = copy_hover(Side::Right);
+    let l_copy = |p: &egui::Painter, r, c| draw_copy_icon(p, r, c, true);
+    if icon_button(ui, sz, ctl.can_copy(Side::Left), &l_hover, l_copy).clicked() {
+        acts.push(A::Copy(Side::Left));
+    }
+    ui.add_space(6.0);
+    let r_hover = copy_hover(Side::Left);
+    let r_copy = |p: &egui::Painter, r, c| draw_copy_icon(p, r, c, false);
+    if icon_button(ui, sz, ctl.can_copy(Side::Right), &r_hover, r_copy).clicked() {
+        acts.push(A::Copy(Side::Right));
+    }
+    ui.add_space(12.0);
+    let del_hover = format!(
+        "Delete the selected item(s) in the {} pane",
+        ctl.active().label()
+    );
+    if icon_button(ui, sz, ctl.can_delete(), &del_hover, draw_delete_icon).clicked() {
+        acts.push(A::Delete);
+    }
+    ui.add_space(12.0);
+    icon_button(
+        ui,
+        sz,
+        false,
+        "Compare - not implemented yet",
+        draw_compare_icon,
+    );
+    ui.add_space(12.0);
+    let mut keep_dates = ctl.keep_dates();
+    if ui
+        .checkbox(&mut keep_dates, "Keep original dates")
+        .on_hover_text(
+            "Reproduce each copied file's original timestamps on the \
+             destination (HFS catalog dates / Amiga datestamp) instead of \
+             stamping the current time. Image-to-image copies only.",
+        )
+        .changed()
+    {
+        acts.push(A::SetKeepDates(keep_dates));
+    }
+    ui.add_space(8.0);
+    ui.label("Export as:");
+    let mut format = ctl.export_format();
+    egui::ComboBox::from_id_salt("commander_export_format")
+        .selected_text(format.label())
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for fmt in ExportFormat::ALL {
+                ui.selectable_value(&mut format, fmt, fmt.label());
+            }
+        })
+        .response
+        .on_hover_text(
+            "How the row menu's \"Export to hard drive...\" writes the selection \
+             out. The row menu's \"Export as\" submenu can pick a format inline.",
+        );
+    if format != ctl.export_format() {
+        acts.push(A::SetExportFormat(format));
+    }
+    ui.add_space(4.0);
+    // The resource-fork container applies to loose files only.
+    ui.add_enabled_ui(ctl.export_format() == ExportFormat::LooseFiles, |ui| {
+        ui.label("Forks as:");
+        let mut mode = ctl.export_fork_mode();
+        egui::ComboBox::from_id_salt("commander_fork_mode")
+            .selected_text(mode.label())
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for m in ResourceForkMode::ALL {
+                    ui.selectable_value(&mut mode, m, m.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "How to preserve a Mac file's resource fork when exporting loose \
+                 files. Tar keeps data forks only; Zip and StuffIt carry forks \
+                 natively.",
+            );
+        if mode != ctl.export_fork_mode() {
+            acts.push(A::SetForkMode(mode));
+        }
+    });
 }
 
 // --- procedural button icons -----------------------------------------------
@@ -1696,4 +1157,65 @@ fn printable(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The shortcut map, logging any lines of the user's file it could not use.
+pub(crate) fn load_keymap() -> KeyMap {
+    let (map, problems) = KeyMap::load(KeyMap::user_file().as_deref());
+    for p in problems {
+        log::warn!("keybindings: {p}");
+    }
+    map
+}
+
+/// An egui key as the key map names it; keys no binding can use are `None`.
+pub(crate) fn egui_key(key: egui::Key) -> Option<Key> {
+    use egui::Key as K;
+    Some(match key {
+        K::Tab => Key::Tab,
+        K::Enter => Key::Enter,
+        K::Escape => Key::Escape,
+        K::Backspace => Key::Backspace,
+        K::Delete => Key::Delete,
+        K::Insert => Key::Insert,
+        K::Space => Key::Space,
+        K::ArrowUp => Key::Up,
+        K::ArrowDown => Key::Down,
+        K::ArrowLeft => Key::Left,
+        K::ArrowRight => Key::Right,
+        K::PageUp => Key::PageUp,
+        K::PageDown => Key::PageDown,
+        K::Home => Key::Home,
+        K::End => Key::End,
+        K::F1 => Key::F(1),
+        K::F2 => Key::F(2),
+        K::F3 => Key::F(3),
+        K::F4 => Key::F(4),
+        K::F5 => Key::F(5),
+        K::F6 => Key::F(6),
+        K::F7 => Key::F(7),
+        K::F8 => Key::F(8),
+        K::F9 => Key::F(9),
+        K::F10 => Key::F(10),
+        K::F11 => Key::F(11),
+        K::F12 => Key::F(12),
+        other => {
+            let name = other.name();
+            let mut chars = name.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphanumeric() => Key::Char(c.to_ascii_lowercase()),
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// egui's modifiers; `mac_cmd` is Cmd on macOS and never set elsewhere.
+pub(crate) fn egui_mods(m: egui::Modifiers) -> Mods {
+    Mods {
+        ctrl: m.ctrl,
+        alt: m.alt,
+        shift: m.shift,
+        cmd: m.mac_cmd,
+    }
 }

@@ -1,0 +1,27 @@
+# The Optical tab's Start: why it is refused (no image, the detect, the image's own format, no
+# output) and its label, the rules every shell shows beside its Start (slice 28).
+name = "Optical: Start names what it waits for"
+vm = "optical"
+requires = ["optical"]
+
+[[step]]
+expect = { refusal = "Choose a disc image.", label = "Start Convert", can_start = false }
+
+[[step]]
+action = "OpenImage"
+arg = "$hybrid"
+settle = true
+expect = { format = "ISO image", refusal = "The image is already ISO; choose another output format." }
+
+[[step]]
+action = "Start"
+expect = { result = "", can_start = false }
+
+[[step]]
+action = "SetOutputFormat"
+arg = "bincue"
+expect = { refusal = "Choose an output file." }
+
+[[step]]
+action = "Pick"
+expect = { refusal = "", can_start = true, label = "Start Convert" }

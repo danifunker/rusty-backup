@@ -340,7 +340,7 @@ Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
 - `reqwest` flipped from `native-tls` to `rustls`, so the host build
   no longer drags in `openssl-sys`.
 - Module-level gates throughout `src/`: `src/main.rs` (gui),
-  `src/update.rs`, `src/model/{update_runner,chd_expand_runner}`,
+  `src/update.rs`, `src/model/chd_expand_runner`,
   `src/optical/`, `src/cli/verbs/optical.rs`,
   `src/rbformats/{chd,chd_edit,chd_options}`,
   `src/backup/single_file_chd`. Runtime stubs in

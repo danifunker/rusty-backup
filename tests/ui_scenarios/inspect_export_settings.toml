@@ -1,0 +1,56 @@
+# The Inspect controller's Export window rules every shell (egui, TUI) relies on: the source
+# label and Close, a whole-disk-only format refusing per-partition, HFV forcing per-partition,
+# and a size row's modes, its Custom seed at the minimum and the clamp of a typed size.
+name = "Inspect: export formats, layout and size rows"
+vm = "inspect"
+
+[[step]]
+action = "OpenImage"
+arg = "$blank_fat"
+settle = true
+expect = { source = "image", partitions = 1, source_label = "~vol.img", can_close = true }
+
+[[step]]
+action = "OpenExport"
+expect = { export_format = "VHD", export_whole_disk = true }
+
+[[step]]
+action = "ExportFormat"
+arg = "QCOW2"
+
+[[step]]
+action = "ExportWholeDisk"
+arg = false
+expect = { export_whole_disk = true }
+
+[[step]]
+action = "ExportFormat"
+arg = "Raw (.img)"
+
+[[step]]
+action = "ExportWholeDisk"
+arg = false
+expect = { export_whole_disk = false }
+
+[[step]]
+action = "ExportFormat"
+arg = "HFV (BasiliskII)"
+
+[[step]]
+action = "ExportWholeDisk"
+arg = true
+expect = { export_whole_disk = false }
+
+[[step]]
+action = "ExportSizeMode"
+arg = "Custom"
+expect = { export_modes = "~Original", export_size_mib = 1 }
+
+[[step]]
+action = "ExportCustomMib"
+arg = 99999999
+expect = { export_size_mib = 2097152 }
+
+[[step]]
+action = "Close"
+expect = { source = "none", can_close = false, source_label = "Select a device or image..." }

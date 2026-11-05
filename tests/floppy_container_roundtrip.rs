@@ -8,9 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusty_backup::rbformats::containers::{
-    convert_floppy_container, floppy_geom::FloppyMedia, ContainerKind,
-};
+use dsk_floppy::floppy_geom::FloppyMedia;
+use rusty_backup::rbformats::containers::{convert_floppy_container, ContainerKind};
 
 const FORMATS: &[(&str, ContainerKind)] = &[
     ("xdf", ContainerKind::Xdf),
@@ -36,12 +35,10 @@ fn write_format(tempdir: &Path, ext: &str, pattern: &[u8]) -> PathBuf {
 }
 
 fn write_format_with_stem(tempdir: &Path, stem: &str, ext: &str, pattern: &[u8]) -> PathBuf {
-    use rusty_backup::rbformats::containers::{
-        d88::{encode_d88_bytes, D88Media},
-        dim::encode_dim_bytes,
-        hdm::encode_hdm_bytes,
-        xdf::encode_xdf_bytes,
-    };
+    use dsk_floppy::d88::{encode_d88_bytes, D88Media};
+    use dsk_floppy::dim::encode_dim_bytes;
+    use dsk_floppy::hdm::encode_hdm_bytes;
+    use dsk_floppy::xdf::encode_xdf_bytes;
     let geom = FloppyMedia::Hd1232.geometry();
     let bytes = match ext {
         "xdf" => encode_xdf_bytes(pattern, geom).unwrap(),
@@ -71,24 +68,10 @@ fn decode_to_flat(path: &Path) -> Vec<u8> {
         Some(path),
     );
     match kind {
-        ContainerKind::Xdf => {
-            rusty_backup::rbformats::containers::xdf::decode_xdf_bytes(&bytes)
-                .unwrap()
-                .0
-        }
-        ContainerKind::Hdm => {
-            rusty_backup::rbformats::containers::hdm::decode_hdm_bytes(&bytes)
-                .unwrap()
-                .0
-        }
-        ContainerKind::Dim => {
-            rusty_backup::rbformats::containers::dim::decode_dim_bytes(&bytes)
-                .unwrap()
-                .0
-        }
-        ContainerKind::D88 => {
-            rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes).unwrap()
-        }
+        ContainerKind::Xdf => dsk_floppy::xdf::decode_xdf_bytes(&bytes).unwrap().0,
+        ContainerKind::Hdm => dsk_floppy::hdm::decode_hdm_bytes(&bytes).unwrap().0,
+        ContainerKind::Dim => dsk_floppy::dim::decode_dim_bytes(&bytes).unwrap().0,
+        ContainerKind::D88 => dsk_floppy::d88::decode_d88_bytes(&bytes).unwrap(),
         other => panic!("decode_to_flat: not a floppy container ({:?})", other),
     }
 }
@@ -194,7 +177,7 @@ fn bulk_convert_runner_routes_floppy_targets() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("d88") {
             let bytes = std::fs::read(&path).unwrap();
-            let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes).unwrap();
+            let flat = dsk_floppy::d88::decode_d88_bytes(&bytes).unwrap();
             assert_eq!(flat, pattern, "bulk-converted D88 didn't decode to pattern");
             count += 1;
         }
@@ -218,7 +201,7 @@ fn dim_target_rejects_dd640_geometry() {
     let xdf_path = tempdir.path().join("dd640.xdf");
     std::fs::write(
         &xdf_path,
-        rusty_backup::rbformats::containers::xdf::encode_xdf_bytes(&pattern, geom).unwrap(),
+        dsk_floppy::xdf::encode_xdf_bytes(&pattern, geom).unwrap(),
     )
     .unwrap();
 

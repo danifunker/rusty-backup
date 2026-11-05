@@ -6,11 +6,11 @@
 
 use std::io::Cursor;
 
-use rusty_backup::fs::cpm::CpmFilesystem;
-use rusty_backup::fs::cpm_diskdefs::Dpb;
-use rusty_backup::fs::cpm_diskdefs::ALL_PRESETS;
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::rbformats::containers::edsk::decode_edsk_bytes;
+use disk_core::filesystem::Filesystem;
+use dsk_floppy::edsk::decode_edsk_bytes;
+use fs_cpm::cpm::CpmFilesystem;
+use fs_cpm::cpm_diskdefs::Dpb;
+use fs_cpm::cpm_diskdefs::ALL_PRESETS;
 
 fn try_dpb(flat: &[u8], dpb: Dpb) -> Result<Vec<String>, String> {
     let cur = Cursor::new(flat.to_vec());

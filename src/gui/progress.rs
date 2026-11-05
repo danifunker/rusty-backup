@@ -1,121 +1,99 @@
 use egui::RichText;
+use rusty_backup::controller::app::{format_size, AppController, RateTracker, Snapshot};
+use rusty_backup::controller::log::{LogLevel, LogStore};
+use rusty_backup::controller::Controller;
 
-// The rate/ETA estimator lives in the (non-GUI) model layer so the CLI shares
-// it; re-exported here for the tabs that refer to `progress::RateTracker`.
-pub use rusty_backup::model::rate_tracker::RateTracker;
+/// Draw the log panel at the bottom of the window from the app view-model.
+pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
+    use rusty_backup::controller::app::AppAction;
+    let mut actions = Vec::new();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Log").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Copy Log").clicked() {
+                actions.push(AppAction::CopyLog);
+            }
+            if ui.button("Clear").clicked() {
+                actions.push(AppAction::ClearLog);
+            }
+            let mut auto_scroll = app.log_auto_scroll();
+            if ui.checkbox(&mut auto_scroll, "Auto-scroll").changed() {
+                actions.push(AppAction::SetLogAutoScroll(auto_scroll));
+            }
+        });
+    });
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LogLevel {
-    Info,
-    Warning,
-    Error,
+    ui.separator();
+
+    // Use a simple ScrollArea without show_rows to avoid bouncing
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .stick_to_bottom(app.log_auto_scroll())
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for entry in app.log.entries() {
+                let color = match entry.level {
+                    LogLevel::Info => super::theme::muted(ui.visuals()),
+                    LogLevel::Warning => super::theme::warning(ui.visuals()),
+                    LogLevel::Error => super::theme::danger(ui.visuals()),
+                };
+                // Use horizontal layout with word wrap to handle long lines
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(entry.line()).color(color).monospace());
+                });
+            }
+        });
+
+    for action in actions {
+        let effects = app.apply(action);
+        super::run_effects(ui.ctx(), effects);
+    }
 }
 
-#[derive(Debug, Clone)]
-struct LogEntry {
-    level: LogLevel,
-    message: String,
-    timestamp: String,
-}
-
-/// Scrollable log panel displayed at the bottom of the window.
-pub struct LogPanel {
-    entries: Vec<LogEntry>,
-    auto_scroll: bool,
-}
-
-impl Default for LogPanel {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            auto_scroll: true,
+/// Move a controller's log lines into the log panel.
+pub fn drain_log_lines(lines: Vec<(LogLevel, String)>, log: &mut LogStore) {
+    for (level, msg) in lines {
+        match level {
+            LogLevel::Info => log.info(msg),
+            LogLevel::Warning => log.warn(msg),
+            LogLevel::Error => log.error(msg),
         }
     }
 }
 
-impl LogPanel {
-    pub fn add(&mut self, level: LogLevel, message: impl Into<String>) {
-        let now = chrono_now();
-        self.entries.push(LogEntry {
-            level,
-            message: message.into(),
-            timestamp: now,
-        });
-    }
-
-    pub fn info(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Info, message);
-    }
-
-    pub fn warn(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Warning, message);
-    }
-
-    pub fn error(&mut self, message: impl Into<String>) {
-        self.add(LogLevel::Error, message);
-    }
-
-    /// Copy all log entries to clipboard
-    fn copy_to_clipboard(&self, ctx: &egui::Context) {
-        let log_text: String = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let prefix = match entry.level {
-                    LogLevel::Info => "INFO",
-                    LogLevel::Warning => "WARN",
-                    LogLevel::Error => "ERR ",
-                };
-                format!("{} [{}] {}", entry.timestamp, prefix, entry.message)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        ctx.copy_text(log_text);
-    }
-
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+/// Draw a running job: its step, a bar (an activity bar when the total is unknown),
+/// speed and time, and Cancel when offered; returns true when Cancel is clicked.
+pub fn show_job(ui: &mut egui::Ui, snap: &Snapshot) -> bool {
+    let mut cancel = false;
+    let phase = if snap.phase.is_empty() {
+        snap.label.as_str()
+    } else {
+        snap.phase.as_str()
+    };
+    ui.vertical(|ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Log").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Copy Log").clicked() {
-                    self.copy_to_clipboard(ui.ctx());
-                }
-                if ui.button("Clear").clicked() {
-                    self.entries.clear();
-                }
-                ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
-            });
+            ui.label(phase);
+            if snap.cancel_requested {
+                ui.label(RichText::new("(cancelling)").weak());
+            } else if snap.can_cancel && ui.small_button("Cancel").clicked() {
+                cancel = true;
+            }
         });
-
-        ui.separator();
-
-        // Use a simple ScrollArea without show_rows to avoid bouncing
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .stick_to_bottom(self.auto_scroll)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for entry in &self.entries {
-                    let color = match entry.level {
-                        LogLevel::Info => super::theme::muted(ui.visuals()),
-                        LogLevel::Warning => super::theme::warning(ui.visuals()),
-                        LogLevel::Error => super::theme::danger(ui.visuals()),
-                    };
-                    let prefix = match entry.level {
-                        LogLevel::Info => "INFO",
-                        LogLevel::Warning => "WARN",
-                        LogLevel::Error => "ERR ",
-                    };
-
-                    let text = format!("{} [{}] {}", entry.timestamp, prefix, entry.message);
-
-                    // Use horizontal layout with word wrap to handle long lines
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(text).color(color).monospace());
-                    });
-                }
-            });
-    }
+        let bar = match snap.progress.fraction() {
+            Some(f) => egui::ProgressBar::new(f).show_percentage(),
+            // No total to measure against: a sweeping fill says it is alive without implying a percentage.
+            None => {
+                let t = snap.elapsed.as_secs_f32();
+                let sweep = (t * 0.6).fract();
+                egui::ProgressBar::new(sweep).animate(true)
+            }
+        };
+        ui.add(bar.desired_width(260.0));
+        ui.label(RichText::new(snap.detail()).small().weak());
+    });
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
+    cancel
 }
 
 /// Progress state for long-running operations.
@@ -152,17 +130,17 @@ impl ProgressState {
                 let text = if self.full_size_bytes > self.total_bytes {
                     format!(
                         "{} / {} to image of {} total ({:.0}%){}",
-                        rusty_backup::partition::format_size(self.current_bytes),
-                        rusty_backup::partition::format_size(self.total_bytes),
-                        rusty_backup::partition::format_size(self.full_size_bytes),
+                        format_size(self.current_bytes),
+                        format_size(self.total_bytes),
+                        format_size(self.full_size_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )
                 } else {
                     format!(
                         "{} / {} ({:.0}%){}",
-                        rusty_backup::partition::format_size(self.current_bytes),
-                        rusty_backup::partition::format_size(self.total_bytes),
+                        format_size(self.current_bytes),
+                        format_size(self.total_bytes),
                         fraction * 100.0,
                         rate_eta,
                     )
@@ -174,9 +152,4 @@ impl ProgressState {
             }
         });
     }
-}
-
-/// Get current timestamp in local time.
-fn chrono_now() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
 }

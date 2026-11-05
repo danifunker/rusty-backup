@@ -6,7 +6,7 @@
 //! Used by `scripts/generate-d88-fixture.sh` to synthesize a fixture
 //! from a flat FAT12 image.
 
-use rusty_backup::rbformats::containers::d88::{encode_d88_bytes, D88Media};
+use dsk_floppy::d88::{encode_d88_bytes, D88Media};
 
 fn parse_media(s: &str) -> Option<D88Media> {
     match s.to_ascii_lowercase().as_str() {

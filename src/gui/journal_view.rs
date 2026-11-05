@@ -5,7 +5,9 @@
 //! (or macOS) wrote, in order, with enough detail to troubleshoot a volume that
 //! won't mount. ASCII only — no emoji or arrows beyond `->` (CLAUDE.md rule).
 
-use rusty_backup::fs::hfsplus_journal::{classify_target, JournalDetail};
+use rusty_backup::controller::commander::{
+    journal_block_class, journal_txn_classes, JournalDetail,
+};
 
 /// Modal state for the journal viewer. Created when the user clicks "Journal"
 /// in the browse-view toolbar; holds the decoded journal plus the currently
@@ -107,7 +109,6 @@ impl JournalView {
             return;
         }
 
-        let regions = self.detail.regions.clone();
         // Snapshot the rows we need to render so we don't borrow self.detail
         // while mutating self.selected.
         let rows: Vec<TxnRow> = self
@@ -135,7 +136,7 @@ impl JournalView {
                         t.sequence_num,
                         t.blocks.len(),
                         human_bytes(t.total_bytes),
-                        classification_summary(&regions, t),
+                        journal_txn_classes(&self.detail, t),
                     ),
                 }
             })
@@ -166,7 +167,7 @@ impl JournalView {
                     .max_height(160.0)
                     .show(ui, |ui| {
                         for b in &txn.blocks {
-                            let class = classify_target(&regions, b.target);
+                            let class = journal_block_class(&self.detail, b.target);
                             ui.label(format!(
                                 "  sector {}  ({} bytes)  [{class}]  {}",
                                 b.target / 512,
@@ -184,25 +185,6 @@ impl JournalView {
 struct TxnRow {
     idx: usize,
     label: String,
-}
-
-/// One-line classification of which subsystems a transaction's blocks touch.
-fn classification_summary(
-    regions: &[rusty_backup::fs::hfsplus_journal::MetadataRegion],
-    txn: &rusty_backup::fs::hfsplus_journal::JournalTxnDetail,
-) -> String {
-    let mut names: Vec<&'static str> = Vec::new();
-    for b in &txn.blocks {
-        let c = classify_target(regions, b.target);
-        if !names.contains(&c) {
-            names.push(c);
-        }
-    }
-    if names.is_empty() {
-        "empty".to_string()
-    } else {
-        names.join(", ")
-    }
 }
 
 /// A compact hex preview of up to the first 16 bytes.

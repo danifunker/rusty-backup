@@ -21,7 +21,7 @@ use crate::cli::parse::parse_size;
 use crate::model::chd_expand_runner;
 #[cfg(feature = "chd")]
 use crate::model::status::ChdExpandStatus;
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct GrowArgs {
@@ -91,7 +91,7 @@ fn drain_chd(status: Arc<Mutex<ChdExpandStatus>>) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, cur, total, finished, error) = match status.lock() {
             Ok(mut s) => (
-                s.log_messages.drain(..).collect::<Vec<String>>(),
+                std::mem::take(&mut s.log_messages),
                 s.current_bytes,
                 s.total_bytes,
                 s.finished,

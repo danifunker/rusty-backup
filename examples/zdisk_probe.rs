@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use rusty_backup::fs::alto::pilot::{self, Generation, Label};
-use rusty_backup::fs::alto::{zdisk, Disk};
+use fs_xerox::alto::pilot::{self, Generation, Label};
+use fs_xerox::alto::{zdisk, Disk};
 
 fn rdw(buf: &[u8], wi: usize) -> u16 {
     ((buf[wi * 2] as u16) << 8) | (buf[wi * 2 + 1] as u16)

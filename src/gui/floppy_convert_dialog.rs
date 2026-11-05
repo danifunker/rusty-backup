@@ -1,414 +1,218 @@
-//! "Convert Floppy Container…" dialog for the Inspect tab.
+//! "Convert Floppy Container..." dialog for the Inspect tab: a shell over
+//! `controller::floppy_convert`.
 //!
-//! Single-file conversion between XDF / HDM / DIM / D88. Mirrors the shape
-//! of [`super::expand_hfs_dialog::ExpandHfsDialog`]: source path (picked
-//! inside the dialog), target-format radio group, "Save As…" picker,
-//! worker thread that calls
-//! [`rusty_backup::rbformats::containers::convert_floppy_container`], status
-//! polled per frame.
-//!
-//! Bulk mode lives in two places:
-//! - GUI: the existing [`super::bulk_convert_dialog`] now lists XDF /
-//!   HDM / DIM / D88 alongside the other output formats — point users
-//!   there for folder-of-floppies conversions.
-//! - CLI: `rb-cli floppy convert <dir> <dir> --to <fmt> [--recursive]`.
+//! Draws the source, the target radios, the output and the run's result, maps them to
+//! [`FloppyConvertAction`]s and answers the pickers through an [`EffectHost`]. Bulk conversion
+//! lives in the Bulk Convert dialog and `rb-cli floppy convert <dir> <dir> --to <fmt>`.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use rusty_backup::rbformats::containers::{
-    convert_floppy_container, floppy_kind_from_extension, ContainerKind,
+use rusty_backup::controller::floppy_convert::{
+    FloppyConvertAction, FloppyConvertController, FloppyTarget,
 };
+use rusty_backup::controller::log::LogStore;
+use rusty_backup::controller::{Controller, Effect};
 
-use super::progress::LogPanel;
-
-/// Backing status shared between the GUI thread and the worker.
-#[derive(Default)]
-pub struct FloppyConvertStatus {
-    pub finished: bool,
-    pub current_step: String,
-    pub log_messages: Vec<String>,
-    pub error: Option<String>,
-    pub summary: Option<String>,
-}
-
-/// One of the four floppy formats — distinct from `ContainerKind` so the
-/// dialog only offers the four floppy choices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FloppyTarget {
-    Xdf,
-    Hdm,
-    Dim,
-    D88,
-}
-
-impl FloppyTarget {
-    pub const fn extension(self) -> &'static str {
-        match self {
-            FloppyTarget::Xdf => "xdf",
-            FloppyTarget::Hdm => "hdm",
-            FloppyTarget::Dim => "dim",
-            FloppyTarget::D88 => "d88",
-        }
-    }
-    pub const fn container(self) -> ContainerKind {
-        match self {
-            FloppyTarget::Xdf => ContainerKind::Xdf,
-            FloppyTarget::Hdm => ContainerKind::Hdm,
-            FloppyTarget::Dim => ContainerKind::Dim,
-            FloppyTarget::D88 => ContainerKind::D88,
-        }
-    }
-    pub const fn label(self) -> &'static str {
-        match self {
-            FloppyTarget::Xdf => "X68000 XDF (.xdf)",
-            FloppyTarget::Hdm => "PC-98 HDM (.hdm)",
-            FloppyTarget::Dim => "DiskExplorer DIM (.dim)",
-            FloppyTarget::D88 => "Sharp D88 (.d88)",
-        }
-    }
-    pub fn from_container(c: ContainerKind) -> Option<Self> {
-        match c {
-            ContainerKind::Xdf => Some(FloppyTarget::Xdf),
-            ContainerKind::Hdm => Some(FloppyTarget::Hdm),
-            ContainerKind::Dim => Some(FloppyTarget::Dim),
-            ContainerKind::D88 => Some(FloppyTarget::D88),
-            _ => None,
-        }
-    }
-}
+use super::effects::{EffectHost, Reply};
 
 pub struct FloppyConvertDialog {
-    pub open: bool,
-    source_path: Option<PathBuf>,
-    source_kind: Option<ContainerKind>,
-    source_error: Option<String>,
-    target: FloppyTarget,
-    output_path: Option<PathBuf>,
-    status: Option<Arc<Mutex<FloppyConvertStatus>>>,
-    completed: bool,
+    ctl: FloppyConvertController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
 }
 
 impl FloppyConvertDialog {
-    /// Open with no pre-loaded source — the user picks it inside the dialog.
-    pub fn empty() -> Self {
-        Self {
-            open: true,
-            source_path: None,
-            source_kind: None,
-            source_error: None,
-            target: FloppyTarget::D88,
-            output_path: None,
-            status: None,
-            completed: false,
-        }
+    /// A conversion is in flight.
+    pub fn is_running(&self) -> bool {
+        self.ctl.is_running()
     }
 
-    /// Open with `path` pre-loaded as the source. Used by the Inspect tab,
-    /// which only offers the converter when the loaded image already
-    /// sniffs as a floppy container — `set_source` re-detects the kind so
-    /// the target radio defaults sensibly and surfaces any read error.
-    pub fn with_source(path: PathBuf) -> Self {
-        let mut dialog = Self::empty();
-        dialog.set_source(path);
-        dialog
+    /// Open with `path` as the source; it is sniffed in a job.
+    pub fn with_source(path: std::path::PathBuf) -> Self {
+        let mut dlg = FloppyConvertDialog {
+            ctl: FloppyConvertController::new(std::sync::Arc::new(super::ui_logger::EguiWake)),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+        };
+        dlg.act(FloppyConvertAction::Open(Some(path)));
+        dlg
     }
 
-    fn set_source(&mut self, path: PathBuf) {
-        // Detect the container kind by reading the first 256 bytes + extension.
-        let head = match rusty_backup::compat::read_head(&path, 256) {
-            Ok(b) => b,
-            Err(e) => {
-                self.source_error = Some(format!("Cannot read source: {e}"));
-                return;
-            }
-        };
-        let kind = rusty_backup::rbformats::containers::detect_container_kind(&head, Some(&path));
-        let too_big = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-            > rusty_backup::rbformats::containers::FLOPPY_CONTAINER_MAX;
-        if !rusty_backup::rbformats::containers::is_floppy_container(kind) || too_big {
-            self.source_error = Some(format!(
-                "{} is not a recognised floppy container (detected: {})",
-                path.display(),
-                kind.display_name()
-            ));
-            return;
-        }
-        self.source_path = Some(path);
-        self.source_kind = Some(kind);
-        self.source_error = None;
-        self.output_path = None;
-        self.completed = false;
-        self.status = None;
-        // Reset target to something useful relative to the new source.
-        self.target = match kind {
-            ContainerKind::D88 => FloppyTarget::Xdf,
-            _ => FloppyTarget::D88,
-        };
+    fn act(&mut self, action: FloppyConvertAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
     }
 
     /// Render the dialog. Returns `false` once the user closes it for good.
-    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogPanel) -> bool {
-        if !self.open {
+    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogStore) -> bool {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        super::progress::drain_log_lines(self.ctl.take_log(), log);
+        if !self.ctl.is_open() {
             return false;
         }
-        struct StatusSnapshot {
-            finished: bool,
-            current_step: String,
-            log_messages: Vec<String>,
-            error: Option<String>,
-            summary: Option<String>,
-        }
-        let status_snapshot: Option<StatusSnapshot> = self.status.as_ref().and_then(|s| {
-            s.lock().ok().map(|g| StatusSnapshot {
-                finished: g.finished,
-                current_step: g.current_step.clone(),
-                log_messages: g.log_messages.clone(),
-                error: g.error.clone(),
-                summary: g.summary.clone(),
-            })
-        });
+        let mut actions = Vec::new();
+        let busy = self.ctl.is_running();
+        let mut window_open = true;
+        // No title-bar X while the conversion runs: it is still writing the output file.
+        let window = egui::Window::new("Convert Floppy Container...");
+        let window = if busy {
+            window
+        } else {
+            window.open(&mut window_open)
+        };
+        window.resizable(true).default_width(520.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Source").strong());
+            ui.horizontal(|ui| {
+                let label = self
+                    .ctl
+                    .source()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not chosen)".to_string());
+                ui.label(label);
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Choose File..."))
+                    .clicked()
+                {
+                    actions.push(FloppyConvertAction::PickSource);
+                }
+                if self.ctl.probing() {
+                    ui.spinner();
+                }
+            });
+            if let Some(kind) = self.ctl.source_kind() {
+                ui.label(format!("Detected: {kind}"));
+            }
+            if let Some(err) = self.ctl.source_error() {
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Converting a folder of floppies? Use the main Bulk Convert dialog \
+                     (XDF / HDM / DIM / D88 are listed there as output formats).",
+                )
+                .small()
+                .italics(),
+            );
 
-        let mut start_clicked = false;
-        let mut close_clicked = false;
-        let mut pick_output_clicked = false;
-        let mut pick_source_clicked = false;
+            ui.separator();
+            ui.label(egui::RichText::new("Target").strong());
 
-        let mut window_open = self.open;
-        egui::Window::new("Convert Floppy Container...")
-            .open(&mut window_open)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Source").strong());
+            ui.add_enabled_ui(self.ctl.editable(), |ui| {
+                let target = self.ctl.target();
+                for (i, pair) in FloppyTarget::ALL.chunks(2).enumerate() {
+                    ui.horizontal(|ui| {
+                        if i == 0 {
+                            ui.label("Output format:");
+                        } else {
+                            ui.add_space(96.0);
+                        }
+                        for &t in pair {
+                            if ui.radio(target == t, t.label()).clicked() {
+                                actions.push(FloppyConvertAction::SetTarget(t));
+                            }
+                        }
+                    });
+                }
+
                 ui.horizontal(|ui| {
-                    let label = self
-                        .source_path
-                        .as_ref()
+                    ui.label("Output file:");
+                    let path_text = self
+                        .ctl
+                        .output()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(not chosen)".to_string());
-                    ui.label(label);
-                    if ui.button("Choose File...").clicked() {
-                        pick_source_clicked = true;
-                    }
-                });
-                if let Some(kind) = self.source_kind {
-                    ui.label(format!("Detected: {}", kind.display_name()));
-                }
-                if let Some(err) = &self.source_error {
-                    ui.colored_label(super::theme::danger(ui.visuals()), err.clone());
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Converting a folder of floppies? Use the main Bulk Convert dialog \
-                         (XDF / HDM / DIM / D88 are listed there as output formats).",
-                    )
-                    .small()
-                    .italics(),
-                );
-
-                ui.separator();
-                ui.label(egui::RichText::new("Target").strong());
-
-                let busy = status_snapshot
-                    .as_ref()
-                    .map(|s| !s.finished)
-                    .unwrap_or(false);
-
-                ui.add_enabled_ui(!busy && !self.completed, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Output format:");
-                        ui.radio_value(&mut self.target, FloppyTarget::Xdf, FloppyTarget::Xdf.label());
-                        ui.radio_value(&mut self.target, FloppyTarget::Hdm, FloppyTarget::Hdm.label());
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(96.0);
-                        ui.radio_value(&mut self.target, FloppyTarget::Dim, FloppyTarget::Dim.label());
-                        ui.radio_value(&mut self.target, FloppyTarget::D88, FloppyTarget::D88.label());
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Output file:");
-                        let path_text = self
-                            .output_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(not chosen)".to_string());
-                        ui.label(path_text);
-                        if ui.button("Save As...").clicked() {
-                            pick_output_clicked = true;
-                        }
-                    });
-
-                    if let Some(sk) = self.source_kind {
-                        if FloppyTarget::from_container(sk) == Some(self.target) {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Source and target match - the output will be a byte-identical copy.",
-                                )
-                                .small()
-                                .italics(),
-                            );
-                        }
+                    ui.label(path_text);
+                    if ui.button("Save As...").clicked() {
+                        actions.push(FloppyConvertAction::PickOutput);
                     }
                 });
 
-                ui.separator();
-                if let Some(snap) = &status_snapshot {
-                    if !snap.finished {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(&snap.current_step);
-                        });
-                    } else if let Some(err) = &snap.error {
+                if self.ctl.same_format() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Source and target match - the output will be a byte-identical copy.",
+                        )
+                        .small()
+                        .italics(),
+                    );
+                }
+            });
+
+            ui.separator();
+            if let Some(snap) = self.ctl.progress() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(snap.phase.as_str());
+                });
+            } else {
+                match self.ctl.outcome() {
+                    Some(Err(err)) => {
                         ui.colored_label(
                             super::theme::danger(ui.visuals()),
                             format!("Failed: {err}"),
                         );
-                    } else if let Some(s) = &snap.summary {
-                        ui.colored_label(super::theme::success(ui.visuals()), s.clone());
-                    } else {
+                    }
+                    Some(Ok(done)) => {
                         ui.colored_label(
                             super::theme::success(ui.visuals()),
-                            "Conversion complete.",
+                            done.summary.as_str(),
                         );
+                        ui.label(done.line.as_str());
                     }
-                    if !snap.log_messages.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .max_height(120.0)
-                            .id_salt("floppy_convert_log")
-                            .show(ui, |ui| {
-                                for m in &snap.log_messages {
-                                    ui.label(m);
-                                }
-                            });
-                    }
+                    None => {}
                 }
+            }
 
-                ui.horizontal(|ui| {
-                    let can_start = !busy
-                        && !self.completed
-                        && self.source_path.is_some()
-                        && self.output_path.is_some();
-                    if ui
-                        .add_enabled(can_start, egui::Button::new("Convert"))
-                        .clicked()
-                    {
-                        start_clicked = true;
-                    }
-                    let close_label = if self.completed { "Close" } else { "Cancel" };
-                    if ui
-                        .add_enabled(!busy, egui::Button::new(close_label))
-                        .clicked()
-                    {
-                        close_clicked = true;
-                    }
-                });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.ctl.can_start(), egui::Button::new("Convert"))
+                    .clicked()
+                {
+                    actions.push(FloppyConvertAction::Start);
+                }
+                let close_label = if self.ctl.outcome().is_some() {
+                    "Close"
+                } else {
+                    "Cancel"
+                };
+                if ui
+                    .add_enabled(!busy, egui::Button::new(close_label))
+                    .clicked()
+                {
+                    actions.push(FloppyConvertAction::Close);
+                }
             });
-        self.open = window_open;
-
-        if pick_source_clicked {
-            if let Some(path) = super::file_dialog()
-                .add_filter("Floppy Containers", &["xdf", "hdm", "dim", "d88"])
-                .add_filter("All Files", &["*"])
-                .pick_file()
-            {
-                self.set_source(path);
-            }
+        });
+        if !window_open {
+            actions.push(FloppyConvertAction::Close);
         }
-
-        if pick_output_clicked {
-            let stem = self
-                .source_path
-                .as_ref()
-                .and_then(|p| p.file_stem())
-                .and_then(|s| s.to_str())
-                .unwrap_or("converted")
-                .to_string();
-            let ext = self.target.extension();
-            if let Some(path) = super::file_dialog()
-                .set_file_name(format!("{stem}.{ext}"))
-                .add_filter(self.target.label(), &[ext])
-                .save_file()
-            {
-                self.output_path = Some(path);
-            }
+        for a in actions {
+            self.act(a);
         }
-        if start_clicked {
-            if let (Some(src), Some(out)) = (self.source_path.clone(), self.output_path.clone()) {
-                self.spawn_worker(src, out, log);
-            }
+        self.run_effects(ctx, log);
+        if busy || self.ctl.probing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if close_clicked {
-            self.open = false;
-        }
-
-        if let Some(snap) = &status_snapshot {
-            if snap.finished {
-                self.completed = true;
-            }
-        }
-
-        self.open
+        self.ctl.is_open()
     }
 
-    fn spawn_worker(&mut self, source: PathBuf, output: PathBuf, log: &mut LogPanel) {
-        let target_kind = self.target.container();
-        log.info(format!(
-            "Converting floppy container: {} -> {} ({})",
-            source.display(),
-            output.display(),
-            self.target.label(),
-        ));
-        let status = Arc::new(Mutex::new(FloppyConvertStatus {
-            finished: false,
-            current_step: "Starting...".to_string(),
-            log_messages: Vec::new(),
-            error: None,
-            summary: None,
-        }));
-        let status_for_worker = Arc::clone(&status);
-        let target_label = self.target.label();
-        std::thread::spawn(move || {
-            if let Ok(mut s) = status_for_worker.lock() {
-                s.current_step = "Decoding source...".to_string();
-            }
-            // Sanity check: when the output extension doesn't match the radio
-            // selection, prefer the radio selection (the user clicked it last).
-            // Falling back through `floppy_kind_from_extension` would mismatch.
-            let result = convert_floppy_container(&source, &output, target_kind);
-            if let Ok(mut s) = status_for_worker.lock() {
-                match result {
-                    Ok(report) => {
-                        s.summary = Some(format!(
-                            "Converted to {} ({}, {} bytes)",
-                            target_label,
-                            report.media.display_label(),
-                            report.bytes_written
-                        ));
-                        s.log_messages.push(format!(
-                            "Wrote {} bytes to {}",
-                            report.bytes_written,
-                            output.display()
-                        ));
-                    }
-                    Err(e) => {
-                        s.error = Some(format!("{e:#}"));
-                    }
+    fn run_effects(&mut self, ctx: &egui::Context, log: &mut LogStore) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ctx, fx, &mut messages);
+        replies.extend(self.effects.show(ctx, "Floppy convert"));
+        for msg in messages {
+            log.info(msg);
+        }
+        for reply in replies {
+            match reply {
+                Reply::Picked { purpose, path } => {
+                    self.act(FloppyConvertAction::Picked { purpose, path })
                 }
-                s.finished = true;
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
-        });
-        self.status = Some(status);
+        }
     }
 }
-
-/// Compile-time consistency check that the radio enum and the engine kinds
-/// match — keeps the dialog from going stale if a new floppy format is added.
-#[allow(dead_code)]
-const _: fn() = || {
-    // Only the four floppy variants must be expressible as FloppyTarget.
-    let _ = |c: ContainerKind| -> Option<FloppyTarget> { FloppyTarget::from_container(c) };
-    // `floppy_kind_from_extension` is referenced so the import isn't dead.
-    let _: fn(&std::path::Path) -> anyhow::Result<ContainerKind> = floppy_kind_from_extension;
-};

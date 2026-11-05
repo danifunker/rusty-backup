@@ -7,7 +7,7 @@
 //   cargo run --release --example gho_find_attrlist -- PATH.GHO name1 [name2 ...]
 // Defaults to looking for "system" and "software".
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::io::{Read, Seek, SeekFrom};
 
 fn rd_u16(b: &[u8], o: usize) -> u16 {

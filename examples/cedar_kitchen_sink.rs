@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::fs;
 
-use rusty_backup::fs::alto::pilot::{self, Generation, PvBootFile};
+use fs_xerox::alto::pilot::{self, Generation, PvBootFile};
 
 /// Volume size in Pilot pages. `pilot_geometry` takes a `u16`, so 65535 pages
 /// (~31 MB usable after boot + leaders + VAM) is the ceiling for one volume.

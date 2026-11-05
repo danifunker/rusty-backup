@@ -19,7 +19,8 @@ use std::path::PathBuf;
 
 use crate::cli::logging::out_stdout;
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
-use crate::partition::{format_size, PartitionTable};
+use crate::partition::PartitionTable;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct InspectArgs {
@@ -147,7 +148,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
         None
     };
     let gho_report = if ext == "gho" || ext == "ghs" {
-        crate::rbformats::gho::format_gho_info(&args.image).ok()
+        dsk_ghost::gho::format_gho_info(&args.image).ok()
     } else {
         None
     };
@@ -312,7 +313,7 @@ fn emit_text(
 
 /// Print the full SGI volume-header slot table (all non-empty slots, including
 /// the VOLHDR / VOLUME wrappers) plus the disk geometry.
-fn emit_sgi_volume_header(vh: &crate::partition::sgi::SgiVolumeHeader) {
+fn emit_sgi_volume_header(vh: &part_tables::sgi::SgiVolumeHeader) {
     let dp = &vh.device_parameters;
     out_stdout("");
     out_stdout(format!(

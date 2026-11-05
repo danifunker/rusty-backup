@@ -21,9 +21,9 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::io::{Cursor, Read};
 
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::hfsplus::HfsPlusFilesystem;
-use rusty_backup::fs::hfsplus_journal::{
+use disk_core::filesystem::Filesystem;
+use fs_mac::hfsplus::HfsPlusFilesystem;
+use fs_mac::hfsplus_journal::{
     classify_target, replay_journal, JournalEndian, JournalHeader, JournalInfoBlock,
 };
 

@@ -109,7 +109,7 @@ pub fn find_squashfs(path: &Path) -> Option<IsoSquashfs> {
                 EntryType::Directory => stack.push(child),
                 EntryType::File => {
                     let offset = child.location.checked_mul(ISO_SECTOR)?;
-                    if crate::fs::squashfs::SquashfsFilesystem::detect(&mut raw, offset) {
+                    if fs_squashfs::squashfs::SquashfsFilesystem::detect(&mut raw, offset) {
                         return Some(IsoSquashfs {
                             offset,
                             len: child.size,
@@ -146,7 +146,7 @@ mod tests {
     /// change in how it reports a file's `location` would be caught here.
     #[test]
     fn finds_a_squashfs_file_in_a_plain_iso() {
-        use crate::fs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+        use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
         use std::io::Write;
 
         // The payload we will embed.
@@ -224,9 +224,9 @@ mod tests {
 
         // And the offset really opens as a filesystem.
         let file = std::fs::File::open(&path).unwrap();
-        let mut sqfs = crate::fs::squashfs::SquashfsFilesystem::open(file, found.offset)
+        let mut sqfs = fs_squashfs::squashfs::SquashfsFilesystem::open(file, found.offset)
             .expect("open payload at the located offset");
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
         let root = sqfs.root().unwrap();
         let names: Vec<String> = sqfs
             .list_directory(&root)

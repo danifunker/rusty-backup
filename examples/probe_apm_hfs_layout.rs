@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
         let f4 = File::open(path)?;
         let mut r4 = BufReader::new(f4);
         if let Some(info) =
-            fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut r4, offset, part.size_bytes)
+            fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus(&mut r4, offset, part.size_bytes)
         {
             println!(
                 "    wrapper: al_block_size={} drAlBlSt={} drNmAlBlks={} drVBMSt={} embed_start_block={} embed_block_count={}",
@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
                 // back it out for the plan dry-run.
                 let inner_only = inner_min.saturating_sub(outer_overhead);
                 println!("    inner-only defragmented_minimum_size = {inner_only}");
-                match fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_only) {
+                match fs_mac::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_only) {
                     Ok(p) => println!(
                         "    plan_wrapped_clone OK: new_inner_size={} new_embed_block_count={} new_partition_size={}",
                         p.new_inner_size, p.new_embed_block_count, p.new_partition_size,

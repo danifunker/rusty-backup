@@ -1,97 +1,34 @@
-//! A `log::Log` implementation that both prints to stderr (preserving the
-//! terminal output `env_logger` used to give us) and buffers records so the
-//! GUI log panel can surface them. This is how `log::info!` calls from worker
-//! threads — e.g. the GHO reader's lazy-scan progress in `rbformats::gho` —
-//! become visible in the app's log panel instead of only on stderr.
+//! egui's side of the app log: the [`Notify`] that wakes egui, and start-up wiring.
 //!
-//! ## Why the repaint request is thread-gated
-//!
-//! `log()` can be re-entered from inside egui itself: `Context::end_pass`
-//! emits `log::warn!` (the debug-only `warn_if_rect_changes_id` id-instability
-//! check) while holding the context `RwLock` for writing. Calling
-//! `Context::request_repaint()` from there re-enters `Context::read()` on the
-//! same thread and self-deadlocks — a debug build panics after 10s with
-//! "DEBUG PANIC: Failed to acquire RwLock read", a release build hangs
-//! outright. Records logged on the UI thread are drained by the frame already
-//! in flight, so only worker threads need the wake-up.
+//! The `log` sink and the log store live in `rusty_backup::controller::log`; this module
+//! only connects them to egui. See that module for why the wake is thread-gated.
 
-use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-use std::thread::ThreadId;
+use std::sync::{Arc, OnceLock};
 
-use log::{Level, LevelFilter, Log, Metadata, Record};
+use rusty_backup::controller::app::Notify;
+use rusty_backup::controller::log::capture;
 
-static BUFFER: OnceLock<Mutex<VecDeque<(Level, String)>>> = OnceLock::new();
+/// The egui context, registered once the window exists.
+static REPAINT_CTX: OnceLock<egui::Context> = OnceLock::new();
 
-/// egui repaint handle plus the UI thread it was registered on, so a log call
-/// from a worker thread can wake the UI. See the module header for the gating.
-static REPAINT: OnceLock<(egui::Context, ThreadId)> = OnceLock::new();
+/// Wakes egui with `request_repaint`; a no-op until the window exists.
+pub struct EguiWake;
 
-/// Cap on buffered-but-undrained records, so a long scan that runs while no
-/// frame is painted can't grow the buffer without bound.
-const MAX_BUFFERED: usize = 8000;
-
-struct UiLogger {
-    level: LevelFilter,
-}
-
-impl Log for UiLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-        let msg = format!("{}", record.args());
-        // Keep the stderr stream so terminal/CI captures still work.
-        eprintln!("[{}] {}: {}", record.level(), record.target(), msg);
-        if let Some(buf) = BUFFER.get() {
-            if let Ok(mut q) = buf.lock() {
-                if q.len() >= MAX_BUFFERED {
-                    q.pop_front();
-                }
-                q.push_back((record.level(), msg));
-            }
-        }
-        // Only a worker thread needs to wake the UI; requesting a repaint on
-        // the UI thread can re-enter egui's context lock. See module header.
-        if let Some((ctx, ui_thread)) = REPAINT.get() {
-            if std::thread::current().id() != *ui_thread {
-                ctx.request_repaint();
-            }
+impl Notify for EguiWake {
+    fn wake(&self) {
+        if let Some(ctx) = REPAINT_CTX.get() {
+            ctx.request_repaint();
         }
     }
-
-    fn flush(&self) {}
 }
 
-/// Register the egui context so log calls from worker threads wake the UI.
-/// Call once from the UI thread after the window is created.
+/// Register the egui context so jobs and worker-thread log calls wake the UI; call from the UI thread.
 pub fn set_repaint_ctx(ctx: egui::Context) {
-    let _ = REPAINT.set((ctx, std::thread::current().id()));
+    let _ = REPAINT_CTX.set(ctx);
+    capture::set_wake(Arc::new(EguiWake));
 }
 
-/// Install the UI-capturing logger as the global `log` sink. The level comes
-/// from a bare `RUST_LOG` level name (`info`, `debug`, ...), defaulting to
-/// `info`. Safe to call once at startup.
+/// Install the capturing `log` sink; safe to call once at start-up.
 pub fn init() {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.trim().parse::<LevelFilter>().ok())
-        .unwrap_or(LevelFilter::Info);
-    let _ = BUFFER.set(Mutex::new(VecDeque::new()));
-    if log::set_boxed_logger(Box::new(UiLogger { level })).is_ok() {
-        log::set_max_level(level);
-    }
-}
-
-/// Drain buffered records (oldest first) for the GUI to display. Returns an
-/// empty vec if the logger was never installed.
-pub fn drain() -> Vec<(Level, String)> {
-    match BUFFER.get().and_then(|b| b.lock().ok()) {
-        Some(mut q) => q.drain(..).collect(),
-        None => Vec::new(),
-    }
+    capture::init();
 }

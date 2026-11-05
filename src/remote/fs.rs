@@ -18,10 +18,10 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::remote::connection::RemoteConnection;
 use crate::remote::protocol::{WireEntry, WireKind};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Lock the shared connection, mapping a poisoned mutex to an I/O error (a
 /// worker thread panicked mid-operation; the connection is no longer trusted).

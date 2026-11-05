@@ -5,6 +5,7 @@
 use clap::{CommandFactory, FromArgMatches};
 
 fn main() {
+    rusty_backup::fs::prodos_types::init_user_config_dir();
     // Note: `env_logger` is initialized inside `run()` once we've parsed
     // the global flags, so the user-supplied --log-level takes effect.
     //

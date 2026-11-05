@@ -1,0 +1,27 @@
+# The log panel: lines appear, Copy Log hands every line to the clipboard,
+# Clear empties it, and Auto-scroll toggles.
+name = "Log panel copy, clear and auto-scroll"
+vm = "app"
+
+[[step]]
+action = "LogInfo"
+arg = "Opening disk.img"
+
+[[step]]
+action = "LogError"
+arg = "Sector 12 unreadable"
+expect = { log_lines = 2, log_text = "~[ERR ] Sector 12 unreadable" }
+
+[[step]]
+action = "CopyLog"
+effects = ["CopyToClipboard"]
+
+[[step]]
+action = "SetLogAutoScroll"
+arg = false
+expect = { log_auto_scroll = false }
+
+[[step]]
+action = "ClearLog"
+effects = []
+expect = { log_lines = 0 }

@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::FilesystemError;
-use crate::fs::name_legalize::{legalize_name, unique_name, NameValidator};
 use crate::model::edit_queue::StagedEdit;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::FilesystemError;
+use disk_core::name_legalize::{legalize_name, unique_name, NameValidator};
 
 /// One staged name that was rewritten for the destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +138,7 @@ fn describe(e: &FilesystemError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::name_legalize::validate_amiga_name;
+    use disk_core::name_legalize::validate_amiga_name;
     use std::path::PathBuf;
 
     fn dir(parent: &str, name: &str) -> StagedEdit {

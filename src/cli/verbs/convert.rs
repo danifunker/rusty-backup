@@ -214,7 +214,7 @@ fn drain(status: Arc<Mutex<BulkConvertStatus>>) -> Result<()> {
             match status.lock() {
                 Ok(mut s) => {
                     let drained: Vec<(BulkConvertLogLevel, String)> =
-                        s.log_messages.drain(..).collect();
+                        std::mem::take(&mut s.log_messages);
                     (
                         drained,
                         s.current_index,

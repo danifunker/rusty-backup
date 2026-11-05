@@ -1,0 +1,33 @@
+[package]
+name = "dsk-tape"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Tape images as browsable, editable trees; first format: Sun QIC tapes (SUN2TAPE .qic)"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["tape", "sun", "qic", "disk-image", "retro"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["native-zstd", "sun2tape"]
+# Sun QIC tapes: tar sections (plain or compress(1)-ed) and UFS miniroots. The compress(1)
+# codec comes from arc-mac, which is MIT AND LGPL and depends on the GPL fs-mac-unicode.
+sun2tape = ["dep:arc-mac", "dep:fs-tar", "dep:fs-unix", "dep:tar"]
+# zstd backend for fs-tar (.tar.zst sections): the C libzstd or the pure-Rust port.
+native-zstd = ["fs-tar?/native-zstd"]
+pure-zstd = ["fs-tar?/pure-zstd"]
+# Only for a Rust 1.73 toolchain; see disk-core.
+rust173-polyfill = ["disk-core/rust173-polyfill", "arc-mac?/rust173-polyfill", "fs-tar?/rust173-polyfill", "fs-unix?/rust173-polyfill"]
+
+[dependencies]
+disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
+log = "0.4"
+# Edits rebuild the tape into a temp file beside the original.
+tempfile = "3"
+arc-mac = { path = "../arc-mac", version = "0.1", optional = true }
+fs-tar = { path = "../fs-tar", version = "0.1", default-features = false, features = ["mem-archive"], optional = true }
+fs-unix = { path = "../fs-unix", version = "0.2", default-features = false, features = ["ufs"], optional = true }
+tar = { version = "0.4", optional = true }

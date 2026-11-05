@@ -73,7 +73,7 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
     let status = new_status(req.total_source_bytes());
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "provision", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: build disk");
         let result = run_worker(&req, Arc::clone(&status_thread));
         if let Ok(mut s) = status_thread.lock() {
@@ -82,6 +82,7 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -129,7 +130,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
         anyhow::bail!(
             "partition at LBA {} runs past the end of the {} target",
             p.start_lba,
-            crate::partition::format_size(req.target_size_bytes),
+            disk_core::display::format_size(req.target_size_bytes),
         );
     }
 
@@ -327,7 +328,7 @@ mod tests {
     #[test]
     fn a_poured_hfsplus_volume_gets_its_alternate_header_at_the_partition_end() {
         // R-057: fsck_hfs read zeros where Mac OS keeps the alternate header.
-        let image = crate::fs::hfsplus::create_blank_hfsplus(4 * MIB, 4096, "Fit", false);
+        let image = fs_mac::hfsplus::create_blank_hfsplus(4 * MIB, 4096, "Fit", false);
         let (target, placed) = build_with_source(image, 8);
         let start = placed[0].start_byte();
         let primary = read_at(&target, start + 1024, 512);
@@ -343,7 +344,7 @@ mod tests {
     fn a_poured_hfs_volume_is_grown_to_its_partition() {
         // R-058: Mac OS expects the allocation area to end at the partition's
         // alternate MDB; a 3 MiB volume's bitmap can address 4 MiB.
-        let image = crate::fs::hfs::create_blank_hfs(3 * MIB, 512, "Fit").unwrap();
+        let image = fs_mac::hfs::create_blank_hfs(3 * MIB, 512, "Fit").unwrap();
         let before = BigEndian::read_u16(&image[1024 + 0x12..1024 + 0x14]);
         let (target, placed) = build_with_source(image, 4);
         let start = placed[0].start_byte();

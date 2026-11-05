@@ -15,9 +15,8 @@ fn main() {
         eprintln!("sample not found at {}; skipping", path.display());
         return;
     }
-    let mut r =
-        rusty_backup::rbformats::imz::ImzReader::open_with_password(&path, Some(b"password"))
-            .expect("open with password");
+    let mut r = dsk_imz::imz::ImzReader::open_with_password(&path, Some(b"password"))
+        .expect("open with password");
     println!(
         "entry name = {:?}, logical_size = {}",
         r.entry_name(),

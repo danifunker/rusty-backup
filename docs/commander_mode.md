@@ -153,6 +153,67 @@ read-only `open()` and the editable `open_editable()` → `(efs, commit)` pair. 
 image pane owns one. This is the single biggest reuse: Commander does **not** learn
 container formats — it asks `BrowseSession`.
 
+### 2.4 Where the code lives now (Phase 2)
+
+The sketches above are the original plan. Since Phase 2 of
+[native_frontends_plan.md](native_frontends_plan.md) the logic lives in controllers
+every shell shares, and `src/gui/commander/` only draws:
+
+- `controller::browser::BrowserPaneController` (`src/controller/browser/pane*`, the Commander
+  profile `PaneProfile::commander()`; Phase 2 slice 10 moved it out of `controller::commander`):
+  one pane's source, listing, queue, wrapper tree, apply, host writes, remote.
+- `controller::commander::CommanderController` (`src/controller/commander/screen*`):
+  both panes, the active side, the status line and session log, the key map, the
+  cross-pane copy, export, checksums, the File Info data, the host-conflict review,
+  the rename notice and Close (`Effect::Confirm` while edits are staged, then
+  `Effect::CloseScreen`). Copy, stage copy, export and checksums are `model::job`
+  jobs; the view draws them with `gui::progress::show_job`.
+- `src/gui/commander/mod.rs` / `pane.rs`: egui drawing, egui keys translated to
+  `controller::keys::Key`, and one `EffectHost` for pickers and prompts. The File
+  Info metadata editors stay in the view and send `StageMetadata` back.
+- `src/cli/verbs/tui_app/commander.rs` (the `rb-cli tui` Commander tab): ratatui
+  drawing over the same controller. Crossterm keys become `Key` + `Mods`; a key the
+  map binds goes to the controller, anything else falls through to the tab shell
+  (tab switching, `q`, `:`). Effects: pickers use the TUI `FilePicker` (a save
+  picker for single-file exports), `Confirm` is a y/n box, `AskText` a one-line
+  prompt that runs the spec's validator per keystroke, `CopyToClipboard` shows the
+  text (a terminal has no clipboard), `CloseScreen` returns to the tab Commander was
+  opened from. The windows the controller holds (apply review / report, host
+  conflicts, rename notice, staged edits, partitions, help, File Info, checksums,
+  log) take their button keys in the view. The terminal key map is the PC one on
+  every platform (`KeyMap::for_terminal`: a terminal has no Cmd key). The File Info
+  window edits mode, owner and xattrs through `EditDetail` prompts instead of the
+  egui editors.
+- The TUI's Ctrl+E opens an "Export as" menu (`export_choices()`) before exporting, and its
+  File Info shows a text / hex preview of the file (`r` switches to the resource fork).
+- The TUI Explorer (Inspect tab) is the same screen with one pane:
+  `CommanderController::single` + `PaneProfile::explorer` (Phase 2 slice 10).
+- Keyboard commands beyond the F-keys (all views): Ctrl/Cmd+O open image, +D open
+  folder, +B open backup, +Shift+K connect (a terminal also takes Alt+K, since most
+  send Ctrl+Shift+K as Ctrl+K), +K quick view, +P partition chooser, +S sort (column
+  descending, then the next column), +G checksums, +E export, +U staged edits,
+  +L session log, F9 the View menu. Copy, Delete, Checksums and Export act on the
+  cursor row when nothing is selected; that implicit selection is dropped by the next key.
+- **View menu** (egui: "View" in the top bar, and a window on F9; TUI: a popup on F9).
+  Its entries come from `CommanderController::view_menu()`, so both views list the
+  same things: the active pane's listing style (radio), Quick view (with its chord),
+  Session log and Keyboard shortcuts.
+- **Listing styles** (per pane, remembered per view in config.json `listing_styles`
+  under `commander-left` / `commander-right` / `explorer` / `inspect`):
+  - *Flat list* (the default): the current folder with `..`, as before.
+  - *Combined tree*: folders expand in place (+/- toggle, Right / Left, double-click or
+    Enter); a folder's children are listed by a job and show "(reading...)" until
+    they arrive. Delete, rename, new folder and a copy into the pane act on the
+    folder of the cursor row; a Shift range stays inside one folder.
+  - *Folder tree + list*: a folder tree above the list (egui and the two-pane TUI;
+    the TUI Explorer keeps it beside the list). Tab visits the tree, then its list,
+    then the other pane.
+- **Quick view** (Primary+K): the other pane shows the active pane's File Info
+  (metadata and a text / hex preview) for the cursor row, following it; the preview
+  is read once the cursor rests (150 ms) and a read for a row already left is
+  cancelled. Toggling it off (Primary+K, the View menu, or Esc when nothing else is
+  open) shows the other pane exactly as it was.
+
 ---
 
 ## 3. Reuse & refactor strategy
@@ -261,7 +322,7 @@ backend combinations; each preserves as much metadata as the destination support
 | Source → Dest | Mechanism | Staged? |
 |---------------|-----------|---------|
 | **host → image** | stage `StagedEdit::AddFile { host_path = real file, ... }` (the existing add-file flow) | yes (dest queue) |
-| **image → image** | extract source entry (data fork **+** resource fork + type/creator/aux) to `CommanderMode::temp`, then stage `AddFile { host_path = temp, resource_fork, hfs_type_override, .. }` on dest | yes (dest queue) |
+| **image → image** | extract source entry (data fork **+** resource fork + type/creator/aux) to the controller's temp dir (a job), then stage `AddFile { host_path = temp, resource_fork, hfs_type_override, .. }` on dest | yes (dest queue) |
 | **image → host** | extract source data fork straight to the host destination path | no (immediate) |
 | **host → host** | `std::fs::copy` | no (immediate) |
 
@@ -310,7 +371,8 @@ destination's `validate_name`, renames what the destination can't hold (with a
 changes and points at Mac Archive (.mar) export for a lossless copy; "Undo copy"
 drops the batch.
 
-**Apply** first runs `commander_ops::spawn_apply_preflight` on a fresh read-only
+**Apply** is controller work (`BrowserPaneController`, `browser/pane/edits.rs`): a
+preflight job runs `commander_ops::preflight_apply` on a fresh read-only
 open. `EditQueue::scan_against` replays the queue over the real listings
 (case-folded where the destination folds case) and reports name conflicts,
 folders blocked by a file of the same name, and parent folders that neither
@@ -325,12 +387,15 @@ failed to be created are reported, not tried; 25 failures in a row stop the run
 (the volume is likely full or failing). Afterwards the pane drops the edits
 that landed, reopens the volume, restores the rest of the queue, returns to the
 same folder, and shows the report with **Retry / Discard remaining / Close**.
+Discard (the button or "Discard remaining") asks first. Rename and New Folder ask
+through `Effect::AskText` with a validator the view runs as the user types; host
+delete / rename / new folder run as jobs through `model::host_ops`.
 The TUI keeps the stop-at-first-failure `apply_edits` contract.
 
 ### 5.5 Temp-file lifetime
 
-Files extracted for image→image / import copies live in `CommanderMode::temp`
-(a `tempfile::TempDir`) until the destination queue is **applied**, because the staged
+Files extracted for image→image / import copies live in the screen controller's
+temp dir (`CommanderController`, a `tempfile::TempDir`) until the destination queue is **applied**, because the staged
 `AddFile` references them by path. Applying the queue (or discarding it) is when the
 temp entries can be reclaimed.
 

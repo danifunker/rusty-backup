@@ -190,7 +190,7 @@ if run_both edit-emdash fat "edit fat.img /DOSTEXT.TXT --editor ./ed-emdash.sh";
   if [ "$LAST_LRC" -eq 0 ]; then
     fail "edit accepted an em-dash into a CP437 file (expected refusal)"
   # Match `line N, col N` exactly: the informational first line contains those words anyway.
-  elif ! printf '%s' "$LAST_ROUT" | grep -qiE 'line [0-9]+, col(umn)? [0-9]+'; then
+  elif ! grep -qiE 'line [0-9]+, col(umn)? [0-9]+' <<<"$LAST_ROUT"; then
     fail "edit refused the em-dash but did not name a position"
     info "ppc: $(printf '%s' "$LAST_ROUT" | tail -3 | tr '\n' ' ')"
   elif [ "$(head -1 "$WORK/edit-emdash.rdiff")" != "IDENTICAL" ]; then
@@ -251,7 +251,7 @@ echo
 echo "== put --force metadata preservation =="
 if run_both put-preserve-ext ext "put ext.img replace.txt /meta.txt --force"; then
   lo="$(cd "$WORK" && "$LOCAL_BIN" ls ext-remote.img / -o 2>&1 | grep meta)"
-  if printf '%s' "$lo" | grep -q '1234:5678' && printf '%s' "$lo" | grep -q 'rwxr-x---'; then
+  if grep -q '1234:5678' <<<"$lo" && grep -q 'rwxr-x---' <<<"$lo"; then
     pass "put --force preserved mode 750 and owner 1234:5678"
   else
     fail "put --force did not preserve mode/owner on $SMOKE_HOST"
@@ -264,7 +264,7 @@ if run_both put-fresh-ext ext "put ext.img replace.txt /meta.txt --force --no-pr
   lr="$(cd "$WORK" && "$LOCAL_BIN" ls ext-remote.img / -o 2>&1 | grep meta)"
   if [ "$ll" = "$lr" ]; then
     pass "put --no-preserve-meta agrees on both builds"
-    printf '%s' "$lr" | grep -q '1234:5678' && \
+    grep -q '1234:5678' <<<"$lr" && \
       info "both builds keep owner 1234:5678 here - known desktop bug, not a port regression"
   else
     fail "put --no-preserve-meta differs between builds"
@@ -274,7 +274,7 @@ if run_both put-fresh-ext ext "put ext.img replace.txt /meta.txt --force --no-pr
 fi
 if run_both put-preserve-hfs hfs "put hfs.img replace.txt /meta.txt --force"; then
   lo="$(cd "$WORK" && "$LOCAL_BIN" ls hfs-remote.img / 2>&1)"
-  if printf '%s' "$lo" | grep -q 'TEXT' && printf '%s' "$lo" | grep -q 'MSWD'; then
+  if grep -q 'TEXT' <<<"$lo" && grep -q 'MSWD' <<<"$lo"; then
     pass "put --force preserved type/creator TEXT/MSWD"
   else
     fail "put --force lost type/creator on $SMOKE_HOST (the BINA bug's shape)"
@@ -284,7 +284,7 @@ fi
 # type/creator does go through the preserved-meta path, so the opt-out works here.
 if run_both put-fresh-hfs hfs "put hfs.img replace.txt /meta.txt --force --no-preserve-meta"; then
   lo="$(cd "$WORK" && "$LOCAL_BIN" ls hfs-remote.img / 2>&1)"
-  if printf '%s' "$lo" | grep -q 'MSWD'; then
+  if grep -q 'MSWD' <<<"$lo"; then
     fail "--no-preserve-meta still kept creator MSWD"
     info "$(printf '%s' "$lo" | head -4 | tr '\n' ' ')"
   else

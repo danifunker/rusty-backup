@@ -172,6 +172,18 @@ pub fn run(args: BackupArgs) -> Result<()> {
 
     let progress = Arc::new(Mutex::new(BackupProgress::default()));
     spawn_progress_pump(progress.clone());
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
 
     log_stderr(format!(
         "rb-cli backup: {} -> {}/{}",
@@ -283,8 +295,8 @@ fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
                     log_stderr(format!(
                         "  progress: {:>3}% ({}/{})",
                         pct,
-                        crate::partition::format_size(cur),
-                        crate::partition::format_size(total),
+                        disk_core::display::format_size(cur),
+                        disk_core::display::format_size(total),
                     ));
                     last_pct = pct;
                 }

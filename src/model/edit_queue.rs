@@ -12,12 +12,12 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::{
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
     ResourceForkSource,
 };
-use crate::fs::resource_fork::{self, ImportedResourceFork};
+use fs_mac::resource_fork::{self, ImportedResourceFork};
 
 /// Original timestamps captured from a source file so a cross-image copy can
 /// reproduce them on the destination instead of stamping the current time.
@@ -37,7 +37,7 @@ pub struct PreservedDates {
     /// inode / Mac dates / Amiga datestamp / tar Header / host stat).
     pub unix_mtime: Option<u64>,
     /// QNX 2 permissions, owner and date words, copied exactly onto a QNX 2 destination.
-    pub qnx2: Option<qnx2fs::Attributes>,
+    pub qnx2: Option<disk_core::entry::Qnx2Attrs>,
 }
 
 impl PreservedDates {
@@ -102,7 +102,7 @@ pub enum StagedEdit {
         parent: FileEntry,
         name: String,
         /// A QNX 2 source folder's permissions, owner and date, copied exactly.
-        qnx2_attrs: Option<qnx2fs::Attributes>,
+        qnx2_attrs: Option<disk_core::entry::Qnx2Attrs>,
     },
     DeleteEntry {
         parent: FileEntry,
@@ -213,7 +213,7 @@ pub fn resolve_dir_by_path(
 /// [`resolve_dir_by_path`] on a read-only filesystem (the Apply preflight).
 pub fn resolve_dir_in(fs: &mut dyn Filesystem, path: &str) -> Result<FileEntry, FilesystemError> {
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    crate::fs::filesystem::resolve_components_joined(fs, &components, true)?.ok_or_else(|| {
+    disk_core::filesystem::resolve_components_joined(fs, &components, true)?.ok_or_else(|| {
         FilesystemError::NotFound(format!("folder '{path}' not found on the destination"))
     })
 }
@@ -251,7 +251,7 @@ pub fn apply_edit(
                 unix_times: dates
                     .as_ref()
                     .and_then(|d| d.unix_mtime)
-                    .map(crate::fs::times::UnixTimes::mtime_only),
+                    .map(disk_core::times::UnixTimes::mtime_only),
                 qnx2_attrs: dates.as_ref().and_then(|d| d.qnx2),
                 ..Default::default()
             };
@@ -344,7 +344,7 @@ pub fn apply_edit(
             let fold = efs.case_insensitive_lookup();
             let children = efs.list_directory(&resolved_parent)?;
             if let Some(existing) =
-                crate::fs::filesystem::find_child(fold, &children, name).cloned()
+                disk_core::filesystem::find_child(fold, &children, name).cloned()
             {
                 if existing.is_directory() {
                     return Ok(());
@@ -416,6 +416,46 @@ pub struct QueueScan {
     pub blocked_folders: Vec<String>,
     /// Destination folders the queue writes into that neither exist nor are created by it.
     pub missing_folders: Vec<String>,
+}
+
+/// A metadata change from a File Info editor, staged with [`EditQueue::stage_metadata`].
+#[derive(Debug, Clone)]
+pub enum MetadataEdit {
+    TypeCreator {
+        entry: FileEntry,
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
+    },
+    ProdosType {
+        entry: FileEntry,
+        type_byte: u8,
+        aux_type: u16,
+    },
+    /// Mac epoch seconds.
+    Dates {
+        entry: FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
+    },
+    Permissions {
+        entry: FileEntry,
+        mode: u32,
+    },
+    Owner {
+        entry: FileEntry,
+        uid: u32,
+        gid: u32,
+    },
+    SetXattr {
+        entry: FileEntry,
+        name: String,
+        value: Vec<u8>,
+    },
+    RemoveXattr {
+        entry: FileEntry,
+        name: String,
+    },
 }
 
 /// Staged-edit queue with the predicates and mutations the GUI needs while the
@@ -682,7 +722,7 @@ impl EditQueue {
     }
 
     /// Full path for an `AddFile` / `CreateDirectory` edit, anchored at root.
-    fn pending_path(parent_path: &str, name: &str) -> String {
+    pub fn pending_path(parent_path: &str, name: &str) -> String {
         if parent_path == "/" {
             format!("/{name}")
         } else {
@@ -875,7 +915,7 @@ impl EditQueue {
                 // is what keeps this preview honest -- an import carrying a blank
                 // FInfo must display the dictionary value that will actually be
                 // written, not a blank.
-                return crate::fs::hfs_common::resolve_create_type_creator(
+                return fs_mac::hfs_common::resolve_create_type_creator(
                     name,
                     hfs_type_override.or(imp_t),
                     hfs_creator_override.or(imp_c),
@@ -953,6 +993,62 @@ impl EditQueue {
             }
         }
         false
+    }
+
+    /// Stage a File Info change (on a pending copy when the entry is one); returns what it did.
+    pub fn stage_metadata(&mut self, edit: MetadataEdit) -> String {
+        match edit {
+            MetadataEdit::TypeCreator {
+                entry,
+                type_code: t,
+                creator_code: c,
+            } => {
+                let (ts, cs) = (String::from_utf8_lossy(&t), String::from_utf8_lossy(&c));
+                if self.set_pending_hfs_override(&entry.path, t, c) {
+                    format!("Updated pending '{}' to {ts}/{cs}", entry.name)
+                } else {
+                    self.replace_set_type_creator(&entry, t, c);
+                    format!("Staged type/creator {ts}/{cs} on '{}'", entry.name)
+                }
+            }
+            MetadataEdit::ProdosType {
+                entry,
+                type_byte: t,
+                aux_type: a,
+            } => {
+                if self.set_pending_prodos_override(&entry.path, t, a) {
+                    format!("Updated pending '{}' to ${t:02X}/${a:04X}", entry.name)
+                } else {
+                    self.replace_set_prodos_type(&entry, t, a);
+                    format!("Staged type ${t:02X}/${a:04X} on '{}'", entry.name)
+                }
+            }
+            MetadataEdit::Dates {
+                entry,
+                create,
+                modify,
+                backup,
+            } => {
+                self.replace_set_dates(&entry, create, modify, backup);
+                format!("Staged date change on '{}'", entry.name)
+            }
+            MetadataEdit::Permissions { entry, mode } => {
+                self.replace_set_permissions(&entry, mode);
+                format!("Staged permissions {mode:o} on '{}'", entry.name)
+            }
+            MetadataEdit::Owner { entry, uid, gid } => {
+                self.replace_set_owner(&entry, uid, gid);
+                format!("Staged owner {uid}:{gid} on '{}'", entry.name)
+            }
+            MetadataEdit::SetXattr { entry, name, value } => {
+                self.replace_set_xattr(&entry, &name, value);
+                format!("Staged xattr {name} on '{}'", entry.name)
+            }
+            MetadataEdit::RemoveXattr { entry, name } => {
+                self.replace_remove_xattr(&entry, &name);
+                format!("Staged xattr removal {name} on '{}'", entry.name)
+            }
+        }
     }
 
     /// Push a `SetProdosType` edit, replacing any prior one targeting the
@@ -1137,8 +1233,8 @@ impl EditQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
-    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::Filesystem;
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
@@ -1345,8 +1441,8 @@ mod tests {
     /// done, not a mid-batch error; a file in the way still is one.
     #[test]
     fn creating_a_directory_that_exists_is_a_no_op_but_a_file_in_the_way_fails() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1387,9 +1483,9 @@ mod tests {
     /// in the same batch made it report the wrong conflicts.
     #[test]
     fn conflict_scan_replays_pending_renames_and_deletes() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
         use crate::fs::replace::OnConflict;
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1458,9 +1554,9 @@ mod tests {
     /// instead of being interrupted per file mid-batch.
     #[test]
     fn conflicting_adds_are_detected_up_front_and_decided_per_file() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
         use crate::fs::replace::OnConflict;
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1530,8 +1626,8 @@ mod tests {
     /// path now replaces, and carries the previous file's metadata across.
     #[test]
     fn apply_edit_can_replace_and_keeps_the_old_files_metadata() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1586,8 +1682,8 @@ mod tests {
     /// conflicts keeps refusing rather than silently overwriting.
     #[test]
     fn apply_edit_still_refuses_a_collision_by_default() {
-        use crate::fs::fat::{create_blank_fat, FatFilesystem};
-        use crate::fs::filesystem::{CreateFileOptions, Filesystem};
+        use disk_core::filesystem::{CreateFileOptions, Filesystem};
+        use fs_pc::fat::{create_blank_fat, FatFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_fat(2 * 1024 * 1024, Some("T")).unwrap();
@@ -1634,8 +1730,8 @@ mod tests {
     /// instead of stamping the current time — end to end through apply_edit.
     #[test]
     fn add_file_preserves_amiga_dates() {
-        use crate::fs::affs::{create_blank_affs, AffsFilesystem};
-        use crate::fs::filesystem::Filesystem;
+        use disk_core::filesystem::Filesystem;
+        use fs_amiga::affs::{create_blank_affs, AffsFilesystem};
         use std::io::Cursor;
 
         let img = create_blank_affs(880 * 1024, 1, "DATES").unwrap();

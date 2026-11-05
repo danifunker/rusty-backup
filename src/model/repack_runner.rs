@@ -5,7 +5,7 @@
 //! Shared by the GUI inspect tab (the per-partition "Defragment" button)
 //! and modeled on [`super::chd_expand_runner`]: spawn returns a shared
 //! [`RepackStatus`] the caller polls each frame. The heavy lifting lives in
-//! [`crate::fs::human68k_clone::stream_defragmented_human68k`] — the same
+//! [`fs_pc::human68k_clone::stream_defragmented_human68k`] — the same
 //! engine the `rb-cli repack` verb calls — so the GUI and CLI behave
 //! identically.
 //!
@@ -17,13 +17,12 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use super::status::RepackStatus;
-use crate::fs::filesystem::Filesystem;
-use crate::fs::human68k::Human68kFilesystem;
-use crate::fs::human68k_clone::stream_defragmented_human68k;
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use disk_core::filesystem::Filesystem;
+use fs_pc::human68k::Human68kFilesystem;
+use fs_pc::human68k_clone::stream_defragmented_human68k;
 
 /// Spawn a worker that defragments the Human68k partition at
 /// `partition_offset` inside the image at `path`, in place. Returns a
@@ -31,7 +30,7 @@ use crate::partition::format_size;
 pub fn spawn(path: PathBuf, partition_offset: u64) -> Arc<Mutex<RepackStatus>> {
     let status = Arc::new(Mutex::new(RepackStatus::default()));
     let status_clone = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "repack", move || {
         if let Err(e) = run_repack(&path, partition_offset, &status_clone) {
             if let Ok(mut s) = status_clone.lock() {
                 s.error = Some(format!("{e}"));
@@ -40,6 +39,7 @@ pub fn spawn(path: PathBuf, partition_offset: u64) -> Arc<Mutex<RepackStatus>> {
         if let Ok(mut s) = status_clone.lock() {
             s.finished = true;
         }
+        Ok(())
     });
     status
 }

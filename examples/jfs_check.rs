@@ -15,10 +15,10 @@
 use std::fs::OpenOptions;
 use std::process::ExitCode;
 
-use rusty_backup::fs::filesystem::{EditableFilesystem, Filesystem};
-use rusty_backup::fs::jfs::JfsFilesystem;
+use disk_core::filesystem::{EditableFilesystem, Filesystem};
+use fs_unix::jfs::JfsFilesystem;
 
-fn print_result(result: &rusty_backup::fs::fsck::FsckResult) {
+fn print_result(result: &disk_core::fsck::FsckResult) {
     for e in &result.errors {
         println!("ERROR  [{}] {}", e.code, e.message);
     }

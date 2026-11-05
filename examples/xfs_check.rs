@@ -13,8 +13,8 @@
 use std::fs::{File, OpenOptions};
 use std::process::ExitCode;
 
-use rusty_backup::fs::filesystem::{EditableFilesystem, Filesystem};
-use rusty_backup::fs::xfs::XfsFilesystem;
+use disk_core::filesystem::{EditableFilesystem, Filesystem};
+use fs_xfs::xfs::XfsFilesystem;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();

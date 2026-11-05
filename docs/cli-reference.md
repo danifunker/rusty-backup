@@ -15,6 +15,7 @@ Usage: rb-cli [OPTIONS] [COMMAND]
 - `--log-level` — Diagnostic verbosity for stderr logs. Falls back to `[defaults] log-level` from the config; built-in default `warn`
 - `-q` / `--quiet` — Suppress all stderr output except errors and the final result. Mutually exclusive with `--log-level debug|trace`
 - `--progress` — Progress bar behavior. Built-in default `auto`; `never` is the safest setting inside CI / cron / wrapper scripts
+- `--status` — Print a status line (step, percent, speed, time left) to stderr while a long operation runs: every 5 seconds, or every SECONDS with `--status=SECONDS`
 - `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
@@ -603,6 +604,7 @@ Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
 **Options**
 
 - `-r` / `--recursive` — Recursively copy directories. Without this, directory sources / matches are skipped with a warning
+- `-p` / `--preserve-times` — Keep each source entry's dates instead of stamping the time of the copy. HFS/MFS to HFS keeps the raw catalog create, modify and backup dates exactly; other pairs keep the modification date
 - `--force` — Overwrite existing destination entries. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip when a destination entry already exists. Mutually exclusive with `--force`. Without either, an existing destination is an error
 - `--exclude` — Exclude source paths matching this glob. Repeatable. Exclude wins
@@ -1267,7 +1269,7 @@ Usage: solaris-x86 [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 
 ### `new hd sun`
 
-Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk "backup" alias
+Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk "backup" alias. Fill a slice with a volume from `new volume ufs-solaris`; Solaris rejects a 4.4BSD `ufs`
 
 ```
 Usage: sun [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
@@ -1349,7 +1351,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
 - `--name` — Volume label/name. Defaults to `rusty-backup`. Ignored by the filesystems with no label field, among them 4.3BSD UFS
 - `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). On `--fs bfs` this is the BFS block size (power of two, 1024..=8192); on `--fs ufs` it is `fs_bsize`, and the fragment is an eighth of it. Auto when unset
-- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default. Implied by `ufs-43bsd`, since every NeXT disk is big-endian
+- `--big-endian` — BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k / MIPS) instead of the little-endian default. Implied by `ufs-43bsd` and `ufs-solaris`, the byte order of every NeXT and SPARC disk
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
@@ -1502,6 +1504,7 @@ Usage: extract [OPTIONS] <SOURCE>
 - `--preserve-permissions` — Apply the POSIX mode a disc records (Rock Ridge, HFS+, EFS) to the extracted files. Unix hosts only — on Windows the bits have nowhere to go, so use `--tar`, which carries them regardless of host
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
+- `--on-error` — What to do when an entry can't be extracted (a read error, a file the destination refuses). `ask` prompts on the terminal: skip it, continue with all errors, or stop. Defaults to `ask` when stdin and stderr are a terminal, otherwise `stop`. Ignored with `--tar`
 - `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`
 - `--filesystem-index` — Which filesystem to open when a disc carries more than one of the same kind — Apple shipped CD-ROMs with two HFS volumes. 0-based, indexing the list `optical info` prints. Overrides `--filesystem`
 

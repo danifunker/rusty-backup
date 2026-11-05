@@ -44,8 +44,10 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
 - [x] **Inspect** — disk list → device detail; `o` opens a file/backup (path +
   MRU move-to-front via `update::{load_recent,push_recent}` + Tab-to-browse);
   backup-aware (`model::backup_loader::load_backup`). Opened image shows its
-  **partition table**; each partition opens a two-pane **Explorer** (tree + list)
-  over the shared `resolve` + `open_filesystem` + `list_directory`:
+  **partition table**; each partition opens a two-pane **Explorer** (tree + list).
+  Since Phase 2 slice 10 the Explorer is a view over the shared browser pane
+  (`PaneProfile::explorer`, keys from `controller::keys`, see
+  `docs/phase2_commander_plan.md` § Slice 10); the original notes follow:
   browse/PageUp-Down/Home-End, **View** (data + resource fork, `r` toggles, hex
   for binary), **Export** (`e`: 5 fork modes + `.tar`/`.tar.gz` + `.mar`),
   **Import** (`i`), **metadata edit** (`m`: HFS/HFS+ Type/Creator + modified
@@ -61,12 +63,17 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   alignment) → run via `restore::run_restore`; round-trip byte-identical to the
   source. (Device targets deferred to the elevation pass.)
 - [x] **Bulk** — source folder → format + review list (un-check to skip) → run
-  via `bulk_convert_runner::start_bulk_convert` with per-file progress.
+  via `bulk_convert_runner::start_bulk_convert` with per-file progress. Since
+  Phase 2 slice 29: every dialog format (CD, floppy, CHD), the CHD options,
+  multi-bin BIN/CUE and the output extension, over `BulkConvertController`.
 - [x] **Optical (rip)** — local drive list → config (output/format/eject) → run
   via `optical::rip::run_rip`. Wired; needs a physical drive to verify a full rip.
 - [x] **Archives** — open a Mac archive, list entries, extract to host (fork
-  format cycled with `f`) via `macarchive::extract`.
-- [x] **Commander** — dual-pane (host folder / image partition) browse + copy
+  format cycled with `f`) via `macarchive::extract`. Since Phase 2 slice 29:
+  entry ticks (Space) with Extract Selected (`s`) and Mount in Inspect (`m`).
+- [x] **Commander** — now a view over the shared `CommanderController` (Phase 2
+  slice 8; keys and behaviour in `docs/commander_mode.md` §2.4). Original notes:
+  dual-pane (host folder / image partition) browse + copy
   between panes (host↔image, host↔host, **image↔image**) via `dir_listing` +
   `commander_ops`; **multi-select** (Space), **sort** (`s`/`S`), **new folder**
   (`n`), **delete** (`x`, confirmed) — all batch-aware.
@@ -75,13 +82,18 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   prefills the palette (convert / resize / expand / partition table).
 - [x] **Command palette** — `:` runs any `rb-cli` verb (alt-screen suspended);
   also the execution path for the Explorer/Optical/Archives launchers.
-- [x] **Optical / Archives image ops** — `i` on Optical opens a browse/extract/
-  info/convert/new launcher; `c` on Archives prefills `archive create`.
+- [x] **Optical / Archives image ops** — `i` on Optical opened a browse/extract/
+  info/convert/new launcher (gone since Phase 2 slice 28: the Optical screen
+  converts, browses and shows CHD Info itself); `c` on Archives prefills
+  `archive create`.
 - [x] **Device targets** — Backup source *and* **Restore target** can be a
   physical disk (target-type chooser + destructive-write confirmation).
 - [x] **Settings** — `update::UpdateConfig` editor (two persisted toggles) plus
   **`c` check-for-updates**; `rb-cli update --apply` self-updates (Windows
-  self_replace / Unix temp-file+rename).
+  self_replace / Unix temp-file+rename). Since Phase 2 slice 29: the repository
+  URL and Clear Recent Files (through the app's config store), the start-up
+  update banner in `tui-update` builds, and the backup folder Restore and
+  Inspect share.
 - [x] **`menu` verb** absorbed — opens the full TUI on the Backup tab (slim
   builds keep the standalone appliance menu).
 - [x] **crossterm** deduped to 0.29 (single version in the tree).
@@ -137,8 +149,8 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - [x] Run `bulk_convert_runner::start_bulk_convert(...)` (spawns its own thread);
   each tick reads `current_index/total_files/current_bytes` into the shared bar
   and shows the running file; Esc sets `cancel_requested`. (General whole-disk
-  formats — Raw/VHD/VHD-Dynamic/QCOW2/VMDK×2/CHD/DVD-CHD; CD/floppy formats with
-  input constraints stay CLI-only.)
+  formats until Phase 2 slice 29, which added the CD / floppy formats, the CHD
+  options, multi-bin and the extension.)
 - **Verified:** converting a 3-image folder to VHD with one file un-checked
   produced exactly the two selected `.vhd` outputs ("Converted 2 ok, 0 failed").
 
@@ -295,4 +307,4 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   `no_binary_name`) → `rusty_backup::cli::dispatch(command)`.
 - **Settings / updater:** `update::UpdateConfig::{load, save, user_config_path}`,
   `update::UpdateCheckConfig{enabled, repository_url}`, `update::check_for_updates`,
-  `model::update_runner` (Windows self-update today).
+  `controller::app`'s install job (Windows self-update today).

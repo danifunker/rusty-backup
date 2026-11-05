@@ -12,7 +12,7 @@
 //! is wide enough; otherwise the legend below carries the identification.
 
 use eframe::egui;
-use rusty_backup::partition::format_size;
+use rusty_backup::controller::app::format_size;
 
 /// One block in the bar: a real partition, trailing unallocated space, or a
 /// dimmed bookkeeping region (APM partition-map entry, SGI volume header).

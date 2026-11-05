@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::clonezilla::block_cache::PartcloneBlockCache;
-use crate::fs::hfs_clone::{CloneReport, EmitReport};
+use crate::fs::hfs_clone::EmitReport;
 use crate::os::TempFileGuard;
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
+use dsk_clonezilla::block_cache::PartcloneBlockCache;
+use fs_mac::hfs_clone::CloneReport;
 
 /// Status of a background disk inspect operation.
 pub struct InspectStatus {
@@ -73,16 +74,6 @@ pub struct BlockCacheScan {
     pub partition_index: usize,
     pub partition_type: u8,
     pub cache: Arc<Mutex<PartcloneBlockCache>>,
-}
-
-/// Status of a VHD whole-disk export running on a background thread.
-pub struct VhdExportStatus {
-    pub finished: bool,
-    pub error: Option<String>,
-    pub current_bytes: u64,
-    pub total_bytes: u64,
-    pub cancel_requested: bool,
-    pub log_messages: Vec<String>,
 }
 
 /// Status of a background file/folder extraction from `BrowseView`.
@@ -184,3 +175,15 @@ pub struct BulkConvertStatus {
     /// Drained by the main thread into the GUI log panel each frame.
     pub log_messages: Vec<(BulkConvertLogLevel, String)>,
 }
+
+crate::model::worker::finished_with_error!(
+    BlockCacheScan,
+    ChdExpandStatus,
+    SwabStatus,
+    ExpandStatus,
+    RepackStatus,
+    ResizeStatus,
+    ExtractionProgress,
+    CacheStatus,
+    InspectStatus,
+);

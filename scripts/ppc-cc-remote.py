@@ -31,8 +31,9 @@ Environment:
                    may emit AltiVec. scripts/build-ppc.sh derives it from PPC_CPU.
   PPC_LDFLAGS      extra flags for link steps (see DEFAULT_LDFLAGS)
   PPC_CC_VERBOSE   set to echo each remote command
-  PPC_SPLIT_UNITS  how many objects an oversized unit becomes (default 4;
-                   1 disables splitting) -- see "splitting an oversized unit"
+  PPC_SPLIT_UNITS  how many objects an oversized unit becomes (default: one per
+                   SPLIT_SOURCE_PER_UNIT of C, at least 4; 1 disables
+                   splitting) -- see "splitting an oversized unit"
   PPC_SPLIT_JOBS   how many of those to compile at once (default PPC_JOBS or 2)
   PPC_SPLIT_FORCE  re-split and recompile even if the pieces look current
 """
@@ -180,16 +181,30 @@ OPT_FLAGS = ("-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast",
 # by leaving a `<output>.parts` sidecar, which the link expands.
 #
 # PPC_SPLIT_UNITS=1 restores the old single-object behaviour.
-SPLIT_UNITS = int(os.environ.get("PPC_SPLIT_UNITS", "4"))
+#
+# The real per-object ceiling is 16 MiB of __text, not the 32 MB above: a
+# scattered relocation (jump tables, section differences) stores its address in
+# 24 bits, so past 16 MiB `as` wraps it and ld patches code 16 MiB earlier with
+# no diagnostic. That shipped 56 wrong call targets in the 2026-10-30 engine
+# (four units of 18.4 MiB), first seen as `rb-cli fsck` aborting on HFS.
+# docs/build-ppc-mrustc.md "Scattered relocations and the 16 MiB ceiling".
+SPLIT_UNITS = int(os.environ["PPC_SPLIT_UNITS"]) if os.environ.get("PPC_SPLIT_UNITS") else None
+# C source per unit when PPC_SPLIT_UNITS is unset. The engine runs ~0.075 bytes
+# of -O0 __text per byte of C, so 128 MiB of C is ~10 MiB of text: room to grow.
+SPLIT_SOURCE_PER_UNIT = 128 * 1024 * 1024
+SCATTERED_RELOC_LIMIT = 1 << 24
 SPLIT_JOBS = int(os.environ.get("PPC_SPLIT_JOBS", os.environ.get("PPC_JOBS", "2")))
 SPLIT_FORCE = bool(os.environ.get("PPC_SPLIT_FORCE"))
 SPLITTER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "ppc-split-tu.py")
 PARTS_SUFFIX = ".parts"
-# The measured ceiling is between 30 and 61 MB of __text in one input object.
-# Warn with room to spare, because the failure it prevents surfaces an hour
-# later as an out-of-range branch naming a symbol that looks unrelated.
-SPLIT_TEXT_WARN = int(os.environ.get("PPC_SPLIT_TEXT_WARN", 24 * 1024 * 1024))
+
+def split_units(source):
+    """How many units to split `source` into: PPC_SPLIT_UNITS, else by size."""
+    if SPLIT_UNITS is not None:
+        return SPLIT_UNITS
+    size = os.path.getsize(source)
+    return max(4, -(-size // SPLIT_SOURCE_PER_UNIT))
 
 
 def die(msg):
@@ -335,7 +350,8 @@ def split_and_compile(source, output, remote_args, remap):
     """
     stem = source[:-2] if source.endswith(".c") else source
     outdir = stem + ".split"
-    cmd = [sys.executable, SPLITTER, source, "-n", str(SPLIT_UNITS),
+    n_units = split_units(source)
+    cmd = [sys.executable, SPLITTER, source, "-n", str(n_units),
            "-o", outdir]
     if SPLIT_FORCE:
         cmd.append("--force")
@@ -406,12 +422,13 @@ def split_and_compile(source, output, remote_args, remap):
 
     for obj in objects:
         text = macho_text_size(obj)
-        if text and text > SPLIT_TEXT_WARN:
-            sys.stderr.write(
-                "ppc-cc-remote: WARNING: %s carries %.0f MB of __text. ld "
-                "cannot place a branch island inside an object much past "
-                "32 MB - raise PPC_SPLIT_UNITS (currently %d)\n"
-                % (os.path.basename(obj), text / 1048576.0, SPLIT_UNITS))
+        if text and text >= SCATTERED_RELOC_LIMIT:
+            # Fatal, not a warning: the link succeeds and the binary calls the wrong functions.
+            os.remove(obj)
+            die("%s carries %.1f MiB of __text; past 16 MiB its scattered "
+                "relocations wrap and ld corrupts the code. Raise "
+                "PPC_SPLIT_UNITS (currently %d)."
+                % (os.path.basename(obj), text / 1048576.0, n_units))
 
     with open(output + PARTS_SUFFIX, "w") as fh:
         for obj in objects[1:]:
@@ -663,7 +680,7 @@ def main():
             # ...and split it, so no single object carries more __text than the
             # linker can reach across. One source per command line is all
             # mrustc ever emits; anything else is not ours to second-guess.
-            if SPLIT_UNITS > 1 and len(oversized) == 1:
+            if split_units(oversized[0]) > 1 and len(oversized) == 1:
                 return split_and_compile(oversized[0], output, remote_args, remap)
 
     remote_cmd = "cd %s && %s %s" % (

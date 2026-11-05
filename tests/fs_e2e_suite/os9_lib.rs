@@ -3,11 +3,11 @@
 //! read tree and the `create_directory` write path (not reachable through the
 //! flat `rb-cli put`/`rm` surface).
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::filesystem::{
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
 };
-use rusty_backup::fs::os9::Os9Filesystem;
+use fs_8bit::os9::Os9Filesystem;
 use std::io::{Cursor, Read};
 
 fn fixture_bytes() -> Vec<u8> {
@@ -122,10 +122,7 @@ fn refuses_to_delete_nonempty_directory() {
         .unwrap();
     let err = fs.delete_entry(&root, &cmds).unwrap_err();
     assert!(
-        matches!(
-            err,
-            rusty_backup::fs::filesystem::FilesystemError::Unsupported(_)
-        ),
+        matches!(err, disk_core::filesystem::FilesystemError::Unsupported(_)),
         "expected refusal to delete non-empty dir, got {err:?}"
     );
 }

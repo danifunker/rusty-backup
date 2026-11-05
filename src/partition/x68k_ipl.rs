@@ -1,6 +1,6 @@
 //! Bootable X68000 HDD assembly — IPL stubs + boot-block layout.
 //!
-//! This is the write side of [`crate::partition::x68k`]: how to construct
+//! This is the write side of [`part_tables::x68k`]: how to construct
 //! a sector-0 boot block that the Sharp X68000 IPL ROM will recognise as
 //! a bootable HDD and chain into.
 //!
@@ -38,7 +38,7 @@
 //! the `X68SCSI1` signature + descriptor, and the IPL menu sits at byte
 //! `0x400` instead of byte 0.
 
-use crate::partition::x68k::{
+use part_tables::x68k::{
     X68K_ENTRY_SIZE, X68K_MAX_PARTITIONS, X68K_SCSI_SIGNATURE, X68K_TABLE_HEADER_SIZE,
 };
 
@@ -228,7 +228,7 @@ pub fn render_ipl_stub_bytes(stub: IplStub, partitions: &[(char, u64)]) -> Vec<u
 /// of the SASI HDD image.
 ///
 /// `partition_table_bytes` must be the 144-byte block produced by
-/// [`crate::partition::x68k::X68kPartitionTable::to_bytes`].
+/// [`part_tables::x68k::X68kPartitionTable::to_bytes`].
 pub fn build_sasi_boot_block(
     stub: IplStub,
     partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],

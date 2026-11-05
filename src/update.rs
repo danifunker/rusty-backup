@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdateConfig {
     pub update_check: UpdateCheckConfig,
     /// Last-used CHD codec spec (chdman-style, e.g. `"lzma,zlib,huff,flac"`).
@@ -35,6 +35,9 @@ pub struct UpdateConfig {
     /// newest-first, deduped, and capped; see [`RecentFiles`].
     #[serde(default)]
     pub recent_files: RecentFiles,
+    /// The listing style last chosen per file view (`commander-left`, `explorer`, ...).
+    #[serde(default)]
+    pub listing_styles: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-mode most-recently-used file/folder history for the GUI's "Recent"
@@ -179,6 +182,7 @@ impl Default for UpdateConfig {
             assoc_registered_version: None,
             recent_daemon_addrs: Vec::new(),
             recent_files: RecentFiles::default(),
+            listing_styles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -190,6 +194,10 @@ impl UpdateConfig {
     /// even when running elevated via pkexec (where `dirs::config_dir()` would
     /// return `/root/.config`).
     pub fn user_config_dir() -> Option<PathBuf> {
+        // Unit tests must never write the real user's config.json (recent lists, CHD choice).
+        if cfg!(test) {
+            return Some(std::env::temp_dir().join("rusty-backup-test-config"));
+        }
         #[cfg(target_os = "linux")]
         let config_dir = crate::os::linux::real_user_home().map(|h| h.join(".config"));
         #[cfg(not(target_os = "linux"))]
@@ -295,6 +303,26 @@ pub fn push_recent(mode: RecentMode, path: &str) -> Vec<String> {
     let list = cfg.recent_files.list(mode).to_vec();
     let _ = cfg.save();
     list
+}
+
+/// Commander's merged recent list: the newest 3 of each mode, deduped, Inspect first.
+pub fn merged_recent(cfg: &UpdateConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for mode in [
+        RecentMode::Inspect,
+        RecentMode::Restore,
+        RecentMode::Optical,
+        RecentMode::Archives,
+        RecentMode::Commander,
+        RecentMode::Backup,
+    ] {
+        for p in cfg.recent_files.list(mode).iter().take(3) {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]

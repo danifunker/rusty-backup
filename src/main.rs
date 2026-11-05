@@ -1,5 +1,7 @@
 // Hide console window on Windows release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
 
 mod gui;
 
@@ -74,6 +76,7 @@ fn handle_windows_assoc_cli() {
 }
 
 fn main() -> eframe::Result {
+    rusty_backup::fs::prodos_types::init_user_config_dir();
     // Windows installer/uninstaller association hooks (and launch-time refresh).
     // Must run before GUI init; the hook flags exit without opening a window.
     #[cfg(windows)]

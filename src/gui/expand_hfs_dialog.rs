@@ -1,103 +1,53 @@
-//! "Expand HFS Volume…" dialog for the Inspect tab.
+//! "Expand HFS Volume..." dialog for the Inspect tab: a shell over `controller::expand_hfs`.
 //!
-//! Step 7 of `docs/hfs_expand_block_size.md`. The user picks a target volume
-//! size + allocation block size; a worker thread captures the source HFS
-//! volume, builds a fresh blank HFS image of the chosen size, copies every
-//! file/dir/metadata across, and wraps the result in a new APM disk image
-//! at the user-chosen output path.
-//!
-//! Source disk is opened read-only; the output is always a brand-new file.
+//! Draws the source summary and the target form, maps them to [`ExpandHfsAction`]s, answers
+//! the Save As picker through an [`EffectHost`] and shows the expand's step and lines.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use rusty_backup::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController, ExpandSource};
+use rusty_backup::controller::log::LogStore;
+use rusty_backup::controller::{Controller, Effect};
 
-use rusty_backup::fs::hfv::HFV_MAX_BYTES;
-use rusty_backup::model::hfs_expand_runner::{
-    max_volume_for_block_size, start_hfs_expand, suggest_block_size, ExpandOutput, ExpandSource,
-    BLOCK_SIZE_CHOICES,
-};
-use rusty_backup::model::status::ExpandStatus;
-
-/// HFV's 2047 MB ceiling expressed in whole MiB, for slider clamping.
-const HFV_MAX_MIB: u32 = (HFV_MAX_BYTES / (1024 * 1024)) as u32;
-
-use super::progress::LogPanel;
-
-pub use rusty_backup::model::hfs_expand_runner::summarize_source;
+use super::effects::{EffectHost, Reply};
 
 pub struct ExpandHfsDialog {
-    pub open: bool,
-    source: ExpandSource,
-    /// Target size in MiB.
-    target_size_mib: u32,
-    /// Target allocation block size (one of `BLOCK_SIZE_CHOICES`).
-    target_block_size: u32,
-    /// When true, write a flat BasiliskII HFV (no partition table, max
-    /// 2047 MB) instead of an APM disk image.
-    output_hfv: bool,
-    /// User-picked output file path.
-    output_path: Option<PathBuf>,
-    /// Background work status; `Some` while running and after completion.
-    status: Option<Arc<Mutex<ExpandStatus>>>,
-    /// Set once the user has acknowledged a finished run.
-    completed: bool,
+    ctl: ExpandHfsController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
 }
 
 impl ExpandHfsDialog {
+    /// An expand is in flight.
+    pub fn is_running(&self) -> bool {
+        self.ctl.is_running()
+    }
+
     pub fn new(source: ExpandSource) -> Self {
-        // Default target = current partition size, but never below the source's
-        // used space. Round up to nearest MiB.
-        let suggested_bytes = source.partition_size.max(source.used_bytes);
-        let suggested_mib =
-            (suggested_bytes.div_ceil(1024 * 1024)).clamp(1, u32::MAX as u64) as u32;
-        let suggested_bs = suggest_block_size(suggested_bytes);
-        // Default to bare-HFS output whenever the source isn't APM-wrapped:
-        // a `.hfv` BasiliskII image, or any raw single-partition HFS image
-        // (e.g. `partition-0.img` from a per-partition backup). Both open
-        // at byte offset 0; APM-wrapped HFS partitions start at the disk's
-        // HFS partition offset (typically block 64 → byte 32768).
-        let output_hfv = source.partition_offset == 0;
-        Self {
-            open: true,
-            source,
-            target_size_mib: suggested_mib,
-            target_block_size: suggested_bs,
-            output_hfv,
-            output_path: None,
-            status: None,
-            completed: false,
-        }
+        let mut dlg = ExpandHfsDialog {
+            ctl: ExpandHfsController::new(std::sync::Arc::new(super::ui_logger::EguiWake)),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+        };
+        dlg.act(ExpandHfsAction::Open(source));
+        dlg
+    }
+
+    fn act(&mut self, action: ExpandHfsAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
     }
 
     /// Render the dialog. Returns `false` once the user closes it for good.
-    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogPanel) -> bool {
-        if !self.open {
+    pub fn show(&mut self, ctx: &egui::Context, log: &mut LogStore) -> bool {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        super::progress::drain_log_lines(self.ctl.take_log(), log);
+        let Some(src) = self.ctl.source().cloned() else {
             return false;
-        }
-        // Snapshot status state so the closure doesn't have to lock twice.
-        let status_snapshot: Option<(bool, String, Vec<String>, Option<String>)> =
-            self.status.as_ref().and_then(|s| {
-                s.lock().ok().map(|g| {
-                    (
-                        g.finished,
-                        g.current_step.clone(),
-                        g.log_messages.clone(),
-                        g.error.clone(),
-                    )
-                })
-            });
-
-        let mut start_clicked = false;
-        let mut close_clicked = false;
-        let mut pick_output_clicked = false;
-
-        let mut window_open = self.open;
-        // No title-bar X while the worker runs: closing would orphan a thread
-        // that is still writing the output file.
-        let busy = status_snapshot
-            .as_ref()
-            .map(|(finished, _, _, _)| !*finished)
-            .unwrap_or(false);
+        };
+        let mut actions = Vec::new();
+        let mut window_open = true;
+        // No title-bar X while the worker runs: it is still writing the output file.
+        let busy = self.ctl.is_running();
         let window = egui::Window::new("Expand HFS Volume...");
         let window = if busy {
             window
@@ -106,33 +56,38 @@ impl ExpandHfsDialog {
         };
         window.resizable(true).default_width(520.0).show(ctx, |ui| {
             ui.label(egui::RichText::new("Source").strong());
-            ui.label(format!("Volume: {}", self.source.volume_name));
+            ui.label(format!("Volume: {}", src.volume_name));
             ui.label(format!(
                 "Size: {} MiB ({} bytes)",
-                self.source.partition_size / (1024 * 1024),
-                self.source.partition_size
+                src.partition_size / (1024 * 1024),
+                src.partition_size
             ));
             ui.label(format!(
                 "Allocation block size: {} KiB",
-                self.source.source_block_size / 1024
+                src.source_block_size / 1024
             ));
             ui.label(format!(
                 "Used: {} MiB across {} file(s) in {} folder(s)",
-                self.source.used_bytes / (1024 * 1024),
-                self.source.file_count,
-                self.source.dir_count
+                src.used_bytes / (1024 * 1024),
+                src.file_count,
+                src.dir_count
             ));
 
             ui.separator();
             ui.label(egui::RichText::new("Target").strong());
 
-            ui.add_enabled_ui(!busy && !self.completed, |ui| {
+            ui.add_enabled_ui(self.ctl.editable(), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Output format:");
-                    ui.radio_value(&mut self.output_hfv, false, "APM disk (.hda)");
-                    ui.radio_value(&mut self.output_hfv, true, "Bare HFS image (.hfv / .img)");
+                    let hfv = self.ctl.flat_hfv();
+                    if ui.radio(!hfv, "APM disk (.hda)").clicked() {
+                        actions.push(ExpandHfsAction::SetFlatHfv(false));
+                    }
+                    if ui.radio(hfv, "Bare HFS image (.hfv / .img)").clicked() {
+                        actions.push(ExpandHfsAction::SetFlatHfv(true));
+                    }
                 });
-                if self.output_hfv {
+                if self.ctl.flat_hfv() {
                     ui.label(
                         egui::RichText::new(
                             "Bare classic-HFS volume with no partition table - mountable in \
@@ -147,199 +102,121 @@ impl ExpandHfsDialog {
                 ui.horizontal(|ui| {
                     ui.label("Allocation block size:");
                     egui::ComboBox::new("expand_hfs_bs", "")
-                        .selected_text(format!(
-                            "{} KiB (max {} MiB)",
-                            self.target_block_size / 1024,
-                            max_volume_for_block_size(self.target_block_size) / (1024 * 1024)
-                        ))
+                        .selected_text(self.ctl.block_size_label())
                         .show_ui(ui, |ui| {
-                            for &bs in BLOCK_SIZE_CHOICES {
-                                ui.selectable_value(
-                                    &mut self.target_block_size,
-                                    bs,
-                                    format!(
-                                        "{} KiB (max {} MiB)",
-                                        bs / 1024,
-                                        max_volume_for_block_size(bs) / (1024 * 1024)
-                                    ),
-                                );
+                            for choice in self.ctl.block_choices() {
+                                let on = choice.bytes == self.ctl.block_size();
+                                if ui.selectable_label(on, choice.label).clicked() {
+                                    actions.push(ExpandHfsAction::SetBlockSize(choice.bytes));
+                                }
                             }
                         });
                 });
 
-                let mut max_mib_for_bs =
-                    (max_volume_for_block_size(self.target_block_size) / (1024 * 1024)) as u32;
-                // A flat HFV must stay under the classic-HFS 2047 MB ceiling.
-                if self.output_hfv {
-                    max_mib_for_bs = max_mib_for_bs.min(HFV_MAX_MIB);
-                }
-                let min_mib = (self.source.used_bytes.div_ceil(1024 * 1024)).max(1) as u32;
-                if self.target_size_mib > max_mib_for_bs {
-                    self.target_size_mib = max_mib_for_bs;
-                }
-                if self.target_size_mib < min_mib {
-                    self.target_size_mib = min_mib;
-                }
-
+                let (min_mib, max_mib) = self.ctl.size_bounds();
                 ui.horizontal(|ui| {
                     ui.label("Target size (MiB):");
-                    ui.add(egui::Slider::new(
-                        &mut self.target_size_mib,
-                        min_mib..=max_mib_for_bs,
-                    ));
+                    let mut mib = self.ctl.size_mib();
+                    if ui
+                        .add(egui::Slider::new(&mut mib, min_mib..=max_mib))
+                        .changed()
+                    {
+                        actions.push(ExpandHfsAction::SetSizeMib(mib));
+                    }
                 });
 
                 ui.horizontal(|ui| {
                     ui.label("Output file:");
                     let path_text = self
-                        .output_path
-                        .as_ref()
+                        .ctl
+                        .output()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(not chosen)".to_string());
                     ui.label(path_text);
                     if ui.button("Save As...").clicked() {
-                        pick_output_clicked = true;
+                        actions.push(ExpandHfsAction::PickOutput);
                     }
                 });
             });
 
             ui.separator();
-            if let Some((finished, step, msgs, error)) = &status_snapshot {
-                if !*finished {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(step);
+            let lines = self.ctl.lines();
+            if let Some(snap) = self.ctl.progress() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(if snap.phase.is_empty() {
+                        "Starting..."
+                    } else {
+                        snap.phase.as_str()
                     });
-                } else if let Some(err) = error {
-                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Failed: {err}"));
-                } else {
-                    ui.colored_label(super::theme::success(ui.visuals()), "Expand complete.");
-                }
-                if !msgs.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(140.0)
-                        .id_salt("expand_hfs_log")
-                        .show(ui, |ui| {
-                            for m in msgs {
-                                ui.label(m);
-                            }
-                        });
-                }
+                });
+            } else if let Some(Err(err)) = self.ctl.outcome() {
+                ui.colored_label(super::theme::danger(ui.visuals()), format!("Failed: {err}"));
+            } else if self.ctl.outcome().is_some() {
+                ui.colored_label(super::theme::success(ui.visuals()), "Expand complete.");
+            }
+            if !lines.is_empty() {
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .id_salt("expand_hfs_log")
+                    .show(ui, |ui| {
+                        for m in &lines {
+                            ui.label(m);
+                        }
+                    });
             }
 
             ui.horizontal(|ui| {
-                let can_start = !busy && !self.completed && self.output_path.is_some();
                 if ui
-                    .add_enabled(can_start, egui::Button::new("Expand"))
+                    .add_enabled(self.ctl.can_start(), egui::Button::new("Expand"))
                     .clicked()
                 {
-                    start_clicked = true;
+                    actions.push(ExpandHfsAction::Start);
                 }
-                let close_label = if self.completed { "Close" } else { "Cancel" };
+                let close_label = if self.ctl.outcome().is_some() {
+                    "Close"
+                } else {
+                    "Cancel"
+                };
                 if ui
                     .add_enabled(!busy, egui::Button::new(close_label))
                     .clicked()
                 {
-                    close_clicked = true;
+                    actions.push(ExpandHfsAction::Close);
                 }
             });
         });
-        self.open = window_open;
-
-        if pick_output_clicked {
-            let stem = sanitize_filename(&self.source.volume_name);
-            // For bare-HFS output, default the suggested extension to whatever
-            // the source uses — `.hfv` for a BasiliskII image stays `.hfv`, a
-            // raw `partition-0.img` stays `.img`. Filter accepts either.
-            let dialog = if self.output_hfv {
-                let ext = self
-                    .source
-                    .source_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .filter(|e| e.eq_ignore_ascii_case("hfv"))
-                    .map(|_| "hfv")
-                    .unwrap_or("img");
-                super::file_dialog()
-                    .set_file_name(format!("{stem}-expanded.{ext}"))
-                    .add_filter("Bare HFS image", &["hfv", "img", "dsk"])
-            } else {
-                super::file_dialog()
-                    .set_file_name(format!("{stem}-expanded.hda"))
-                    .add_filter("Disk image", &["hda", "img", "dsk"])
-            };
-            if let Some(path) = dialog.save_file() {
-                self.output_path = Some(path);
-            }
+        if !window_open {
+            actions.push(ExpandHfsAction::Close);
         }
-        if start_clicked {
-            if let Some(out) = self.output_path.clone() {
-                self.spawn_worker(out, log);
-            }
+        for a in actions {
+            self.act(a);
         }
-        if close_clicked {
-            self.open = false;
+        self.run_effects(ctx, log);
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-
-        // Promote a finished run into the "completed" state so the Expand
-        // button stays disabled and the close button reads "Close".
-        if let Some((finished, _, _, _)) = &status_snapshot {
-            if *finished {
-                self.completed = true;
-            }
-        }
-
-        self.open
+        self.ctl.is_open()
     }
 
-    fn spawn_worker(&mut self, output: PathBuf, log: &mut LogPanel) {
-        let source = self.source.clone();
-        let target_size = self.target_size_mib as u64 * 1024 * 1024;
-        let target_bs = self.target_block_size;
-        let output_mode = if self.output_hfv {
-            ExpandOutput::FlatHfv
-        } else {
-            ExpandOutput::ApmDisk
-        };
-        log.info(format!(
-            "Expanding HFS volume '{}' to {} MiB at {} KiB blocks -> {} ({})",
-            source.volume_name,
-            self.target_size_mib,
-            target_bs / 1024,
-            output.display(),
-            if self.output_hfv {
-                "bare HFS image"
-            } else {
-                "APM disk"
+    fn run_effects(&mut self, ctx: &egui::Context, log: &mut LogStore) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ctx, fx, &mut messages);
+        replies.extend(self.effects.show(ctx, "Expand HFS"));
+        for msg in messages {
+            log.info(msg);
+        }
+        for reply in replies {
+            match reply {
+                Reply::Picked { purpose, path } => {
+                    self.act(ExpandHfsAction::Picked { purpose, path })
+                }
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
             }
-        ));
-        self.status = Some(start_hfs_expand(
-            source,
-            target_size,
-            target_bs,
-            output,
-            output_mode,
-        ));
-    }
-}
-
-/// Strip filesystem-unfriendly characters from a volume name for use as a
-/// default output filename.
-fn sanitize_filename(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().to_string();
-    if trimmed.is_empty() {
-        "Expanded".to_string()
-    } else {
-        trimmed
+        }
     }
 }

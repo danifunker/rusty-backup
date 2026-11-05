@@ -84,6 +84,12 @@ ext = "img"
 args = ["new", "volume", "efs", "--size", "2M", "{out}"]
 
 [[recipe]]
+id = "fs.ufs1"
+ext = "img"
+# 16M: FreeBSD's fsck_ffs (oracles/freebsd/fsck_ffs.py) wants room for a few cylinder groups.
+args = ["new", "volume", "ufs", "--size", "16M", "{out}"]
+
+[[recipe]]
 id = "fs.efs-v1"
 ext = "img"
 # 8M, not the 2M its siblings use: the Motion oracle drops this straight into
@@ -194,6 +200,27 @@ ext = "img"
 # on the blocks that disk uses and the layout is checkable against it.
 args = ["new", "hd", "sgi-dklabel", "--size", "60135936", "--heads", "7", "--sectors", "17",
         "--partition", "9139200:root", "--partition", "9078272:swap", "--partition", "rest:slice", "{out}"]
+
+[[recipe]]
+id = "part.next"
+ext = "img"
+args = ["new", "hd", "next", "--size", "16M", "--partition", "rest:4.3BSD:/", "{out}"]
+
+[[recipe]]
+id = "part.solaris-x86"
+ext = "img"
+args = ["new", "hd", "solaris-x86", "--size", "64M", "--partition", "16M:root", "--partition", "rest:swap", "{out}"]
+
+# 72M is the smallest BFS rb-cli writes: nine allocation groups of 1024-byte blocks.
+[[recipe]]
+id = "fs.bfs"
+ext = "img"
+args = ["new", "volume", "bfs", "--size", "72M", "{out}"]
+
+[[recipe]]
+id = "fs.ofs"
+ext = "img"
+args = ["new", "volume", "ofs", "--size", "8M", "{out}"]
 
 # --- Containers --------------------------------------------------------------
 #

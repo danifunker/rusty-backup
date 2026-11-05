@@ -740,6 +740,8 @@ fn to_bcd(val: u8) -> u8 {
 
 use opticaldiscs::SectorReader;
 
+crate::model::worker::finished_with_error!(ConvertProgress);
+
 #[cfg(test)]
 mod tests {
     use super::*;

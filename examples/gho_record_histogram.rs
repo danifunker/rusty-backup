@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use rusty_backup::rbformats::gho::{
+use dsk_ghost::gho::{
     find_inner_stream_start, GhoContainerHeader, GHO_HEADER_PREFIX_LEN, GHO_PASSWORD_VERIFIER_LEN,
     GHO_RECORD_HEADER_LEN, GHO_RECORD_MAGIC,
 };

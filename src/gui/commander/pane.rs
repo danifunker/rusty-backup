@@ -1,81 +1,19 @@
-//! One Commander pane: a source bar (open image / folder + partition picker +
-//! Apply/Discard), a path line, and a flat single-directory listing grid with
-//! sortable columns, multi-selection, `..` / double-click navigation, and a
-//! per-pane staged-edit queue (delete + copy-in, shown in the virtual overlay).
+//! One Commander pane drawn from its controller: a source bar (open image / folder + partition
+//! picker + Apply / Discard), a path line, and the listing grid with sortable columns, selection,
+//! `..` / double-click navigation and the staged-edit overlay.
 //!
-//! A pane lists one of three sources: a **disk-image volume** (partition probe +
-//! `BrowseSession`, opened off-thread via [`BrowseSession::spawn_open`]), a
-//! **host-OS folder** (`std::fs`), or a **backup folder** — native rusty-backup
-//! or Clonezilla (read-only; partitions + opener come from the shared
-//! [`commander_source::resolve_backup`] resolver). All listing state lives in
-//! the [`DirListing`] model
-//! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
-//! it. Applying staged edits runs off-thread via
-//! [`rusty_backup::model::commander_ops::spawn_apply`].
-//!
-//! Image panes stage edits (Apply writes through); host panes take immediate
-//! writes and never stage; backup panes are read-only (browse + copy-out only).
-//! The cross-pane copy itself lives in [`super::CommanderMode`] (it spans both
-//! panes).
-//!
-//! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
-
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+//! Everything it shows comes from [`CommanderController::pane`]; every click becomes a
+//! [`CommanderAction`] collected into the frame's list, which [`super::CommanderMode`] runs once
+//! drawing is done. The only state here is the view's own: the review's radio choice, the
+//! password field's text and the listing height last sent for Page Up / Page Down.
 
 use eframe::egui;
 
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::export_selection::ExportFormat;
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::partition_is_browsable;
-use rusty_backup::fs::replace::OnConflict;
-use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
-use rusty_backup::model::cache_runner;
-use rusty_backup::model::commander_descend::{
-    classify, classify_entry, open_archive, open_optical, open_optical_hybrid, optical_filesystems,
-    DescendKind, OpticalFsChoice, ReopenRecipe,
+use rusty_backup::controller::browser::rows::{DisplayRow, RowKind};
+use rusty_backup::controller::commander::{
+    format_size, BrowserPaneAction, BrowserPaneController, CommanderAction, CommanderController,
+    ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
-use rusty_backup::model::commander_ops::{
-    self, ApplyPreflight, ApplyStatus, FailedEdit, PreflightStatus, WrapperExtract,
-    WrapperOpenPlan, WrapperOpenStatus,
-};
-use rusty_backup::model::commander_source;
-use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
-use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
-use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
-use rusty_backup::model::stage_names::{legalize_staged_names, LegalizeReport, NameChange};
-use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::model::wrapper_tree::{tree_range, TreeRow, WrapperTree};
-use rusty_backup::partition::{format_size, PartitionInfo};
-use rusty_backup::update::RecentMode;
-
-use super::Side;
-
-/// Preflight findings shown before an apply that needs a decision.
-struct ApplyReview {
-    preflight: ApplyPreflight,
-    on_conflict: OnConflict,
-}
-
-/// A finished apply that did not land everything; the rest stays staged.
-struct ApplyReport {
-    total: usize,
-    applied: usize,
-    failed: Vec<FailedEdit>,
-    not_tried: usize,
-    fatal: Option<String>,
-}
-
-/// What one `stage_edits` batch did, for the status line and the rename notice.
-pub(crate) struct StageOutcome {
-    pub staged: usize,
-    pub queue_start: usize,
-    pub fs_type: String,
-    pub renamed: Vec<NameChange>,
-    pub dropped: Vec<(String, String)>,
-}
 
 const ROW_H: f32 = 20.0;
 /// Per-depth indent for tree rows, and the width reserved for the `+`/`-`
@@ -110,571 +48,61 @@ fn read_only_badge_color(v: &egui::Visuals) -> egui::Color32 {
     super::super::theme::warning(v)
 }
 
-/// What a pane reports back to [`super::CommanderMode`] after a frame.
-#[derive(Default)]
-pub(crate) struct PaneResponse {
-    /// A status line for the overlay's bottom bar, if anything happened.
-    pub status: Option<String>,
-    /// The user asked (via the row menu) to copy this pane's selection to the
-    /// other pane; `CommanderMode` performs the cross-pane copy.
-    pub copy_to_other: bool,
-    /// The user asked (via the row menu) to export this pane's selection to the
-    /// host using the middle-column "Export as" format; `CommanderMode` runs the
-    /// threaded write.
-    pub export_to_host: bool,
-    /// The user picked a specific format from the row menu's "Export" submenu,
-    /// overriding the dropdown for this one export.
-    pub export_as: Option<ExportFormat>,
-    /// The user asked (via the row menu) to calculate checksums for this pane's
-    /// selection; `CommanderMode` opens the threaded checksum window.
-    pub checksums: bool,
-    /// The user double-clicked a file or chose "File Info..."; carries the
-    /// entry name. `CommanderMode` opens the floating File Info window over it.
-    pub detail: Option<String>,
-    /// The user interacted with (clicked in) this pane this frame, so it becomes
-    /// the "active" pane the middle-column Delete acts on.
-    pub focused: bool,
-    /// Data-changing operations that completed on this pane this frame (a staged
-    /// queue applied, or an immediate host delete / rename / new folder), in the
-    /// order they happened. `CommanderMode` timestamps each and appends it to the
-    /// rolling session log.
-    pub log_events: Vec<String>,
-}
+type A = CommanderAction;
+type P = BrowserPaneAction;
 
-/// Per-frame outcome of the listing grid (which row action, if any, fired).
-#[derive(Default)]
-struct RowActions {
-    status: Option<String>,
-    /// Copy the selection to the other pane.
-    copy: bool,
-    /// Export the selection to the host using the dropdown's "Export as" format.
-    export: bool,
-    /// Export the selection in a format picked from the "Export" submenu.
-    export_as: Option<ExportFormat>,
-    /// Calculate checksums for the selection.
-    checksums: bool,
-    /// Open the File Info window for this entry (by name).
-    detail: Option<String>,
-    /// Open this entry (a file on a remote-host pane) as a disk image (by name).
-    open_image: Option<String>,
-    /// A row in this pane was clicked/navigated this frame (focus signal).
-    focused: bool,
-}
-
-pub(crate) struct CommanderPane {
+pub(crate) struct PaneView {
     side: Side,
-    /// Loaded source path (image / container). `None` until the user opens one.
-    source: Option<PathBuf>,
-    /// Partitions parsed from the source; drives the partition dropdown.
-    partitions: Vec<PartitionInfo>,
-    /// When the source is a backup folder (native rusty-backup *or* Clonezilla),
-    /// the resolved backup — `open_partition` routes through it to build the
-    /// right session. `None` for an image / host source.
-    resolved_backup: Option<commander_source::ResolvedBackup>,
-    /// Index into `partitions` currently being browsed.
-    selected_part: Option<usize>,
-    /// The directory-listing model this pane renders.
-    listing: DirListing,
-    /// The session that opened the current partition, kept so Apply can
-    /// re-open it read-write. `None` until a partition is opened.
-    session: Option<BrowseSession>,
-    /// Staged edits (delete + copy-in) for this image pane; empty for host
-    /// panes, which write immediately.
-    queue: EditQueue,
-    /// In-flight async open (spinner) from `BrowseSession::spawn_open`.
-    pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
-    /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
-    pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
-    /// In-flight Apply preflight; a clean verdict starts the apply, anything else opens the review.
-    pending_preflight: Option<Arc<Mutex<PreflightStatus>>>,
-    apply_review: Option<ApplyReview>,
-    apply_report: Option<ApplyReport>,
-    /// Still-staged edits and the folder to return to once the post-apply reopen lands.
-    reopen_restore: Option<(Vec<StagedEdit>, String)>,
-    /// In-flight Clonezilla metadata scan (spinner) from
-    /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
-    /// partclone-cache session and hands off to `pending_open`.
-    pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
-    /// In-flight async wrapper expansion (a large `.toast`/`.chd`/`.iso` being
-    /// materialized + probed off the UI thread). `poll_wrapper` installs the
-    /// mount when it finishes; a spinner shows meanwhile.
-    pending_wrapper: Option<PendingWrapper>,
-    /// Scanned Clonezilla block caches reused across opens this session. The
-    /// shared store also holds the in-memory/on-disk/scan decision tree so this
-    /// pane and the Inspect tab agree (see `commander_source::PartcloneCacheStore`).
-    cache_store: commander_source::PartcloneCacheStore,
-    /// Phase text shown next to the spinner while `pending_open` is live.
-    open_phase: String,
-    /// Rate / ETA estimator for the open-progress bar when the underlying open
-    /// is a synthetic carve scan (large ISO or full-disk scan). Reset on each
-    /// open so a fresh scan doesn't inherit the previous window.
-    open_rate: super::super::progress::RateTracker,
-    /// Volume metadata captured on open, for the source-bar readout.
-    volume_label: String,
-    fs_type: String,
-    total_size: u64,
-    used_size: u64,
-    /// Last open / navigation / apply error, shown in the pane body.
-    error: Option<String>,
-    /// True when the current source needs a password / passphrase to open
-    /// (encrypted container, or a locked APFS FileVault volume). Renders the
-    /// unlock prompt in the pane body; on submit the secret is stashed on
-    /// `session.password` and the open is re-spawned.
-    needs_password: bool,
+    /// The review window's conflict choice until the user presses Apply.
+    review_choice: OnConflict,
     /// The user's in-progress password / passphrase entry for the unlock prompt.
     password_input: String,
-    /// A source/partition switch the user requested while the queue was
-    /// non-empty; held until they confirm discarding the staged edits.
-    pending_switch: Option<PendingSwitch>,
-    /// Host-pane only: entry names the user asked to delete, held until they
-    /// confirm the (immediate, irreversible) host removal.
-    pending_host_delete: Option<Vec<String>>,
-    /// The open "Rename..." dialog, if any (single entry at a time).
-    rename_dialog: Option<RenameDialog>,
-    /// The open "New Folder..." dialog, if any.
-    new_folder_dialog: Option<NewFolderDialog>,
-    /// Whether the "Pending edits" review popup is open for this pane.
-    show_edits_popup: bool,
-    /// Data-changing operations completed this frame, drained into the
-    /// `PaneResponse` at the end of `show()` for the session log.
-    log_events: Vec<String>,
-    /// The remote file-browser session driving this pane when it browses a
-    /// daemon — the shared-connection engine (`model::remote_browser`). One
-    /// connection holds every image the user opens, so switching images never
-    /// reconnects. `None` when local, or *transiently* while a blocking
-    /// transition runs on a worker thread (the browser is moved into the worker
-    /// and re-installed on completion).
-    browser: Option<RemoteBrowser>,
-    /// Display cache mirroring the browser's identity (addr + mode). Stays set
-    /// across an in-flight transition so the source bar's label holds steady
-    /// while `browser` is on the worker thread. Also the marker that this is a
-    /// remote pane. `None` for local.
-    remote: Option<RemoteConn>,
-    /// In-flight async remote transition (connect / open image / close image).
-    pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
-    /// The open "Connect to remote..." dialog, if any.
-    connect_dialog: Option<ConnectDialog>,
-    /// Inline `+`/`-` expansion of wrapper rows (archives / nested images): the
-    /// mounted wrapper filesystems and which nodes are expanded.
-    wrapper_tree: WrapperTree,
-    /// Selected node ids *inside* expanded wrappers (kept separate from the base
-    /// listing's name-based selection; the two are mutually exclusive so copy
-    /// has one unambiguous source context).
-    tree_selected: Vec<String>,
-    /// Last plain / ctrl-clicked tree row: the fixed end of a Shift-click range.
-    tree_anchor: Option<String>,
-    /// Per-frame map of visible tree node id -> its row (mount + entry), rebuilt
-    /// by `build_display_rows`. Resolves a selected/clicked node to the
-    /// filesystem and entry to read it from.
-    tree_index: HashMap<String, TreeRow>,
-    /// The base cwd as of last frame; wrapper expansion is per-directory, so a
-    /// change here (navigate / switch / close) collapses every wrapper.
-    last_cwd: String,
-    /// In-memory mirror of the merged recent list (newest 3 per mode across
-    /// Inspect/Restore/Optical/Archives/Commander). Seeded at construction and
-    /// refreshed on each open; drives this pane's "Recent" dropdown.
-    recent: Vec<String>,
-    /// True when the source is a Mac archive opened in-pane (`ArchiveFilesystem`,
-    /// read-only). Copy-OUT works via the session-less path; the pane rejects
-    /// edits and receiving copies, like a wrapper mount or backup.
-    archive_source: bool,
-    /// True when the source is an optical disc image opened in-pane
-    /// (`OpticalFilesystem`, read-only). Like `archive_source`, but the pane's
-    /// partition picker instead lists this disc's filesystems (`optical_choices`)
-    /// — e.g. the ISO 9660 and HFS sides of a hybrid Mac/PC disc.
-    optical_source: bool,
-    /// The optical disc's selectable filesystems (primary + any hybrid Mac side);
-    /// drives the picker when `optical_source`. `selected_part` indexes into it.
-    optical_choices: Vec<OpticalFsChoice>,
+    /// Rows that fit in the listing, as last sent to the controller.
+    page_rows: i32,
 }
 
-/// Display cache for a remote pane (addr + what it's browsing). The live engine
-/// is [`CommanderPane::browser`]; this mirror lets the source bar render even
-/// while the browser is moved onto a worker thread for a blocking transition.
-struct RemoteConn {
-    addr: String,
-    mode: BrowseMode,
-}
-
-/// Async status for a remote transition (connect / open image / close image)
-/// running on a worker thread. Both the `RemoteBrowser` and the produced
-/// `BrowseTarget` are `Send`, so they move back to the UI thread here.
-#[derive(Default)]
-struct RemoteTransition {
-    done: bool,
-    addr: String,
-    /// The browser, returned so the UI thread re-installs it. `Some` after any
-    /// op on an existing browser (success *or* failure — the browser survives a
-    /// failed open/close), and after a successful fresh connect. `None` only
-    /// when a fresh connect failed (no browser was created).
-    browser: Option<RemoteBrowser>,
-    /// The new listing target, or an error message.
-    result: Option<Result<BrowseTarget, String>>,
-}
-
-/// State for the modal "Connect to remote..." dialog (host only — you browse the
-/// remote machine and open an image you find, rather than naming it up front).
-struct ConnectDialog {
-    /// `host` or `host:port` of the daemon.
-    host: String,
-    /// Last validation / connect error, shown inline.
-    error: Option<String>,
-}
-
-/// State for the modal "Rename..." dialog.
-struct RenameDialog {
-    /// The live entry being renamed.
-    entry: FileEntry,
-    /// The editable new-name buffer (seeded with the current name).
-    input: String,
-    /// Last validation error, shown inline; cleared as the user types.
-    error: Option<String>,
-}
-
-/// State for the modal "New Folder..." dialog.
-struct NewFolderDialog {
-    /// The editable folder-name buffer.
-    input: String,
-    /// Last validation error, shown inline; cleared as the user types.
-    error: Option<String>,
-}
-
-/// A deferred source change awaiting the unsaved-edits confirmation.
-enum PendingSwitch {
-    Source(PathBuf),
-    HostRoot(PathBuf),
-    /// Open a native rusty-backup folder as the source.
-    Backup(PathBuf),
-    Partition(usize),
-    /// Close (unload) the pane entirely.
-    Close,
-}
-
-/// An in-flight async wrapper expansion: the node being opened, its display
-/// name (for the spinner + status), and the worker's shared status handle.
-struct PendingWrapper {
-    node_id: String,
-    name: String,
-    status: Arc<Mutex<WrapperOpenStatus>>,
-}
-
-impl CommanderPane {
+impl PaneView {
     pub(crate) fn new(side: Side) -> Self {
         Self {
             side,
-            source: None,
-            partitions: Vec::new(),
-            resolved_backup: None,
-            selected_part: None,
-            listing: DirListing::new(),
-            session: None,
-            queue: EditQueue::new(),
-            pending_open: None,
-            pending_apply: None,
-            pending_preflight: None,
-            apply_review: None,
-            apply_report: None,
-            reopen_restore: None,
-            pending_scan: None,
-            pending_wrapper: None,
-            cache_store: commander_source::PartcloneCacheStore::new(),
-            open_phase: String::new(),
-            open_rate: super::super::progress::RateTracker::default(),
-            volume_label: String::new(),
-            fs_type: String::new(),
-            total_size: 0,
-            used_size: 0,
-            error: None,
-            needs_password: false,
+            review_choice: OnConflict::Skip,
             password_input: String::new(),
-            pending_switch: None,
-            pending_host_delete: None,
-            rename_dialog: None,
-            new_folder_dialog: None,
-            show_edits_popup: false,
-            log_events: Vec::new(),
-            browser: None,
-            remote: None,
-            pending_remote: None,
-            connect_dialog: None,
-            wrapper_tree: WrapperTree::new(),
-            tree_selected: Vec::new(),
-            tree_anchor: None,
-            tree_index: HashMap::new(),
-            last_cwd: String::new(),
-            recent: super::super::load_recent_merged(),
-            archive_source: false,
-            optical_source: false,
-            optical_choices: Vec::new(),
+            page_rows: 0,
         }
     }
 
-    /// True when the active selection is inside an expanded wrapper. In that
-    /// state the pane's copy source is the mounted wrapper filesystem rather
-    /// than the base listing — `selected_entries` / `fs_mut` / `is_host_pane` /
-    /// `session` all switch to the wrapper context so the existing copy
-    /// dispatch pulls files straight out.
-    fn tree_active(&self) -> bool {
-        !self.tree_selected.is_empty()
+    fn pane_action(&self, out: &mut Vec<CommanderAction>, action: BrowserPaneAction) {
+        out.push(A::Pane(self.side, action));
     }
 
-    /// The mount key and selected entries for the active tree selection, all
-    /// sharing the first selected row's mount (a selection can't span mounts).
-    fn tree_selection(&self) -> Option<(String, Vec<FileEntry>)> {
-        let first = self.tree_selected.first()?;
-        let mount = self.tree_index.get(first)?.mount.clone();
-        let entries = self
-            .tree_selected
-            .iter()
-            .filter_map(|id| self.tree_index.get(id))
-            .filter(|r| r.mount == mount)
-            .map(|r| r.entry.clone())
-            .collect();
-        Some((mount, entries))
-    }
-
-    /// Clear the tree selection (e.g. when the base listing is clicked).
-    fn clear_tree_selection(&mut self) {
-        self.tree_selected.clear();
-    }
-
-    /// Drop this pane's in-memory recent-files mirror (the Settings dialog
-    /// cleared the persisted lists).
-    pub(crate) fn clear_recent_files(&mut self) {
-        self.recent.clear();
-    }
-
-    /// Expand or collapse a wrapper / inner-folder node. Opening a wrapper
-    /// materializes + mounts its contents (reading the wrapper's bytes from the
-    /// host, the base filesystem, or the enclosing mount). Returns a status
-    /// line on error or a note (e.g. a multi-volume image).
-    fn toggle_wrapper(
+    /// Draw the pane; `active` draws the keyboard cursor and `scroll` brings it into view.
+    pub(crate) fn show(
         &mut self,
-        node_id: &str,
-        name: &str,
-        is_tree: bool,
-        is_wrapper: bool,
-        expanded: bool,
-    ) -> Option<String> {
-        if expanded {
-            self.wrapper_tree.collapse(node_id);
-            // Drop any selection that was inside the collapsed subtree.
-            self.tree_selected.retain(|id| !id.starts_with(node_id));
-            return None;
-        }
-        if is_tree {
-            if is_wrapper {
-                // Nested wrapper: read its bytes out of the enclosing mount.
-                let row = self.tree_index.get(node_id)?.clone();
-                let kind = classify_entry(&row.entry)?;
-                let source = match self.wrapper_tree.read_wrapper_source(&row) {
-                    Ok(s) => s,
-                    Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
-                };
-                if let Err(e) = self
-                    .wrapper_tree
-                    .expand_wrapper(node_id, name, kind, source)
-                {
-                    return self.wrapper_open_failed(name, format!("{e:#}"));
-                }
-            } else {
-                // Plain folder inside a mount — just reveal its children.
-                self.wrapper_tree.expand_folder(node_id);
-            }
-        } else {
-            // Base wrapper: open it off the UI thread with a spinner —
-            // materializing a large `.toast`/`.chd`/`.iso` to a temp file and
-            // probing it can take seconds. Only one wrapper opens at a time.
-            if self.pending_wrapper.is_some() {
-                let side = self.side.label();
-                return Some(format!(
-                    "[{side}] a wrapper is already opening; wait for it."
-                ));
-            }
-            let entry = self
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.path == node_id)
-                .cloned()?;
-            let kind = classify_entry(&entry)?;
-            // A host file opens by its real path — cheaper than reading it all,
-            // and required for multi-file optical formats (bin/cue, mdf/mds)
-            // whose sibling data file sits next to it. A wrapper inside an image
-            // pane is extracted on the worker from a fresh reopen of the base
-            // source; a non-reopenable base (rare) extracts synchronously here.
-            let plan = if self.listing.is_host() {
-                WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
-            } else if let Some(base) = self.base_stage_source() {
-                WrapperOpenPlan::Extract(Box::new(WrapperExtract {
-                    base,
-                    entry: entry.clone(),
-                }))
-            } else {
-                let Some(fs) = self.listing.fs_mut() else {
-                    return self.wrapper_open_failed(name, "source is not open".into());
-                };
-                let mut buf = Vec::new();
-                if let Err(e) = fs.write_file_to(&entry, &mut buf) {
-                    return self.wrapper_open_failed(name, e.to_string());
-                }
-                WrapperOpenPlan::Bytes(buf)
-            };
-            self.pending_wrapper = Some(PendingWrapper {
-                node_id: node_id.to_string(),
-                name: name.to_string(),
-                status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
-            });
-            return Some(format!("[{}] opening {name}...", self.side.label()));
-        }
-        let side = self.side.label();
-        self.wrapper_tree
-            .note(node_id)
-            .map(|n| format!("[{side}] {name}: {n}"))
-    }
-
-    /// The reopen handle for this pane's *base* source (ignoring any active
-    /// wrapper-tree selection) — a local image session, a remote image, or a Mac
-    /// archive by path. Used to extract a base wrapper's bytes on a worker so a
-    /// large expand doesn't freeze the UI. `None` for a host base (opened by
-    /// path instead) or a source with no reopenable handle.
-    fn base_stage_source(&self) -> Option<commander_ops::StageSource> {
-        if let Some(session) = self.session.clone() {
-            return Some(commander_ops::StageSource::Session(session));
-        }
-        #[cfg(feature = "remote")]
-        if let Some(RemoteConn {
-            addr,
-            mode: BrowseMode::Image { path, partition },
-        }) = &self.remote
-        {
-            return Some(commander_ops::StageSource::Remote {
-                addr: addr.clone(),
-                path: path.clone(),
-                partition: partition.clone(),
-            });
-        }
-        if self.archive_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
-                    path: path.clone(),
-                    label,
-                }));
-            }
-        }
-        // An optical disc reopens by path + the selected filesystem (the primary
-        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
-        // the same tree the pane shows.
-        if self.optical_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                let hybrid = self
-                    .selected_part
-                    .and_then(|i| self.optical_choices.get(i))
-                    .and_then(|c| c.hybrid_index);
-                let recipe = match hybrid {
-                    Some(index) => ReopenRecipe::OpticalHybrid {
-                        path: path.clone(),
-                        index,
-                        label,
-                    },
-                    None => ReopenRecipe::Optical {
-                        path: path.clone(),
-                        label,
-                    },
-                };
-                return Some(commander_ops::StageSource::Reopen(recipe));
-            }
-        }
-        None
-    }
-
-    /// Record a failed wrapper expansion in the session log (where the full
-    /// detail belongs) and return a short, one-line status — a long error chain
-    /// in the status bar otherwise overflows it and makes the pane unusable. The
-    /// row simply stays collapsed.
-    fn wrapper_open_failed(&mut self, name: &str, detail: String) -> Option<String> {
-        let side = self.side.label();
-        self.log_events
-            .push(format!("[{side}] couldn't open '{name}': {detail}"));
-        Some(format!("[{side}] couldn't open '{name}' (see Log)"))
-    }
-
-    /// Number of staged (unapplied) edits on this pane.
-    pub(crate) fn staged_count(&self) -> usize {
-        self.queue.len()
-    }
-
-    /// Discard all staged edits (used by the overlay's Close guard).
-    pub(crate) fn discard_edits(&mut self) {
-        self.queue.clear();
-    }
-
-    /// Render the pane. Returns status + any cross-pane request for the overlay.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> PaneResponse {
-        // Wrapper expansion is scoped to the current directory: any change of
-        // base cwd (navigate / source / partition switch / close) collapses
-        // every expanded wrapper and drops its mounts + tree selection.
-        let cwd_now = self.listing.cwd_path().to_string();
-        if cwd_now != self.last_cwd {
-            self.last_cwd = cwd_now;
-            self.wrapper_tree.clear();
-            self.tree_selected.clear();
-            // Abandon any wrapper open still in flight — its target row is gone.
-            self.pending_wrapper = None;
-        }
-        let mut status = self.poll_open(ui.ctx());
-        if let Some(s) = self.poll_preflight(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_apply(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_scan(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_wrapper(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.poll_remote(ui.ctx()) {
-            status = Some(s);
-        }
-        let mut copy_to_other = false;
-        let mut export_to_host = false;
-        let mut export_as: Option<ExportFormat> = None;
-        let mut checksums = false;
-        let mut detail = None;
-        let mut focused = false;
-
-        if let Some(s) = self.source_bar(ui) {
-            status = Some(s);
-        }
-        self.path_line(ui);
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        active: bool,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let pane = ctl.pane(self.side);
+        self.source_bar(ui, pane, out);
+        self.path_line(ui, pane, out);
         ui.separator();
 
-        // A wrapper being opened off-thread: show a spinner + phase above the
-        // still-visible listing (the expand is inline, so the base rows stay).
-        if let Some(pw) = &self.pending_wrapper {
-            let phase = pw
-                .status
-                .lock()
-                .ok()
-                .map(|g| g.phase.clone())
-                .unwrap_or_default();
+        // A wrapper expanding as a job: a spinner and its phase above the still-visible listing.
+        if let Some((name, snap)) = pane.wrapper_opening() {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
-                ui.label(if phase.is_empty() {
-                    format!("Opening {}...", pw.name)
+                ui.label(if snap.phase.is_empty() {
+                    format!("Opening {name}...")
                 } else {
-                    format!("{}: {}", pw.name, phase)
+                    format!("{name}: {}", snap.phase)
                 });
             });
             ui.ctx().request_repaint();
         }
-
-        if self.pending_preflight.is_some() {
+        if pane.checking().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -683,1216 +111,121 @@ impl CommanderPane {
             });
             ui.ctx().request_repaint();
         }
-        if self.pending_apply.is_some() {
+        if let Some(snap) = pane.host_writing() {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                super::super::progress::show_job(ui, &snap);
+            });
+        }
+        if pane.applying().is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label("Applying staged edits...");
             });
-        } else if self.pending_scan.is_some() {
+        } else if let Some(snap) = pane.opening() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if super::super::progress::show_job(ui, &snap) {
+                    self.pane_action(out, P::CancelOpen);
+                }
+            });
+        } else if pane.is_opening() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.spinner();
-                ui.label("Scanning Clonezilla metadata (first open of this partition)...");
+                ui.label("Opening...");
             });
-        } else if let Some(arc) = self.pending_open.clone() {
-            // Match the main browse view: when the underlying open is a
-            // synthetic carve scan (large ISO / full-disk scan), render a real
-            // progress bar with % + rate + ETA; otherwise just a spinner +
-            // phase text (metadata reads have no byte counter to bind to).
-            let snap = arc
-                .lock()
-                .ok()
-                .map(|g| (g.phase.clone(), g.scan_done, g.scan_total));
-            ui.add_space(20.0);
-            match snap {
-                Some((phase, done, total)) if total > 0 => {
-                    self.open_rate.record(done, "Opening");
-                    let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-                    let suffix = self.open_rate.suffix(done, total);
-                    let text = format!(
-                        "{} / {} ({:.0}%){}",
-                        rusty_backup::partition::format_size(done),
-                        rusty_backup::partition::format_size(total),
-                        frac * 100.0,
-                        suffix,
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label(if phase.is_empty() { "Opening" } else { &phase });
-                    });
-                    ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
-                    ui.ctx().request_repaint();
-                }
-                Some((phase, _, _)) => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label(if phase.is_empty() {
-                            "Opening...".to_string()
-                        } else {
-                            phase
-                        });
-                    });
-                    ui.ctx().request_repaint();
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label("Opening...");
-                    });
-                }
-            }
-        } else if self.pending_remote.is_some() {
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.spinner();
-                ui.label(if self.open_phase.is_empty() {
-                    "Connecting...".to_string()
-                } else {
-                    self.open_phase.clone()
-                });
-            });
-        } else if self.needs_password && self.session.is_some() {
-            // Unlock prompt for an encrypted source — reuses the same
-            // stash-secret-and-re-spawn retry as the Inspect BrowseView. Adapts
-            // its copy for a locked APFS FileVault volume vs. a container image.
-            // Gated on `session.is_some()` so switching away to a session-less
-            // source (host folder, closed pane) drops a stale prompt.
-            let is_apfs = self.fs_type == "APFS";
-            let mut submit = false;
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                if is_apfs {
-                    ui.label("This APFS volume is encrypted with FileVault.");
-                    ui.add_space(4.0);
-                    ui.label("Enter the volume password or personal recovery key.");
-                } else {
-                    ui.label("This source is password-protected.");
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.password_input)
-                            .password(true)
-                            .desired_width(220.0),
-                    );
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Unlock").clicked() || enter {
-                        submit = true;
-                    }
-                });
-            });
-            if submit {
-                let secret = self.password_input.clone();
-                let spawned = self.session.as_mut().map(|session| {
-                    session.password = Some(secret);
-                    session.spawn_open()
-                });
-                if let Some(arc) = spawned {
-                    self.pending_open = Some(arc);
-                    self.needs_password = false;
-                    self.error = None;
-                }
-            }
-        } else if let Some(err) = &self.error {
+        } else if pane.needs_password() {
+            self.unlock_prompt(ui, pane, out);
+        } else if let Some(err) = pane.source_error() {
             ui.add_space(12.0);
             ui.colored_label(super::super::theme::danger_muted(ui.visuals()), err);
-        } else if self.listing.is_loaded() {
-            self.render_header(ui);
-            let actions = self.render_rows(ui);
-            if actions.status.is_some() {
-                status = actions.status;
+        } else if pane.listing.is_loaded() {
+            if pane.has_folder_tree() {
+                self.render_folder_tree(ui, pane, active, out);
+                ui.separator();
             }
-            copy_to_other = actions.copy;
-            export_to_host = actions.export;
-            export_as = actions.export_as;
-            checksums = actions.checksums;
-            detail = actions.detail;
-            focused = actions.focused;
-            // Open a file on a remote-host pane as a disk image, on the same
-            // connection. The browser remembers the host folder it came from so
-            // "Close Image" returns there.
-            if let Some(name) = actions.open_image {
-                let path = self
-                    .listing
-                    .entries()
-                    .iter()
-                    .find(|e| e.name == name)
-                    .map(|e| e.path.clone());
-                if let Some(path) = path {
-                    let opened_from = self.listing.cwd_path().to_string();
-                    status = Some(self.spawn_open_image(path, None, opened_from));
-                }
-            }
+            self.render_header(ui, pane, out);
+            self.render_rows(ui, ctl, active, scroll, out);
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
             });
         }
 
-        if let Some(s) = self.render_switch_guard(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_connect_dialog(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_new_folder_dialog(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_rename_dialog(ui.ctx()) {
-            status = Some(s);
-        }
-        self.render_edits_popup(ui.ctx());
-        if let Some(s) = self.render_apply_review(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_apply_report(ui.ctx()) {
-            status = Some(s);
-        }
-
-        PaneResponse {
-            status,
-            copy_to_other,
-            export_to_host,
-            export_as,
-            checksums,
-            detail,
-            focused,
-            log_events: std::mem::take(&mut self.log_events),
-        }
+        self.render_edits_popup(ui.ctx(), pane, out);
+        self.render_apply_review(ui.ctx(), pane, out);
+        self.render_apply_report(ui.ctx(), pane, out);
     }
 
-    /// Confirm (and perform) an immediate host delete. No-op when nothing is
-    /// pending. Host writes can't be staged/undone, so this is a hard confirm.
-    fn render_host_delete_guard(&mut self, ctx: &egui::Context) -> Option<String> {
-        let count = self.pending_host_delete.as_ref()?.len();
-        let mut confirm = false;
-        let mut cancel = false;
-        egui::Window::new(format!("Delete from host folder? ({})", self.side.label()))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "Permanently delete {count} item(s) from the host folder?"
-                ));
-                ui.label("This is immediate and cannot be undone.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if confirm {
-            let names = self.pending_host_delete.take().unwrap_or_default();
-            return Some(self.delete_host_entries(&names));
-        }
-        if cancel {
-            self.pending_host_delete = None;
-        }
-        None
-    }
-
-    /// Immediately remove `names` from the host folder, then re-list.
-    fn delete_host_entries(&mut self, names: &[String]) -> String {
-        let targets: Vec<FileEntry> = self
-            .listing
-            .entries()
-            .iter()
-            .filter(|e| names.iter().any(|n| n == &e.name))
-            .cloned()
-            .collect();
-        let (mut removed, mut failed) = (0, 0);
-        for e in targets {
-            let res = if e.is_directory() {
-                std::fs::remove_dir_all(&e.path)
-            } else {
-                std::fs::remove_file(&e.path)
-            };
-            match res {
-                Ok(()) => removed += 1,
-                Err(_) => failed += 1,
-            }
-        }
-        self.reload_listing();
-        let msg = if failed > 0 {
-            format!(
-                "[{}] deleted {removed} item(s); {failed} could not be removed.",
-                self.side.label()
-            )
-        } else {
-            format!(
-                "[{}] deleted {removed} item(s) from the host folder.",
-                self.side.label()
-            )
-        };
-        if removed > 0 {
-            self.log_events.push(msg.clone());
-        }
-        msg
-    }
-
-    /// The modal "Rename..." dialog. Image panes stage a `Rename` edit (applied
-    /// on Apply); host panes rename immediately via `std::fs::rename`. No-op
-    /// when nothing is pending.
-    fn render_rename_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.rename_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_rename = false;
-        let mut cancel = false;
-        {
-            let d = self.rename_dialog.as_mut().unwrap();
-            let old_name = d.entry.name.clone();
-            let input = &mut d.input;
-            let err = d.error.clone();
-            egui::Window::new(format!("Rename ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("Rename \"{old_name}\" to:"));
-                    let resp = ui.text_edit_singleline(input);
-                    if let Some(e) = &err {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !input.trim().is_empty() && *input != old_name;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
-                            do_rename = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    // Enter confirms when the name is valid.
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_rename = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.rename_dialog = None;
-            return None;
-        }
-        if do_rename {
-            let new_name = self
-                .rename_dialog
-                .as_ref()
-                .unwrap()
-                .input
-                .trim()
-                .to_string();
-            // Validate against the filesystem's name rules (image panes only;
-            // host names are validated by the OS at rename time).
-            if let Some(Err(e)) = self.listing.fs_mut().map(|fs| fs.validate_name(&new_name)) {
-                if let Some(d) = self.rename_dialog.as_mut() {
-                    d.error = Some(format!("{e}"));
-                }
-                return None;
-            }
-            let entry = self.rename_dialog.take().unwrap().entry;
-            return Some(self.perform_rename(entry, new_name));
-        }
-        None
-    }
-
-    /// Carry out a confirmed rename: stage it (image pane) or apply it now
-    /// (host pane), then refresh.
-    fn perform_rename(&mut self, entry: FileEntry, new_name: String) -> String {
-        let side = self.side.label();
-        if self.listing.is_host() {
-            let old_path = PathBuf::from(&entry.path);
-            let new_path = old_path.with_file_name(&new_name);
-            if new_path.exists() {
-                return format!("[{side}] '{new_name}' already exists.");
-            }
-            match std::fs::rename(&old_path, &new_path) {
-                Ok(()) => {
-                    self.reload_listing();
-                    let msg = format!("[{side}] renamed '{}' to '{new_name}'.", entry.name);
-                    self.log_events.push(msg.clone());
-                    msg
-                }
-                Err(e) => format!("[{side}] rename failed: {e}"),
-            }
-        } else {
-            let Some(cwd) = self.listing.cwd().cloned() else {
-                return format!("[{side}] no directory to rename in.");
-            };
-            // Replace any prior staged rename of the same entry.
-            self.queue.remove_pending_rename(&entry.path);
-            self.queue.push(StagedEdit::Rename {
-                parent: cwd,
-                entry,
-                new_name: new_name.clone(),
-            });
-            format!("[{side}] staged rename to '{new_name}'. Apply to write.")
-        }
-    }
-
-    /// The "New Folder..." modal: a name field staged as a CreateDirectory on
-    /// an image pane, or created immediately on a host pane.
-    fn render_new_folder_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.new_folder_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_create = false;
-        let mut cancel = false;
-        {
-            let d = self.new_folder_dialog.as_mut().unwrap();
-            let input = &mut d.input;
-            let err = d.error.clone();
-            egui::Window::new(format!("New Folder ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Folder name:");
-                    let resp = ui.text_edit_singleline(input);
-                    if let Some(e) = &err {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !input.trim().is_empty();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new("Create")).clicked() {
-                            do_create = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_create = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.new_folder_dialog = None;
-            return None;
-        }
-        if do_create {
-            let name = self
-                .new_folder_dialog
-                .as_ref()
-                .unwrap()
-                .input
-                .trim()
-                .to_string();
-            // Name validity (image panes; host names are validated by the OS).
-            if let Some(Err(e)) = self.listing.fs_mut().map(|fs| fs.validate_name(&name)) {
-                if let Some(d) = self.new_folder_dialog.as_mut() {
-                    d.error = Some(format!("{e}"));
-                }
-                return None;
-            }
-            // Reject a name already present (on disk or staged here).
-            let cwd_path = self.listing.cwd_path().to_string();
-            let dup = self.listing.entries().iter().any(|e| e.name == name)
-                || self
-                    .queue
-                    .pending_adds_for(&cwd_path)
-                    .iter()
-                    .any(|e| e.name == name);
-            if dup {
-                if let Some(d) = self.new_folder_dialog.as_mut() {
-                    d.error = Some(format!("'{name}' already exists here"));
-                }
-                return None;
-            }
-            self.new_folder_dialog = None;
-            return Some(self.perform_new_folder(name));
-        }
-        None
-    }
-
-    /// Create the folder: immediate `std::fs::create_dir` on a host pane, or a
-    /// staged `CreateDirectory` on an image pane.
-    fn perform_new_folder(&mut self, name: String) -> String {
-        let side = self.side.label();
-        if self.listing.is_host() {
-            let dir = PathBuf::from(self.listing.cwd_path()).join(&name);
-            match std::fs::create_dir(&dir) {
-                Ok(()) => {
-                    self.reload_listing();
-                    let msg = format!("[{side}] created folder '{name}'.");
-                    self.log_events.push(msg.clone());
-                    msg
-                }
-                Err(e) => format!("[{side}] create folder failed: {e}"),
-            }
-        } else {
-            let Some(cwd) = self.listing.cwd().cloned() else {
-                return format!("[{side}] no directory open.");
-            };
-            self.queue.push(StagedEdit::CreateDirectory {
-                parent: cwd,
-                name: name.clone(),
-                qnx2_attrs: None,
-            });
-            format!("[{side}] staged new folder '{name}'. Apply to write.")
-        }
-    }
-
-    /// Render the modal "Connect to remote..." dialog (host:port only). On
-    /// Connect it opens the daemon's host filesystem (the file browser); the
-    /// listing swaps in when `poll_remote` sees it finish. You then open an
-    /// image you find by double-clicking it (or right-click -> Open Image).
-    fn render_connect_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
-        self.connect_dialog.as_ref()?;
-        let side = self.side;
-        let mut do_connect = false;
-        let mut cancel = false;
-        {
-            let d = self.connect_dialog.as_mut().unwrap();
-            egui::Window::new(format!("Connect to remote ({})", side.label()))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Host (rb-cli serve daemon):");
-                    let resp = ui.text_edit_singleline(&mut d.host);
-                    ui.label(
-                        egui::RichText::new("e.g. 192.168.1.42:7341  (port 7341 if omitted)")
-                            .weak()
-                            .small(),
-                    );
-                    if let Some(e) = &d.error {
-                        ui.colored_label(super::super::theme::danger_muted(ui.visuals()), e);
-                    }
-                    let valid = !d.host.trim().is_empty();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(valid, egui::Button::new("Connect"))
-                            .clicked()
-                        {
-                            do_connect = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_connect = true;
-                    }
-                });
-        }
-
-        if cancel {
-            self.connect_dialog = None;
-            return None;
-        }
-        if do_connect {
-            let host_raw = self
-                .connect_dialog
-                .as_ref()
-                .unwrap()
-                .host
-                .trim()
-                .to_string();
-            let addr = if host_raw.contains(':') {
-                host_raw
-            } else {
-                format!(
-                    "{host_raw}:{}",
-                    rusty_backup::remote::protocol::DEFAULT_PORT
-                )
-            };
-            self.connect_dialog = None;
-            return Some(self.spawn_connect(addr, "/".to_string()));
-        }
-        None
-    }
-
-    /// Connect and open the daemon's host filesystem (the file browser) at
-    /// `root_path` on a worker thread — a connect can block on an unreachable
-    /// host. Used for the initial connect (`/`) and for "Close Image" (back to
-    /// the folder the image was opened from).
-    fn spawn_connect(&mut self, addr: String, root_path: String) -> String {
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr: addr.clone(),
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        // A fresh connect drops any previous browser (a new connection replaces
-        // the old). Disconnect happens when the old browser's Arc drops.
-        self.browser = None;
-        self.open_phase = format!("Connecting to {addr}...");
-        let msg = format!("[{}] connecting to {addr}...", self.side.label());
-        std::thread::spawn(move || {
-            let outcome = RemoteBrowser::connect(&addr, &root_path);
-            if let Ok(mut s) = status.lock() {
-                match outcome {
-                    Ok((browser, target)) => {
-                        s.browser = Some(browser);
-                        s.result = Some(Ok(target));
-                    }
-                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
-                }
-                s.done = true;
-            }
-        });
-        msg
-    }
-
-    /// Open an image found while browsing the remote host FS as a new handle on
-    /// the **same** connection (no reconnect), on a worker thread. `opened_from`
-    /// is the host directory it was found in, so "Close Image" returns there.
-    fn spawn_open_image(
+    /// The listing alone (a folder tree, the header and the rows), for a host that draws the rest.
+    pub(crate) fn show_listing(
         &mut self,
-        path: String,
-        partition: Option<rusty_backup::cli::img_at::PartSelector>,
-        opened_from: String,
-    ) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return format!("[{}] not connected to a remote.", self.side.label());
-        };
-        let addr = browser.addr().to_string();
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr,
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        self.open_phase = format!("Opening {path}...");
-        let msg = format!("[{}] opening {path}...", self.side.label());
-        std::thread::spawn(move || {
-            let result = browser
-                .open_image(&path, partition, &opened_from)
-                .map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
-                s.done = true;
-            }
-        });
-        msg
-    }
-
-    /// Step back out of an open image to the host file browser (at the directory
-    /// the image was opened from), reusing the same connection, on a worker
-    /// thread.
-    fn spawn_close_image(&mut self) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return format!("[{}] not connected to a remote.", self.side.label());
-        };
-        let addr = browser.addr().to_string();
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr,
-            ..Default::default()
-        }));
-        self.pending_remote = Some(status.clone());
-        self.open_phase = "Returning to host browser...".to_string();
-        let msg = format!("[{}] closing image...", self.side.label());
-        std::thread::spawn(move || {
-            let result = browser.close_image().map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
-                s.done = true;
-            }
-        });
-        msg
-    }
-
-    /// Reset local-source state when this pane becomes (or re-targets) remote.
-    fn reset_for_remote(&mut self) {
-        self.source = None;
-        self.partitions = Vec::new();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.selected_part = None;
-        self.session = None;
-        self.queue.clear();
-        self.error = None;
-    }
-
-    /// Poll an in-flight remote transition; when done, re-install the browser and
-    /// swap the new target (the host file browser, or an opened image) into the
-    /// listing.
-    fn poll_remote(&mut self, ctx: &egui::Context) -> Option<String> {
-        let done = {
-            let s = self.pending_remote.as_ref()?;
-            s.lock().ok().map(|g| g.done).unwrap_or(false)
-        };
-        if !done {
-            ctx.request_repaint();
-            return None;
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let pane = ctl.pane(self.side);
+        if pane.has_folder_tree() {
+            self.render_folder_tree(ui, pane, true, out);
+            ui.separator();
         }
-        let (addr, browser, result) = {
-            let arc = self.pending_remote.take()?;
-            let mut g = arc.lock().ok()?;
-            (g.addr.clone(), g.browser.take(), g.result.take()?)
-        };
-        self.open_phase.clear();
-        // Re-install the browser (absent only when a fresh connect failed).
-        let had_browser = browser.is_some();
-        if let Some(b) = browser {
-            self.browser = Some(b);
-        }
-
-        match result {
-            Ok(target) => {
-                let mode = target.mode.clone();
-                self.reset_for_remote();
-                self.fs_type = target.fs_type.clone();
-                self.volume_label = target.volume_label.clone();
-                self.total_size = target.total_size;
-                self.used_size = target.used_size;
-                self.remote = Some(RemoteConn {
-                    addr: addr.clone(),
-                    mode: mode.clone(),
-                });
-                self.listing
-                    .load_root(target.fs, target.root, target.entries, false);
-                match mode {
-                    BrowseMode::Host => Some(format!(
-                        "[{}] connected to {addr} (browsing host)",
-                        self.side.label()
-                    )),
-                    BrowseMode::Image { path, .. } => {
-                        Some(format!("[{}] opened rb://{addr}{path}", self.side.label()))
-                    }
-                }
-            }
-            Err(e) => {
-                if had_browser {
-                    // The connection survived a failed open / close — keep the
-                    // current listing, just report it.
-                    Some(format!(
-                        "[{}] remote operation failed: {e}",
-                        self.side.label()
-                    ))
-                } else {
-                    // A fresh connect failed — nothing to show but the error.
-                    self.error = Some(e.clone());
-                    self.remote = None;
-                    Some(format!(
-                        "[{}] remote connect failed: {e}",
-                        self.side.label()
-                    ))
-                }
-            }
-        }
+        self.render_header(ui, pane, out);
+        self.render_rows(ui, ctl, true, scroll, out);
     }
 
-    /// True when this pane is browsing a remote daemon's *host* filesystem (the
-    /// file browser), where a file can be opened as an image.
-    pub(crate) fn is_remote_host(&self) -> bool {
-        matches!(
-            self.remote,
-            Some(RemoteConn {
-                mode: BrowseMode::Host,
-                ..
-            })
-        )
-    }
-
-    /// True when this pane is browsing a disk image on a remote daemon. Such a
-    /// pane receives a copy over the daemon's Family-F image write path
-    /// (OpenSession/StageUpload/Apply); a remote *host* pane receives over the
-    /// host-write path (MkdirHost/WriteHostFile) instead.
-    fn is_remote_image(&self) -> bool {
-        matches!(
-            self.remote,
-            Some(RemoteConn {
-                mode: BrowseMode::Image { .. },
-                ..
-            })
-        )
-    }
-
-    /// The daemon address (`host:port`) this pane is connected to, if remote.
-    /// Used to open a fresh connection for an upload worker.
-    pub(crate) fn remote_addr(&self) -> Option<String> {
-        self.remote.as_ref().map(|r| r.addr.clone())
-    }
-
-    fn render_switch_guard(&mut self, ctx: &egui::Context) -> Option<String> {
-        // Short-circuit when nothing is pending.
-        self.pending_switch.as_ref()?;
-        let n = self.queue.len();
-        let mut confirm = false;
-        let mut cancel = false;
-        egui::Window::new(format!("Discard staged edits? ({})", self.side.label()))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "The {} pane has {n} staged edit(s) that have not been applied.",
-                    self.side.label()
-                ));
-                ui.label("Switching the source will discard them.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Discard & switch").clicked() {
-                        confirm = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if confirm {
-            // `load_source` / `open_partition` reset the queue themselves.
-            return self.pending_switch.take().map(|req| match req {
-                PendingSwitch::Source(path) => self.load_source(path),
-                PendingSwitch::HostRoot(path) => self.load_host(path),
-                PendingSwitch::Backup(path) => self.load_backup_source(path),
-                PendingSwitch::Partition(idx) => self.open_partition(idx),
-                PendingSwitch::Close => self.close_source(),
-            });
-        }
-        if cancel {
-            self.pending_switch = None;
-        }
-        None
-    }
-
-    // --- accessors used by CommanderMode for cross-pane copy ---------------
-
-    /// True when this pane can receive a copy: a volume/folder is open and the
-    /// pane isn't mid-operation. (A host destination takes an immediate write;
-    /// an image destination takes a staged copy.) A read-only backup pane can
-    /// never receive a copy.
-    pub(crate) fn can_receive(&self) -> bool {
-        self.listing.is_loaded()
-            && self.pending_apply.is_none()
-            && self.pending_preflight.is_none()
-            && self.pending_open.is_none()
-            && self.pending_remote.is_none()
-            && self.resolved_backup.is_none()
-            && !self.archive_source
-        // Both remote destinations can now receive: a remote image via the
-        // daemon's OpenSession/StageUpload/Apply path, and a remote host folder
-        // via MkdirHost/WriteHostFile. A read-only daemon refuses the write with
-        // a clear error at copy time (the client can't know its policy up front).
-    }
-
-    /// True when this pane's source is read-only media that can never receive a
-    /// copy — a Mac archive, an optical disc, or a backup folder. Distinct from
-    /// `can_receive`, which is also false for transient states (mid-open/apply);
-    /// this reflects the *medium*, so the pane header can show a "Read-only"
-    /// badge. Host folders, writable image volumes, and remote panes (host or
-    /// image — both writable, subject to the daemon's read-only policy) are not
-    /// read-only.
-    pub(crate) fn is_read_only(&self) -> bool {
-        self.listing.is_loaded()
-            && !self.listing.is_host()
-            && (self.archive_source || self.optical_source || self.resolved_backup.is_some())
-    }
-
-    /// A short reason a copy into this pane is refused, for the copy button's
-    /// disabled hover. `None` when the pane can receive.
-    pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
-        if self.archive_source {
-            Some("the archive is read-only")
-        } else if self.resolved_backup.is_some() {
-            Some("the backup is read-only")
-        } else {
-            None
-        }
-    }
-
-    /// True when this pane lists a host-OS folder rather than a disk image.
-    /// When a wrapper selection is active the effective source is the mounted
-    /// wrapper filesystem (not the host), so report `false`.
-    pub(crate) fn is_host_pane(&self) -> bool {
-        !self.tree_active() && self.listing.is_host()
-    }
-
-    /// True when this pane lists a (read-only) backup folder's contents — native
-    /// rusty-backup or Clonezilla. Backups can be browsed and copied *out of*,
-    /// but not edited: writing to a raw backup's partition file would silently
-    /// desync its `metadata.json` checksum, zstd backups have no in-place
-    /// editable session, and Clonezilla images are read-through a block cache.
-    pub(crate) fn is_backup_pane(&self) -> bool {
-        self.resolved_backup.is_some()
-    }
-
-    /// True when this pane's source is a read-only Mac archive
-    /// (`ArchiveFilesystem`). Like a backup pane, it can be browsed and copied
-    /// out of, but not edited or copied into.
-    pub(crate) fn is_archive_pane(&self) -> bool {
-        self.archive_source
-    }
-
-    /// A clone of the session that opened this image pane (to re-open the source
-    /// read-only on a worker thread for an image->host extraction). `None` for a
-    /// host pane or before a source is opened.
-    pub(crate) fn session(&self) -> Option<BrowseSession> {
-        // A wrapper mount has no BrowseSession; force the session-less
-        // image->host extraction path.
-        if self.tree_active() {
-            return None;
-        }
-        self.session.clone()
-    }
-
-    /// If this pane's *source* is a remote image (no local session — its fs lives
-    /// over the wire), the `(addr, path, partition)` needed to reopen it fresh on
-    /// a copy worker, so an image->image copy out of it runs async with progress
-    /// instead of blocking the UI. `None` for local sources, remote *host* panes,
-    /// and while a wrapper mount is the active source (that stays on the sync
-    /// [`commander_ops::stage_copy`] path — a small, local temp fs).
-    #[cfg(feature = "remote")]
-    pub(crate) fn remote_image_source(
-        &self,
-    ) -> Option<(
-        String,
-        String,
-        Option<rusty_backup::cli::img_at::PartSelector>,
-    )> {
-        if self.tree_active() {
-            return None;
-        }
-        match &self.remote {
-            Some(RemoteConn {
-                addr,
-                mode: BrowseMode::Image { path, partition },
-            }) => Some((addr.clone(), path.clone(), partition.clone())),
-            _ => None,
-        }
-    }
-
-    /// How an async copy / checksum worker should reopen this pane's image source
-    /// off the UI thread. Covers every image source with a way to reopen fresh:
-    /// a local [`BrowseSession`], a remote connection, an inline-expanded
-    /// disk-image / optical wrapper mount, or a Mac archive (by file path).
-    /// `None` only for a source with no reopenable handle — an archive-in-a-
-    /// container wrapper (read from an in-memory buffer) — where the caller falls
-    /// back to a synchronous extraction over its live `fs_mut()`.
-    pub(crate) fn copy_stage_source(&self) -> Option<commander_ops::StageSource> {
-        // A wrapper-tree mount is the effective source when a tree selection is
-        // active; reopen it from its recipe (None for archive mounts -> sync).
-        if let Some((mount_key, _)) = self.tree_selection() {
-            return self
-                .wrapper_tree
-                .mount_reopen(&mount_key)
-                .map(commander_ops::StageSource::Reopen);
-        }
-        if let Some(session) = self.session() {
-            return Some(commander_ops::StageSource::Session(session));
-        }
-        #[cfg(feature = "remote")]
-        if let Some((addr, path, partition)) = self.remote_image_source() {
-            return Some(commander_ops::StageSource::Remote {
-                addr,
-                path,
-                partition,
-            });
-        }
-        // A Mac archive opened in-pane has no session — reopen it by file path.
-        if self.archive_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
-                    path: path.clone(),
-                    label,
-                }));
-            }
-        }
-        // An optical disc reopens by path + the selected filesystem (the primary
-        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
-        // the same tree the pane shows.
-        if self.optical_source {
-            if let Some(path) = &self.source {
-                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                let hybrid = self
-                    .selected_part
-                    .and_then(|i| self.optical_choices.get(i))
-                    .and_then(|c| c.hybrid_index);
-                let recipe = match hybrid {
-                    Some(index) => ReopenRecipe::OpticalHybrid {
-                        path: path.clone(),
-                        index,
-                        label,
-                    },
-                    None => ReopenRecipe::Optical {
-                        path: path.clone(),
-                        label,
-                    },
-                };
-                return Some(commander_ops::StageSource::Reopen(recipe));
-            }
-        }
-        None
-    }
-
-    /// A clone of the pending-apply status handle for the progress modal.
-    /// `None` when nothing is in flight on this pane.
-    pub(crate) fn pending_apply_status(&self) -> Option<Arc<Mutex<commander_ops::ApplyStatus>>> {
-        self.pending_apply.clone()
-    }
-
-    /// Re-read the current directory listing (after an immediate host write).
-    pub(crate) fn reload_listing(&mut self) {
-        let _ = self.listing.reload();
-    }
-
-    /// Delete this pane's current selection — the middle-column Delete acting on
-    /// the active pane. Mirrors the row right-click delete: an image pane toggles
-    /// a staged delete (Apply writes through); a host pane queues a confirm.
-    pub(crate) fn delete_selection(&mut self) -> String {
-        if self.tree_active() {
-            return format!(
-                "[{}] wrapper contents are read-only (copy out, don't edit).",
-                self.side.label()
-            );
-        }
-        if self.is_backup_pane() {
-            return format!("[{}] backup panes are read-only.", self.side.label());
-        }
-        if self.archive_source {
-            return format!("[{}] archive panes are read-only.", self.side.label());
-        }
-        if self.remote.is_some() {
-            // The remote write path carries copies only; delete / rename over the
-            // wire is a follow-up. Keep remote panes copy-in-only for now.
-            return format!(
-                "[{}] remote panes accept copied files/folders only; delete over \
-                 the wire isn't supported yet.",
-                self.side.label()
-            );
-        }
-        let names: Vec<String> = self.listing.selection().to_vec();
-        if names.is_empty() {
-            return format!("[{}] nothing selected to delete.", self.side.label());
-        }
-        if self.listing.is_host() {
-            self.pending_host_delete = Some(names);
-            format!("[{}] confirm host delete...", self.side.label())
-        } else {
-            let n = names.len();
-            self.toggle_delete(&names);
-            format!("[{}] toggled delete on {n} item(s).", self.side.label())
-        }
-    }
-
-    /// True when at least one row is selected (base listing or a wrapper).
-    pub(crate) fn has_selection(&self) -> bool {
-        self.tree_active() || !self.listing.selection().is_empty()
-    }
-
-    /// The selected entries (owned clones) — from the active wrapper mount when
-    /// a tree selection is live, otherwise the base current directory.
-    pub(crate) fn selected_entries(&self) -> Vec<FileEntry> {
-        if let Some((_, entries)) = self.tree_selection() {
-            return entries;
-        }
-        self.listing
-            .selected_entries()
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-
-    /// The current directory entry (copy destination parent).
-    pub(crate) fn cwd_entry(&self) -> Option<FileEntry> {
-        self.listing.cwd().cloned()
-    }
-
-    /// Mutable access to the open filesystem (to extract files for a copy).
-    /// Returns the active wrapper mount when a tree selection is live.
-    pub(crate) fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
-        if let Some((mount, _)) = self.tree_selection() {
-            return self.wrapper_tree.mount_fs(&mount);
-        }
-        self.listing.fs_mut()
-    }
-
-    /// Mutable access to this pane's staged-edit queue (so the File Info window
-    /// can stage metadata edits onto it).
-    pub(crate) fn queue_mut(&mut self) -> &mut EditQueue {
-        &mut self.queue
-    }
-
-    /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
-    /// for a host pane or before a source is opened.
-    pub(crate) fn fs_type(&self) -> &str {
-        &self.fs_type
-    }
-
-    /// Look up an entry by name in the current directory and read up to `max`
-    /// bytes of its data for the File Info preview. Returns the entry plus its
-    /// bytes (`None` for a directory or on read error). Drives `open_detail`.
-    pub(crate) fn detail_payload(
+    /// Unlock prompt for an encrypted source; its copy differs for a locked APFS FileVault volume.
+    fn unlock_prompt(
         &mut self,
-        name: &str,
-        max: usize,
-    ) -> Option<(FileEntry, Option<Vec<u8>>)> {
-        // A wrapper-tree row (a file inside an expanded .sit / .toast / disk-image
-        // wrapper): resolve against the active tree selection — a right-click
-        // selects the row first — and read through the mounted wrapper fs.
-        if self.tree_active() {
-            let (_, entries) = self.tree_selection()?;
-            let entry = entries.into_iter().find(|e| e.name == name)?;
-            if !entry.is_file() {
-                return Some((entry, None));
-            }
-            let data = self.fs_mut().and_then(|fs| fs.read_file(&entry, max).ok());
-            return Some((entry, data));
-        }
-        let entry = self
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.name == name)
-            .cloned()?;
-        if !entry.is_file() {
-            return Some((entry, None));
-        }
-        let data = if self.listing.is_host() {
-            read_host_file_capped(&entry.path, max)
-        } else {
-            self.listing
-                .fs_mut()
-                .and_then(|fs| fs.read_file(&entry, max).ok())
-        };
-        Some((entry, data))
-    }
-
-    /// True when an expanded-wrapper row is the active selection. Its contents
-    /// are read-only (copy out, don't edit), so File Info shows no editors.
-    pub(crate) fn wrapper_selection_active(&self) -> bool {
-        self.tree_active()
-    }
-
-    /// The filesystem type to show in File Info: the mounted wrapper's type
-    /// when a tree selection is active (e.g. "HFS" for a file inside a `.toast`
-    /// opened through a `.sit`), else the base pane's type.
-    /// The on-disk extended attributes of `entry`, for the File Info window.
-    /// Empty on a filesystem without xattr support (or when unreadable) — this
-    /// is display metadata, never a hard failure.
-    pub(crate) fn detail_xattrs(
-        &mut self,
-        entry: &FileEntry,
-    ) -> Vec<rusty_backup::fs::xattr::Xattr> {
-        self.fs_mut()
-            .filter(|fs| fs.supports_xattrs())
-            .and_then(|fs| fs.list_xattrs(entry).ok())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn detail_fs_type(&mut self) -> String {
-        if let Some((mount, _)) = self.tree_selection() {
-            if let Some(fs) = self.wrapper_tree.mount_fs(&mount) {
-                return fs.fs_type().to_string();
-            }
-        }
-        self.fs_type().to_string()
-    }
-
-    /// True when this pane is browsing a remote daemon (host FS or an image on
-    /// it). Cross-pane callers use this to gate in-place edits that the remote
-    /// write path doesn't carry yet (delete / rename over the wire).
-    pub(crate) fn is_remote(&self) -> bool {
-        self.remote.is_some()
-    }
-
-    /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
-    /// A directory opens as a host folder, a file as an image; staged edits defer
-    /// the switch behind the discard-confirmation, mirroring the source picker.
-    pub(crate) fn open_dropped(&mut self, path: PathBuf) -> String {
-        let is_dir = path.is_dir();
-        if !self.queue.is_empty() {
-            self.pending_switch = Some(if is_dir {
-                PendingSwitch::HostRoot(path)
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let is_apfs = pane.volume().fs_type == "APFS";
+        let mut submit = false;
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            if is_apfs {
+                ui.label("This APFS volume is encrypted with FileVault.");
+                ui.add_space(4.0);
+                ui.label("Enter the volume password or personal recovery key.");
             } else {
-                PendingSwitch::Source(path)
+                ui.label("This source is password-protected.");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Unlock").clicked() || enter {
+                    submit = true;
+                }
             });
-            return format!(
-                "[{}] discard staged edits to open a new source.",
-                self.side.label()
-            );
+        });
+        if submit {
+            let secret = std::mem::take(&mut self.password_input);
+            self.pane_action(out, P::SubmitPassword(secret));
         }
-        if is_dir {
-            self.load_host(path)
-        } else {
-            self.load_source(path)
-        }
-    }
-
-    /// Push a copy batch onto this pane's queue, renaming names this volume can't hold.
-    pub(crate) fn stage_edits(&mut self, mut edits: Vec<StagedEdit>) -> StageOutcome {
-        let queue_start = self.queue.len();
-        let cwd_path = self.listing.cwd_path().to_string();
-        let cwd_names: Vec<String> = self
-            .listing
-            .entries()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
-        let queue = &self.queue;
-        let mut existing = |path: &str| {
-            let mut names: Vec<String> = queue
-                .pending_adds_for(path)
-                .into_iter()
-                .map(|e| e.name)
-                .collect();
-            if path == cwd_path {
-                names.extend(cwd_names.iter().cloned());
-            }
-            names
-        };
-        // A remote image has no local fs here; the daemon reports bad names at apply.
-        let (report, fs_type) = match self.listing.fs_mut() {
-            Some(fs) => {
-                let fold = fs.case_insensitive_lookup();
-                let fs_type = fs.fs_type().to_string();
-                let validate = |n: &str| fs.validate_name(n);
-                (
-                    legalize_staged_names(&mut edits, &validate, fold, &mut existing),
-                    fs_type,
-                )
-            }
-            None => (LegalizeReport::default(), String::new()),
-        };
-        let staged = edits.len();
-        for e in edits {
-            self.queue.push(e);
-        }
-        StageOutcome {
-            staged,
-            queue_start,
-            fs_type,
-            renamed: report.renamed,
-            dropped: report.dropped,
-        }
-    }
-
-    /// Drop everything staged since `queue_start` (the rename notice's "Undo copy").
-    pub(crate) fn unstage_since(&mut self, queue_start: usize) -> bool {
-        // An apply in flight holds queue indices; trimming under it would misalign them.
-        if self.pending_apply.is_some() || self.pending_preflight.is_some() {
-            return false;
-        }
-        self.queue.truncate(queue_start);
-        true
     }
 
     // --- source bar --------------------------------------------------------
 
-    fn source_bar(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let mut status = None;
+    fn source_bar(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let mut source_action = None;
 
         // Row 1: source selection + pane lifecycle (Close / Apply / Discard).
         // Wrapped so the picker + lifecycle buttons flow onto a second line on a
@@ -1901,37 +234,23 @@ impl CommanderPane {
             // Shared source picker (R1): the same ComboBox widget the Inspect
             // tab uses, here offering an image file or a host folder. Image
             // opens are not materialized (BrowseSession peels the container).
-            let is_backup = self.resolved_backup.is_some();
-            let current_label = if let Some(r) = &self.remote {
-                match &r.mode {
-                    BrowseMode::Host => format!("Remote {} (host)", r.addr),
-                    BrowseMode::Image { path, partition } => {
-                        // Host + image basename only — the full remote path is
-                        // long and the in-image position shows in the breadcrumb.
-                        let base = path
-                            .rsplit('/')
-                            .find(|s| !s.is_empty())
-                            .unwrap_or(path.as_str());
-                        let part = partition
-                            .as_ref()
-                            .map(|n| format!("{n}"))
-                            .unwrap_or_default();
-                        format!("Remote {}: {base}{part}", r.addr)
-                    }
-                }
-            } else if self.listing.is_host() {
+            let is_backup = pane.is_backup();
+            let source = pane.source_path().map(|p| p.to_path_buf());
+            let current_label = if let Some(label) = pane.remote_label() {
+                label
+            } else if pane.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
-                match &self.source {
+                match &source {
                     Some(p) => format!(
                         "Backup: {}",
                         p.file_name().unwrap_or_default().to_string_lossy()
                     ),
                     None => "Backup folder".to_string(),
                 }
-            } else if let Some(p) = &self.source {
+            } else if let Some(p) = &source {
                 let base = p.file_name().unwrap_or_default().to_string_lossy();
-                if self.archive_source {
+                if pane.is_archive() {
                     format!("Archive: {base}")
                 } else {
                     format!("Image: {base}")
@@ -1947,10 +266,6 @@ impl CommanderPane {
                 // "Connect to Remote..." lives in this dropdown now (no
                 // separate button).
                 show_remote: true,
-                materialize_image: false,
-                // Surface .sit/.hqx/... in the "Open File..." dialog; a Mac
-                // archive opens read-only in-pane (ArchiveFilesystem).
-                include_mac_archives: true,
                 width: 200.0,
                 // Variable-length recent group: the merged list is already short
                 // (newest 3 per mode) and rarely changes mid-session.
@@ -1958,13 +273,13 @@ impl CommanderPane {
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
-                image_active: self.source.is_some() && !self.listing.is_host() && !is_backup,
-                host_active: self.listing.is_host(),
+                image_active: source.is_some() && !pane.listing.is_host() && !is_backup,
+                host_active: pane.listing.is_host(),
                 backup_active: is_backup,
                 devices: &[],
                 // Merged recent list (newest 3 per mode) shown as a group inside
                 // this same dropdown — no extra combo crowding the source bar.
-                recent: &self.recent,
+                recent: pane.recent(),
             };
             let id = format!("commander_source_{}", self.side.idx());
             if let Some(ev) =
@@ -1972,114 +287,56 @@ impl CommanderPane {
             {
                 use super::super::source_picker::SourceEvent;
                 match ev {
-                    // A recent pick opens like a drag-and-drop: file→image/archive,
-                    // dir→host folder (deferred behind the discard prompt if edits
-                    // are staged).
-                    SourceEvent::Recent(path) => {
-                        status = Some(self.open_dropped(path));
-                    }
-                    SourceEvent::Image { path, .. } => {
-                        if self.queue.is_empty() {
-                            status = Some(self.load_source(path));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::Source(path));
-                        }
-                    }
-                    SourceEvent::HostFolder(dir) => {
-                        if self.queue.is_empty() {
-                            status = Some(self.load_host(dir));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::HostRoot(dir));
-                        }
-                    }
-                    SourceEvent::BackupFolder(folder) => {
-                        if self.queue.is_empty() {
-                            status = Some(self.load_backup_source(folder));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::Backup(folder));
-                        }
-                    }
+                    // A recent pick opens like a drag-and-drop: a folder as a host folder, a file as an image.
+                    SourceEvent::Recent(path) => source_action = Some(P::OpenPath(path)),
+                    SourceEvent::PickImage => source_action = Some(P::PickImage),
+                    SourceEvent::PickHostFolder => source_action = Some(P::PickHostFolder),
+                    SourceEvent::PickBackupFolder => source_action = Some(P::PickBackupFolder),
                     SourceEvent::Device(_) => {}
-                    // "Connect to Remote..." opens the host:port dialog. Like the
-                    // other switch events it's blocked while edits are staged
-                    // (connecting replaces the listing), so we hint instead of
-                    // silently doing nothing.
-                    SourceEvent::Remote => {
-                        if self.queue.is_empty() {
-                            self.connect_dialog = Some(ConnectDialog {
-                                host: self
-                                    .remote
-                                    .as_ref()
-                                    .map(|r| r.addr.clone())
-                                    .unwrap_or_default(),
-                                error: None,
-                            });
-                        } else {
-                            status = Some(
-                                "Apply or discard staged edits before connecting to a remote."
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    SourceEvent::Remote => source_action = Some(P::Connect),
                 }
             }
 
             // When inside a remote image, "Close Image" steps back to the host
             // browser (the folder it was opened from) — distinct from "Close",
             // which unloads the whole connection.
-            if matches!(
-                &self.remote,
-                Some(RemoteConn {
-                    mode: BrowseMode::Image { .. },
-                    ..
-                })
-            ) {
+            if pane.is_remote_image() {
                 let btn = egui::Button::new(
                     egui::RichText::new("Close Image").color(close_image_color(ui.visuals())),
                 );
                 if ui
-                    .add_enabled(self.queue.is_empty(), btn)
+                    .add_enabled(pane.queue.is_empty(), btn)
                     .on_hover_text("Back to browsing the remote host filesystem")
                     .clicked()
                 {
-                    // Reuses the live connection (the browser remembers the host
-                    // folder the image was opened from) — no reconnect.
-                    status = Some(self.spawn_close_image());
+                    source_action = Some(P::CloseRemoteImage);
                 }
             }
 
             // Close (unload) this pane — guarded by unsaved staged edits.
-            if (self.source.is_some() || self.listing.is_loaded())
+            if (source.is_some() || pane.listing.is_loaded())
                 && ui
                     .button("Close")
                     .on_hover_text("Unload this pane / disconnect")
                     .clicked()
             {
-                if self.queue.is_empty() {
-                    status = Some(self.close_source());
-                } else {
-                    self.pending_switch = Some(PendingSwitch::Close);
-                }
+                source_action = Some(P::CloseSource);
             }
 
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups / archives are
             // read-only).
-            if !self.listing.is_host() && self.resolved_backup.is_none() && !self.archive_source {
-                let n = self.queue.len();
-                let busy = self.pending_apply.is_some()
-                    || self.pending_preflight.is_some()
-                    || self.pending_open.is_some()
-                    || self.pending_scan.is_some();
+            if pane.stages_edits() {
+                let n = pane.queue.len();
+                let busy = pane.is_busy();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
-                        status = Some(self.apply());
+                        source_action = Some(P::Apply);
                     }
                 });
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button("Discard").clicked() {
-                        self.queue.clear();
-                        status = Some(format!("[{}] discarded staged edits.", self.side.label()));
+                        source_action = Some(P::Discard);
                     }
                 });
                 if n > 0
@@ -2088,7 +345,7 @@ impl CommanderPane {
                         .on_hover_text("Review the pending staged edits")
                         .clicked()
                 {
-                    self.show_edits_popup = !self.show_edits_popup;
+                    source_action = Some(P::ShowEdits(!pane.edits_shown()));
                 }
             }
         });
@@ -2096,57 +353,38 @@ impl CommanderPane {
         // Row 2: partition switcher + New Folder + volume readout. Wrapped so on
         // a narrow pane the volume readout flows onto a second line instead of
         // overlapping the New Folder button.
-        if self.listing.is_loaded() {
+        if pane.listing.is_loaded() {
             ui.horizontal_wrapped(|ui| {
                 // Filesystem / partition dropdown (image panes only; host
                 // folders have none). An optical disc lists its filesystems
                 // (ISO 9660 + any hybrid Mac side); every other image lists its
                 // partition-table entries.
-                if !self.listing.is_host() {
-                    // (label per index, empty-state text) for the active list.
-                    let labels: Vec<String> = if self.optical_source {
-                        self.optical_choices
-                            .iter()
-                            .map(|c| c.label.clone())
-                            .collect()
-                    } else {
-                        self.partitions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| partition_label(i, p))
-                            .collect()
-                    };
-                    let empty_text = if self.optical_source {
+                if !pane.listing.is_host() {
+                    let labels = pane.partition_label_parts();
+                    let empty_text = if pane.is_optical() {
                         "(no filesystems)"
                     } else {
                         "(no partitions)"
                     };
-                    let current = self
-                        .selected_part
-                        .and_then(|i| labels.get(i).cloned())
-                        .unwrap_or_else(|| empty_text.to_string());
-                    let mut chosen = self.selected_part;
-                    // Cap the width so a long label (e.g. a raw-carve "Amiga
-                    // NDOS (no filesystem)") can't overflow into the volume
-                    // readout on the right.
+                    let selected = pane.selected_partition();
+                    let current: egui::WidgetText = match selected.and_then(|i| labels.get(i)) {
+                        Some(p) => crate::gui::theme::format_label(ui, p).into(),
+                        None => empty_text.into(),
+                    };
+                    let mut chosen = selected;
+                    // Capped so a long label (a raw-carve "Amiga NDOS (no filesystem)") can't push the readout.
                     egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
                         .selected_text(current)
                         .width(210.0)
                         .show_ui(ui, |ui| {
-                            for (i, label) in labels.iter().enumerate() {
+                            for (i, parts) in labels.iter().enumerate() {
+                                let label = crate::gui::theme::format_label(ui, parts);
                                 ui.selectable_value(&mut chosen, Some(i), label);
                             }
                         });
-                    if chosen != self.selected_part {
+                    if chosen != selected {
                         if let Some(i) = chosen {
-                            if self.optical_source {
-                                // Optical panes are read-only — no queue to guard.
-                                status = Some(self.open_optical_choice(i));
-                            } else if self.queue.is_empty() {
-                                status = Some(self.open_partition(i));
-                            } else {
-                                self.pending_switch = Some(PendingSwitch::Partition(i));
-                            }
+                            source_action = Some(P::SelectPartition(i));
                         }
                     }
                 }
@@ -2154,43 +392,36 @@ impl CommanderPane {
                 // New Folder: stages a CreateDirectory on an image pane;
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
-                let busy = self.pending_apply.is_some()
-                    || self.pending_preflight.is_some()
-                    || self.pending_open.is_some()
-                    || self.pending_scan.is_some();
-                if !busy
-                    && self.resolved_backup.is_none()
+                if pane.can_new_folder()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
                         .clicked()
                 {
-                    self.new_folder_dialog = Some(NewFolderDialog {
-                        input: String::new(),
-                        error: None,
-                    });
+                    source_action = Some(P::RequestNewFolder);
                 }
 
                 // Volume label + free space. Rendered inline (not right-aligned)
                 // so on a narrow pane it wraps to a second line rather than
                 // overflowing left into the New Folder button.
                 ui.separator();
-                if self.listing.is_host() {
+                if pane.listing.is_host() {
                     ui.strong("local folder");
                 } else {
-                    let label = if self.volume_label.is_empty() {
-                        self.fs_type.clone()
+                    let vol = pane.volume();
+                    let label = if vol.label.is_empty() {
+                        vol.fs_type.clone()
                     } else {
-                        format!("{} ({})", self.volume_label, self.fs_type)
+                        format!("{} ({})", vol.label, vol.fs_type)
                     };
                     ui.strong(label);
                     ui.separator();
-                    let free = self.total_size.saturating_sub(self.used_size);
+                    let free = vol.total_size.saturating_sub(vol.used_size);
                     ui.label(format!("free: {}", format_size(free)));
                     // Read-only media (archive / backup / remote host): flag it so
                     // the greyed copy-into button reads as "by design", and edits
                     // aren't attempted.
-                    if self.is_read_only() {
+                    if pane.is_read_only() {
                         ui.separator();
                         ui.colored_label(read_only_badge_color(ui.visuals()), "Read-only")
                             .on_hover_text(
@@ -2201,63 +432,24 @@ impl CommanderPane {
                 }
             });
         }
-        status
-    }
-
-    /// Unload the pane back to the empty state (the "Close" button). The caller
-    /// guards this behind the unsaved-edits check; here we just reset.
-    /// Clear the optical-source state. Called wherever a pane switches to a
-    /// non-optical source so a stale `optical_choices` picker can't linger.
-    fn reset_optical(&mut self) {
-        self.optical_source = false;
-        self.optical_choices.clear();
-    }
-
-    fn close_source(&mut self) -> String {
-        self.source = None;
-        self.partitions.clear();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.selected_part = None;
-        self.listing = DirListing::new();
-        self.session = None;
-        self.queue.clear();
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.pending_scan = None;
-        self.pending_wrapper = None;
-        self.open_phase.clear();
-        self.volume_label.clear();
-        self.fs_type.clear();
-        self.total_size = 0;
-        self.used_size = 0;
-        self.error = None;
-        self.pending_host_delete = None;
-        self.rename_dialog = None;
-        // Disconnect any remote session: dropping the browser drops the last
-        // Arc to the shared connection (the daemon reaps its handles).
-        self.browser = None;
-        self.remote = None;
-        self.pending_remote = None;
-        self.connect_dialog = None;
-        format!("[{}] closed.", self.side.label())
-    }
-
-    /// The "Pending edits" review popup: a plain-language list of every staged
-    /// edit on this pane, in apply order. Opened by the "Edits (N)" button.
-    fn render_edits_popup(&mut self, ctx: &egui::Context) {
-        if !self.show_edits_popup {
-            return;
+        if let Some(action) = source_action {
+            self.pane_action(out, action);
         }
-        // Auto-close once the queue empties (Apply / Discard).
-        if self.queue.is_empty() {
-            self.show_edits_popup = false;
+    }
+
+    /// The "Pending edits" list: every staged edit in plain words, in apply order, each removable.
+    fn render_edits_popup(
+        &self,
+        ctx: &egui::Context,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        if !pane.edits_shown() {
             return;
         }
         let mut open = true;
-        let lines = self.queue.describe();
+        let busy = pane.is_busy();
+        let lines = pane.edit_lines();
         egui::Window::new(format!("Pending edits ({})", self.side.label()))
             .open(&mut open)
             .resizable(true)
@@ -2270,603 +462,78 @@ impl CommanderPane {
                     .max_height(320.0)
                     .show(ui, |ui| {
                         for (i, line) in lines.iter().enumerate() {
-                            ui.label(format!("{}. {line}", i + 1));
+                            ui.horizontal(|ui| {
+                                let remove = egui::Button::new("X").small();
+                                if ui
+                                    .add_enabled(!busy, remove)
+                                    .on_hover_text("Remove this edit from the queue")
+                                    .clicked()
+                                {
+                                    self.pane_action(out, P::Unstage(i));
+                                }
+                                ui.label(format!("{}. {line}", i + 1));
+                            });
                         }
                     });
             });
         if !open {
-            self.show_edits_popup = false;
+            self.pane_action(out, P::ShowEdits(false));
         }
     }
 
-    fn path_line(&mut self, ui: &mut egui::Ui) {
+    /// The partition tag and the cwd as crumbs; clicking a crumb navigates there.
+    fn path_line(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
         ui.horizontal(|ui| {
-            let prefix = if self.listing.is_host() {
-                "host".to_string()
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let prefix = if pane.listing.is_host() {
+                "host ".to_string()
             } else {
-                match self.selected_part {
-                    Some(i) => format!("@{}", i + 1),
-                    None => "-".to_string(),
+                match pane.selected_partition() {
+                    Some(i) => format!("@{} ", i + 1),
+                    None => "- ".to_string(),
                 }
             };
             ui.monospace(prefix);
-            let path = self.listing.cwd_path();
-            ui.monospace(if path.is_empty() { "/" } else { path });
+            let crumbs = pane.path_crumbs();
+            if crumbs.is_empty() {
+                ui.monospace("/");
+            }
+            let last = crumbs.len().saturating_sub(1);
+            for (i, (label, target)) in crumbs.into_iter().enumerate() {
+                let text = egui::RichText::new(label).monospace();
+                match target {
+                    Some(t) if i < last => {
+                        if ui.link(text).clicked() {
+                            self.pane_action(out, P::NavigateTo(t));
+                        }
+                    }
+                    _ => {
+                        ui.label(text);
+                    }
+                }
+            }
         });
     }
 
-    // --- opening -----------------------------------------------------------
+    // --- apply: the review and report are views over controller state ------
 
-    /// Index of the first partition the browser can actually open — skips
-    /// extended containers *and* non-filesystem partitions (APM driver /
-    /// partition-map entries, EFI system partitions, ...). Uses the shared
-    /// engine gate so Commander, the Inspect grid, and the CLI agree.
-    fn first_browsable_partition(&self) -> Option<usize> {
-        self.partitions.iter().position(|p| {
-            !p.is_extended_container
-                && partition_is_browsable(
-                    p.partition_type_byte,
-                    p.partition_type_string.as_deref(),
-                    &p.type_name,
-                )
-        })
-    }
-
-    /// Probe a freshly-picked file and start browsing its first real partition.
-    fn load_source(&mut self, path: PathBuf) -> String {
-        self.source = Some(path.clone());
-        // Record in the Commander recent MRU (single choke point for local image
-        // opens: picker, recent quick-pick, drag-and-drop, deferred switch), then
-        // refresh this pane's merged view.
-        super::super::push_recent(RecentMode::Commander, &path);
-        self.recent = super::super::load_recent_merged();
-        self.listing = DirListing::new();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.optical_source = false;
-        self.optical_choices.clear();
-        self.cache_store.clear();
-        self.pending_open = None;
-        self.error = None;
-        self.selected_part = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        // A Mac archive (.sit / .hqx / .sea / .cpt / .mar) isn't a disk image —
-        // open it read-only in-pane as an ArchiveFilesystem instead of parsing a
-        // (nonexistent) partition table.
-        if is_mac_archive_path(&path) {
-            return self.load_archive(path);
-        }
-
-        // An optical disc image (.iso / .cue / .toast / .cdr / …) is browsed
-        // through `opticaldiscs`, not the partition table: a hybrid Mac/PC disc
-        // carries an ISO 9660 volume *and* an HFS side that a plain APM parse
-        // (which sees only the Apple_HFS partition) hides. Route it to the
-        // optical opener so the picker lists both. Content-confirmed: an empty
-        // list (not really an optical disc) falls through to `probe_partitions`.
-        let is_optical_ext = path.file_name().and_then(|n| n.to_str()).and_then(classify)
-            == Some(DescendKind::Optical);
-        if is_optical_ext {
-            let choices = optical_filesystems(&path);
-            if !choices.is_empty() {
-                return self.load_optical(choices);
-            }
-        }
-
-        match commander_source::probe_partitions(&path) {
-            Ok(parts) => {
-                self.partitions = parts;
-                // Auto-open the first *browsable* partition (skips APM driver /
-                // partition-map entries and other non-filesystem partitions).
-                match self.first_browsable_partition() {
-                    Some(i) => self.open_partition(i),
-                    None => format!(
-                        "[{}] {} has no browsable partitions.",
-                        self.side.label(),
-                        path.display()
-                    ),
-                }
-            }
-            Err(e) => {
-                self.partitions.clear();
-                self.error = Some(format!("Could not read partitions: {e:#}"));
-                format!("[{}] failed to open {}", self.side.label(), path.display())
-            }
-        }
-    }
-
-    /// Open a Mac archive as a read-only in-pane source (`ArchiveFilesystem`).
-    /// Synchronous — archives decode fully in memory, so there's no worker
-    /// thread; this is the same install `poll_open` does, minus the partition
-    /// machinery. Copy-OUT (both forks) flows through the session-less path.
-    fn load_archive(&mut self, path: PathBuf) -> String {
-        self.partitions.clear();
-        self.reset_optical();
-        self.selected_part = None;
-        self.session = None;
-        self.queue.clear();
-        let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let mut fs = match open_archive(&path, label) {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("Could not open archive: {e:#}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
+    pub(crate) fn render_apply_review(
+        &mut self,
+        ctx: &egui::Context,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let Some(p) = pane.apply_review() else {
+            self.review_choice = OnConflict::Skip;
+            return;
         };
-        let root = match fs.root() {
-            Ok(r) => r,
-            Err(e) => {
-                self.error = Some(format!("Could not read archive root: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
-        };
-        let entries = match fs.list_directory(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error = Some(format!("Could not list archive: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), path.display());
-            }
-        };
-        self.volume_label = fs.volume_label().unwrap_or_default().to_string();
-        self.fs_type = fs.fs_type().to_string();
-        self.archive_source = true;
-        let n = entries.len();
-        self.listing.load_root(fs, root, entries, false);
-        format!(
-            "[{}] opened archive {} ({n} item(s)).",
-            self.side.label(),
-            path.display()
-        )
-    }
-
-    /// Open an optical disc image (`.iso` / `.cue` / `.toast` / …) as a
-    /// read-only in-pane source. `choices` are the disc's filesystems (primary
-    /// ISO 9660 + any hybrid Mac side); the picker lists them and
-    /// `open_optical_choice` opens the selected one. Sessionless, like a Mac
-    /// archive — copy-OUT flows through the session-less path.
-    fn load_optical(&mut self, choices: Vec<OpticalFsChoice>) -> String {
-        self.partitions.clear();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.optical_source = true;
-        self.optical_choices = choices;
-        self.session = None;
-        self.queue.clear();
-        // Auto-open the first filesystem (the primary — usually ISO 9660).
-        self.open_optical_choice(0)
-    }
-
-    /// Open the optical filesystem at `optical_choices[idx]` (primary or a
-    /// hybrid Mac side) and load its root. Read-only and sessionless.
-    fn open_optical_choice(&mut self, idx: usize) -> String {
-        let Some(path) = self.source.clone() else {
-            return String::new();
-        };
-        let Some(choice) = self.optical_choices.get(idx).cloned() else {
-            return String::new();
-        };
-        self.selected_part = Some(idx);
-        self.error = None;
-        self.listing = DirListing::new();
-        self.queue.clear();
-        let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-
-        let opened = match choice.hybrid_index {
-            None => open_optical(&path, label),
-            Some(h) => open_optical_hybrid(&path, h, label),
-        };
-        let mut fs = match opened {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("{e:#}"));
-                return format!("[{}] cannot open {}: {e}", self.side.label(), choice.label);
-            }
-        };
-        let root = match fs.root() {
-            Ok(r) => r,
-            Err(e) => {
-                self.error = Some(format!("Could not read disc root: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), choice.label);
-            }
-        };
-        let entries = match fs.list_directory(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error = Some(format!("Could not list disc: {e}"));
-                return format!("[{}] failed to open {}", self.side.label(), choice.label);
-            }
-        };
-        self.volume_label = fs.volume_label().unwrap_or_default().to_string();
-        self.fs_type = fs.fs_type().to_string();
-        // Optical discs report no usable free-space figure; zero the readout.
-        self.total_size = 0;
-        self.used_size = 0;
-        let n = entries.len();
-        self.listing.load_root(fs, root, entries, false);
-        format!(
-            "[{}] opened {} ({n} item(s)).",
-            self.side.label(),
-            choice.label
-        )
-    }
-
-    /// Open a backup folder — native rusty-backup *or* Clonezilla (the shared
-    /// resolver detects which) — and start browsing its first browsable
-    /// partition. The partition dropdown lists the backed-up partitions;
-    /// `open_partition` routes through the resolver to build the right session.
-    fn load_backup_source(&mut self, folder: PathBuf) -> String {
-        self.source = Some(folder.clone());
-        self.listing = DirListing::new();
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.partitions.clear();
-        self.session = None;
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.queue.clear();
-        self.error = None;
-        self.selected_part = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        match commander_source::resolve_backup(&folder) {
-            Ok(resolved) => {
-                self.partitions = resolved.partitions().to_vec();
-                self.resolved_backup = Some(resolved);
-                match self.first_browsable_partition() {
-                    Some(i) => self.open_partition(i),
-                    None => format!(
-                        "[{}] backup has no browsable partitions.",
-                        self.side.label()
-                    ),
-                }
-            }
-            Err(e) => {
-                self.error = Some(format!("Could not read backup: {e:#}"));
-                format!(
-                    "[{}] failed to open backup {}",
-                    self.side.label(),
-                    folder.display()
-                )
-            }
-        }
-    }
-
-    /// Open a host-OS folder as this pane's source (synchronous `std::fs` read;
-    /// writes to a host pane are immediate, never staged).
-    fn load_host(&mut self, dir: PathBuf) -> String {
-        self.source = Some(dir.clone());
-        self.resolved_backup = None;
-        self.archive_source = false;
-        self.reset_optical();
-        self.cache_store.clear();
-        self.partitions.clear();
-        self.selected_part = None;
-        self.session = None;
-        self.pending_open = None;
-        self.pending_apply = None;
-        self.queue.clear();
-        self.error = None;
-        self.volume_label.clear();
-        self.fs_type.clear();
-
-        match self.listing.load_host_root(dir.clone()) {
-            Ok(()) => format!(
-                "[{}] opened host folder {} ({} item(s)).",
-                self.side.label(),
-                dir.display(),
-                self.listing.entries().len()
-            ),
-            Err(e) => {
-                self.listing = DirListing::new();
-                self.error = Some(format!("Could not read folder: {e}"));
-                format!(
-                    "[{}] failed to open folder {}",
-                    self.side.label(),
-                    dir.display()
-                )
-            }
-        }
-    }
-
-    /// Begin an async open of partition `idx`. Builds a backup-data session
-    /// (per compression) when the source is a backup folder, otherwise a
-    /// raw-image session.
-    fn open_partition(&mut self, idx: usize) -> String {
-        let Some(path) = self.source.clone() else {
-            return String::new();
-        };
-        let Some(part) = self.partitions.get(idx).cloned() else {
-            return String::new();
-        };
-        self.selected_part = Some(idx);
-        self.error = None;
-        self.listing = DirListing::new();
-        self.queue.clear();
-        self.pending_scan = None;
-
-        // Non-filesystem partitions (APM driver / partition-map entries, EFI,
-        // ...) can't be browsed — surface a clear message instead of letting
-        // `open_filesystem` fail with a raw "unsupported partition type" error.
-        if !partition_is_browsable(
-            part.partition_type_byte,
-            part.partition_type_string.as_deref(),
-            &part.type_name,
-        ) {
-            let msg = format!("{} has no browsable filesystem.", part.type_name);
-            self.error = Some(msg.clone());
-            return format!("[{}] {msg}", self.side.label());
-        }
-
-        // Resolve the session. A backup folder routes through the shared
-        // resolver (native -> per-compression session; Clonezilla -> a partclone
-        // block cache from a prior scan); a plain image builds a raw session.
-        // `open_partition` returns owned data, so the `resolved_backup` borrow is
-        // released before we mutate the pane on the error paths below.
-        use commander_source::BackupPartitionOpen;
-        let open_result = self
-            .resolved_backup
-            .as_ref()
-            .map(|r| r.open_partition(part.index));
-        let session = match open_result {
-            Some(Ok(BackupPartitionOpen::Session(s))) => s,
-            Some(Ok(BackupPartitionOpen::Clonezilla(open))) => {
-                // Shared decision tree: a cache scanned earlier this session is
-                // reused in memory; else a prior on-disk scan loads; else a
-                // background scan builds one (`poll_scan` memoizes + opens it).
-                match self.cache_store.resolve(part.index, &open) {
-                    commander_source::PartcloneLookup::Ready(cache) => {
-                        commander_source::session_for_partclone_cache(cache, open.partition_type)
-                    }
-                    commander_source::PartcloneLookup::NeedsScan { cache, cache_path } => {
-                        self.pending_scan = Some(cache_runner::spawn_partclone_scan(
-                            cache,
-                            part.index,
-                            open.partition_type,
-                            cache_path,
-                        ));
-                        self.open_phase = "Scanning Clonezilla metadata...".to_string();
-                        return format!(
-                            "[{}] scanning Clonezilla metadata for {} ...",
-                            self.side.label(),
-                            partition_label(idx, &part)
-                        );
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                self.error = Some(format!("{e:#}"));
-                return format!(
-                    "[{}] cannot browse {}: {e}",
-                    self.side.label(),
-                    partition_label(idx, &part)
-                );
-            }
-            None => commander_source::session_for(&path, &part),
-        };
-        self.open_rate = super::super::progress::RateTracker::default();
-        self.pending_open = Some(session.spawn_open());
-        self.session = Some(session);
-        self.open_phase = "Opening...".to_string();
-        format!(
-            "[{}] opening {} ...",
-            self.side.label(),
-            partition_label(idx, &part)
-        )
-    }
-
-    /// Poll an in-flight Clonezilla metadata scan; on completion, build a
-    /// partclone-cache session and hand off to the normal async-open path (so
-    /// `poll_open` loads the root listing). Returns a status line on completion.
-    fn poll_scan(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_scan.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        self.pending_scan = None;
-        if let Some(err) = guard.error.take() {
-            drop(guard);
-            self.error = Some(format!("Clonezilla metadata scan failed: {err}"));
-            return Some(format!("[{}] Clonezilla scan failed.", self.side.label()));
-        }
-        let cache = Arc::clone(&guard.cache);
-        let partition_type = guard.partition_type;
-        let part_index = guard.partition_index;
-        drop(guard);
-        // Memoize the freshly-scanned cache so re-opening this partition reuses
-        // it in memory instead of re-loading the persisted scan from disk.
-        self.cache_store.insert(part_index, Arc::clone(&cache));
-        let session = commander_source::session_for_partclone_cache(cache, partition_type);
-        self.open_phase = "Opening...".to_string();
-        self.open_rate = super::super::progress::RateTracker::default();
-        self.pending_open = Some(session.spawn_open());
-        self.session = Some(session);
-        Some(format!(
-            "[{}] metadata ready; opening...",
-            self.side.label()
-        ))
-    }
-
-    /// Poll an in-flight async wrapper expansion; on completion, install the
-    /// prepared mount (or record the failure) and drop the spinner.
-    fn poll_wrapper(&mut self, ctx: &egui::Context) -> Option<String> {
-        let finished = {
-            let pw = self.pending_wrapper.as_ref()?;
-            ctx.request_repaint();
-            pw.status.lock().ok().map(|g| g.finished).unwrap_or(false)
-        };
-        if !finished {
-            return None;
-        }
-        let pw = self.pending_wrapper.take()?;
-        let result = pw.status.lock().ok().and_then(|mut g| g.result.take());
-        match result {
-            Some(Ok(prepared)) => {
-                let note = self.wrapper_tree.install_prepared(&pw.node_id, prepared);
-                let side = self.side.label();
-                Some(match note {
-                    Some(n) => format!("[{side}] {}: {n}", pw.name),
-                    None => format!("[{side}] opened {}.", pw.name),
-                })
-            }
-            Some(Err(e)) => self.wrapper_open_failed(&pw.name, e),
-            None => None,
-        }
-    }
-
-    /// Poll an in-flight open; on completion, hand the filesystem + root listing
-    /// to the model or record the error. Returns a status line on completion.
-    fn poll_open(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_open.clone()?;
-        ctx.request_repaint(); // keep polling until the worker finishes
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            self.open_phase = guard.phase.clone();
-            return None;
-        }
-        // Finished — detach the pending handle either way.
-        self.pending_open = None;
-
-        // Encrypted source: the worker flags `needs_password` for a locked
-        // container OR a locked APFS FileVault volume (which opens fine but
-        // fails at the root listing). Show the unlock prompt instead of a dead
-        // error; the (locked) fs is dropped. Capture the label/fs_type first so
-        // the prompt can adapt (APFS) and the source bar still reads the volume.
-        if guard.needs_password {
-            self.volume_label = guard.volume_label.clone();
-            self.fs_type = guard.fs_type.clone();
-            self.needs_password = true;
-            self.error = None;
-            return None;
-        }
-        // The open completed without needing a secret — clear any prior prompt
-        // (e.g. a successful unlock, or switching to an unencrypted source) and
-        // drop the entered secret from memory.
-        self.needs_password = false;
-        self.password_input.clear();
-
-        if let Some(err) = guard.error.take() {
-            // A failed post-apply reopen must not lose what is still staged.
-            if let Some((edits, _)) = self.reopen_restore.take() {
-                for e in edits {
-                    self.queue.push(e);
-                }
-            }
-            self.error = Some(err);
-            return Some(format!("[{}] open failed.", self.side.label()));
-        }
-
-        let fs = guard.fs.take();
-        let root = guard.root.take();
-        let entries = guard.root_entries.take().unwrap_or_default();
-        self.volume_label = guard.volume_label.clone();
-        self.fs_type = guard.fs_type.clone();
-        self.total_size = guard.total_size;
-        self.used_size = guard.used_size;
-        drop(guard);
-
-        match (fs, root) {
-            (Some(fs), Some(root)) => {
-                self.listing.load_root(fs, root, entries, false);
-                if let Some((edits, cwd)) = self.reopen_restore.take() {
-                    for e in edits {
-                        self.queue.push(e);
-                    }
-                    let _ = self.listing.navigate_to(&cwd);
-                }
-                Some(format!(
-                    "[{}] opened {} ({} item(s)).",
-                    self.side.label(),
-                    if self.volume_label.is_empty() {
-                        self.fs_type.clone()
-                    } else {
-                        self.volume_label.clone()
-                    },
-                    self.listing.entries().len()
-                ))
-            }
-            _ => {
-                self.error = Some("Filesystem opened but no root directory was returned.".into());
-                None
-            }
-        }
-    }
-
-    // --- staging -----------------------------------------------------------
-
-    /// Check the staged queue against this pane's volume, then apply (see `poll_preflight`).
-    fn apply(&mut self) -> String {
-        if self.queue.is_empty() {
-            return String::new();
-        }
-        // A remote image pane has no local BrowseSession — apply over the wire.
-        if self.is_remote_image() {
-            return self.apply_remote();
-        }
-        let Some(session) = self.session.clone() else {
-            return format!("[{}] no source to apply to.", self.side.label());
-        };
-        let n = self.queue.len();
-        let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
-        self.pending_preflight = Some(commander_ops::spawn_apply_preflight(session, edits));
-        self.apply_report = None;
-        format!("[{}] checking {n} staged edit(s)...", self.side.label())
-    }
-
-    /// Write the queue, continuing past failed items so one bad file can't strand the batch.
-    fn start_apply(&mut self) -> String {
-        let Some(session) = self.session.clone() else {
-            return format!("[{}] no source to apply to.", self.side.label());
-        };
-        let n = self.queue.len();
-        let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
-        self.pending_apply = Some(commander_ops::spawn_apply(session, edits, true));
-        self.error = None;
-        format!("[{}] applying {n} edit(s)...", self.side.label())
-    }
-
-    fn poll_preflight(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_preflight.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        let result = guard.result.take();
-        drop(guard);
-        self.pending_preflight = None;
-        let side = self.side.label();
-        match result? {
-            Ok(p) if p.is_clean() => Some(self.start_apply()),
-            Ok(p) => {
-                self.apply_review = Some(ApplyReview {
-                    preflight: p,
-                    on_conflict: OnConflict::Skip,
-                });
-                Some(format!("[{side}] review the staged edits before applying."))
-            }
-            Err(e) => {
-                self.apply_report = Some(ApplyReport {
-                    total: self.queue.len(),
-                    applied: 0,
-                    failed: Vec::new(),
-                    not_tried: 0,
-                    fatal: Some(format!("Could not check the staged edits: {e}")),
-                });
-                Some(format!("[{side}] could not check the staged edits."))
-            }
-        }
-    }
-
-    fn render_apply_review(&mut self, ctx: &egui::Context) -> Option<String> {
-        let review = self.apply_review.as_mut()?;
-        let p = &review.preflight;
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
+        let choice = &mut self.review_choice;
         let mut go = None;
         egui::Window::new(format!("Before applying ({})", self.side.label()))
             .collapsible(false)
@@ -2894,8 +561,8 @@ impl CommanderPane {
                     ));
                     path_list(ui, "review_conflicts", p.scan.conflicts.iter().map(|c| &c.0));
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut review.on_conflict, OnConflict::Skip, "Skip existing");
-                        ui.radio_value(&mut review.on_conflict, OnConflict::Replace, "Overwrite");
+                        ui.radio_value(choice, OnConflict::Skip, "Skip existing");
+                        ui.radio_value(choice, OnConflict::Replace, "Overwrite");
                     });
                     ui.add_space(4.0);
                 }
@@ -2928,25 +595,26 @@ impl CommanderPane {
                     }
                 });
             });
-        let go = go?;
-        let review = self.apply_review.take()?;
-        if !go {
-            return Some(format!(
-                "[{}] apply cancelled; nothing was written.",
-                self.side.label()
-            ));
+        match go {
+            Some(true) => self.pane_action(out, P::ApplyReviewed(self.review_choice)),
+            Some(false) => self.pane_action(out, P::DismissReview),
+            None => {}
         }
-        if !review.preflight.scan.conflicts.is_empty() {
-            self.queue.set_all_conflicts(review.on_conflict);
-        }
-        Some(self.start_apply())
     }
 
-    fn render_apply_report(&mut self, ctx: &egui::Context) -> Option<String> {
-        let report = self.apply_report.as_ref()?;
+    pub(crate) fn render_apply_report(
+        &self,
+        ctx: &egui::Context,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let Some(report) = pane.apply_report() else {
+            return;
+        };
         let danger = super::super::theme::danger_muted(&ctx.global_style().visuals);
-        let still = self.queue.len();
-        let mut action = None;
+        let still = pane.queue.len();
+        let mut then = None;
+        let mut dismiss = false;
         egui::Window::new(format!("Apply report ({})", self.side.label()))
             .collapsible(false)
             .resizable(true)
@@ -2983,14 +651,14 @@ impl CommanderPane {
                     ui.add_space(4.0);
                     ui.label(format!(
                         "Stopped after {} failures in a row; {} edit(s) were not tried.",
-                        commander_ops::MAX_CONSECUTIVE_FAILURES,
-                        report.not_tried
+                        MAX_CONSECUTIVE_FAILURES, report.not_tried
                     ));
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if still > 0 && ui.button("Retry").clicked() {
-                        action = Some(0);
+                        dismiss = true;
+                        then = Some(P::Apply);
                     }
                     if still > 0
                         && ui
@@ -2998,206 +666,115 @@ impl CommanderPane {
                             .on_hover_text("Drop the edits that did not apply")
                             .clicked()
                     {
-                        action = Some(1);
+                        dismiss = true;
+                        then = Some(P::Discard);
                     }
                     if ui.button("Close").clicked() {
-                        action = Some(2);
+                        dismiss = true;
                     }
                 });
             });
-        let action = action?;
-        self.apply_report = None;
-        match action {
-            0 => Some(self.apply()),
-            1 => {
-                self.queue.clear();
-                Some(format!(
-                    "[{}] discarded the remaining staged edits.",
-                    self.side.label()
-                ))
-            }
-            _ => None,
+        if dismiss {
+            self.pane_action(out, P::DismissReport);
+        }
+        if let Some(action) = then {
+            self.pane_action(out, action);
         }
     }
 
-    /// Apply the staged queue to a remote image over the Family-F write path
-    /// (`OpenSession` → `StageUpload`/`StageMkdir` → `Apply`), bound to the same
-    /// `(image_path, partition)` the pane is browsing so the daemon resolves the
-    /// partition exactly as it did for the browse. Only copy-in edits travel
-    /// over the wire, so a queue containing anything else is refused here (before
-    /// spawning) rather than half-applied.
-    fn apply_remote(&mut self) -> String {
-        let (addr, path, partition) = match &self.remote {
-            Some(RemoteConn {
-                addr,
-                mode: BrowseMode::Image { path, partition },
-            }) => (addr.clone(), path.clone(), partition.clone()),
-            _ => return format!("[{}] no remote image to apply to.", self.side.label()),
-        };
-        if self.queue.iter().any(|e| {
-            !matches!(
-                e,
-                StagedEdit::AddFile { .. } | StagedEdit::CreateDirectory { .. }
-            )
-        }) {
-            return format!(
-                "[{}] remote panes accept copied files/folders only; delete / \
-                 rename over the wire isn't supported yet.",
-                self.side.label()
-            );
-        }
-        let n = self.queue.len();
-        let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
-        self.pending_apply = Some(commander_ops::spawn_remote_apply(
-            addr, path, partition, edits,
-        ));
-        self.error = None;
-        format!(
-            "[{}] uploading {n} item(s) to the remote image...",
-            self.side.label()
-        )
-    }
+    // --- folder tree (TreeAndList) ------------------------------------------
 
-    /// Poll an in-flight apply: drop what landed from the queue, reopen the
-    /// volume (its cached catalog predates the write), and report any failures.
-    fn poll_apply(&mut self, ctx: &egui::Context) -> Option<String> {
-        let arc = self.pending_apply.clone()?;
-        ctx.request_repaint();
-        let mut guard = arc.lock().ok()?;
-        if !guard.finished {
-            return None;
-        }
-        self.pending_apply = None;
-        let fatal = guard.error.take();
-        let outcome = guard.outcome.take().unwrap_or_default();
-        drop(guard);
-        let side = self.side.label();
-        if self.is_remote_image() {
-            return Some(self.finish_remote_apply(fatal));
-        }
-        let total = self.queue.len();
-        self.queue.remove_indices(&outcome.applied_indices);
-        let applied = outcome.applied();
-        for f in &outcome.failed {
-            self.log_events
-                .push(format!("[{side}] failed: {}: {}", f.label, f.error));
-        }
-        let clean = fatal.is_none() && outcome.failed.is_empty();
-        if !clean {
-            self.apply_report = Some(ApplyReport {
-                total,
-                applied,
-                not_tried: outcome.stopped_at.map_or(0, |at| total.saturating_sub(at)),
-                failed: outcome.failed,
-                fatal: fatal.map(|e| format!("Apply stopped: {e}")),
-            });
-        }
-        let msg = if clean {
-            format!("[{side}] applied {applied} edit(s).")
-        } else {
-            format!(
-                "[{side}] applied {applied} of {total} edit(s); {} still staged.",
-                self.queue.len()
-            )
-        };
-        self.reopen_after_apply();
-        self.log_events.push(msg.clone());
-        Some(msg)
-    }
-
-    /// Reopen the partition after a write, keeping what is still staged and the current folder.
-    fn reopen_after_apply(&mut self) {
-        let Some(i) = self.selected_part else {
-            return;
-        };
-        let keep: Vec<StagedEdit> = self.queue.drain().collect();
-        let cwd = self.listing.cwd_path().to_string();
-        self.open_partition(i);
-        self.reopen_restore = Some((keep, cwd));
-    }
-
-    /// Remote applies are all-or-nothing on the daemon; reopen on success so the copy shows.
-    fn finish_remote_apply(&mut self, fatal: Option<String>) -> String {
-        if let Some(err) = fatal {
-            self.apply_report = Some(ApplyReport {
-                total: self.queue.len(),
-                applied: 0,
-                failed: Vec::new(),
-                not_tried: 0,
-                fatal: Some(format!("Apply failed: {err}")),
-            });
-            return format!("[{}] apply failed.", self.side.label());
-        }
-        let n = self.queue.len();
-        self.queue.clear();
-        // The daemon's browse handle snapshotted the catalog before the write
-        // session committed; a fresh handle shows the copied files.
-        let reopen = match &self.remote {
-            Some(RemoteConn {
-                mode: BrowseMode::Image { path, partition },
-                ..
-            }) => Some((path.clone(), partition.clone())),
-            _ => None,
-        };
-        if let Some((path, partition)) = reopen {
-            let from = remote_parent_dir(&path);
-            let _ = self.spawn_open_image(path, partition, from);
-        }
-        let msg = format!("[{}] applied {n} edit(s).", self.side.label());
-        self.log_events.push(msg.clone());
-        msg
-    }
-
-    /// Toggle the staged-delete state of `names` in the current directory:
-    /// stage a delete on a normal entry, undelete a pending delete, or un-stage
-    /// a pending copy / new folder.
-    fn toggle_delete(&mut self, names: &[String]) {
-        let Some(cwd) = self.listing.cwd().cloned() else {
-            return;
-        };
-        let pending_adds = self.queue.pending_adds_for(&cwd.path);
-        for name in names {
-            if let Some(add) = pending_adds.iter().find(|e| &e.name == name) {
-                if add.is_directory() {
-                    self.queue.remove_pending_subtree(&add.path);
-                } else {
-                    self.queue.remove_pending_add(&add.path);
+    /// The folder tree above the list: a half-width pane has no room beside it.
+    fn render_folder_tree(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        active: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let side = self.side;
+        let height = (ui.available_height() * 0.3).clamp(ROW_H * 3.0, ROW_H * 12.0);
+        let sel = pane.tree_cursor();
+        let focused = active && pane.tree_focused();
+        let mut acts = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt(("commander_folder_tree", side.idx()))
+            .max_height(height)
+            .min_scrolled_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, node) in pane.folder_tree().iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), ROW_H),
+                        egui::Sense::click(),
+                    );
+                    let v = ui.visuals();
+                    if i == sel {
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            v.selection.bg_fill,
+                        );
+                    } else if resp.hovered() {
+                        let fill = v.widgets.hovered.bg_fill;
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+                    }
+                    if i == sel && focused {
+                        let stroke = egui::Stroke::new(1.0_f32, v.selection.stroke.color);
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let x = rect.left() + 6.0 + node.depth as f32 * TREE_INDENT;
+                    let mid = rect.center().y;
+                    let font = egui::FontId::proportional(13.0);
+                    ui.painter().text(
+                        egui::pos2(x, mid),
+                        egui::Align2::LEFT_CENTER,
+                        if node.expanded { "-" } else { "+" },
+                        font.clone(),
+                        v.weak_text_color(),
+                    );
+                    let name = if node.depth == 0 {
+                        "/".to_string()
+                    } else {
+                        format!("{}/", node.entry.name)
+                    };
+                    ui.painter().text(
+                        egui::pos2(x + TOGGLE_W, mid),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        font,
+                        super::super::theme::info(v),
+                    );
+                    let on_toggle = resp
+                        .interact_pointer_pos()
+                        .is_some_and(|p| p.x >= x && p.x < x + TOGGLE_W);
+                    if (resp.clicked() && on_toggle) || resp.double_clicked() {
+                        acts.push(P::FolderTreeToggle(i));
+                    } else if resp.clicked() {
+                        acts.push(P::FolderTreeClick(i));
+                    }
                 }
-                continue;
-            }
-            let Some(entry) = self
-                .listing
-                .entries()
-                .iter()
-                .find(|e| &e.name == name)
-                .cloned()
-            else {
-                continue;
-            };
-            if self.queue.is_pending_delete(&entry.path) {
-                self.queue.remove_pending_delete(&entry.path);
-            } else {
-                // Deleting supersedes a staged rename of the same entry (else
-                // apply would rename it, then fail to delete the old name).
-                self.queue.remove_pending_rename(&entry.path);
-                if entry.is_directory() {
-                    self.queue.push(StagedEdit::DeleteRecursive {
-                        parent: cwd.clone(),
-                        entry,
-                    });
-                } else {
-                    self.queue.push(StagedEdit::DeleteEntry {
-                        parent: cwd.clone(),
-                        entry,
-                    });
-                }
-            }
+            });
+        if !acts.is_empty() {
+            out.push(A::Focus(side));
         }
+        out.extend(acts.into_iter().map(|a| A::Pane(side, a)));
     }
 
     // --- listing grid ------------------------------------------------------
 
-    fn render_header(&mut self, ui: &mut egui::Ui) {
+    fn render_header(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &BrowserPaneController,
+        out: &mut Vec<CommanderAction>,
+    ) {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), ROW_H),
             egui::Sense::click(),
@@ -3206,8 +783,8 @@ impl CommanderPane {
         let mid = rect.center().y;
         let font = egui::FontId::proportional(13.0);
         let color = ui.visuals().strong_text_color();
-        let active = self.listing.sort_column();
-        let desc = self.listing.is_descending();
+        let active = pane.listing.sort_column();
+        let desc = pane.listing.is_descending();
         let caret = |col: SortColumn| -> &'static str {
             if col != active {
                 ""
@@ -3272,62 +849,53 @@ impl CommanderPane {
                 } else {
                     SortColumn::Type
                 };
-                self.listing.resort(clicked);
+                self.pane_action(out, P::SortBy(clicked));
             }
         }
     }
 
-    fn render_rows(&mut self, ui: &mut egui::Ui) -> RowActions {
-        let rows = self.build_display_rows();
-        let busy = self.pending_apply.is_some();
+    fn render_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctl: &CommanderController,
+        active: bool,
+        scroll: bool,
+        out: &mut Vec<CommanderAction>,
+    ) {
+        let side = self.side;
+        let pane = ctl.pane(side);
+        let rows = pane.rows();
+        let cursor = if active { pane.cursor_index() } else { None };
+        let page_rows = ((ui.available_height() / ROW_H) as i32).max(1);
+        if page_rows != self.page_rows {
+            self.page_rows = page_rows;
+            out.push(A::SetPageRows(side, page_rows));
+        }
+        let busy = pane.applying().is_some();
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
-        let host_pane = self.listing.is_host();
+        let host_pane = pane.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
         // delete or rename (both would mutate the backup).
-        let read_only = self.resolved_backup.is_some();
+        let read_only = pane.is_backup();
         // On a remote *host* pane, a file can be opened as a disk image.
-        let remote_host = self.is_remote_host();
+        let remote_host = pane.is_remote_host();
 
-        let mut to_enter: Option<String> = None;
-        let mut to_up = false;
-        let mut click: Option<(String, bool, bool)> = None;
-        let mut bg_deselect = false;
-        let mut ctx_rclick: Option<String> = None;
-        let mut m_delete = false;
-        let mut m_host_delete = false;
-        let mut m_copy = false;
-        let mut m_export = false;
-        let mut m_export_as: Option<ExportFormat> = None;
-        let mut m_checksums = false;
-        let mut m_rename: Option<String> = None;
-        let mut m_cancel_rename: Option<String> = None;
-        let mut m_info: Option<String> = None;
-        let mut m_open_image: Option<String> = None;
-        // node_id, name, is_tree, is_wrapper, currently-expanded.
-        let mut m_toggle: Option<(String, String, bool, bool, bool)> = None;
-        // node_id, ctrl-held, shift-held — selecting a row inside an expanded wrapper.
-        let mut tree_click: Option<(String, bool, bool)> = None;
-        // node_id of a right-clicked tree row (selects it if not selected).
-        let mut tree_rclick: Option<String> = None;
+        // Row clicks this frame, run through the controller in order once drawing is done.
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
+        let mut after: Vec<CommanderAction> = Vec::new();
 
         egui::ScrollArea::vertical()
-            .id_salt(("commander_rows", self.side.idx()))
+            .id_salt(("commander_rows", side.idx()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mods = ui.input(|i| i.modifiers);
-                for row in &rows {
+                for (i, row) in rows.iter().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), ROW_H),
                         egui::Sense::click(),
                     );
-                    let selected = if row.is_parent() {
-                        false
-                    } else if row.is_tree {
-                        self.tree_selected.contains(&row.node_id)
-                    } else {
-                        self.listing.is_selected(&row.name)
-                    };
+                    let selected = pane.row_selected(row);
                     if selected {
                         ui.painter().rect_filled(
                             rect,
@@ -3341,6 +909,18 @@ impl CommanderPane {
                             ui.visuals().widgets.hovered.bg_fill,
                         );
                     }
+                    // With the folder tree holding the keyboard, the list shows no cursor.
+                    if cursor == Some(i) && !pane.tree_focused() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::ZERO,
+                            egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color),
+                            egui::StrokeKind::Inside,
+                        );
+                        if scroll {
+                            ui.scroll_to_rect(rect, None);
+                        }
+                    }
                     paint_row(ui, rect, row);
 
                     // The `+`/`-` disclosure occupies a fixed slot at the row's
@@ -3353,154 +933,41 @@ impl CommanderPane {
                                 .interact_pointer_pos()
                                 .is_some_and(|p| p.x >= toggle_x0 && p.x < toggle_x0 + TOGGLE_W)
                     };
-                    let toggle_req = || {
-                        (
-                            row.node_id.clone(),
-                            row.name.clone(),
-                            row.is_tree,
-                            row.is_wrapper,
-                            row.expanded,
-                        )
-                    };
-
                     if resp.double_clicked() {
-                        if hit_toggle(&resp) {
-                            m_toggle = Some(toggle_req());
-                        } else if row.is_parent() {
-                            to_up = true;
-                        } else if row.is_tree {
-                            // Inside a wrapper: double-click expands a
-                            // folder/wrapper, or selects a file.
-                            if row.expandable {
-                                m_toggle = Some(toggle_req());
-                            } else {
-                                tree_click = Some((row.node_id.clone(), false, false));
-                            }
-                        } else if row.is_dir {
-                            to_enter = Some(row.name.clone());
-                        } else if row.is_wrapper {
-                            // Double-click a wrapper expands it in place.
-                            m_toggle = Some(toggle_req());
-                        } else if remote_host {
-                            m_open_image = Some(row.name.clone());
+                        acts.push(if hit_toggle(&resp) {
+                            P::ToggleExpand(row.node_id.clone())
                         } else {
-                            m_info = Some(row.name.clone());
-                        }
+                            P::Activate(row.node_id.clone())
+                        });
                     } else if resp.clicked() {
                         if hit_toggle(&resp) {
-                            m_toggle = Some(toggle_req());
-                        } else if row.is_tree {
-                            tree_click = Some((row.node_id.clone(), mods.command, mods.shift));
+                            acts.push(P::ToggleExpand(row.node_id.clone()));
+                        } else if row.depth > 0 {
+                            acts.push(P::TreeClick {
+                                node_id: row.node_id.clone(),
+                                ctrl: mods.command,
+                                shift: mods.shift,
+                            });
                         } else if !row.is_parent() {
-                            click = Some((row.name.clone(), mods.command, mods.shift));
+                            acts.push(P::Click {
+                                name: row.name.clone(),
+                                ctrl: mods.command,
+                                shift: mods.shift,
+                            });
                         }
                     }
 
                     // Right-click a data row for its actions.
                     if !row.is_parent() && !busy {
                         let menu = resp.context_menu(|ui| {
-                            // On a remote host pane, offer to open a file as an
-                            // image (browse inside it).
-                            if remote_host
-                                && !row.is_dir
-                                && !row.is_tree
-                                && ui.button("Open Image").clicked()
-                            {
-                                m_open_image = Some(row.name.clone());
-                                ui.close();
-                            }
-                            // Copy applies to real / pending-delete rows, not a
-                            // not-yet-applied staged add.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Copy to other pane").clicked()
-                            {
-                                m_copy = true;
-                                ui.close();
-                            }
-                            // Export the selection to the host. "Export to hard
-                            // drive..." uses the middle-column "Export as" format;
-                            // the "Export" submenu picks a format inline. Needs
-                            // real data, so a not-yet-applied staged add is out.
-                            if !matches!(row.kind, RowKind::PendingAdd) {
-                                if ui.button("Export to hard drive...").clicked() {
-                                    m_export = true;
-                                    ui.close();
-                                }
-                                ui.menu_button("Export as", |ui| {
-                                    for fmt in ExportFormat::ALL {
-                                        if ui.button(fmt.label()).clicked() {
-                                            m_export_as = Some(fmt);
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                            }
-                            // Checksums need real data, so a not-yet-applied
-                            // staged add is excluded (same as Copy / Export).
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Calculate checksums...").clicked()
-                            {
-                                m_checksums = true;
-                                ui.close();
-                            }
-                            // File Info / Details: metadata + preview. Available
-                            // for base-listing rows AND wrapper-tree rows (files
-                            // inside a .sit / .toast / disk-image wrapper), which
-                            // resolve through the mounted wrapper filesystem.
-                            // Needs real data, so a not-yet-applied add is excluded.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("File Info / Details...").clicked()
-                            {
-                                m_info = Some(row.name.clone());
-                                ui.close();
-                            }
-                            // Edit actions are base-listing only — a wrapper's
-                            // contents are read-only (copy out, don't mutate).
-                            if !row.is_tree {
-                                // Rename a single entry in place. A row with a
-                                // rename already staged offers to cancel it
-                                // instead. Suppressed on a read-only backup pane.
-                                if !read_only {
-                                    if matches!(row.kind, RowKind::PendingRename)
-                                        && ui.button("Cancel rename").clicked()
-                                    {
-                                        m_cancel_rename = Some(row.name.clone());
-                                        ui.close();
-                                    } else if matches!(row.kind, RowKind::Normal)
-                                        && ui.button("Rename...").clicked()
-                                    {
-                                        m_rename = Some(row.name.clone());
-                                        ui.close();
-                                    }
-                                }
-                                // Delete (immediate on host, staged on image).
-                                // Suppressed on a read-only backup pane.
-                                if read_only {
-                                    // browse / copy-out only
-                                } else if host_pane {
-                                    if ui.button("Delete (immediate)").clicked() {
-                                        m_host_delete = true;
-                                        ui.close();
-                                    }
-                                } else {
-                                    let label = match row.kind {
-                                        RowKind::PendingDelete => "Undelete",
-                                        RowKind::PendingAdd => "Remove from staging",
-                                        _ => "Delete",
-                                    };
-                                    if ui.button(label).clicked() {
-                                        m_delete = true;
-                                        ui.close();
-                                    }
-                                }
-                            }
+                            row_menu(ui, row, side, remote_host, host_pane, read_only, &mut after)
                         });
                         if menu.is_some() {
-                            if row.is_tree {
-                                tree_rclick = Some(row.node_id.clone());
+                            acts.push(if row.depth > 0 {
+                                P::TreeContextSelect(row.node_id.clone())
                             } else {
-                                ctx_rclick = Some(row.name.clone());
-                            }
+                                P::ContextSelect(row.name.clone())
+                            });
                         }
                     }
                 }
@@ -3510,413 +977,104 @@ impl CommanderPane {
                 if remaining.y > 4.0 {
                     let (_r, bgr) = ui.allocate_exact_size(remaining, egui::Sense::click());
                     if bgr.clicked() {
-                        bg_deselect = true;
+                        acts.push(P::ClearSelection);
                     }
                 }
             });
 
-        // Any row interaction marks this pane "active" for the middle Delete.
-        let focused = click.is_some()
-            || ctx_rclick.is_some()
-            || to_enter.is_some()
-            || to_up
-            || bg_deselect
-            || tree_click.is_some()
-            || tree_rclick.is_some()
-            || m_toggle.is_some();
-
-        let mut status = None;
-        if to_up {
-            self.listing.up();
+        // Any row interaction makes this the active pane, before what the clicks asked for.
+        if !acts.is_empty() {
+            out.push(A::Focus(side));
         }
-        if let Some(name) = to_enter {
-            if let Err(e) = self.listing.enter(&name) {
-                // A synchronous read that hits an encrypted, still-locked volume
-                // (belt-and-suspenders for the "directly through open" paths —
-                // for APFS the root listing already fails at open, but any FS
-                // that opens then errors deeper on a locked read lands here):
-                // surface the unlock prompt instead of a dead status line.
-                if self.session.is_some()
-                    && rusty_backup::model::browse_session::looks_like_password_error(
-                        &e.to_string(),
-                    )
-                {
-                    self.needs_password = true;
-                    self.error = None;
-                } else {
-                    status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
-                }
-            }
-        }
-        if bg_deselect {
-            self.listing.clear_selection();
-            self.clear_tree_selection();
-        }
-        if let Some((name, command, shift)) = click {
-            // A base-listing click takes over the selection from any wrapper.
-            self.clear_tree_selection();
-            if shift {
-                self.listing.shift_click(&name);
-            } else if command {
-                self.listing.ctrl_click(&name);
-            } else {
-                self.listing.click(&name);
-            }
-        }
-        // A click on a row inside an expanded wrapper takes over from the base
-        // selection (the two selection contexts are mutually exclusive).
-        if let Some((node_id, ctrl, shift)) = tree_click {
-            self.listing.clear_selection();
-            let anchor = self
-                .tree_anchor
-                .clone()
-                .filter(|a| self.tree_index.contains_key(a));
-            if let (true, Some(anchor)) = (shift, anchor) {
-                let visible: Vec<TreeRow> = rows
-                    .iter()
-                    .filter(|r| r.is_tree)
-                    .filter_map(|r| self.tree_index.get(&r.node_id).cloned())
-                    .collect();
-                self.tree_selected = tree_range(&visible, &anchor, &node_id);
-            } else if ctrl {
-                if let Some(pos) = self.tree_selected.iter().position(|n| *n == node_id) {
-                    self.tree_selected.remove(pos);
-                } else {
-                    self.tree_selected.push(node_id.clone());
-                }
-                self.tree_anchor = Some(node_id);
-            } else {
-                self.tree_selected = vec![node_id.clone()];
-                self.tree_anchor = Some(node_id);
-            }
-        }
-        // A right-click on an unselected base row acts on just that row.
-        if let Some(name) = &ctx_rclick {
-            if !self.listing.is_selected(name) {
-                self.clear_tree_selection();
-                self.listing.click(name);
-            }
-        }
-        // A right-click on an unselected wrapper row acts on just that row.
-        if let Some(node_id) = &tree_rclick {
-            if !self.tree_selected.contains(node_id) {
-                self.listing.clear_selection();
-                self.tree_selected = vec![node_id.clone()];
-            }
-        }
-        // Expand / collapse a wrapper or inner folder.
-        if let Some((node_id, name, is_tree, is_wrapper, expanded)) = m_toggle {
-            if let Some(s) = self.toggle_wrapper(&node_id, &name, is_tree, is_wrapper, expanded) {
-                status = Some(s);
-            }
-        }
-        if m_delete {
-            let names: Vec<String> = self.listing.selection().to_vec();
-            self.toggle_delete(&names);
-            status = Some(format!(
-                "[{}] toggled delete on {} item(s).",
-                self.side.label(),
-                names.len()
-            ));
-        }
-        if m_host_delete {
-            let names: Vec<String> = self.listing.selection().to_vec();
-            if !names.is_empty() {
-                self.pending_host_delete = Some(names);
-            }
-        }
-        if let Some(name) = m_rename {
-            if let Some(entry) = self
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.name == name)
-                .cloned()
-            {
-                self.rename_dialog = Some(RenameDialog {
-                    input: entry.name.clone(),
-                    entry,
-                    error: None,
-                });
-            }
-        }
-        if let Some(name) = m_cancel_rename {
-            if let Some(path) = self
-                .listing
-                .entries()
-                .iter()
-                .find(|e| e.name == name)
-                .map(|e| e.path.clone())
-            {
-                self.queue.remove_pending_rename(&path);
-                status = Some(format!("[{}] cancelled staged rename.", self.side.label()));
-            }
-        }
-        RowActions {
-            status,
-            copy: m_copy,
-            export: m_export,
-            export_as: m_export_as,
-            checksums: m_checksums,
-            detail: m_info,
-            open_image: m_open_image,
-            focused,
-        }
+        out.extend(acts.into_iter().map(|a| A::Pane(side, a)));
+        out.extend(after);
     }
 }
 
-/// Read up to `max` bytes from a host file for the File Info preview.
-/// Returns `None` on any I/O error (the window then shows metadata only).
-fn read_host_file_capped(path: &str, max: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    file.take(max as u64).read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
-/// True for a Mac-archive file path (`.sit`/`.hqx`/`.sea`/`.cpt`/`.mar`). Such a
-/// file isn't a disk image — a Commander pane opens it read-only in-pane as an
-/// `ArchiveFilesystem` instead of parsing a partition table.
-fn is_mac_archive_path(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| {
-            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(ext))
-        })
-        .unwrap_or(false)
-}
-
-/// The parent directory of a daemon-side path (`/a/b/c.img` -> `/a/b`). Used as
-/// the "opened from" host dir when re-opening a remote image after a write so
-/// "Close Image" still returns near where the image lives.
-fn remote_parent_dir(path: &str) -> String {
-    match path.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(i) => path[..i].to_string(),
+/// A data row's right-click menu; its choices land in `out` after the row's own select.
+fn row_menu(
+    ui: &mut egui::Ui,
+    row: &DisplayRow,
+    side: Side,
+    remote_host: bool,
+    host_pane: bool,
+    read_only: bool,
+    out: &mut Vec<CommanderAction>,
+) {
+    // A not-yet-applied staged add has no data to copy, export, hash or describe.
+    let real = !matches!(row.kind, RowKind::PendingAdd);
+    // On a remote host pane, a file opens as an image (browse inside it).
+    if remote_host && !row.is_dir && !row.is_tree && ui.button("Open Image").clicked() {
+        out.push(A::Pane(side, P::OpenRemoteImage(row.name.clone())));
+        ui.close();
     }
-}
-
-/// How a row participates in the staged-edit overlay.
-#[derive(Clone, Copy, PartialEq)]
-enum RowKind {
-    Parent,
-    Normal,
-    PendingDelete,
-    PendingAdd,
-    PendingRename,
-}
-
-/// Owned per-frame row snapshot, so the row loop can mutate the listing / queue
-/// freely after rendering without holding a borrow of them.
-struct DisplayRow {
-    name: String,
-    is_dir: bool,
-    size: u64,
-    /// Resource-fork size in bytes (0 = none). Mac filesystems / archives only.
-    rsrc_size: u64,
-    modified: String,
-    type_tag: String,
-    kind: RowKind,
-    /// For a `PendingRename` row, the staged new name (shown as `old -> new`).
-    rename_to: Option<String>,
-    /// A metadata edit (type/creator, dates, permissions, ...) is staged for
-    /// this existing entry — tints the row blue.
-    meta_changed: bool,
-    /// A file in a remote-host listing whose name looks like a disk image we can
-    /// open — tinted so the user knows it's openable (double-click / Open Image).
-    is_image: bool,
-    /// Stable tree node id (base-row path, or a wrapper subtree id). Used as the
-    /// expand + selection key.
-    node_id: String,
-    /// Indent level: 0 for base rows, >=1 for rows inside an expanded wrapper.
-    depth: usize,
-    /// Has a `+`/`-` disclosure toggle (a wrapper, or a folder inside a wrapper).
-    expandable: bool,
-    expanded: bool,
-    /// True for rows produced from inside an expanded wrapper (vs. base rows).
-    is_tree: bool,
-    /// True for a wrapper row (archive / disk image) — `<ARC>` / `<IMG>` tag.
-    is_wrapper: bool,
-}
-
-impl DisplayRow {
-    fn is_parent(&self) -> bool {
-        self.kind == RowKind::Parent
+    if real && ui.button("Copy to other pane").clicked() {
+        out.push(A::Copy(side));
+        ui.close();
     }
-}
-
-/// Whether a filename's extension is one of the disk-image containers the
-/// engine can open (so the remote file browser can tint it as openable).
-fn looks_like_disk_image(name: &str) -> bool {
-    name.rsplit_once('.')
-        .map(|(_, ext)| {
-            rusty_backup::model::file_types::DISK_IMAGE_EXTS
-                .contains(&ext.to_ascii_lowercase().as_str())
-        })
-        .unwrap_or(false)
-}
-
-impl CommanderPane {
-    /// Build the rendered rows, merging the staged-edit overlay: real entries
-    /// flagged pending-delete where the queue has a delete for them, and the
-    /// queue's pending adds for this directory appended as green rows.
-    fn build_display_rows(&mut self) -> Vec<DisplayRow> {
-        let cwd_path = self.listing.cwd_path().to_string();
-        // On a remote-host pane, flag files that look like disk images.
-        let remote_host = self.is_remote_host();
-        // Wrappers are descendable only on local panes (remote routes disk
-        // images through "Open Image"; reading wrapper bytes over the wire
-        // isn't wired).
-        let allow_wrap = !remote_host;
-        // Base rows (parent + current dir entries + pending adds). Collected
-        // first (immutable borrow of listing/queue), then wrapper subtrees are
-        // spliced in below (which needs `&mut self.wrapper_tree`).
-        let mut base: Vec<DisplayRow> = self
-            .listing
-            .current_rows()
-            .into_iter()
-            .map(|r| match r {
-                Row::Parent => DisplayRow {
-                    name: "..".to_string(),
-                    is_dir: true,
-                    size: 0,
-                    rsrc_size: 0,
-                    modified: String::new(),
-                    type_tag: String::new(),
-                    kind: RowKind::Parent,
-                    rename_to: None,
-                    meta_changed: false,
-                    is_image: false,
-                    node_id: String::new(),
-                    depth: 0,
-                    expandable: false,
-                    expanded: false,
-                    is_tree: false,
-                    is_wrapper: false,
-                },
-                Row::Entry(e) => {
-                    let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
-                    let kind = if self.queue.is_pending_delete(&e.path) {
-                        RowKind::PendingDelete
-                    } else if rename_to.is_some() {
-                        RowKind::PendingRename
-                    } else {
-                        RowKind::Normal
-                    };
-                    let is_wrapper = allow_wrap && !e.is_directory() && classify_entry(e).is_some();
-                    DisplayRow {
-                        is_image: remote_host
-                            && !e.is_directory()
-                            && looks_like_disk_image(&e.name),
-                        name: e.name.clone(),
-                        is_dir: e.is_directory(),
-                        size: e.size,
-                        rsrc_size: e.resource_fork_size.unwrap_or(0),
-                        modified: e.modified.clone().unwrap_or_default(),
-                        type_tag: wrapper_or_type_tag(e, is_wrapper),
-                        kind,
-                        rename_to,
-                        meta_changed: self.queue.has_pending_metadata(&e.path),
-                        node_id: e.path.clone(),
-                        depth: 0,
-                        expandable: is_wrapper,
-                        expanded: is_wrapper && self.wrapper_tree.is_expanded(&e.path),
-                        is_tree: false,
-                        is_wrapper,
-                    }
-                }
-            })
-            .collect();
-
-        for e in self.queue.pending_adds_for(&cwd_path) {
-            base.push(DisplayRow {
-                name: e.name.clone(),
-                is_dir: e.is_directory(),
-                size: e.size,
-                rsrc_size: e.resource_fork_size.unwrap_or(0),
-                modified: String::new(),
-                type_tag: type_tag(&e),
-                kind: RowKind::PendingAdd,
-                rename_to: None,
-                meta_changed: false,
-                is_image: false,
-                node_id: e.path.clone(),
-                depth: 0,
-                expandable: false,
-                expanded: false,
-                is_tree: false,
-                is_wrapper: false,
+    if real {
+        if ui.button("Export to hard drive...").clicked() {
+            out.push(A::Export {
+                from: side,
+                format: None,
             });
+            ui.close();
         }
-
-        // Splice each expanded base wrapper's contents in beneath it, and
-        // rebuild the node->row index for click / selection / copy resolution.
-        self.tree_index.clear();
-        let mut rows = Vec::with_capacity(base.len());
-        for row in base {
-            let expand_here = row.expanded && row.expandable && !row.is_tree;
-            let node_id = row.node_id.clone();
-            rows.push(row);
-            if expand_here {
-                for tr in self.wrapper_tree.subtree_rows(&node_id, 1) {
-                    self.tree_index.insert(tr.node_id.clone(), tr.clone());
-                    rows.push(tree_row_to_display(&tr));
+        ui.menu_button("Export as", |ui| {
+            for fmt in ExportFormat::ALL {
+                if ui.button(fmt.label()).clicked() {
+                    out.push(A::Export {
+                        from: side,
+                        format: Some(fmt),
+                    });
+                    ui.close();
                 }
             }
-        }
-        rows
+        });
     }
-}
-
-/// Type-column text for a base entry: `<ARC>` / `<IMG>` for a wrapper, else the
-/// usual per-filesystem tag.
-fn wrapper_or_type_tag(e: &FileEntry, is_wrapper: bool) -> String {
-    if is_wrapper {
-        match classify_entry(e) {
-            Some(DescendKind::Archive) => "<ARC>".into(),
-            Some(DescendKind::DiskImage) => "<IMG>".into(),
-            Some(DescendKind::Optical) => "<CD>".into(),
-            None => type_tag(e),
-        }
+    if real && ui.button("Calculate checksums...").clicked() {
+        out.push(A::Checksums(side));
+        ui.close();
+    }
+    // File Info works for wrapper-tree rows too, read through the mounted wrapper.
+    if real && ui.button("File Info / Details...").clicked() {
+        out.push(A::OpenDetail(side, row.name.clone()));
+        ui.close();
+    }
+    // A wrapper's contents are read-only (copy out, don't edit), and so is a backup.
+    if row.is_tree || read_only {
+        return;
+    }
+    // A combined-tree row is named by its node id; the row's own select puts the cursor on it.
+    let target = if row.in_folder {
+        row.node_id.clone()
     } else {
-        type_tag(e)
+        row.name.clone()
+    };
+    if matches!(row.kind, RowKind::PendingRename) && ui.button("Cancel rename").clicked() {
+        out.push(A::Pane(side, P::CancelRename(target)));
+        ui.close();
+    } else if matches!(row.kind, RowKind::Normal) && ui.button("Rename...").clicked() {
+        out.push(A::Pane(
+            side,
+            if row.in_folder {
+                P::RenameAtCursor
+            } else {
+                P::RequestRename(target)
+            },
+        ));
+        ui.close();
     }
-}
-
-/// Convert a wrapper-tree row into a `DisplayRow`.
-fn tree_row_to_display(tr: &TreeRow) -> DisplayRow {
-    DisplayRow {
-        name: tr.entry.name.clone(),
-        is_dir: tr.entry.is_directory(),
-        size: tr.entry.size,
-        rsrc_size: tr.entry.resource_fork_size.unwrap_or(0),
-        modified: tr.entry.modified.clone().unwrap_or_default(),
-        type_tag: wrapper_or_type_tag(&tr.entry, tr.is_wrapper),
-        kind: RowKind::Normal,
-        rename_to: None,
-        meta_changed: false,
-        is_image: false,
-        node_id: tr.node_id.clone(),
-        depth: tr.depth,
-        expandable: tr.expandable,
-        expanded: tr.expanded,
-        is_tree: true,
-        is_wrapper: tr.is_wrapper,
+    let label = match row.kind {
+        _ if host_pane => "Delete (immediate)",
+        RowKind::PendingDelete => "Undelete",
+        RowKind::PendingAdd => "Remove from staging",
+        _ => "Delete",
+    };
+    if ui.button(label).clicked() {
+        out.push(A::Pane(side, P::Delete));
+        ui.close();
     }
-}
-
-/// Short label for a partition in the dropdown: `1: FAT16 (510.0 MiB)`. `pos`
-/// is the position in the list, matching `inspect`'s `#` and `IMG@N`.
-fn partition_label(pos: usize, p: &PartitionInfo) -> String {
-    format!(
-        "{}: {} ({})",
-        pos + 1,
-        p.type_name,
-        format_size(p.size_bytes)
-    )
 }
 
 // --- column geometry + painting (adapted from the layout mock) -------------
@@ -4020,6 +1178,11 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
             ui.visuals().weak_text_color(),
         );
     }
+    let display_name = if row.loading {
+        format!("{display_name}  (reading...)")
+    } else {
+        display_name
+    };
     painter.text(
         egui::pos2(name_x, mid),
         egui::Align2::LEFT_CENTER,

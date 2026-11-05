@@ -15,9 +15,9 @@
 
 use std::io::{Cursor, Read};
 
-use rusty_backup::fs::cbm::CbmFilesystem;
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::rbformats::containers::g64::decode_g64_bytes;
+use disk_core::filesystem::Filesystem;
+use dsk_floppy::g64::decode_g64_bytes;
+use fs_8bit::cbm::CbmFilesystem;
 
 fn sha256_hex(b: &[u8]) -> String {
     use sha2::{Digest, Sha256};

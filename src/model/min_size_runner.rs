@@ -14,7 +14,7 @@ use std::thread;
 use crate::fs::{self, MinimumResult};
 use crate::os::SectorAlignedReader;
 use crate::rbformats::chd::ChdReader;
-use crate::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 
 /// Shared state between the GUI poll loop and the worker thread.
 pub struct MinSizeStatus {
@@ -134,7 +134,7 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                     // info into `partition_minimum_size` as a hint so it skips
                     // its own probe.
                     progress("Probing for HFS wrapper...");
-                    let wrapper_hint = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                    let wrapper_hint = fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
                         &file,
                         req.partition_offset,
                         u64::MAX,

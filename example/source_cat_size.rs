@@ -1,4 +1,4 @@
-use rusty_backup::fs::hfs::HfsFilesystem;
+use fs_mac::hfs::HfsFilesystem;
 use std::fs::File;
 fn main() {
     let path = std::env::args().nth(1).unwrap();

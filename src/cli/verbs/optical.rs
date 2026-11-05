@@ -39,8 +39,8 @@ use crate::optical::{
     convert::{bincue_to_iso, iso_to_bincue, ConvertProgress},
     rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
 };
-use crate::partition::format_size;
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
+use disk_core::display::format_size;
 
 #[derive(Debug, Subcommand)]
 pub enum OpticalCommand {
@@ -384,6 +384,18 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
     let progress = Arc::new(Mutex::new(RipProgress::new()));
     let progress_thread = Arc::clone(&progress);
     let worker = std::thread::spawn(move || run_rip(config, progress_thread));
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
     drain_rip(progress)?;
     worker
         .join()
@@ -515,6 +527,18 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
                     source.display()
                 ),
             },
+        }
+    });
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
         }
     });
     drain_convert(progress)?;
@@ -1286,16 +1310,10 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
     });
 
     // Partition table / HFS. Our own detector handles the zeroed-DDR case.
-    let apm = probe_apm(&args.source);
-    let (partition_table, ddr_present) = match &apm {
-        Some(a) => ("APM".to_string(), a.ddr_present),
-        None => ("none".to_string(), false),
+    let (partition_table, ddr_present, apm_has_hfs) = match probe_apple_map(&args.source) {
+        Some(found) => found,
+        None => ("none".to_string(), false, false),
     };
-    let apm_has_hfs = apm.as_ref().is_some_and(|a| {
-        a.entries
-            .iter()
-            .any(|e| e.partition_type.to_ascii_uppercase().contains("HFS"))
-    });
     let hfs = build_hfs_info(&info, partition_table, ddr_present);
 
     // Assemble the filesystems list from everything detected.
@@ -1460,11 +1478,23 @@ fn optical_data_and_cue_sizes(
     (data_size, cue_size)
 }
 
-fn probe_apm(path: &Path) -> Option<crate::partition::apm::Apm> {
+/// An Apple map on a flat image: (scheme name, DDR present, has an HFS partition).
+fn probe_apple_map(path: &Path) -> Option<(String, bool, bool)> {
+    use crate::partition::PartitionTable;
     let f = std::fs::File::open(path).ok()?;
     let mut r = std::io::BufReader::new(f);
-    match crate::partition::PartitionTable::detect(&mut r) {
-        Ok(crate::partition::PartitionTable::Apm(apm)) => Some(apm),
+    match PartitionTable::detect(&mut r) {
+        Ok(PartitionTable::Apm(apm)) => {
+            let hfs = apm
+                .entries
+                .iter()
+                .any(|e| e.partition_type.to_ascii_uppercase().contains("HFS"));
+            Some(("APM".to_string(), apm.ddr_present, hfs))
+        }
+        Ok(PartitionTable::ApmTs(map)) => {
+            let hfs = map.entries.iter().any(|e| e.is_hfs());
+            Some(("APM-TS".to_string(), true, hfs))
+        }
         _ => None,
     }
 }
@@ -1716,9 +1746,9 @@ pub enum CliResourceForkMode {
     Macbinary,
 }
 
-impl From<CliResourceForkMode> for crate::fs::resource_fork::ResourceForkMode {
+impl From<CliResourceForkMode> for fs_mac::resource_fork::ResourceForkMode {
     fn from(m: CliResourceForkMode) -> Self {
-        use crate::fs::resource_fork::ResourceForkMode as M;
+        use fs_mac::resource_fork::ResourceForkMode as M;
         match m {
             CliResourceForkMode::DataOnly => M::DataForkOnly,
             CliResourceForkMode::Native => M::Native,
@@ -1742,9 +1772,9 @@ pub struct ExtractArgs {
     /// Write a `.tar` / `.tar.gz` / `.tar.zst` instead of loose files.
     ///
     /// The faithful option for archiving: a tar entry carries the POSIX mode,
-    /// uid and gid a Rock Ridge / HFS+ / EFS disc records, and real symlinks,
-    /// none of which survive extraction onto a filesystem that has no concept
-    /// of them. Compression follows the extension.
+    /// uid and gid a Rock Ridge / HFS+ / EFS disc records, and its symlinks,
+    /// which a host without them (Windows without the privilege) can't hold.
+    /// Compression follows the extension.
     #[arg(long = "tar", value_name = "FILE")]
     pub tar: Option<PathBuf>,
 
@@ -1780,6 +1810,13 @@ pub struct ExtractArgs {
     #[arg(long = "on-collision", value_enum)]
     pub on_collision: Option<CliCaseCollisionMode>,
 
+    /// What to do when an entry can't be extracted (a read error, a file the
+    /// destination refuses). `ask` prompts on the terminal: skip it, continue
+    /// with all errors, or stop. Defaults to `ask` when stdin and stderr are
+    /// a terminal, otherwise `stop`. Ignored with `--tar`.
+    #[arg(long = "on-error", value_enum)]
+    pub on_error: Option<CliOnError>,
+
     /// Which filesystem to extract from on a hybrid Mac/PC disc. `auto`
     /// (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS
     /// side; `iso` forces the ISO 9660 tree. See `optical info`.
@@ -1791,6 +1828,28 @@ pub struct ExtractArgs {
     /// list `optical info` prints. Overrides `--filesystem`.
     #[arg(long = "filesystem-index", value_name = "N")]
     pub filesystem_index: Option<usize>,
+}
+
+/// What `optical extract --to` does when an entry fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliOnError {
+    /// Ask on the terminal for each failure: skip, continue with all errors, or stop.
+    Ask,
+    /// Skip every failed entry (each named on stderr, then listed in a summary).
+    Skip,
+    /// Stop at the first failure; what was written stays.
+    Stop,
+}
+
+impl CliOnError {
+    /// `ask` on an interactive terminal (stdin and stderr), otherwise `stop`.
+    fn default_for_terminal() -> Self {
+        use std::io::IsTerminal;
+        match std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            true => CliOnError::Ask,
+            false => CliOnError::Stop,
+        }
+    }
 }
 
 /// How to resolve case-insensitive filename collisions during extraction.
@@ -1854,66 +1913,177 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         })
         .unwrap_or(CaseCollisionMode::Rename);
 
-    // Only disambiguate when the destination genuinely can't tell the names
-    // apart; on a case-sensitive host everything extracts verbatim.
-    let case_insensitive_dest = dest_is_case_insensitive(&to);
+    let mut opts = rb_fsexporter::Options::new(rf_mode.into());
+    // Only disambiguate when the destination genuinely can't tell the names apart; on a
+    // case-sensitive host everything extracts verbatim.
+    opts.case_collision = match dest_is_case_insensitive(&to) {
+        true => Some(collision.into()),
+        false => None,
+    };
+    // No --path means the whole disc, which has always recursed.
+    opts.recursive = args.path.is_none() || args.recursive;
+    opts.posix_modes = args.preserve_permissions;
+    opts.volume_folder = false;
 
-    let mut ctx = ExtractCtx {
-        fork_mode: rf_mode.into(),
-        collision,
-        case_insensitive_dest,
-        // No --path means the whole disc, which has always recursed.
-        recursive: args.path.is_none() || args.recursive,
-        preserve_permissions: args.preserve_permissions,
-        count: 0,
-        skipped: 0,
-        errors: 0,
+    let mut rfs = crate::fs::optical_fs::OpticalFilesystem::from_inner(fs, String::new(), None)
+        .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
+        .with_extract_metadata();
+    let start = match &target {
+        Some(t) => t.path.clone(),
+        None => root.path.clone(),
+    };
+    let start = rfs
+        .entry_at(start.as_str())
+        .map_err(|e| anyhow::anyhow!("{start}: {e}"))?;
+    let mut host = CliExtractHost::new(
+        args.on_error
+            .unwrap_or_else(CliOnError::default_for_terminal),
+    );
+    // A named file extracts on its own; a named directory extracts its contents into --to
+    // rather than recreating the directory itself, as `cp -r DIR/. DEST` does.
+    let result = match start.is_directory() {
+        true => rb_fsexporter::extract_contents(&mut rfs, &start, &to, &opts, &mut host),
+        false => rb_fsexporter::extract(&mut rfs, &start, &to, &opts, &mut host),
+    };
+    let count = match result {
+        Ok(done) => done.files,
+        Err(_) if host.stopped.is_some() => host.wrote,
+        Err(e) => {
+            log_stderr(format!("warning: skipping {}: {e:#}", start.path));
+            host.errors += 1;
+            0
+        }
     };
 
-    let mut used = std::collections::HashSet::new();
-    match &target {
-        // A named file extracts on its own; a named directory extracts its
-        // contents into --to rather than recreating the directory itself,
-        // which is what `cp -r DIR/. DEST` does and what a user naming one
-        // folder expects.
-        Some(t) if t.entry_type == opticaldiscs::browse::entry::EntryType::File => {
-            extract(&mut *fs, t, &to, &mut ctx, &mut used);
-        }
-        Some(t) => {
-            for child in fs
-                .list_directory(t)
-                .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
-            {
-                extract(&mut *fs, &child, &to, &mut ctx, &mut used);
-            }
-        }
-        None => {
-            for child in fs
-                .list_directory(&root)
-                .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
-            {
-                extract(&mut *fs, &child, &to, &mut ctx, &mut used);
-            }
-        }
+    let mut summary = format!("extracted {count} entry/entries");
+    if host.skipped > 0 {
+        summary.push_str(&format!(", skipped {}", host.skipped));
     }
-
-    let mut summary = format!("extracted {} entry/entries", ctx.count);
-    if ctx.skipped > 0 {
-        summary.push_str(&format!(", skipped {}", ctx.skipped));
-    }
-    if ctx.errors > 0 {
-        summary.push_str(&format!(", {} error(s)", ctx.errors));
+    if host.errors > 0 {
+        summary.push_str(&format!(", {} error(s)", host.errors));
     }
     log_stderr(summary);
+    if !host.failed.is_empty() {
+        log_stderr(format!("skipped {} entry/entries:", host.failed.len()));
+        for f in &host.failed {
+            log_stderr(format!("  {f}"));
+        }
+    }
+    if let Some(at) = host.stopped {
+        anyhow::bail!("extraction stopped at {at}");
+    }
 
     // Only a total failure (nothing extracted, at least one error) is fatal.
-    if ctx.count == 0 && ctx.errors > 0 {
+    if count == 0 && host.errors > 0 {
         anyhow::bail!(
             "extraction failed: {} error(s), 0 files written",
-            ctx.errors
+            host.errors
         );
     }
     Ok(())
+}
+
+/// What `optical extract` reports while the extractor runs: skips and errors, on stderr; a
+/// failed entry is asked about, skipped or stops the run per `--on-error`.
+struct CliExtractHost {
+    on_error: CliOnError,
+    skipped: u64,
+    errors: u64,
+    wrote: usize,
+    /// Each entry skipped after an error, with the error, for the summary.
+    failed: Vec<String>,
+    /// The entry (and its error) the run stopped at.
+    stopped: Option<String>,
+}
+
+impl CliExtractHost {
+    fn new(on_error: CliOnError) -> Self {
+        CliExtractHost {
+            on_error,
+            skipped: 0,
+            errors: 0,
+            wrote: 0,
+            failed: Vec::new(),
+            stopped: None,
+        }
+    }
+}
+
+/// Ask on stderr what to do about a failed entry; end of input stops.
+fn ask_entry_failed(path: &str, err: &anyhow::Error) -> rb_fsexporter::ErrorChoice {
+    use rb_fsexporter::ErrorChoice;
+    use std::io::{BufRead, Write};
+    eprintln!("Could not extract {path}: {err:#}");
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("[s]kip, [c]ontinue with all errors, s[t]op? ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return ErrorChoice::Stop,
+            Ok(_) => {}
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "s" | "skip" => return ErrorChoice::Skip,
+            "c" | "continue" => return ErrorChoice::SkipAll,
+            "t" | "stop" => return ErrorChoice::Stop,
+            _ => {}
+        }
+    }
+}
+
+impl rb_fsexporter::Host for CliExtractHost {
+    fn wrote(
+        &mut self,
+        _entry: &disk_core::entry::FileEntry,
+        _bytes: u64,
+        total: &rb_fsexporter::Summary,
+    ) {
+        self.wrote = total.files;
+    }
+
+    fn on_error(
+        &mut self,
+        entry: &disk_core::entry::FileEntry,
+        err: &anyhow::Error,
+    ) -> Option<rb_fsexporter::ErrorChoice> {
+        use rb_fsexporter::ErrorChoice;
+        let choice = match self.on_error {
+            CliOnError::Skip => ErrorChoice::SkipAll,
+            CliOnError::Stop => ErrorChoice::Stop,
+            CliOnError::Ask => ask_entry_failed(entry.path.as_str(), err),
+        };
+        match choice {
+            ErrorChoice::SkipAll => self.on_error = CliOnError::Skip,
+            ErrorChoice::Stop => self.stopped = Some(format!("{}: {err:#}", entry.path)),
+            ErrorChoice::Skip => {}
+        }
+        Some(choice)
+    }
+
+    fn failed(&mut self, entry: &disk_core::entry::FileEntry, err: &anyhow::Error) {
+        log_stderr(format!("warning: skipping {}: {err:#}", entry.path));
+        self.failed.push(format!("{}: {err:#}", entry.path));
+        self.errors += 1;
+    }
+
+    fn collision(&mut self, name: &str, outcome: rb_fsexporter::Collision<'_>) {
+        match outcome {
+            rb_fsexporter::Collision::Refused => {
+                log_stderr(format!(
+                    "warning: name collision (case-insensitive destination): {name} - skipping (use --on-collision rename to keep both)"
+                ));
+                self.errors += 1;
+            }
+            rb_fsexporter::Collision::Skipped => {
+                log_stderr(format!("warning: skipping case-collision: {name}"));
+                self.skipped += 1;
+            }
+            rb_fsexporter::Collision::Renamed(to) => {
+                log_stderr(format!("info: case-collision: {name} -> {to}"));
+            }
+        }
+    }
 }
 
 /// How to resolve case-insensitive filename collisions (core enum).
@@ -1930,6 +2100,16 @@ impl From<CliCaseCollisionMode> for CaseCollisionMode {
             CliCaseCollisionMode::Rename => CaseCollisionMode::Rename,
             CliCaseCollisionMode::Skip => CaseCollisionMode::Skip,
             CliCaseCollisionMode::Fail => CaseCollisionMode::Fail,
+        }
+    }
+}
+
+impl From<CaseCollisionMode> for rb_fsexporter::CaseCollision {
+    fn from(m: CaseCollisionMode) -> Self {
+        match m {
+            CaseCollisionMode::Rename => rb_fsexporter::CaseCollision::Rename,
+            CaseCollisionMode::Skip => rb_fsexporter::CaseCollision::Skip,
+            CaseCollisionMode::Fail => rb_fsexporter::CaseCollision::Fail,
         }
     }
 }
@@ -1954,204 +2134,6 @@ fn dest_is_case_insensitive(dir: &Path) -> bool {
     let insensitive = lower.exists();
     let _ = std::fs::remove_file(&upper);
     insensitive
-}
-
-/// Mutable state threaded through the recursive extraction.
-struct ExtractCtx {
-    fork_mode: crate::fs::resource_fork::ResourceForkMode,
-    collision: CaseCollisionMode,
-    case_insensitive_dest: bool,
-    /// Descend into subdirectories. Always true for a whole-disc extract;
-    /// under `--path DIR` it follows `--recursive`.
-    recursive: bool,
-    /// Apply the disc's POSIX mode to what we write. Unix only.
-    preserve_permissions: bool,
-    count: u64,
-    skipped: u64,
-    errors: u64,
-}
-
-impl ExtractCtx {
-    /// Resolve the on-disk name for `name` within a directory whose already-used
-    /// (lowercased) names are in `used`. Returns `None` when the entry should be
-    /// skipped. Records skip/error bookkeeping.
-    fn resolve_name(
-        &mut self,
-        name: &str,
-        used: &mut std::collections::HashSet<String>,
-    ) -> Option<String> {
-        if !self.case_insensitive_dest {
-            return Some(name.to_string());
-        }
-        let key = name.to_lowercase();
-        if !used.contains(&key) {
-            used.insert(key);
-            return Some(name.to_string());
-        }
-        // Collision on a case-insensitive destination.
-        match self.collision {
-            CaseCollisionMode::Fail => {
-                log_stderr(format!(
-                    "warning: name collision (case-insensitive destination): {name} - skipping (use --on-collision rename to keep both)"
-                ));
-                self.errors += 1;
-                None
-            }
-            CaseCollisionMode::Skip => {
-                log_stderr(format!("warning: skipping case-collision: {name}"));
-                self.skipped += 1;
-                None
-            }
-            CaseCollisionMode::Rename => {
-                for n in 1..10_000u32 {
-                    let candidate = format!("{name}~{n}");
-                    let ckey = candidate.to_lowercase();
-                    if !used.contains(&ckey) {
-                        used.insert(ckey);
-                        log_stderr(format!("info: case-collision: {name} -> {candidate}"));
-                        return Some(candidate);
-                    }
-                }
-                self.skipped += 1;
-                None
-            }
-        }
-    }
-}
-
-/// Extract one entry, recording success / skip / error into `ctx` and never
-/// aborting the whole run on a single failure. `used` holds the lowercased names
-/// already written into `dest` (for case-insensitive collision handling).
-fn extract(
-    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
-    entry: &opticaldiscs::browse::entry::FileEntry,
-    dest: &Path,
-    ctx: &mut ExtractCtx,
-    used: &mut std::collections::HashSet<String>,
-) {
-    if let Err(e) = extract_one(fs, entry, dest, ctx, used) {
-        log_stderr(format!("warning: skipping {}: {e}", entry.path));
-        ctx.errors += 1;
-    }
-}
-
-fn extract_one(
-    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
-    entry: &opticaldiscs::browse::entry::FileEntry,
-    dest: &Path,
-    ctx: &mut ExtractCtx,
-    used: &mut std::collections::HashSet<String>,
-) -> Result<()> {
-    use crate::fs::resource_fork::{self, ResourceForkMode as M};
-    use opticaldiscs::browse::entry::EntryType;
-    use std::io::{BufWriter, Write};
-
-    let sanitized = resource_fork::sanitize_filename(&entry.name);
-    let safe_name = match ctx.resolve_name(&sanitized, used) {
-        Some(n) => n,
-        None => return Ok(()), // skipped per collision policy
-    };
-    let mode = ctx.fork_mode;
-    match entry.entry_type {
-        EntryType::File => {
-            // A non-zero resource-fork size only appears on fork-capable
-            // filesystems (HFS / HFS+); ISO 9660 reports `None`. Keying off it
-            // covers every current and future fork filesystem opticaldiscs
-            // supports without re-checking the filesystem type.
-            let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
-            if has_rsrc && mode == M::MacBinary {
-                let data = fs
-                    .read_file(entry)
-                    .map_err(|e| anyhow::anyhow!("read_file: {e}"))?;
-                let rsrc = fs
-                    .read_resource_fork(entry)
-                    .map_err(|e| anyhow::anyhow!("read_resource_fork: {e}"))?
-                    .unwrap_or_default();
-                let type_code = entry.type_code.unwrap_or([0; 4]);
-                let creator_code = entry.creator_code.unwrap_or([0; 4]);
-                let dates = crate::optical::mac_dates_from(&entry.timestamps);
-                let mb = resource_fork::build_macbinary(
-                    &safe_name,
-                    &type_code,
-                    &creator_code,
-                    dates,
-                    &data,
-                    &rsrc,
-                );
-                let out_path = dest.join(format!("{safe_name}.bin"));
-                let mut f = BufWriter::new(std::fs::File::create(&out_path)?);
-                f.write_all(&mb)?;
-                f.flush()?;
-            } else {
-                let data = fs
-                    .read_file(entry)
-                    .map_err(|e| anyhow::anyhow!("read_file: {e}"))?;
-                let out_path = dest.join(&safe_name);
-                let mut f = BufWriter::new(std::fs::File::create(&out_path)?);
-                f.write_all(&data)?;
-                f.flush()?;
-                if has_rsrc && mode != M::DataForkOnly {
-                    let type_code = entry.type_code.unwrap_or([0; 4]);
-                    let creator_code = entry.creator_code.unwrap_or([0; 4]);
-                    let dates = crate::optical::mac_dates_from(&entry.timestamps);
-                    let rsrc = fs
-                        .read_resource_fork(entry)
-                        .map_err(|e| anyhow::anyhow!("read_resource_fork: {e}"))?
-                        .unwrap_or_default();
-                    match mode {
-                        M::Native => {
-                            let rp = out_path.join("..namedfork/rsrc");
-                            let mut rf = BufWriter::new(std::fs::File::create(&rp)?);
-                            rf.write_all(&rsrc)?;
-                            rf.flush()?;
-                        }
-                        M::AppleDouble => {
-                            let ad = resource_fork::build_appledouble(
-                                &type_code,
-                                &creator_code,
-                                dates,
-                                &rsrc,
-                            );
-                            let ap = dest.join(format!("._{safe_name}"));
-                            let mut af = BufWriter::new(std::fs::File::create(&ap)?);
-                            af.write_all(&ad)?;
-                            af.flush()?;
-                        }
-                        M::SeparateRsrc => {
-                            let sp = dest.join(format!("{safe_name}.rsrc"));
-                            let mut rf = BufWriter::new(std::fs::File::create(&sp)?);
-                            rf.write_all(&rsrc)?;
-                            rf.flush()?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if ctx.preserve_permissions {
-                apply_posix_mode(&dest.join(&safe_name), entry);
-            }
-            ctx.count += 1;
-        }
-        EntryType::Directory => {
-            if !ctx.recursive {
-                return Ok(());
-            }
-            let dir_path = dest.join(&safe_name);
-            std::fs::create_dir_all(&dir_path)?;
-            if ctx.preserve_permissions {
-                apply_posix_mode(&dir_path, entry);
-            }
-            let children = fs
-                .list_directory(entry)
-                .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
-            // Each directory gets its own name-collision namespace.
-            let mut child_used = std::collections::HashSet::new();
-            for child in &children {
-                extract(fs, child, &dir_path, ctx, &mut child_used);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Walk `/A/B/C` from the disc root to the entry it names.
@@ -2190,23 +2172,6 @@ fn resolve_disc_path(
     Ok(current)
 }
 
-/// Apply the disc's POSIX mode where it records one and the host understands
-/// it. A no-op on Windows: the bits have nowhere to go, which is why `--tar`
-/// exists.
-#[allow(unused_variables)]
-fn apply_posix_mode(path: &Path, entry: &opticaldiscs::browse::entry::FileEntry) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(p) = &entry.posix {
-            let _ = std::fs::set_permissions(
-                path,
-                std::fs::Permissions::from_mode(p.permission_bits()),
-            );
-        }
-    }
-}
-
 /// Archive to `.tar` / `.tar.gz` / `.tar.zst`, carrying mode, uid, gid and
 /// symlinks — the metadata plain extraction drops on a host that cannot store
 /// it. Compression follows the extension.
@@ -2232,7 +2197,7 @@ fn extract_to_tar(
     } else if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
         // Through the backend shim, not the `zstd` crate: the MiSTer armv7 build
         // has `optical` on and `native-zstd` off (it uses `pure-zstd`), so naming
-        // the C crate here fails to compile there. `fs::tar_export` does the same
+        // the C crate here fails to compile there. `fs_tar::tar_export` does the same
         // job the same way.
         let enc = crate::rbformats::zstd_compat::ZstdEncoder::new(file, 0)
             .context("init zstd encoder")?;

@@ -11,17 +11,18 @@ use std::io::{Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::hfs::{create_blank_hfs_sized, HfsFilesystem};
-use crate::fs::hfs_clone::{clone_hfs_volume, emit_apm_disk_with_hfs, CloneReport, EmitReport};
+use crate::fs::hfs_clone::{emit_apm_disk_with_hfs, EmitReport};
 use crate::model::source_reader::open_read;
 use crate::model::status::ExpandStatus;
+use fs_mac::hfs::{create_blank_hfs_sized, HfsFilesystem};
+use fs_mac::hfs_clone::{clone_hfs_volume, CloneReport};
 
 // The allocation-block-size choices and ceiling helpers are classic-HFS
 // domain knowledge shared with HFV creation; they live canonically in
-// `crate::fs::hfv` and are re-exported here so existing GUI/CLI imports
+// `fs_mac::hfv` and are re-exported here so existing GUI/CLI imports
 // (`model::hfs_expand_runner::{BLOCK_SIZE_CHOICES, suggest_block_size, ...}`)
 // keep resolving.
-pub use crate::fs::hfv::{max_volume_for_block_size, suggest_block_size, BLOCK_SIZE_CHOICES};
+pub use fs_mac::hfv::{max_volume_for_block_size, suggest_block_size, BLOCK_SIZE_CHOICES};
 
 /// Source-volume summary used to validate inputs and shape the clone.
 #[derive(Debug, Clone)]
@@ -71,7 +72,7 @@ pub enum ExpandOutput {
     ApmDisk,
     /// Write the cloned volume as a flat **HFV** (`.hfv`) — the bare HFS volume
     /// with no partition table, as BasiliskII / SheepShaver expect. Capped at
-    /// [`crate::fs::hfv::HFV_MAX_BYTES`] (2047 MB).
+    /// [`fs_mac::hfv::HFV_MAX_BYTES`] (2047 MB).
     FlatHfv,
 }
 
@@ -92,7 +93,7 @@ pub fn start_hfs_expand(
         emit_report: None,
     }));
     let status_thread = Arc::clone(&status);
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "HFS expand", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: expand HFS volume");
         let result = run_expand(
             source,
@@ -115,6 +116,7 @@ pub fn start_hfs_expand(
                 s.current_step = "Failed.".into();
             }
         }
+        Ok(())
     });
     status
 }
@@ -143,7 +145,7 @@ fn run_expand(
     // A flat HFV must respect the classic-HFS 2047 MB ceiling (APM output is
     // bounded only by the 65535-block limit, which can be larger).
     if output == ExpandOutput::FlatHfv {
-        crate::fs::hfv::validate_hfv_target(target_size_bytes, crate::fs::hfv::HfvVolumeKind::Hfs)
+        fs_mac::hfv::validate_hfv_target(target_size_bytes, fs_mac::hfv::HfvVolumeKind::Hfs)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
@@ -151,7 +153,7 @@ fn run_expand(
     // Floor the target B-trees at the blank-format default for `target_size`,
     // not just 1.5x the source: a densely-packed source catalog can otherwise
     // undersize the target and exhaust it mid-clone ("no free B-tree nodes").
-    let (catalog_min, extents_min) = crate::fs::hfs::clone_target_btree_sizes(
+    let (catalog_min, extents_min) = fs_mac::hfs::clone_target_btree_sizes(
         target_size_bytes,
         target_block_size,
         source.source_catalog_size,

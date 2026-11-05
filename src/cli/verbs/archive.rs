@@ -16,11 +16,11 @@ use clap::{Args, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 
 use crate::cli::logging::log_stderr;
-use crate::fs::binhex;
-use crate::fs::resource_fork;
-use crate::macarchive::extract;
-use crate::macarchive::mar;
-use crate::macarchive::stuffit;
+use arc_mac::extract;
+use arc_mac::mar;
+use arc_mac::stuffit;
+use fs_mac::binhex;
+use fs_mac::resource_fork;
 
 #[derive(Debug, Subcommand)]
 pub enum ArchiveCommand {
@@ -109,6 +109,9 @@ fn run_list(args: ListArgs) -> Result<()> {
     if let Some(t) = archive.truncated {
         log_stderr(t.describe());
     }
+    for d in &archive.damage {
+        log_stderr(d.describe());
+    }
     for e in &archive.entries {
         if e.is_dir {
             println!("DIR   {}/", e.display_path());
@@ -126,8 +129,8 @@ fn run_list(args: ListArgs) -> Result<()> {
             .filter(|f| f.uncompressed_len > 0)
             .map(|f| format!("rsrc {} ({})", f.uncompressed_len, f.method_name()))
             .unwrap_or_default();
-        let type_str = crate::fs::hfs::format_ostype(&e.type_code);
-        let creator_str = crate::fs::hfs::format_ostype(&e.creator_code);
+        let type_str = fs_mac::hfs::format_ostype(&e.type_code);
+        let creator_str = fs_mac::hfs::format_ostype(&e.creator_code);
         println!(
             "FILE  {:<40} {:>4} {:>4}  {}  {}",
             e.display_path(),

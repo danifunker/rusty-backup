@@ -11,7 +11,7 @@ use std::env;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

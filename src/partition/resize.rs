@@ -92,8 +92,8 @@ pub fn compute_resize_plan(
             bail!(
                 "Partition {} would end at {} which exceeds disk size {}",
                 p.index,
-                crate::partition::format_size(new_start_bytes + new_size),
-                crate::partition::format_size(disk_size_bytes),
+                disk_core::display::format_size(new_start_bytes + new_size),
+                disk_core::display::format_size(disk_size_bytes),
             );
         }
 
@@ -125,8 +125,8 @@ pub fn compute_resize_plan(
                 "Partitions {} and {} would overlap after resize (end {} > start {})",
                 plans[i - 1].index,
                 plans[i].index,
-                crate::partition::format_size(prev_end),
-                crate::partition::format_size(curr_start),
+                disk_core::display::format_size(prev_end),
+                disk_core::display::format_size(curr_start),
             );
         }
     }
@@ -146,7 +146,7 @@ fn unexpandable_container(
     if n >= 8 && &head == b"MComprHD" {
         return Ok(Some("CHD"));
     }
-    if n >= 4 && &head[..4] == crate::rbformats::qcow2::QCOW2_MAGIC {
+    if n >= 4 && &head[..4] == dsk_vm::qcow2::QCOW2_MAGIC {
         return Ok(Some("QCOW2"));
     }
     if n >= 4 && &head[..4] == b"KDMV" {
@@ -156,12 +156,12 @@ fn unexpandable_container(
         let mut footer = [0u8; 512];
         file.seek(SeekFrom::Start(size - 512))?;
         file.read_exact(&mut footer)?;
-        if &footer[..8] == crate::rbformats::vhd::VHD_COOKIE {
+        if &footer[..8] == dsk_vm::vhd::VHD_COOKIE {
             let disk_type = u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]);
-            if disk_type == crate::rbformats::vhd::VHD_TYPE_DYNAMIC {
+            if disk_type == dsk_vm::vhd::VHD_TYPE_DYNAMIC {
                 return Ok(Some("dynamic VHD"));
             }
-            if disk_type == crate::rbformats::vhd::VHD_TYPE_DIFFERENCING {
+            if disk_type == dsk_vm::vhd::VHD_TYPE_DIFFERENCING {
                 return Ok(Some("differencing VHD"));
             }
         }
@@ -323,8 +323,8 @@ pub fn apply_resize(
     if !is_device && new_file_size > old_disk_size {
         log_cb(&format!(
             "Expanding file from {} to {}",
-            crate::partition::format_size(old_disk_size),
-            crate::partition::format_size(new_file_size),
+            disk_core::display::format_size(old_disk_size),
+            disk_core::display::format_size(new_file_size),
         ));
         // We need to use set_len but we have a generic impl. We'll write zeros at the end.
         file.seek(SeekFrom::Start(new_file_size - 1))?;
@@ -345,7 +345,7 @@ pub fn apply_resize(
         log_cb(&format!(
             "Moving partition {} backward by {}",
             plan.index,
-            crate::partition::format_size(plan.move_delta_bytes.unsigned_abs()),
+            disk_core::display::format_size(plan.move_delta_bytes.unsigned_abs()),
         ));
 
         let base = moved_so_far;
@@ -374,7 +374,7 @@ pub fn apply_resize(
         log_cb(&format!(
             "Moving partition {} forward by {}",
             plan.index,
-            crate::partition::format_size(plan.move_delta_bytes.unsigned_abs()),
+            disk_core::display::format_size(plan.move_delta_bytes.unsigned_abs()),
         ));
 
         let base = moved_so_far;
@@ -450,7 +450,7 @@ pub fn apply_resize(
         };
         log_cb(&format!(
             "Truncating file to {}",
-            crate::partition::format_size(target_size),
+            disk_core::display::format_size(target_size),
         ));
         // We can't call set_len on a generic. We'll leave the file as-is
         // and document that truncation requires a std::fs::File.
@@ -460,7 +460,7 @@ pub fn apply_resize(
     // Step 7: Regenerate VHD footer if applicable
     if is_vhd {
         log_cb("Regenerating VHD footer...");
-        let footer = crate::rbformats::vhd::build_vhd_footer(new_data_end);
+        let footer = dsk_vm::vhd::build_vhd_footer(new_data_end);
         file.seek(SeekFrom::Start(new_data_end))?;
         file.write_all(&footer)?;
     }
@@ -586,9 +586,9 @@ pub fn expand_image_file(
         let new_data_size = old_data_size + add_bytes;
         log_cb(&format!(
             "Growing VHD data region: {} -> {} (+{})",
-            crate::partition::format_size(old_data_size),
-            crate::partition::format_size(new_data_size),
-            crate::partition::format_size(add_bytes),
+            disk_core::display::format_size(old_data_size),
+            disk_core::display::format_size(new_data_size),
+            disk_core::display::format_size(add_bytes),
         ));
         // Step 1: extend the file so we can stamp the new footer at the end.
         file.set_len(new_data_size + 512)?;
@@ -596,7 +596,7 @@ pub fn expand_image_file(
         // new footer. set_len already zero-pads on POSIX/Windows; do not
         // do an explicit zero-write — keeps this O(1) regardless of size.
         // Step 3: write the new footer.
-        let footer = crate::rbformats::vhd::build_vhd_footer(new_data_size);
+        let footer = dsk_vm::vhd::build_vhd_footer(new_data_size);
         file.seek(SeekFrom::Start(new_data_size))?;
         file.write_all(&footer)?;
         file.flush()?;
@@ -605,9 +605,9 @@ pub fn expand_image_file(
         let new_size = old_size + add_bytes;
         log_cb(&format!(
             "Growing raw image: {} -> {} (+{})",
-            crate::partition::format_size(old_size),
-            crate::partition::format_size(new_size),
-            crate::partition::format_size(add_bytes),
+            disk_core::display::format_size(old_size),
+            disk_core::display::format_size(new_size),
+            disk_core::display::format_size(add_bytes),
         ));
         file.set_len(new_size)?;
         file.flush()?;
@@ -631,7 +631,7 @@ mod tests {
         use crate::fs::InPlaceResize;
 
         // SGI EFS — the one that prompted the audit.
-        let efs = crate::fs::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
+        let efs = fs_unix::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
         match crate::fs::in_place_resize_support(&mut Cursor::new(efs), 0, None) {
             InPlaceResize::Supported(name) => assert_eq!(name, "SGI EFS"),
             _ => panic!("EFS must be resizable in place"),
@@ -666,12 +666,11 @@ mod tests {
     /// superblock rather than log "unknown filesystem" and move on.
     #[test]
     fn patch_filesystem_size_reaches_efs() {
-        let img = crate::fs::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
-        let before = crate::fs::efs::EfsSuperblock::parse(
-            &img[512..512 + crate::fs::efs::EFS_SUPERBLOCK_SIZE],
-        )
-        .expect("parse")
-        .fs_size;
+        let img = fs_unix::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
+        let before =
+            fs_unix::efs::EfsSuperblock::parse(&img[512..512 + fs_unix::efs::EFS_SUPERBLOCK_SIZE])
+                .expect("parse")
+                .fs_size;
 
         // Grow: a shrink has its own conservative floor and cylinder-group
         // rules, which are efs_resize's business, not this path's. The
@@ -684,11 +683,10 @@ mod tests {
         patch_filesystem_size(&mut cur, 0, NEW_SIZE, &mut log).expect("patch");
 
         let img = cur.into_inner();
-        let after = crate::fs::efs::EfsSuperblock::parse(
-            &img[512..512 + crate::fs::efs::EFS_SUPERBLOCK_SIZE],
-        )
-        .expect("parse")
-        .fs_size;
+        let after =
+            fs_unix::efs::EfsSuperblock::parse(&img[512..512 + fs_unix::efs::EFS_SUPERBLOCK_SIZE])
+                .expect("parse")
+                .fs_size;
         assert!(
             after > before,
             "the EFS superblock was not patched ({before} -> {after}) — \
@@ -912,7 +910,7 @@ mod tests {
         // Build a 1 MiB raw region + VHD footer.
         let data_size: u64 = 1024 * 1024;
         let mut buf = vec![0xCDu8; data_size as usize];
-        buf.extend_from_slice(&crate::rbformats::vhd::build_vhd_footer(data_size));
+        buf.extend_from_slice(&dsk_vm::vhd::build_vhd_footer(data_size));
         std::fs::write(&path, &buf).unwrap();
 
         let mut log = Vec::<String>::new();
@@ -934,9 +932,9 @@ mod tests {
         // in front of its footer used to leave a "fixed" footer on sparse data.
         let dynamic = tempfile::NamedTempFile::new().unwrap();
         let mut buf = vec![0u8; 4096];
-        buf.extend_from_slice(&crate::rbformats::vhd::build_vhd_footer_with_type(
+        buf.extend_from_slice(&dsk_vm::vhd::build_vhd_footer_with_type(
             1024 * 1024,
-            crate::rbformats::vhd::VHD_TYPE_DYNAMIC,
+            dsk_vm::vhd::VHD_TYPE_DYNAMIC,
             512,
         ));
         std::fs::write(dynamic.path(), &buf).unwrap();
@@ -950,7 +948,7 @@ mod tests {
         );
 
         let qcow2 = tempfile::NamedTempFile::new().unwrap();
-        let mut head = crate::rbformats::qcow2::QCOW2_MAGIC.to_vec();
+        let mut head = dsk_vm::qcow2::QCOW2_MAGIC.to_vec();
         head.resize(4096, 0);
         std::fs::write(qcow2.path(), &head).unwrap();
         let err = expand_image_file(qcow2.path(), 4096, &mut |_| {}).unwrap_err();

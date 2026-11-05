@@ -11,9 +11,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use rusty_backup::fs::alto::bfs::Bfs;
-use rusty_backup::fs::alto::write::{add_file, create_blank};
-use rusty_backup::fs::alto::{pdi, Disk, FsFamily, Geometry, LabelCodec};
+use fs_xerox::alto::bfs::Bfs;
+use fs_xerox::alto::write::{add_file, create_blank};
+use fs_xerox::alto::{pdi, Disk, FsFamily, Geometry, LabelCodec};
 
 fn cli_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rb-cli"))

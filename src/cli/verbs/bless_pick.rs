@@ -22,8 +22,8 @@ use crossterm::{cursor, execute, queue, terminal};
 use super::bless::{apply_bless, BlessPickArgs};
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::resolve::resolve_partition_streaming;
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// Smallest list viewport we'll render, even on a tiny console.
 const MIN_VIEWPORT: usize = 3;

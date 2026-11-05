@@ -29,8 +29,8 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::output::{emit_envelope, Envelope, OutputFormat};
 use crate::cli::resolve::resolve_partition_ro;
-use crate::fs::entry::FileEntry;
-use crate::fs::hfs::{HfsFileLocation, HfsFilesystem};
+use disk_core::entry::FileEntry;
+use fs_mac::hfs::{HfsFileLocation, HfsFilesystem};
 
 #[derive(Debug, Args)]
 pub struct LocateArgs {
@@ -168,7 +168,7 @@ fn resolve_hfs_path<R: std::io::Read + std::io::Seek + Send>(
     fs: &mut HfsFilesystem<R>,
     path: &str,
 ) -> Result<FileEntry> {
-    use crate::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
     // HFS reserves `:`, so a `:` in the path is always a separator (colon
     // grammar) and `/` is plain data; a plain `/`-path uses `\/` for a literal
     // slash. See `crate::cli::parse::split_image_path`.
@@ -179,7 +179,7 @@ fn resolve_hfs_path<R: std::io::Read + std::io::Seek + Send>(
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
-        let next = crate::fs::filesystem::find_child(fold, &children, component)
+        let next = disk_core::filesystem::find_child(fold, &children, component)
             .cloned()
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;

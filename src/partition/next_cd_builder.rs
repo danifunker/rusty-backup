@@ -11,7 +11,7 @@
 //!   recorded at sectors 16 / 48, root partition `a`; four checksummed copies
 //!   at 512-byte blocks 0 / 15 / 30 / 45, exactly as on a NeXT hard disk,
 //! - slot 0: `4.3BSD`, base 0, the rest of the disc, `p_cpg` 2,
-//! - the filesystem: the pre-4.4BSD UFS1 of [`crate::fs::ufs_format`] with
+//! - the filesystem: the pre-4.4BSD UFS1 of [`fs_unix::ufs_format`] with
 //!   8 KiB blocks over **2048-byte fragments**, `fs_fsbtodb` 0 (the device
 //!   block is the CD sector), 2 cylinders per group, 1984 inodes per group,
 //!   `fs_cgoffset` 64 — see [`Bsd43Geometry::NEXT_CDROM`].
@@ -27,12 +27,12 @@
 use anyhow::{ensure, Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::fs::ufs::{CgLayout, UfsEndian};
-use crate::fs::ufs_format::{write_blank_ufs1, Bsd43Geometry, Ufs1FormatParams, Ufs1Geometry};
-use crate::partition::next::{
+use crate::rbformats::payload_slice::PayloadSlice;
+use fs_unix::ufs::{CgLayout, UfsEndian};
+use fs_unix::ufs_format::{write_blank_ufs1, Bsd43Geometry, Ufs1FormatParams, Ufs1Geometry};
+use part_tables::next::{
     build_label, write_copies, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS, N_PARTITIONS,
 };
-use crate::rbformats::payload_slice::PayloadSlice;
 
 /// `d_secsize` on a NeXT CD — the CD-ROM sector.
 pub const NEXT_CD_SECTOR: u64 = 2048;
@@ -121,6 +121,7 @@ fn ufs_params(opts: &NextCdOptions, fs_bytes: u64) -> Ufs1FormatParams {
         cg_layout: CgLayout::Bsd43,
         label: None,
         bsd43_geometry: Some(Bsd43Geometry::NEXT_CDROM),
+        sun: false,
     }
 }
 
@@ -129,8 +130,8 @@ pub fn plan_next_ufs_cd(opts: &NextCdOptions) -> Result<NextCdLayout> {
     ensure!(
         opts.size_bytes >= MIN_DISC_BYTES,
         "a NeXT CD needs at least {}; {} was asked for",
-        crate::partition::format_size(MIN_DISC_BYTES),
-        crate::partition::format_size(opts.size_bytes),
+        disk_core::display::format_size(MIN_DISC_BYTES),
+        disk_core::display::format_size(opts.size_bytes),
     );
     let disc_sectors = opts.size_bytes.div_ceil(NEXT_CD_SECTOR);
     let partition_sectors = disc_sectors - NEXT_CD_FRONT_PORCH;
@@ -140,7 +141,7 @@ pub fn plan_next_ufs_cd(opts: &NextCdOptions) -> Result<NextCdLayout> {
         partition_sectors,
     );
     let fs_bytes = partition_sectors * NEXT_CD_SECTOR;
-    let geometry = crate::fs::ufs_format::plan(&ufs_params(opts, fs_bytes))
+    let geometry = fs_unix::ufs_format::plan(&ufs_params(opts, fs_bytes))
         .map_err(|e| anyhow::anyhow!("planning the NeXT CD's UFS: {e}"))?;
     Ok(NextCdLayout {
         disk_bytes: disc_sectors * NEXT_CD_SECTOR,
@@ -175,13 +176,13 @@ pub fn write_next_ufs_cd<W: Read + Write + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::{
-        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
-    };
-    use crate::fs::ufs::UfsFilesystem;
-    use crate::fs::ufs_fsck::fsck_ufs;
     use crate::partition::PartitionTable;
     use byteorder::{BigEndian, ByteOrder};
+    use disk_core::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+    };
+    use fs_unix::ufs::UfsFilesystem;
+    use fs_unix::ufs_fsck::fsck_ufs;
     use std::io::Cursor;
 
     /// `NeXTTIME.iso`'s partition `a`: 98304 CD sectors behind the 80-sector porch.
@@ -324,7 +325,7 @@ mod tests {
         assert_eq!(parts[0].byte_offset(), layout.fs_offset);
 
         let mut fs = UfsFilesystem::open(cur, layout.fs_offset).expect("open");
-        assert_eq!(fs.dirblksiz, 1024, "NeXT CDs chunk directories at 1024");
+        assert_eq!(fs.dirblksiz(), 1024, "NeXT CDs chunk directories at 1024");
         let root = fs.root().unwrap();
         let dir = fs
             .create_directory(&root, "NextApps", &CreateDirectoryOptions::default())
@@ -359,7 +360,7 @@ mod tests {
     /// The OPENSTEP 4.2 Install CD shape: Sun label at block 0, NeXT copies at blocks 16 / 30 / 48.
     #[test]
     fn a_sun_labelled_multi_arch_disc_opens_through_its_next_label() {
-        use crate::partition::next::{present_copies, LABEL_SPAN, RISC_LABEL_BLOCKS};
+        use part_tables::next::{present_copies, LABEL_SPAN, RISC_LABEL_BLOCKS};
         let (mut img, layout) = build(&NextCdOptions::new(24 * 1024 * 1024, "OPENSTEP_4.2"));
         let copy = img[..LABEL_SPAN].to_vec();
         for block in LABEL_BLOCKS {

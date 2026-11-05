@@ -26,7 +26,7 @@ use crate::cli::logging::log_stderr;
 use crate::cli::parse::split_mac_path;
 use crate::cli::parse::ZeroReader;
 use crate::cli::resolve::{resolve_partition_rw, resolve_partition_rw_forced, FsDispatchOverride};
-use crate::fs::filesystem::CreateFileOptions;
+use disk_core::filesystem::CreateFileOptions;
 
 #[derive(Debug, Args)]
 pub struct PutArgs {
@@ -178,7 +178,7 @@ pub fn run(args: PutArgs) -> Result<()> {
 /// passes one; see [`super::squashfs`].
 pub fn run_with_budget(
     args: PutArgs,
-    budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+    budget: Option<fs_squashfs::squashfs_edit::SizeBudget>,
 ) -> Result<()> {
     if let Some(bb_file) = args.boot {
         // Boot-block write: 1024 bytes at the *partition's* first
@@ -249,7 +249,7 @@ pub fn run_with_budget(
     // Duplicate check so we can honor --force consistently, matched the way
     // the filesystem matches (FAT and friends ignore case).
     let fold_case = fs.case_insensitive_lookup();
-    let existing = crate::fs::copy::select_child(
+    let existing = disk_core::entry::select_child(
         &fs.list_directory(&parent)
             .map_err(|e| anyhow!("list_directory: {e}"))?,
         fold_case,
@@ -261,9 +261,9 @@ pub fn run_with_budget(
     // writes new *contents*; it is not a request to reset permissions, owner,
     // timestamps or type/creator. Must be captured before the delete below.
     let preserved = if args.no_preserve_meta {
-        crate::fs::attrs::PreservedMeta::default()
+        disk_core::attrs::PreservedMeta::default()
     } else {
-        crate::fs::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
+        disk_core::attrs::preserved_meta(fs.as_filesystem_mut(), existing.as_ref())
     };
     if existing.as_ref().is_some_and(|e| e.is_directory()) {
         bail!("{dst} is a directory; put replaces files only (rm -r it first)");
@@ -287,7 +287,7 @@ pub fn run_with_budget(
     let rsrc_import = if crate::fs::copy::Capabilities::infer(fs.fs_type()).resource_forks {
         args.host_file
             .as_ref()
-            .and_then(|p| crate::fs::resource_fork::detect_resource_fork(p))
+            .and_then(|p| fs_mac::resource_fork::detect_resource_fork(p))
     } else {
         None
     };
@@ -318,8 +318,8 @@ pub fn run_with_budget(
     // the fallback would fire first and leave nothing for preservation to fill
     // in. Precedence, highest first: explicit flag, config default, the
     // replaced file's own type, the extension dictionary, then BINA/????.
-    let auto_from_extension = crate::fs::hfs_common::uses_hfs_type_dictionary(fs.fs_type())
-        && crate::fs::hfs_common::type_creator_for_filename(&name).is_some();
+    let auto_from_extension = fs_mac::hfs_common::uses_hfs_type_dictionary(fs.fs_type())
+        && fs_mac::hfs_common::type_creator_for_filename(&name).is_some();
     let preserves_type = preserved.os_type.is_some();
     let type_code = args
         .type_code
@@ -349,7 +349,7 @@ pub fn run_with_budget(
     // POSIX attributes. Every editable Unix filesystem honours these; until now
     // nothing set them, so each driver's `unwrap_or` silently made every added
     // file root:root 0644. Resolution (and its precedence rules) lives in
-    // `fs::attrs` so the GUI and TUI cannot drift from the CLI.
+    // `disk_core::attrs` so the GUI and TUI cannot drift from the CLI.
     let host_mode = args.host_file.as_ref().and_then(|p| {
         #[cfg(unix)]
         {
@@ -362,8 +362,8 @@ pub fn run_with_budget(
             None
         }
     });
-    let attrs = crate::fs::attrs::resolve_attrs(
-        &crate::fs::attrs::AttrOverrides {
+    let attrs = disk_core::attrs::resolve_attrs(
+        &disk_core::attrs::AttrOverrides {
             mode: args.mode,
             uid: args.uid,
             gid: args.gid,
@@ -417,7 +417,7 @@ pub fn run_with_budget(
     // below only fills what is still unset.
     if let Some(imp) = &rsrc_import {
         if !imp.data.is_empty() {
-            options.resource_fork = Some(crate::fs::filesystem::ResourceForkSource::Data(
+            options.resource_fork = Some(disk_core::filesystem::ResourceForkSource::Data(
                 imp.data.clone(),
             ));
         }
@@ -432,7 +432,7 @@ pub fn run_with_budget(
     // Fills only what nobody set explicitly, so --type / --mode still win.
     preserved.apply_to_options(&mut options);
 
-    let write_through = |fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
+    let write_through = |fs: &mut dyn disk_core::filesystem::EditableFilesystem,
                          reader: &mut dyn std::io::Read,
                          len: u64|
      -> anyhow::Result<()> {
@@ -566,7 +566,7 @@ fn remote_put(
     // recognized extension sends `None` and lets the server's `create_file`
     // resolve it (which consults the same dictionary on HFS/HFS+/MFS, and picks
     // its own sensible default elsewhere).
-    let auto_from_extension = crate::fs::hfs_common::type_creator_for_filename(name).is_some();
+    let auto_from_extension = fs_mac::hfs_common::type_creator_for_filename(name).is_some();
     let type_code = type_code
         .or_else(|| {
             crate::cli::logging::loaded_config()
@@ -620,7 +620,7 @@ fn put_boot_from(
     donor: &ImageRef,
 ) -> Result<()> {
     use crate::cli::resolve::resolve_partition_streaming;
-    use crate::fs::hfs_boot::read_donor_boot_blocks;
+    use fs_mac::hfs_boot::read_donor_boot_blocks;
 
     // Read + validate from the donor first; never touch the target if the
     // donor isn't actually bootable.

@@ -15,10 +15,10 @@ use crate::fs::{
     validate_prodos_integrity,
 };
 use crate::os::SectorAlignedWriter;
-use crate::partition::apm::build_minimal_apm;
-use crate::partition::gpt::{build_minimal_gpt, Gpt};
-use crate::partition::mbr::build_minimal_mbr;
 use crate::rbformats;
+use part_tables::apm::build_minimal_apm;
+use part_tables::gpt::{build_minimal_gpt, Gpt};
+use part_tables::mbr::build_minimal_mbr;
 
 use super::{detect_partition_fs_type, write_fat_clean_flags, PartitionFsType, RestoreProgress};
 
@@ -78,7 +78,7 @@ pub struct NewDiskConfig {
     /// MBR partition type byte (e.g. 0x0C for FAT32 LBA).
     pub partition_type_byte: u8,
     /// GPT partition type GUID (e.g. Microsoft Basic Data).
-    pub partition_type_guid: Option<crate::partition::gpt::Guid>,
+    pub partition_type_guid: Option<part_tables::gpt::Guid>,
     /// APM partition type string (e.g. "Apple_HFS").
     pub partition_type_string: Option<String>,
     /// Whether the partition should be marked bootable (MBR only).
@@ -159,8 +159,8 @@ pub fn run_single_partition_restore(
                     "Source: backup partition {} ({}), imaged {} / original {}",
                     pm.index,
                     pm.type_name,
-                    crate::partition::format_size(pm.imaged_size_bytes),
-                    crate::partition::format_size(pm.original_size_bytes),
+                    disk_core::display::format_size(pm.imaged_size_bytes),
+                    disk_core::display::format_size(pm.original_size_bytes),
                 ),
             );
 
@@ -209,7 +209,7 @@ pub fn run_single_partition_restore(
                 LogLevel::Info,
                 format!(
                     "Image data size: {}",
-                    crate::partition::format_size(data_size),
+                    disk_core::display::format_size(data_size),
                 ),
             );
 
@@ -230,8 +230,8 @@ pub fn run_single_partition_restore(
     if write_size < source_data_size {
         bail!(
             "Target partition ({}) is smaller than source data ({})",
-            crate::partition::format_size(write_size),
-            crate::partition::format_size(source_data_size),
+            disk_core::display::format_size(write_size),
+            disk_core::display::format_size(source_data_size),
         );
     }
 
@@ -263,11 +263,19 @@ pub fn run_single_partition_restore(
                 config.target_path.display()
             ),
         );
+        // A new disk's image file is created at its full size; a partition target must exist.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(config.new_disk.is_some())
+            .truncate(false)
             .open(&config.target_path)
             .with_context(|| format!("failed to open {}", config.target_path.display()))?;
+        if let Some(nd) = &config.new_disk {
+            if file.metadata()?.len() < nd.disk_size_bytes {
+                file.set_len(nd.disk_size_bytes)?;
+            }
+        }
         crate::os::DeviceWriteHandle::from_file(file)
     };
 
@@ -309,7 +317,7 @@ pub fn run_single_partition_restore(
             NewTableType::Gpt => {
                 let type_guid = new_disk.partition_type_guid.unwrap_or_else(|| {
                     // Default: Microsoft Basic Data
-                    crate::partition::gpt::Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
+                    part_tables::gpt::Guid::from_string("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
                         .unwrap()
                 });
                 let end_lba = start_lba + part_size_sectors - 1;
@@ -450,7 +458,7 @@ pub fn run_single_partition_restore(
         LogLevel::Info,
         format!(
             "Wrote {} of partition data",
-            crate::partition::format_size(bytes_written),
+            disk_core::display::format_size(bytes_written),
         ),
     );
 
@@ -463,7 +471,7 @@ pub fn run_single_partition_restore(
             LogLevel::Info,
             format!(
                 "Zero-padding {} at end of partition",
-                crate::partition::format_size(pad_size),
+                disk_core::display::format_size(pad_size),
             ),
         );
 
@@ -539,8 +547,8 @@ pub fn run_single_partition_restore(
             format!(
                 "Resizing {:?} filesystem from {} to {}",
                 fs_type,
-                crate::partition::format_size(header_size),
-                crate::partition::format_size(write_size),
+                disk_core::display::format_size(header_size),
+                disk_core::display::format_size(write_size),
             ),
         );
         let mut log_cb = |msg: &str| log(&progress, LogLevel::Info, msg);
@@ -668,7 +676,7 @@ pub fn run_single_partition_restore(
         LogLevel::Info,
         format!(
             "Single-partition restore complete: {} written to {} at offset {}",
-            crate::partition::format_size(bytes_written),
+            disk_core::display::format_size(bytes_written),
             config.target_path.display(),
             config.target_offset_bytes,
         ),
@@ -686,8 +694,8 @@ pub fn run_single_partition_restore(
 mod tests {
     use super::*;
     use crate::backup::metadata::{AlignmentMetadata, BackupLayout, PartitionMetadata};
-    use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-    use crate::fs::hfsplus::{create_blank_hfsplus, CompactHfsPlusReader, HfsPlusFilesystem};
+    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use fs_mac::hfsplus::{create_blank_hfsplus, CompactHfsPlusReader, HfsPlusFilesystem};
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;

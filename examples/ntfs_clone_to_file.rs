@@ -1,11 +1,11 @@
 //! Build a populated NTFS source in memory, stream a defragmenting clone to a
 //! file, for oracle validation. Usage: cargo run --example ntfs_clone_to_file -- <out>
-use rusty_backup::fs::filesystem::{
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
 };
-use rusty_backup::fs::ntfs::NtfsFilesystem;
-use rusty_backup::fs::ntfs_clone::stream_defragmented_ntfs;
-use rusty_backup::fs::ntfs_format::{create_blank_ntfs, ntfs_min_packed_size};
+use fs_pc::ntfs::NtfsFilesystem;
+use fs_pc::ntfs_clone::stream_defragmented_ntfs;
+use fs_pc::ntfs_format::{create_blank_ntfs, ntfs_min_packed_size};
 use std::io::{Cursor, Seek, SeekFrom};
 
 fn main() {

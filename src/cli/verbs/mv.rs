@@ -8,8 +8,8 @@ use clap::Args;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
 pub struct MvArgs {
@@ -71,7 +71,7 @@ pub fn run(args: MvArgs) -> Result<()> {
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     let fold = fs.case_insensitive_lookup();
-    let entry = crate::fs::filesystem::find_child(fold, &children, &old_name)
+    let entry = disk_core::filesystem::find_child(fold, &children, &old_name)
         .cloned()
         .ok_or_else(|| anyhow!("not found: {}", args.src))?;
     // A case-only rename on a case-folding volume is the entry itself, not a clash.

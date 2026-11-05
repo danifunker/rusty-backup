@@ -46,11 +46,12 @@ use anyhow::{anyhow, Context, Result};
 use super::disk_image_stream::DiskImageStreamBuilder;
 use super::metadata::{BackupLayout, BackupMetadata};
 use crate::fs;
-use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::resize::{compute_resize_plan, PartitionResizePlan};
-use crate::partition::{PartitionInfo, PartitionSizeOverride, PartitionTable};
+use crate::partition::{PartitionInfo, PartitionTable};
 use crate::rbformats::chd::{compress_chd, compress_chd_dvd, ChdReader};
 use crate::rbformats::chd_options::ChdOptions;
+use part_tables::mbr::patch_mbr_entries;
+use part_tables::PartitionSizeOverride;
 
 /// Inputs for a single-file CHD backup. The caller (typically `run_backup`)
 /// is responsible for opening the source, parsing the partition table,
@@ -86,7 +87,7 @@ pub struct SingleFileChdInputs<'a> {
     /// `docs/whole_disk_chd_backup.md` (Stage 4b, Approach A).
     pub resize_targets: Option<&'a [(usize, u64)]>,
     /// HFS+/HFSX partitions that should be reproduced as a fully repacked
-    /// (defragmented) volume via [`fs::hfsplus_defrag::stream_defragmented_hfsplus`]
+    /// (defragmented) volume via [`fs_mac::hfsplus_defrag::stream_defragmented_hfsplus`]
     /// rather than via raw read + in-place resize. Entries are
     /// `(partition_index, target_size_bytes)`. The new partition size in the
     /// resize plan is taken from `resize_targets`; this list just flags which
@@ -213,6 +214,7 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
         PartitionTable::Mbr(_)
             | PartitionTable::Gpt { .. }
             | PartitionTable::Apm(_)
+            | PartitionTable::ApmTs(_)
             | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
@@ -233,7 +235,8 @@ pub fn is_supported(inputs_table: &PartitionTable) -> bool {
 fn is_verbatim_head_scheme(table: &PartitionTable) -> bool {
     matches!(
         table,
-        PartitionTable::Sun(_)
+        PartitionTable::ApmTs(_)
+            | PartitionTable::Sun(_)
             | PartitionTable::Next(_)
             | PartitionTable::Bsd(_)
             | PartitionTable::HpuxLvm(_)
@@ -261,7 +264,7 @@ fn verify_head_covers_label(table: &PartitionTable, head_len: u64) -> Result<()>
         }
     }
     if let PartitionTable::X68k { sector_size, .. } = table {
-        use crate::partition::x68k::{
+        use part_tables::x68k::{
             X68K_ENTRY_SIZE, X68K_MAX_PARTITIONS, X68K_TABLE_HEADER_SIZE, X68K_TABLE_OFFSET,
             X68K_TABLE_OFFSET_SASI,
         };
@@ -1714,28 +1717,28 @@ fn stage_partitions_to_zst(
             // minutes during build_target_metadata.
             let producer_sink: Option<DefragLogSink> = defrag_log_sink.cloned();
             let producer =
-                std::thread::spawn(move || -> Result<fs::hfsplus_defrag::DefragReport> {
+                std::thread::spawn(move || -> Result<fs_mac::hfsplus_defrag::DefragReport> {
                     // Defensive: clear the thread-local on the way out
                     // regardless of how this thread exits, so a future
                     // OS-thread reuse can't inherit our sink.
                     struct ClearSinkOnDrop;
                     impl Drop for ClearSinkOnDrop {
                         fn drop(&mut self) {
-                            fs::hfsplus_defrag::set_progress_sink(None);
+                            fs_mac::hfsplus_defrag::set_progress_sink(None);
                         }
                     }
                     let _sink_guard = ClearSinkOnDrop;
                     let sink_for_clone = producer_sink.clone();
                     if let Some(sink) = producer_sink {
                         let sink_for_install = sink.clone();
-                        fs::hfsplus_defrag::set_progress_sink(Some(Box::new(move |msg: &str| {
-                            sink_for_install(msg)
-                        })));
+                        fs_mac::hfsplus_defrag::set_progress_sink(Some(Box::new(
+                            move |msg: &str| sink_for_install(msg),
+                        )));
                     }
                     match shape {
                         fs::DefragCloneShape::Pfs3 => {
                             let br = std::io::BufReader::new(producer_clone);
-                            let mut pfs = fs::pfs3::Pfs3Filesystem::open(br, part_offset)
+                            let mut pfs = fs_amiga::pfs3::Pfs3Filesystem::open(br, part_offset)
                                 .context("open source PFS3 for defrag-clone")?;
                             let sink_for_log = sink_for_clone.clone();
                             let mut clone_log = |s: &str| {
@@ -1744,7 +1747,7 @@ fn stage_partitions_to_zst(
                                 }
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::pfs3_clone::stream_defragmented_pfs3(
+                            let pr = fs_amiga::pfs3_clone::stream_defragmented_pfs3(
                                 &mut pfs,
                                 target_len,
                                 &mut writer,
@@ -1755,7 +1758,7 @@ fn stage_partitions_to_zst(
                             for w in &pr.warnings {
                                 eprintln!("PFS3 clone warning: {w}");
                             }
-                            Ok(fs::hfsplus_defrag::DefragReport {
+                            Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1768,7 +1771,7 @@ fn stage_partitions_to_zst(
                         }
                         fs::DefragCloneShape::Exfat => {
                             let br = std::io::BufReader::new(producer_clone);
-                            let mut ex = fs::exfat::ExfatFilesystem::open(br, part_offset)
+                            let mut ex = fs_pc::exfat::ExfatFilesystem::open(br, part_offset)
                                 .context("open source exFAT for defrag-clone")?;
                             let sink_for_log = sink_for_clone.clone();
                             let mut clone_log = |s: &str| {
@@ -1777,7 +1780,7 @@ fn stage_partitions_to_zst(
                                 }
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::exfat_clone::stream_defragmented_exfat(
+                            let pr = fs_pc::exfat_clone::stream_defragmented_exfat(
                                 &mut ex,
                                 target_len,
                                 &mut writer,
@@ -1788,7 +1791,7 @@ fn stage_partitions_to_zst(
                             for w in &pr.warnings {
                                 eprintln!("exFAT clone warning: {w}");
                             }
-                            Ok(fs::hfsplus_defrag::DefragReport {
+                            Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1801,7 +1804,7 @@ fn stage_partitions_to_zst(
                         }
                         fs::DefragCloneShape::Ntfs => {
                             let br = std::io::BufReader::new(producer_clone);
-                            let mut nt = fs::ntfs::NtfsFilesystem::open(br, part_offset)
+                            let mut nt = fs_pc::ntfs::NtfsFilesystem::open(br, part_offset)
                                 .context("open source NTFS for defrag-clone")?;
                             let sink_for_log = sink_for_clone.clone();
                             let mut clone_log = |s: &str| {
@@ -1810,7 +1813,7 @@ fn stage_partitions_to_zst(
                                 }
                             };
                             let mut clone_progress = |_emitted: u64| {};
-                            let pr = fs::ntfs_clone::stream_defragmented_ntfs(
+                            let pr = fs_pc::ntfs_clone::stream_defragmented_ntfs(
                                 &mut nt,
                                 target_len,
                                 &mut writer,
@@ -1821,7 +1824,7 @@ fn stage_partitions_to_zst(
                             for w in &pr.warnings {
                                 eprintln!("NTFS clone warning: {w}");
                             }
-                            Ok(fs::hfsplus_defrag::DefragReport {
+                            Ok(fs_mac::hfsplus_defrag::DefragReport {
                                 files_copied: pr.files_copied,
                                 dirs_copied: pr.dirs_copied,
                                 data_bytes_copied: pr.bytes_copied,
@@ -1834,9 +1837,9 @@ fn stage_partitions_to_zst(
                         }
                         fs::DefragCloneShape::Flat => {
                             let br = std::io::BufReader::new(producer_clone);
-                            let mut hfs = fs::hfsplus::HfsPlusFilesystem::open(br, part_offset)
+                            let mut hfs = fs_mac::hfsplus::HfsPlusFilesystem::open(br, part_offset)
                                 .context("open source HFS+ for defrag-clone")?;
-                            fs::hfsplus_defrag::stream_defragmented_hfsplus(
+                            fs_mac::hfsplus_defrag::stream_defragmented_hfsplus(
                                 &mut hfs,
                                 target_len,
                                 &mut writer,
@@ -1849,7 +1852,7 @@ fn stage_partitions_to_zst(
                             // shared-fd offset on this thread's dup'd
                             // source clone can't be clobbered by another
                             // partition's producer thread mid-detect.
-                            let info = fs::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
+                            let info = fs_mac::hfsplus_wrapper_clone::detect_wrapped_hfsplus_at(
                                 &producer_clone,
                                 part_offset,
                                 part_size,
@@ -1865,9 +1868,11 @@ fn stage_partitions_to_zst(
                                 + (info.embed_start_block as u64) * (info.al_block_size as u64)
                                 + 1024;
                             let inner_target = target_len.saturating_sub(outer_overhead);
-                            let cplan =
-                                fs::hfsplus_wrapper_clone::plan_wrapped_clone(&info, inner_target)
-                                    .map_err(|e| anyhow!("{e}"))?;
+                            let cplan = fs_mac::hfsplus_wrapper_clone::plan_wrapped_clone(
+                                &info,
+                                inner_target,
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
                             if cplan.new_partition_size != target_len {
                                 anyhow::bail!(
                                     "wrapped HFS+ partition-{}: planned size {} \
@@ -1885,7 +1890,7 @@ fn stage_partitions_to_zst(
                                     info.inner_size,
                                 );
                             }
-                            fs::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
+                            fs_mac::hfsplus_wrapper_clone::stream_wrapped_defragmented_hfsplus(
                                 &mut br,
                                 &cplan,
                                 &mut writer,
@@ -2158,9 +2163,8 @@ fn build_patched_head_segments(
         PartitionTable::Gpt { gpt, .. } => {
             let total_sectors = target_size / 512;
             let mut head_bytes: Vec<u8> = Vec::with_capacity(34 * 512);
-            head_bytes.extend_from_slice(&crate::partition::gpt::Gpt::build_protective_mbr(
-                total_sectors,
-            ));
+            head_bytes
+                .extend_from_slice(&part_tables::gpt::Gpt::build_protective_mbr(total_sectors));
             let patched = gpt.patch_for_restore(overrides, total_sectors);
             head_bytes.extend(patched.build_primary_gpt(total_sectors));
 
@@ -2210,7 +2214,8 @@ fn build_patched_head_segments(
             let head: Segment = (0, head_end, Box::new(std::io::Cursor::new(head_buf)));
             Ok((vec![head], None))
         }
-        PartitionTable::Sun(_)
+        PartitionTable::ApmTs(_)
+        | PartitionTable::Sun(_)
         | PartitionTable::Next(_)
         | PartitionTable::Bsd(_)
         | PartitionTable::HpuxLvm(_)
@@ -2298,6 +2303,7 @@ mod tests {
         for table in [
             PartitionTable::Sun(sun_label()),
             PartitionTable::Next(next_label()),
+            PartitionTable::ApmTs(ts_map()),
         ] {
             assert!(is_supported(&table), "{}", table.type_name());
             assert!(is_verbatim_head_scheme(&table), "{}", table.type_name());
@@ -2313,7 +2319,18 @@ mod tests {
         assert!(!is_verbatim_head_scheme(&dsd));
     }
 
-    fn sun_label() -> crate::partition::sun::SunDiskLabel {
+    fn ts_map() -> part_tables::apm::TsMap {
+        use part_tables::apm::{TsEntry, TsMap};
+        let hfs = TsEntry {
+            start_block: 6,
+            block_count: 100,
+            fs_id: "TFS1".into(),
+        };
+        let blocks = TsMap::build_blocks(106, &[hfs]);
+        TsMap::parse_blocks(&blocks[..512], &blocks[512..]).unwrap()
+    }
+
+    fn sun_label() -> part_tables::sun::SunDiskLabel {
         let mut buf = vec![0u8; 512];
         buf[436] = 0; // ntrks high
         buf[437] = 2; // ntrks = 2
@@ -2328,11 +2345,11 @@ mod tests {
         }
         buf[510] = (csum >> 8) as u8;
         buf[511] = csum as u8;
-        crate::partition::sun::SunDiskLabel::parse(&buf).expect("synthetic Sun label")
+        part_tables::sun::SunDiskLabel::parse(&buf).expect("synthetic Sun label")
     }
 
-    fn next_label() -> crate::partition::next::NextDiskLabel {
-        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+    fn next_label() -> part_tables::next::NextDiskLabel {
+        use part_tables::next::{build_label, NextLabelSpec, NextPartitionSpec};
         let spec = NextLabelSpec {
             partitions: vec![
                 Some(NextPartitionSpec {
@@ -2351,7 +2368,7 @@ mod tests {
             ..Default::default()
         };
         let buf = build_label(&spec);
-        crate::partition::next::NextDiskLabel::parse(&buf, 0).expect("synthetic NeXT label")
+        part_tables::next::NextDiskLabel::parse(&buf, 0).expect("synthetic NeXT label")
     }
 
     #[test]
@@ -2367,7 +2384,7 @@ mod tests {
     /// bytes verbatim and the round-trip must reproduce them exactly.
     #[test]
     fn end_to_end_round_trip_next_label() {
-        use crate::partition::next::{build_label, NextLabelSpec, NextPartitionSpec};
+        use part_tables::next::{build_label, NextLabelSpec, NextPartitionSpec};
 
         const SECTOR: u64 = 1024;
         const FRONT: u64 = 160;
@@ -2396,7 +2413,7 @@ mod tests {
         let label = build_label(&spec);
 
         let mut data = vec![0u8; total_bytes as usize];
-        for &block in crate::partition::next::LABEL_BLOCKS.iter() {
+        for &block in part_tables::next::LABEL_BLOCKS.iter() {
             let at = (block * 512) as usize;
             data[at..at + label.len()].copy_from_slice(&label);
             // Each copy stamps its own block number; the checksum ignores it.
@@ -2473,6 +2490,80 @@ mod tests {
             "round-tripped CHD should still parse as a NeXT label, got: {}",
             detected.type_name(),
         );
+    }
+
+    /// The old Apple TS map backs up whole: DDR, map and the driver blocks ahead of
+    /// the HFS volume ride verbatim, and the CHD re-detects and opens as before.
+    #[test]
+    fn end_to_end_round_trip_apm_ts_map() {
+        use part_tables::apm::{TsEntry, TsMap};
+        let hfs = fs_mac::hfs::create_blank_hfs(2 * 1024 * 1024, 512, "Manhole").unwrap();
+        let blocks = (hfs.len() / 512) as u32;
+        let entry = TsEntry {
+            start_block: 6,
+            block_count: blocks,
+            fs_id: "TFS1".into(),
+        };
+        let mut data = TsMap::build_blocks(6 + blocks, &[entry]);
+        // Driver code in blocks 2-5, the way HD SC Setup lays it out.
+        data.extend((0..4 * 512).map(|i| (i % 249) as u8 + 3));
+        data.extend_from_slice(&hfs);
+        let total_bytes = data.len() as u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source.img");
+        std::fs::write(&source_path, &data).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let mut br = BufReader::new(source_file.try_clone().unwrap());
+        let table = PartitionTable::detect(&mut br).expect("detect TS map");
+        assert!(matches!(table, PartitionTable::ApmTs(_)));
+        let partitions = table.partitions();
+        let output_base = tmp.path().join("disk");
+        let head_bytes: [u8; 512] = data[..512].try_into().unwrap();
+        run_via_staging(
+            SingleFileChdInputs {
+                keep_swap: true,
+                source_file: &source_file,
+                source_size: total_bytes,
+                source_partition_table_bytes: &head_bytes,
+                partition_table: &table,
+                partitions: &partitions,
+                partition_filter: None,
+                sector_by_sector: true,
+                chd_options: None,
+                is_dvd: false,
+                output_base: &output_base,
+                resize_targets: None,
+                hfsplus_clone_targets: None,
+                alignment_sectors: 0,
+                checksum_type: crate::backup::ChecksumType::Sha256,
+            },
+            &mut |_: u64| {},
+            &|| false,
+            &mut |_: &str| {},
+            &mut |_, _| {},
+            &mut |_| {},
+            None,
+        )
+        .expect("TS-map single-file CHD backup");
+
+        let chd_path = tmp.path().join("disk.chd");
+        let mut reader = ChdReader::open(&chd_path).unwrap();
+        let mut back = vec![0u8; total_bytes as usize];
+        reader.read_exact(&mut back).unwrap();
+        assert_eq!(back, data, "the whole disk is verbatim");
+        let mut br = BufReader::new(ChdReader::open(&chd_path).unwrap());
+        let detected = PartitionTable::detect(&mut br).unwrap();
+        assert!(matches!(detected, PartitionTable::ApmTs(_)));
+        let p = &detected.partitions()[0];
+        let fs = crate::fs::open_filesystem(
+            BufReader::new(ChdReader::open(&chd_path).unwrap()),
+            p.byte_offset(),
+            0,
+            p.partition_type_string.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(fs.volume_label(), Some("Manhole"));
     }
 
     /// The RDSK block and its PART / FSHD / LSEG chain live in the reserved
@@ -2721,7 +2812,7 @@ mod tests {
     /// the last 33 LBAs.
     #[test]
     fn end_to_end_round_trip_gpt() {
-        use crate::partition::gpt::{build_minimal_gpt, Gpt, Guid};
+        use part_tables::gpt::{build_minimal_gpt, Gpt, Guid};
 
         const TOTAL_SECTORS: u64 = 8192; // 4 MiB
         const SECTOR_SIZE: u64 = 512;

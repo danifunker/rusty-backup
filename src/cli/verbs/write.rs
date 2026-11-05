@@ -15,7 +15,7 @@ use crate::cli::logging::log_stderr;
 use crate::model::physical_write_runner::{
     self, PhysicalWriteRequest, PhysicalWriteSource, WriteExtent,
 };
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct WriteArgs {
@@ -114,6 +114,18 @@ pub fn run(args: WriteArgs) -> Result<()> {
     };
 
     let status = Arc::new(Mutex::new(new_cli_status(src_size)));
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&status);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: "Writing".to_string(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
     physical_write_runner::run_worker(&req, Arc::clone(&status))
         .with_context(|| format!("writing {} to {}", args.image.display(), target_label))?;
 

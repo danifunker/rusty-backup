@@ -31,6 +31,8 @@ mod cli_literal_paths;
 mod cli_macplus_appleii;
 mod cli_native_slots;
 mod cli_next_cdrom;
+#[cfg(feature = "optical")]
+mod cli_optical_extract;
 mod cli_provision;
 mod cli_put_case;
 mod cli_ql;

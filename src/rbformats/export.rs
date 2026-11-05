@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::dc42;
-use super::twomg::build_twomg_header;
-use super::vhd::build_vhd_footer;
 use super::woz_write;
 use super::{decompress_members_to_writer, reconstruct_disk_from_backup, write_zeros, CHUNK_SIZE};
 use crate::backup::metadata::BackupMetadata;
-use crate::partition::PartitionSizeOverride;
+use dsk_apple::twomg::build_twomg_header;
+use dsk_vm::vhd::build_vhd_footer;
+use part_tables::PartitionSizeOverride;
 
 /// Output format for disk image export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub enum ExportFormat {
     /// by *cloning* the source HFS partition into a freshly-sized volume rather
     /// than streaming bytes. Unlike every other `ExportFormat`, this is NOT a
     /// streaming codec: the GUI/CLI intercept it and route to the HFV clone
-    /// path (`fs::hfv::clone_into_hfv` via `export_runner::start_per_partition_hfv`),
+    /// path (`fs_mac::hfv::clone_into_hfv` via `export_runner::start_per_partition_hfv`),
     /// so it never reaches `write_header`/`write_footer` or the whole-disk /
     /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
     Hfv,
@@ -286,14 +286,14 @@ fn write_woz_from_sectors(
 /// Encode raw sector bytes as an Applesauce MOOF file and write to `dest_path`.
 ///
 /// `sectors.len()` must be 409,600 (400K single-sided) or 819,200 (800K
-/// double-sided) — MOOF is 3.5"-only; [`crate::rbformats::moof::sectors_to_moof`]
+/// double-sided) — MOOF is 3.5"-only; [`dsk_apple::moof::sectors_to_moof`]
 /// rejects anything else.
 fn write_moof_from_sectors(
     sectors: &[u8],
     dest_path: &Path,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    let bytes = crate::rbformats::moof::sectors_to_moof(sectors)
+    let bytes = dsk_apple::moof::sectors_to_moof(sectors)
         .context("MOOF export failed: source is not a 400K or 800K 3.5\" floppy")?;
     std::fs::write(dest_path, &bytes)
         .with_context(|| format!("failed to write {}", dest_path.display()))?;
@@ -384,7 +384,7 @@ fn open_source_reader(source_path: &Path) -> Result<(super::BoxReadSeek, u64)> {
         // (synthesize $Bitmap, recover $Boot's boot code) — these make the
         // export mountable AND bootable. Only export goes through here; inspect
         // uses source_reader::open_read and keeps its fast lazy open.
-        let mut gho = super::gho::GhoReader::open(source_path)?;
+        let mut gho = dsk_ghost::gho::GhoReader::open(source_path)?;
         gho.prepare_full_image();
         let size = gho.seek(SeekFrom::End(0))?;
         gho.seek(SeekFrom::Start(0))?;
@@ -1087,7 +1087,7 @@ pub fn export_partition(
 /// Export a whole disk from a Clonezilla image in the specified format.
 pub fn export_clonezilla_disk(
     format: ExportFormat,
-    cz_image: &crate::clonezilla::metadata::ClonezillaImage,
+    cz_image: &dsk_clonezilla::metadata::ClonezillaImage,
     backup_folder: &Path,
     output_path: &Path,
     partition_sizes: &[PartitionSizeOverride],
@@ -1367,7 +1367,7 @@ fn export_whole_disk_qcow2(
         )?;
         tmp.flush()?;
         tmp.seek(SeekFrom::Start(0))?;
-        super::qcow2::export_qcow2(
+        dsk_vm::qcow2::export_qcow2(
             &mut tmp,
             &mut out,
             written,
@@ -1379,7 +1379,7 @@ fn export_whole_disk_qcow2(
     } else {
         let (mut reader, source_data_size) =
             open_export_source(source_path, &mut progress_cb, &cancel_check)?;
-        super::qcow2::export_qcow2(
+        dsk_vm::qcow2::export_qcow2(
             &mut reader,
             &mut out,
             source_data_size,
@@ -1435,7 +1435,7 @@ fn export_whole_disk_vmdk_flat(
         )?;
         tmp.flush()?;
         tmp.seek(SeekFrom::Start(0))?;
-        super::vmdk::export_vmdk_flat(
+        dsk_vm::vmdk::export_vmdk_flat(
             &mut tmp,
             dest_path,
             written,
@@ -1446,7 +1446,7 @@ fn export_whole_disk_vmdk_flat(
     } else {
         let (mut reader, source_data_size) =
             open_export_source(source_path, &mut progress_cb, &cancel_check)?;
-        super::vmdk::export_vmdk_flat(
+        dsk_vm::vmdk::export_vmdk_flat(
             &mut reader,
             dest_path,
             source_data_size,
@@ -1509,7 +1509,7 @@ fn export_whole_disk_vmdk_sparse(
         )?;
         tmp.flush()?;
         tmp.seek(SeekFrom::Start(0))?;
-        super::vmdk_sparse::export_vmdk_sparse(
+        dsk_vm::vmdk_sparse::export_vmdk_sparse(
             &mut tmp,
             &mut out,
             written,
@@ -1521,7 +1521,7 @@ fn export_whole_disk_vmdk_sparse(
     } else {
         let (mut reader, source_data_size) =
             open_export_source(source_path, &mut progress_cb, &cancel_check)?;
-        super::vmdk_sparse::export_vmdk_sparse(
+        dsk_vm::vmdk_sparse::export_vmdk_sparse(
             &mut reader,
             &mut out,
             source_data_size,

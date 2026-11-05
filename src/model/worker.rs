@@ -6,8 +6,8 @@
 //! closed. `run_guarded` records the panic or error into the status, and
 //! `lock_status` recovers a poisoned lock (the status structs are plain data,
 //! so nothing in them can be left half-updated in a way that matters).
+//! The guard itself is [`super::job::catch`], shared with [`super::job::Job`].
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A status the GUI polls: it must be able to record a terminal failure.
@@ -26,15 +26,11 @@ pub fn run_guarded<S: WorkerStatus>(
     what: &str,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) {
-    let failure = match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(format!("{e:#}")),
-        Err(payload) => Some(format!(
-            "{what} worker panicked: {}",
-            panic_message(payload.as_ref())
-        )),
-    };
-    if let Some(message) = failure {
+    if let Err(failure) = super::job::catch(what, body) {
+        let message = match failure {
+            super::job::Failure::Cancelled => super::job::Cancelled.to_string(),
+            super::job::Failure::Error(message) => message,
+        };
         lock_status(status).fail(message);
     }
 }
@@ -46,6 +42,18 @@ pub fn spawn_guarded<S: WorkerStatus + Send + 'static>(
     body: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || run_guarded(&status, what, body))
+}
+
+/// Spawn a thread no status watches (audio playback, the update check); a panic or error is logged.
+pub fn spawn_detached(
+    what: &'static str,
+    body: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if let Err(super::job::Failure::Error(message)) = super::job::catch(what, body) {
+            log::error!("{message}");
+        }
+    })
 }
 
 /// Relay a cancel from one flag to another until `done`: for a step that
@@ -66,15 +74,56 @@ pub fn forward_cancel(
     })
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
+/// Run a status-polled runner inside a job: `body` runs on a scoped thread while `mirror` copies
+/// `status` into `ctx` every 50 ms (and forwards `ctx`'s cancel into the status).
+pub fn run_mirrored<S: Send, R: Send>(
+    ctx: &super::job::JobCtx,
+    status: &Arc<Mutex<S>>,
+    mirror: impl Fn(&mut S, &super::job::JobCtx),
+    body: impl FnOnce() -> R + Send,
+) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(body);
+        while !handle.is_finished() {
+            mirror(&mut lock_status(status), ctx);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        mirror(&mut lock_status(status), ctx);
+        match handle.join() {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
+/// Wait inside a job for a runner that spawned its own worker: `step` sees the status every 50 ms
+/// (mirror progress, drain log lines, forward a cancel) and returns true once the runner finished.
+pub fn wait_spawned<S>(
+    ctx: &super::job::JobCtx,
+    status: &Arc<Mutex<S>>,
+    mut step: impl FnMut(&mut S, &super::job::JobCtx) -> bool,
+) {
+    loop {
+        if step(&mut lock_status(status), ctx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// `impl WorkerStatus` for a status whose end is `finished = true` plus an `error` message.
+#[macro_export]
+macro_rules! finished_with_error {
+    ($($t:ty),+ $(,)?) => {$(
+        impl $crate::model::worker::WorkerStatus for $t {
+            fn fail(&mut self, message: String) {
+                self.error = Some(message);
+                self.finished = true;
+            }
+        }
+    )+};
+}
+pub use crate::finished_with_error;
 
 impl WorkerStatus for crate::backup::BackupProgress {
     fn fail(&mut self, message: String) {
@@ -84,13 +133,6 @@ impl WorkerStatus for crate::backup::BackupProgress {
 }
 
 impl WorkerStatus for crate::restore::RestoreProgress {
-    fn fail(&mut self, message: String) {
-        self.error = Some(message);
-        self.finished = true;
-    }
-}
-
-impl WorkerStatus for super::status::VhdExportStatus {
     fn fail(&mut self, message: String) {
         self.error = Some(message);
         self.finished = true;
@@ -125,6 +167,29 @@ mod tests {
             finished: false,
             error: None,
         }))
+    }
+
+    struct Runner {
+        finished: bool,
+        error: Option<String>,
+    }
+    finished_with_error!(Runner);
+
+    #[test]
+    fn a_runner_status_from_the_macro_ends_failed_when_its_thread_panics() {
+        let status = Arc::new(Mutex::new(Runner {
+            finished: false,
+            error: None,
+        }));
+        spawn_guarded(Arc::clone(&status), "export", || panic!("short read"))
+            .join()
+            .unwrap();
+        let s = lock_status(&status);
+        assert!(s.finished);
+        assert_eq!(
+            s.error.as_deref(),
+            Some("export worker panicked: short read")
+        );
     }
 
     #[test]

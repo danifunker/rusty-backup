@@ -135,7 +135,7 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     let block = match fs {
         MacCdFs::Hfs => {
             let rough = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
-            crate::fs::hfs::pick_block_size(rough) as u64
+            fs_mac::hfs::pick_block_size(rough) as u64
         }
         MacCdFs::HfsPlus => 4096,
     };
@@ -167,7 +167,7 @@ fn populate(args: &NewMacCdromArgs, dir: &std::path::Path) -> Result<()> {
     let mut fs = ctx
         .open_editable(file)
         .map_err(|e| anyhow::anyhow!("opening the new Mac volume for writing: {e}"))?;
-    let dest = crate::fs::filesystem::Filesystem::root(fs.as_filesystem_mut())
+    let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
     let opts = DirImportOptions {

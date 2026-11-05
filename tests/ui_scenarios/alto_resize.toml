@@ -1,0 +1,22 @@
+# Resize Alto Disk: a Diablo 31 pack re-laid onto a Diablo 44 and saved as a new PDI.
+name = "Alto resize: Diablo 31 to 44"
+vm = "alto_resize"
+
+[[step]]
+action = "Open"
+arg = "$diablo31"
+settle = true
+expect = { open = true, summary = "~Current: Diablo 31", target = 44, fit_warning = "" }
+
+[[step]]
+action = "SaveAs"
+effects = ["PickFile"]
+
+[[step]]
+action = "Pick"
+settle = true
+expect = { result = "~(9744 pages)", out_model = 44 }
+
+[[step]]
+action = "Close"
+expect = { open = false }

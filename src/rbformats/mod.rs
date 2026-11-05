@@ -168,40 +168,33 @@ pub mod appimage;
 pub mod cbk;
 pub mod compress;
 pub mod containers;
-pub mod dart;
-pub mod dc42;
-pub mod dmg;
+use dsk_apple::dart;
+use dsk_apple::dc42;
+use dsk_dmg::dmg;
 #[cfg(feature = "crypto")]
-pub mod dmg_crypto;
+use dsk_dmg::dmg_crypto;
 pub mod export;
-pub mod flux;
-pub mod gho;
-pub mod gho_crypto;
 pub mod gz_index;
 pub mod gzip;
 pub mod icon_hd;
-pub mod imz;
 pub mod interleave;
 pub mod iso_squashfs;
 pub mod lz4;
-pub mod lzhuf;
-pub mod moof;
-pub mod ndif;
+use dsk_apple::moof;
 pub mod next_mo;
 pub mod payload_slice;
-pub mod qcow2;
+use dsk_vm::qcow2;
 #[cfg(test)]
 pub(crate) mod qemu_img_test;
 pub mod raw;
-pub mod sparse;
-pub mod sparseimage;
+use dsk_dmg::sparseimage;
 pub mod swab;
-pub mod twomg;
+use dsk_apple::twomg;
 pub mod vhd;
-pub mod vmdk;
-pub mod vmdk_sparse;
-pub mod woz;
-pub mod woz_write;
+use dsk_apple::woz;
+use dsk_apple::woz_write;
+use dsk_vm::vmdk;
+use dsk_vm::vmdk_sparse;
 pub mod zip_disk;
 pub mod zstd;
 pub(crate) mod zstd_compat;
@@ -214,15 +207,15 @@ use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
 use crate::fs::patch_hidden_sectors_for;
-use crate::partition::apm::Apm;
-use crate::partition::gpt::Gpt;
-use crate::partition::mbr::patch_mbr_entries;
-use crate::partition::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
-use crate::partition::x68k::{
+use part_tables::apm::Apm;
+use part_tables::gpt::Gpt;
+use part_tables::mbr::patch_mbr_entries;
+use part_tables::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
+use part_tables::x68k::{
     patch_x68k_entries, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_TABLE_OFFSET,
     X68K_TABLE_OFFSET_SASI,
 };
-use crate::partition::PartitionSizeOverride;
+use part_tables::PartitionSizeOverride;
 
 // Re-exports keep the historical `crate::rbformats::write_zeros` /
 // `super::CHUNK_SIZE` paths working for callers in `restore/` and the
@@ -473,10 +466,9 @@ pub fn reconstruct_disk_from_backup(
         if !partition_sizes.is_empty() {
             patch_mbr_entries(&mut mbr_buf, partition_sizes);
             log_cb("Patched MBR partition table with export sizes");
-            for index in crate::partition::mbr::clear_orphan_entries_overlapping(
-                &mut mbr_buf,
-                partition_sizes,
-            ) {
+            for index in
+                part_tables::mbr::clear_orphan_entries_overlapping(&mut mbr_buf, partition_sizes)
+            {
                 log_cb(&format!(
                     "Warning: MBR entry {index} was not part of this backup and the new layout \
                      overwrites its sectors; the entry has been removed"
@@ -1080,7 +1072,7 @@ pub fn detect_raw_rdb(reader: &mut (impl Read + Seek)) -> Option<Rdb> {
 ///
 /// `pfs3_clone_source`: when `Some(path)`, PFS3 partitions whose
 /// `export_size < source_size` (i.e. a real shrink) are rebuilt via
-/// [`crate::fs::pfs3_clone::stream_defragmented_pfs3`] instead of
+/// [`fs_amiga::pfs3_clone::stream_defragmented_pfs3`] instead of
 /// being copied verbatim + in-place trimmed. The path is opened with
 /// a fresh `File` for each PFS3 partition so the clone has its own
 /// reader independent of the byte-copy `reader` above. When `None`,
@@ -1230,10 +1222,10 @@ pub fn reconstruct_raw_rdb_disk(
                 let src_file = std::fs::File::open(src_path)
                     .with_context(|| format!("open PFS3 clone source {}", src_path.display()))?;
                 let src_br = std::io::BufReader::new(src_file);
-                let mut src_fs = crate::fs::pfs3::Pfs3Filesystem::open(src_br, p.source_lba * 512)
+                let mut src_fs = fs_amiga::pfs3::Pfs3Filesystem::open(src_br, p.source_lba * 512)
                     .with_context(|| {
-                        format!("open source PFS3 at LBA {} for clone-shrink", p.source_lba)
-                    })?;
+                    format!("open source PFS3 at LBA {} for clone-shrink", p.source_lba)
+                })?;
                 let base_written = total_written;
                 let export_size = p.export_size;
                 let report = {
@@ -1246,7 +1238,7 @@ pub fn reconstruct_raw_rdb_disk(
                     let mut clone_progress = |emitted: u64| {
                         progress_cb_ref(base_written + emitted.min(export_size));
                     };
-                    crate::fs::pfs3_clone::stream_defragmented_pfs3(
+                    fs_amiga::pfs3_clone::stream_defragmented_pfs3(
                         &mut src_fs,
                         export_size,
                         writer,
@@ -1738,9 +1730,9 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
     if file_size >= 512 {
         file.seek(SeekFrom::End(-512))?;
         let mut footer = [0u8; 512];
-        if file.read_exact(&mut footer).is_ok() && &footer[0..8] == vhd::VHD_COOKIE {
+        if file.read_exact(&mut footer).is_ok() && &footer[0..8] == dsk_vm::vhd::VHD_COOKIE {
             let disk_type = u32::from_be_bytes(footer[60..64].try_into().unwrap());
-            if disk_type == vhd::VHD_TYPE_DYNAMIC {
+            if disk_type == dsk_vm::vhd::VHD_TYPE_DYNAMIC {
                 // Logical size = footer "current size" (offset 48). The reader
                 // is opened by path in wrap_image_reader.
                 let logical_size = u64::from_be_bytes(footer[48..56].try_into().unwrap());
@@ -1800,7 +1792,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                     // as Raw so the tag-dependent Lisa filesystem (which parses
                     // the DC42 header itself) sees data + tags.
                     if let Ok(mut f2) = File::open(p) {
-                        if crate::fs::lisa::looks_like_lisa(&mut f2) {
+                        if fs_mac::lisa::looks_like_lisa(&mut f2) {
                             return Ok(ImageFormat::Raw);
                         }
                     }
@@ -1981,7 +1973,7 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         ImageFormat::VhdDynamic { path, logical_size } => {
             // Re-open by path so the reader owns its own File handle.
             drop(file);
-            let reader = vhd::DynamicVhdReader::open(File::open(&path)?)?;
+            let reader = dsk_vm::vhd::DynamicVhdReader::open(File::open(&path)?)?;
             Ok((Box::new(reader), logical_size))
         }
         ImageFormat::Qcow2 {
@@ -2235,8 +2227,8 @@ mod tests {
     /// Build a minimal APM + classic HFS raw disk image for round-trip testing:
     /// block 0 = DDR, blocks 1-2 = APM (self-map + HFS), blocks 3+ = HFS data.
     fn build_apm_hfs_test_disk() -> Vec<u8> {
-        use crate::partition::apm::build_minimal_apm;
         use byteorder::{BigEndian, ByteOrder};
+        use part_tables::apm::build_minimal_apm;
 
         // Classic HFS at block 3. Use a tiny volume: 128 alloc blocks × 4096
         // bytes = 512 KB of data area, plus 3 sectors of overhead
@@ -2284,8 +2276,8 @@ mod tests {
 
     #[test]
     fn test_reconstruct_raw_apm_disk_grows_hfs_partition() {
-        use crate::partition::apm::Apm;
-        use crate::partition::PartitionSizeOverride;
+        use part_tables::apm::Apm;
+        use part_tables::PartitionSizeOverride;
 
         let source = build_apm_hfs_test_disk();
         let source_size = source.len() as u64;
@@ -2362,8 +2354,8 @@ mod tests {
 #[cfg(test)]
 mod table_sidecar_tests {
     use super::*;
-    use crate::partition::apm::build_minimal_apm;
-    use crate::partition::gpt::{build_minimal_gpt, Guid};
+    use part_tables::apm::build_minimal_apm;
+    use part_tables::gpt::{build_minimal_gpt, Guid};
 
     /// BR6: exports handed the reconstruction no GPT / APM, so a GPT export
     /// kept only its protective MBR and an APM export was patched as an MBR.
@@ -2527,7 +2519,8 @@ mod label_export_tests {
     use super::{detect_raw_label, reconstruct_raw_label_disk};
     use crate::partition::provision::{self, Geometry, PartSpec};
     use crate::partition::type_catalog::TableKind;
-    use crate::partition::{PartitionSizeOverride, PartitionTable};
+    use crate::partition::PartitionTable;
+    use part_tables::PartitionSizeOverride;
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
     const DISK: u64 = 64 * 1024 * 1024;
@@ -2608,3 +2601,6 @@ mod label_export_tests {
         assert!(detect_raw_label(&mut Cursor::new(mbr)).is_none());
     }
 }
+
+#[cfg(test)]
+mod moved_tests;

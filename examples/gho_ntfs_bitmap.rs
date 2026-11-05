@@ -28,7 +28,7 @@ fn main() {
     let p = std::path::Path::new(&path);
 
     // --- locate $Bitmap's run from MFT record 6 ---
-    let mut r = rusty_backup::rbformats::gho::GhoReader::open(p).unwrap();
+    let mut r = dsk_ghost::gho::GhoReader::open(p).unwrap();
     r.seek(SeekFrom::Start(0)).unwrap();
     let vbr = rd(&mut r, 512);
     let cluster = (u16::from_le_bytes([vbr[0x0B], vbr[0x0C]]) as u64 * vbr[0x0D] as u64) as usize;
@@ -78,7 +78,7 @@ fn main() {
     println!("$Bitmap: lcn={bm_lcn} clusters={bm_clusters} (bytes {bm_start}..{bm_end})");
 
     // --- full sequential read; capture the $Bitmap region as it streams by ---
-    let mut r2 = rusty_backup::rbformats::gho::GhoReader::open(p).unwrap();
+    let mut r2 = dsk_ghost::gho::GhoReader::open(p).unwrap();
     r2.seek(SeekFrom::Start(0)).unwrap();
     let mut buf = vec![0u8; 1 << 20];
     let mut pos = 0u64;

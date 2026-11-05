@@ -1,0 +1,49 @@
+# The Inspect table editor's rules every shell (egui, TUI) relies on: Add Partition needs a gap of
+# at least 1 MiB and pre-fills the editor, a row offers Minimum once its minimum is known, a
+# primary row can be deleted and undone, and Apply writes the new entry so the re-read table
+# lists it.
+name = "Inspect: add a partition through the table editor"
+vm = "inspect"
+
+[[step]]
+action = "OpenImage"
+arg = "$mbr_gap"
+settle = true
+expect = { partitions = 1, can_add_partition = true, floppy_source = false, alto_source = true }
+
+[[step]]
+action = "AddPartition"
+expect = { editor_open = true, table_rows = 1, table_modes = "Original,Minimum,Custom", table_can_delete = true }
+
+[[step]]
+action = "TableDelete"
+arg = 0
+expect = { table_can_delete = false }
+
+[[step]]
+action = "TableUndo"
+arg = 0
+expect = { table_can_delete = true }
+
+[[step]]
+action = "TableAdd"
+expect = { table_rows = 2 }
+
+[[step]]
+action = "TableValidate"
+expect = { table_errors = "", table_can_apply = true }
+
+[[step]]
+action = "ApplyTable"
+settle = true
+expect = { partitions = 2, log = "~Partition table updated successfully." }
+
+[[step]]
+action = "CloseEditor"
+expect = { editor_open = false }
+
+[[step]]
+action = "OpenImage"
+arg = "$blank_fat"
+settle = true
+expect = { partitions = 1, can_add_partition = false }

@@ -14,15 +14,15 @@
 //! One end-to-end test per stage; one "genuinely new stamps now" test per
 //! kind so a future refactor can't silently regress the distinction.
 
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::times::UnixTimes;
+use fs_mac::fork_export::export_file_with_fork;
+use fs_mac::resource_fork::ResourceForkMode;
+use fs_tar::tar_export::{export_tar, TarCompression, TarExportOptions};
+use fs_tar::tar_import::{import_tar_into, TarImportOptions};
+use fs_unix::efs::{create_blank_efs, EfsFilesystem};
 use rusty_backup::fs::dir_import::{import_dir, DirImportOptions};
-use rusty_backup::fs::efs::{create_blank_efs, EfsFilesystem};
-use rusty_backup::fs::entry::FileEntry;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::fs::fork_export::export_file_with_fork;
-use rusty_backup::fs::resource_fork::ResourceForkMode;
-use rusty_backup::fs::tar_export::{export_tar, TarCompression, TarExportOptions};
-use rusty_backup::fs::tar_import::{import_tar_into, TarImportOptions};
-use rusty_backup::fs::times::UnixTimes;
 use std::io::Cursor;
 
 const YEAR_2020: u64 = 1_577_836_800; // 2020-01-01 00:00:00 UTC
@@ -323,24 +323,24 @@ fn genuinely_new_file_stamps_now() {
 // `CreateFileOptions.unix_times` gets one test that puts a 2020-dated byte
 // stream through `create_file` and reads the mtime back via `list_directory`.
 // The point is not to re-verify each format encoder (those have unit tests in
-// `fs::times`) — it's the plumbing between `create_file` and `list_directory`
+// `disk_core::times`) — it's the plumbing between `create_file` and `list_directory`
 // that's easy to let drift; one test per driver catches a driver forgetting
 // to thread `options.unix_times` through, or forgetting to populate
 // `modified_unix` on read.
 // ---------------------------------------------------------------------------
 
-use rusty_backup::fs::adfs::{create_blank_adfs, AdfsFilesystem};
-use rusty_backup::fs::exfat::{create_blank_exfat, ExfatFilesystem, ExfatFormatTemplate};
-use rusty_backup::fs::fat::{create_blank_fat, FatFilesystem};
-use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
-use rusty_backup::fs::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
-use rusty_backup::fs::hpfs::{create_blank_hpfs, HpfsFilesystem};
-use rusty_backup::fs::mfs::{create_blank_mfs, MfsFilesystem};
-use rusty_backup::fs::ntfs::NtfsFilesystem;
-use rusty_backup::fs::ntfs_format::create_blank_ntfs;
-use rusty_backup::fs::os9::{create_blank_os9, Os9Filesystem};
-use rusty_backup::fs::prodos::{create_blank_prodos, ProDosFilesystem};
-use rusty_backup::fs::ucsd::{create_blank_ucsd, UcsdFilesystem};
+use fs_8bit::os9::{create_blank_os9, Os9Filesystem};
+use fs_adfs::adfs::{create_blank_adfs, AdfsFilesystem};
+use fs_apple2::prodos::{create_blank_prodos, ProDosFilesystem};
+use fs_apple2::ucsd::{create_blank_ucsd, UcsdFilesystem};
+use fs_hpfs::hpfs::{create_blank_hpfs, HpfsFilesystem};
+use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
+use fs_mac::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+use fs_mac::mfs::{create_blank_mfs, MfsFilesystem};
+use fs_pc::exfat::{create_blank_exfat, ExfatFilesystem, ExfatFormatTemplate};
+use fs_pc::fat::{create_blank_fat, FatFilesystem};
+use fs_pc::ntfs::NtfsFilesystem;
+use fs_pc::ntfs_format::create_blank_ntfs;
 
 /// One-shot helper: create a file on `fs` at `/name` with mtime = YEAR_2020,
 /// re-list the root, and return the entry's `modified_unix`.

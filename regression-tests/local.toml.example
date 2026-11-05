@@ -169,3 +169,21 @@ notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 an
 # Physical device cases additionally require --allow-hardware and a device
 # allowlist; see HARDWARE.md. Listing a device here does not enable anything.
 # device_allowlist = "regression-tests/local-devices.toml"
+
+# --- Emulator oracles ---------------------------------------------------------
+#
+# Used by oracles/serialvm.py, oracles/freebsd/fsck_ffs.py and the scenarios in
+# emulator/ (scripts/regress-emulators.sh). A missing key makes the oracle skip
+# with exit 77, never fail. See emulator/README.md for what each one is.
+
+# [emulators]
+# freebsd15 = "/path/to/freebsd15"                 # holds fbsd.qcow2
+# icon_cli  = "/path/to/icon-emu/target/release/icon-cli"
+# icon_rom  = "/path/to/icon1_rom_combined.bin"
+# hpux_boot = "/path/to/hp715.img"
+# win7      = "/path/to/win7.qcow2"                # overlay on the Win7 image; run oracles/win7/win7vm.py settle once
+# copperline = "/path/to/copperline"               # github.com/CopperlineHQ/Copperline, cargo build --release
+# kickstart_a1200 = "/path/to/kicka1200.rom"       # A1200 Kickstart 3.1 or 3.2, decrypted
+# solaris9  = "/path/to/sol9-sun4m.img"            # raw sun4m Solaris 9, boots on -M SS-5 -nographic, no root password
+# previous  = "/path/to/previous"                # github.com/danifunker/previous-fork release binary; ROMs beside it
+# nextstep_boot = "/path/to/NeXTSTEP3-3_Disk-serial.hda"  # NeXTSTEP 3.3 with a root shell on ttya from rc.local

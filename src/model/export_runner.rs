@@ -18,10 +18,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::backup::metadata::BackupMetadata;
-use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::hfs_max_growable_size;
 use crate::model::size_mode::SizeMode;
-use crate::partition::{self, PartitionInfo, PartitionSizeOverride};
+use crate::partition::PartitionInfo;
 #[cfg(feature = "chd")]
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 use crate::rbformats::export::{
@@ -32,7 +31,9 @@ use crate::rbformats::export::{
 use crate::rbformats::export::{
     export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd,
 };
-use crate::rbformats::vhd::build_vhd_footer;
+use dsk_clonezilla::metadata::ClonezillaImage;
+use dsk_vm::vhd::build_vhd_footer;
+use part_tables::PartitionSizeOverride;
 
 /// Shared status for a background export operation. Worker threads write
 /// progress / log lines / errors here; the GUI thread polls and renders.
@@ -62,9 +63,48 @@ pub struct PartitionExportConfig {
 }
 
 impl PartitionExportConfig {
+    /// The exported size; a Custom size outside [`Self::custom_bounds_mib`] is clamped.
     pub fn effective_size(&self) -> u64 {
-        self.choice
-            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
+        self.choice.effective_size(
+            self.original_size,
+            self.minimum_size,
+            self.custom_mib_effective(),
+        )
+    }
+
+    /// The size modes this row offers: Minimum only below the original.
+    pub fn mode_choices(&self) -> Vec<SizeMode> {
+        let mut modes = vec![SizeMode::Original];
+        if self.minimum_size < self.original_size {
+            modes.push(SizeMode::Minimum);
+        }
+        modes.push(SizeMode::Custom);
+        modes
+    }
+
+    /// A Custom size's range in MiB: the minimum (at least 1) up to the volume's cap or 2 TiB.
+    pub fn custom_bounds_mib(&self) -> (u32, u32) {
+        let max = crate::model::size_mode::CUSTOM_MIB_MAX as u64;
+        let lo = (self.minimum_size / (1024 * 1024)).clamp(1, max);
+        let hi = self
+            .max_size
+            .map(|b| (b / (1024 * 1024)).max(lo))
+            .unwrap_or(max)
+            .min(max);
+        (lo as u32, hi as u32)
+    }
+
+    pub fn custom_mib_effective(&self) -> u32 {
+        let (lo, hi) = self.custom_bounds_mib();
+        self.custom_size_mib.clamp(lo, hi)
+    }
+
+    /// Switch the size mode; a switch into Custom starts at the minimum.
+    pub fn set_choice(&mut self, mode: SizeMode) {
+        if mode == SizeMode::Custom && self.choice != SizeMode::Custom {
+            self.custom_size_mib = (self.minimum_size / (1024 * 1024)).max(1) as u32;
+        }
+        self.choice = mode;
     }
 }
 
@@ -195,7 +235,7 @@ pub fn start_clonezilla_whole_disk(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: Clonezilla disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -223,6 +263,7 @@ pub fn start_clonezilla_whole_disk(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -241,7 +282,7 @@ pub fn start_native_whole_disk(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: whole-disk export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -270,6 +311,7 @@ pub fn start_native_whole_disk(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -312,7 +354,7 @@ pub fn start_native_whole_disk_chd(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: CHD/BinCue export");
         let status2 = Arc::clone(&status_thread);
         let status3 = Arc::clone(&status_thread);
@@ -406,6 +448,7 @@ pub fn start_native_whole_disk_chd(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -443,7 +486,7 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: per-partition export");
         let result = run_per_partition(
             format,
@@ -464,6 +507,7 @@ pub fn start_per_partition(inputs: PerPartitionInputs) -> Arc<Mutex<ExportStatus
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -489,7 +533,7 @@ fn is_hfv_eligible(part: &PartitionInfo) -> bool {
 
 /// Spawn a per-partition **HFV** export from a raw image / device. Every
 /// classic-HFS partition is *cloned* (not streamed) into a flat BasiliskII
-/// `.hfv` of its configured export size via [`crate::fs::hfv::clone_into_hfv`];
+/// `.hfv` of its configured export size via [`fs_mac::hfv::clone_into_hfv`];
 /// non-HFS partitions are skipped with a log line. This is the HFV branch of
 /// the Export dialog — see [`ExportFormat::Hfv`] for why it bypasses the
 /// streaming export path.
@@ -503,7 +547,7 @@ pub fn start_per_partition_hfv(
     let status = new_status(total_bytes);
     let status_thread = Arc::clone(&status);
 
-    std::thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "export", move || {
         let _wake = crate::os::wakelock::acquire("Rusty Backup: HFV export");
         let result = run_per_partition_hfv(
             &source_image,
@@ -518,6 +562,7 @@ pub fn start_per_partition_hfv(
                 s.error = Some(format!("{e:#}"));
             }
         }
+        Ok(())
     });
 
     status
@@ -575,7 +620,7 @@ fn run_per_partition_hfv(
                 "Exporting partition-{} to flat HFV {} ({})",
                 part.index,
                 dest_path.display(),
-                partition::format_size(target_size),
+                disk_core::display::format_size(target_size),
             ),
         );
 
@@ -591,13 +636,13 @@ fn run_per_partition_hfv(
         )?;
         let (reader, _len) =
             crate::rbformats::wrap_image_reader(File::open(source_image)?, format)?;
-        let mut source_fs = crate::fs::hfs::HfsFilesystem::open(reader, offset)
+        let mut source_fs = fs_mac::hfs::HfsFilesystem::open(reader, offset)
             .map_err(|e| anyhow::anyhow!("open source HFS at partition-{}: {e}", part.index))?;
         let name = source_fs.volume_summary().volume_name;
-        let block_size = crate::fs::hfv::suggest_block_size(target_size);
+        let block_size = fs_mac::hfv::suggest_block_size(target_size);
 
         let (bytes, report) =
-            crate::fs::hfv::clone_into_hfv(&mut source_fs, target_size, block_size, &name)
+            fs_mac::hfv::clone_into_hfv(&mut source_fs, target_size, block_size, &name)
                 .map_err(|e| anyhow::anyhow!("partition-{} -> HFV: {e}", part.index))?;
         std::fs::write(&dest_path, &bytes)
             .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest_path.display()))?;
@@ -655,7 +700,7 @@ fn run_per_partition(
                 s.log_messages.push(format!(
                     "Exporting partition-{} ({}) to {}",
                     cz_part.index,
-                    partition::format_size(export_size),
+                    disk_core::display::format_size(export_size),
                     dest_path.display()
                 ));
             }
@@ -712,7 +757,7 @@ fn run_per_partition(
                 s.log_messages.push(format!(
                     "Exporting partition-{} ({}) to {}",
                     pm.index,
-                    partition::format_size(export_size),
+                    disk_core::display::format_size(export_size),
                     dest_path.display()
                 ));
             }
@@ -798,7 +843,7 @@ fn run_per_partition(
                 s.log_messages.push(format!(
                     "Exporting partition-{} ({}) to {}",
                     part.index,
-                    partition::format_size(export_size),
+                    disk_core::display::format_size(export_size),
                     dest_path.display()
                 ));
             }
@@ -813,7 +858,7 @@ fn run_per_partition(
             let mut writer = BufWriter::new(File::create(&dest_path)?);
 
             if format == ExportFormat::TwoMg {
-                let hdr = crate::rbformats::twomg::build_twomg_header(export_size);
+                let hdr = dsk_apple::twomg::build_twomg_header(export_size);
                 writer.write_all(&hdr)?;
             }
 
@@ -929,20 +974,22 @@ fn refuse_unpatched_shrink(
         "partition-{index} cannot be written at {}: {reason:#}. A raw per-partition export \
          can only trim a volume whose filesystem is resized in place to match. Export it at \
          its original size, or use Backup with shrink-to-minimum, which clones the volume.",
-        partition::format_size(export_size)
+        disk_core::display::format_size(export_size)
     )
 }
+
+crate::model::worker::finished_with_error!(ExportStatus);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
 
     fn hfs(size: u64) -> Vec<u8> {
-        crate::fs::hfs::create_blank_hfs(size, 4096, "Trim").unwrap()
+        fs_mac::hfs::create_blank_hfs(size, 4096, "Trim").unwrap()
     }
 
     /// BR9: a compacted HFS backup exported at Minimum was refused as "not a
@@ -954,7 +1001,7 @@ mod tests {
         img.truncate(4 * MIB as usize);
         let mut file = Cursor::new(img);
         fit_filesystem_to_export(&mut file, 0, 4 * MIB, true, &mut |_| {}).unwrap();
-        let fs = crate::fs::hfs::HfsFilesystem::open(Cursor::new(file.into_inner()), 0).unwrap();
+        let fs = fs_mac::hfs::HfsFilesystem::open(Cursor::new(file.into_inner()), 0).unwrap();
         assert!(fs.total_size() <= 4 * MIB, "{}", fs.total_size());
         assert!(fs.total_size() > 3 * MIB, "{}", fs.total_size());
     }
@@ -984,8 +1031,7 @@ mod tests {
     #[test]
     fn a_volume_with_no_resizer_is_refused_and_zeros_are_not() {
         let minix =
-            crate::fs::minix::create_blank_minix(4 * MIB, crate::fs::minix::MinixVersion::V1)
-                .unwrap();
+            fs_unix::minix::create_blank_minix(4 * MIB, fs_unix::minix::MinixVersion::V1).unwrap();
         let err = fit_filesystem_to_export(&mut Cursor::new(minix), 0, 2 * MIB, true, &mut |_| {})
             .unwrap_err();
         assert!(

@@ -1,0 +1,24 @@
+# Archives: a one-entry archive holding a raw HFS disk is offered, and handed, to Inspect.
+name = "Archives: mount a disk-image payload in Inspect"
+vm = "archives"
+
+[[step]]
+action = "Open"
+arg = "$sit"
+settle = true
+expect = { loaded = true, mountable = "" }
+
+[[step]]
+action = "Open"
+arg = "$sit_hfs"
+settle = true
+expect = { loaded = true, files = 1, mountable = "raw HFS" }
+
+[[step]]
+action = "Mount"
+expect = { mounted = "~Disk", log = "" }
+
+[[step]]
+action = "Close"
+settle = true
+expect = { loaded = false, log = "~Routing raw HFS payload to Inspect tab" }

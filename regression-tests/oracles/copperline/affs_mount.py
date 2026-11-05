@@ -56,10 +56,29 @@ SER:
 """
 
 
+def local_config():
+    """regression-tests/local.toml, or {} when it is missing or unreadable."""
+    try:
+        import tomllib
+
+        with open(REPO / "regression-tests/local.toml", "rb") as f:
+            return tomllib.load(f)
+    except (ImportError, OSError, ValueError):
+        return {}
+
+
+def emulator_setting(key):
+    v = local_config().get("emulators", {}).get(key)
+    return Path(os.path.expanduser(v)) if v else None
+
+
 def find_copperline():
     env = os.environ.get("COPPERLINE")
     if env and Path(env).is_file():
         return Path(env)
+    configured = emulator_setting("copperline")
+    if configured and configured.is_file():
+        return configured
     for c in [
         REPO.parent / "Copperline/target/release/copperline.exe",
         REPO.parent / "Copperline/target/release/copperline",
@@ -71,6 +90,9 @@ def find_copperline():
 
 
 def find_rb_cli():
+    env = os.environ.get("RB_CLI")
+    if env and Path(env).is_file():
+        return Path(env)
     for c in [REPO / "target/release/rb-cli.exe", REPO / "target/release/rb-cli"]:
         if c.is_file():
             return c
@@ -84,6 +106,9 @@ def find_kickstart(work):
     Copperline unwraps Amiga Forever's AMIROMTYPE1 container only on its
     WHDLoad path, not in the main ROM loader, so the key is applied here.
     """
+    configured = emulator_setting("kickstart_a1200")
+    if configured and configured.is_file():
+        return configured
     cached = work / "kick31-a1200.rom"
     if cached.is_file():
         return cached
@@ -181,8 +206,12 @@ def main() -> int:
         print("unavailable: no rb-cli binary to assemble the disk with",
               file=sys.stderr)
         return 77
-    fixture = REPO / "regression-tests/fixtures/fs.affs.workbench13.hd.hdf"
-    mount3x = REPO / "regression-tests/fixtures/oracle-assets/amiga/Mount-3x"
+    # The corpus lives at local.toml's fixture_root; oracle-assets/ sits beside it.
+    root = Path(local_config().get("fixture_root") or REPO / "regression-tests/fixtures")
+    fixture = root / "fs.affs.workbench13.hd.hdf"
+    mount3x = root.parent / "oracle-assets/amiga/Mount-3x"
+    if not mount3x.is_file():
+        mount3x = root / "oracle-assets/amiga/Mount-3x"
     if not fixture.is_file() or not mount3x.is_file():
         print("unavailable: the Workbench fixture or the 3.x Mount is not in "
               "this host's corpus", file=sys.stderr)
@@ -192,8 +221,8 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     kick = find_kickstart(work)
     if not kick:
-        print("unavailable: no Kickstart 3.1 A1200 ROM (plus rom.key for an "
-              "Amiga Forever image) under ~/Documents/FS-UAE/Kickstarts",
+        print("unavailable: no A1200 Kickstart 3.x ROM ([emulators] kickstart_a1200 "
+              "in local.toml, or Amiga Forever's under ~/Documents/FS-UAE/Kickstarts)",
               file=sys.stderr)
         return 77
     boot = work / "wb13.affs"

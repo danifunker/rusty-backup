@@ -22,21 +22,21 @@ use crate::rbformats::cbk::{
     CbkPayloadReader,
 };
 use crate::rbformats::chd::ChdReader;
-use crate::rbformats::containers::atr::{decode_atr_bytes, looks_like_atr_header};
-use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
-use crate::rbformats::containers::dim::{decode_dim_bytes, looks_like_dim_header};
-use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
-use crate::rbformats::containers::g64::{decode_g64_bytes, looks_like_g64_header};
-use crate::rbformats::containers::hdf::detect_hdf_offset;
-use crate::rbformats::containers::hdm::decode_hdm_bytes;
-use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
-use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
-use crate::rbformats::containers::xdf::decode_xdf_bytes;
-use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
-use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::zip_disk::{ZipDiskReader, ZIP_MAGIC};
 use crate::rbformats::{detect_image_format_with_path, wrap_image_reader, ImageFormat, ReadSeek};
+use dsk_floppy::atr::{decode_atr_bytes, looks_like_atr_header};
+use dsk_floppy::d88::{decode_d88_bytes, looks_like_d88_header};
+use dsk_floppy::dim::{decode_dim_bytes, looks_like_dim_header};
+use dsk_floppy::edsk::{decode_edsk_bytes, looks_like_edsk_header};
+use dsk_floppy::g64::{decode_g64_bytes, looks_like_g64_header};
+use dsk_floppy::hdf::detect_hdf_offset;
+use dsk_floppy::hdm::decode_hdm_bytes;
+use dsk_floppy::msa::{decode_msa_bytes, MSA_MAGIC};
+use dsk_floppy::xdf::decode_xdf_bytes;
+use dsk_ghost::gho::{GhoReader, GHO_MAGIC};
+use dsk_imz::imz::{ImzReader, IMZ_MAGIC};
 use flate2::read::MultiGzDecoder;
+use fs_apple2::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
 
 /// Cheap magic sniff: returns true when `path` starts with `MComprHD`.
 pub fn is_chd_path(path: &Path) -> bool {
@@ -55,7 +55,7 @@ pub fn is_qcow2_path(path: &Path) -> bool {
         return false;
     };
     let mut magic = [0u8; 4];
-    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == crate::rbformats::qcow2::QCOW2_MAGIC
+    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == dsk_vm::qcow2::QCOW2_MAGIC
 }
 
 /// Cheap sniff: returns true when `path` looks like a WinImage IMZ
@@ -197,8 +197,8 @@ pub fn is_dsd_path(path: &Path) -> bool {
     };
     let side_len = (flat.len() / 2) as u64;
     let mut cur = std::io::Cursor::new(flat);
-    crate::fs::dfs::looks_like_dfs_within(&mut cur, 0, side_len).is_some()
-        && crate::fs::dfs::looks_like_dfs_within(&mut cur, side_len, side_len).is_some()
+    fs_8bit::dfs::looks_like_dfs_within(&mut cur, 0, side_len).is_some()
+        && fs_8bit::dfs::looks_like_dfs_within(&mut cur, side_len, side_len).is_some()
 }
 
 /// Cheap sniff for a Commodore G64 / G71 raw-GCR image: requires the
@@ -396,7 +396,7 @@ fn has_gzip_magic(path: &Path) -> bool {
 
 /// Fully decompress a gzip file into memory. Used for the small gzip-wrapped
 /// Alto / Pilot packs (`.pdi.gz`, gzipped CopyDisk) that must be parsed as a
-/// whole [`crate::fs::alto::Disk`] rather than streamed as flat sectors.
+/// whole [`fs_xerox::alto::Disk`] rather than streamed as flat sectors.
 pub fn gunzip_to_vec(path: &Path) -> std::io::Result<Vec<u8>> {
     let input = File::open(path)?;
     let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
@@ -724,7 +724,7 @@ fn try_open_cbk_lazy(path: &Path) -> Result<Option<CbkLazyReader>> {
     ) else {
         return Ok(None);
     };
-    crate::partition::mbr::patch_mbr_entries(&mut mbr, &overrides);
+    part_tables::mbr::patch_mbr_entries(&mut mbr, &overrides);
     let ebr = crate::restore::build_restore_ebr_chain(&metadata, &overrides, Some(&mbr));
 
     let mut regions: Vec<CbkRegion> = Vec::new();
@@ -1010,46 +1010,46 @@ fn open_read_dispatch(
         let flat =
             decode_g64_bytes(&bytes).with_context(|| format!("decode G64 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
-    } else if crate::rbformats::flux::kryoflux::is_stream_path(path) {
+    } else if dsk_flux::flux::kryoflux::is_stream_path(path) {
         // KryoFlux stream set: decode every track's flux to IBM MFM sectors, best copy wins.
-        let tracks = crate::rbformats::flux::kryoflux::read_set(path)
+        let tracks = dsk_flux::flux::kryoflux::read_set(path)
             .with_context(|| format!("read KryoFlux streams beside {}", path.display()))?;
-        let disk = crate::rbformats::flux::decode_disk(&tracks)
+        let disk = dsk_flux::flux::decode_disk(&tracks)
             .with_context(|| format!("no MFM sectors in the KryoFlux set {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
             eprintln!("KryoFlux: {faults}; unreadable sectors are zero-filled");
         }
-        crate::rbformats::flux::record_faults(path, &disk);
+        dsk_flux::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
-    } else if crate::rbformats::flux::mfm_emu::is_emu_path(path) {
+    } else if dsk_flux::flux::mfm_emu::is_emu_path(path) {
         // MFM reader capture of an ST-506 hard disk: decoded track by track into a temp file.
         let mut src =
             BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
         let mut out = tempfile::tempfile().context("temp file for an .emu decode")?;
-        let disk = crate::rbformats::flux::mfm_emu::decode_to(&mut src, &mut out)
+        let disk = dsk_flux::flux::mfm_emu::decode_to(&mut src, &mut out)
             .with_context(|| format!("decode MFM capture {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
             eprintln!("MFM capture: {faults}; unreadable sectors are zero-filled");
         }
-        crate::rbformats::flux::record_faults(path, &disk);
+        dsk_flux::flux::record_faults(path, &disk);
         out.seek(SeekFrom::Start(0))?;
         Ok(Box::new(BufReader::new(out)))
-    } else if crate::rbformats::flux::is_flux_file_path(path) {
+    } else if dsk_flux::flux::is_flux_file_path(path) {
         // SCP (Greaseweazle) or HFE: the same MFM decode as a KryoFlux set.
-        let tracks = crate::rbformats::flux::read_flux_file(path)
+        let tracks = dsk_flux::flux::read_flux_file(path)
             .with_context(|| format!("read flux image {}", path.display()))?;
-        let disk = crate::rbformats::flux::decode_disk(&tracks)
+        let disk = dsk_flux::flux::decode_disk(&tracks)
             .with_context(|| format!("no MFM sectors in {}", path.display()))?;
         if let Some(faults) = disk.fault_summary() {
             eprintln!("Flux: {faults}; unreadable sectors are zero-filled");
         }
-        crate::rbformats::flux::record_faults(path, &disk);
+        dsk_flux::flux::record_faults(path, &disk);
         Ok(Box::new(std::io::Cursor::new(disk.image)))
     } else if is_woz_path(path) {
         // WOZ 1/2 Apple/Mac floppy: decode the GCR bitstream to a flat sector
         // buffer (≤ 800 KB) and hand off as Cursor, like G64. Read-only here;
         // editing re-encodes via container_edit's EditFormat::Woz.
-        let mut reader = crate::rbformats::woz::WozReader::open(path)
+        let mut reader = dsk_apple::woz::WozReader::open(path)
             .with_context(|| format!("decode WOZ {}", path.display()))?;
         let mut flat = Vec::with_capacity(reader.len() as usize);
         reader
@@ -1060,7 +1060,7 @@ fn open_read_dispatch(
         // MOOF (Applesauce Macintosh 3.5" GCR bitstream): decode to a flat
         // 400K/800K sector buffer via the shared 3.5" GCR decoder, like WOZ.
         // Read-only here (no in-place re-encode wired into container_edit yet).
-        let mut reader = crate::rbformats::moof::MoofReader::open(path)
+        let mut reader = dsk_apple::moof::MoofReader::open(path)
             .with_context(|| format!("decode MOOF {}", path.display()))?;
         let mut flat = Vec::with_capacity(reader.len() as usize);
         reader
@@ -1114,7 +1114,7 @@ fn open_read_dispatch(
         // The header decides the offset; the volume itself is a window on the file, not a copy.
         let head = crate::compat::read_head(path, 0x2000)
             .with_context(|| format!("read HDF {}", path.display()))?;
-        let off = crate::rbformats::containers::hdf::detect_hdf_offset(&head).unwrap_or(0);
+        let off = dsk_floppy::hdf::detect_hdf_offset(&head).unwrap_or(0);
         let file = File::open(path).with_context(|| format!("open HDF {}", path.display()))?;
         Ok(Box::new(
             crate::rbformats::payload_slice::PayloadSlice::tail(file, off as u64),
@@ -1171,7 +1171,7 @@ fn open_read_dispatch(
         // flat image stream — a Lisa disk becomes DiskCopy 4.2 *with* tags,
         // everything else its block data.
         Ok(Box::new(std::io::Cursor::new(image)))
-    } else if let Some(image) = try_open_ndif_carrier(path).map(BufReader::new) {
+    } else if let Some(image) = try_open_ndif_carrier(path)?.map(BufReader::new) {
         // Self-mounting image / NDIF disk image delivered through a fork carrier
         // (MacBinary `.smi.bin`, AppleDouble sidecar, or a native resource fork):
         // the raw disk lives across both forks — data-fork chunks described by a
@@ -1188,11 +1188,11 @@ fn open_read_dispatch(
         // (Normal DC42 unwrapping in the CLI is a separate, pre-existing gap;
         // this only handles Twiggy.)
         if let Ok(mut probe) = File::open(path) {
-            if let Some(hdr) = crate::rbformats::dc42::parse_dc42_header(&mut probe) {
+            if let Some(hdr) = dsk_apple::dc42::parse_dc42_header(&mut probe) {
                 if hdr.is_twiggy() {
                     let raw = std::fs::read(path)
                         .with_context(|| format!("read Twiggy image {}", path.display()))?;
-                    let image = crate::rbformats::dc42::deinterleave_twiggy(&raw)
+                    let image = dsk_apple::dc42::deinterleave_twiggy(&raw)
                         .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
                     return Ok(Box::new(std::io::Cursor::new(image)));
                 }
@@ -1214,25 +1214,29 @@ fn open_read_dispatch(
 /// files reach us as a MacBinary `.smi.bin`, an AppleDouble `._name` sidecar
 /// pair, or (on macOS) a native resource fork. Returns the flat image only when
 /// a `bcem` resource is present, so a plain `.bin` raw image is never hijacked.
-fn try_open_ndif_carrier(path: &Path) -> Option<File> {
-    use crate::fs::resource_fork::{detect_resource_fork, parse_macbinary};
-    use crate::rbformats::ndif;
+/// `Ok(None)` = not NDIF; past a `bcem` map a rebuild failure errors, not "Unrecognized media".
+fn try_open_ndif_carrier(path: &Path) -> Result<Option<File>> {
+    use dsk_dmg::ndif;
+    use fs_mac::resource_fork::{detect_resource_fork, parse_macbinary};
 
     // Cheap gate: peek the 128-byte MacBinary header before reading a whole
     // (possibly multi-GB) file. If it's not MacBinary, fall back to the
     // sidecar/native probe, which only touches small companion files.
-    let head = crate::compat::read_head(path, 128).ok()?;
+    let Ok(head) = crate::compat::read_head(path, 128) else {
+        return Ok(None);
+    };
     // MacBinary forks are capped at 8 MiB, so that carrier is read whole; the image is not.
-    if head.len() == 128 && crate::macarchive::macbinary::is_macbinary(&head).is_some() {
+    if head.len() == 128 && arc_mac::macbinary::is_macbinary(&head).is_some() {
         if let Ok(bytes) = std::fs::read(path) {
             if let Some(rf) = parse_macbinary(&bytes) {
                 if let Some(bcem) = ndif::extract_bcem(&rf.data) {
                     let data = rf.data_fork.unwrap_or_default();
-                    return ndif_to_tempfile(&bcem, &mut |off, len| {
+                    return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                         data.get(off..off + len)
                             .map(<[u8]>::to_vec)
                             .context("NDIF: chunk past the data fork")
-                    });
+                    })
+                    .map(Some);
                 }
             }
         }
@@ -1243,34 +1247,38 @@ fn try_open_ndif_carrier(path: &Path) -> Option<File> {
     if let Some(rf) = detect_resource_fork(path) {
         if let Some(bcem) = ndif::extract_bcem(&rf.data) {
             if let Some(data) = rf.data_fork {
-                return ndif_to_tempfile(&bcem, &mut |off, len| {
+                return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                     data.get(off..off + len)
                         .map(<[u8]>::to_vec)
                         .context("NDIF: chunk past the data fork")
-                });
+                })
+                .map(Some);
             }
-            let mut f = File::open(path).ok()?;
-            return ndif_to_tempfile(&bcem, &mut |off, len| {
+            let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            return ndif_to_tempfile(path, &bcem, &mut |off, len| {
                 let mut buf = vec![0u8; len];
                 f.seek(SeekFrom::Start(off as u64))?;
                 f.read_exact(&mut buf)?;
                 Ok(buf)
-            });
+            })
+            .map(Some);
         }
     }
-    None
+    Ok(None)
 }
 
 /// Rebuild an NDIF image into an anonymous, sparse temp file rather than memory.
 fn ndif_to_tempfile(
+    path: &Path,
     bcem: &[u8],
     read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
-) -> Option<File> {
-    let mut f = tempfile::tempfile().ok()?;
-    let len = crate::rbformats::ndif::reconstruct_to(read, bcem, &mut f).ok()?;
-    f.set_len(len).ok()?;
-    f.seek(SeekFrom::Start(0)).ok()?;
-    Some(f)
+) -> Result<File> {
+    let mut f = tempfile::tempfile().context("create a temp file for the NDIF image")?;
+    let len = dsk_dmg::ndif::reconstruct_to(read, bcem, &mut f)
+        .with_context(|| format!("rebuild Disk Copy 6 (NDIF) image {}", path.display()))?;
+    f.set_len(len)?;
+    f.seek(SeekFrom::Start(0))?;
+    Ok(f)
 }
 
 /// Content-detect a DART image and, if so, decode it into a flat image stream.
@@ -1283,11 +1291,11 @@ fn try_decode_dart(path: &Path) -> Result<Option<Vec<u8>>> {
     }
     let mut head = vec![0u8; 148.min(file_size as usize)];
     let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    if probe.read_exact(&mut head).is_err() || !crate::rbformats::dart::is_dart(&head, file_size) {
+    if probe.read_exact(&mut head).is_err() || !dsk_apple::dart::is_dart(&head, file_size) {
         return Ok(None);
     }
     let bytes = std::fs::read(path).with_context(|| format!("read DART {}", path.display()))?;
-    let image = crate::rbformats::dart::decode_dart_to_image(&bytes)
+    let image = dsk_apple::dart::decode_dart_to_image(&bytes)
         .map_err(|e| anyhow::anyhow!("decode DART {}: {e}", path.display()))?;
     Ok(Some(image))
 }
@@ -1354,7 +1362,7 @@ pub fn open_peeled_read_with_entry(
         let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut head = [0u8; 8];
         if std::io::Read::read_exact(&mut probe, &mut head).is_ok()
-            && crate::rbformats::dmg_crypto::detect_encrypted_dmg(&head).is_some()
+            && dsk_dmg::dmg_crypto::detect_encrypted_dmg(&head).is_some()
         {
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             let pw = password.ok_or_else(|| {
@@ -1363,7 +1371,7 @@ pub fn open_peeled_read_with_entry(
                     path.display()
                 )
             })?;
-            let reader = crate::rbformats::dmg_crypto::open_encrypted_dmg(file, pw)
+            let reader = dsk_dmg::dmg_crypto::open_encrypted_dmg(file, pw)
                 .with_context(|| format!("decrypt {}", path.display()))?;
             return Ok(Box::new(reader));
         }
@@ -1371,7 +1379,7 @@ pub fn open_peeled_read_with_entry(
     // Self-mounting image / NDIF via a fork carrier (`.smi.bin`, AppleDouble,
     // native resource fork): reconstruct the raw disk from both forks. Gated on
     // a `bcem` resource, so a plain `.bin` raw image is never affected.
-    if let Some(image) = try_open_ndif_carrier(path) {
+    if let Some(image) = try_open_ndif_carrier(path)? {
         return Ok(Box::new(BufReader::new(image)));
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -1421,7 +1429,7 @@ pub fn is_flat_floppy_container_path(path: &Path) -> bool {
 /// True for a standalone WOZ 1/2 floppy image (`.woz` + WOZ magic). WOZ is an
 /// editable container: it decodes to a flat 140K / 400K / 800K sector buffer
 /// that [`crate::model::container_edit`] re-encodes via
-/// [`crate::rbformats::woz_write::sectors_to_woz`] on commit.
+/// [`dsk_apple::woz_write::sectors_to_woz`] on commit.
 pub fn is_woz_path(path: &Path) -> bool {
     let ext_ok = path
         .extension()
@@ -1436,7 +1444,7 @@ pub fn is_woz_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 12];
     match f.read(&mut magic) {
-        Ok(n) if n >= 8 => crate::rbformats::woz::is_woz(&magic[..n]),
+        Ok(n) if n >= 8 => dsk_apple::woz::is_woz(&magic[..n]),
         _ => false,
     }
 }
@@ -1460,7 +1468,7 @@ pub fn is_moof_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 8];
     match f.read(&mut magic) {
-        Ok(n) if n >= 8 => crate::rbformats::moof::is_moof(&magic[..n]),
+        Ok(n) if n >= 8 => dsk_apple::moof::is_moof(&magic[..n]),
         _ => false,
     }
 }
@@ -1551,17 +1559,17 @@ pub fn open_container_rw(path: &Path) -> Result<ContainerRw> {
             crate::rbformats::payload_slice::PayloadSlice::bounded(rw()?, 0, data_size),
         )),
         ImageFormat::VhdDynamic { .. } => {
-            let reader = crate::rbformats::vhd::DynamicVhdReader::open(rw()?)
+            let reader = dsk_vm::vhd::DynamicVhdReader::open(rw()?)
                 .with_context(|| format!("opening dynamic VHD {} for edit", path.display()))?;
             ContainerRw::Handle(Box::new(reader))
         }
         ImageFormat::VmdkSparse { .. } => {
-            let reader = crate::rbformats::vmdk_sparse::VmdkSparseReader::open(rw()?)
+            let reader = dsk_vm::vmdk_sparse::VmdkSparseReader::open(rw()?)
                 .with_context(|| format!("opening sparse VMDK {} for edit", path.display()))?;
             ContainerRw::Handle(Box::new(reader))
         }
         ImageFormat::Qcow2 { .. } => {
-            let reader = crate::rbformats::qcow2::Qcow2Reader::open(rw()?)
+            let reader = dsk_vm::qcow2::Qcow2Reader::open(rw()?)
                 .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
             // Shared clusters and no copy-on-write: a snapshot-bearing image
             // (a UTM suspended VM, typically) would be corrupted by an edit.
@@ -1639,18 +1647,100 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_moof_path(path)
         || is_dsd_path(path)
         || is_flat_floppy_container_path(path)
-        || crate::rbformats::flux::kryoflux::is_stream_path(path)
-        || crate::rbformats::flux::is_flux_file_path(path)
-        || crate::rbformats::flux::mfm_emu::is_emu_path(path)
+        || dsk_flux::flux::kryoflux::is_stream_path(path)
+        || dsk_flux::flux::is_flux_file_path(path)
+        || dsk_flux::flux::mfm_emu::is_emu_path(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A Disk Copy 6 (NDIF) image as a data fork plus an AppleDouble `._`
+    /// sidecar whose resource fork holds a one-chunk `bcem` map of `ty`.
+    fn write_ndif_pair(dir: &Path, name: &str, ty: u8, data: &[u8]) -> std::path::PathBuf {
+        let sectors = (data.len() / 512) as u32;
+        let mut bcem = vec![0u8; 128];
+        bcem[68..72].copy_from_slice(&sectors.to_be_bytes());
+        bcem[124..128].copy_from_slice(&2u32.to_be_bytes());
+        for (sector, t, off, len) in [(0u32, ty, 0u32, data.len() as u32), (sectors, 0xff, 0, 0)] {
+            bcem.extend_from_slice(&((sector << 8) | t as u32).to_be_bytes());
+            bcem.extend_from_slice(&off.to_be_bytes());
+            bcem.extend_from_slice(&len.to_be_bytes());
+        }
+        // Resource fork: header, one data item (length-prefixed bcem), and a
+        // map with a single type `bcem` holding one reference (id 128).
+        let mut item = (bcem.len() as u32).to_be_bytes().to_vec();
+        item.extend_from_slice(&bcem);
+        let mut map = vec![0u8; 28];
+        map[24..26].copy_from_slice(&28u16.to_be_bytes());
+        map.extend_from_slice(&0u16.to_be_bytes()); // one type
+        map.extend_from_slice(b"bcem");
+        map.extend_from_slice(&0u16.to_be_bytes()); // one ref
+        map.extend_from_slice(&10u16.to_be_bytes()); // ref list right after the type list
+        map.extend_from_slice(&128u16.to_be_bytes());
+        map.extend_from_slice(&0xffffu16.to_be_bytes());
+        map.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // attrs + data offset 0, reserved
+        let mut rsrc = Vec::new();
+        for v in [
+            16u32,
+            16 + item.len() as u32,
+            item.len() as u32,
+            map.len() as u32,
+        ] {
+            rsrc.extend_from_slice(&v.to_be_bytes());
+        }
+        rsrc.resize(16, 0);
+        rsrc.extend_from_slice(&item);
+        rsrc.extend_from_slice(&map);
+        // AppleDouble v2 with only entry 2 (resource fork).
+        let mut ad = 0x0005_1607u32.to_be_bytes().to_vec();
+        ad.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        ad.extend_from_slice(&[0u8; 16]);
+        ad.extend_from_slice(&1u16.to_be_bytes());
+        ad.extend_from_slice(&2u32.to_be_bytes());
+        ad.extend_from_slice(&38u32.to_be_bytes());
+        ad.extend_from_slice(&(rsrc.len() as u32).to_be_bytes());
+        ad.extend_from_slice(&rsrc);
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        std::fs::write(dir.join(format!("._{name}")), &ad).unwrap();
+        path
+    }
+
+    #[test]
+    fn ndif_sidecar_pair_rebuilds_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..2048u32).map(|i| (i * 7 % 251) as u8).collect();
+        let path = write_ndif_pair(dir.path(), "Raw.img", 0x02, &data);
+        let mut got = Vec::new();
+        open_read(&path).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// Once a `bcem` map is found the file is NDIF, so a chunk codec rb-cli
+    /// can't decode must surface as that error, not as "Unrecognized media".
+    #[test]
+    fn ndif_rebuild_failure_reports_the_ndif_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ndif_pair(dir.path(), "Shrunk.img", 0x82, &[0x5a; 2048]);
+        let err = match open_read(&path) {
+            Ok(_) => panic!("an LZH-compressed chunk should not open"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("Disk Copy 6 (NDIF)"), "{err}");
+        assert!(err.contains("LZH compression"), "{err}");
+    }
+
     #[test]
     fn arculator_hdf_opens_as_a_window_past_its_header() {
-        let bare = crate::rbformats::containers::hdf::tests::build_bare_adfs();
+        // A minimal bare ADFS volume: the Disc Record at 0xDC0 is all detection needs.
+        let mut bare = vec![0u8; 800 * 1024];
+        let dr_off = 0xC00 + 0x1C0;
+        bare[dr_off] = 10;
+        bare[dr_off + 1] = 5;
+        bare[dr_off + 2] = 2;
+        bare[dr_off + 9] = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.hdf");
         let mut wrapped = vec![0u8; 512];
@@ -1912,7 +2002,7 @@ mod tests {
     #[test]
     fn open_read_routes_msa_through_decoder_and_partition_detect_finds_fat() {
         use crate::partition::PartitionTable;
-        use crate::rbformats::containers::msa::{encode_msa_bytes, MsaHeader};
+        use dsk_floppy::msa::{encode_msa_bytes, MsaHeader};
 
         // Build a 720K raw FAT12 floppy in memory: BPB at byte 0, 0xAA55 at
         // 510-511. No partition table — `detect` should report
@@ -1969,7 +2059,7 @@ mod tests {
     /// unified opener and reads through transparently.
     #[test]
     fn open_read_routes_sector_gho_through_gho_reader() {
-        use crate::rbformats::gho::GHO_SECTOR_SIZE;
+        use dsk_ghost::gho::GHO_SECTOR_SIZE;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sector.gho");
@@ -2013,7 +2103,7 @@ mod tests {
     #[test]
     fn open_read_routes_xdf_and_partition_detect_finds_fat() {
         use crate::partition::PartitionTable;
-        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+        use dsk_floppy::floppy_geom::FloppyMedia;
 
         // 720K geometry with a minimal FAT12 BPB + 0xAA55 boot signature —
         // no MBR, so detection should report a FAT superfloppy.
@@ -2053,8 +2143,8 @@ mod tests {
     /// `open_read` and decodes back to the original flat sector stream.
     #[test]
     fn open_read_round_trips_dim_floppy() {
-        use crate::rbformats::containers::dim::encode_dim_bytes;
-        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+        use dsk_floppy::dim::encode_dim_bytes;
+        use dsk_floppy::floppy_geom::FloppyMedia;
 
         let dir = tempfile::tempdir().unwrap();
         let geom = FloppyMedia::Hd1232.geometry();
@@ -2192,7 +2282,7 @@ mod tests {
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("ZIPD")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("ZIPD")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup.zip");
         {
@@ -2228,7 +2318,7 @@ mod tests {
     /// byte-for-byte — the contract the CLI's raw path relies on.
     #[test]
     fn open_peeled_read_passes_raw_image_through() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("PEEL")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("PEEL")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("disk.img");
         std::fs::write(&img, &flat).unwrap();

@@ -163,6 +163,18 @@ pub fn run(args: RestoreArgs) -> Result<()> {
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
     spawn_progress_pump(progress.clone());
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
 
     log_stderr(format!(
         "rb-cli restore: {} -> {}",
@@ -221,6 +233,18 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
     spawn_progress_pump(progress.clone());
+    let _status = crate::cli::status::watch({
+        let p = Arc::clone(&progress);
+        move || {
+            let g = crate::model::worker::lock_status(&p);
+            Some(crate::cli::status::Sample {
+                step: g.operation.clone(),
+                done: g.current_bytes,
+                total: g.total_bytes,
+                finished: g.finished,
+            })
+        }
+    });
 
     log_stderr(format!(
         "rb-cli restore: {} -> rb://{}{} ({})",
@@ -291,8 +315,8 @@ fn read_metadata(backup_dir: &std::path::Path) -> Result<crate::backup::metadata
 
 fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {
     if !backup_dir.join("metadata.json").exists() {
-        if let Some(cz) = crate::clonezilla::metadata::resolve_clonezilla_folder(backup_dir) {
-            return Ok(crate::clonezilla::metadata::load(&cz)?.source_size_bytes);
+        if let Some(cz) = dsk_clonezilla::metadata::resolve_clonezilla_folder(backup_dir) {
+            return Ok(dsk_clonezilla::metadata::load(&cz)?.source_size_bytes);
         }
     }
     Ok(read_metadata(backup_dir)?.source_size_bytes)
@@ -336,8 +360,8 @@ fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) {
                     log_stderr(format!(
                         "  progress: {:>3}% ({}/{})",
                         pct,
-                        crate::partition::format_size(cur),
-                        crate::partition::format_size(total),
+                        disk_core::display::format_size(cur),
+                        disk_core::display::format_size(total),
                     ));
                     last_pct = pct;
                 }

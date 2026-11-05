@@ -18,13 +18,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::{BackupLayout, BackupMetadata};
-use crate::clonezilla::block_cache::{CacheState, PartcloneBlockCache};
-use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::zstd_stream::ZstdStreamCache;
 use crate::model::backup_loader::{self, infer_fat_type_byte, LoadOutcome};
 use crate::model::browse_session::BrowseSession;
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
+use dsk_clonezilla::block_cache::{CacheState, PartcloneBlockCache};
+use dsk_clonezilla::metadata::ClonezillaImage;
 
 /// Parse the partition table of the image/container at `path` and return its
 /// partition list. A partition-less (superfloppy) image yields a single
@@ -518,7 +518,7 @@ mod tests {
     /// offset-0 partition, and the session built for it opens the volume.
     #[test]
     fn probe_and_session_round_trip_on_superfloppy() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("PROBE")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("PROBE")).unwrap();
         let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
 
@@ -590,7 +590,7 @@ mod tests {
     /// A raw ("none") backup partition opens via `source_path` at offset 0.
     #[test]
     fn backup_session_opens_raw_partition() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("BKRAW")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("BKRAW")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("partition-0.raw"), &flat).unwrap();
 
@@ -606,7 +606,7 @@ mod tests {
     /// A zstd backup partition opens through a streaming `ZstdStreamCache`.
     #[test]
     fn backup_session_opens_zstd_partition() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("BKZSTD")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("BKZSTD")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let compressed = crate::rbformats::zstd_compat::encode_all(&flat[..], 3).unwrap();
         std::fs::write(dir.path().join("partition-0.zst"), &compressed).unwrap();
@@ -707,7 +707,7 @@ mod tests {
     /// `open_partition` yields a ready browsing session.
     #[test]
     fn resolve_native_backup_lists_partitions_and_opens() {
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("RESV")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("RESV")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let compressed = crate::rbformats::zstd_compat::encode_all(&flat[..], 3).unwrap();
         std::fs::write(dir.path().join("partition-0.zst"), &compressed).unwrap();
@@ -832,7 +832,7 @@ mod tests {
     /// yet, `load_partclone_cache` reports that a scan is needed.
     #[test]
     fn clonezilla_open_routes_to_cache_path() {
-        use crate::clonezilla::metadata::ClonezillaPartition;
+        use dsk_clonezilla::metadata::ClonezillaPartition;
         let dir = tempfile::tempdir().unwrap();
         let files = vec![dir.path().join("sda1.ext4-ptcl-img.gz.aa")];
         let part = ClonezillaPartition {

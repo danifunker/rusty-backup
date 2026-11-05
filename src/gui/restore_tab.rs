@@ -1,390 +1,194 @@
-use std::fs::File;
+//! The Restore tab: the egui shell of `controller::restore::RestoreController`.
+//!
+//! The tab draws each mode's form from the controller's accessors, maps clicks to
+//! `RestoreAction`s, answers the controller's pickers, confirmations and the Build Disk name
+//! prompt through an `EffectHost`, moves its log lines into the log panel and mirrors a running
+//! restore onto the shared progress bar. It hosts two dialogs of its own: the Physical Disk Export
+//! window Write Image File hands its image to, and the partition editor Build Disk fills.
+
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rusty_backup::backup::metadata::BackupMetadata;
-use rusty_backup::clonezilla;
-use rusty_backup::clonezilla::metadata::ClonezillaImage;
-use rusty_backup::model::disk_builder::DiskBuilder;
-use rusty_backup::model::physical_write_runner::PhysicalWriteStatus;
-use rusty_backup::model::provision_runner::{self, ProvisionRequest};
-use rusty_backup::model::size_mode::SizeMode;
-use rusty_backup::partition::{self, PartitionInfo, PartitionTable};
-
-use super::partition_bar::{PartitionBar, Segment, SegmentKind};
-use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
-use rusty_backup::restore::single::{
-    NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
+use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::restore::{
+    format_size, AlignmentChoice, HostRequest, LayoutFit, NewTableType, RestoreAction,
+    RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
 };
-use rusty_backup::restore::{
-    self, RestoreAlignment, RestoreConfig, RestorePartitionSize, RestoreProgress, RestoreSizeChoice,
-};
+use rusty_backup::controller::{Controller as _, Effect};
 
 use super::context::TabContext;
+use super::effects::{EffectHost, Reply};
+use super::partition_bar::{PartitionBar, Segment, SegmentKind};
+use super::physical_disk_export::PhysicalDiskExport;
 use super::progress::ProgressState;
+use super::size_mode_row::{size_mode_row, SizeModeRowOptions};
 
-/// Which restore mode is active.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RestoreMode {
-    /// Existing behavior: restore entire disk from backup.
-    FullDisk,
-    /// Restore a single partition to an existing disk.
-    SinglePartition,
-    /// Restore a single partition to a new/empty disk with a fresh partition table.
-    NewDisk,
-    /// Write a plain image file (any readable format) to a disk or partition.
-    WriteImage,
-    /// Lay a fresh partition table on a blank disk and fill its partitions.
-    BuildDisk,
+fn new_controller() -> RestoreController {
+    RestoreController::new(RestoreServices {
+        jobs: rusty_backup::controller::restore::JobRegistry::new(),
+        notify: Arc::new(super::ui_logger::EguiWake),
+    })
 }
 
-/// Per-partition restore configuration in the GUI.
-#[derive(Debug, Clone)]
-struct RestorePartitionConfig {
-    index: usize,
-    type_name: String,
-    #[allow(dead_code)]
-    start_lba: u64,
-    original_size: u64,
-    minimum_size: u64,
-    choice: SizeMode,
-    custom_size_mib: u32,
-}
-
-impl RestorePartitionConfig {
-    fn effective_size(&self) -> u64 {
-        self.choice
-            .effective_size(self.original_size, self.minimum_size, self.custom_size_mib)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum AlignmentChoice {
-    Original,
-    Modern1MB,
-    Custom,
-}
-
-/// Restore-tab state for a remote target (a drive/image on a daemon). Mirrors
-/// the Backup tab's `RemoteSourceState`: open the connect dialog -> connect+list
-/// devices on a worker -> pick a device (or name an image file under the serve
-/// root) -> Start Restore pushes the restored image via
-/// `model::restore_remote::restore_to_remote`.
-#[cfg(feature = "remote")]
-#[derive(Default)]
-struct RemoteTargetState {
-    /// True when the restore target is a remote daemon (vs a local device/file).
-    active: bool,
-    /// `Some` while the connect dialog is open; holds the host:port input.
-    dialog_addr: Option<String>,
-    /// The live shared connection once connected.
-    conn: Option<Arc<Mutex<rusty_backup::remote::RemoteConnection>>>,
-    /// `addr` we connected to, for display labels.
-    addr: Option<String>,
-    /// Devices advertised by the daemon (after a successful connect).
-    devices: Vec<rusty_backup::remote::protocol::WireDevice>,
-    /// Image-file target name under the serve root (when not writing a device).
-    image_name: String,
-    /// The chosen target: `(path, display, is_device)`. `Some` => a remote
-    /// target is selected and ready to restore to.
-    selected: Option<(String, String, bool)>,
-    /// Background connect+list worker status.
-    status: Option<Arc<Mutex<RemoteConnectStatus>>>,
-    /// Last error, shown inline.
-    error: Option<String>,
-}
-
-/// One pending remote connect+list op for the Restore tab.
-#[cfg(feature = "remote")]
-#[derive(Default)]
-struct RemoteConnectStatus {
-    finished: bool,
-    error: Option<String>,
-    connected: Option<(
-        Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
-        Vec<rusty_backup::remote::protocol::WireDevice>,
-    )>,
-}
-
-impl rusty_backup::model::worker::WorkerStatus for RemoteConnectStatus {
-    fn fail(&mut self, message: String) {
-        self.error = Some(message);
-        self.finished = true;
-    }
-}
-
-/// State for the Restore tab.
 pub struct RestoreTab {
-    // Mode
-    restore_mode: RestoreMode,
-    /// Write Image File mode: chosen source, and its decoded size.
-    image_write_path: Option<PathBuf>,
-    image_write_size: u64,
-    /// Target picker + progress, shared with the Inspect tab's export action.
-    image_write: super::physical_disk_export::PhysicalDiskExport,
-
-    /// MRU of opened backup-folder paths (newest first), mirrored to
-    /// `config.json` — the "Recent:" quick-pick row.
+    ctl: RestoreController,
+    /// Pickers, confirmations and the Build Disk prompt the controller asks for.
+    effects: EffectHost,
+    /// Effects from a call made outside `show`, run on the next frame.
+    pending_fx: Vec<Effect>,
+    /// MRU of opened backup-folder paths (newest first), mirrored to `config.json`.
     recent_files: Vec<String>,
-
-    // Source (Full Disk + Single Partition)
-    backup_folder: Option<PathBuf>,
-    backup_metadata: Option<BackupMetadata>,
-    clonezilla_image: Option<ClonezillaImage>,
-    mbr_bytes: Option<[u8; 512]>,
-    metadata_error: Option<String>,
-    prev_backup_folder: Option<PathBuf>,
-
-    // Target (Full Disk)
-    selected_device_idx: Option<usize>,
-    image_file_path: Option<PathBuf>,
-    target_is_device: bool,
-    /// Remote-target state: when active, the restore target is a drive/image on
-    /// an `rb-cli serve` daemon, pushed over the block tier.
-    #[cfg(feature = "remote")]
-    remote: RemoteTargetState,
-
-    // Alignment (Full Disk)
-    alignment_choice: AlignmentChoice,
-    custom_alignment_sectors: u32,
-
-    // Per-partition sizing (Full Disk)
-    partition_configs: Vec<RestorePartitionConfig>,
-
-    // Confirmation
-    confirm_popup_open: bool,
-
-    // Operation state
-    restore_running: bool,
-    restore_progress: Option<Arc<Mutex<RestoreProgress>>>,
-
-    // --- Single Partition mode state ---
-    /// Source image file for single-partition restore (alternative to backup folder)
-    sp_image_file: Option<PathBuf>,
-    /// Keeps a decompressed `.adz` / `.hdz` source alive while
-    /// `sp_image_file` references it.
-    sp_amiga_tempdir: Option<tempfile::TempDir>,
-    /// Which partition index to restore (from backup)
-    sp_source_partition_idx: Option<usize>,
-    /// Target device for single-partition restore
-    sp_target_device_idx: Option<usize>,
-    /// Scanned target partition table
-    sp_target_partitions: Vec<PartitionInfo>,
-    /// Identity of the device `sp_target_partitions` was scanned from.
-    sp_target_identity: Option<rusty_backup::device::DeviceIdentity>,
-    /// Which target partition to overwrite
-    sp_target_partition_idx: Option<usize>,
-    /// Error from scanning target
-    sp_scan_error: Option<String>,
-
-    // --- "Add free space for in-OS expansion" (Phase 2 of disk_expansion plan) ---
-    /// Enabled by the "Add free space for in-OS expansion" checkbox. Image
-    /// targets only — disabled for device targets since physical disk size
-    /// is fixed.
-    expand_disk_enabled: bool,
-    /// How much free space to leave at the end of the target image, in MiB.
-    /// In Mode A the trailing region is unallocated and the user partitions
-    /// it in their guest OS; in Mode B the last partition is extended over
-    /// it so only the filesystem's own grow tool (run in the guest OS) is
-    /// needed.
-    expand_free_space_mib: u32,
-    /// True when the user chose "Extend last partition automatically"
-    /// (Mode B). Forces the last partition's restore size to FillRemaining
-    /// at restore-config build time. False is Mode A (the recommended
-    /// default).
-    expand_extend_last_partition: bool,
-
-    // --- New Disk mode state ---
-    /// Table type for new disk
-    nd_table_type: NewTableType,
-    /// Alignment choice for new disk
-    nd_alignment_choice: AlignmentChoice,
-    nd_custom_alignment: u32,
-    /// Bootable flag (MBR only)
-    nd_bootable: bool,
-    /// Target device or image file
-    nd_target_device_idx: Option<usize>,
-    nd_image_file_path: Option<PathBuf>,
-    nd_target_is_device: bool,
-
-    // --- Build Disk mode state ---
-    bd_target_is_device: bool,
-    bd_target_device_idx: Option<usize>,
-    bd_image_file_path: Option<PathBuf>,
-    /// Size of an image-file target, in the `rb-cli new hd --size` grammar.
-    bd_image_size_text: String,
-    /// Partition plan. `Some` while the Build Disk modal is open.
-    bd_builder: Option<rusty_backup::model::disk_builder::DiskBuilder>,
-    /// Typed device name, so a build can't erase the wrong disk by a stray click.
-    bd_confirm_text: String,
-    bd_status: Option<Arc<Mutex<PhysicalWriteStatus>>>,
-    bd_rate: super::progress::RateTracker,
-    /// How many of the worker's log lines have already reached the log panel.
-    bd_logged: usize,
-    /// Guards the one-shot completion message; the poll runs every frame.
-    bd_finished_reported: bool,
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
+    /// Write Image File's target picker and progress, shared with the Inspect tab's export.
+    image_write: PhysicalDiskExport,
+    /// The shared progress bar shows this tab's restore.
+    showing_bar: bool,
 }
 
-impl Default for RestoreTab {
-    fn default() -> Self {
+impl RestoreTab {
+    pub fn new(recent: RecentHandle) -> Self {
         Self {
-            restore_mode: RestoreMode::FullDisk,
-            image_write_path: None,
-            image_write_size: 0,
-            image_write: Default::default(),
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Restore),
-            backup_folder: None,
-            backup_metadata: None,
-            clonezilla_image: None,
-            mbr_bytes: None,
-            metadata_error: None,
-            prev_backup_folder: None,
-            selected_device_idx: None,
-            image_file_path: None,
-            target_is_device: true,
-            #[cfg(feature = "remote")]
-            remote: RemoteTargetState::default(),
-            alignment_choice: AlignmentChoice::Original,
-            custom_alignment_sectors: 2048,
-            partition_configs: Vec::new(),
-            confirm_popup_open: false,
-            restore_running: false,
-            restore_progress: None,
-            sp_image_file: None,
-            sp_amiga_tempdir: None,
-            sp_source_partition_idx: None,
-            sp_target_device_idx: None,
-            sp_target_partitions: Vec::new(),
-            sp_target_identity: None,
-            sp_target_partition_idx: None,
-            sp_scan_error: None,
-            nd_table_type: NewTableType::Mbr,
-            nd_alignment_choice: AlignmentChoice::Modern1MB,
-            nd_custom_alignment: 2048,
-            nd_bootable: false,
-            nd_target_device_idx: None,
-            nd_image_file_path: None,
-            nd_target_is_device: true,
-            bd_target_is_device: false,
-            bd_target_device_idx: None,
-            bd_image_file_path: None,
-            bd_image_size_text: "512M".to_string(),
-            bd_builder: None,
-            bd_confirm_text: String::new(),
-            bd_status: None,
-            bd_rate: super::progress::RateTracker::default(),
-            bd_logged: 0,
-            bd_finished_reported: false,
-            expand_disk_enabled: false,
-            expand_free_space_mib: 0,
-            expand_extend_last_partition: false,
+            ctl: new_controller(),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+            recent_files: recent.list(RecentMode::Restore),
+            recent,
+            image_write: PhysicalDiskExport::default(),
+            showing_bar: false,
         }
     }
+}
+
+/// One device combo's label in the list.
+fn device_label(d: &rusty_backup::device::DiskDevice) -> String {
+    format!(
+        "{} ({}){}",
+        d.display_name(),
+        format_size(d.size_bytes),
+        if d.is_system { " [SYSTEM]" } else { "" },
+    )
 }
 
 impl RestoreTab {
     pub fn is_running(&self) -> bool {
-        self.restore_running || self.build_running() || self.image_write.is_writing()
-    }
-
-    /// True while a Build Disk job is writing to the target.
-    fn build_running(&self) -> bool {
-        self.bd_status
-            .as_ref()
-            .and_then(|s| s.lock().ok().map(|g| !g.finished))
-            .unwrap_or(false)
+        self.ctl.is_running() || self.image_write.is_writing()
     }
 
     pub fn get_loaded_backup(&self) -> Option<PathBuf> {
-        self.backup_folder.clone()
+        self.ctl.backup_folder().map(|p| p.to_path_buf())
     }
 
     pub fn has_backup(&self) -> bool {
-        self.backup_metadata.is_some() || self.clonezilla_image.is_some()
+        self.ctl.has_backup()
     }
 
-    /// A source the user picked instead of a backup folder: an image for
-    /// single-partition / new-disk restore, or the Write Image / Build Disk modes.
+    /// A source the user picked instead of a backup folder, or Write Image / Build Disk.
     pub fn has_other_source(&self) -> bool {
-        self.sp_image_file.is_some()
-            || self.nd_image_file_path.is_some()
-            || matches!(
-                self.restore_mode,
-                RestoreMode::WriteImage | RestoreMode::BuildDisk
-            )
+        self.ctl.has_other_source()
     }
 
-    pub fn load_backup(&mut self, path: &PathBuf) {
-        if self.backup_folder.as_ref() != Some(path) {
-            self.backup_folder = Some(path.clone());
-            // Force reload on next show
-            self.prev_backup_folder = None;
-        }
+    pub fn load_backup(&mut self, path: &std::path::Path) {
+        self.act(RestoreAction::OpenBackup(path.to_path_buf()));
     }
 
-    /// Open a dropped path (drag-and-drop router). A directory is treated as a
-    /// backup folder (full-disk restore); a file is treated as a single-
-    /// partition source image. Mirrors the tab's two `Browse...` handlers so
-    /// drag-and-drop behaves the same as the picker.
+    /// Open a dropped path: a folder restores in full, a file is a partition image.
     pub fn open_dropped(&mut self, path: PathBuf) {
-        if path.is_dir() {
-            self.restore_mode = RestoreMode::FullDisk;
-            self.load_backup(&path);
-        } else {
-            self.restore_mode = RestoreMode::SinglePartition;
-            match super::prepare_disk_image_path(&path, true) {
-                Ok((materialized, guard)) => {
-                    self.sp_image_file = Some(materialized);
-                    self.sp_amiga_tempdir = guard;
-                }
-                Err(e) => {
-                    log::error!("Failed to decompress {}: {}", path.display(), e);
-                    self.sp_image_file = Some(path);
-                    self.sp_amiga_tempdir = None;
-                }
-            }
-            self.backup_folder = None;
-            self.backup_metadata = None;
-            self.sp_source_partition_idx = None;
-            self.prev_backup_folder = None;
-        }
+        self.act(RestoreAction::OpenDropped(path));
     }
 
-    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
-    /// the persisted lists; the mirror otherwise only reloads at construction).
+    /// Drop the in-memory recent list after Settings cleared the persisted one.
     pub(crate) fn clear_recent_files(&mut self) {
         self.recent_files.clear();
     }
 
     pub fn clear_backup(&mut self) {
-        self.backup_folder = None;
-        self.backup_metadata = None;
-        self.clonezilla_image = None;
-        self.mbr_bytes = None;
-        self.metadata_error = None;
-        self.prev_backup_folder = None;
-        self.partition_configs.clear();
+        self.act(RestoreAction::ClearBackup);
     }
 
-    /// Drain the workers while another tab is showing, so a job keeps
-    /// reporting and its completion is not missed after a tab switch.
+    /// Drain the controller while another tab shows, so a job keeps reporting and its end is seen.
     pub fn poll_background(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
-        self.poll_progress(ctx, progress);
-        #[cfg(feature = "remote")]
-        self.poll_remote(ctx);
-        self.poll_build(ctx);
+        self.poll(ctx, progress);
+        self.image_write.poll(ctx);
+    }
+
+    /// Send an action; its effects run on the next frame.
+    fn act(&mut self, action: RestoreAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
+        self.carry_out_requests();
+    }
+
+    fn carry_out_requests(&mut self) {
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(path) => {
+                    self.recent_files = super::push_recent(&self.recent, RecentMode::Restore, &path)
+                }
+                HostRequest::WriteImage(open) => self.image_write.open_for(open),
+            }
+        }
+    }
+
+    fn poll(&mut self, ctx: &mut TabContext, progress: &mut ProgressState) {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        self.carry_out_requests();
+        for (level, msg) in self.ctl.take_log() {
+            match level {
+                LogLevel::Info => ctx.log.info(msg),
+                LogLevel::Warning => ctx.log.warn(msg),
+                LogLevel::Error => ctx.log.error(msg),
+            }
+        }
+        match self.ctl.progress() {
+            Some(bar) => {
+                progress.active = true;
+                progress.operation = bar.operation;
+                progress.current_bytes = bar.current_bytes;
+                progress.total_bytes = bar.total_bytes;
+                progress.full_size_bytes = 0;
+                progress.record_sample();
+                self.showing_bar = true;
+            }
+            None if self.showing_bar => {
+                progress.active = false;
+                self.showing_bar = false;
+            }
+            None => {}
+        }
+    }
+
+    /// Run the effects waiting; answers go back to the controller.
+    fn run_effects(&mut self, ui: &egui::Ui, ctx: &mut TabContext) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ui.ctx(), fx, &mut messages);
+        replies.extend(self.effects.show(ui.ctx(), "restore"));
+        for msg in messages {
+            ctx.log.info(msg);
+        }
+        for reply in replies {
+            let action = match reply {
+                Reply::Picked { purpose, path } => RestoreAction::Picked { purpose, path },
+                Reply::Confirmed { purpose, yes } => RestoreAction::Confirmed { purpose, yes },
+                Reply::Answered { purpose, text } => RestoreAction::Answered { purpose, text },
+                Reply::Chose { .. } | Reply::CloseScreen => continue,
+            };
+            self.act(action);
+        }
+        if !self.pending_fx.is_empty() {
+            ui.ctx().request_repaint();
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
-        // Poll background restore thread
-        self.poll_progress(ctx, progress);
-
-        // Poll a pending remote connect/list worker
-        #[cfg(feature = "remote")]
-        self.poll_remote(ctx);
-
-        // Drain the Build Disk worker's log lines into the shared log panel.
-        self.poll_build(ctx);
+        self.ctl.reconcile_devices(ctx.devices);
+        self.poll(ctx, progress);
+        if let Some(snap) = self.ctl.decoding() {
+            super::progress::show_job(ui, &snap);
+        }
 
         ui.heading("Restore Backup");
         ui.add_space(8.0);
@@ -397,66 +201,159 @@ impl RestoreTab {
         }
         let controls_enabled = !self.is_running() && ctx.busy_elsewhere.is_none();
 
-        // --- Restore Mode Selector ---
         ui.add_enabled_ui(controls_enabled, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Mode:").strong());
-                ui.radio_value(
-                    &mut self.restore_mode,
-                    RestoreMode::FullDisk,
-                    "Full Disk Restore",
-                );
-                ui.radio_value(
-                    &mut self.restore_mode,
-                    RestoreMode::SinglePartition,
-                    "Restore Single Partition",
-                );
-                ui.radio_value(
-                    &mut self.restore_mode,
-                    RestoreMode::NewDisk,
-                    "Restore to New Disk",
-                );
-                ui.radio_value(
-                    &mut self.restore_mode,
-                    RestoreMode::WriteImage,
-                    "Write Image File",
-                )
-                .on_hover_text(
-                    "Write a disk image straight to a device or one of its \
-                     partitions. Any format Rusty Backup can read works, \
-                     including DMG, CHD, VHD and compressed images.",
-                );
-                ui.radio_value(&mut self.restore_mode, RestoreMode::BuildDisk, "Build Disk")
-                    .on_hover_text(
+                let mode = self.ctl.mode();
+                let modes = [
+                    (RestoreMode::FullDisk, "Full Disk Restore", ""),
+                    (RestoreMode::SinglePartition, "Restore Single Partition", ""),
+                    (RestoreMode::NewDisk, "Restore to New Disk", ""),
+                    (
+                        RestoreMode::WriteImage,
+                        "Write Image File",
+                        "Write a disk image straight to a device or one of its \
+                         partitions. Any format Rusty Backup can read works, \
+                         including DMG, CHD, VHD and compressed images.",
+                    ),
+                    (
+                        RestoreMode::BuildDisk,
+                        "Build Disk",
                         "Lay a fresh MBR / GPT / APM / SGI / X68000 partition \
                          table on a blank disk or image file, and optionally \
                          pour an image into each partition in one pass.",
-                    );
+                    ),
+                ];
+                for (m, label, hover) in modes {
+                    let mut resp = ui.radio(mode == m, label);
+                    if !hover.is_empty() {
+                        resp = resp.on_hover_text(hover);
+                    }
+                    if resp.clicked() {
+                        self.act(RestoreAction::SetMode(m));
+                    }
+                }
             });
         });
         ui.add_space(4.0);
 
-        match self.restore_mode {
+        match self.ctl.mode() {
             RestoreMode::FullDisk => self.show_full_disk_mode(ui, ctx, controls_enabled),
             RestoreMode::SinglePartition => {
                 self.show_single_partition_mode(ui, ctx, controls_enabled)
             }
             RestoreMode::NewDisk => self.show_new_disk_mode(ui, ctx, controls_enabled),
-            RestoreMode::WriteImage => self.show_write_image_mode(ui, ctx, controls_enabled),
+            RestoreMode::WriteImage => self.show_write_image_mode(ui, controls_enabled),
             RestoreMode::BuildDisk => self.show_build_disk_mode(ui, ctx, controls_enabled),
         }
 
-        if self.image_write.open {
-            let _ = self.image_write.show(ui.ctx(), ctx);
+        self.image_write.show(ui.ctx(), ctx);
+        if self.ctl.builder_open() {
+            self.show_build_disk_modal(ui);
         }
+        self.run_effects(ui, ctx);
+    }
 
-        if self.bd_builder.is_some() {
-            self.show_build_disk_modal(ui, ctx);
+    /// A device combo for `slot`, plus Close Drive when `closable`.
+    fn device_combo(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &TabContext,
+        slot: TargetSlot,
+        salt: &str,
+        closable: bool,
+    ) {
+        let row = self.ctl.device_row(slot);
+        let current = self
+            .ctl
+            .device(slot)
+            .map(|d| d.display_name())
+            .unwrap_or_else(|| "Select a target device...".into());
+        let mut picked = None;
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(&current)
+            .width(400.0)
+            .height(400.0)
+            .show_ui(ui, |ui| {
+                for (i, device) in ctx.devices.iter().enumerate() {
+                    if ui
+                        .selectable_label(row == Some(i), device_label(device))
+                        .clicked()
+                    {
+                        picked = Some((i, device.clone()));
+                    }
+                }
+                if ctx.devices.is_empty() {
+                    ui.label(
+                        egui::RichText::new(super::no_devices_hint())
+                            .italics()
+                            .weak(),
+                    );
+                }
+            });
+        if let Some((row, device)) = picked {
+            self.act(RestoreAction::SelectDevice { slot, row, device });
         }
+        if closable
+            && row.is_some()
+            && ui
+                .button("Close Drive")
+                .on_hover_text(
+                    "Clear the selected target device so the drive can be safely removed",
+                )
+                .clicked()
+        {
+            self.act(RestoreAction::ClearDevice(slot));
+        }
+    }
 
-        // --- Confirmation popup ---
-        if self.confirm_popup_open {
-            self.show_confirmation_popup(ui, ctx);
+    /// "Write to device" / "Save as image file" radios for `slot`.
+    fn target_kind_radios(&mut self, ui: &mut egui::Ui, slot: TargetSlot) {
+        let is_device = self.ctl.target_is_device(slot);
+        ui.horizontal(|ui| {
+            if ui.radio(is_device, "Write to device").clicked() {
+                self.act(RestoreAction::SetTargetIsDevice(slot, true));
+            }
+            if ui.radio(!is_device, "Save as image file").clicked() {
+                self.act(RestoreAction::SetTargetIsDevice(slot, false));
+            }
+        });
+    }
+
+    /// The image target's path and its "Save As..." button.
+    fn target_image_row(&mut self, ui: &mut egui::Ui, slot: TargetSlot, caption: &str) {
+        ui.horizontal(|ui| {
+            ui.label(caption);
+            let label = self
+                .ctl
+                .target_image(slot)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No file selected".into());
+            ui.label(&label);
+            if ui.button("Save As...").clicked() {
+                self.act(RestoreAction::PickTargetImage(slot));
+            }
+        });
+    }
+
+    fn backup_folder_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Backup Folder:");
+            let label = self
+                .ctl
+                .backup_folder()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No folder selected".into());
+            ui.label(&label);
+            if ui.button("Browse...").clicked() {
+                self.act(RestoreAction::PickBackupFolder);
+            }
+        });
+    }
+
+    fn load_status(&mut self, ui: &mut egui::Ui) {
+        if let Some(snap) = self.ctl.loading() {
+            super::progress::show_job(ui, &snap);
         }
     }
 
@@ -466,206 +363,82 @@ impl RestoreTab {
         ctx: &mut TabContext,
         controls_enabled: bool,
     ) {
-        // --- Section 1: Backup Source ---
-        ui.horizontal(|ui| {
-            ui.label("Backup Folder:");
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                let label = self
-                    .backup_folder
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No folder selected".into());
-                ui.label(&label);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog().pick_folder() {
-                        self.backup_folder = Some(path);
-                    }
-                }
-            });
-        });
+        ui.add_enabled_ui(controls_enabled, |ui| self.backup_folder_row(ui));
         if controls_enabled {
             if let Some(path) = super::recent_combo(ui, "restore_recent", &self.recent_files, 0) {
-                self.open_dropped(path);
+                self.act(RestoreAction::OpenDropped(path));
             }
         }
+        self.load_status(ui);
 
-        // Auto-load metadata when folder changes
-        if !self.restore_running {
-            let folder_changed = self.backup_folder != self.prev_backup_folder;
-            if folder_changed {
-                self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(ctx);
-            }
-        }
-
-        // Show backup summary
-        if let Some(meta) = &self.backup_metadata {
+        if let Some((info, source)) = self.ctl.backup_summary() {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Backup Info:").strong());
-                ui.label(format!(
-                    "{} partition(s), {}, {}, {}",
-                    meta.partitions.len(),
-                    meta.partition_table_type,
-                    meta.compression_type,
-                    &meta.created[..meta.created.len().min(10)],
-                ));
+                ui.label(info);
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Source:").strong());
-                ui.label(format!(
-                    "{} ({})",
-                    meta.source_device,
-                    partition::format_size(meta.source_size_bytes),
-                ));
-            });
-        } else if let Some(cz) = &self.clonezilla_image {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Backup Info:").strong());
-                ui.label(format!(
-                    "Clonezilla image, {} partition(s), MBR",
-                    cz.partitions.len(),
-                ));
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Source:").strong());
-                ui.label(format!(
-                    "/dev/{} ({})",
-                    cz.disk_name,
-                    partition::format_size(cz.source_size_bytes),
-                ));
+                ui.label(source);
             });
         }
-        if let Some(err) = &self.metadata_error {
+        if let Some(err) = self.ctl.load_error() {
             ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
 
         ui.add_space(8.0);
-
-        // --- Section 2: Target ---
         ui.label(egui::RichText::new("Target").strong());
         ui.separator();
 
         ui.add_enabled_ui(controls_enabled, |ui| {
             #[cfg(feature = "remote")]
             {
-                ui.checkbox(
-                    &mut self.remote.active,
-                    "Restore to a remote machine (rb-cli serve)",
-                )
-                .on_hover_text(
-                    "Push the restored image to a drive or image file on a remote \
-                     daemon over the network",
-                );
+                let mut on = self.ctl.remote_active();
+                if ui
+                    .checkbox(&mut on, "Restore to a remote machine (rb-cli serve)")
+                    .on_hover_text(
+                        "Push the restored image to a drive or image file on a remote \
+                         daemon over the network",
+                    )
+                    .changed()
+                {
+                    self.act(RestoreAction::SetRemote(on));
+                }
             }
-            #[cfg(feature = "remote")]
-            let remote_active = self.remote.active;
-            #[cfg(not(feature = "remote"))]
-            let remote_active = false;
-
-            if !remote_active {
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.target_is_device, true, "Write to device");
-                    ui.radio_value(&mut self.target_is_device, false, "Save as image file");
-                });
-
-                if self.target_is_device {
+            if !self.ctl.remote_active() {
+                self.target_kind_radios(ui, TargetSlot::FullDisk);
+                if self.ctl.target_is_device(TargetSlot::FullDisk) {
                     ui.horizontal(|ui| {
                         ui.label("Device:");
-                        let current_label = self
-                            .selected_device_idx
-                            .and_then(|idx| ctx.devices.get(idx))
-                            .map(|d| d.display_name())
-                            .unwrap_or_else(|| "Select a target device...".into());
-
-                        egui::ComboBox::from_id_salt("restore_target_device")
-                            .selected_text(&current_label)
-                            .width(400.0)
-                            .height(400.0) // Allow more items to be visible without scrolling
-                            .show_ui(ui, |ui| {
-                                for (i, device) in ctx.devices.iter().enumerate() {
-                                    let label = format!(
-                                        "{} ({}){}",
-                                        device.display_name(),
-                                        partition::format_size(device.size_bytes),
-                                        if device.is_system { " [SYSTEM]" } else { "" },
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.selected_device_idx,
-                                        Some(i),
-                                        label,
-                                    );
-                                }
-                                if ctx.devices.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(super::no_devices_hint())
-                                            .italics()
-                                            .weak(),
-                                    );
-                                }
-                            });
-
-                        // Clear the selected target device so the drive can be
-                        // safely removed or a different one chosen.
-                        if self.selected_device_idx.is_some()
-                            && ui
-                                .button("Close Drive")
-                                .on_hover_text(
-                                    "Clear the selected target device so the drive \
-                                     can be safely removed",
-                                )
-                                .clicked()
-                        {
-                            self.selected_device_idx = None;
-                        }
+                        self.device_combo(
+                            ui,
+                            ctx,
+                            TargetSlot::FullDisk,
+                            "restore_target_device",
+                            true,
+                        );
                     });
-
-                    // Show warning for system disks
-                    if let Some(idx) = self.selected_device_idx {
-                        if let Some(device) = ctx.devices.get(idx) {
-                            if device.is_system {
-                                ui.colored_label(
-                                super::theme::danger(ui.visuals()),
-                                "WARNING: This is a system disk! Restoring will destroy your OS.",
-                            );
-                            }
-                        }
+                    if self
+                        .ctl
+                        .device(TargetSlot::FullDisk)
+                        .is_some_and(|d| d.is_system)
+                    {
+                        ui.colored_label(
+                            super::theme::danger(ui.visuals()),
+                            "WARNING: This is a system disk! Restoring will destroy your OS.",
+                        );
                     }
                 } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Image File:");
-                        let label = self
-                            .image_file_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "No file selected".into());
-                        ui.label(&label);
-                        if ui.button("Save As...").clicked() {
-                            if let Some(path) = super::file_dialog()
-                                .add_filter("Disk Images", &["img", "raw", "bin"])
-                                .save_file()
-                            {
-                                self.image_file_path = Some(path);
-                            }
-                        }
-                    });
+                    self.target_image_row(ui, TargetSlot::FullDisk, "Image File:");
                 }
-            } // end: if !remote_active
-
+            }
             #[cfg(feature = "remote")]
-            if remote_active {
+            if self.ctl.remote_active() {
                 self.remote_target_ui(ui);
             }
 
-            // Show target size comparison
-            let source_size_opt = self
-                .backup_metadata
-                .as_ref()
-                .map(|m| m.source_size_bytes)
-                .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes));
-            if let Some(source_size) = source_size_opt {
-                let target_size = self.get_target_size(ctx);
+            if let Some(source_size) = self.ctl.source_size() {
+                let target_size = self.ctl.target_size();
                 if target_size > 0 {
                     let color = if target_size >= source_size {
                         super::theme::muted(ui.visuals())
@@ -676,8 +449,8 @@ impl RestoreTab {
                         color,
                         format!(
                             "Target: {} | Source was: {}{}",
-                            partition::format_size(target_size),
-                            partition::format_size(source_size),
+                            format_size(target_size),
+                            format_size(source_size),
                             if target_size < source_size {
                                 " (target is smaller!)"
                             } else {
@@ -689,787 +462,275 @@ impl RestoreTab {
             }
         });
 
-        // --- Section 2b: Add free space for in-OS expansion ---
-        // Image-file targets only — for device targets the disk size is
-        // fixed by the hardware, so the toggle doesn't apply. Recommends
-        // Mode A ("leave as unpartitioned free space") which works for every
-        // filesystem on every guest OS; Mode B is added in Phase 4 of
-        // docs/disk_expansion.md.
-        let source_size_bytes = self
-            .backup_metadata
-            .as_ref()
-            .map(|m| m.source_size_bytes)
-            .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
-            .unwrap_or(0);
-        if !self.target_is_device
-            && source_size_bytes > 0
-            && (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
-        {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Add free space for in-OS expansion").strong());
-            ui.separator();
-
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.checkbox(
-                    &mut self.expand_disk_enabled,
-                    "Pad the target image with unallocated free space",
-                )
-                .on_hover_text(
-                    "Useful for restoring a backup onto a larger virtual disk and \
-                     letting the guest OS extend or add a partition there. After \
-                     restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
-                     Disk Management) followed by your filesystem's own grow \
-                     tool. Works for any filesystem.",
-                );
-
-                if self.expand_disk_enabled {
-                    let source_mib = (source_size_bytes / (1024 * 1024)).max(1) as u32;
-                    let cap = source_mib.saturating_mul(8).max(source_mib + 8192);
-                    ui.horizontal(|ui| {
-                        ui.label("Free space:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.expand_free_space_mib)
-                                .range(0..=cap)
-                                .suffix(" MiB"),
-                        );
-                        let new_total_bytes = source_size_bytes
-                            .saturating_add((self.expand_free_space_mib as u64) * 1024 * 1024);
-                        ui.label(format!(
-                            "(target size {} -> {})",
-                            partition::format_size(source_size_bytes),
-                            partition::format_size(new_total_bytes),
-                        ));
-                    });
-
-                    // Mode A vs Mode B radio.
-                    ui.add_space(4.0);
-                    ui.radio_value(
-                        &mut self.expand_extend_last_partition,
-                        false,
-                        "Leave as unpartitioned free space (recommended)",
-                    )
-                    .on_hover_text(
-                        "Mode A: partition table stays unchanged; the trailing region is \
-                         unallocated. After restore, run your OS's partitioner to extend or \
-                         add a partition, then your filesystem's grow tool. Works for any \
-                         filesystem on any OS.",
-                    );
-                    ui.radio_value(
-                        &mut self.expand_extend_last_partition,
-                        true,
-                        "Extend last partition automatically",
-                    )
-                    .on_hover_text(
-                        "Mode B: the last partition is sized to absorb the new free space \
-                         during restore (equivalent to picking 'Fill' for the last partition \
-                         in the size table below). After restore, only the filesystem's \
-                         own grow tool is needed in the guest OS.",
-                    );
-
-                    // Visualization: current vs after PartitionBar pair.
-                    self.show_expand_preview_bars(ui, source_size_bytes);
-                }
-            });
-        } else if self.expand_disk_enabled {
-            // Auto-disable when the user flips back to a device target so
-            // the next file-target render doesn't surprise them with a
-            // stale "free space" value still in the target-size readout.
-            self.expand_disk_enabled = false;
+        if self.ctl.expand_shown() {
+            self.show_expand_section(ui, controls_enabled);
         }
 
-        // --- Section 3: Alignment (only when metadata loaded) ---
-        if self.backup_metadata.is_some() || self.clonezilla_image.is_some() {
+        if self.ctl.has_backup() {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Alignment").strong());
             ui.separator();
-
             ui.add_enabled_ui(controls_enabled, |ui| {
-                let orig_label = if let Some(meta) = &self.backup_metadata {
-                    format!(
-                        "Original ({}, LBA {})",
-                        meta.alignment.detected_type, meta.alignment.first_partition_lba,
+                let (choice, custom) = self.ctl.alignment();
+                if ui
+                    .radio(
+                        choice == AlignmentChoice::Original,
+                        self.ctl.original_alignment_label(),
                     )
-                } else if let Some(cz) = &self.clonezilla_image {
-                    let first_lba = cz
-                        .partitions
-                        .iter()
-                        .filter(|p| !p.is_extended)
-                        .map(|p| p.start_lba)
-                        .min()
-                        .unwrap_or(63);
-                    format!("Original (LBA {})", first_lba)
-                } else {
-                    "Original".to_string()
-                };
-
-                ui.radio_value(
-                    &mut self.alignment_choice,
-                    AlignmentChoice::Original,
-                    orig_label,
-                );
-                ui.radio_value(
-                    &mut self.alignment_choice,
-                    AlignmentChoice::Modern1MB,
-                    "1 MB boundaries (modern, LBA 2048)",
-                );
+                    .clicked()
+                {
+                    self.act(RestoreAction::SetAlignment(AlignmentChoice::Original));
+                }
+                if ui
+                    .radio(
+                        choice == AlignmentChoice::Modern1MB,
+                        "1 MB boundaries (modern, LBA 2048)",
+                    )
+                    .clicked()
+                {
+                    self.act(RestoreAction::SetAlignment(AlignmentChoice::Modern1MB));
+                }
                 ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.alignment_choice,
-                        AlignmentChoice::Custom,
-                        "Custom:",
-                    );
-                    if self.alignment_choice == AlignmentChoice::Custom {
-                        ui.add(
-                            egui::DragValue::new(&mut self.custom_alignment_sectors)
-                                .range(1..=65535),
-                        );
+                    if ui
+                        .radio(choice == AlignmentChoice::Custom, "Custom:")
+                        .clicked()
+                    {
+                        self.act(RestoreAction::SetAlignment(AlignmentChoice::Custom));
+                    }
+                    if choice == AlignmentChoice::Custom {
+                        let mut n = custom;
+                        if ui
+                            .add(egui::DragValue::new(&mut n).range(1..=65535))
+                            .changed()
+                        {
+                            self.act(RestoreAction::SetCustomAlignment(n));
+                        }
                         ui.label("sectors");
                     }
                 });
             });
         }
 
-        // --- Section 4: Partition Layout (only when metadata loaded) ---
-        if !self.partition_configs.is_empty() {
+        if !self.ctl.size_rows().is_empty() {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Partition Sizes").strong());
             ui.separator();
+            ui.add_enabled_ui(controls_enabled, |ui| self.show_size_grid(ui));
+        }
 
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                let last_index = self.partition_configs.last().map(|c| c.index);
+        ui.add_space(16.0);
+        self.show_action_buttons(ui, ctx);
+    }
 
-                egui::Grid::new("restore_partition_sizes")
-                    .striped(true)
-                    .min_col_width(50.0)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("#").strong());
-                        ui.label(egui::RichText::new("Type").strong());
-                        ui.label(egui::RichText::new("Original").strong());
-                        ui.label(egui::RichText::new("Minimum").strong());
-                        ui.label(egui::RichText::new("Size Mode").strong());
-                        ui.label(egui::RichText::new("Size (MiB)").strong());
-                        ui.end_row();
-
-                        for (pos, cfg) in self.partition_configs.iter_mut().enumerate() {
-                            // Position, matching `inspect`'s `#`; `cfg.index` is
-                            // the table slot and stays the matching key.
-                            ui.label(format!("{}", pos + 1));
-                            ui.label(&cfg.type_name);
-                            ui.label(partition::format_size(cfg.original_size));
-                            ui.label(partition::format_size(cfg.minimum_size));
-
-                            size_mode_row(
-                                ui,
-                                &mut cfg.choice,
-                                &mut cfg.custom_size_mib,
-                                cfg.original_size,
-                                cfg.minimum_size,
-                                SizeModeRowOptions {
-                                    allow_fill: Some(cfg.index) == last_index,
-                                    custom_seed: super::size_mode_row::CustomSeed::Original,
-                                    ..Default::default()
-                                },
-                            );
-                            ui.end_row();
-                        }
-                    });
-
-                // Total size summary
-                let target_size = self.get_target_size(ctx);
-                if target_size > 0 {
-                    let total: u64 = self
-                        .partition_configs
-                        .iter()
-                        .map(|c| {
-                            if c.choice == SizeMode::FillRemaining {
-                                0
-                            } else {
-                                c.effective_size()
-                            }
-                        })
-                        .sum();
-                    let color = if total <= target_size {
-                        super::theme::muted(ui.visuals())
-                    } else {
-                        super::theme::danger(ui.visuals())
-                    };
-                    ui.colored_label(
-                        color,
-                        format!(
-                            "Total: {} / {} available",
-                            partition::format_size(total),
-                            partition::format_size(target_size),
-                        ),
+    fn show_size_grid(&mut self, ui: &mut egui::Ui) {
+        let rows = self.ctl.size_rows().to_vec();
+        let mut actions = Vec::new();
+        egui::Grid::new("restore_partition_sizes")
+            .striped(true)
+            .min_col_width(50.0)
+            .show(ui, |ui| {
+                for head in [
+                    "#",
+                    "Type",
+                    "Original",
+                    "Minimum",
+                    "Size Mode",
+                    "Size (MiB)",
+                ] {
+                    ui.label(egui::RichText::new(head).strong());
+                }
+                ui.end_row();
+                for (pos, row) in rows.iter().enumerate() {
+                    // Position, matching `inspect`'s `#`; `row.index` is the table slot.
+                    ui.label(format!("{}", pos + 1));
+                    ui.label(&row.type_name);
+                    ui.label(format_size(row.original_size));
+                    ui.label(format_size(row.minimum_size));
+                    let mut mode = row.mode;
+                    let mut custom = row.custom_mib;
+                    size_mode_row(
+                        ui,
+                        &mut mode,
+                        &mut custom,
+                        row.original_size,
+                        row.minimum_size,
+                        SizeModeRowOptions {
+                            allow_fill: self
+                                .ctl
+                                .size_mode_choices(row.index)
+                                .contains(&SizeMode::FillRemaining),
+                            custom_seed: super::size_mode_row::CustomSeed::Original,
+                            ..Default::default()
+                        },
                     );
-
-                    // Sizes fitting is not the same as the layout fitting: with
-                    // Original alignment each partition keeps its absolute start,
-                    // so shrinking leaves gaps and the last partition can still
-                    // run off the end. Project the real layout the engine will
-                    // build rather than letting Restore fail after the click.
-                    self.show_layout_fit_warning(ui, target_size);
-                }
-            });
-        }
-
-        ui.add_space(16.0);
-
-        // --- Section 5: Action Buttons ---
-        self.show_action_buttons(ui, ctx);
-    }
-
-    fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            if !self.restore_running && ctx.busy_elsewhere.is_none() {
-                let can_start = match self.restore_mode {
-                    RestoreMode::FullDisk => {
-                        (self.backup_metadata.is_some() || self.clonezilla_image.is_some())
-                            && self.has_target(ctx)
-                    }
-                    RestoreMode::SinglePartition => {
-                        let has_source = (self.backup_metadata.is_some()
-                            && self.sp_source_partition_idx.is_some())
-                            || self.sp_image_file.is_some();
-                        let has_target = self.sp_target_device_idx.is_some()
-                            && self.sp_target_partition_idx.is_some();
-                        has_source && has_target
-                    }
-                    RestoreMode::NewDisk => {
-                        let has_source = (self.backup_metadata.is_some()
-                            && self.sp_source_partition_idx.is_some())
-                            || self.sp_image_file.is_some();
-                        let has_target = if self.nd_target_is_device {
-                            self.nd_target_device_idx.is_some()
-                        } else {
-                            self.nd_image_file_path.is_some()
-                        };
-                        has_source && has_target
-                    }
-                    // Both drive their own action from a sub-window rather than
-                    // this row's Restore button.
-                    RestoreMode::WriteImage | RestoreMode::BuildDisk => false,
-                };
-                if ui
-                    .add_enabled(can_start, egui::Button::new("Restore"))
-                    .clicked()
-                {
-                    self.confirm_popup_open = true;
-                }
-            } else if ui.button("Cancel").clicked() {
-                if let Some(ref progress_arc) = self.restore_progress {
-                    if let Ok(mut p) = progress_arc.lock() {
-                        p.cancel_requested = true;
-                        p.operation =
-                            "Cancelling - waiting for current write to complete...".to_string();
-                    }
-                }
-                ctx.log
-                    .warn("Cancellation requested - waiting for current disk write to complete...");
-            }
-        });
-    }
-
-    fn show_single_partition_mode(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &mut TabContext,
-        controls_enabled: bool,
-    ) {
-        // --- Source Section ---
-        ui.label(egui::RichText::new("Source").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            // Backup folder source
-            ui.horizontal(|ui| {
-                ui.label("Backup Folder:");
-                let label = self
-                    .backup_folder
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No folder selected".into());
-                ui.label(&label);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog().pick_folder() {
-                        self.backup_folder = Some(path);
-                        self.sp_image_file = None;
-                    }
-                }
-            });
-
-            // Or image file source
-            ui.horizontal(|ui| {
-                ui.label("Or Image File:");
-                let label = self
-                    .sp_image_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No file selected".into());
-                ui.label(&label);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog()
-                        .add_filter(
-                            "Disk Images",
-                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                        )
-                        .add_filter(
-                            "Mac archives",
-                            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-                        )
-                        .add_filter("All Files", &["*"])
-                        .pick_file()
-                    {
-                        match super::prepare_disk_image_path(&path, true) {
-                            Ok((materialized, guard)) => {
-                                self.sp_image_file = Some(materialized);
-                                self.sp_amiga_tempdir = guard;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to decompress {}: {}", path.display(), e);
-                                self.sp_image_file = Some(path);
-                                self.sp_amiga_tempdir = None;
-                            }
-                        }
-                        self.backup_folder = None;
-                        self.backup_metadata = None;
-                        self.sp_source_partition_idx = None;
-                        self.prev_backup_folder = None;
-                    }
-                }
-            });
-        });
-
-        // Auto-load metadata when folder changes
-        if !self.restore_running {
-            let folder_changed = self.backup_folder != self.prev_backup_folder;
-            if folder_changed {
-                self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(ctx);
-            }
-        }
-
-        // Show source partition selector for backup sources
-        if let Some(meta) = &self.backup_metadata {
-            ui.add_space(4.0);
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Source Partition:");
-                    let partitions = &meta.partitions;
-                    let current_label = self
-                        .sp_source_partition_idx
-                        .and_then(|idx| partitions.iter().find(|p| p.index == idx))
-                        .map(|p| {
-                            format!(
-                                "#{}: {} ({})",
-                                p.index,
-                                p.type_name,
-                                partition::format_size(p.original_size_bytes),
-                            )
-                        })
-                        .unwrap_or_else(|| "Select a partition...".into());
-
-                    egui::ComboBox::from_id_salt("sp_source_partition")
-                        .selected_text(&current_label)
-                        .width(350.0)
-                        .show_ui(ui, |ui| {
-                            for pm in partitions {
-                                let label = format!(
-                                    "#{}: {} ({})",
-                                    pm.index,
-                                    pm.type_name,
-                                    partition::format_size(pm.original_size_bytes),
-                                );
-                                ui.selectable_value(
-                                    &mut self.sp_source_partition_idx,
-                                    Some(pm.index),
-                                    label,
-                                );
-                            }
+                    if mode != row.mode || custom != row.custom_mib {
+                        actions.push(RestoreAction::SetPartitionSize {
+                            index: row.index,
+                            mode,
+                            custom_mib: custom,
                         });
-                });
-            });
-        } else if self.sp_image_file.is_some() {
-            ui.add_space(4.0);
-            ui.label("Source: entire image file");
-        }
-
-        if let Some(err) = &self.metadata_error {
-            ui.colored_label(super::theme::warning(ui.visuals()), err);
-        }
-
-        ui.add_space(8.0);
-
-        // --- Target Section ---
-        ui.label(egui::RichText::new("Target").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Target Device:");
-                let current_label = self
-                    .sp_target_device_idx
-                    .and_then(|idx| ctx.devices.get(idx))
-                    .map(|d| d.display_name())
-                    .unwrap_or_else(|| "Select a target device...".into());
-
-                egui::ComboBox::from_id_salt("sp_target_device")
-                    .selected_text(&current_label)
-                    .width(400.0)
-                    .height(400.0)
-                    .show_ui(ui, |ui| {
-                        for (i, device) in ctx.devices.iter().enumerate() {
-                            let label = format!(
-                                "{} ({}){}",
-                                device.display_name(),
-                                partition::format_size(device.size_bytes),
-                                if device.is_system { " [SYSTEM]" } else { "" },
-                            );
-                            if ui
-                                .selectable_value(&mut self.sp_target_device_idx, Some(i), label)
-                                .clicked()
-                            {
-                                self.sp_target_partitions.clear();
-                                self.sp_target_partition_idx = None;
-                                self.sp_target_identity = None;
-                                self.sp_scan_error = None;
-                            }
-                        }
-                        if ctx.devices.is_empty() {
-                            ui.label(
-                                egui::RichText::new(super::no_devices_hint())
-                                    .italics()
-                                    .weak(),
-                            );
-                        }
-                    });
-
-                if self.sp_target_device_idx.is_some() && ui.button("Scan Target").clicked() {
-                    self.scan_target_partitions(ctx);
+                    }
+                    ui.end_row();
                 }
             });
-
-            // System disk warning
-            if let Some(idx) = self.sp_target_device_idx {
-                if let Some(device) = ctx.devices.get(idx) {
-                    if device.is_system {
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            "WARNING: This is a system disk!",
-                        );
-                    }
-                }
-            }
-
-            // A refreshed list can put another disk at this index; the old
-            // disk's scan must not pick a partition on the new one.
-            if !self.sp_target_partitions.is_empty()
-                && rusty_backup::device::identity_at(ctx.devices, self.sp_target_device_idx)
-                    != self.sp_target_identity
-            {
-                self.sp_target_partitions.clear();
-                self.sp_target_partition_idx = None;
-                self.sp_target_identity = None;
-                self.sp_scan_error =
-                    Some("The target device changed since it was scanned; scan it again.".into());
-            }
-
-            // Show scanned target partitions
-            if !self.sp_target_partitions.is_empty() {
-                ui.add_space(4.0);
-                ui.label("Target Partition:");
-
-                // Get source size for comparison
-                let source_size = self.get_sp_source_size();
-
-                egui::Grid::new("sp_target_partitions")
-                    .striped(true)
-                    .min_col_width(30.0)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("").strong()); // radio
-                        ui.label(egui::RichText::new("#").strong());
-                        ui.label(egui::RichText::new("Type").strong());
-                        ui.label(egui::RichText::new("Size").strong());
-                        ui.label(egui::RichText::new("").strong()); // compat
-                        ui.end_row();
-
-                        for (pos, part) in self.sp_target_partitions.iter().enumerate() {
-                            if part.is_extended_container {
-                                continue;
-                            }
-                            let selected = self.sp_target_partition_idx == Some(part.index);
-                            if ui.radio(selected, "").clicked() {
-                                self.sp_target_partition_idx = Some(part.index);
-                            }
-                            ui.label(format!("{}", pos + 1));
-                            ui.label(&part.type_name);
-                            ui.label(partition::format_size(part.size_bytes));
-
-                            // Size compatibility indicator
-                            if let Some(src_sz) = source_size {
-                                if part.size_bytes < src_sz {
-                                    ui.colored_label(
-                                        super::theme::danger(ui.visuals()),
-                                        "too small",
-                                    );
-                                } else {
-                                    ui.label("OK");
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            ui.end_row();
-                        }
-                    });
-            }
-
-            if let Some(err) = &self.sp_scan_error {
-                ui.colored_label(super::theme::warning(ui.visuals()), err);
-            }
-        });
-
-        // Action buttons
-        self.show_action_buttons(ui, ctx);
-    }
-
-    /// Get the source data size for the single-partition mode.
-    fn get_sp_source_size(&self) -> Option<u64> {
-        if let Some(meta) = &self.backup_metadata {
-            if let Some(idx) = self.sp_source_partition_idx {
-                return meta
-                    .partitions
-                    .iter()
-                    .find(|p| p.index == idx)
-                    .map(|p| p.imaged_size_bytes);
-            }
+        for a in actions {
+            self.act(a);
         }
-        if let Some(path) = &self.sp_image_file {
-            return std::fs::metadata(path).ok().map(|m| m.len());
+
+        let target_size = self.ctl.target_size();
+        if target_size == 0 {
+            return;
         }
-        None
-    }
-
-    /// Scan the target device's partition table (requires elevation for devices).
-    fn scan_target_partitions(&mut self, ctx: &mut TabContext) {
-        self.sp_target_partitions.clear();
-        self.sp_target_partition_idx = None;
-        self.sp_target_identity = None;
-        self.sp_scan_error = None;
-
-        let device = match self
-            .sp_target_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-        {
-            Some(d) => d,
-            None => return,
-        };
-
-        ctx.log.info(format!(
-            "Scanning target partitions on {}...",
-            device.path.display()
-        ));
-
-        match rusty_backup::os::open_source_for_reading(&device.path) {
-            Ok(elevated) => {
-                let (file, _guard) = elevated.into_parts();
-                // A device cannot answer seek(End); carry the length the OS reports instead.
-                let mut reader = rusty_backup::os::known_len_source(file, &device.path);
-                match PartitionTable::detect(&mut reader) {
-                    Ok(table) => {
-                        self.sp_target_partitions = table.partitions();
-                        self.sp_target_identity = Some(device.identity());
-                        ctx.log.info(format!(
-                            "Found {} partition(s) on target ({})",
-                            self.sp_target_partitions.len(),
-                            table.type_name(),
-                        ));
-                    }
-                    Err(e) => {
-                        self.sp_scan_error = Some(format!("Could not read partition table: {e}"));
-                        ctx.log.error(format!("Target scan failed: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.sp_scan_error = Some(format!("Cannot access device: {e}"));
-                ctx.log.error(format!("Cannot access target device: {e}"));
-            }
-        }
-    }
-
-    fn load_backup_metadata(&mut self, ctx: &mut TabContext) {
-        self.backup_metadata = None;
-        self.clonezilla_image = None;
-        self.mbr_bytes = None;
-        self.metadata_error = None;
-        self.partition_configs.clear();
-
-        let folder = match &self.backup_folder {
-            Some(f) => f.clone(),
-            None => return,
-        };
-        // Single choke point for backup-folder opens across all three restore
-        // modes (they each call this on a folder change): record in the Restore
-        // recent-backups MRU.
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Restore, &folder);
-
-        let metadata_path = folder.join("metadata.json");
-        if metadata_path.exists() {
-            self.load_native_backup_metadata(&folder, &metadata_path, ctx);
-        } else if let Some(cz_folder) = clonezilla::metadata::resolve_clonezilla_folder(&folder) {
-            self.load_clonezilla_backup_metadata(&cz_folder, ctx);
+        let total = self.ctl.fixed_total();
+        let color = if total <= target_size {
+            super::theme::muted(ui.visuals())
         } else {
-            self.metadata_error =
-                Some("No backup found (metadata.json or Clonezilla image)".to_string());
-        }
-    }
-
-    fn load_native_backup_metadata(
-        &mut self,
-        folder: &std::path::Path,
-        metadata_path: &std::path::Path,
-        ctx: &mut TabContext,
-    ) {
-        let file = match File::open(metadata_path) {
-            Ok(f) => f,
-            Err(e) => {
-                self.metadata_error = Some(format!("Cannot open metadata.json: {e}"));
-                return;
-            }
+            super::theme::danger(ui.visuals())
         };
-
-        let metadata: BackupMetadata = match serde_json::from_reader(file) {
-            Ok(m) => m,
-            Err(e) => {
-                self.metadata_error = Some(format!("Invalid metadata.json: {e}"));
-                return;
-            }
-        };
-
-        // Read MBR if available
-        let mbr_path = folder.join("mbr.bin");
-        if mbr_path.exists() {
-            if let Ok(data) = std::fs::read(&mbr_path) {
-                let mut buf = [0u8; 512];
-                let copy_len = data.len().min(512);
-                buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                self.mbr_bytes = Some(buf);
-            }
-        }
-
-        // Build partition configs
-        for pm in &metadata.partitions {
-            // Prefer the smallest known-safe floor: defragmented_min when it
-            // exists (CHD backups produced with compact-always have allocated
-            // clusters packed at the start, so the defragmented floor is real),
-            // then in-place minimum_size_bytes (last_data_byte), then
-            // imaged_size_bytes for older packed backups, and finally
-            // original_size_bytes when no sizing hint is available.
-            let minimum = pm
-                .defragmented_min_size_bytes
-                .filter(|&s| s > 0)
-                .or(pm.minimum_size_bytes.filter(|&s| s > 0))
-                .unwrap_or({
-                    if pm.imaged_size_bytes > 0 {
-                        pm.imaged_size_bytes
-                    } else {
-                        pm.original_size_bytes
-                    }
-                });
-
-            self.partition_configs.push(RestorePartitionConfig {
-                index: pm.index,
-                type_name: pm.type_name.clone(),
-                start_lba: pm.start_lba,
-                original_size: pm.original_size_bytes,
-                minimum_size: minimum,
-                choice: SizeMode::Original,
-                custom_size_mib: (pm.original_size_bytes / (1024 * 1024)) as u32,
-            });
-        }
-
-        ctx.log.info(format!(
-            "Loaded backup: {} partition(s) from {}",
-            metadata.partitions.len(),
-            metadata.source_device,
-        ));
-
-        self.backup_metadata = Some(metadata);
-    }
-
-    fn load_clonezilla_backup_metadata(&mut self, folder: &std::path::Path, ctx: &mut TabContext) {
-        let cz_image = match clonezilla::metadata::load(folder) {
-            Ok(img) => img,
-            Err(e) => {
-                self.metadata_error = Some(format!("Failed to load Clonezilla image: {e}"));
-                return;
-            }
-        };
-
-        self.mbr_bytes = Some(cz_image.mbr_bytes);
-
-        // Build partition configs from Clonezilla partitions (skip extended containers)
-        for cz_part in &cz_image.partitions {
-            if cz_part.is_extended {
-                continue;
-            }
-
-            // Try to get minimum size from partclone header
-            let minimum_size = if !cz_part.partclone_files.is_empty() {
-                match clonezilla::partclone::read_partclone_header(&cz_part.partclone_files) {
-                    Ok(header) => header.used_size(),
-                    Err(_) => cz_part.size_bytes(),
+        ui.colored_label(
+            color,
+            format!(
+                "Total: {} / {} available",
+                format_size(total),
+                format_size(target_size),
+            ),
+        );
+        // Sizes adding up is not the layout fitting: Original alignment keeps every start.
+        match self.ctl.layout_fit() {
+            Some(LayoutFit::Refused { message, original }) => {
+                ui.colored_label(
+                    super::theme::danger(ui.visuals()),
+                    format!("This layout will not fit: {message}"),
+                );
+                if original {
+                    ui.colored_label(
+                        super::theme::warning(ui.visuals()),
+                        "Original alignment keeps every partition at its \
+                         original position, so shrinking only leaves gaps. \
+                         Choose 1 MB boundaries or Custom to repack them \
+                         from the start of the disk.",
+                    );
                 }
-            } else {
-                cz_part.size_bytes()
-            };
-
-            self.partition_configs.push(RestorePartitionConfig {
-                index: cz_part.index,
-                type_name: cz_part.type_name(),
-                start_lba: cz_part.start_lba,
-                original_size: cz_part.size_bytes(),
-                minimum_size,
-                choice: SizeMode::Original,
-                custom_size_mib: (cz_part.size_bytes() / (1024 * 1024)) as u32,
-            });
+            }
+            Some(LayoutFit::Overrun { end, target }) => {
+                ui.colored_label(
+                    super::theme::danger(ui.visuals()),
+                    format!(
+                        "Layout ends at {} but the target holds {}",
+                        format_size(end),
+                        format_size(target),
+                    ),
+                );
+            }
+            Some(LayoutFit::Fits) | None => {}
         }
-
-        ctx.log.info(format!(
-            "Loaded Clonezilla image: {} partition(s) from /dev/{}",
-            cz_image
-                .partitions
-                .iter()
-                .filter(|p| !p.is_extended)
-                .count(),
-            cz_image.disk_name,
-        ));
-
-        self.clonezilla_image = Some(cz_image);
     }
 
-    /// Render the before/after PartitionBar pair for the expand-disk preview.
-    /// `source_size` is the original backup-source disk size in bytes; the
-    /// "After" bar appends a `Free` segment sized by the expansion toggle.
-    /// Both bars use the same byte-per-pixel scale, so the After bar is
-    /// physically wider by the growth ratio — the visual "this disk is now
-    /// bigger" cue.
+    /// "Add free space for in-OS expansion": image targets only (docs/disk_expansion.md).
+    fn show_expand_section(&mut self, ui: &mut egui::Ui, controls_enabled: bool) {
+        let source_size = self.ctl.source_size().unwrap_or(0);
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Add free space for in-OS expansion").strong());
+        ui.separator();
+        let plan = self.ctl.expand();
+        let mut actions = Vec::new();
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            let mut on = plan.enabled;
+            if ui
+                .checkbox(&mut on, "Pad the target image with unallocated free space")
+                .on_hover_text(
+                    "Useful for restoring a backup onto a larger virtual disk and \
+                     letting the guest OS extend or add a partition there. After \
+                     restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
+                     Disk Management) followed by your filesystem's own grow \
+                     tool. Works for any filesystem.",
+                )
+                .changed()
+            {
+                actions.push(RestoreAction::SetExpand(on));
+            }
+            if !plan.enabled {
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Free space:");
+                let mut mib = plan.free_mib;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut mib)
+                            .range(0..=self.ctl.expand_cap_mib())
+                            .suffix(" MiB"),
+                    )
+                    .changed()
+                {
+                    actions.push(RestoreAction::SetExpandMib(mib));
+                }
+                let new_total = source_size.saturating_add(self.ctl.expand_free_bytes());
+                ui.label(format!(
+                    "(target size {} -> {})",
+                    format_size(source_size),
+                    format_size(new_total),
+                ));
+            });
+            ui.add_space(4.0);
+            if ui
+                .radio(
+                    !plan.extend_last,
+                    "Leave as unpartitioned free space (recommended)",
+                )
+                .on_hover_text(
+                    "Mode A: partition table stays unchanged; the trailing region is \
+                     unallocated. After restore, run your OS's partitioner to extend or \
+                     add a partition, then your filesystem's grow tool. Works for any \
+                     filesystem on any OS.",
+                )
+                .clicked()
+            {
+                actions.push(RestoreAction::SetExtendLast(false));
+            }
+            if ui
+                .radio(plan.extend_last, "Extend last partition automatically")
+                .on_hover_text(
+                    "Mode B: the last partition is sized to absorb the new free space \
+                     during restore (equivalent to picking 'Fill' for the last partition \
+                     in the size table below). After restore, only the filesystem's \
+                     own grow tool is needed in the guest OS.",
+                )
+                .clicked()
+            {
+                actions.push(RestoreAction::SetExtendLast(true));
+            }
+            self.show_expand_preview_bars(ui, source_size);
+        });
+        for a in actions {
+            self.act(a);
+        }
+    }
+
+    /// The current / after bars at one byte-per-pixel scale, so the after bar is wider.
     fn show_expand_preview_bars(&self, ui: &mut egui::Ui, source_size: u64) {
-        let segments = self.build_expand_preview_segments();
-        let added_bytes = self.expand_free_space_bytes();
-        let new_total = source_size.saturating_add(added_bytes);
+        let segments: Vec<Segment> = self
+            .ctl
+            .plan_segments()
+            .into_iter()
+            .enumerate()
+            .map(|(color_index, s)| Segment {
+                label: s.label,
+                fs: s.fs,
+                size_bytes: s.size_bytes,
+                kind: SegmentKind::Partition { color_index },
+            })
+            .collect();
+        let added = self.ctl.expand_free_bytes();
+        let new_total = source_size.saturating_add(added);
 
         ui.add_space(6.0);
         ui.label("Current:");
         let available_width = ui.available_width().max(120.0);
-        // Avoid div-by-zero; clamp to 1 byte to make the math work even on
-        // edge-case empty backups.
-        let denom = new_total.max(1);
-        let current_ratio = (source_size as f64 / denom as f64) as f32;
-        let current_width = available_width * current_ratio;
+        let ratio = (source_size as f64 / new_total.max(1) as f64) as f32;
         let current_segments = segments.clone();
         ui.scope(|ui| {
-            ui.set_width(current_width.max(60.0));
+            ui.set_width((available_width * ratio).max(60.0));
             PartitionBar {
                 segments: current_segments,
                 show_inline_labels: true,
@@ -1479,891 +740,301 @@ impl RestoreTab {
         });
 
         ui.add_space(6.0);
-        ui.label(format!(
-            "After  (+ {} free):",
-            partition::format_size(added_bytes),
-        ));
-        let mut after_segments = segments;
-        if added_bytes > 0 {
-            if self.expand_extend_last_partition {
+        ui.label(format!("After  (+ {} free):", format_size(added)));
+        let mut after = segments;
+        if added > 0 {
+            if self.ctl.expand().extend_last {
                 // Mode B: the last partition absorbs the new free space.
-                // Show this by growing its size_bytes; the bar renders the
-                // last segment longer in its own color, signalling "this
-                // partition will be larger after restore."
-                if let Some(last) = after_segments.last_mut() {
-                    last.size_bytes = last.size_bytes.saturating_add(added_bytes);
+                if let Some(last) = after.last_mut() {
+                    last.size_bytes = last.size_bytes.saturating_add(added);
                 }
             } else {
-                // Mode A: a separate gray Free segment at the end.
-                after_segments.push(Segment {
+                after.push(Segment {
                     label: String::new(),
                     fs: String::new(),
-                    size_bytes: added_bytes,
+                    size_bytes: added,
                     kind: SegmentKind::Free,
                 });
             }
         }
         PartitionBar {
-            segments: after_segments,
+            segments: after,
             show_inline_labels: true,
             show_legend: true,
         }
         .show(ui);
     }
 
-    /// Build the partition-bar segments matching the current backup source.
-    /// Skips extended-container entries; partitions get sequential color
-    /// indices so the palette is stable across the current/after bars.
-    fn build_expand_preview_segments(&self) -> Vec<Segment> {
-        let mut color_index: usize = 0;
-        let mut segs = Vec::new();
-
-        if let Some(meta) = &self.backup_metadata {
-            for pm in &meta.partitions {
-                if pm.is_logical {
-                    // Logical partitions live inside an extended container —
-                    // we render the container, not the children, to keep the
-                    // bar a flat view of the disk layout.
-                    continue;
-                }
-                let kind = SegmentKind::Partition { color_index };
-                color_index += 1;
-                segs.push(Segment {
-                    // `color_index` counts the rendered segments, so this is the
-                    // partition's position — the same number the tables show.
-                    label: format!("Partition {color_index}"),
-                    fs: pm.type_name.clone(),
-                    size_bytes: pm.original_size_bytes,
-                    kind,
-                });
-            }
-        } else if let Some(cz) = &self.clonezilla_image {
-            for cp in &cz.partitions {
-                if cp.is_logical || cp.is_extended {
-                    continue;
-                }
-                let kind = SegmentKind::Partition { color_index };
-                color_index += 1;
-                segs.push(Segment {
-                    label: format!("Partition {}", cp.index + 1),
-                    fs: cp.filesystem_type.clone(),
-                    size_bytes: cp.size_sectors * 512,
-                    kind,
-                });
-            }
-        }
-        segs
-    }
-
-    fn get_target_size(&self, ctx: &TabContext) -> u64 {
-        if self.target_is_device {
-            self.selected_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
-                .map(|d| d.size_bytes)
-                .unwrap_or(0)
-        } else {
-            // For image files, use the source disk size as default target.
-            // The "Add free space for in-OS expansion" toggle (Mode A of
-            // docs/disk_expansion.md) pads the trailing region of the
-            // output image so the guest OS can extend or add partitions
-            // there and absorb the space with its native grow tool.
-            let base = if let Some(meta) = &self.backup_metadata {
-                meta.source_size_bytes
-            } else if let Some(cz) = &self.clonezilla_image {
-                cz.source_size_bytes
-            } else {
-                0
-            };
-            base.saturating_add(self.expand_free_space_bytes())
-        }
-    }
-
-    /// Free-space contribution from the expansion toggle, in bytes. Zero when
-    /// the toggle is off (or when the target is a device, since physical disk
-    /// size isn't user-controllable).
-    pub fn expand_free_space_bytes(&self) -> u64 {
-        if self.expand_disk_enabled && !self.target_is_device {
-            (self.expand_free_space_mib as u64) * 1024 * 1024
-        } else {
-            0
-        }
-    }
-
-    fn has_target(&self, ctx: &TabContext) -> bool {
-        #[cfg(feature = "remote")]
-        if self.remote.active {
-            return self.remote.selected.is_some();
-        }
-        if self.target_is_device {
-            self.selected_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
-                .is_some()
-        } else {
-            self.image_file_path.is_some()
-        }
-    }
-
-    fn show_confirmation_popup(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
-        let mut close = false;
-
-        egui::Window::new("Confirm Restore")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(400.0)
-            .show(ui.ctx(), |ui| {
-                match self.restore_mode {
-                    RestoreMode::FullDisk => {
-                        #[cfg(feature = "remote")]
-                        let remote_target = self
-                            .remote
-                            .active
-                            .then(|| self.remote.selected.as_ref().map(|(_, d, _)| d.clone()))
-                            .flatten();
-                        #[cfg(not(feature = "remote"))]
-                        let remote_target: Option<String> = None;
-                        let target_name = if let Some(d) = remote_target {
-                            d
-                        } else if self.target_is_device {
-                            self.selected_device_idx
-                                .and_then(|idx| ctx.devices.get(idx))
-                                .map(|d| d.display_name())
-                                .unwrap_or_else(|| "Unknown".into())
-                        } else {
-                            self.image_file_path
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "Unknown".into())
-                        };
-
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!(
-                                "All data on {} will be permanently overwritten!",
-                                target_name
-                            ),
-                        );
-                        ui.add_space(8.0);
-
-                        for cfg in &self.partition_configs {
-                            let size_str = if cfg.choice == SizeMode::FillRemaining {
-                                "Fill remaining".to_string()
-                            } else {
-                                partition::format_size(cfg.effective_size())
-                            };
-                            ui.label(format!(
-                                "  Partition {}: {} -> {}",
-                                cfg.index, cfg.type_name, size_str,
-                            ));
-                        }
-                    }
-                    RestoreMode::SinglePartition => {
-                        let target_name = self
-                            .sp_target_device_idx
-                            .and_then(|idx| ctx.devices.get(idx))
-                            .map(|d| d.display_name())
-                            .unwrap_or_else(|| "Unknown".into());
-                        let target_part = self.sp_target_partition_idx.and_then(|idx| {
-                            self.sp_target_partitions.iter().find(|p| p.index == idx)
-                        });
-                        let part_desc = target_part
-                            .map(|p| {
-                                format!(
-                                    "Partition {} ({}, {})",
-                                    p.index,
-                                    p.type_name,
-                                    partition::format_size(p.size_bytes),
-                                )
-                            })
-                            .unwrap_or_else(|| "Unknown".into());
-
-                        ui.colored_label(
-                            super::theme::warning(ui.visuals()),
-                            format!("{} on {} will be overwritten.", part_desc, target_name,),
-                        );
-                        ui.label("The partition table will NOT be modified.");
-                    }
-                    RestoreMode::NewDisk => {
-                        let target_name = if self.nd_target_is_device {
-                            self.nd_target_device_idx
-                                .and_then(|idx| ctx.devices.get(idx))
-                                .map(|d| d.display_name())
-                                .unwrap_or_else(|| "Unknown".into())
-                        } else {
-                            self.nd_image_file_path
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "Unknown".into())
-                        };
-                        let table_type = match self.nd_table_type {
-                            NewTableType::Mbr => "MBR",
-                            NewTableType::Gpt => "GPT",
-                            NewTableType::Apm => "APM",
-                        };
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!(
-                                "A new {} partition table will be written to {}!",
-                                table_type, target_name,
-                            ),
-                        );
-                        ui.label("All existing data will be destroyed.");
-                    }
-                    RestoreMode::BuildDisk => {
-                        let device_name = self
-                            .bd_target_device_idx
-                            .and_then(|idx| ctx.devices.get(idx))
-                            .map(|d| d.display_name())
-                            .unwrap_or_else(|| "Unknown".into());
-                        let table = self
-                            .bd_builder
-                            .as_ref()
-                            .map(|b| b.kind.label())
-                            .unwrap_or("?");
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!(
-                                "A new {} partition table will be written to {}, \
-                                 destroying everything on it!",
-                                table, device_name,
-                            ),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(format!(
-                            "Confirm: type the device name `{}` to enable the build",
-                            device_name,
-                        ));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.bd_confirm_text)
-                                .hint_text(&device_name),
-                        );
-                    }
-                    // Never reaches this popup; it confirms in its own window.
-                    RestoreMode::WriteImage => {}
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let armed = self.restore_mode != RestoreMode::BuildDisk
-                        || self.build_confirm_matches(ctx);
-                    if ui
-                        .add_enabled(
-                            armed,
-                            egui::Button::new(
-                                egui::RichText::new("I understand, proceed")
-                                    .color(super::theme::danger(ui.visuals())),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        close = true;
-                        match self.restore_mode {
-                            RestoreMode::FullDisk => self.start_restore(ctx),
-                            RestoreMode::SinglePartition => {
-                                self.start_single_partition_restore(ctx)
-                            }
-                            RestoreMode::NewDisk => self.start_new_disk_restore(ctx),
-                            RestoreMode::BuildDisk => self.start_build_disk(ctx),
-                            // Never reaches this popup; it confirms in its own window.
-                            RestoreMode::WriteImage => {}
-                        }
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
-            });
-
-        if close {
-            self.confirm_popup_open = false;
-        }
-    }
-
-    fn start_restore(&mut self, ctx: &mut TabContext) {
-        // A remote target pushes the restored image over the block tier.
-        #[cfg(feature = "remote")]
-        if self.remote.active {
-            self.start_remote_restore(ctx);
-            return;
-        }
-
-        let backup_folder = match &self.backup_folder {
-            Some(f) => f.clone(),
-            None => {
-                ctx.log.error("No backup folder selected");
-                return;
-            }
-        };
-
-        let (target_path, target_is_device, target_size) = if self.target_is_device {
-            let device = match self
-                .selected_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
-            {
-                Some(d) => d,
-                None => {
-                    ctx.log.error("No target device selected");
-                    return;
-                }
-            };
-            (device.path.clone(), true, device.size_bytes)
-        } else {
-            let path = match &self.image_file_path {
-                Some(p) => p.clone(),
-                None => {
-                    ctx.log.error("No image file selected");
-                    return;
-                }
-            };
-            let base = self
-                .backup_metadata
-                .as_ref()
-                .map(|m| m.source_size_bytes)
-                .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
-                .unwrap_or(0);
-            // Add the "Add free space for in-OS expansion" amount so the
-            // target image is sized for both the original layout and the
-            // requested trailing free space (Phase 2 of disk_expansion).
-            let size = base.saturating_add(self.expand_free_space_bytes());
-            (path, false, size)
-        };
-
-        let alignment = self.resolve_alignment();
-        let partition_sizes = self.build_partition_sizes(target_is_device);
-
-        let config = RestoreConfig {
-            backup_folder,
-            target_path: target_path.clone(),
-            target_is_device,
-            target_size,
-            alignment,
-            partition_sizes,
-            write_zeros_to_unused: false, // Default: no zero-fill (FAT handles it)
-        };
-
-        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
-        self.restore_progress = Some(Arc::clone(&progress_arc));
-        self.restore_running = true;
-
-        ctx.log
-            .info(format!("Starting restore to {}", target_path.display(),));
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "disk restore",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: disk restore");
-                restore::run_restore(config, progress_arc)
-            },
-        );
-    }
-
-    /// Resolve the alignment radio into a `RestoreAlignment`.
-    /// Warn when the projected layout overruns the target even though the
-    /// sizes add up — the Original-alignment case, where positions are frozen.
-    fn show_layout_fit_warning(&self, ui: &mut egui::Ui, target_size: u64) {
-        let Some(metadata) = self.backup_metadata.as_ref() else {
-            return;
-        };
-        let alignment = self.resolve_alignment();
-        let sizes = self.build_partition_sizes(self.target_is_device);
-        // Ask the engine's own layout function so the projection can't drift.
-        let overrides = match rusty_backup::restore::calculate_restore_layout(
-            metadata,
-            &alignment,
-            &sizes,
-            target_size,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                ui.colored_label(
-                    super::theme::danger(ui.visuals()),
-                    format!("This layout will not fit: {e}"),
-                );
-                if matches!(alignment, RestoreAlignment::Original) {
-                    ui.colored_label(
-                        super::theme::warning(ui.visuals()),
-                        "Original alignment keeps every partition at its \
-                             original position, so shrinking only leaves gaps. \
-                             Choose 1 MB boundaries or Custom to repack them \
-                             from the start of the disk.",
-                    );
-                }
-                return;
-            }
-        };
-
-        let end_bytes = overrides
-            .iter()
-            .map(|o| o.effective_start_lba() * 512 + o.export_size)
-            .max()
-            .unwrap_or(0);
-        if end_bytes > target_size {
-            ui.colored_label(
-                super::theme::danger(ui.visuals()),
-                format!(
-                    "Layout ends at {} but the target holds {}",
-                    partition::format_size(end_bytes),
-                    partition::format_size(target_size),
-                ),
-            );
-        }
-    }
-
-    fn resolve_alignment(&self) -> RestoreAlignment {
-        match self.alignment_choice {
-            AlignmentChoice::Original => RestoreAlignment::Original,
-            AlignmentChoice::Modern1MB => RestoreAlignment::Modern1MB,
-            AlignmentChoice::Custom => {
-                RestoreAlignment::Custom(self.custom_alignment_sectors as u64)
-            }
-        }
-    }
-
-    /// Build the per-partition size overrides from the GUI's per-partition
-    /// config. `target_is_device` gates Mode B of the disk-expansion feature
-    /// (extend-last-partition only applies to image-file-shaped targets).
-    fn build_partition_sizes(&self, target_is_device: bool) -> Vec<RestorePartitionSize> {
-        // Mode B: when "Extend last partition automatically" is selected
-        // alongside an image-file-shaped target, force the last partition to
-        // FillRemaining so the engine grows it over the trailing free space.
-        let last_idx = self.partition_configs.last().map(|c| c.index);
-        let mode_b_active =
-            self.expand_disk_enabled && self.expand_extend_last_partition && !target_is_device;
-
-        self.partition_configs
-            .iter()
-            .map(|cfg| RestorePartitionSize {
-                index: cfg.index,
-                size_choice: if mode_b_active && Some(cfg.index) == last_idx {
-                    RestoreSizeChoice::FillRemaining
-                } else {
-                    match cfg.choice {
-                        SizeMode::Original => RestoreSizeChoice::Original,
-                        SizeMode::Minimum => RestoreSizeChoice::Custom(cfg.minimum_size),
-                        SizeMode::MinPlus20 => {
-                            RestoreSizeChoice::Custom(cfg.choice.effective_size(
-                                cfg.original_size,
-                                cfg.minimum_size,
-                                cfg.custom_size_mib,
-                            ))
-                        }
-                        SizeMode::Custom => {
-                            RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
-                        }
-                        SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
-                    }
-                },
-            })
-            .collect()
-    }
-
-    /// Push the restored image to a remote target (device or image file) over
-    /// the block tier. Materializes to a local staging image, then writes it to
-    /// the daemon — see `model::restore_remote`.
-    #[cfg(feature = "remote")]
-    fn start_remote_restore(&mut self, ctx: &mut TabContext) {
-        let backup_folder = match &self.backup_folder {
-            Some(f) => f.clone(),
-            None => {
-                ctx.log.error("No backup folder selected");
-                return;
-            }
-        };
-        let (path, display, is_device) = match self.remote.selected.clone() {
-            Some(t) => t,
-            None => {
-                ctx.log.error("No remote target selected");
-                return;
-            }
-        };
-        let conn = match self.remote.conn.clone() {
-            Some(c) => c,
-            None => {
-                ctx.log.error("Not connected to a remote daemon");
-                return;
-            }
-        };
-
-        let base = self
-            .backup_metadata
-            .as_ref()
-            .map(|m| m.source_size_bytes)
-            .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
-            .unwrap_or(0);
-        // Image targets honour the trailing-free-space request; a device's
-        // size is fixed by the hardware (the daemon checks the image fits).
-        let target_size = if is_device {
-            base
-        } else {
-            base.saturating_add(self.expand_free_space_bytes())
-        };
-
-        let config = RestoreConfig {
-            backup_folder,
-            // Overridden by restore_to_remote (a local staging image is used).
-            target_path: PathBuf::new(),
-            target_is_device: false,
-            target_size,
-            alignment: self.resolve_alignment(),
-            partition_sizes: self.build_partition_sizes(is_device),
-            write_zeros_to_unused: false,
-        };
-
-        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
-        self.restore_progress = Some(Arc::clone(&progress_arc));
-        self.restore_running = true;
-        ctx.log.info(format!("Starting restore to {display}"));
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "remote restore",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote restore");
-                rusty_backup::model::restore_remote::restore_to_remote(
-                    config,
-                    conn,
-                    &path,
-                    is_device,
-                    progress_arc,
-                    None,
-                    // The picker is the confirmation, as for a local image target.
-                    true,
-                )
-            },
-        );
-    }
-
-    /// Spawn a worker to connect to `addr` and list the daemon's devices.
-    #[cfg(feature = "remote")]
-    fn spawn_remote_connect(&mut self, addr: String) {
-        let status = Arc::new(Mutex::new(RemoteConnectStatus::default()));
-        self.remote.status = Some(Arc::clone(&status));
-        self.remote.error = None;
-        self.remote.addr = Some(addr.clone());
-        let status_done = Arc::clone(&status);
-        rusty_backup::model::worker::spawn_guarded(status, "remote connect", move || {
-            let (conn, devices) =
-                rusty_backup::model::backup_remote::connect_and_list_devices(&addr)?;
-            let mut s = rusty_backup::model::worker::lock_status(&status_done);
-            s.connected = Some((conn, devices));
-            s.finished = true;
-            Ok(())
-        });
-    }
-
-    /// Drain a finished remote connect/list worker into tab state.
-    #[cfg(feature = "remote")]
-    fn poll_remote(&mut self, ctx: &mut TabContext) {
-        let status = match &self.remote.status {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-        let (connected, error) = {
-            let mut s = rusty_backup::model::worker::lock_status(&status);
-            if !s.finished {
-                return;
-            }
-            (s.connected.take(), s.error.take())
-        };
-        self.remote.status = None;
-        if let Some(err) = error {
-            self.remote.error = Some(err.clone());
-            ctx.log.error(format!("Remote: {err}"));
-            return;
-        }
-        if let Some((conn, devices)) = connected {
-            ctx.log.info(format!(
-                "Connected to remote daemon ({} device{})",
-                devices.len(),
-                if devices.len() == 1 { "" } else { "s" }
-            ));
-            self.remote.conn = Some(conn);
-            self.remote.devices = devices;
-        }
-    }
-
-    /// Inline remote-target picker: connect to a daemon, then pick a physical
-    /// drive or name an image file under its serve root as the restore target.
-    #[cfg(feature = "remote")]
-    fn remote_target_ui(&mut self, ui: &mut egui::Ui) {
-        let busy = self.remote.status.is_some();
-        let connected = self.remote.conn.is_some();
-        if self.remote.dialog_addr.is_none() {
-            self.remote.dialog_addr = Some(self.remote.addr.clone().unwrap_or_default());
-        }
-        let mut do_connect: Option<String> = None;
-        let mut pick: Option<(String, String, bool)> = None;
-
+    fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
-            ui.label("Host:");
-            if let Some(addr) = self.remote.dialog_addr.as_mut() {
-                ui.add(
-                    egui::TextEdit::singleline(addr)
-                        .hint_text("192.168.1.50:7341")
-                        .desired_width(200.0),
-                );
-            }
-            let clicked = ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(if connected { "Reconnect" } else { "Connect" }),
-                )
-                .clicked();
-            if busy {
-                ui.add(egui::Spinner::new());
-            }
-            if clicked {
-                let a = self
-                    .remote
-                    .dialog_addr
-                    .clone()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                if !a.is_empty() {
-                    do_connect = Some(if a.contains(':') {
-                        a
-                    } else {
-                        format!("{a}:7341")
-                    });
-                }
-            }
-        });
-        if let Some(err) = &self.remote.error {
-            ui.colored_label(super::theme::danger(ui.visuals()), err);
-        }
-
-        if connected {
-            ui.separator();
-            ui.label("Restore target on the remote machine:");
-            let addr = self.remote.addr.clone().unwrap_or_default();
-            if self.remote.devices.is_empty() {
-                ui.label(
-                    egui::RichText::new(
-                        "No physical drives reported (the daemon may need to run as root). \
-                         You can still restore to an image file below.",
-                    )
-                    .italics()
-                    .weak(),
-                );
-            } else {
-                let selected_dev_path = self
-                    .remote
-                    .selected
-                    .as_ref()
-                    .filter(|(_, _, is_dev)| *is_dev)
-                    .map(|(p, _, _)| p.clone());
-                egui::ScrollArea::vertical()
-                    .max_height(160.0)
-                    .show(ui, |ui| {
-                        for d in &self.remote.devices {
-                            let is_sel = selected_dev_path.as_deref() == Some(d.path.as_str());
-                            let mut label =
-                                format!("{} ({})", d.path, partition::format_size(d.size_bytes));
-                            if !d.media.is_empty() {
-                                label.push_str(&format!(" - {}", d.media));
-                            }
-                            if d.is_removable {
-                                label.push_str(" [removable]");
-                            }
-                            if ui.selectable_label(is_sel, label).clicked() {
-                                let display = format!(
-                                    "rb://{addr}{} ({})",
-                                    d.path,
-                                    partition::format_size(d.size_bytes)
-                                );
-                                pick = Some((d.path.clone(), display, true));
-                            }
-                        }
-                    });
-            }
-            ui.horizontal(|ui| {
-                ui.label("or image file:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.remote.image_name)
-                        .hint_text("restored.img")
-                        .desired_width(200.0),
-                );
-                let name = self.remote.image_name.trim().to_string();
+            if !self.ctl.restore_running() && ctx.busy_elsewhere.is_none() {
                 if ui
-                    .add_enabled(!name.is_empty(), egui::Button::new("Use file"))
+                    .add_enabled(self.ctl.can_start(), egui::Button::new("Restore"))
                     .clicked()
                 {
-                    let path = if name.starts_with('/') {
-                        name.clone()
-                    } else {
-                        format!("/{name}")
-                    };
-                    let display = format!("rb://{addr}{path} (image)");
-                    pick = Some((path, display, false));
+                    self.act(RestoreAction::Start);
+                }
+            } else if self.ctl.restore_running() && ui.button("Cancel").clicked() {
+                self.act(RestoreAction::Cancel);
+            }
+        });
+    }
+
+    /// The source rows of the single-partition and new-disk modes.
+    fn show_partition_source(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls_enabled: bool,
+        salt: &str,
+        whole_image_note: bool,
+    ) {
+        ui.label(egui::RichText::new("Source").strong());
+        ui.separator();
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            self.backup_folder_row(ui);
+            ui.horizontal(|ui| {
+                ui.label("Or Image File:");
+                let label = self
+                    .ctl
+                    .source_image()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No file selected".into());
+                ui.label(&label);
+                if ui.button("Browse...").clicked() {
+                    self.act(RestoreAction::PickSourceImage);
                 }
             });
-            if let Some((_, display, _)) = &self.remote.selected {
-                ui.colored_label(
-                    super::theme::muted(ui.visuals()),
-                    format!("Selected target: {display}"),
-                );
-            }
-        }
+        });
+        self.load_status(ui);
 
-        if let Some(addr) = do_connect {
-            // A fresh connect clears any prior selection / device list.
-            self.remote.selected = None;
-            self.remote.devices.clear();
-            self.remote.conn = None;
-            self.spawn_remote_connect(addr);
+        if self.ctl.has_native_backup() {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Source Partition:");
+                    let parts = self.ctl.source_partitions();
+                    let current = self.ctl.source_partition();
+                    let label = current
+                        .and_then(|idx| parts.iter().find(|p| p.index == idx))
+                        .map(|p| p.label.clone())
+                        .unwrap_or_else(|| "Select a partition...".into());
+                    let mut picked = None;
+                    egui::ComboBox::from_id_salt(salt)
+                        .selected_text(&label)
+                        .width(350.0)
+                        .show_ui(ui, |ui| {
+                            for p in &parts {
+                                if ui
+                                    .selectable_label(current == Some(p.index), p.label.as_str())
+                                    .clicked()
+                                {
+                                    picked = Some(p.index);
+                                }
+                            }
+                        });
+                    if let Some(idx) = picked {
+                        self.act(RestoreAction::SetSourcePartition(Some(idx)));
+                    }
+                });
+            });
+        } else if whole_image_note && self.ctl.source_image().is_some() {
+            ui.add_space(4.0);
+            ui.label("Source: entire image file");
         }
-        if let Some(sel) = pick {
-            self.remote.selected = Some(sel);
+        if let Some(err) = self.ctl.load_error() {
+            ui.colored_label(super::theme::warning(ui.visuals()), err);
         }
     }
 
-    fn start_single_partition_restore(&mut self, ctx: &mut TabContext) {
-        // Determine source
-        let source = if let Some(path) = &self.sp_image_file {
-            SinglePartitionSource::ImageFile { path: path.clone() }
-        } else if let Some(folder) = &self.backup_folder {
-            let idx = match self.sp_source_partition_idx {
-                Some(i) => i,
-                None => {
-                    ctx.log.error("No source partition selected");
-                    return;
-                }
-            };
-            SinglePartitionSource::Backup {
-                folder: folder.clone(),
-                partition_index: idx,
-            }
-        } else {
-            ctx.log.error("No source selected");
-            return;
-        };
-
-        // Determine target
-        let device = match self
-            .sp_target_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-        {
-            Some(d) => d,
-            None => {
-                ctx.log.error("No target device selected");
-                return;
-            }
-        };
-        if self.sp_target_identity.as_ref() != Some(&device.identity()) {
-            ctx.log
-                .error("The target device changed since it was scanned; scan it again");
-            return;
-        }
-        let target_part = match self
-            .sp_target_partition_idx
-            .and_then(|idx| self.sp_target_partitions.iter().find(|p| p.index == idx))
-        {
-            Some(p) => p.clone(),
-            None => {
-                ctx.log.error("No target partition selected");
-                return;
-            }
-        };
-
-        let source_start_lba = match &source {
-            SinglePartitionSource::Backup {
-                partition_index, ..
-            } => self
-                .backup_metadata
-                .as_ref()
-                .and_then(|m| m.partitions.iter().find(|p| p.index == *partition_index))
-                .map(|p| p.start_lba)
-                .unwrap_or(0),
-            SinglePartitionSource::ImageFile { .. } => 0,
-        };
-
-        let config = SinglePartitionRestoreConfig {
-            source,
-            target_path: device.path.clone(),
-            target_is_device: true,
-            target_offset_bytes: target_part.start_lba * 512,
-            target_size_bytes: Some(target_part.size_bytes),
-            target_start_lba: target_part.start_lba,
-            source_start_lba,
-            new_disk: None,
-        };
-
-        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
-        self.restore_progress = Some(Arc::clone(&progress_arc));
-        self.restore_running = true;
-
-        ctx.log.info(format!(
-            "Starting single-partition restore to partition {} on {}",
-            target_part.index,
-            device.path.display(),
-        ));
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "partition restore",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: partition restore");
-                rusty_backup::restore::single::run_single_partition_restore(config, progress_arc)
-            },
-        );
-    }
-
-    /// Write Image File: pour any readable image onto a device or one of its
-    /// partitions. Target selection, confirmation and progress are the shared
-    /// [`PhysicalDiskExport`](super::physical_disk_export::PhysicalDiskExport)
-    /// sub-window.
-    fn show_write_image_mode(
+    fn show_single_partition_mode(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &mut TabContext,
         controls_enabled: bool,
     ) {
-        ui.label(egui::RichText::new("Source Image").strong());
+        self.show_partition_source(ui, controls_enabled, "sp_source_partition", true);
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Target").strong());
         ui.separator();
 
         ui.add_enabled_ui(controls_enabled, |ui| {
             ui.horizontal(|ui| {
+                ui.label("Target Device:");
+                self.device_combo(
+                    ui,
+                    ctx,
+                    TargetSlot::SinglePartition,
+                    "sp_target_device",
+                    false,
+                );
+                if let Some(snap) = self.ctl.target_scan() {
+                    super::progress::show_job(ui, &snap);
+                } else if self.ctl.device(TargetSlot::SinglePartition).is_some()
+                    && ui.button("Scan Target").clicked()
+                {
+                    self.act(RestoreAction::ScanTarget);
+                }
+            });
+            if self
+                .ctl
+                .device(TargetSlot::SinglePartition)
+                .is_some_and(|d| d.is_system)
+            {
+                ui.colored_label(
+                    super::theme::danger(ui.visuals()),
+                    "WARNING: This is a system disk!",
+                );
+            }
+
+            let parts = self.ctl.target_partitions();
+            if !parts.is_empty() {
+                ui.add_space(4.0);
+                ui.label("Target Partition:");
+                let selected = self.ctl.target_partition();
+                let mut picked = None;
+                egui::Grid::new("sp_target_partitions")
+                    .striped(true)
+                    .min_col_width(30.0)
+                    .show(ui, |ui| {
+                        for head in ["", "#", "Type", "Size", ""] {
+                            ui.label(egui::RichText::new(head).strong());
+                        }
+                        ui.end_row();
+                        for part in &parts {
+                            if ui.radio(selected == Some(part.index), "").clicked() {
+                                picked = Some(part.index);
+                            }
+                            ui.label(format!("{}", part.position));
+                            ui.label(&part.type_name);
+                            ui.label(format_size(part.size_bytes));
+                            match part.fits {
+                                Some(false) => {
+                                    ui.colored_label(
+                                        super::theme::danger(ui.visuals()),
+                                        "too small",
+                                    );
+                                }
+                                Some(true) => {
+                                    ui.label("OK");
+                                }
+                                None => {
+                                    ui.label("");
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if let Some(idx) = picked {
+                    self.act(RestoreAction::SetTargetPartition(idx));
+                }
+            }
+            if let Some(err) = self.ctl.target_scan_error() {
+                ui.colored_label(super::theme::warning(ui.visuals()), err);
+            }
+        });
+        self.show_action_buttons(ui, ctx);
+    }
+
+    fn show_new_disk_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &mut TabContext,
+        controls_enabled: bool,
+    ) {
+        self.show_partition_source(ui, controls_enabled, "nd_source_partition", false);
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Target").strong());
+        ui.separator();
+
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            self.target_kind_radios(ui, TargetSlot::NewDisk);
+            if self.ctl.target_is_device(TargetSlot::NewDisk) {
+                ui.horizontal(|ui| {
+                    ui.label("Device:");
+                    self.device_combo(ui, ctx, TargetSlot::NewDisk, "nd_target_device", false);
+                });
+            } else {
+                self.target_image_row(ui, TargetSlot::NewDisk, "Image File:");
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("New Partition Table").strong());
+        ui.separator();
+
+        let mut choice = self.ctl.new_disk();
+        let before = choice;
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Table Type:");
+                ui.radio_value(&mut choice.table, NewTableType::Mbr, "MBR");
+                ui.radio_value(&mut choice.table, NewTableType::Gpt, "GPT");
+                ui.radio_value(&mut choice.table, NewTableType::Apm, "APM");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Alignment:");
+                ui.radio_value(
+                    &mut choice.alignment,
+                    AlignmentChoice::Modern1MB,
+                    "1 MB (LBA 2048)",
+                );
+                ui.radio_value(
+                    &mut choice.alignment,
+                    AlignmentChoice::Original,
+                    "DOS (LBA 63)",
+                );
+                ui.radio_value(&mut choice.alignment, AlignmentChoice::Custom, "Custom");
+                if choice.alignment == AlignmentChoice::Custom {
+                    ui.add(egui::DragValue::new(&mut choice.custom_alignment).range(1..=65535));
+                    ui.label("sectors");
+                }
+            });
+            if choice.table == NewTableType::Mbr {
+                ui.checkbox(&mut choice.bootable, "Mark partition as bootable");
+            }
+            ui.colored_label(
+                super::theme::muted(ui.visuals()),
+                format!(
+                    "Partition will start at LBA {}",
+                    self.ctl.new_disk_start_lba()
+                ),
+            );
+        });
+        if choice != before {
+            self.act(RestoreAction::SetNewDisk(choice));
+        }
+        self.show_action_buttons(ui, ctx);
+    }
+
+    /// Write Image File: the source here; target, confirmation and progress are the shared
+    /// Physical Disk Export window.
+    fn show_write_image_mode(&mut self, ui: &mut egui::Ui, controls_enabled: bool) {
+        ui.label(egui::RichText::new("Source Image").strong());
+        ui.separator();
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.horizontal(|ui| {
                 ui.label("Image file:");
                 let label = self
-                    .image_write_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
+                    .ctl
+                    .write_image()
+                    .map(|(p, _)| p.display().to_string())
                     .unwrap_or_else(|| "(none selected)".to_string());
                 ui.label(label);
                 if ui.button("Choose...").clicked() {
-                    let mut dialog = rfd::FileDialog::new();
-                    dialog = dialog.add_filter(
-                        "Disk images",
-                        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                    );
-                    if let Some(path) = dialog.pick_file() {
-                        self.image_write_size =
-                            rusty_backup::model::source_reader::decoded_image_size(&path)
-                                .unwrap_or(0);
-                        if self.image_write_size == 0 {
-                            ctx.log.error(format!(
-                                "Could not read {} as a disk image",
-                                path.display()
-                            ));
-                        } else {
-                            ctx.log.info(format!(
-                                "Source image: {} ({})",
-                                path.display(),
-                                partition::format_size(self.image_write_size),
-                            ));
-                        }
-                        self.image_write_path = Some(path);
-                    }
+                    self.act(RestoreAction::PickWriteImage);
                 }
             });
         });
+        if let Some(snap) = self.ctl.probing() {
+            super::progress::show_job(ui, &snap);
+        }
 
-        if let Some(path) = self.image_write_path.clone() {
-            if self.image_write_size > 0 {
+        match self.ctl.write_image() {
+            Some((_, size)) if size > 0 => {
                 ui.label(format!(
                     "Decoded size: {} (the file on disk may be smaller if it is compressed)",
-                    partition::format_size(self.image_write_size),
+                    format_size(size),
                 ));
                 ui.add_space(6.0);
                 if ui
@@ -2373,34 +1044,29 @@ impl RestoreTab {
                     )
                     .clicked()
                 {
-                    let source = super::physical_disk_export::PhysicalDiskExportSource {
-                        path,
-                        size_bytes: self.image_write_size,
-                        fs_hint: "image".to_string(),
-                        has_partition_table: true,
-                    };
-                    self.image_write.open_for(source, None);
+                    self.act(RestoreAction::WriteImageTarget);
                 }
-            } else {
+            }
+            Some(_) => {
                 ui.colored_label(
                     super::theme::danger(ui.visuals()),
                     "That file could not be opened as a disk image.",
                 );
             }
-        } else {
-            ui.label(
-                egui::RichText::new(
-                    "Pick an image to write. Any format Rusty Backup can read works -- \
-                     raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
-                     are decoded on the way to the disk.",
-                )
-                .weak(),
-            );
+            None => {
+                ui.label(
+                    egui::RichText::new(
+                        "Pick an image to write. Any format Rusty Backup can read works -- \
+                         raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
+                         are decoded on the way to the disk.",
+                    )
+                    .weak(),
+                );
+            }
         }
     }
 
-    /// Build Disk mode: pick a blank target, then define its partitions in the
-    /// shared modal. The table and every assigned image land in one pass.
+    /// Build Disk: pick a blank target, then define its partitions in the shared modal.
     fn show_build_disk_mode(
         &mut self,
         ui: &mut egui::Ui,
@@ -2411,77 +1077,48 @@ impl RestoreTab {
         ui.separator();
 
         ui.add_enabled_ui(controls_enabled, |ui| {
+            let is_device = self.ctl.target_is_device(TargetSlot::BuildDisk);
             ui.horizontal(|ui| {
-                ui.radio_value(&mut self.bd_target_is_device, false, "New image file");
-                ui.radio_value(&mut self.bd_target_is_device, true, "Physical device");
+                if ui.radio(!is_device, "New image file").clicked() {
+                    self.act(RestoreAction::SetTargetIsDevice(
+                        TargetSlot::BuildDisk,
+                        false,
+                    ));
+                }
+                if ui.radio(is_device, "Physical device").clicked() {
+                    self.act(RestoreAction::SetTargetIsDevice(
+                        TargetSlot::BuildDisk,
+                        true,
+                    ));
+                }
             });
-
-            if self.bd_target_is_device {
+            if is_device {
                 ui.horizontal(|ui| {
                     ui.label("Device:");
-                    let current_label = self
-                        .bd_target_device_idx
-                        .and_then(|idx| ctx.devices.get(idx))
-                        .map(|d| d.display_name())
-                        .unwrap_or_else(|| "Select a target device...".into());
-                    egui::ComboBox::from_id_salt("bd_target_device")
-                        .selected_text(&current_label)
-                        .width(400.0)
-                        .height(400.0)
-                        .show_ui(ui, |ui| {
-                            for (i, device) in ctx.devices.iter().enumerate() {
-                                let label = format!(
-                                    "{} ({}){}",
-                                    device.display_name(),
-                                    partition::format_size(device.size_bytes),
-                                    if device.is_system { " [SYSTEM]" } else { "" },
-                                );
-                                ui.selectable_value(&mut self.bd_target_device_idx, Some(i), label);
-                            }
-                            if ctx.devices.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(super::no_devices_hint())
-                                        .italics()
-                                        .weak(),
-                                );
-                            }
-                        });
+                    self.device_combo(ui, ctx, TargetSlot::BuildDisk, "bd_target_device", false);
                 });
                 ui.label(
                     egui::RichText::new("Building erases everything on the selected device.")
                         .color(super::theme::warning(ui.visuals())),
                 );
             } else {
-                ui.horizontal(|ui| {
-                    ui.label("Image file:");
-                    let label = self
-                        .bd_image_file_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "No file selected".into());
-                    ui.label(&label);
-                    if ui.button("Save As...").clicked() {
-                        if let Some(path) = super::file_dialog()
-                            .add_filter("Disk Images", &["img", "raw", "bin"])
-                            .save_file()
-                        {
-                            self.bd_image_file_path = Some(path);
-                        }
-                    }
-                });
+                self.target_image_row(ui, TargetSlot::BuildDisk, "Image file:");
                 ui.horizontal(|ui| {
                     ui.label("Disk size:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.bd_image_size_text)
-                            .desired_width(90.0),
-                    )
-                    .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.");
-                    match rusty_backup::partition::parse_size(&self.bd_image_size_text) {
+                    let mut text = self.ctl.build_size_text().to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut text).desired_width(90.0))
+                        .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.")
+                        .changed()
+                    {
+                        self.act(RestoreAction::SetBuildSize(text));
+                    }
+                    match self.ctl.build_size() {
                         Ok(n) => {
-                            ui.label(egui::RichText::new(partition::format_size(n)).weak());
+                            ui.label(egui::RichText::new(format_size(n)).weak());
                         }
                         Err(e) => {
-                            ui.colored_label(super::theme::danger(ui.visuals()), format!("{e:#}"));
+                            ui.colored_label(super::theme::danger(ui.visuals()), e);
                         }
                     }
                 });
@@ -2489,648 +1126,155 @@ impl RestoreTab {
         });
 
         ui.add_space(8.0);
-
-        let target = self.build_disk_target(ctx);
-        ui.add_enabled_ui(controls_enabled && target.is_some(), |ui| {
+        let has_target = self.ctl.build_target().is_some();
+        ui.add_enabled_ui(controls_enabled && has_target, |ui| {
             if ui
                 .button("Define Partitions...")
                 .on_hover_text("Choose the table type and lay out the partitions")
                 .clicked()
             {
-                if let Some((_, size)) = &target {
-                    let keep = self
-                        .bd_builder
-                        .as_ref()
-                        .map(|b| b.kind)
-                        .unwrap_or(rusty_backup::partition::type_catalog::TableKind::Mbr);
-                    let mut builder = DiskBuilder::new(keep, *size);
-                    builder.disk_size = *size;
-                    self.bd_builder = Some(builder);
-                    self.bd_confirm_text.clear();
-                }
+                self.act(RestoreAction::BuildDefine);
             }
         });
-        if target.is_none() {
+        if !has_target {
             ui.label(egui::RichText::new("Pick a target first.").weak());
         }
-
         self.show_build_progress(ui);
     }
 
-    /// The chosen target as `(path, size_bytes)`, or `None` when the selection
-    /// is incomplete or the size field doesn't parse.
-    fn build_disk_target(&self, ctx: &TabContext) -> Option<(PathBuf, u64)> {
-        if self.bd_target_is_device {
-            let device = self.bd_target_device_idx.and_then(|i| ctx.devices.get(i))?;
-            Some((device.path.clone(), device.size_bytes))
-        } else {
-            let path = self.bd_image_file_path.clone()?;
-            let size = rusty_backup::partition::parse_size(&self.bd_image_size_text).ok()?;
-            (size > 0).then_some((path, size))
-        }
-    }
-
-    fn show_build_disk_modal(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
-        let Some(builder) = self.bd_builder.as_mut() else {
+    fn show_build_disk_modal(&mut self, ui: &mut egui::Ui) {
+        let Some(view) = self.ctl.build_view() else {
             return;
         };
-        let action = super::partition_editor_modal::show(
-            ui,
-            super::partition_editor_modal::Mode::BuildNew { builder },
-            true,
-        );
+        let probing = self.ctl.build_source_probing().is_some();
+        let (edits, action) = super::partition_editor_modal::show_build(ui, &view, probing);
+        for edit in edits {
+            self.act(RestoreAction::Build(edit));
+        }
         match action {
             super::partition_editor_modal::Action::Stay => {}
-            super::partition_editor_modal::Action::Close => self.bd_builder = None,
-            super::partition_editor_modal::Action::Apply => {
-                // Erasing a physical disk needs the same typed confirmation the
-                // Inspect tab's disk export asks for; an image file does not.
-                if self.bd_target_is_device {
-                    self.confirm_popup_open = true;
-                } else {
-                    self.start_build_disk(ctx);
-                }
-            }
+            super::partition_editor_modal::Action::Close => self.act(RestoreAction::BuildClose),
+            super::partition_editor_modal::Action::Apply => self.act(RestoreAction::BuildApply),
         }
-    }
-
-    fn start_build_disk(&mut self, ctx: &mut TabContext) {
-        let (target_path, target_size) = match self.build_disk_target(ctx) {
-            Some(t) => t,
-            None => {
-                ctx.log.error("No target selected");
-                return;
-            }
-        };
-        let Some(builder) = self.bd_builder.as_mut() else {
-            return;
-        };
-        let Some(placed) = builder.validate() else {
-            ctx.log
-                .error("Partition layout is not valid; fix the errors and try again");
-            return;
-        };
-
-        let req = ProvisionRequest {
-            target_path: target_path.clone(),
-            target_size_bytes: target_size,
-            kind: builder.kind,
-            geometry: builder.geometry,
-            partitions: placed,
-            sources: builder.sources(),
-        };
-        let kind_label = builder.kind.label();
-        ctx.log.info(format!(
-            "Building a {} disk on {} ({})",
-            kind_label,
-            target_path.display(),
-            partition::format_size(target_size),
-        ));
-        self.bd_logged = 0;
-        self.bd_finished_reported = false;
-        self.bd_rate.reset();
-        self.bd_status = Some(provision_runner::start_provision(req));
-        self.bd_builder = None;
-        self.bd_confirm_text.clear();
     }
 
     fn show_build_progress(&mut self, ui: &mut egui::Ui) {
-        let Some(status) = self.bd_status.as_ref() else {
+        let Some(snap) = self.ctl.build_progress() else {
             return;
         };
-        let Some((finished, error, current, total, cancel_requested)) =
-            status.lock().ok().map(|g| {
-                (
-                    g.finished,
-                    g.error.clone(),
-                    g.current_bytes,
-                    g.total_bytes,
-                    g.cancel_requested,
+        ui.add_space(8.0);
+        ui.separator();
+        if snap.is_running() {
+            if super::progress::show_job(ui, &snap) {
+                self.act(RestoreAction::BuildCancel);
+            }
+            return;
+        }
+        match self.ctl.build_result() {
+            Some(Err(err)) => {
+                ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
+            }
+            Some(Ok(())) => {
+                ui.label("Disk build complete.");
+            }
+            None => {}
+        }
+    }
+
+    /// Inline remote-target picker: connect to a daemon, then pick a drive or name an image file.
+    #[cfg(feature = "remote")]
+    fn remote_target_ui(&mut self, ui: &mut egui::Ui) {
+        let busy = self.ctl.remote_busy();
+        let connected = self.ctl.remote_connected();
+        let mut actions = Vec::new();
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            let mut addr = self.ctl.remote_address().to_string();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut addr)
+                        .hint_text("192.168.1.50:7341")
+                        .desired_width(200.0),
                 )
-            })
-        else {
-            return;
-        };
-
-        ui.add_space(8.0);
-        ui.separator();
-        let frac = if total > 0 {
-            (current as f32 / total as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let text = if total > 0 {
-            self.bd_rate.record(current, "Building disk");
-            let suffix = self.bd_rate.suffix(current, total);
-            format!(
-                "{} / {} ({:.0}%){}",
-                partition::format_size(current),
-                partition::format_size(total),
-                frac * 100.0,
-                suffix,
-            )
-        } else if finished {
-            "done".to_string()
-        } else {
-            "writing the partition table...".to_string()
-        };
-        ui.add(egui::ProgressBar::new(if finished { 1.0 } else { frac }).text(text));
-
-        if finished {
-            match error {
-                Some(err) => {
-                    ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"))
-                }
-                None => ui.label("Disk build complete."),
-            };
-        } else if !cancel_requested {
-            if ui.button("Cancel build").clicked() {
-                if let Ok(mut g) = status.lock() {
-                    g.cancel_requested = true;
-                }
-            }
-        } else {
-            ui.label("Cancelling...");
-        }
-    }
-
-    /// The typed confirmation matches the selected device, so a build can't
-    /// erase the wrong disk by a stray click.
-    fn build_confirm_matches(&self, ctx: &TabContext) -> bool {
-        self.bd_target_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-            .is_some_and(|d| self.bd_confirm_text == d.display_name())
-    }
-
-    /// Forward the Build Disk worker's log lines to the shared log panel once
-    /// each, and report the outcome when it finishes.
-    fn poll_build(&mut self, ctx: &mut TabContext) {
-        let Some(status) = self.bd_status.as_ref() else {
-            return;
-        };
-        let guard = rusty_backup::model::worker::lock_status(status);
-        let fresh: Vec<String> = guard
-            .log_messages
-            .iter()
-            .skip(self.bd_logged)
-            .cloned()
-            .collect();
-        let finished = guard.finished;
-        let error = guard.error.clone();
-        drop(guard);
-
-        self.bd_logged += fresh.len();
-        for msg in fresh {
-            ctx.log.info(msg);
-        }
-        if finished && !self.bd_finished_reported {
-            self.bd_finished_reported = true;
-            match error {
-                Some(e) => ctx.log.error(format!("Disk build failed: {e}")),
-                None => ctx.log.info("Disk build complete"),
-            }
-            self.bd_rate.reset();
-        }
-    }
-
-    fn show_new_disk_mode(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &mut TabContext,
-        controls_enabled: bool,
-    ) {
-        // --- Source Section (same as single partition) ---
-        ui.label(egui::RichText::new("Source").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Backup Folder:");
-                let label = self
-                    .backup_folder
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No folder selected".into());
-                ui.label(&label);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog().pick_folder() {
-                        self.backup_folder = Some(path);
-                        self.sp_image_file = None;
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Or Image File:");
-                let label = self
-                    .sp_image_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "No file selected".into());
-                ui.label(&label);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = super::file_dialog()
-                        .add_filter(
-                            "Disk Images",
-                            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                        )
-                        .add_filter(
-                            "Mac archives",
-                            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-                        )
-                        .add_filter("All Files", &["*"])
-                        .pick_file()
-                    {
-                        match super::prepare_disk_image_path(&path, true) {
-                            Ok((materialized, guard)) => {
-                                self.sp_image_file = Some(materialized);
-                                self.sp_amiga_tempdir = guard;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to decompress {}: {}", path.display(), e);
-                                self.sp_image_file = Some(path);
-                                self.sp_amiga_tempdir = None;
-                            }
-                        }
-                        self.backup_folder = None;
-                        self.backup_metadata = None;
-                        self.sp_source_partition_idx = None;
-                        self.prev_backup_folder = None;
-                    }
-                }
-            });
-        });
-
-        // Auto-load metadata when folder changes
-        if !self.restore_running {
-            let folder_changed = self.backup_folder != self.prev_backup_folder;
-            if folder_changed {
-                self.prev_backup_folder = self.backup_folder.clone();
-                self.load_backup_metadata(ctx);
-            }
-        }
-
-        // Source partition selector
-        if let Some(meta) = &self.backup_metadata {
-            ui.add_space(4.0);
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Source Partition:");
-                    let partitions = &meta.partitions;
-                    let current_label = self
-                        .sp_source_partition_idx
-                        .and_then(|idx| partitions.iter().find(|p| p.index == idx))
-                        .map(|p| {
-                            format!(
-                                "#{}: {} ({})",
-                                p.index,
-                                p.type_name,
-                                partition::format_size(p.original_size_bytes),
-                            )
-                        })
-                        .unwrap_or_else(|| "Select a partition...".into());
-
-                    egui::ComboBox::from_id_salt("nd_source_partition")
-                        .selected_text(&current_label)
-                        .width(350.0)
-                        .show_ui(ui, |ui| {
-                            for pm in partitions {
-                                let label = format!(
-                                    "#{}: {} ({})",
-                                    pm.index,
-                                    pm.type_name,
-                                    partition::format_size(pm.original_size_bytes),
-                                );
-                                ui.selectable_value(
-                                    &mut self.sp_source_partition_idx,
-                                    Some(pm.index),
-                                    label,
-                                );
-                            }
-                        });
-                });
-            });
-        }
-
-        if let Some(err) = &self.metadata_error {
-            ui.colored_label(super::theme::warning(ui.visuals()), err);
-        }
-
-        ui.add_space(8.0);
-
-        // --- Target Section ---
-        ui.label(egui::RichText::new("Target").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.nd_target_is_device, true, "Write to device");
-                ui.radio_value(&mut self.nd_target_is_device, false, "Save as image file");
-            });
-
-            if self.nd_target_is_device {
-                ui.horizontal(|ui| {
-                    ui.label("Device:");
-                    let current_label = self
-                        .nd_target_device_idx
-                        .and_then(|idx| ctx.devices.get(idx))
-                        .map(|d| d.display_name())
-                        .unwrap_or_else(|| "Select a target device...".into());
-
-                    egui::ComboBox::from_id_salt("nd_target_device")
-                        .selected_text(&current_label)
-                        .width(400.0)
-                        .height(400.0)
-                        .show_ui(ui, |ui| {
-                            for (i, device) in ctx.devices.iter().enumerate() {
-                                let label = format!(
-                                    "{} ({}){}",
-                                    device.display_name(),
-                                    partition::format_size(device.size_bytes),
-                                    if device.is_system { " [SYSTEM]" } else { "" },
-                                );
-                                ui.selectable_value(&mut self.nd_target_device_idx, Some(i), label);
-                            }
-                            if ctx.devices.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(super::no_devices_hint())
-                                        .italics()
-                                        .weak(),
-                                );
-                            }
-                        });
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Image File:");
-                    let label = self
-                        .nd_image_file_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "No file selected".into());
-                    ui.label(&label);
-                    if ui.button("Save As...").clicked() {
-                        if let Some(path) = super::file_dialog()
-                            .add_filter("Disk Images", &["img", "raw", "bin"])
-                            .save_file()
-                        {
-                            self.nd_image_file_path = Some(path);
-                        }
-                    }
-                });
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // --- Partition Table Options ---
-        ui.label(egui::RichText::new("New Partition Table").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Table Type:");
-                ui.radio_value(&mut self.nd_table_type, NewTableType::Mbr, "MBR");
-                ui.radio_value(&mut self.nd_table_type, NewTableType::Gpt, "GPT");
-                ui.radio_value(&mut self.nd_table_type, NewTableType::Apm, "APM");
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Alignment:");
-                ui.radio_value(
-                    &mut self.nd_alignment_choice,
-                    AlignmentChoice::Modern1MB,
-                    "1 MB (LBA 2048)",
-                );
-                ui.radio_value(
-                    &mut self.nd_alignment_choice,
-                    AlignmentChoice::Original,
-                    "DOS (LBA 63)",
-                );
-                ui.radio_value(
-                    &mut self.nd_alignment_choice,
-                    AlignmentChoice::Custom,
-                    "Custom",
-                );
-                if self.nd_alignment_choice == AlignmentChoice::Custom {
-                    ui.add(egui::DragValue::new(&mut self.nd_custom_alignment).range(1..=65535));
-                    ui.label("sectors");
-                }
-            });
-
-            if self.nd_table_type == NewTableType::Mbr {
-                ui.checkbox(&mut self.nd_bootable, "Mark partition as bootable");
-            }
-
-            // Preview layout
-            let alignment_sectors = match self.nd_alignment_choice {
-                AlignmentChoice::Original => 63,
-                AlignmentChoice::Modern1MB => 2048,
-                AlignmentChoice::Custom => self.nd_custom_alignment as u64,
-            };
-            let start_lba = match self.nd_table_type {
-                NewTableType::Gpt => {
-                    // GPT needs LBAs 0-33 for protective MBR + header + entries
-                    let min_lba = 34u64;
-                    if alignment_sectors > 0 {
-                        let rem = min_lba % alignment_sectors;
-                        if rem != 0 {
-                            min_lba + alignment_sectors - rem
-                        } else {
-                            min_lba
-                        }
-                    } else {
-                        min_lba
-                    }
-                }
-                _ => alignment_sectors,
-            };
-            ui.colored_label(
-                super::theme::muted(ui.visuals()),
-                format!("Partition will start at LBA {}", start_lba),
-            );
-        });
-
-        self.show_action_buttons(ui, ctx);
-    }
-
-    fn start_new_disk_restore(&mut self, ctx: &mut TabContext) {
-        // Determine source
-        let source = if let Some(path) = &self.sp_image_file {
-            SinglePartitionSource::ImageFile { path: path.clone() }
-        } else if let Some(folder) = &self.backup_folder {
-            let idx = match self.sp_source_partition_idx {
-                Some(i) => i,
-                None => {
-                    ctx.log.error("No source partition selected");
-                    return;
-                }
-            };
-            SinglePartitionSource::Backup {
-                folder: folder.clone(),
-                partition_index: idx,
-            }
-        } else {
-            ctx.log.error("No source selected");
-            return;
-        };
-
-        // Determine target
-        let (target_path, target_is_device, disk_size_bytes) = if self.nd_target_is_device {
-            let device = match self
-                .nd_target_device_idx
-                .and_then(|idx| ctx.devices.get(idx))
+                .changed()
             {
-                Some(d) => d,
-                None => {
-                    ctx.log.error("No target device selected");
-                    return;
-                }
-            };
-            (device.path.clone(), true, device.size_bytes)
-        } else {
-            let path = match &self.nd_image_file_path {
-                Some(p) => p.clone(),
-                None => {
-                    ctx.log.error("No target file selected");
-                    return;
-                }
-            };
-            // For image files, estimate disk size from source partition size
-            let source_size = self.get_sp_source_size().unwrap_or(0);
-            let estimated = source_size + 2048 * 512; // add alignment overhead
-            (path, false, estimated)
-        };
-
-        // Calculate partition start LBA
-        let alignment_sectors = match self.nd_alignment_choice {
-            AlignmentChoice::Original => 63u64,
-            AlignmentChoice::Modern1MB => 2048,
-            AlignmentChoice::Custom => self.nd_custom_alignment as u64,
-        };
-        let start_lba = match self.nd_table_type {
-            NewTableType::Gpt => {
-                let min_lba = 34u64;
-                if alignment_sectors > 0 {
-                    let rem = min_lba % alignment_sectors;
-                    if rem != 0 {
-                        min_lba + alignment_sectors - rem
-                    } else {
-                        min_lba
-                    }
-                } else {
-                    min_lba
-                }
+                actions.push(RestoreAction::RemoteSetAddress(addr));
             }
-            _ => alignment_sectors,
-        };
-
-        let source_start_lba = match &source {
-            SinglePartitionSource::Backup {
-                partition_index, ..
-            } => self
-                .backup_metadata
-                .as_ref()
-                .and_then(|m| m.partitions.iter().find(|p| p.index == *partition_index))
-                .map(|p| p.start_lba)
-                .unwrap_or(0),
-            SinglePartitionSource::ImageFile { .. } => 0,
-        };
-
-        // Determine partition type from backup metadata
-        let partition_type_byte = self
-            .backup_metadata
-            .as_ref()
-            .and_then(|m| {
-                self.sp_source_partition_idx.and_then(|idx| {
-                    m.partitions
-                        .iter()
-                        .find(|p| p.index == idx)
-                        .map(|p| p.partition_type_byte)
-                })
-            })
-            .unwrap_or(0x0C); // default to FAT32 LBA
-
-        let partition_type_string = self.backup_metadata.as_ref().and_then(|m| {
-            self.sp_source_partition_idx.and_then(|idx| {
-                m.partitions
-                    .iter()
-                    .find(|p| p.index == idx)
-                    .and_then(|p| p.partition_type_string.clone())
-            })
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(if connected { "Reconnect" } else { "Connect" }),
+                )
+                .clicked()
+            {
+                actions.push(RestoreAction::RemoteConnect);
+            }
+            if busy {
+                ui.add(egui::Spinner::new());
+            }
         });
-
-        let config = SinglePartitionRestoreConfig {
-            source,
-            target_path: target_path.clone(),
-            target_is_device,
-            target_offset_bytes: start_lba * 512,
-            target_size_bytes: None, // use source size
-            target_start_lba: start_lba,
-            source_start_lba,
-            new_disk: Some(NewDiskConfig {
-                table_type: self.nd_table_type,
-                alignment_sectors,
-                partition_type_byte,
-                partition_type_guid: None, // use default
-                partition_type_string,
-                bootable: self.nd_bootable,
-                disk_size_bytes,
-            }),
-        };
-
-        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
-        self.restore_progress = Some(Arc::clone(&progress_arc));
-        self.restore_running = true;
-
-        ctx.log.info(format!(
-            "Starting new-disk restore to {}",
-            target_path.display(),
-        ));
-
-        rusty_backup::model::worker::spawn_guarded(
-            Arc::clone(&progress_arc),
-            "new-disk restore",
-            move || {
-                let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: new-disk restore");
-                rusty_backup::restore::single::run_single_partition_restore(config, progress_arc)
-            },
-        );
-    }
-
-    fn poll_progress(&mut self, ctx: &mut TabContext, progress_state: &mut ProgressState) {
-        let progress_arc = match &self.restore_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-
-        let mut p = rusty_backup::model::worker::lock_status(&progress_arc);
-
-        // Drain log messages
-        while let Some(msg) = p.log_messages.pop_front() {
-            match msg.level {
-                rusty_backup::backup::LogLevel::Info => ctx.log.info(msg.message),
-                rusty_backup::backup::LogLevel::Warning => ctx.log.warn(msg.message),
-                rusty_backup::backup::LogLevel::Error => ctx.log.error(msg.message),
-            }
+        if let Some(err) = self.ctl.remote_error() {
+            ui.colored_label(super::theme::danger(ui.visuals()), err);
         }
 
-        // Update progress bar
-        progress_state.active = !p.finished;
-        progress_state.operation = p.operation.clone();
-        progress_state.current_bytes = p.current_bytes;
-        progress_state.total_bytes = p.total_bytes;
-        progress_state.full_size_bytes = 0;
-        progress_state.record_sample();
-
-        if p.finished {
-            if let Some(err) = &p.error {
-                ctx.log.error(format!("Restore failed: {err}"));
+        if connected {
+            ui.separator();
+            ui.label("Restore target on the remote machine:");
+            let drives = self.ctl.remote_drives();
+            if drives.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No physical drives reported (the daemon may need to run as root). \
+                         You can still restore to an image file below.",
+                    )
+                    .italics()
+                    .weak(),
+                );
             } else {
-                ctx.log.info("Restore completed successfully.");
+                let selected = self.ctl.remote_selected_device().map(|s| s.to_string());
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for d in drives {
+                            let is_sel = selected.as_deref() == Some(d.path.as_str());
+                            if ui.selectable_label(is_sel, d.label.as_str()).clicked() {
+                                actions.push(RestoreAction::RemotePickDevice {
+                                    path: d.path,
+                                    size: d.size_bytes,
+                                });
+                            }
+                        }
+                    });
             }
-            drop(p);
-            self.restore_running = false;
-            self.restore_progress = None;
+            ui.horizontal(|ui| {
+                ui.label("or image file:");
+                let mut name = self.ctl.remote_image_name().to_string();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut name)
+                            .hint_text("restored.img")
+                            .desired_width(200.0),
+                    )
+                    .changed()
+                {
+                    actions.push(RestoreAction::RemoteSetImageName(name.clone()));
+                }
+                if ui
+                    .add_enabled(!name.trim().is_empty(), egui::Button::new("Use file"))
+                    .clicked()
+                {
+                    actions.push(RestoreAction::RemoteUseImage);
+                }
+            });
+            if let Some(label) = self.ctl.remote_target_label() {
+                ui.colored_label(
+                    super::theme::muted(ui.visuals()),
+                    format!("Selected target: {label}"),
+                );
+            }
+        }
+        for a in actions {
+            self.act(a);
         }
     }
 }

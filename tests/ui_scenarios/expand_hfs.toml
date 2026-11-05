@@ -1,0 +1,29 @@
+# Expand HFS: a 4 MiB flat HFV grown to a 12 MiB bare HFS image after picking the output.
+name = "Expand HFS: flat HFV to a bigger image"
+vm = "expand_hfs"
+
+[[step]]
+action = "Open"
+arg = "$hfv"
+expect = { open = true, flat_hfv = true, size_mib = 4, can_start = false }
+
+[[step]]
+action = "SetSizeMib"
+arg = 12
+
+[[step]]
+action = "PickOutput"
+effects = ["PickFile"]
+
+[[step]]
+action = "Pick"
+expect = { can_start = true }
+
+[[step]]
+action = "Start"
+settle = true
+expect = { outcome = "ok", out_mib = 12, can_start = false }
+
+[[step]]
+action = "Close"
+expect = { open = false }

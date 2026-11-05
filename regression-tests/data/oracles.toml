@@ -240,6 +240,28 @@ verifies = [{ format = "fmt.zip-disk", direction = "write", strength = "structur
 # --- Emulator oracles --------------------------------------------------------
 
 [[oracle]]
+id = "freebsd-fsck_ffs"
+tool = "FreeBSD 15.1 fsck_ffs (QEMU)"
+kind = "emulator"
+program = "python3"
+notes = """FreeBSD 15.1-RELEASE amd64 in QEMU, booted with -snapshot from local.toml's
+`[emulators] freebsd15`; the artifact is the second virtio disk and is checked
+with `fsck_ffs -fn`. With -n, fsck_ffs declines every repair and still exits 0,
+so oracles/freebsd/fsck_ffs.py also fails on any "...? no" question. About a
+minute per check with KVM. emulator/ufs_freebsd_fsck.py drives the same check
+over FreeBSD-made volumes after rb-cli edits.
+"""
+availability = [
+  { platform = "linux",   status = "verified", verified_on = "2026-11-01" },
+  { platform = "macos",   status = "install" },
+  { platform = "windows", status = "install" },
+]
+verifies = [
+  { format = "fs.ufs1", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-01, after R-071 / R-072: a blank `new volume ufs`, the same volume after mkdir / put / mv / rm, and those edits on a FreeBSD 15.1 UFS1 volume all pass fsck_ffs -fn (emulator/ufs_freebsd_fsck.py). Controlled by overwriting cylinder group 0, which fails.", check = ["{oracles}/freebsd/fsck_ffs.py", "{artifact}"] },
+  { format = "fs.ufs2", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-01: mkdir / put past the direct blocks / mv / rm on a FreeBSD 15.1 UFS2 volume with check-hashes pass fsck_ffs -fn (emulator/ufs_freebsd_fsck.py ufs2)" },
+]
+
+[[oracle]]
 id = "motion"
 tool = "Motion"
 kind = "emulator"
@@ -403,7 +425,7 @@ licensed ROM to run it. `program` is python3 on the amitools pattern: the
 interpreter is what must exist, and the script finds the emulator (sibling
 checkout, or $COPPERLINE)."""
 verifies = [
-  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1).", check = ["{oracles}/copperline/affs_mount.py", "{artifact}"] },
+  { format = "fs.affs", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-08-18: Kickstart 3.1 on an A1200 profile mounts our volume Read/Write under its own name as DH1:, reported over Paula serial to Copperline stdout. Controlled against 2 MB of urandom, which the same guest reports as 'Not a DOS disk' (exit 1). 2026-11-01, m900: the same with Kickstart 3.2 (exec 47.7) and 3.2's Mount 47.2, Copperline 2c2fed48; a volume rb-cli made and wrote mounts, urandom does not.", check = ["{oracles}/copperline/affs_mount.py", "{artifact}"] },
 ]
 
 [[oracle]]

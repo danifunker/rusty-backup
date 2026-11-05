@@ -21,12 +21,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::Filesystem;
-use crate::fs::fork_export::{export_file_with_fork, safe_name};
-use crate::fs::resource_fork::{build_appledouble, MacFileDates, ResourceForkMode};
-use crate::fs::tar_export::{export_tar_multi, TarCompression, TarExportOptions};
-use crate::macarchive::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::Filesystem;
+use fs_mac::fork_export::safe_name;
+use fs_mac::resource_fork::{build_appledouble, MacFileDates, ResourceForkMode};
+use fs_tar::tar_export::{export_tar_multi, TarCompression, TarExportOptions};
 
 /// One user-selectable export output shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +57,13 @@ pub enum ExportFormat {
     /// A single MacArchive `.mar`; forks + Finder type/creator native, same
     /// input tree as StuffIt.
     MacArchive,
+    /// A StuffIt archive wrapped in BinHex (`.sit.hqx`), safe for text-only transfers.
+    StuffItHqx,
 }
 
 impl ExportFormat {
     /// Every format, in menu order (folder outputs first, then archives).
-    pub const ALL: [ExportFormat; 10] = [
+    pub const ALL: [ExportFormat; 11] = [
         ExportFormat::LooseFiles,
         ExportFormat::GzipPerFile,
         ExportFormat::ZstdPerFile,
@@ -72,6 +74,7 @@ impl ExportFormat {
         ExportFormat::Zip,
         ExportFormat::StuffIt,
         ExportFormat::MacArchive,
+        ExportFormat::StuffItHqx,
     ];
 
     /// Short menu / dropdown label.
@@ -87,6 +90,7 @@ impl ExportFormat {
             ExportFormat::Zip => "Zip (.zip)",
             ExportFormat::StuffIt => "StuffIt (.sit)",
             ExportFormat::MacArchive => "Mac Archive (.mar)",
+            ExportFormat::StuffItHqx => "StuffIt in BinHex (.sit.hqx)",
         }
     }
 
@@ -101,6 +105,7 @@ impl ExportFormat {
                 | ExportFormat::Zip
                 | ExportFormat::StuffIt
                 | ExportFormat::MacArchive
+                | ExportFormat::StuffItHqx
         )
     }
 
@@ -113,6 +118,7 @@ impl ExportFormat {
             ExportFormat::Zip => Some("zip"),
             ExportFormat::StuffIt => Some("sit"),
             ExportFormat::MacArchive => Some("mar"),
+            ExportFormat::StuffItHqx => Some("sit.hqx"),
             _ => None,
         }
     }
@@ -136,59 +142,7 @@ fn cancelled_err() -> anyhow::Error {
     anyhow::anyhow!("export cancelled")
 }
 
-/// The directory part of an absolute entry path, "" for a top-level entry.
-fn parent_dir(path: &str) -> &str {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some((dir, _)) => dir,
-        None => "",
-    }
-}
-
-/// The deepest directory containing every selected entry, "" at the volume root.
-///
-/// Selections are named relative to this, so picking several files out of one
-/// folder still yields bare names (what it always did) while a selection that
-/// spans folders keeps enough path to stay unique. Without it every root was
-/// named by `archive_name()` alone, so `/a/notes.txt` and `/b/notes.txt` both
-/// became `notes.txt` and the second silently replaced the first.
-pub fn common_parent(entries: &[FileEntry]) -> String {
-    let mut it = entries.iter();
-    let Some(first) = it.next() else {
-        return String::new();
-    };
-    let mut base: Vec<&str> = parent_dir(&first.path)
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .collect();
-    for e in it {
-        let these: Vec<&str> = parent_dir(&e.path)
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .collect();
-        let keep = base
-            .iter()
-            .zip(these.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        base.truncate(keep);
-        if base.is_empty() {
-            break;
-        }
-    }
-    if base.is_empty() {
-        String::new()
-    } else {
-        format!("/{}", base.join("/"))
-    }
-}
-
-/// `entry`'s own directory relative to `base`; "" when it sits directly in it.
-/// Always uses `/` separators — callers targeting the host filesystem convert.
-pub fn relative_dir(entry: &FileEntry, base: &str) -> String {
-    let dir = parent_dir(&entry.path);
-    let rel = dir.strip_prefix(base).unwrap_or(dir);
-    rel.trim_matches('/').to_string()
-}
+use disk_core::entry::{common_parent, relative_dir};
 
 /// Export `entries` from `fs` as loose outputs into the directory `dest_dir`.
 /// Only [`ExportFormat::LooseFiles`] / [`GzipPerFile`](ExportFormat::GzipPerFile)
@@ -215,85 +169,84 @@ pub fn export_to_folder(
             std::fs::create_dir_all(&t).with_context(|| format!("creating {}", t.display()))?;
             t
         };
-        folder_recurse(
-            fs,
-            std::slice::from_ref(e),
-            &target,
+        let mut host = FolderHost {
             format,
-            fork_mode,
             progress,
             cancelled,
-            &mut summary,
-        )?;
+            summary: &mut summary,
+        };
+        let opts = folder_options(format, fork_mode);
+        rb_fsexporter::extract(fs, e, &target, &opts, &mut host).map_err(|err| {
+            match err.is::<rb_fsexporter::Cancelled>() {
+                true => cancelled_err(),
+                false => err.context(format!("exporting '{}'", e.name)),
+            }
+        })?;
     }
     Ok(summary)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn folder_recurse(
-    fs: &mut dyn Filesystem,
-    entries: &[FileEntry],
-    dest_dir: &Path,
+/// How a folder export writes: the root's contents into the folder, symlinks left out, any
+/// error stops it. BinHex is a fixed fork container, independent of the loose "Forks as:".
+fn folder_options(format: ExportFormat, fork_mode: ResourceForkMode) -> rb_fsexporter::Options {
+    let mode = match format {
+        ExportFormat::BinHex => ResourceForkMode::BinHex,
+        _ => fork_mode,
+    };
+    let mut opts = rb_fsexporter::Options::new(mode);
+    opts.symlinks = rb_fsexporter::Symlinks::Skip;
+    opts.on_error = rb_fsexporter::OnError::Stop;
+    opts.volume_folder = false;
+    opts
+}
+
+/// A folder export as the extractor's host: progress, cancel and the per-file compressors.
+struct FolderHost<'a, 'b> {
     format: ExportFormat,
-    fork_mode: ResourceForkMode,
-    progress: &Progress,
-    cancelled: &Cancelled,
-    summary: &mut ExportSummary,
-) -> Result<()> {
-    for e in entries {
-        if cancelled() {
-            return Err(cancelled_err());
-        }
-        match e.entry_type {
-            EntryType::Directory => {
-                let children = fs
-                    .list_directory(e)
-                    .with_context(|| format!("listing '{}'", e.name))?;
-                // A volume root has no name of its own — extract its contents
-                // straight into `dest_dir`. Joining its literal "/" name would
-                // discard `dest_dir` entirely and target the host root.
-                let sub = match e.archive_name() {
-                    Some(name) => {
-                        let sub = dest_dir.join(crate::fs::resource_fork::sanitize_filename(name));
-                        std::fs::create_dir_all(&sub)
-                            .with_context(|| format!("creating {}", sub.display()))?;
-                        sub
-                    }
-                    None => dest_dir.to_path_buf(),
-                };
-                folder_recurse(
-                    fs, &children, &sub, format, fork_mode, progress, cancelled, summary,
-                )?;
-            }
-            EntryType::File => {
-                match format {
-                    // BinHex is a fixed fork container, independent of the loose
-                    // "Forks as:" choice.
-                    ExportFormat::LooseFiles | ExportFormat::BinHex => {
-                        let mode = if format == ExportFormat::BinHex {
-                            ResourceForkMode::BinHex
-                        } else {
-                            fork_mode
-                        };
-                        export_file_with_fork(fs, e, dest_dir, &safe_name(e), mode)
-                            .with_context(|| format!("exporting '{}'", e.name))?;
-                    }
-                    ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => {
-                        export_compressed_file(fs, e, dest_dir, format)
-                            .with_context(|| format!("compressing '{}'", e.name))?;
-                    }
-                    _ => anyhow::bail!("{:?} is not a folder-output format", format),
-                }
-                summary.files += 1;
-                summary.bytes = summary.bytes.saturating_add(e.size);
-                progress(&e.path, summary.files, summary.bytes);
-            }
-            EntryType::Symlink | EntryType::Special => {
-                // Not representable as a loose host file here; skip.
-            }
+    progress: &'a Progress<'b>,
+    cancelled: &'a Cancelled<'b>,
+    summary: &'a mut ExportSummary,
+}
+
+impl rb_fsexporter::Host for FolderHost<'_, '_> {
+    fn cancelled(&self) -> bool {
+        (self.cancelled)()
+    }
+
+    fn wrote(&mut self, entry: &FileEntry, _bytes: u64, _total: &rb_fsexporter::Summary) {
+        self.summary.files += 1;
+        self.summary.bytes = self.summary.bytes.saturating_add(entry.size);
+        (self.progress)(&entry.path, self.summary.files, self.summary.bytes);
+    }
+
+    // A folder keeps its own name with any leading or trailing '/' trimmed.
+    fn host_name(&self, entry: &FileEntry, base: String) -> String {
+        match entry.is_directory() {
+            true => entry
+                .archive_name()
+                .map(fs_mac::resource_fork::sanitize_filename)
+                .unwrap_or(base),
+            false => base,
         }
     }
-    Ok(())
+
+    fn write_file(
+        &mut self,
+        fs: &mut dyn Filesystem,
+        entry: &FileEntry,
+        dir: &Path,
+        _name: &str,
+    ) -> Option<Result<u64>> {
+        match self.format {
+            ExportFormat::LooseFiles | ExportFormat::BinHex => None,
+            ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => Some(
+                export_compressed_file(fs, entry, dir, self.format)
+                    .with_context(|| format!("compressing '{}'", entry.name))
+                    .map(|()| entry.size),
+            ),
+            f => Some(Err(anyhow::anyhow!("{:?} is not a folder-output format", f))),
+        }
+    }
 }
 
 /// Read a file's data fork fully into memory.
@@ -368,7 +321,7 @@ pub fn export_to_file(
             export_tar_file(fs, entries, out_path, format, progress)
         }
         ExportFormat::Zip => export_zip_file(fs, entries, out_path, progress, cancelled),
-        ExportFormat::StuffIt | ExportFormat::MacArchive => {
+        ExportFormat::StuffIt | ExportFormat::MacArchive | ExportFormat::StuffItHqx => {
             export_mac_archive_file(fs, entries, out_path, format, progress, cancelled)
         }
         _ => anyhow::bail!("{:?} is not a single-file format", format),
@@ -531,9 +484,26 @@ fn export_mac_archive_file(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("archive");
-        crate::macarchive::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
+        arc_mac::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
     } else {
         build_archive_tree(&nodes, WriteMethod::Rle).context("building StuffIt archive")?
+    };
+    let bytes = if format == ExportFormat::StuffItHqx {
+        let name = out_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("archive.sit.hqx");
+        let bh = fs_mac::binhex::BinHexFile {
+            name: name.trim_end_matches(".hqx").to_string(),
+            type_code: *b"SITD",
+            creator_code: *b"SIT!",
+            flags: 0,
+            data_fork: bytes,
+            resource_fork: Vec::new(),
+        };
+        fs_mac::binhex::build_binhex(&bh).into_bytes()
+    } else {
+        bytes
     };
     std::fs::write(out_path, &bytes).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(summary)
@@ -639,7 +609,7 @@ fn mac_dates(e: &FileEntry) -> MacFileDates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::EditableFilesystem;
+    use disk_core::filesystem::EditableFilesystem;
     use std::io::Read;
 
     fn put_file(efs: &mut dyn EditableFilesystem, parent: &FileEntry, name: &str, data: &[u8]) {
@@ -651,7 +621,7 @@ mod tests {
     /// A blank FAT volume holding `HELLO.TXT`, `DATA.BIN`, and `SUB/INNER.TXT`.
     /// Returns the open (read-only) filesystem and its selected root entries.
     fn fixture() -> (Box<dyn Filesystem>, Vec<FileEntry>, tempfile::TempDir) {
-        let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("v.img");
         std::fs::write(&img, &flat).unwrap();
@@ -767,7 +737,7 @@ mod tests {
         // folder-in-folder: SUB/SUBSUB/DEEP.TXT. Every other test only exercises
         // one directory level; real folders nest, so exercise a marked folder
         // that contains a subfolder across every single-file archive format.
-        let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("v.img");
         std::fs::write(&img, &flat).unwrap();
@@ -935,15 +905,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.files, 3);
         let bytes = std::fs::read(&path).unwrap();
-        let archive = crate::macarchive::stuffit::parse(&bytes).unwrap();
+        let archive = arc_mac::stuffit::parse(&bytes).unwrap();
         let hello = archive
             .entries
             .iter()
             .find(|e| e.name == "HELLO.TXT")
             .expect("HELLO.TXT in sit");
-        let data =
-            crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
-                .unwrap();
+        let data = arc_mac::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap()).unwrap();
         assert_eq!(data, b"hello world");
     }
 
@@ -962,7 +930,7 @@ mod tests {
         )
         .unwrap();
         let hqx = std::fs::read(out.path().join("HELLO.TXT.hqx")).unwrap();
-        let bh = crate::fs::binhex::parse_binhex(&hqx).unwrap();
+        let bh = fs_mac::binhex::parse_binhex(&hqx).unwrap();
         assert_eq!(bh.data_fork, b"hello world");
     }
 
@@ -982,15 +950,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.files, 3);
         let raw = std::fs::read(&path).unwrap();
-        let (bytes, archive) = crate::macarchive::mar::parse(&raw).unwrap();
+        let (bytes, archive) = arc_mac::mar::parse(&raw).unwrap();
         let hello = archive
             .entries
             .iter()
             .find(|e| e.name == "HELLO.TXT")
             .expect("HELLO.TXT in mar");
-        let data =
-            crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
-                .unwrap();
+        let data = arc_mac::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap()).unwrap();
         assert_eq!(data, b"hello world");
     }
 
@@ -1015,7 +981,7 @@ mod tests {
 #[cfg(test)]
 mod selection_path_tests {
     use super::*;
-    use crate::fs::entry::EntryType;
+    use disk_core::entry::EntryType;
 
     fn f(path: &str) -> FileEntry {
         let mut e = FileEntry::root();

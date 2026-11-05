@@ -18,9 +18,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::partition::parse_size;
 use crate::partition::provision::{self, Geometry, PartSpec, Placed};
 use crate::partition::type_catalog::{self, TableKind};
-use crate::partition::{format_size, parse_size};
+use disk_core::display::format_size;
 
 /// One partition being defined, before it is placed.
 #[derive(Debug, Clone, Default)]

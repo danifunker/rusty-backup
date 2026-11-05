@@ -3,13 +3,20 @@
 //! The eventual goal is for every GUI tab to be a renderer over an object in
 //! this tree. See §5 / §10 of `docs/codecleanup.md`.
 
+pub mod alto_resize;
 pub mod archive_edit;
+pub mod archive_import;
 pub mod backup_loader;
+pub mod backup_plan;
 #[cfg(feature = "remote")]
 pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
 pub mod cache_runner;
+#[cfg(feature = "audio")]
+pub mod cd_audio_player;
+#[cfg(feature = "chd")]
+pub mod chd_edit_open;
 #[cfg(feature = "chd")]
 pub mod chd_expand_runner;
 pub mod checksum;
@@ -19,16 +26,31 @@ pub mod commander_source;
 pub mod container_edit;
 pub mod dir_listing;
 pub mod disk_builder;
+pub mod disk_write_plan;
 pub mod edit_queue;
+pub mod entry_detail;
 pub mod export_runner;
+pub mod extract;
 pub mod file_types;
+pub mod floppy_convert;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
+pub mod host_ops;
+pub mod image_prep;
+pub mod inspect_runner;
+pub mod job;
+pub mod mac_archive_extract;
+pub mod mac_archive_read;
 pub mod min_size_runner;
 pub mod multi_volume_fs;
 #[cfg(feature = "optical")]
+pub mod optical_browse;
+#[cfg(feature = "optical")]
 pub mod optical_devices;
+#[cfg(feature = "optical")]
+pub mod optical_ops;
 pub mod partition_editor;
+pub mod partition_resize;
 pub mod physical_write_runner;
 pub mod provision_runner;
 pub mod rate_tracker;
@@ -40,17 +62,15 @@ pub mod remote_browser;
 pub mod repack_runner;
 #[cfg(feature = "remote")]
 pub mod resize_remote;
+pub mod restore_plan;
 #[cfg(feature = "remote")]
 pub mod restore_remote;
 pub mod size_mode;
 pub mod source_reader;
+pub mod source_scan;
 pub mod stage_names;
 pub mod status;
 pub mod swab_runner;
 pub mod text_edit;
-// `update_runner` wraps the GUI's update-download/install flow on top of
-// `src/update.rs` — both depend on `reqwest`, which is GUI-feature-only.
-#[cfg(feature = "gui")]
-pub mod update_runner;
 pub mod volume_label_runner;
 pub mod worker;

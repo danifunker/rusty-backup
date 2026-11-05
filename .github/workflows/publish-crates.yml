@@ -1,0 +1,75 @@
+# Publishes every crate under crates/ whose Cargo.toml version is not on crates.io yet.
+# Releasing a crate = bump its version (and CHANGELOG) and push to main; no tags.
+# Manual runs work on any branch and default to a dry run.
+# Needs the CARGO_REGISTRY_TOKEN repository secret (crates.io token, publish-update scope).
+name: Publish crates
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/*/Cargo.toml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package and verify only, do not upload
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish new versions
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          # crates.io rate limits (new crates: 5 then 1 per 10 min) answer 429 with a
+          # "try again after" time; wait for it and retry what is still unpublished.
+          for attempt in $(seq 1 30); do
+            mapfile -t pending < <(scripts/unpublished-crates.py)
+            if [ ${#pending[@]} -eq 0 ]; then
+              echo "Every crate's version is on crates.io; nothing to publish."
+              exit 0
+            fi
+            echo "Unpublished: ${pending[*]} (dry run: $DRY_RUN)"
+            args=()
+            for c in "${pending[@]}"; do args+=(-p "$c"); done
+            if [ "$DRY_RUN" = "true" ]; then
+              cargo publish --dry-run "${args[@]}"
+              exit 0
+            fi
+            # Multi-package publish orders the crates by their dependencies.
+            if cargo publish "${args[@]}" 2>&1 | tee publish.log; then
+              continue
+            fi
+            if ! grep -qiE '429|too many requests' publish.log; then
+              exit 1
+            fi
+            after="$(grep -oE 'try again after [^.]*GMT' publish.log | head -1 | sed 's/try again after //')"
+            wait=600
+            if [ -n "$after" ]; then
+              wait=$(( $(date -d "$after" +%s) - $(date +%s) + 10 ))
+              [ "$wait" -lt 10 ] && wait=10
+            fi
+            echo "Rate-limited; waiting ${wait}s (attempt $attempt)"
+            sleep "$wait"
+          done
+          echo "::error::still unpublished after 30 attempts"
+          exit 1

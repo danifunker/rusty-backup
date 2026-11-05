@@ -7,7 +7,7 @@
 
 use std::fs::File;
 
-use rusty_backup::fs::hfsplus::HfsPlusFilesystem;
+use fs_mac::hfsplus::HfsPlusFilesystem;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -68,8 +68,7 @@ fn main() {
                     }
                 );
                 for b in &t.blocks {
-                    let class =
-                        rusty_backup::fs::hfsplus_journal::classify_target(&d.regions, b.target);
+                    let class = fs_mac::hfsplus_journal::classify_target(&d.regions, b.target);
                     println!(
                         "      sector {:<8} {} bytes  [{}]",
                         b.target / 512,

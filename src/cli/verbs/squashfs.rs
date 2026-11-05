@@ -21,8 +21,8 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::parse::parse_size;
 use crate::cli::resolve::resolve_partition_streaming;
-use crate::fs::squashfs_edit::{plan_size, SizeBudget};
-use crate::partition::format_size;
+use disk_core::display::format_size;
+use fs_squashfs::squashfs_edit::{plan_size, SizeBudget};
 
 #[derive(Debug, Subcommand)]
 pub enum SquashfsCommand {
@@ -135,8 +135,8 @@ pub fn run(cmd: SquashfsCommand) -> Result<()> {
 }
 
 fn run_create(args: SquashfsCreateArgs) -> Result<()> {
-    use crate::fs::squashfs::Compressor;
-    use crate::fs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+    use fs_squashfs::squashfs::Compressor;
+    use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
 
     if !args.dir.is_dir() {
         bail!("{} is not a directory", args.dir.display());
@@ -207,10 +207,10 @@ fn run_verify(args: SquashfsVerifyArgs) -> Result<()> {
     // Reopen concretely for the verifier.
     let (reader, _ctx) =
         resolve_partition_streaming(&args.image.path, args.image.partition.clone())?;
-    let mut fs = crate::fs::squashfs::SquashfsFilesystem::open(reader, ctx.offset)
+    let mut fs = fs_squashfs::squashfs::SquashfsFilesystem::open(reader, ctx.offset)
         .map_err(|e| anyhow!("opening SquashFS: {e}"))?;
     let report =
-        crate::fs::squashfs_verify::verify_squashfs(&mut fs).map_err(|e| anyhow!("{e}"))?;
+        fs_squashfs::squashfs_verify::verify_squashfs(&mut fs).map_err(|e| anyhow!("{e}"))?;
 
     out_stdout(format!(
         "OK: {} file(s), {} dir(s), {} symlink(s), {} special; {} of data, {} xattr(s) — every block decompressed and cross-referenced",
@@ -245,7 +245,7 @@ fn run_plan(args: SquashfsPlanArgs) -> Result<()> {
     // `total_size` is the superblock's `bytes_used`; pad it the way the image
     // actually sits on disk, so this figure and the one the budget is enforced
     // against are the same number.
-    let image_len = crate::fs::squashfs_write::image_footprint(fs.total_size());
+    let image_len = fs_squashfs::squashfs_write::image_footprint(fs.total_size());
     let plan = plan_size(fs.as_mut(), image_len, capacity)
         .map_err(|e| anyhow!("measuring the image: {e}"))?;
 

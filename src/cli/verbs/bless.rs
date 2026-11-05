@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::resolve::{resolve_partition_rw, resolve_partition_streaming};
-use crate::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
 
 #[derive(Debug, Subcommand)]
 pub enum BlessCommand {

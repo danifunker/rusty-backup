@@ -17,8 +17,13 @@ use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::partition::parse_size;
 use crate::partition::type_catalog::{self, TableKind};
-use crate::partition::{apm, format_size, gpt, mbr, parse_size, sgi_dklabel};
+use disk_core::display::format_size;
+use part_tables::apm;
+use part_tables::gpt;
+use part_tables::mbr;
+use part_tables::sgi_dklabel;
 
 const SECTOR: u64 = 512;
 
@@ -118,23 +123,23 @@ const SOLARIS_ALT_CYLINDERS: u64 = 2;
 pub fn slot_limit(kind: TableKind) -> Option<usize> {
     match kind {
         TableKind::Mbr => Some(4),
-        TableKind::X68k => Some(crate::partition::x68k::X68K_MAX_PARTITIONS),
+        TableKind::X68k => Some(part_tables::x68k::X68K_MAX_PARTITIONS),
         // SGI has 16 slots but reserves 8 (volhdr) and 10 (whole volume).
-        TableKind::Sgi => Some(crate::partition::sgi::SGI_NUM_PARTITIONS - 2),
+        TableKind::Sgi => Some(part_tables::sgi::SGI_NUM_PARTITIONS - 2),
         // Eight `d_map` slots; the last is the whole-disk wrapper the era's
         // labels always carry, so it is not offered.
         TableKind::SgiDkLabel => Some(sgi_dklabel::SGI_DKLABEL_NFS - 1),
         // RDB is a linked list, but keeping every PART block inside the first
         // 16 sectors is what every Amiga tool scans for.
-        TableKind::Rdb => Some(crate::partition::rdb::RDB_SCAN_BLOCKS as usize - 1),
+        TableKind::Rdb => Some(part_tables::rdb::RDB_SCAN_BLOCKS as usize - 1),
         // Sun has 8 slices; slice 2 is the whole-disk backup alias.
         TableKind::Sun => Some(7),
-        TableKind::Next => Some(crate::partition::next::N_PARTITIONS),
+        TableKind::Next => Some(part_tables::next::N_PARTITIONS),
         // 16 slices less the backup / boot / alternates trio the label owns.
         TableKind::SolarisX86 => Some(solaris_user_slices().count()),
         // Four primary slots. XGM extended chains parse, but we don't create
         // them — see docs/partition_table_writers_backlog.md.
-        TableKind::Atari => Some(crate::partition::atari::AHDI_NUM_SLOTS),
+        TableKind::Atari => Some(part_tables::atari::AHDI_NUM_SLOTS),
         _ => None,
     }
 }
@@ -190,7 +195,7 @@ fn sun_user_slices() -> impl Iterator<Item = usize> {
 /// Slice numbers a Solaris x86 VTOC offers to user slices: all 16 less the
 /// whole-partition backup alias and the boot / alternates pair.
 fn solaris_user_slices() -> impl Iterator<Item = usize> {
-    (0..crate::partition::solaris_x86::N_SLICES).filter(|&i| !matches!(i, 2 | 8 | 9))
+    (0..part_tables::solaris_x86::N_SLICES).filter(|&i| !matches!(i, 2 | 8 | 9))
 }
 
 /// Bytes at the head of the disk the table itself needs. `geometry` matters
@@ -208,10 +213,10 @@ pub fn reserved_head(kind: TableKind, geometry: Geometry) -> u64 {
         // cylinder alignment then pushes slot 0 out to cylinder 1.
         TableKind::SgiDkLabel => sgi_dklabel::SGI_DKLABEL_RESERVED_BLOCKS * SECTOR,
         // X68k: table at byte 2048, partitions conventionally from sector 64.
-        TableKind::X68k => u64::from(crate::partition::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
+        TableKind::X68k => u64::from(part_tables::x68k::X68K_FIRST_PARTITION_SECTOR) * SECTOR,
         // RDB: the RDSK plus its PART chain. Cylinder alignment then pushes
         // the first partition to cylinder 1, where Amiga tools put it.
-        TableKind::Rdb => crate::partition::rdb::RDB_SCAN_BLOCKS * SECTOR,
+        TableKind::Rdb => part_tables::rdb::RDB_SCAN_BLOCKS * SECTOR,
         // Sun keeps only the 512-byte label at sector 0, but slices start on
         // cylinder boundaries, so alignment pushes slice 0 out to cylinder 1.
         TableKind::Sun => SECTOR,
@@ -526,7 +531,7 @@ fn write_sgi<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::sgi::{
+    use part_tables::sgi::{
         SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
         SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
     };
@@ -577,7 +582,7 @@ fn write_sgi<W: Write + Seek>(
         magic: SGI_VOLHDR_MAGIC,
         root_part_num: 0,
         swap_part_num: 1,
-        device_parameters: crate::partition::sgi::SgiDeviceParameters::for_geometry(
+        device_parameters: part_tables::sgi::SgiDeviceParameters::for_geometry(
             (total_sectors / cyl_sectors) as u32,
             geometry.heads,
             geometry.sectors_per_track,
@@ -602,7 +607,7 @@ fn write_sgi<W: Write + Seek>(
 
 /// Map a type keyword to the SGI discriminant, falling back to XFS.
 pub fn sgi_type_raw(text: &str) -> u32 {
-    use crate::partition::sgi::SgiPartitionType;
+    use part_tables::sgi::SgiPartitionType;
     sgi_type_from_text(text).unwrap_or_else(|| SgiPartitionType::Xfs.as_u32())
 }
 
@@ -610,7 +615,7 @@ pub fn sgi_type_raw(text: &str) -> u32 {
 /// it, or a raw decimal / `0x` discriminant. `None` when it is neither, which
 /// is what lets a caller decide its own default.
 pub fn sgi_type_from_text(text: &str) -> Option<u32> {
-    use crate::partition::sgi::SgiPartitionType;
+    use part_tables::sgi::SgiPartitionType;
     let trimmed = text.trim();
     let named = match trimmed.to_ascii_lowercase().as_str() {
         "volhdr" => Some(SgiPartitionType::VolHdr),
@@ -649,7 +654,7 @@ fn write_rdb<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::rdb::{parse_dos_type, stamp_checksum, NO_BLOCK, RDB_SCAN_BLOCKS};
+    use part_tables::rdb::{parse_dos_type, stamp_checksum, NO_BLOCK, RDB_SCAN_BLOCKS};
 
     let heads = u64::from(geometry.heads);
     let sectors = u64::from(geometry.sectors_per_track);
@@ -667,7 +672,7 @@ fn write_rdb<W: Write + Seek>(
     }
 
     let mut rdsk = [0u8; 512];
-    rdsk[0..4].copy_from_slice(crate::partition::rdb::RDSK_SIGNATURE);
+    rdsk[0..4].copy_from_slice(part_tables::rdb::RDSK_SIGNATURE);
     let part_list = if placed.is_empty() { NO_BLOCK } else { 1 };
     for (long, value) in [
         (1u32, 64u32),      // rdb_SummedLongs
@@ -713,7 +718,7 @@ fn write_rdb<W: Write + Seek>(
             .ok_or_else(|| anyhow::anyhow!("bad Amiga DosType '{}'", p.type_text))?;
 
         let mut part = [0u8; 512];
-        part[0..4].copy_from_slice(crate::partition::rdb::PART_SIGNATURE);
+        part[0..4].copy_from_slice(part_tables::rdb::PART_SIGNATURE);
         let next = if i + 1 < placed.len() {
             block + 1
         } else {
@@ -750,9 +755,7 @@ fn write_rdb<W: Write + Seek>(
 /// Atari AHDI: four 12-byte entries at 0x1C6 in a root sector whose word-sum
 /// must be 0x1234. `AhdiTable::root_to_bytes` serialises; this fills slots.
 fn write_ahdi<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
-    use crate::partition::atari::{
-        AhdiPartitionEntry, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS,
-    };
+    use part_tables::atari::{AhdiPartitionEntry, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 
     let empty = || AhdiPartitionEntry {
         flags: 0,
@@ -804,9 +807,7 @@ fn write_sgi_dklabel<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::sgi_dklabel::{
-        SgiDiskLabel, SgiDiskMap, SgiLabelByteOrder, SGI_DKLABEL_NFS,
-    };
+    use part_tables::sgi_dklabel::{SgiDiskLabel, SgiDiskMap, SgiLabelByteOrder, SGI_DKLABEL_NFS};
 
     let spc = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
     if spc == 0 {
@@ -908,9 +909,7 @@ fn write_sun<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::sun::{
-        tag_from_text, SUN_LABEL_MAGIC, SUN_TAG_WHOLE_DISK, SUN_VTOC_SANITY,
-    };
+    use part_tables::sun::{tag_from_text, SUN_LABEL_MAGIC, SUN_TAG_WHOLE_DISK, SUN_VTOC_SANITY};
 
     let heads = u64::from(geometry.heads);
     let sectors = u64::from(geometry.sectors_per_track);
@@ -993,7 +992,7 @@ fn write_next<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::next::{
+    use part_tables::next::{
         build_label, write_copies, NextLabelSpec, NextPartitionSpec, LABEL_BLOCKS, N_PARTITIONS,
     };
 
@@ -1062,10 +1061,10 @@ fn write_solaris_x86<W: Write + Seek>(
     disk_size: u64,
     geometry: Geometry,
 ) -> Result<()> {
-    use crate::partition::solaris_x86::{
+    use part_tables::solaris_x86::{
         build_label, write_label, SolarisLabelSpec, MBR_TYPE_SUNIXOS, V_UNMNT,
     };
-    use crate::partition::sun::{tag_from_text, SUN_TAG_WHOLE_DISK};
+    use part_tables::sun::{tag_from_text, SUN_TAG_WHOLE_DISK};
 
     let spc = u64::from(geometry.heads) * u64::from(geometry.sectors_per_track);
     if spc == 0 {
@@ -1171,7 +1170,7 @@ fn put_bstr(buf: &mut [u8; 512], long_idx: usize, max_chars: usize, text: &str) 
 
 /// X68000 table at byte 2048; `start`/`length` count logical sectors.
 fn write_x68k<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
-    use crate::partition::x68k::{X68kEntry, X68kPartitionTable, X68K_TABLE_OFFSET};
+    use part_tables::x68k::{X68kEntry, X68kPartitionTable, X68K_TABLE_OFFSET};
 
     let entries = placed
         .iter()
@@ -1226,7 +1225,7 @@ pub fn write_rdb_filesystems<W: Read + Write + Seek>(
     out: &mut W,
     filesystems: &[(u32, Vec<u8>)],
 ) -> Result<()> {
-    use crate::partition::rdb::{stamp_checksum, stamp_checksum_longs, NO_BLOCK};
+    use part_tables::rdb::{stamp_checksum, stamp_checksum_longs, NO_BLOCK};
 
     if filesystems.is_empty() {
         return Ok(());
@@ -1235,7 +1234,7 @@ pub fn write_rdb_filesystems<W: Read + Write + Seek>(
     out.seek(SeekFrom::Start(0))?;
     out.read_exact(&mut rdsk)
         .context("reading the RDSK block")?;
-    if &rdsk[0..4] != crate::partition::rdb::RDSK_SIGNATURE {
+    if &rdsk[0..4] != part_tables::rdb::RDSK_SIGNATURE {
         bail!("not an RDB disk: no RDSK at block 0");
     }
     // The reserved area the RDSK itself declares; anything we add lives there.
@@ -1463,7 +1462,7 @@ mod tests {
     /// put the slots on the blocks that disk uses, or it is not that shape.
     #[test]
     fn sgi_dklabel_reproduces_the_reference_iris_layout() {
-        use crate::partition::sgi_dklabel::SgiDiskLabel;
+        use part_tables::sgi_dklabel::SgiDiskLabel;
 
         let geom = Geometry {
             heads: 7,
@@ -1512,7 +1511,7 @@ mod tests {
     /// for would make slot 0 read back as swap and lose its type byte.
     #[test]
     fn sgi_dklabel_without_a_swap_slot_names_no_slot_as_swap() {
-        use crate::partition::sgi_dklabel::SgiDiskLabel;
+        use part_tables::sgi_dklabel::SgiDiskLabel;
 
         let geom = Geometry {
             heads: 4,
@@ -1541,7 +1540,7 @@ mod tests {
         assert_eq!(label.rootnotboot, 1, "root is a different slot from boot");
         assert_eq!(label.rootfs, 1);
         assert!(
-            (label.swapfs as usize) >= crate::partition::sgi_dklabel::SGI_DKLABEL_NFS,
+            (label.swapfs as usize) >= part_tables::sgi_dklabel::SGI_DKLABEL_NFS,
             "d_swapfs must not name a real slot when there is no swap slice",
         );
         assert!((0..2).all(|i| label.slot_role(i) != "swap"));
@@ -1551,7 +1550,7 @@ mod tests {
     /// with a part-cylinder tail must stop short rather than pass `d_altstart`.
     #[test]
     fn sgi_dklabel_rest_slot_stops_at_the_last_whole_cylinder() {
-        use crate::partition::sgi_dklabel::SgiDiskLabel;
+        use part_tables::sgi_dklabel::SgiDiskLabel;
 
         let geom = Geometry {
             heads: 7,
@@ -1708,7 +1707,7 @@ mod tests {
     /// slice 2 has to carry the whole-disk alias every Sun tool looks for.
     #[test]
     fn sun_label_checksums_and_reserves_the_backup_slice() {
-        use crate::partition::sun::{SunDiskLabel, SUN_TAG_WHOLE_DISK};
+        use part_tables::sun::{SunDiskLabel, SUN_TAG_WHOLE_DISK};
 
         let disk = 200 * 1024 * 1024;
         let geometry = Geometry::default();
@@ -1753,7 +1752,7 @@ mod tests {
     /// entries — and GEM cannot describe a partition over 16 MiB.
     #[test]
     fn ahdi_stamps_its_checksum_and_promotes_oversized_gem_to_bgm() {
-        use crate::partition::atari::{AhdiPartitionKind, AhdiTable};
+        use part_tables::atari::{AhdiPartitionKind, AhdiTable};
 
         let disk = 64 * 1024 * 1024;
         let specs = vec![
@@ -1802,7 +1801,7 @@ mod tests {
 
     #[test]
     fn sgi_type_keywords_map_to_discriminants() {
-        use crate::partition::sgi::SgiPartitionType;
+        use part_tables::sgi::SgiPartitionType;
         assert_eq!(sgi_type_raw("EFS"), SgiPartitionType::Efs.as_u32());
         assert_eq!(sgi_type_raw("raw"), SgiPartitionType::Raw.as_u32());
         assert_eq!(sgi_type_raw("xfslog"), SgiPartitionType::XfsLog.as_u32());
@@ -1857,7 +1856,7 @@ mod tests {
     /// at half its intended offset.
     #[test]
     fn next_partitions_are_measured_from_the_front_porch() {
-        use crate::partition::next::{NextDiskLabel, LABEL_SPAN};
+        use part_tables::next::{NextDiskLabel, LABEL_SPAN};
         use std::io::Read;
 
         let disk = 660 * 1024 * 1024;

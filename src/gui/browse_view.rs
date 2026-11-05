@@ -2,81 +2,77 @@
 // info, reader, ctx, logging, etc. — multi-arg by design.
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
-use rusty_backup::fs::entry::{EntryType, FileEntry};
-use rusty_backup::fs::filesystem::Filesystem;
-use rusty_backup::fs::fork_export;
-use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
-use rusty_backup::fs::zstd_stream::ZstdStreamCache;
-use rusty_backup::macarchive::detect::{detect_mac_archive, MacArchiveKind};
-use rusty_backup::macarchive::extract as mac_extract;
-use rusty_backup::macarchive::stuffit::{
-    build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
+use rusty_backup::controller::app::{CommanderRecent, UserConfig};
+use rusty_backup::controller::commander::{
+    format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveUse,
+    BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DiscSource, DisplayRow,
+    EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _,
+    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
+    PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot, TarChoice, TextShape,
+    UnsavedChoice, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
 };
-use rusty_backup::model::archive_edit::{self, ArchiveEditContext, ArchiveEditProgress};
-use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
-use rusty_backup::model::edit_queue::{self, EditQueue, StagedEdit};
-use rusty_backup::model::status::ExtractionProgress;
-use rusty_backup::partition;
-use rusty_backup::rbformats::chd_edit::{
-    self, is_compressed_chd, make_backup_copy, ChdEditSession,
-};
+use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
+use rusty_backup::controller::{Controller as _, Effect};
 
+use super::commander::pane::PaneView;
+use super::commander::DetailEditors;
+use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
-use super::metadata_editor::{
-    self, ExtPermsEditorState, HfsTypeEditorState, OwnerEditorState, ProdosTypeEditorState,
-    XattrEditorState,
-};
-
-/// Smallest file offered "Open as Disk Image": below this nothing holds a partitioned volume.
-const MIN_NESTED_IMAGE_BYTES: u64 = 16 * 1024;
-/// Free space kept spare beyond the image size when copying it out for "Open as Disk Image".
-const NESTED_FREE_MARGIN: u64 = 64 * 1024 * 1024;
+use super::metadata_editor;
+use super::picker;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
-/// Upper bound on bytes read off the disk image to sniff whether the
-/// selected file is a Mac archive (drives the "Save as Mac archive..." /
-/// "Browse archive..." button visibility). The magics for SIT / SIT5 /
-/// SEA sit at or near the start, and BinHex's banner is at byte 0, so a
-/// generous prefix is enough to classify every archive we'd practically
-/// meet on a vintage Mac volume while keeping the per-selection read
-/// bounded. The click handlers still read the full file authoritatively.
-const ARCHIVE_SNIFF_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
-
-/// Beyond this many bytes, the tree-view popup's `TextEdit::multiline` widget
-/// becomes unresponsive (egui re-lays the entire text every frame). We route
-/// past the threshold straight to a save-to-file dialog with a "show anyway"
-/// escape hatch. 1 MiB ~= 30–50k lines depending on indentation.
+/// Past this the tree popup's multiline widget stalls (egui lays the whole text out every
+/// frame), so a larger listing offers Save first.
 const TREE_INLINE_RENDER_LIMIT: usize = 1024 * 1024;
+
+/// The browser pane behind the view: the Inspect profile (style remembered as `inspect`), or the
+/// Optical tab's disc browser (`optical`).
+fn new_controller(optical: bool) -> CommanderController {
+    let services = PaneServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(super::ui_logger::EguiWake),
+        recent: Box::new(CommanderRecent(UserConfig)),
+    };
+    let keymap = super::commander::load_keymap();
+    if optical {
+        return rusty_backup::controller::optical::disc_browser(services, keymap);
+    }
+    CommanderController::single(services, keymap, PaneProfile::inspect())
+}
 
 /// Filesystem browser view for inspecting partition contents.
 pub struct BrowseView {
-    /// Root entry of the filesystem.
-    root: Option<FileEntry>,
-    /// Cached directory listings keyed by path.
-    directory_cache: HashMap<String, Vec<FileEntry>>,
-    /// Which directories are expanded in the tree.
-    expanded_paths: HashSet<String>,
-    /// Currently selected file entry.
+    /// The Optical tab's disc browser (read-only, its own header), not the Inspect browse view.
+    optical: bool,
+    /// Effects from a host call made outside `show`, run on the next frame.
+    pending_fx: Vec<Effect>,
+    /// The modes' volume generation the panel last followed.
+    generation_seen: u64,
+    /// The browser pane (profile `inspect`): source, listing, tree, cursor, selection, queue.
+    ctl: CommanderController,
+    /// Pickers, confirmations and prompts the controller asks for.
+    effects: EffectHost,
+    /// The "Add File" picker on screen.
+    add_files: Option<picker::Pending<Option<Vec<PathBuf>>>>,
+    /// Draws the flat list and folder-tree styles, as Commander does.
+    pane_view: PaneView,
+    /// The tree was clicked last, so bound keys go to the pane.
+    keys_active: bool,
+    /// A key moved the cursor, so the tree scrolls it into view.
+    scroll_cursor: bool,
+    /// The cursor row `selected_entry` was last taken from.
+    cursor_seen: Option<String>,
+    /// The user moved the cursor since the volume (re)opened; until then it selects nothing.
+    cursor_armed: bool,
+    /// The entry the content panel shows: the cursor row, or the root when its row is clicked.
     selected_entry: Option<FileEntry>,
-    /// Checkbox-marked entries for multi-select export (independent of the
-    /// single-click `selected_entry` preview), keyed by path. The entry is stored
-    /// so export can read it without re-walking the tree. Fed to the shared
-    /// `export_selection` engine by the "Export selected..." bar.
-    marked: std::collections::BTreeMap<String, FileEntry>,
-    /// Edits applied into a compressed CHD's diff that no flatten has
-    /// committed yet; closing on an empty queue deleted that diff silently.
-    chd_diff_dirty: bool,
-    /// Chosen output format for the "Export selected" pulldown.
-    export_format: rusty_backup::fs::export_selection::ExportFormat,
-    /// Cached content of the selected file.
-    content: Option<FileContent>,
+    /// The side panel's preview and editor widgets, rebuilt when its detail changes.
+    side_ed: DetailEditors,
     /// View mode for file content.
     #[allow(dead_code)]
     view_mode: ViewMode,
@@ -84,65 +80,30 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
-    /// Cached uid/gid -> name map from the image's own `/etc/passwd` +
-    /// `/etc/group`, built lazily the first time File Info shows an owner and
-    /// reused thereafter. `None` = not yet built; a built-but-empty map (a
-    /// non-Linux image) is still cached so we don't retry every frame.
-    id_names: Option<rusty_backup::fs::id_names::IdNameMap>,
     /// Volume total / used bytes (cached at open) for the header free-space
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
     volume_used: u64,
-    /// "Full scan" toggle for the synthetic carve view: when off (default)
-    /// only the first `carve::DEFAULT_SCAN_LIMIT` bytes are scanned for
-    /// recoverable text; when on the whole image is scanned. Only shown for
-    /// carve filesystems. Flipping it re-opens the volume.
-    carve_full_scan: bool,
     volume_label: String,
     /// Optional prefix prepended to the volume label in the header (e.g. the
     /// Amiga drive name "DH0"). Set by the caller via `set_label_prefix`
     /// right after `open` so the header reads "Label: DH0 - Workbench". When
     /// the volume label is empty the prefix is shown on its own.
     label_prefix: String,
-    /// Where to open the filesystem from (path / preopen handle / caches).
-    /// `Clone` so background workers can be handed a session value.
-    session: BrowseSession,
     /// Whether the browser is active (filesystem loaded).
     active: bool,
     /// Resource fork handling mode (HFS/HFS+ only).
     resource_fork_mode: ResourceForkMode,
     /// How to encode ProDOS type/aux on extract (ProDOS only).
     prodos_export_mode: ProdosExportMode,
-    /// List deleted entries the filesystem can still read (QNX 2).
-    show_deleted: bool,
     /// Convert RS line separators in text files to LF on extract (QNX 2).
     rs_to_lf: bool,
-    /// Active extraction progress (shared with background thread).
-    extraction_progress: Option<Arc<Mutex<ExtractionProgress>>>,
+    /// An extraction runs as the screen's copy job; its status line becomes the result.
+    extracting: bool,
     /// Message to show after extraction completes.
     extraction_result: Option<String>,
-    /// Temp dir an "Open as Disk Image" extraction is writing into, until it finishes.
-    nested_open: Option<tempfile::TempDir>,
-    /// A finished "Open as Disk Image" extraction, for the Inspect tab to load.
-    nested_ready: Option<(PathBuf, tempfile::TempDir)>,
-    /// Whether edit mode is enabled (allows adding/deleting files).
-    edit_mode: bool,
-    /// Whether editing is possible for this source (not Clonezilla/streaming).
-    edit_supported: bool,
     /// Status message from last edit operation.
     edit_result: Option<String>,
-    /// Pending "new folder" name input.
-    new_folder_name: String,
-    /// Whether the "new folder" dialog is open.
-    show_new_folder_dialog: bool,
-    /// Entry pending deletion (for confirmation dialog).
-    pending_delete: Option<(FileEntry, FileEntry, bool)>, // (parent, entry, recursive)
-    /// Context for backup archive editing (decompress → edit → recompress).
-    archive_edit_ctx: Option<ArchiveEditContext>,
-    /// Progress for archive edit background operations.
-    archive_edit_progress: Option<Arc<Mutex<ArchiveEditProgress>>>,
-    /// Temp file path while editing an archive (cleaned up on close/save).
-    archive_temp_path: Option<PathBuf>,
     /// Blessed (bootable) system folder info (HFS/HFS+ only).
     blessed_folder: Option<(u64, String)>,
     /// Whether the open HFS volume has boot blocks at sector 0 (`'LK'`).
@@ -150,20 +111,12 @@ pub struct BrowseView {
     /// edit mode where the backing bytes are raw. Drives the "Boot blocks:"
     /// status line and the "Boot Blocks…" button's hint.
     boot_blocks_present: Option<bool>,
-    /// Last filesystem check result (for popup display).
-    fsck_result: Option<rusty_backup::fs::FsckResult>,
-    /// Whether to show the fsck results popup.
-    show_fsck_popup: bool,
-    /// CHD info popup text. `Some` while the popup is open.
-    chd_info_text: Option<String>,
     /// HFS+ journal history viewer. `Some` while the window is open.
     journal_view: Option<super::journal_view::JournalView>,
     /// Whether to show debug-level fsck messages.
     show_fsck_debug: bool,
-    /// Whether to show the repair confirmation dialog.
-    show_repair_confirm: bool,
-    /// Result of a repair operation.
-    repair_report: Option<rusty_backup::fs::RepairReport>,
+    /// The screen's export of the marked rows is running; its status line is the result.
+    exporting: bool,
     /// Cached tree-view text output.
     tree_text: Option<String>,
     /// Whether to show the tree-view popup.
@@ -176,226 +129,11 @@ pub struct BrowseView {
     /// laid-out text every frame and grinds to a halt at multi-MB sizes
     /// (originally hit on a 128 GB Amiga RDB partition).
     show_tree_large_dialog: bool,
-    /// Set while a worker thread is running `format_tree`. The thread takes
-    /// ownership of the cached filesystem; we poll the status each frame and
-    /// hand the fs back to `cached_fs` once the walk completes.
-    pending_tree: Option<Arc<Mutex<TreeStatus>>>,
-    /// Queued edit operations awaiting "Apply Edits".
-    staged_edits: EditQueue,
-    /// Free space of the editable volume: None = not probed, Some(None) = unavailable.
-    edit_free_space: Option<Option<u64>>,
-    /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
-    /// a SquashFS volume and choosing a ceiling. See
-    /// [`super::squashfs_budget_dialog`].
-    squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
-    /// Whether to show the "unsaved changes" confirmation dialog.
-    show_unsaved_dialog: bool,
-    /// Staged additions whose destination already exists, awaiting one review
-    /// before anything is written: `(full path, name, decision)`.
-    conflict_review: Option<Vec<(String, String, rusty_backup::fs::replace::OnConflict)>>,
     /// The text editor window, when open.
     text_editor: Option<GuiTextEditor>,
-    /// When true, a successful Discard/Apply from the unsaved dialog should
-    /// fully close the browse view rather than just leaving edit mode. Set by
-    /// the in-view Close intercept when staged edits force the dialog first.
-    pending_close: bool,
-    /// Inline ProDOS type/aux editor state, keyed by entry path. Reset when
-    /// the selection changes.
-    prodos_type_editor: Option<ProdosTypeEditorState>,
-    /// Inline HFS type/creator editor state, keyed by entry path. The fields
-    /// are kept as 4-char-clamped strings so the user can type freely; on
-    /// "Set" we encode and stage. `None` means the editor is closed for that
-    /// entry; on first open we seed from current FInfo or the dictionary.
-    hfs_type_editor: Option<HfsTypeEditorState>,
-    /// Inline Unix permissions / owner / xattr editor state, keyed by entry
-    /// path. Reset when the selection changes.
-    ext_perms_editor: Option<ExtPermsEditorState>,
-    owner_editor: Option<OwnerEditorState>,
-    xattr_editor: Option<XattrEditorState>,
-    /// On-disk xattrs of the selected entry, cached by path (read once per
-    /// selection on an xattr-bearing filesystem). Rebuilt when the selection
-    /// changes; `None` = not yet read for this selection.
-    xattr_cache: Option<(String, Vec<rusty_backup::fs::xattr::Xattr>)>,
-    /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
-    /// `show_staging_errors` drives a modal dialog listing each failure.
-    staging_errors: Vec<(PathBuf, String)>,
-    /// Whether the staging-errors modal dialog is open.
-    show_staging_errors: bool,
-    /// Extraction parameters awaiting overwrite confirmation.
-    pending_extraction: Option<PendingExtraction>,
-    /// Live CHD edit-mode state. Present while editing a CHD via
-    /// [`chd_edit::ChdEditSession`] (diff-against-parent for compressed,
-    /// in-place for uncompressed). The `Arc<Mutex<ChdEditSession>>` itself
-    /// lives on `self.session.chd_edit_session`; this struct just holds the
-    /// paths needed to flatten / clean up on exit.
-    chd_edit: Option<ChdEditState>,
-    /// Background flatten progress (compressed CHD apply): merges the diff
-    /// into a fresh compressed CHD that overwrites the parent.
-    chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
-    /// Background tar export progress ("Export to .tar.gz...").
-    tar_export_progress: Option<Arc<Mutex<TarExportProgress>>>,
-    /// A tar import awaiting the user's confirmation (preflight found
-    /// content this filesystem can't represent).
-    pending_tar_import: Option<PendingTarImport>,
-    /// A tar archive dropped/added as a host file, awaiting the user's
-    /// choice: import its contents, or add the archive as a plain file.
-    pending_tar_add: Option<PathBuf>,
-    /// When the CHD being edited is the body of a single-file-chd backup,
-    /// this carries the backup folder path so that on flatten-success we
-    /// can refresh `metadata.json` (per-partition checksums + container
-    /// SHA-1). `None` for plain CHD images that aren't part of a backup.
-    single_file_chd_backup_folder: Option<PathBuf>,
 
-    /// Set while the worker spawned by `BrowseSession::spawn_open` is loading
-    /// the filesystem and root listing. Polled each frame in `show()`; once
-    /// the worker reports `finished`, its results are drained into this view's
-    /// state. Showing a spinner + phase here is much friendlier than freezing
-    /// the UI for the seconds a 500k-file HFS+ open can take.
-    pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
-
-    /// Whether the container requires a password (detected on open failure).
-    needs_password: bool,
     /// User's password input text for the password prompt.
     password_input: String,
-
-    /// One open `Filesystem` instance reused across read-only operations
-    /// (directory listings, file previews, fsck, tree dumps). Re-opening for
-    /// every operation forces a re-read of the entire catalog — fine for
-    /// FAT, slow for HFS+ on a heavily-used volume. Read-only paths borrow
-    /// this via `take_or_open_fs` and return it via `return_fs`. Any code
-    /// that mutates the volume (sync_metadata, archive recompress, edit
-    /// apply) calls `invalidate_cached_fs` so the next read sees disk truth.
-    cached_fs: Option<Box<dyn Filesystem>>,
-    /// Bumped on every invalidation; a worker's handle is only cached if it matches.
-    fs_generation: u64,
-    /// `fs_generation` when the pending tree walk borrowed its filesystem.
-    pending_tree_generation: u64,
-
-    /// Queue of Mac archives (`.hqx` / `.sit` / `.sea` / `.sit.hqx` /
-    /// `.sea.hqx`) that the user picked via Add File... — each waits on a
-    /// user choice in the Workflow A modal (Convert / Expand / Add as-is).
-    /// Drained by [`render_archive_import_dialog`] one item at a time.
-    pending_archive_imports: Vec<PendingArchiveImport>,
-    /// Holds extracted archive payloads on the host so the staged
-    /// `AddFile` paths still resolve at Apply time. Created lazily on the
-    /// first Convert/Expand action; dropped on Discard / browse close.
-    archive_import_tempdir: Option<tempfile::TempDir>,
-    /// Workflow C state — the user clicked "Save as Mac archive..." on a
-    /// file inside the disk image that sniffed as a Mac archive, and the
-    /// modal is open asking what to do with it.
-    pending_archive_extract: Option<PendingArchiveExtract>,
-    /// Workflow E state — a floating "Archive viewer" window the user
-    /// opened with "Browse archive..." on a Mac archive file inside the
-    /// disk image. Read-only: shows entries + a per-entry checkbox + the
-    /// fork-format dropdown + Extract All / Extract Selected, mirroring
-    /// the standalone Archives tab shape.
-    mac_archive_window: Option<MacArchiveWindow>,
-    /// Cached Mac-archive sniff for the current selection, keyed by path.
-    /// `Some((path, Some(kind)))` means the file at `path` is a Mac
-    /// archive of `kind`; `Some((path, None))` means it was sniffed and
-    /// is not one. Gates the "Save as Mac archive..." / "Browse
-    /// archive..." buttons so they only appear for actual archives rather
-    /// than showing always and erroring on click. Recomputed only when
-    /// the selected path changes — see [`Self::ensure_archive_sniff`].
-    archive_sniff: Option<(String, Option<MacArchiveKind>)>,
-}
-
-/// Workflow C state: the selected entry on the disk image is a Mac
-/// archive and the user clicked "Save as Mac archive...". The raw
-/// bytes are kept around so "Save as-is" doesn't need to re-read; the
-/// parsed archive + ready-for-extract bytes drive the "Decode and
-/// save" path. `fork_format` is the user-editable container choice for
-/// the decode path (BinHex / MacBinary / AppleDouble / Raw).
-struct PendingArchiveExtract {
-    entry_name: String,
-    kind: MacArchiveKind,
-    raw_bytes: Vec<u8>,
-    extract_bytes: Vec<u8>,
-    archive: rusty_backup::macarchive::stuffit::StuffItArchive,
-    fork_format: mac_extract::ForkFormat,
-}
-
-/// Workflow E state — the floating "Archive viewer" window opened on a
-/// Mac archive that lives inside the disk image. Read-only browse +
-/// extract; mirrors the standalone Archives tab shape so the UX is
-/// consistent. Per-entry `selected` checkboxes drive "Extract
-/// Selected".
-struct MacArchiveWindow {
-    entry_name: String,
-    kind: MacArchiveKind,
-    bytes: Vec<u8>,
-    archive: rusty_backup::macarchive::stuffit::StuffItArchive,
-    selected: Vec<bool>,
-    fork_format: mac_extract::ForkFormat,
-}
-
-/// One Mac archive the user picked via Add File..., awaiting their
-/// Convert/Expand/Add-as-is choice in the import modal (Workflow A).
-/// The archive's bytes are read up-front so the modal can show the
-/// correct three-option set (which depends on whether the file is
-/// HQX-wrapping-a-SIT vs a plain SIT, etc.).
-#[derive(Clone)]
-struct PendingArchiveImport {
-    /// The original host path the user picked.
-    host_path: PathBuf,
-    /// Where on the disk image to land the result.
-    parent: FileEntry,
-    /// Sniffed archive kind — drives modal copy + which buttons appear.
-    kind: MacArchiveKind,
-    /// Raw bytes of the picked file, kept around so the action handler
-    /// doesn't have to re-read after the user clicks.
-    raw: Vec<u8>,
-}
-
-/// State carried for the duration of a CHD edit-mode session.
-struct ChdEditState {
-    /// Original CHD file the user is editing (and which `flatten_to_parent`
-    /// will overwrite on exit).
-    parent_path: PathBuf,
-    /// Companion diff file. `Some` for compressed CHDs; `None` when editing
-    /// an uncompressed CHD in place.
-    diff_path: Option<PathBuf>,
-}
-
-/// Background flatten progress for compressed CHD edit-apply. Mirrors
-/// [`ArchiveEditProgress`] but lives in the GUI crate so the worker thread
-/// can update it without pulling chd_edit into model/.
-struct ChdFlattenProgress {
-    current: u64,
-    total: u64,
-    finished: bool,
-    error: Option<String>,
-    cancel_requested: bool,
-}
-
-/// Background progress for "Export to .tar.gz..." — archiving the whole
-/// volume to a tar stream on a worker thread.
-struct TarExportProgress {
-    files: u64,
-    dirs: u64,
-    symlinks: u64,
-    bytes: u64,
-    finished: bool,
-    error: Option<String>,
-    out_path: std::path::PathBuf,
-}
-
-/// A tar import awaiting user confirmation because the preflight found
-/// content the target filesystem can't represent (dropped symlinks, invalid
-/// names, …). Cleared when the user confirms or cancels the modal.
-#[derive(Clone)]
-struct PendingTarImport {
-    archive_path: std::path::PathBuf,
-    preflight: rusty_backup::fs::tar_import::TarImportPreflight,
-}
-
-/// Captured state from `start_extraction` so the extraction can resume after
-/// the user answers the overwrite confirmation dialog.
-struct PendingExtraction {
-    entry: FileEntry,
-    dest: PathBuf,
-    /// Path(s) at `dest` that already exist and would be replaced.
-    conflicts: Vec<PathBuf>,
 }
 
 /// How to encode ProDOS file type/aux when extracting files to a host
@@ -431,103 +169,46 @@ enum ViewMode {
 impl Default for BrowseView {
     fn default() -> Self {
         Self {
-            root: None,
-            directory_cache: HashMap::new(),
-            expanded_paths: HashSet::new(),
+            optical: false,
+            pending_fx: Vec::new(),
+            generation_seen: 0,
+            ctl: new_controller(false),
+            effects: EffectHost::default(),
+            add_files: None,
+            pane_view: PaneView::new(Side::Left),
+            keys_active: false,
+            scroll_cursor: false,
+            cursor_seen: None,
+            cursor_armed: false,
             selected_entry: None,
-            marked: std::collections::BTreeMap::new(),
-            chd_diff_dirty: false,
-            export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
-            content: None,
+            side_ed: DetailEditors::default(),
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
-            id_names: None,
             volume_total: 0,
             volume_used: 0,
-            carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
             volume_label: String::new(),
             label_prefix: String::new(),
-            session: BrowseSession::new(),
             active: false,
             resource_fork_mode: ResourceForkMode::AppleDouble,
             prodos_export_mode: ProdosExportMode::WithTypeSuffix,
-            show_deleted: false,
             rs_to_lf: false,
-            extraction_progress: None,
+            extracting: false,
             extraction_result: None,
-            nested_open: None,
-            nested_ready: None,
-            edit_mode: false,
-            edit_supported: false,
             edit_result: None,
-            new_folder_name: String::new(),
-            show_new_folder_dialog: false,
-            pending_delete: None,
-            archive_edit_ctx: None,
-            archive_edit_progress: None,
-            archive_temp_path: None,
             blessed_folder: None,
             boot_blocks_present: None,
-            fsck_result: None,
-            show_fsck_popup: false,
-            chd_info_text: None,
             journal_view: None,
             show_fsck_debug: false,
-            show_repair_confirm: false,
-            repair_report: None,
+            exporting: false,
             tree_text: None,
             show_tree_popup: false,
             tree_show_ids: false,
             show_tree_large_dialog: false,
-            staged_edits: EditQueue::new(),
-            edit_free_space: None,
-            show_unsaved_dialog: false,
-            conflict_review: None,
             text_editor: None,
-            pending_close: false,
-            prodos_type_editor: None,
-            hfs_type_editor: None,
-            ext_perms_editor: None,
-            owner_editor: None,
-            xattr_editor: None,
-            xattr_cache: None,
-            staging_errors: Vec::new(),
-            show_staging_errors: false,
-            pending_extraction: None,
-            chd_edit: None,
-            chd_flatten_progress: None,
-            squashfs_budget_dialog: None,
-            tar_export_progress: None,
-            pending_tar_import: None,
-            pending_tar_add: None,
-            single_file_chd_backup_folder: None,
-            pending_open: None,
-            needs_password: false,
             password_input: String::new(),
-            cached_fs: None,
-            fs_generation: 0,
-            pending_tree_generation: 0,
-            pending_tree: None,
-            pending_archive_imports: Vec::new(),
-            archive_import_tempdir: None,
-            pending_archive_extract: None,
-            mac_archive_window: None,
-            archive_sniff: None,
         }
     }
-}
-
-/// Shared state between the GUI and the worker thread that runs
-/// `format_tree`. The walk can take seconds on large HFS+ volumes, so it
-/// runs off the UI thread and the GUI polls this struct each frame. The
-/// `fs` slot lets us hand the filesystem back to `cached_fs` after the
-/// walk so subsequent reads don't re-open.
-pub struct TreeStatus {
-    pub finished: bool,
-    pub text: Option<String>,
-    pub error: Option<String>,
-    pub fs: Option<Box<dyn Filesystem>>,
 }
 
 /// A text file open for editing in the GUI.
@@ -537,200 +218,117 @@ pub struct TreeStatus {
 /// open and re-encoded to its own encoding and endings on save, exactly as the
 /// CLI and TUI editors do, via the shared `model::text_edit`.
 struct GuiTextEditor {
-    /// Path inside the image, used as the write target.
-    path: String,
     name: String,
+    /// The folder holding it, where the save is staged.
+    folder: String,
     /// The editable buffer: UTF-8 with LF endings.
     text: String,
     /// What the file was, and what it will be written back as.
-    shape: rusty_backup::model::text_edit::TextShape,
+    shape: TextShape,
     /// The endings it was found with, so a conversion can be shown as one.
-    original_ending: rusty_backup::model::text_edit::LineEnding,
+    original_ending: LineEnding,
     dirty: bool,
     status: Option<String>,
 }
 
 impl BrowseView {
-    /// Initialize the browser for a partition within a source image/device.
-    ///
-    /// `preopen_file` — if provided, this already-elevated file handle is used
-    /// for all filesystem reads instead of re-opening `source_path`.  Pass
-    /// `Some(file)` when browsing a raw device on macOS to avoid a second auth
-    /// prompt; pass `None` for backup files / image files.
-    /// Open the browser from a fully-built [`BrowseSession`]. This is the
-    /// low-level seam every other opener funnels through: it clears prior
-    /// browse state, installs the session, and spawns the async open + initial
-    /// root listing on a worker thread (`show()` drains the result each frame).
-    ///
-    /// It deliberately does **not** decide edit policy — `edit_supported`, the
-    /// WOZ/zstd `archive_edit_ctx`, the CHD-edit flow, and the single-file-chd
-    /// backup folder are layered by the caller after this returns (see `open`,
-    /// and the Inspect tab's resolver-driven routing).
+    /// The Optical tab's disc browser: the same view over `PaneProfile::optical`.
+    pub fn optical() -> Self {
+        BrowseView {
+            optical: true,
+            ctl: new_controller(true),
+            ..Self::default()
+        }
+    }
+
+    /// Browse a disc image or the disc in a drive (the Optical tab's Browse Contents).
+    pub fn open_disc(&mut self, src: DiscSource) {
+        self.close();
+        self.active = true;
+        let fx = self.ctl.open_disc(src);
+        self.pending_fx.extend(fx);
+    }
+
+    /// The label of a running extract, source-level job, export, apply or volume tool, if any.
+    pub fn running_job(&self) -> Option<&'static str> {
+        let pane = self.ctl.pane(Side::Left);
+        if self.extracting && self.ctl.copy_job().is_some() {
+            Some("Extract")
+        } else if self.ctl.mode_working().is_some() {
+            Some("Edit Mode")
+        } else if self.exporting && self.ctl.copy_job().is_some() {
+            Some("Export")
+        } else if pane.checking().is_some() || pane.applying().is_some() {
+            Some("Apply edits")
+        } else if pane.archive_working().is_some() {
+            Some("Archive")
+        } else if pane.tool_working().is_some() {
+            Some("Volume tool")
+        } else {
+            None
+        }
+    }
+
+    /// Open the browser on a session the Inspect tab built; it starts read-only.
     pub fn open_with_session(&mut self, session: BrowseSession) {
         self.close();
-        self.session = session;
+        let label = session
+            .source_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "partition".into());
         self.active = true;
-        self.pending_open = Some(self.session.spawn_open());
+        let fx = self.ctl.open_inspect(session, &label);
+        self.pending_fx.extend(fx);
     }
 
-    pub fn open(
-        &mut self,
-        source_path: PathBuf,
-        partition_offset: u64,
-        partition_type: u8,
-        partition_type_string: Option<String>,
-        preopen_file: Option<File>,
-    ) {
-        let session = BrowseSession {
-            source_path: Some(source_path.clone()),
-            partition_offset,
-            partition_type,
-            partition_type_string,
-            preopen_file: preopen_file.map(std::sync::Arc::new),
-            ..Default::default()
-        };
+    /// The pane's staged-edit queue.
+    fn queue(&self) -> &EditQueue {
+        &self.ctl.pane(Side::Left).queue
+    }
+
+    /// Open the partition the Inspect controller chose, with its edit flow and header extras.
+    pub fn open_request(&mut self, req: BrowseOpen) {
+        let BrowseOpen {
+            session,
+            edit,
+            label_prefix,
+            backup_folder,
+        } = req;
         self.open_with_session(session);
-
-        // Editing is supported for regular files (not Clonezilla/streaming).
-        self.edit_supported = true;
-
-        // WOZ images still go through the decompress→edit→recompress
-        // archive flow (no in-place / diff support). CHDs use the lighter
-        // chd_edit path: nothing to set up here — the edit-mode toggle
-        // calls `enter_chd_edit_mode` which opens a `ChdEditSession`
-        // (diff-against-parent for compressed, in-place for uncompressed).
-        let ext = source_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "woz" {
-            let original_size = rusty_backup::rbformats::woz::WozReader::open(&source_path)
-                .map(|r| r.len())
-                .unwrap_or(0);
-            log::info!(
-                "Container edit context set for {} ({} decoded bytes)",
-                source_path.display(),
-                original_size
-            );
-            self.archive_edit_ctx = Some(ArchiveEditContext {
-                archive_path: source_path.clone(),
-                compression_type: "woz".to_string(),
-                original_size,
-                compacted: false,
-                metadata_path: PathBuf::new(),
-                partition_index: 0,
-                checksum_type: String::new(),
-            });
+        match edit {
+            BrowseEdit::ReadOnly => {}
+            BrowseEdit::InPlace => self.ctl.inspect_edit_in_place(),
+            BrowseEdit::Archive(ctx) => self.ctl.inspect_edit_archive(ctx),
+        }
+        if let Some(prefix) = label_prefix {
+            self.label_prefix = prefix;
+        }
+        if let Some(folder) = backup_folder {
+            self.ctl.inspect_backup_folder(folder);
         }
     }
 
-    /// Open the browser using a partclone block cache (for Clonezilla images).
-    pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
-        self.open_with_session(BrowseSession {
-            partclone_cache: Some(cache),
-            partition_type,
-            partition_offset: 0,
-            ..Default::default()
-        });
-    }
-
-    /// Open the browser by streaming a native zstd-compressed partition image.
-    ///
-    /// The filesystem opens immediately via a `ZstdStreamReader` backed by a
-    /// 256 MB in-memory buffer.  Call `upgrade_to_seekable_cache` once the
-    /// background seekable cache is ready to enable full random access.
-    pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
-        let cache = match ZstdStreamCache::new(&path) {
-            Ok(c) => Arc::new(Mutex::new(c)),
-            Err(e) => {
-                self.close();
-                self.error = Some(format!("Cannot open zstd stream: {e}"));
-                self.active = true;
-                return;
-            }
-        };
-        // Open + initial root listing on a worker thread so the UI can paint
-        // a spinner while a slow first read (NAS, large HFS+ catalog) runs.
-        self.open_with_session(BrowseSession {
-            partition_type: ptype,
-            partition_type_string: ptype_str,
-            partition_offset: 0,
-            zstd_cache: Some(cache),
-            ..Default::default()
-        });
-    }
-
-    /// Set a label prefix shown alongside the volume label in the header.
-    /// Used to surface the Amiga drive name (e.g. "DH0") so users don't lose
-    /// track of which RDB partition they're browsing when several share the
-    /// same volume name (or none have one). Pass an empty string to clear.
-    pub fn set_label_prefix(&mut self, prefix: String) {
-        self.label_prefix = prefix;
-    }
-
-    /// Mark the open source as editable in place (no archive decompress flow).
-    /// `open` sets this for image/device sources; a resolver-built session
-    /// opened via [`open_with_session`](Self::open_with_session) starts
-    /// read-only, so the caller flips it on for raw / CHD backup partitions
-    /// (the edit-mode toggle then picks direct vs `chd_edit` by sniffing the
-    /// source). Compressed (zstd / woz) backups use
-    /// [`set_archive_edit_context`](Self::set_archive_edit_context) instead.
-    pub fn mark_edit_supported(&mut self) {
-        self.edit_supported = true;
-    }
-
-    /// Set up archive edit context so that toggling edit mode triggers
-    /// decompress → edit → recompress flow instead of direct editing.
-    pub fn set_archive_edit_context(
-        &mut self,
-        archive_path: PathBuf,
-        compression_type: String,
-        original_size: u64,
-        compacted: bool,
-        metadata_path: PathBuf,
-        partition_index: usize,
-        checksum_type: String,
-    ) {
-        self.archive_edit_ctx = Some(ArchiveEditContext {
-            archive_path,
-            compression_type,
-            original_size,
-            compacted,
-            metadata_path,
-            partition_index,
-            checksum_type,
-        });
-        self.edit_supported = true;
-    }
-
-    /// Mark the currently-open CHD as the body of a single-file-chd backup.
-    /// On a successful chd_edit flatten we'll refresh the backup's
-    /// `metadata.json` (per-partition SHA-256 + container SHA-1).
-    pub fn set_single_file_chd_backup_folder(&mut self, backup_folder: PathBuf) {
-        self.single_file_chd_backup_folder = Some(backup_folder);
-    }
-
-    /// (`zstd_cache` is `Some`).  The directory cache is preserved so the
-    /// user stays in the same place in the tree.
+    /// The streamed backup's seekable cache is ready; the tree stays where it is.
     pub fn upgrade_to_seekable_cache(&mut self, cache_path: PathBuf) {
-        if !self.active || self.session.zstd_cache.is_none() {
-            return;
+        if self.active {
+            let act = CommanderAction::Mode(ModeAction::UpgradeSeekable(cache_path));
+            let fx = self.ctl.apply(act);
+            self.pending_fx.extend(fx);
         }
-        self.session.source_path = Some(cache_path);
-        self.session.zstd_cache = None;
     }
 
     pub fn close(&mut self) {
-        self.root = None;
-        self.edit_free_space = None;
-        self.directory_cache.clear();
-        self.expanded_paths.clear();
+        // The old pane's readers go before its CHD diff or archive temp is removed.
+        std::mem::replace(&mut self.ctl, new_controller(self.optical)).close_inspect();
+        self.pending_fx.clear();
+        self.effects = EffectHost::default();
+        self.add_files = None;
+        self.keys_active = false;
+        self.cursor_seen = None;
         self.selected_entry = None;
-        self.marked.clear();
-        self.content = None;
-        self.id_names = None;
-        self.xattr_cache = None;
+        self.side_ed = DetailEditors::default();
         self.error = None;
         self.active = false;
         self.fs_type.clear();
@@ -738,59 +336,21 @@ impl BrowseView {
         self.volume_used = 0;
         self.volume_label.clear();
         self.label_prefix.clear();
-        self.session = BrowseSession::new();
-        self.extraction_progress = None;
+        self.extracting = false;
         self.extraction_result = None;
-        self.edit_mode = false;
-        self.edit_supported = false;
         self.edit_result = None;
-        self.new_folder_name.clear();
-        self.show_new_folder_dialog = false;
-        self.pending_delete = None;
         self.blessed_folder = None;
-        self.fsck_result = None;
-        self.show_fsck_popup = false;
         self.journal_view = None;
-        self.show_repair_confirm = false;
-        self.repair_report = None;
         self.tree_text = None;
         self.show_tree_popup = false;
         self.show_tree_large_dialog = false;
         self.tree_show_ids = false;
-        self.pending_tree = None;
-        self.staged_edits.clear();
-        self.show_unsaved_dialog = false;
-        self.pending_close = false;
-        self.pending_archive_imports.clear();
-        self.archive_import_tempdir = None;
-        self.pending_archive_extract = None;
-        self.mac_archive_window = None;
-        self.archive_sniff = None;
-        // Detach any in-flight open worker. The thread keeps running but its
-        // result will be dropped when the Arc dies on completion.
-        self.pending_open = None;
-        self.needs_password = false;
         self.password_input.clear();
-        self.cached_fs = None;
-        // Clean up archive temp file if present
-        if let Some(temp) = self.archive_temp_path.take() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        self.archive_edit_ctx = None;
-        self.archive_edit_progress = None;
-        // Drop any live CHD edit session and remove its diff. The parent
-        // CHD is left untouched; user's `.chd_backup` is preserved.
-        self.discard_chd_edit_session();
-        self.chd_flatten_progress = None;
-        self.tar_export_progress = None;
-        self.pending_tar_import = None;
-        self.pending_tar_add = None;
-        self.single_file_chd_backup_folder = None;
         // Dialogs and editors that name a file on the volume being closed;
         // left open, their Save/Overwrite acted on the next volume.
         self.text_editor = None;
-        self.pending_extraction = None;
         self.boot_blocks_present = None;
+        self.generation_seen = 0;
     }
 
     pub fn is_active(&self) -> bool {
@@ -802,7 +362,7 @@ impl BrowseView {
     /// a source switch behind its own confirm dialog (see Inspect's deferred
     /// source-switch guard) before calling [`close`](Self::close).
     pub fn has_unsaved_edits(&self) -> bool {
-        self.active && self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
+        self.active && self.ctl.has_unsaved_edits()
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -830,72 +390,103 @@ impl BrowseView {
         )
     }
 
-    /// Sniff the selected file for Mac-archive content, caching the result
-    /// by path so the disk read + [`detect_mac_archive`] runs once per
-    /// selection rather than every frame. Returns the detected kind, if
-    /// any. No-op (returns `None`) for non-files, non-Mac filesystems, or
-    /// when the bytes can't be read. The read is bounded by
-    /// [`ARCHIVE_SNIFF_LIMIT`]; the click handlers re-detect on the full
-    /// file, so a >16 MB archive (vanishingly rare on a vintage volume)
-    /// simply won't surface the buttons rather than mis-detecting.
+    /// The selected file's Mac-archive kind, once the pane's sniff of it has landed.
     fn ensure_archive_sniff(&mut self, entry: &FileEntry) -> Option<MacArchiveKind> {
         if !entry.is_file() || !self.is_mac_filesystem() {
-            self.archive_sniff = None;
             return None;
         }
-        if let Some((path, kind)) = &self.archive_sniff {
-            if path == &entry.path {
-                return *kind;
-            }
+        let pane = self.ctl.pane(Side::Left);
+        if let Some(kind) = pane.archive_sniff(&entry.path) {
+            return kind;
         }
-        let Some(mut fs) = self.take_or_open_fs() else {
-            // Couldn't open the filesystem this frame — leave the cache
-            // untouched so we retry on the next paint.
-            return None;
-        };
-        let result = fs.read_file(entry, ARCHIVE_SNIFF_LIMIT);
-        self.return_fs(fs);
-        let kind = result.ok().and_then(|bytes| detect_mac_archive(&bytes));
-        self.archive_sniff = Some((entry.path.clone(), kind));
-        kind
-    }
-
-    /// Validate a filename against the current filesystem's rules at
-    /// staging time, so invalid names are rejected before apply.
-    fn validate_staged_name(&self, name: &str) -> Result<(), String> {
-        let fs = self.session.open().map_err(|e| e.to_string())?;
-        fs.validate_name(name).map_err(|e| e.to_string())
+        if !pane.is_sniffing() {
+            let act = BrowserPaneAction::SniffArchive(entry.path.clone());
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
+        }
+        None
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.active {
             return;
         }
-
-        // If a background open is in progress, drain its status and either
-        // render a spinner or finalize the open with the results it produced.
-        if self.pending_open.is_some() {
-            self.poll_pending_open(ui);
-            if self.pending_open.is_some() {
-                // Still loading — show only the progress indicator.
-                return;
+        if let Some(paths) = self.add_files.as_mut().and_then(|p| p.poll()) {
+            self.add_files = None;
+            if let Some(paths) = paths {
+                self.add_host_paths(&ui.ctx().clone(), &paths);
             }
         }
+        self.poll_editor();
+        if let Some(snap) = self.ctl.pane(Side::Left).tool_working() {
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+        }
+        if let Some(said) = self.ctl.host_pane().take_archive_notice() {
+            self.edit_result = Some(said);
+        }
+        self.render_apply_job(ui);
+        if let Some(snap) = self.ctl.pane(Side::Left).archive_working() {
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+        }
+        self.poll_export(ui);
+        if let Some(snap) = self.ctl.mode_working() {
+            egui::Window::new(snap.label.clone())
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    super::progress::show_job(ui, &snap);
+                });
+        }
+
+        let ctx = ui.ctx().clone();
+        let mut fx = std::mem::take(&mut self.pending_fx);
+        fx.extend(self.ctl.tick());
+        self.run_effects(&ctx, fx);
+        self.poll_modes();
+        if !self.active {
+            return;
+        }
+        if self.ctl.is_working() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        // The first open takes the whole view; a reopen after a write shows in the tree's place.
+        if self.fs_type.is_empty() && self.pane_opening(ui) {
+            return;
+        }
+        self.sync_volume();
 
         // Poll background tree-view generation. Only renders a spinner here;
         // the rest of the UI stays interactive while the walk runs.
-        if self.pending_tree.is_some() {
-            self.poll_pending_tree(ui);
+        if let Some(tree) = self.ctl.host_pane().take_tree_text() {
+            self.tree_show_ids = tree.ids;
+            let oversized = tree.text.len() > TREE_INLINE_RENDER_LIMIT;
+            self.tree_text = Some(tree.text);
+            if oversized {
+                self.show_tree_large_dialog = true;
+            } else {
+                self.show_tree_popup = true;
+            }
         }
-
+        if let Some(detail) = self.ctl.host_pane().take_journal() {
+            self.journal_view = Some(super::journal_view::JournalView::new(detail));
+        }
         // Poll extraction progress
-        self.poll_extraction(ui);
+        self.poll_extraction();
 
         // Unlock prompt for an encrypted container (e.g. IMZ with ZipCrypto)
         // or an encrypted filesystem (APFS FileVault). The retry loop is shared:
         // stash the secret on the session and re-spawn the open.
-        if self.needs_password {
-            let is_apfs = self.fs_type == "APFS";
+        if self.ctl.pane(Side::Left).needs_password() {
+            let is_apfs = self.ctl.pane(Side::Left).volume().fs_type == "APFS";
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
                 if is_apfs {
@@ -915,10 +506,10 @@ impl BrowseView {
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Unlock").clicked() || enter {
-                        self.session.password = Some(self.password_input.clone());
-                        self.needs_password = false;
+                        let secret = self.password_input.clone();
                         self.error = None;
-                        self.pending_open = Some(self.session.spawn_open());
+                        let act = CommanderAction::Mode(ModeAction::Password(secret));
+                        self.dispatch(&ctx, act);
                     }
                 });
             });
@@ -928,261 +519,168 @@ impl BrowseView {
         // Handle drag-and-drop from host OS
         self.handle_dropped_files(ui);
 
-        // Lazily compute boot-block presence for the status line + the
-        // "Boot Blocks..." button. Only read in edit mode, where the backing
-        // file holds the raw (decompressed) image bytes.
-        if self.edit_mode && self.is_hfs_type() && self.boot_blocks_present.is_none() {
-            self.boot_blocks_present = self.detect_boot_blocks_present();
-        }
+        self.boot_blocks_present = self.ctl.pane(Side::Left).boot_blocks_present();
 
         // Header
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Filesystem Browser").strong());
-            ui.label(format!("[{}]", self.fs_type));
-            if self.volume_total > 0 {
-                let free = self.volume_total.saturating_sub(self.volume_used);
-                ui.label(format!(
-                    "{} used / {} ({} free)",
-                    partition::format_size(self.volume_used),
-                    partition::format_size(self.volume_total),
-                    partition::format_size(free),
-                ))
-                .on_hover_text("Volume space: used / total (free)");
-            }
-            let display_label = match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
-                (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
-                (false, true) => self.label_prefix.clone(),
-                (true, false) => self.volume_label.clone(),
-                (true, true) => String::new(),
-            };
-            if !display_label.is_empty() {
-                ui.label(format!("Label: {}", display_label));
-            }
-            if let Some((_, ref name)) = self.blessed_folder {
-                ui.label(format!("Blessed: {}", name));
-            }
-            // Boot-block status (edit mode, HFS volumes). A bootable volume
-            // needs both a blessed System Folder and boot blocks at sector 0.
-            if self.edit_mode && self.is_hfs_type() {
-                match self.boot_blocks_present {
-                    Some(true) => {
-                        ui.label("Boot blocks: present")
-                            .on_hover_text("The volume's first sector has the 'LK' boot loader.");
-                    }
-                    Some(false) => {
-                        ui.label(
-                            egui::RichText::new("Boot blocks: absent")
-                                .color(super::theme::warning(ui.visuals())),
-                        )
-                        .on_hover_text(
-                            "This volume has no boot loader. Use 'Boot Blocks...' to copy \
+        if self.optical {
+            self.render_disc_header(ui);
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Filesystem Browser").strong());
+                ui.label(format!("[{}]", self.fs_type));
+                if self.volume_total > 0 {
+                    let free = self.volume_total.saturating_sub(self.volume_used);
+                    ui.label(format!(
+                        "{} used / {} ({} free)",
+                        format_size(self.volume_used),
+                        format_size(self.volume_total),
+                        format_size(free),
+                    ))
+                    .on_hover_text("Volume space: used / total (free)");
+                }
+                let display_label =
+                    match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
+                        (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
+                        (false, true) => self.label_prefix.clone(),
+                        (true, false) => self.volume_label.clone(),
+                        (true, true) => String::new(),
+                    };
+                if !display_label.is_empty() {
+                    ui.label(format!("Label: {}", display_label));
+                }
+                if let Some((_, ref name)) = self.blessed_folder {
+                    ui.label(format!("Blessed: {}", name));
+                }
+                // Boot-block status (edit mode, HFS volumes). A bootable volume
+                // needs both a blessed System Folder and boot blocks at sector 0.
+                if self.ctl.edit_mode() && self.is_hfs_type() {
+                    match self.boot_blocks_present {
+                        Some(true) => {
+                            ui.label("Boot blocks: present").on_hover_text(
+                                "The volume's first sector has the 'LK' boot loader.",
+                            );
+                        }
+                        Some(false) => {
+                            ui.label(
+                                egui::RichText::new("Boot blocks: absent")
+                                    .color(super::theme::warning(ui.visuals())),
+                            )
+                            .on_hover_text(
+                                "This volume has no boot loader. Use 'Boot Blocks...' to copy \
                              them from a bootable donor disk (e.g. a matching stock System \
                              disk), then bless the System Folder. Works on a flat HFV and on \
                              the HFS partition of a full (APM) disk alike.",
-                        );
+                            );
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
-            }
 
-            // Carve view: "Full scan" toggle. By default the synthetic carve
-            // view only scans the first 10 MB of an image for recoverable
-            // text (fast on large devices); turning this on scans the whole
-            // image. Flipping it re-opens the volume so the new policy applies.
-            if self.fs_type == "Raw carve (no filesystem)" {
-                ui.add_space(8.0);
-                let resp = ui.checkbox(&mut self.carve_full_scan, "Full scan");
-                let limit_mb = rusty_backup::fs::carve::DEFAULT_SCAN_LIMIT / (1024 * 1024);
-                resp.clone().on_hover_text(format!(
-                    "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
+                // Carve view: "Full scan" toggle. By default the synthetic carve
+                // view only scans the first 10 MB of an image for recoverable
+                // text (fast on large devices); turning this on scans the whole
+                // image. Flipping it re-opens the volume so the new policy applies.
+                if self.fs_type == "Raw carve (no filesystem)" {
+                    ui.add_space(8.0);
+                    let mut full = self.ctl.carve_full_scan();
+                    let resp = ui.checkbox(&mut full, "Full scan");
+                    let limit_mb = self.ctl.carve_scan_limit_mb();
+                    resp.clone().on_hover_text(format!(
+                        "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
                      On: scan the entire image (slower on large disks).\n\
                      'whole-disk.img' is always the full image regardless."
-                ));
-                if resp.changed() {
-                    rusty_backup::fs::carve::set_full_scan(self.carve_full_scan);
-                    self.error = None;
-                    self.pending_open = Some(self.session.spawn_open());
+                    ));
+                    if resp.changed() {
+                        self.error = None;
+                        let act = CommanderAction::Mode(ModeAction::CarveFullScan(full));
+                        self.dispatch(&ctx, act);
+                    }
                 }
-            }
 
-            if self.fs_type == "QNX 2" {
-                ui.add_space(8.0);
-                let resp = ui.checkbox(&mut self.show_deleted, "Show deleted");
-                resp.clone().on_hover_text(
+                if self.fs_type == "QNX 2" {
+                    ui.add_space(8.0);
+                    let mut deleted = self.ctl.show_deleted();
+                    let resp = ui.checkbox(&mut deleted, "Show deleted");
+                    resp.clone().on_hover_text(
                     "List deleted entries whose data can still be read, named 'NAME [deleted]'.",
                 );
-                if resp.changed() {
-                    self.invalidate_all_caches();
+                    if resp.changed() {
+                        let act = CommanderAction::Mode(ModeAction::ShowDeleted(deleted));
+                        self.dispatch(&ctx, act);
+                    }
                 }
-            }
 
-            // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
-            if self.edit_supported && self.fs_type != "Pilot/Cedar" {
-                let busy = self.extraction_progress.is_some()
-                    || self.archive_edit_progress.is_some()
-                    || self.chd_flatten_progress.is_some();
-                ui.add_space(8.0);
-                let edit_btn = if self.edit_mode {
-                    egui::Button::new("Edit Mode ON")
-                } else {
-                    egui::Button::new("Edit Mode")
-                };
-                let btn = ui.add_enabled(!busy, edit_btn);
-                if btn.clicked() {
-                    log::info!(
-                        "Edit Mode clicked: archive_edit_ctx={}, chd_edit={}, edit_mode={}",
-                        self.archive_edit_ctx.is_some(),
-                        self.chd_edit.is_some(),
-                        self.edit_mode
-                    );
-                    if self.is_chd_source() {
-                        // CHD editing: open ChdEditSession on entry; flatten
-                        // the diff back into the parent on exit.
-                        if !self.edit_mode {
-                            self.enter_chd_edit_mode();
-                        } else if !self.staged_edits.is_empty() {
-                            self.show_unsaved_dialog = true;
-                        } else {
-                            self.exit_edit_mode();
-                        }
-                    } else if self.archive_edit_ctx.is_some() {
-                        // Archive editing: toggle triggers decompress/recompress
-                        if !self.edit_mode {
-                            log::info!("Starting archive extract for editing");
-                            self.start_archive_extract();
-                        } else if !self.staged_edits.is_empty() {
-                            self.show_unsaved_dialog = true;
-                        } else {
-                            self.start_archive_compress();
-                        }
+                // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
+                if self.ctl.edit_supported() && self.fs_type != "Pilot/Cedar" {
+                    let busy = self.extracting || self.ctl.mode_working().is_some();
+                    ui.add_space(8.0);
+                    let edit_btn = if self.ctl.edit_mode() {
+                        egui::Button::new("Edit Mode ON")
                     } else {
-                        // Direct editing (raw image / device)
-                        if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty)
-                        {
-                            self.show_unsaved_dialog = true;
-                        } else if !self.edit_mode {
-                            // SquashFS has to declare a size budget before any
-                            // edit is made — it has no free space to consult and
-                            // no in-place write, so "will this still fit?" can
-                            // only be answered as a ceiling chosen up front.
-                            // The dialog answers it and re-runs this entry when
-                            // the user commits. See docs/squashfs_edit.md §2.
-                            if !self.open_squashfs_budget_dialog() {
-                                self.enter_direct_edit_mode();
-                            }
-                        } else {
-                            self.edit_mode = false;
-                            self.edit_result = None;
-                            self.show_new_folder_dialog = false;
-                            self.pending_delete = None;
-                            self.staged_edits.clear();
-                            self.pending_archive_imports.clear();
-                            self.archive_import_tempdir = None;
-                        }
+                        egui::Button::new("Edit Mode")
+                    };
+                    let btn = ui.add_enabled(!busy, edit_btn);
+                    if btn.clicked() {
+                        self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ToggleEditMode));
+                    }
+                    if !self.ctl.edit_mode() && btn.hovered() {
+                        btn.on_hover_text("Enable editing to add or delete files on this image");
                     }
                 }
-                if !self.edit_mode && btn.hovered() {
-                    btn.on_hover_text("Enable editing to add or delete files on this image");
-                }
-            }
 
-            // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
-            // .tar). Preserves case-sensitive names + real symlinks (data
-            // fork only) so a case-insensitive host won't clobber files that
-            // differ only in case. Runs on a worker thread.
-            if !self.edit_mode && self.tar_export_progress.is_none() {
-                let btn = ui.button("Export to .tar.gz...");
-                if btn.hovered() {
-                    btn.clone().on_hover_text(
-                        "Archive the whole volume to .tar.gz / .tar.zst / .tar \
+                // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
+                // .tar). Preserves case-sensitive names + real symlinks (data
+                // fork only) so a case-insensitive host won't clobber files that
+                // differ only in case. Runs on a worker thread.
+                if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
+                    let btn = ui.button("Export to .tar.gz...");
+                    if btn.hovered() {
+                        btn.clone().on_hover_text(
+                            "Archive the whole volume to .tar.gz / .tar.zst / .tar \
                          (preserves case + symlinks; choose the extension in the save dialog)",
-                    );
-                }
-                if btn.clicked() {
-                    self.start_tar_export(&FileEntry::root());
-                }
-            }
-
-            // Check filesystem button. HFS has always been here; Alto BFS/TFS
-            // packs open through the container path (BrowseSession -> open_pack)
-            // rather than the block factory the inspect-grid Check button uses,
-            // so the browse view is where their check/repair lives. Both are
-            // small volumes, so the synchronous fsck below is fine.
-            if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS") && ui.button("Check").clicked() {
-                match self.take_or_open_fs() {
-                    Some(mut fs) => {
-                        match fs.fsck() {
-                            Some(Ok(result)) => {
-                                self.fsck_result = Some(result);
-                                self.show_fsck_popup = true;
-                            }
-                            Some(Err(e)) => {
-                                self.error = Some(format!("Filesystem check failed: {}", e));
-                            }
-                            None => {
-                                self.error =
-                                    Some("Filesystem check not supported for this type".into());
-                            }
-                        }
-                        self.return_fs(fs);
+                        );
                     }
-                    None => {
-                        self.error = Some("Failed to open filesystem".into());
+                    if btn.clicked() {
+                        self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
                     }
                 }
-            }
 
-            // Journal history viewer (HFS+/HFSX only). Opening reports whether
-            // the volume is actually journaled.
-            if (self.fs_type == "HFS+" || self.fs_type == "HFSX") && ui.button("Journal").clicked()
-            {
-                match self.take_or_open_fs() {
-                    Some(mut fs) => {
-                        match fs.journal_detail() {
-                            Ok(Some(detail)) => {
-                                self.journal_view =
-                                    Some(super::journal_view::JournalView::new(detail));
-                            }
-                            Ok(None) => {
-                                self.error = Some("This volume is not journaled.".into());
-                            }
-                            Err(e) => {
-                                self.error = Some(format!("Could not read journal: {e}"));
-                            }
-                        }
-                        self.return_fs(fs);
-                    }
-                    None => {
-                        self.error = Some("Failed to open filesystem".into());
-                    }
+                // HFS and Alto BFS packs check here; the Inspect grid's Check covers the rest.
+                let tool_free = self.ctl.pane(Side::Left).tool_working().is_none();
+                if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
+                    && tool_free
+                    && ui.button("Check").clicked()
+                {
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Fsck);
                 }
-            }
+                if (self.fs_type == "HFS+" || self.fs_type == "HFSX")
+                    && ui.button("Journal").clicked()
+                {
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
+                }
 
-            if self.is_chd_source() {
-                if let Some(chd_path) = self.session.source_path.clone() {
-                    if ui.button("CHD Info").clicked() {
-                        match rusty_backup::rbformats::chd::format_chd_info(&chd_path) {
-                            Ok(text) => self.chd_info_text = Some(text),
-                            Err(e) => {
-                                self.error = Some(format!("CHD Info failed: {}", e));
-                            }
-                        }
+                if self.ctl.is_chd_source() && ui.button("CHD Info").clicked() {
+                    self.dispatch(&ctx, CommanderAction::Mode(ModeAction::ChdInfo));
+                }
+
+                if ui.button("Tree").clicked() {
+                    let ids = self.tree_show_ids;
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
+                }
+
+                ui.menu_button("View", |ui| {
+                    let items = self.ctl.view_menu();
+                    if let Some(action) = super::commander::view_menu_body(ui, &items) {
+                        self.ctl.apply(action);
+                        ui.close();
                     }
-                }
-            }
+                });
 
-            if ui.button("Tree").clicked() {
-                self.generate_tree_text();
-            }
-
-            if ui.button("Close").clicked() {
-                if self.edit_mode && (!self.staged_edits.is_empty() || self.chd_diff_dirty) {
-                    self.show_unsaved_dialog = true;
-                } else {
-                    self.close();
+                if ui.button("Close").clicked() {
+                    self.request_close();
                 }
-            }
-        });
+            });
+        }
 
         if let Some(err) = &self.error {
             ui.colored_label(super::theme::danger(ui.visuals()), err);
@@ -1213,52 +711,17 @@ impl BrowseView {
             });
         }
 
-        // Archive edit progress bar
-        self.poll_archive_edit(ui);
-        if let Some(progress) = &self.archive_edit_progress {
-            if let Ok(p) = progress.lock() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("{}...", p.phase));
-                    if p.total > 0 {
-                        let frac = p.current as f32 / p.total as f32;
-                        ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    }
-                });
-                ui.ctx().request_repaint();
-            }
-        }
-
         // The SquashFS size-budget dialog, and the edit-mode entry it gates.
         self.poll_squashfs_budget_dialog(ui);
 
-        // Background tar-export progress (Export to .tar.gz...).
-        self.poll_tar_export(ui);
-
-        // CHD flatten progress bar (compressed CHD edit-apply)
-        self.poll_chd_flatten(ui);
-        if let Some(progress) = &self.chd_flatten_progress {
-            if let Ok(p) = progress.lock() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Flattening CHD...");
-                    if p.total > 0 {
-                        let frac = p.current as f32 / p.total as f32;
-                        ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    }
-                });
-                ui.ctx().request_repaint();
-            }
-        }
-
         // Info banner while editing an archive
-        if self.edit_mode && self.archive_edit_ctx.is_some() {
+        if self.ctl.editing_archive() {
             ui.colored_label(
                 super::theme::info(ui.visuals()),
                 "Editing temporary copy. Click 'Apply Edits' to write changes.",
             );
         }
-        if self.edit_mode && self.chd_edit.is_some() {
+        if self.ctl.editing_chd() {
             ui.colored_label(
                 super::theme::info(ui.visuals()),
                 "Editing CHD via diff. Click 'Apply Edits' to flush, or exit Edit Mode to merge into the CHD.",
@@ -1266,14 +729,14 @@ impl BrowseView {
         }
 
         // Edit mode toolbar
-        if self.edit_mode {
+        if self.ctl.edit_mode() {
             self.render_edit_toolbar(ui);
         }
 
         ui.separator();
 
         // Show drop target overlay when files are being dragged over
-        if self.edit_mode {
+        if self.ctl.edit_mode() {
             let hovered = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
             if hovered {
                 ui.colored_label(
@@ -1285,19 +748,23 @@ impl BrowseView {
         }
 
         // Delete confirmation dialog
-        self.render_delete_dialog(ui);
 
         // Unsaved changes dialog
         self.render_unsaved_dialog(ui);
 
-        // File-exists review, shown once before anything is written
-        self.render_conflict_review(ui);
+        // The pane's apply review (names already taken) and its report
+        let mut review_acts = Vec::new();
+        let pane = self.ctl.pane(Side::Left);
+        self.pane_view
+            .render_apply_review(ui.ctx(), pane, &mut review_acts);
+        self.pane_view
+            .render_apply_report(ui.ctx(), pane, &mut review_acts);
+        for a in review_acts {
+            self.dispatch(&ctx, a);
+        }
 
         // Text editor window
         self.render_text_editor(ui);
-
-        // New folder dialog
-        self.render_new_folder_dialog(ui);
 
         // Tar archive added/dropped: import contents vs add as file
         self.render_tar_add_dialog(ui);
@@ -1311,7 +778,6 @@ impl BrowseView {
         self.render_staging_errors_dialog(ui);
 
         // Extraction overwrite-confirm dialog
-        self.render_extract_overwrite_dialog(ui);
 
         // Workflow A: Mac archive import modal (Convert / Expand / Add as-is).
         self.render_archive_import_dialog(ui);
@@ -1335,15 +801,7 @@ impl BrowseView {
                 ui.set_width(tree_width);
                 ui.set_min_height(panel_height);
                 self.render_selection_bar(ui);
-                egui::ScrollArea::vertical()
-                    .id_salt("browse_tree")
-                    .max_height(panel_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if let Some(root) = self.root.clone() {
-                            self.render_tree_entry(ui, &root);
-                        }
-                    });
+                self.render_listing(ui, panel_height);
             });
 
             ui.separator();
@@ -1368,106 +826,430 @@ impl BrowseView {
                 self.journal_view = None;
             }
         }
+
+        // Commander's windows for what the shared keys and the View menu open.
+        let mut acts = Vec::new();
+        type Cm = super::commander::CommanderMode;
+        Cm::render_checksum_window(&self.ctl, &ctx, &mut acts);
+        Cm::render_host_conflict_modal(&self.ctl, &ctx, &mut acts);
+        Cm::render_skipped_report(&self.ctl, &ctx, &mut acts);
+        Cm::render_log_window(&self.ctl, &ctx, &mut acts);
+        Cm::render_help(&self.ctl, &ctx, &mut acts);
+        Cm::render_view_window(&self.ctl, &ctx, &mut acts);
+        // The content panel already shows what File Info would.
+        if self.ctl.detail().is_some() {
+            acts.push(CommanderAction::CloseDetail);
+        }
+        for a in acts {
+            self.dispatch(&ctx, a);
+        }
+        if let Some(reply) = self.effects.show(&ctx, "") {
+            self.answer(&ctx, reply);
+        }
+        self.handle_keys(&ctx);
+        self.sync_selected();
     }
 
-    fn render_tree_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let pending_del = self.edit_mode && self.staged_edits.is_pending_delete(&entry.path);
+    /// The pane's open in progress, or a failed one: drawn instead of the browser.
+    fn pane_opening(&mut self, ui: &mut egui::Ui) -> bool {
+        let pane = self.ctl.pane(Side::Left);
+        if let Some(snap) = pane.opening() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label("Loading filesystem:");
+            });
+            if super::progress::show_job(ui, &snap) {
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::CancelOpen);
+                self.ctl.apply(act);
+            }
+            ui.label(
+                "Large volumes (e.g. HFS+ catalogs with hundreds of \
+                 thousands of files) can take several seconds.",
+            );
+            return true;
+        }
+        if pane.is_opening() {
+            ui.spinner();
+            return true;
+        }
+        // A disc keeps its header, so another of its filesystems can be picked.
+        if let Some(err) = pane.source_error().filter(|_| !self.optical) {
+            if !pane.listing.is_loaded() && !pane.needs_password() {
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
+                if ui.button("Close").clicked() {
+                    self.close();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The disc browser's header: the filesystem picker (hybrid sides, boot areas), the game, Tree.
+    fn render_disc_header(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let pane = self.ctl.pane(Side::Left);
+        let labels = pane.partition_label_parts();
+        let selected = pane.selected_partition().unwrap_or(0);
+        let game = pane.disc_game().map(|g| g.to_string());
+        let mut acts = Vec::new();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Disc Browser").strong());
+            if labels.len() > 1 {
+                ui.label("Filesystem:");
+                let current = labels
+                    .get(selected)
+                    .map(|p| super::theme::format_label(ui, p));
+                egui::ComboBox::from_id_salt("optical_fs_picker")
+                    .selected_text(current.unwrap_or_default())
+                    .show_ui(ui, |ui| {
+                        for (idx, parts) in labels.iter().enumerate() {
+                            let label = super::theme::format_label(ui, parts);
+                            if ui.selectable_label(idx == selected, label).clicked() {
+                                acts.push(BrowserPaneAction::SelectPartition(idx));
+                            }
+                        }
+                    });
+            } else if let Some(parts) = labels.first() {
+                let mut bracketed = parts.clone();
+                bracketed.lead.insert(0, '[');
+                bracketed.tail.push(']');
+                ui.label(super::theme::format_label(ui, &bracketed));
+            }
+            if let Some(g) = &game {
+                ui.label(format!("Game: {g}"));
+            }
+            if ui.button("Tree").clicked() {
+                acts.push(BrowserPaneAction::ListTree { ids: false });
+            }
+            ui.menu_button("View", |ui| {
+                let items = self.ctl.view_menu();
+                if let Some(action) = super::commander::view_menu_body(ui, &items) {
+                    self.ctl.apply(action);
+                    ui.close();
+                }
+            });
+            if ui.button("Close").clicked() {
+                self.request_close();
+            }
+        });
+        for a in acts {
+            if matches!(a, BrowserPaneAction::SelectPartition(_)) {
+                self.selected_entry = None;
+                self.side_ed = DetailEditors::default();
+                self.error = None;
+            }
+            self.pane_act(&ctx, a);
+        }
+    }
+
+    /// The header's volume readout, from the volume the pane opened.
+    fn sync_volume(&mut self) {
+        let pane = self.ctl.pane(Side::Left);
+        if !pane.listing.is_loaded() {
+            return;
+        }
+        let v = pane.volume();
+        if self.fs_type != v.fs_type {
+            self.fs_type = v.fs_type.clone();
+        }
+        if self.volume_label != v.label {
+            self.volume_label = v.label.clone();
+        }
+        self.volume_total = v.total_size;
+        self.volume_used = v.used_size;
+        if self.blessed_folder != v.blessed {
+            self.blessed_folder = v.blessed.clone();
+        }
+    }
+
+    /// Carry out the pane's effects; answers go straight back to it.
+    fn run_effects(&mut self, ctx: &egui::Context, fx: Vec<Effect>) {
+        let mut messages = Vec::new();
+        let replies = self.effects.run(ctx, fx, &mut messages);
+        for m in messages {
+            log::info!("{m}");
+        }
+        for reply in replies {
+            self.answer(ctx, reply);
+        }
+    }
+
+    fn answer(&mut self, ctx: &egui::Context, reply: Reply) {
+        let action = match reply {
+            Reply::Picked { purpose, path } => CommanderAction::Picked { purpose, path },
+            Reply::Confirmed { purpose, yes } => CommanderAction::Confirmed { purpose, yes },
+            Reply::Answered { purpose, text } => CommanderAction::Answered { purpose, text },
+            Reply::Chose { purpose, choice } => CommanderAction::Chose { purpose, choice },
+            Reply::CloseScreen => {
+                self.request_close();
+                return;
+            }
+        };
+        self.dispatch(ctx, action);
+    }
+
+    fn dispatch(&mut self, ctx: &egui::Context, action: CommanderAction) {
+        let fx = self.ctl.apply(action);
+        self.run_effects(ctx, fx);
+    }
+
+    fn pane_act(&mut self, ctx: &egui::Context, action: BrowserPaneAction) {
+        self.dispatch(ctx, CommanderAction::Pane(Side::Left, action));
+    }
+
+    /// Close, after the unsaved-edits dialog when edits wait.
+    fn request_close(&mut self) {
+        self.ctl
+            .apply(CommanderAction::Mode(ModeAction::RequestClose));
+        if self.ctl.take_close_request() {
+            self.close();
+        }
+    }
+
+    /// What the modes ended with: notices, errors, a close, a size budget to ask for, a write.
+    fn poll_modes(&mut self) {
+        if let Some(said) = self.ctl.take_mode_notice() {
+            self.edit_result = Some(said);
+        }
+        if let Some(e) = self.ctl.take_mode_error() {
+            self.error = Some(e);
+        }
+        let generation = self.ctl.volume_generation();
+        if generation != self.generation_seen {
+            // The volume was reopened or written: what the panel showed may be gone.
+            self.generation_seen = generation;
+            self.selected_entry = None;
+            self.side_ed = DetailEditors::default();
+            self.cursor_seen = None;
+            self.cursor_armed = false;
+        }
+        if self.ctl.take_close_request() {
+            self.close();
+        }
+    }
+
+    /// Bound keys go to the pane while the tree was clicked last and no text field has focus.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        let modal = self.effects.modal_open() || self.ctl.modal_open();
+        if !self.keys_active || modal || ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let ctl = &self.ctl;
+        let keys: Vec<_> = ctx.input_mut(|i| {
+            let mut found = Vec::new();
+            i.events.retain(|ev| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                else {
+                    return true;
+                };
+                let mods = super::commander::egui_mods(*modifiers);
+                let bound = super::commander::egui_key(*key).filter(|k| ctl.binds(*k, mods));
+                found.extend(bound.map(|k| (k, mods)));
+                bound.is_none()
+            });
+            found
+        });
+        if keys.is_empty() {
+            return;
+        }
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        for (key, mods) in keys {
+            self.dispatch(ctx, CommanderAction::Key(key, mods));
+        }
+        self.cursor_armed = true;
+        self.scroll_cursor = true;
+        ctx.request_repaint();
+    }
+
+    /// Point the content panel at the cursor row once it moved (a click or a key).
+    fn sync_selected(&mut self) {
+        let pane = self.ctl.pane(Side::Left);
+        let Some(row) = pane.cursor_index().map(|i| pane.rows()[i].clone()) else {
+            return;
+        };
+        if self.cursor_seen.as_deref() == Some(row.node_id.as_str()) {
+            return;
+        }
+        self.cursor_seen = Some(row.node_id.clone());
+        if !self.cursor_armed {
+            return;
+        }
+        // Rows inside an expanded archive or image belong to another filesystem.
+        let entry = if row.is_tree {
+            None
+        } else {
+            pane.row_entry(&row)
+        };
+        let Some(entry) = entry else {
+            self.selected_entry = None;
+            self.side_ed = DetailEditors::default();
+            return;
+        };
+        if self.selected_entry.as_ref().map(|e| &e.path) == Some(&entry.path) {
+            return;
+        }
+        self.selected_entry = Some(entry);
+        self.error = None;
+    }
+
+    /// The listing in the pane's style: the combined tree as the browser always drew it, or Commander's.
+    fn render_listing(&mut self, ui: &mut egui::Ui, height: f32) {
+        let mut acts: Vec<CommanderAction> = Vec::new();
+        let pane = self.ctl.pane(Side::Left);
+        if !pane.listing.is_loaded() {
+            if pane.is_opening() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading the volume...");
+                });
+            } else if let Some(err) = pane.source_error() {
+                ui.colored_label(super::theme::danger(ui.visuals()), err);
+            }
+            return;
+        }
+        if pane.listing_style() == ListingStyle::CombinedTree {
+            egui::ScrollArea::vertical()
+                .id_salt("browse_tree")
+                .max_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.render_tree_rows(ui, &mut acts));
+            self.scroll_cursor = false;
+        } else {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let scroll = self.scroll_cursor;
+                    self.pane_view
+                        .show_listing(ui, &self.ctl, scroll, &mut acts)
+                },
+            );
+            self.scroll_cursor = false;
+        }
+        if !acts.is_empty() {
+            self.keys_active = true;
+            self.cursor_armed = true;
+            self.cursor_seen = None;
+            let ctx = ui.ctx().clone();
+            for a in acts {
+                self.dispatch(&ctx, a);
+            }
+        }
+    }
+
+    /// One row per entry of the combined tree, indented by depth, with the mark checkbox.
+    fn render_tree_rows(&mut self, ui: &mut egui::Ui, acts: &mut Vec<CommanderAction>) {
+        let pane = self.ctl.pane(Side::Left);
+        let rows = pane.rows().to_vec();
+        let cursor = pane.cursor_index();
+        let root_selected = self.selected_entry.as_ref().is_some_and(|e| e.path == "/");
+        let p = |a| CommanderAction::Pane(Side::Left, a);
+        // The volume's root: always open; clicking it shows the volume in the content panel.
+        ui.horizontal(|ui| {
+            if ui.selectable_label(root_selected, "/").clicked() {
+                self.selected_entry = pane.entry_at("/").or_else(|| Some(FileEntry::root()));
+                self.side_ed = DetailEditors::default();
+                self.error = None;
+                self.keys_active = true;
+            }
+        });
+        let indent = ui.spacing().indent;
+        for (i, row) in rows.iter().enumerate() {
+            if row.is_parent() {
+                continue;
+            }
+            let entry = pane.row_entry(row);
+            let is_cursor = cursor == Some(i) && !root_selected;
+            ui.horizontal(|ui| {
+                ui.add_space(indent * (row.depth as f32 + 1.0));
+                if row.expandable {
+                    let size = egui::vec2(indent, ui.spacing().interact_size.y);
+                    let (_, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let openness = if row.expanded { 1.0 } else { 0.0 };
+                    egui::collapsing_header::paint_default_icon(ui, openness, &resp);
+                    if resp.clicked() {
+                        acts.push(p(BrowserPaneAction::ToggleExpand(row.node_id.clone())));
+                    }
+                } else {
+                    ui.add_space(indent);
+                }
+                let markable = !matches!(row.kind, RowKind::PendingAdd | RowKind::PendingDelete);
+                if markable {
+                    let mut marked = pane.row_selected(row);
+                    let resp = ui
+                        .checkbox(&mut marked, "")
+                        .on_hover_text("Mark for multi-select export");
+                    if resp.changed() {
+                        acts.push(p(BrowserPaneAction::Mark(row.node_id.clone())));
+                    }
+                }
+                let resp = self.row_label(ui, row, entry.as_ref(), is_cursor);
+                if resp.double_clicked() {
+                    acts.push(p(BrowserPaneAction::Activate(row.node_id.clone())));
+                } else if resp.clicked() {
+                    acts.push(p(BrowserPaneAction::CursorTo(row.node_id.clone())));
+                }
+                if is_cursor && self.scroll_cursor {
+                    resp.scroll_to_me(None);
+                }
+            });
+            if row.loading {
+                ui.horizontal(|ui| {
+                    ui.add_space(indent * (row.depth as f32 + 3.0));
+                    ui.label("Loading...");
+                });
+            }
+        }
+    }
+
+    /// A row's label as the tree always showed it: sizes, ProDOS badges, links, staged edits.
+    fn row_label(
+        &self,
+        ui: &mut egui::Ui,
+        row: &DisplayRow,
+        entry: Option<&FileEntry>,
+        selected: bool,
+    ) -> egui::Response {
         let dimmed = super::theme::muted(ui.visuals());
-
-        match entry.entry_type {
+        if row.kind == RowKind::PendingAdd {
+            let text = match entry {
+                Some(e) => self.pending_add_text(ui, e),
+                None => egui::RichText::new(format!("+ {}", row.name)),
+            };
+            return ui.selectable_label(selected, text);
+        }
+        let Some(entry) = entry else {
+            return ui.selectable_label(selected, &row.name);
+        };
+        let mut hover = None;
+        let mut label = match entry.entry_type {
             EntryType::Directory => {
-                let path = entry.path.clone();
-                let has_children = self.directory_cache.contains_key(&path);
-
-                let dir_label = if self
+                let blessed = self
                     .blessed_folder
                     .as_ref()
-                    .map(|(cnid, _)| *cnid == entry.location)
-                    .unwrap_or(false)
-                {
+                    .is_some_and(|(cnid, _)| *cnid == entry.location);
+                if blessed {
                     format!("{} [System]", entry.name)
                 } else {
                     entry.name.clone()
-                };
-
-                let id = ui.make_persistent_id(&path);
-                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    id,
-                    path == "/",
-                );
-
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
-                let header_res = ui.horizontal(|ui| {
-                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                    if !pending_del {
-                        self.mark_checkbox(ui, entry);
-                    }
-                    if pending_del {
-                        let text = egui::RichText::new(&dir_label)
-                            .color(dimmed)
-                            .strikethrough();
-                        ui.label(text);
-                    } else if ui.selectable_label(is_selected, &dir_label).clicked() {
-                        self.selected_entry = Some(entry.clone());
-                        self.content = None;
-                        self.error = None;
-                    }
-                });
-
-                state.show_body_indented(&header_res.response, ui, |ui| {
-                    if let Some(children) = self.directory_cache.get(&path).cloned() {
-                        for child in &children {
-                            self.render_tree_entry(ui, child);
-                        }
-                    } else {
-                        ui.label("Loading...");
-                    }
-
-                    // Append pending-add entries for this directory
-                    if self.edit_mode {
-                        let pending = self.staged_edits.pending_adds_for(&path);
-                        for pentry in &pending {
-                            self.render_pending_add_entry(ui, pentry);
-                        }
-                    }
-                });
-
-                let is_now_open = state.is_open();
-
-                // Load directory contents on first expansion
-                if is_now_open {
-                    if !has_children {
-                        self.load_directory(entry);
-                    }
-                    self.expanded_paths.insert(path.clone());
-                } else {
-                    self.expanded_paths.remove(&path);
                 }
             }
             EntryType::File => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let size_str = entry.size_string();
-                // ProDOS entries get an inline "$XX ABC" type badge so the user
-                // can see the file's type/aux without clicking into it.
-                let prodos_badge = if self.is_prodos_type() {
+                let badge = if self.is_prodos_type() {
                     entry.type_code_display()
                 } else {
                     None
                 };
-                let hover_text = prodos_badge.as_ref().map(|tc| {
+                hover = badge.as_ref().map(|tc| {
                     let tt = entry.prodos_file_type.unwrap_or(0);
-                    let desc = rusty_backup::fs::prodos_types::type_description(tt);
+                    let desc = prodos_type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
                     if desc.is_empty() {
                         format!("{tc} ${:04X}", aux)
@@ -1475,138 +1257,54 @@ impl BrowseView {
                         format!("{desc} ${:04X}", aux)
                     }
                 });
-
-                if pending_del {
-                    let label = if let Some(ref b) = prodos_badge {
-                        format!("{}  [{}]  ({})", entry.name, b, size_str)
-                    } else {
-                        format!("{}  ({})", entry.name, size_str)
-                    };
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else {
-                    let label = if let Some(ref b) = prodos_badge {
-                        format!("{}  [{}]  ({})", entry.name, b, size_str)
-                    } else {
-                        format!("{}  ({})", entry.name, size_str)
-                    };
-                    // Tint files with staged metadata edits (type/dates/perms)
-                    // blue so the user sees what they've changed before Apply.
-                    let meta_changed =
-                        self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
-                    ui.horizontal(|ui| {
-                        // Directory rows spend `spacing().indent` on the collapse
-                        // toggle before their checkbox; files must match or the
-                        // checkbox column zig-zags. See egui show_button_indented.
-                        ui.add_space(ui.spacing().indent);
-                        self.mark_checkbox(ui, entry);
-                        let rich = if meta_changed {
-                            egui::RichText::new(&label).color(super::theme::info(ui.visuals()))
-                        } else {
-                            egui::RichText::new(&label)
-                        };
-                        let resp = ui.selectable_label(is_selected, rich);
-                        let resp = if let Some(h) = hover_text {
-                            resp.on_hover_text(h)
-                        } else {
-                            resp
-                        };
-                        if resp.clicked() {
-                            self.select_file(entry);
-                        }
-                    });
+                match badge {
+                    Some(b) => format!("{}  [{}]  ({})", entry.name, b, size_str),
+                    None => format!("{}  ({})", entry.name, size_str),
                 }
             }
             EntryType::Symlink => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let target = entry.symlink_target.as_deref().unwrap_or("?");
-                let label = format!("{} -> {}", entry.name, target);
-
-                if pending_del {
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else if ui.selectable_label(is_selected, &label).clicked() {
-                    self.select_file(entry);
-                }
+                format!("{} -> {}", entry.name, target)
             }
             EntryType::Special => {
-                let is_selected = self
-                    .selected_entry
-                    .as_ref()
-                    .map(|s| s.path == entry.path)
-                    .unwrap_or(false);
-
                 let stype = entry.special_type.as_deref().unwrap_or("special");
-                let label = format!("{}  ({})", entry.name, stype);
-
-                if pending_del {
-                    let text = egui::RichText::new(&label).color(dimmed).strikethrough();
-                    ui.label(text);
-                } else if ui.selectable_label(is_selected, &label).clicked() {
-                    self.selected_entry = Some(entry.clone());
-                    self.content = None;
-                }
+                format!("{}  ({})", entry.name, stype)
             }
+        };
+        if row.is_wrapper {
+            label = format!("{label}  {}", row.type_tag);
         }
-    }
-
-    /// Render the multi-select checkbox for `entry`, toggling its mark. Marked
-    /// entries feed the "Export selected..." bar; independent of the single-click
-    /// `selected_entry` preview.
-    fn mark_checkbox(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let mut marked = self.marked.contains_key(&entry.path);
-        if ui
-            .checkbox(&mut marked, "")
-            .on_hover_text("Mark for multi-select export")
-            .changed()
-        {
-            if marked {
-                self.marked.insert(entry.path.clone(), entry.clone());
-            } else {
-                self.marked.remove(&entry.path);
-            }
+        if let Some(to) = &row.rename_to {
+            label = format!("{label} -> {to}");
         }
-    }
-
-    /// Marked entries to export, with any entry that lives under another marked
-    /// directory dropped — that ancestor's recursive walk already includes it, so
-    /// nothing is archived twice.
-    fn marked_export_entries(&self) -> Vec<FileEntry> {
-        fn is_ancestor(a: &str, p: &str) -> bool {
-            if a == p {
-                return false;
+        let text = match row.kind {
+            RowKind::PendingDelete => egui::RichText::new(label).color(dimmed).strikethrough(),
+            _ if row.meta_changed || row.rename_to.is_some() => {
+                egui::RichText::new(label).color(super::theme::info(ui.visuals()))
             }
-            if a == "/" {
-                return p.len() > 1 && p.starts_with('/');
-            }
-            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
+            _ => egui::RichText::new(label),
+        };
+        let resp = ui.selectable_label(selected, text);
+        match hover {
+            Some(h) => resp.on_hover_text(h),
+            None => resp,
         }
-        let marked_paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
-        self.marked
-            .iter()
-            .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
-            .map(|(_, e)| e.clone())
-            .collect()
     }
 
     /// Compact bar shown above the tree when entries are checkbox-marked: the
     /// count, an "Export selected as..." format menu (the shared `export_selection`
     /// engine, so `.mar` and the other formats come for free), and Clear.
     fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
-        if self.marked.is_empty() {
+        let count = self.ctl.pane(Side::Left).selected_entries().len();
+        if count == 0 {
             return;
         }
-        use rusty_backup::fs::export_selection::ExportFormat;
-        let mut fmt = self.export_format;
+        let picked = self.ctl.export_format();
+        let mut fmt = picked;
         let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} selected", self.marked.len()));
+            ui.label(format!("{count} selected"));
             ui.label("Export as:");
             egui::ComboBox::from_id_salt("browse_export_fmt")
                 .selected_text(fmt.label())
@@ -1623,116 +1321,105 @@ impl BrowseView {
             }
         });
         ui.separator();
-        self.export_format = fmt;
+        if fmt != picked {
+            self.ctl.apply(CommanderAction::SetExportFormat(fmt));
+        }
         if clear {
-            self.marked.clear();
+            let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::ClearSelection);
+            self.ctl.apply(act);
         }
         if do_export {
-            self.export_marked(fmt);
+            self.export_marked(&ui.ctx().clone(), fmt);
         }
     }
 
-    /// Export the checkbox-marked entries together as one `format` output, reusing
-    /// the shared multi-entry engine (the same path Commander uses). Foreground
-    /// execution; classic-Mac payloads are typically small.
-    fn export_marked(&mut self, format: rusty_backup::fs::export_selection::ExportFormat) {
-        use rusty_backup::fs::export_selection::{export_to_file, export_to_folder};
-        let entries = self.marked_export_entries();
-        if entries.is_empty() {
-            self.edit_result = Some("Nothing selected to export.".into());
+    /// Export the marked rows as one `format` output through the screen's export (picker, job).
+    fn export_marked(&mut self, ctx: &egui::Context, format: ExportFormat) {
+        if self.ctl.copy_job().is_some() {
             return;
         }
-        let fork_mode = self.resource_fork_mode;
-        let noop_progress = |_: &str, _: usize, _: u64| {};
-        let never_cancel = || false;
+        let fork = CommanderAction::SetForkMode(self.resource_fork_mode);
+        self.ctl.apply(fork);
+        let export = CommanderAction::Export {
+            from: Side::Left,
+            format: Some(format),
+        };
+        self.exporting = true;
+        self.dispatch(ctx, export);
+    }
 
-        if format.is_single_file() {
-            let ext = format
-                .file_extension()
-                .map(|e| format!(".{e}"))
-                .unwrap_or_default();
-            let default_name = format!("selection{ext}");
-            let Some(path) = super::file_dialog()
-                .set_title("Export selection")
-                .set_file_name(&default_name)
-                .save_file()
-            else {
-                return;
-            };
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open.".into());
-                return;
-            };
-            let res = export_to_file(
-                &mut *fs,
-                &entries,
-                &path,
-                format,
-                &noop_progress,
-                &never_cancel,
-            );
-            self.return_fs(fs);
-            self.report_export(res, &path);
-        } else {
-            let Some(dir) = super::file_dialog()
-                .set_title("Export selection to folder")
-                .pick_folder()
-            else {
-                return;
-            };
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open.".into());
-                return;
-            };
-            let res = export_to_folder(
-                &mut *fs,
-                &entries,
-                &dir,
-                format,
-                fork_mode,
-                &noop_progress,
-                &never_cancel,
-            );
-            self.return_fs(fs);
-            self.report_export(res, &dir);
+    /// Export one entry (the root: the whole volume) as `format` through the screen's export.
+    fn export_entry(&mut self, ctx: &egui::Context, entry: &FileEntry, format: ExportFormat) {
+        if self.ctl.copy_job().is_some() {
+            return;
+        }
+        self.ctl
+            .apply(CommanderAction::SetForkMode(self.resource_fork_mode));
+        let act = CommanderAction::ExportEntry {
+            from: Side::Left,
+            path: entry.path.clone(),
+            format: Some(format),
+        };
+        self.exporting = true;
+        let ctx = ctx.clone();
+        self.dispatch(&ctx, act);
+    }
+
+    /// The export's progress window, then its status line as the result.
+    fn poll_export(&mut self, ui: &mut egui::Ui) {
+        if self.extracting {
+            if let Some((_, snap)) = self.ctl.copy_job() {
+                self.show_copy_job(ui, "Extracting", &snap);
+            }
+            return;
+        }
+        if !self.exporting {
+            return;
+        }
+        let Some((title, snap)) = self.ctl.copy_job() else {
+            // Not started (cancelled picker, nothing marked) or finished.
+            if !self.effects.modal_open() {
+                self.exporting = false;
+                let said = self.ctl.status();
+                if !said.is_empty() {
+                    self.edit_result = Some(said.to_string());
+                }
+            }
+            return;
+        };
+        self.show_copy_job(ui, title, &snap);
+    }
+
+    /// The screen's copy job as a window with Cancel.
+    fn show_copy_job(&mut self, ui: &mut egui::Ui, title: &str, snap: &Snapshot) {
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                cancel = super::progress::show_job(ui, snap);
+            });
+        if cancel {
+            self.ctl.apply(CommanderAction::CancelCopy);
         }
     }
 
-    /// Fold an export result into the status line.
-    fn report_export(
-        &mut self,
-        res: anyhow::Result<rusty_backup::fs::export_selection::ExportSummary>,
-        path: &Path,
-    ) {
-        self.edit_result = Some(match res {
-            Ok(s) => format!(
-                "Exported {} item(s), {} to {}",
-                s.files,
-                partition::format_size(s.bytes),
-                path.display()
-            ),
-            Err(e) => format!("Export failed: {e}"),
-        });
-    }
-
-    /// Render a pending-add entry with green "+" prefix (not selectable for content).
-    fn render_pending_add_entry(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+    /// A staged add's label: green, blue when its type is unresolved, with its fork badge.
+    fn pending_add_text(&self, ui: &egui::Ui, entry: &FileEntry) -> egui::RichText {
         let green = super::theme::success(ui.visuals());
         let blue = super::theme::info(ui.visuals());
-        // On HFS/HFS+ and ProDOS, surface files that will be added without a
-        // resolved type by tinting them blue so the user can fix them before
-        // Apply. HFS: no FInfo + no dict match + no override. ProDOS: type byte
-        // not in the registry.
+        let queue = self.queue();
+        // HFS: no FInfo, no dictionary match, no override. ProDOS: a type byte not in the registry.
         let color = if self.is_hfs_type() && entry.is_file() {
-            let (t, c) = self.staged_edits.resolved_hfs_type_creator(entry);
+            let (t, c) = queue.resolved_hfs_type_creator(entry);
             if t == [0; 4] && c == [0; 4] {
                 blue
             } else {
                 green
             }
         } else if self.is_prodos_type() && entry.is_file() {
-            let (t, _) = metadata_editor::resolved_prodos_type(&self.staged_edits, entry);
-            if !rusty_backup::fs::prodos_types::is_known_type(t) {
+            let (t, _) = metadata_editor::resolved_prodos_type(queue, entry);
+            if !is_known_prodos_type(t) {
                 blue
             } else {
                 green
@@ -1740,36 +1427,21 @@ impl BrowseView {
         } else {
             green
         };
-        let is_selected = self
-            .selected_entry
-            .as_ref()
-            .map(|s| s.path == entry.path)
-            .unwrap_or(false);
-
-        // Look up the staged AddFile for this entry to surface rsrc/type info.
-        let rsrc_badge: Option<String> = self
-            .staged_edits
-            .pending_resource_fork_for(&entry.path)
-            .map(|imp| {
-                let tc = imp
-                    .type_code
-                    .map(|c| String::from_utf8_lossy(&c).to_string());
-                let cc = imp
-                    .creator_code
-                    .map(|c| String::from_utf8_lossy(&c).to_string());
-                let codes = match (tc, cc) {
-                    (Some(t), Some(c)) => format!("{t}/{c} "),
-                    (Some(t), None) => format!("{t} "),
-                    (None, Some(c)) => format!("?/{c} "),
-                    (None, None) => String::new(),
-                };
-                format!(
-                    "[{}+rsrc {}]",
-                    codes,
-                    partition::format_size(imp.data.len() as u64)
-                )
-            });
-
+        let rsrc_badge: Option<String> = queue.pending_resource_fork_for(&entry.path).map(|imp| {
+            let tc = imp
+                .type_code
+                .map(|c| String::from_utf8_lossy(&c).to_string());
+            let cc = imp
+                .creator_code
+                .map(|c| String::from_utf8_lossy(&c).to_string());
+            let codes = match (tc, cc) {
+                (Some(t), Some(c)) => format!("{t}/{c} "),
+                (Some(t), None) => format!("{t} "),
+                (None, Some(c)) => format!("?/{c} "),
+                (None, None) => String::new(),
+            };
+            format!("[{}+rsrc {}]", codes, format_size(imp.data.len() as u64))
+        });
         let label = if entry.is_directory() {
             format!("+ {}", entry.name)
         } else if let Some(ref badge) = rsrc_badge {
@@ -1777,693 +1449,359 @@ impl BrowseView {
         } else {
             format!("+ {}  ({})", entry.name, entry.size_string())
         };
-
-        let text = egui::RichText::new(&label).color(color);
-
-        if entry.is_directory() {
-            // Pending directories collapse open just like real ones, and their
-            // staged children render underneath via recursion.
-            let id = ui.make_persistent_id(("pending-dir", &entry.path));
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                true,
-            );
-            let header_res = ui.horizontal(|ui| {
-                state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-                if ui.selectable_label(is_selected, text).clicked() {
-                    self.selected_entry = Some(entry.clone());
-                    self.content = None;
-                }
-            });
-            state.show_body_indented(&header_res.response, ui, |ui| {
-                let nested = self.staged_edits.pending_adds_for(&entry.path);
-                for child in &nested {
-                    self.render_pending_add_entry(ui, child);
-                }
-            });
-        } else if ui.selectable_label(is_selected, text).clicked() {
-            // Allow selecting pending-add entries (for unstaging via delete)
-            self.selected_entry = Some(entry.clone());
-            self.content = None;
-        }
-    }
-
-    fn load_directory(&mut self, entry: &FileEntry) {
-        if let Some(mut fs) = self.take_or_open_fs() {
-            match fs.list_directory(entry) {
-                Ok(mut entries) => {
-                    rusty_backup::fs::entry::sort_for_display(&mut entries);
-                    self.directory_cache.insert(entry.path.clone(), entries);
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to read {}: {e}", entry.path));
-                }
-            }
-            self.return_fs(fs);
-        }
-    }
-
-    fn select_file(&mut self, entry: &FileEntry) {
-        self.selected_entry = Some(entry.clone());
-        self.content = None;
-        self.error = None;
-
-        // Symlinks: show the target path as text content
-        if entry.is_symlink() {
-            let target = entry
-                .symlink_target
-                .as_deref()
-                .unwrap_or("(unknown target)");
-            self.content = Some(FileContent::Text(format!("Symlink target: {target}")));
-            return;
-        }
-
-        // Special files: no content to preview
-        if entry.is_special() {
-            let stype = entry.special_type.as_deref().unwrap_or("special file");
-            self.content = Some(FileContent::Text(format!(
-                "{} -- no preview available",
-                stype
-            )));
-            return;
-        }
-
-        if entry.size > MAX_PREVIEW_SIZE as u64 {
-            // Don't auto-load large files
-            return;
-        }
-
-        if let Some(mut fs) = self.take_or_open_fs() {
-            match fs.read_file(entry, MAX_PREVIEW_SIZE) {
-                Ok(mut data) => {
-                    if self.fs_type == "QNX 2" && rusty_backup::fs::qnx2::looks_like_rs_text(&data)
-                    {
-                        data = rusty_backup::fs::qnx2::rs_to_lf(&data);
-                    }
-                    self.content = Some(file_detail::detect_content_type(entry, &data));
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to read file: {e}"));
-                }
-            }
-            self.return_fs(fs);
-        }
+        egui::RichText::new(label).color(color)
     }
 
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
-        // Extraction progress bar
-        if let Some(progress) = &self.extraction_progress {
-            if let Ok(p) = progress.lock() {
-                let fraction = if p.total_bytes > 0 {
-                    p.current_bytes as f32 / p.total_bytes as f32
-                } else if p.total_files > 0 {
-                    p.files_extracted as f32 / p.total_files as f32
-                } else {
-                    0.0
-                };
-                let text = format!(
-                    "Extracting {}/{} files: {}",
-                    p.files_extracted, p.total_files, p.current_file
-                );
-                ui.add(egui::ProgressBar::new(fraction).text(text));
-                if !p.finished {
-                    // Clone progress Arc to allow the mutable borrow for the button
-                    let progress_clone = Arc::clone(progress);
-                    drop(p);
-                    if ui.button("Cancel").clicked() {
-                        if let Ok(mut p) = progress_clone.lock() {
-                            p.cancel_requested = true;
-                        }
-                    }
-                    ui.separator();
-                }
-            }
-        }
-
-        // Lazily build the uid/gid -> name map the first time we're about to
-        // show an owner on a Unix filesystem (the selected entry carrying a uid
-        // is the signal). Cached even when empty so we don't reopen every frame.
-        if self.id_names.is_none()
-            && self
-                .selected_entry
-                .as_ref()
-                .map(|e| e.uid.is_some())
-                .unwrap_or(false)
-        {
-            let map = self
-                .session
-                .open()
-                .ok()
-                .map(|mut fs| rusty_backup::fs::id_names::IdNameMap::from_filesystem(&mut *fs))
-                .unwrap_or_default();
-            self.id_names = Some(map);
-        }
-
-        match &self.selected_entry {
-            None => {
+        let entry = self.selected_entry.clone();
+        let shown = self.render_detail(ui, entry.as_ref());
+        // A row inside an expanded archive or image: details only, its actions act on this volume.
+        let Some(entry) = entry else {
+            if !shown {
                 ui.colored_label(
                     super::theme::muted(ui.visuals()),
                     "Select a file to view its contents.",
                 );
             }
-            Some(entry) => {
-                let entry = entry.clone();
-                // Read-only metadata rows (name header + size/modified/type/...).
-                // HFS/HFS+ and ProDOS suppress the inline Type/Creator labels —
-                // they render those in a dedicated editor row below.
-                let suppress_type_creator = self.is_hfs_type() || self.is_prodos_type();
-                file_detail::render_metadata_rows(
-                    ui,
-                    &entry,
-                    suppress_type_creator,
-                    self.id_names.as_ref(),
-                );
-
-                // HFS/HFS+ type/creator row — read-only labels normally, full
-                // editor (text fields + dictionary pulldown) when in edit mode.
-                if self.is_hfs_type() && entry.is_file() {
-                    metadata_editor::render_hfs_type_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.staged_edits,
-                        &mut self.hfs_type_editor,
-                        &mut self.edit_result,
+            return;
+        };
+        // ProDOS/GS-OS leaves $CB..$EE unassigned; vintage apps used them, so say it is not corruption.
+        if self.is_prodos_type() {
+            let tt = entry.prodos_file_type;
+            if let Some(tt) = tt {
+                if !is_known_prodos_type(tt) {
+                    let aux = entry.aux_type.unwrap_or(0);
+                    ui.colored_label(
+                        super::theme::warning(ui.visuals()),
+                        format!(
+                            "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
+                            tt,
+                            PRODOS_UNKNOWN_TYPE_NOTE,
+                            aux,
+                            tt,
+                            aux,
+                        ),
                     );
-                }
-
-                // ProDOS type/aux row — read-only normally, type pulldown + hex
-                // inputs when in edit mode.
-                if self.is_prodos_type() && entry.is_file() {
-                    metadata_editor::render_prodos_type_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.staged_edits,
-                        &mut self.prodos_type_editor,
-                        &mut self.edit_result,
-                    );
-                }
-
-                // ProDOS/GS-OS leaves $CB..$EE unassigned in the official
-                // type registry; vintage apps often picked bytes out of
-                // that range for their own data files. Surface a note so
-                // the user knows the file isn't corrupt — the type and
-                // aux round-trip via the CiderPress #TTAAAA suffix.
-                if self.is_prodos_type() {
-                    let tt = entry.prodos_file_type;
-                    if let Some(tt) = tt {
-                        if !rusty_backup::fs::prodos_types::is_known_type(tt) {
-                            let aux = entry.aux_type.unwrap_or(0);
-                            ui.colored_label(
-                                super::theme::warning(ui.visuals()),
-                                format!(
-                                    "Note: ${:02X} is not in the ProDOS type registry - {}. The type and aux (${:04X}) will be preserved on export via the CiderPress #{:02X}{:04X} filename suffix.",
-                                    tt,
-                                    rusty_backup::fs::prodos_types::UNKNOWN_TYPE_NOTE,
-                                    aux,
-                                    tt,
-                                    aux,
-                                ),
-                            );
-                        }
-                    }
-                }
-
-                // Unix permissions / owner / xattrs. Shown on any filesystem
-                // whose entries carry POSIX metadata (the entry having a `mode`
-                // is the signal). Read-only labels normally; octal / uid-gid /
-                // xattr editors when in edit mode.
-                if entry.mode.is_some() {
-                    metadata_editor::render_ext_permissions_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        &mut self.staged_edits,
-                        &mut self.ext_perms_editor,
-                        &mut self.edit_result,
-                    );
-                    metadata_editor::render_owner_row(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        self.id_names.as_ref(),
-                        &mut self.staged_edits,
-                        &mut self.owner_editor,
-                        &mut self.edit_result,
-                    );
-
-                    // Extended attributes: read the on-disk set once per
-                    // selection on an xattr-bearing filesystem, then let the
-                    // section overlay any staged edits.
-                    let want_xattrs =
-                        self.xattr_cache.as_ref().map(|(p, _)| p) != Some(&entry.path);
-                    if want_xattrs {
-                        let read = self
-                            .session
-                            .open()
-                            .ok()
-                            .filter(|fs| fs.supports_xattrs())
-                            .and_then(|mut fs| fs.list_xattrs(&entry).ok())
-                            .unwrap_or_default();
-                        self.xattr_cache = Some((entry.path.clone(), read));
-                    }
-                    let xattrs = self
-                        .xattr_cache
-                        .as_ref()
-                        .map(|(_, x)| x.as_slice())
-                        .unwrap_or(&[]);
-                    metadata_editor::render_xattr_section(
-                        ui,
-                        &entry,
-                        self.edit_mode,
-                        xattrs,
-                        &mut self.staged_edits,
-                        &mut self.xattr_editor,
-                        &mut self.edit_result,
-                    );
-                }
-
-                // Extract controls row
-                let extraction_running = self.extraction_progress.is_some();
-                let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
-
-                // The Mac-archive workflows only make sense on Mac-native
-                // volumes. Sniff the selection once per change so the
-                // "Save as / Browse archive" buttons appear strictly for
-                // files that are actually archives (preflight, not
-                // error-on-click). The bundling row needs only the
-                // filesystem gate — you can wrap any file/folder.
-                let is_mac_fs = self.is_mac_filesystem();
-                let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
-
-                if is_extractable && !extraction_running {
-                    ui.horizontal(|ui| {
-                        // Resource fork mode dropdown (HFS/HFS+ only)
-                        if self.is_hfs_type() {
-                            ui.label("Resource forks:");
-                            let current_label = self.resource_fork_mode.label();
-                            egui::ComboBox::from_id_salt("rsrc_mode")
-                                .selected_text(current_label)
-                                .show_ui(ui, |ui| {
-                                    for mode in &ResourceForkMode::ALL {
-                                        ui.selectable_value(
-                                            &mut self.resource_fork_mode,
-                                            *mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                        }
-
-                        if self.fs_type == "QNX 2" {
-                            ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
-                                "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
-                            );
-                            ui.add_space(8.0);
-                        }
-
-                        // ProDOS export mode dropdown (ProDOS only)
-                        if self.is_prodos_type() {
-                            ui.label("Export name:");
-                            let current_label = self.prodos_export_mode.label();
-                            egui::ComboBox::from_id_salt("prodos_export_mode")
-                                .selected_text(current_label)
-                                .show_ui(ui, |ui| {
-                                    for mode in &ProdosExportMode::ALL {
-                                        ui.selectable_value(
-                                            &mut self.prodos_export_mode,
-                                            *mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                        }
-
-                        let btn_label = if entry.is_directory() {
-                            "Extract Folder..."
-                        } else {
-                            "Extract File..."
-                        };
-                        if ui.button(btn_label).clicked() {
-                            self.start_extraction(&entry);
-                        }
-
-                        // Archive the selected folder/file to a tar.gz instead
-                        // of laying it out on the host — preserves case +
-                        // symlinks (handy for case-sensitive volumes).
-                        let tgz_label = if entry.is_directory() {
-                            "Export Folder to .tgz..."
-                        } else {
-                            "Export File to .tgz..."
-                        };
-                        if ui
-                            .add_enabled(
-                                self.tar_export_progress.is_none(),
-                                egui::Button::new(tgz_label),
-                            )
-                            .on_hover_text(
-                                "Save the selection as a single .tar.gz / .tar.zst / .tar \
-                                 (preserves exact case + symlinks; pick the extension in \
-                                 the save dialog)",
-                            )
-                            .clicked()
-                        {
-                            self.start_tar_export(&entry);
-                        }
-
-                        if entry.is_file()
-                            && entry.size >= MIN_NESTED_IMAGE_BYTES
-                            && ui
-                                .button("Open as Disk Image")
-                                .on_hover_text(
-                                    "Copy this file to a temporary folder and inspect it as \
-                                     its own disk image, e.g. a ShapeShifter hardfile or a \
-                                     floppy image stored on this volume.",
-                                )
-                                .clicked()
-                        {
-                            self.start_nested_open(&entry);
-                        }
-
-                        // Workflow C: the selection already sniffed as a
-                        // Mac archive (see show_archive_actions), so pop
-                        // the C modal (Save as-is vs Decode-and-save).
-                        if show_archive_actions
-                            && ui
-                                .button("Save as Mac archive...")
-                                .on_hover_text(
-                                    "This file is a Mac archive (BinHex / StuffIt / \
-                                     SEA): open a dialog to either save it raw or \
-                                     decode and save its contents in a fork-preserving \
-                                     container.",
-                                )
-                                .clicked()
-                        {
-                            self.open_archive_extract_modal(&entry);
-                        }
-
-                        // Workflow E: open a floating viewer that lets
-                        // the user browse the archive's entries and
-                        // extract any subset.
-                        if show_archive_actions
-                            && ui
-                                .button("Browse archive...")
-                                .on_hover_text(
-                                    "Open a viewer to browse this Mac archive's entries \
-                                     and extract any subset (per-entry selection, \
-                                     fork-preserving containers).",
-                                )
-                                .clicked()
-                        {
-                            self.open_archive_browse_window(&entry);
-                        }
-                    });
-
-                    // Workflow B: bundle the current selection as a Mac
-                    // archive on the host. BinHex is single-file only;
-                    // SIT / SIT.HQX accept any single entry (folders
-                    // walk recursively). Only offered on Mac volumes,
-                    // where forks / type / creator codes exist to bundle.
-                    if is_mac_fs {
-                        ui.horizontal(|ui| {
-                            ui.label("Export Mac archive:");
-                            let is_single_file = entry.is_file();
-                            if ui
-                                .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
-                                .on_hover_text(
-                                    "Encode the selected file's data fork, resource fork, \
-                                 and type/creator codes as printable ASCII (BinHex 4.0). \
-                                 The only flat format that survives a non-HFS roundtrip.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
-                            }
-                            if ui
-                                .button("StuffIt (.sit)")
-                                .on_hover_text(
-                                    "Multi-file compressed archive in classic StuffIt format. \
-                                 Preserves forks on HFS or inside a .hqx wrapper. \
-                                 Folders walk recursively.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
-                            }
-                            if ui
-                                .button("StuffIt-over-BinHex (.sit.hqx)")
-                                .on_hover_text(
-                                    "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
-                                 The classic \"emailed me a Mac app\" format.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(
-                                    &entry,
-                                    ArchiveExportFormat::SitHqx,
-                                );
-                            }
-                            if ui
-                                .button("MAR (.mar)")
-                                .on_hover_text(
-                                    "Hampa Hug's MAR format: a single file or folder tree with \
-                                 both forks, stored uncompressed. Folders walk recursively; \
-                                 multiple items are wrapped in a folder.",
-                                )
-                                .clicked()
-                            {
-                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Mar);
-                            }
-                        });
-                    }
-                }
-
-                ui.separator();
-
-                if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
-                    ui.label(format!(
-                        "File too large to preview ({}).",
-                        partition::format_size(entry.size)
-                    ));
-                    return;
-                }
-
-                if entry.is_directory() {
-                    return;
-                }
-
-                // Remaining height for the scroll area after the header
-                let content_height = ui.available_height().min(panel_height);
-
-                // Deferred: `self.content` is borrowed for the match below, so
-                // the editor cannot be opened from inside it.
-                let mut open_editor_for: Option<(String, String)> = None;
-
-                match &self.content {
-                    None => {
-                        if entry.is_file() {
-                            ui.spinner();
-                            ui.label("Loading...");
-                        }
-                    }
-                    Some(FileContent::Text(text)) => {
-                        // Editing is offered only where it is safe: a text
-                        // preview means the content decoded cleanly.
-                        if ui.button("Edit as text...").clicked() {
-                            open_editor_for = Some((entry.path.clone(), entry.name.clone()));
-                        }
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_content")
-                            .max_height(content_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut text.as_str())
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace),
-                                );
-                            });
-                    }
-                    Some(FileContent::Binary(data)) => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_content")
-                            .max_height(content_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                file_detail::render_hex_view(ui, data);
-                            });
-                    }
-                }
-                if let Some((path, name)) = open_editor_for.take() {
-                    self.open_text_editor(&path, &name);
                 }
             }
         }
+
+        // Extract controls row
+        let extraction_running = self.extracting;
+        let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
+
+        // The Mac-archive workflows only make sense on Mac-native
+        // volumes. Sniff the selection once per change so the
+        // "Save as / Browse archive" buttons appear strictly for
+        // files that are actually archives (preflight, not
+        // error-on-click). The bundling row needs only the
+        // filesystem gate — you can wrap any file/folder.
+        // The disc browser offers only Extract, as the Optical tab always did.
+        let extras = !self.optical;
+        let is_mac_fs = extras && self.is_mac_filesystem();
+        let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
+
+        if is_extractable && !extraction_running {
+            ui.horizontal(|ui| {
+                // Resource fork mode dropdown (HFS/HFS+ only)
+                if self.is_hfs_type() {
+                    ui.label("Resource forks:");
+                    let current_label = self.resource_fork_mode.label();
+                    egui::ComboBox::from_id_salt("rsrc_mode")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for mode in &ResourceForkMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.resource_fork_mode,
+                                    *mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+
+                if self.fs_type == "QNX 2" {
+                    ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
+                        "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
+                    );
+                    ui.add_space(8.0);
+                }
+
+                // ProDOS export mode dropdown (ProDOS only)
+                if self.is_prodos_type() {
+                    ui.label("Export name:");
+                    let current_label = self.prodos_export_mode.label();
+                    egui::ComboBox::from_id_salt("prodos_export_mode")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for mode in &ProdosExportMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.prodos_export_mode,
+                                    *mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+
+                let btn_label = if entry.is_directory() {
+                    "Extract Folder..."
+                } else {
+                    "Extract File..."
+                };
+                if ui.button(btn_label).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.start_extraction(&ctx, &entry, None);
+                }
+
+                // Archive the selected folder/file to a tar.gz instead
+                // of laying it out on the host — preserves case +
+                // symlinks (handy for case-sensitive volumes).
+                let tgz_label = if entry.is_directory() {
+                    "Export Folder to .tgz..."
+                } else {
+                    "Export File to .tgz..."
+                };
+                if extras
+                    && ui
+                    .add_enabled(
+                        self.ctl.copy_job().is_none(),
+                        egui::Button::new(tgz_label),
+                    )
+                    .on_hover_text(
+                        "Save the selection as a single .tar.gz / .tar.zst / .tar \
+                         (preserves exact case + symlinks; pick the extension in \
+                         the save dialog)",
+                    )
+                    .clicked()
+                {
+                    self.export_entry(ui.ctx(), &entry, ExportFormat::TarGz);
+                }
+
+                if extras
+                    && entry.is_file()
+                    && entry.size >= MIN_NESTED_IMAGE_BYTES
+                    && ui
+                        .button("Open as Disk Image")
+                        .on_hover_text(
+                            "Copy this file to a temporary folder and inspect it as \
+                             its own disk image, e.g. a ShapeShifter hardfile or a \
+                             floppy image stored on this volume.",
+                        )
+                        .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.extracting = true;
+                    self.extraction_result = None;
+                    let act = CommanderAction::Mode(ModeAction::OpenNested(entry.path.clone()));
+                    self.dispatch(&ctx, act);
+                    if self.ctl.copy_job().is_none() {
+                        self.extracting = false;
+                        self.extraction_result = Some(self.ctl.status().to_string());
+                    }
+                }
+
+                // Workflow C: the selection already sniffed as a
+                // Mac archive (see show_archive_actions), so pop
+                // the C modal (Save as-is vs Decode-and-save).
+                if show_archive_actions
+                    && ui
+                        .button("Save as Mac archive...")
+                        .on_hover_text(
+                            "This file is a Mac archive (BinHex / StuffIt / \
+                             SEA): open a dialog to either save it raw or \
+                             decode and save its contents in a fork-preserving \
+                             container.",
+                        )
+                        .clicked()
+                {
+                    self.open_archive_extract_modal(&ui.ctx().clone(), &entry);
+                }
+
+                // Workflow E: open a floating viewer that lets
+                // the user browse the archive's entries and
+                // extract any subset.
+                if show_archive_actions
+                    && ui
+                        .button("Browse archive...")
+                        .on_hover_text(
+                            "Open a viewer to browse this Mac archive's entries \
+                             and extract any subset (per-entry selection, \
+                             fork-preserving containers).",
+                        )
+                        .clicked()
+                {
+                    self.open_archive_browse_window(&ui.ctx().clone(), &entry);
+                }
+            });
+
+            // Workflow B: bundle the current selection as a Mac
+            // archive on the host. BinHex is single-file only;
+            // SIT / SIT.HQX accept any single entry (folders
+            // walk recursively). Only offered on Mac volumes,
+            // where forks / type / creator codes exist to bundle.
+            if is_mac_fs {
+                ui.horizontal(|ui| {
+                    ui.label("Export Mac archive:");
+                    let is_single_file = entry.is_file();
+                    if ui
+                        .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
+                        .on_hover_text(
+                            "Encode the selected file's data fork, resource fork, \
+                         and type/creator codes as printable ASCII (BinHex 4.0). \
+                         The only flat format that survives a non-HFS roundtrip.",
+                        )
+                        .clicked()
+                    {
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::BinHex);
+                    }
+                    if ui
+                        .button("StuffIt (.sit)")
+                        .on_hover_text(
+                            "Multi-file compressed archive in classic StuffIt format. \
+                         Preserves forks on HFS or inside a .hqx wrapper. \
+                         Folders walk recursively.",
+                        )
+                        .clicked()
+                    {
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffIt);
+                    }
+                    if ui
+                        .button("StuffIt-over-BinHex (.sit.hqx)")
+                        .on_hover_text(
+                            "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
+                         The classic \"emailed me a Mac app\" format.",
+                        )
+                        .clicked()
+                    {
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffItHqx);
+                    }
+                    if ui
+                        .button("MAR (.mar)")
+                        .on_hover_text(
+                            "Hampa Hug's MAR format: a single file or folder tree with \
+                         both forks, stored uncompressed. Folders walk recursively; \
+                         multiple items are wrapped in a folder.",
+                        )
+                        .clicked()
+                    {
+                        self.export_entry(ui.ctx(), &entry, ExportFormat::MacArchive);
+                    }
+                });
+            }
+        }
+
+        ui.separator();
+
+        if entry.size > MAX_PREVIEW_SIZE as u64 && entry.is_file() {
+            ui.label(format!(
+                "File too large to preview ({}).",
+                format_size(entry.size)
+            ));
+            return;
+        }
+
+        if entry.is_directory() {
+            return;
+        }
+
+        let content_height = ui.available_height().min(panel_height);
+        if entry.is_symlink() {
+            let target = entry
+                .symlink_target
+                .as_deref()
+                .unwrap_or("(unknown target)");
+            ui.monospace(format!("Symlink target: {target}"));
+            return;
+        }
+        if entry.is_special() {
+            let stype = entry.special_type.as_deref().unwrap_or("special file");
+            ui.label(format!("{stype} -- no preview available"));
+            return;
+        }
+        // Editing is offered only where it is safe: a text preview means the content decoded cleanly.
+        if extras
+            && matches!(self.side_ed.content, Some(FileContent::Text(_)))
+            && ui
+                .add_enabled(self.ctl.edit_mode(), egui::Button::new("Edit as text..."))
+                .on_disabled_hover_text("Turn on Edit Mode to edit this file.")
+                .clicked()
+        {
+            self.open_text_editor();
+        }
+        super::commander::detail_preview(ui, &self.side_ed, "browse", content_height);
+    }
+
+    /// The side panel's File Info for the cursor row: metadata, editors (Edit Mode) and the preview.
+    fn render_detail(&mut self, ui: &mut egui::Ui, entry: Option<&FileEntry>) -> bool {
+        let detail = self.ctl.side_detail(Side::Left);
+        // The root has no row; anything else must be the cursor row the detail follows.
+        let detail = match entry {
+            Some(e) if e.path == "/" => None,
+            Some(e) => detail.filter(|d| d.entry.path == e.path),
+            None => detail.filter(|_| self.cursor_armed),
+        };
+        let Some(d) = detail else {
+            if let Some(e) = entry {
+                file_detail::render_metadata_rows(ui, e, false, None);
+            }
+            return false;
+        };
+        let ed = &mut self.side_ed;
+        if ed.serial != d.serial {
+            *ed = DetailEditors::fresh(d.serial);
+        }
+        if ed.content.is_none() {
+            ed.content = d.preview.as_ref().map(|data| {
+                let shown = preview_bytes(&d.fs_type, data);
+                file_detail::detect_content_type(&d.entry, &shown)
+            });
+        }
+        let mut staged = Vec::new();
+        let queue = &self.ctl.pane(Side::Left).queue;
+        super::commander::detail_meta(ui, d, ed, queue, &mut staged);
+        if entry.is_none() {
+            ui.separator();
+            super::commander::detail_preview(ui, ed, "browse_wrapped", ui.available_height());
+        }
+        for e in staged {
+            self.ctl.apply(CommanderAction::StageMetadata(Box::new(e)));
+        }
+        true
     }
 
     /// Start extracting the selected entry to a user-chosen folder.
     /// A finished "Open as Disk Image" copy: the image path and the temp dir that owns it.
     pub fn take_nested_open(&mut self) -> Option<(PathBuf, tempfile::TempDir)> {
-        self.nested_ready.take()
+        self.ctl.take_nested_open()
     }
 
-    /// Stream `entry` into a fresh temp dir, then hand it to Inspect as a disk image.
-    fn start_nested_open(&mut self, entry: &FileEntry) {
-        if !self.staged_edits.is_empty() {
-            self.extraction_result = Some(
-                "Apply or discard the staged edits first: opening a disk image replaces this view."
-                    .to_string(),
-            );
+    /// Extract `entry` through the screen (a picker unless `dest` is given; existing files are reviewed).
+    fn start_extraction(&mut self, ctx: &egui::Context, entry: &FileEntry, dest: Option<PathBuf>) {
+        if self.ctl.copy_job().is_some() {
             return;
         }
-        let temp = match tempfile::Builder::new().prefix("rb-nested-").tempdir() {
-            Ok(t) => t,
-            Err(e) => {
-                self.extraction_result = Some(format!("Open as disk image failed: {e}"));
-                return;
-            }
+        // An image opened from inside the volume wants its bytes, not its forks.
+        let fork_mode = match dest {
+            Some(_) => ResourceForkMode::DataForkOnly,
+            None => self.resource_fork_mode,
         };
-        let needed = entry.size.saturating_add(NESTED_FREE_MARGIN);
-        if let Some(free) = rusty_backup::os::available_space(temp.path()) {
-            if free < needed {
-                self.extraction_result = Some(format!(
-                    "Not enough free space to open {} as a disk image: it needs {} in {}, \
-                     which has {} free. Point TMPDIR at a larger drive, or extract it instead.",
-                    entry.name,
-                    super::bytes_human(needed),
-                    temp.path().parent().unwrap_or(temp.path()).display(),
-                    super::bytes_human(free),
-                ));
-                return;
-            }
-        }
-        let dest = temp.path().to_path_buf();
-        self.nested_open = Some(temp);
-        let mode = std::mem::replace(&mut self.resource_fork_mode, ResourceForkMode::DataForkOnly);
-        self.launch_extraction(entry.clone(), dest);
-        self.resource_fork_mode = mode;
-    }
-
-    fn start_extraction(&mut self, entry: &FileEntry) {
-        // Pick destination folder
-        let dest = match rfd::FileDialog::new()
-            .set_title("Extract to folder")
-            .pick_folder()
-        {
-            Some(d) => d,
-            None => return,
+        let options = ExtractOptions {
+            fork_mode,
+            prodos_suffix: self.prodos_export_mode == ProdosExportMode::WithTypeSuffix,
+            rs_to_lf: self.rs_to_lf,
         };
-
-        let conflicts = self.detect_extract_conflicts(entry, &dest);
-        if !conflicts.is_empty() {
-            self.pending_extraction = Some(PendingExtraction {
-                entry: entry.clone(),
-                dest,
-                conflicts,
-            });
-            return;
-        }
-
-        self.launch_extraction(entry.clone(), dest);
-    }
-
-    /// Collect existing paths under `dest` that the extraction would overwrite.
-    /// Only top-level collisions are considered (the primary output plus any
-    /// sidecar file for HFS resource-fork modes).
-    fn detect_extract_conflicts(&self, entry: &FileEntry, dest: &std::path::Path) -> Vec<PathBuf> {
-        let base = resource_fork::sanitize_filename(&entry.name);
-        let safe_name = if self.is_prodos_type()
-            && entry.is_file()
-            && self.prodos_export_mode == ProdosExportMode::WithTypeSuffix
-        {
-            let tt = entry.prodos_file_type.unwrap_or(0x06);
-            let aux = entry.aux_type.unwrap_or(0);
-            format!(
-                "{}{}",
-                base,
-                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
-            )
-        } else {
-            base
+        let act = CommanderAction::Extract {
+            from: Side::Left,
+            path: entry.path.clone(),
+            options,
+            dest,
         };
-
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        let has_rsrc = self.is_hfs_type()
-            && entry.is_file()
-            && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
-
-        if has_rsrc && self.resource_fork_mode == ResourceForkMode::MacBinary {
-            candidates.push(dest.join(format!("{safe_name}.bin")));
-        } else if entry.is_file() && self.resource_fork_mode == ResourceForkMode::BinHex {
-            // BinHex packs data + resource fork + Finder info into one .hqx,
-            // regardless of whether a resource fork is present.
-            candidates.push(dest.join(format!("{safe_name}.hqx")));
-        } else {
-            candidates.push(dest.join(&safe_name));
-            if has_rsrc {
-                match self.resource_fork_mode {
-                    ResourceForkMode::AppleDouble => {
-                        candidates.push(dest.join(format!("._{safe_name}")));
-                    }
-                    ResourceForkMode::SeparateRsrc => {
-                        candidates.push(dest.join(format!("{safe_name}.rsrc")));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        candidates.into_iter().filter(|p| p.exists()).collect()
-    }
-
-    /// Spawn the extraction thread. Separated from `start_extraction` so the
-    /// overwrite confirmation dialog can resume it after the user confirms.
-    fn launch_extraction(&mut self, entry: FileEntry, dest: PathBuf) {
-        let session = self.session.clone();
-        let resource_fork_mode = self.resource_fork_mode;
-        let is_prodos = self.is_prodos_type();
-        let prodos_export_mode = self.prodos_export_mode;
-        let rs_to_lf = self.rs_to_lf && self.fs_type == "QNX 2";
-
-        let progress = Arc::new(Mutex::new(ExtractionProgress {
-            current_bytes: 0,
-            total_bytes: 0,
-            current_file: String::new(),
-            files_extracted: 0,
-            files_skipped: 0,
-            total_files: 0,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-        }));
-
-        self.extraction_progress = Some(Arc::clone(&progress));
+        self.extracting = true;
         self.extraction_result = None;
-
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: extract files");
-            let result = run_extraction(
-                &session,
-                &entry,
-                &dest,
-                resource_fork_mode,
-                is_prodos,
-                prodos_export_mode,
-                rs_to_lf,
-                &progress,
-            );
-
-            if let Ok(mut p) = progress.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e}"));
-                }
-            }
-        });
+        self.dispatch(ctx, act);
     }
 
     /// Get the parent entry for the currently selected entry, or root if nothing selected.
@@ -2477,8 +1815,15 @@ impl BrowseView {
                 return parent;
             }
         }
-        // Default to root
-        self.root.clone().unwrap_or_else(FileEntry::root)
+        self.root_entry()
+    }
+
+    /// The volume's root entry as the pane listed it.
+    fn root_entry(&self) -> FileEntry {
+        let pane = self.ctl.pane(Side::Left);
+        pane.entry_at("/")
+            .or_else(|| pane.listing.root_entry())
+            .unwrap_or_else(FileEntry::root)
     }
 
     /// The directory entry holding `path`, from the expanded-directory cache.
@@ -2487,878 +1832,20 @@ impl BrowseView {
             .rsplit_once('/')
             .map(|(p, _)| if p.is_empty() { "/" } else { p })?;
         if parent_path == "/" {
-            return self.root.clone();
+            return Some(self.root_entry());
         }
-        for entries in self.directory_cache.values() {
-            for entry in entries {
-                if entry.path == parent_path && entry.is_directory() {
-                    return Some(entry.clone());
-                }
-            }
-        }
-        None
+        let pane = self.ctl.pane(Side::Left);
+        pane.entry_at(parent_path).filter(|e| e.is_directory())
     }
 
-    /// Start background extraction of an archive to a temp file for editing.
-    fn start_archive_extract(&mut self) {
-        let Some(ctx) = self.archive_edit_ctx.clone() else {
-            return;
-        };
-
-        // Create temp file next to the archive
-        let parent = ctx
-            .archive_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let temp_path = parent.join(format!(
-            "{}-edit.img",
-            ctx.archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-
-        self.archive_edit_progress = Some(archive_edit::start_extract(&ctx, temp_path));
-    }
-
-    /// Start background recompression of the edited temp file back to the archive.
-    fn start_archive_compress(&mut self) {
-        let Some(ctx) = self.archive_edit_ctx.clone() else {
-            return;
-        };
-        let Some(temp_path) = self.archive_temp_path.clone() else {
-            return;
-        };
-
-        // Disable edit mode immediately
-        self.edit_mode = false;
-        self.edit_free_space = None;
-        self.edit_result = None;
-        self.show_new_folder_dialog = false;
-        self.pending_delete = None;
-
-        // Switch browse source back to archive (read-only) — close the browser
-        // while compressing to release the temp file.
-        self.root = None;
-        self.directory_cache.clear();
-        self.selected_entry = None;
-        self.content = None;
-
-        self.archive_edit_progress = Some(archive_edit::start_compress(&ctx, temp_path));
-    }
-
-    /// Point the session at the extracted temp and enter edit mode; also used
-    /// after a failed recompress so the edits there are saved, not re-extracted over.
-    fn adopt_archive_temp(&mut self, temp: PathBuf) {
-        self.archive_temp_path = Some(temp.clone());
-        self.session.source_path = Some(temp);
-        self.session.zstd_cache = None;
-        self.edit_mode = true;
-        self.edit_free_space = None;
-
-        // Re-open filesystem from temp file. Invalidate the cache
-        // first because the source bytes have changed.
-        self.invalidate_cached_fs();
-        match self.session.open() {
-            Ok(mut fs) => {
-                self.fs_type = fs.fs_type().to_string();
-                self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                self.volume_total = fs.total_size();
-                self.volume_used = fs.used_size();
-                self.blessed_folder = fs.blessed_system_folder();
-                if let Ok(root) = fs.root() {
-                    self.root = Some(root);
-                }
-                self.directory_cache.clear();
-                self.expanded_paths.clear();
-                self.selected_entry = None;
-                self.content = None;
-                self.return_fs(fs);
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Error opening temp file: {e}"));
-            }
-        }
-    }
-
-    /// Poll archive edit background operations for completion.
-    fn poll_archive_edit(&mut self, ui: &egui::Ui) {
-        let progress_arc = match &self.archive_edit_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-
-        let Ok(p) = progress_arc.lock() else {
-            return;
-        };
-
-        if !p.finished {
-            ui.ctx().request_repaint();
-            return;
-        }
-
-        let phase = p.phase.clone();
-        let error = p.error.clone();
-        let temp_path = p.temp_path.clone();
-        drop(p);
-
-        self.archive_edit_progress = None;
-
-        if let Some(err) = error {
-            if phase == "Compressing" {
-                // The temp still holds the applied edits: re-adopt it so Close
-                // or Apply Edits can try the save again, not re-extract over it.
-                if let Some(temp) = self.archive_temp_path.clone() {
-                    self.adopt_archive_temp(temp);
-                }
-                self.edit_result = Some(format!(
-                    "Error saving the archive: {err}. Your edits are still in the temporary \
-                     volume; use Close or Apply Edits to try saving again."
-                ));
-            } else {
-                self.edit_result = Some(format!("Error: {err}"));
-            }
-            return;
-        }
-
-        if phase == "Extracting" {
-            // Extraction done — switch source to temp file, enable editing.
-            // `partition_offset` is preserved: the temp file is byte-identical
-            // to the archive's decompressed content, so a partition that lived
-            // at offset N inside the original (e.g. an HFS volume inside a
-            // whole-disk APM CHD) is at offset N in the temp too. Resetting
-            // it to 0 here used to break edits of any non-single-partition
-            // container.
-            if let Some(temp) = temp_path {
-                self.adopt_archive_temp(temp);
-            }
-        } else {
-            // Compression done — re-open original archive for browsing.
-            // Preserve `partition_offset` for the same reason as above: the
-            // recompressed archive's logical bytes match the temp file, so
-            // the partition is still at the original offset.
-            if let Some(ctx) = &self.archive_edit_ctx {
-                self.session.source_path = Some(ctx.archive_path.clone());
-                self.archive_temp_path = None;
-                self.invalidate_cached_fs();
-
-                match self.session.open() {
-                    Ok(mut fs) => {
-                        self.fs_type = fs.fs_type().to_string();
-                        self.volume_label = fs.volume_label().unwrap_or("").to_string();
-                        self.volume_total = fs.total_size();
-                        self.volume_used = fs.used_size();
-                        self.blessed_folder = fs.blessed_system_folder();
-                        if let Ok(root) = fs.root() {
-                            self.root = Some(root);
-                        }
-                        self.directory_cache.clear();
-                        self.expanded_paths.clear();
-                        self.selected_entry = None;
-                        self.content = None;
-                        self.edit_result = Some("Changes saved successfully.".to_string());
-                        self.return_fs(fs);
-                    }
-                    Err(e) => {
-                        self.edit_result =
-                            Some(format!("Saved but failed to re-open archive: {e}"));
-                    }
-                }
-            }
-        }
-    }
-
-    /// True if the current session is editing a CHD file (extension match —
-    /// the chd_edit path covers both compressed and uncompressed CHDs).
-    fn is_chd_source(&self) -> bool {
-        self.session
-            .source_path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("chd"))
-            .unwrap_or(false)
-    }
-
-    /// Diff path for a compressed CHD edit session: sibling `<stem>.edit-diff.chd`.
-    fn diff_path_for(parent: &Path) -> PathBuf {
-        let parent_dir = parent.parent().unwrap_or(Path::new("."));
-        let stem = parent
-            .file_stem()
-            .map(|s| s.to_os_string())
-            .unwrap_or_default();
-        let mut diff_name = stem;
-        diff_name.push(".edit-diff.chd");
-        parent_dir.join(diff_name)
-    }
-
-    /// Open a [`ChdEditSession`] for the current source CHD and install it
-    /// on `self.session.chd_edit_session` so subsequent reads / writes flow
-    /// through the diff (or in-place for uncompressed). Reloads the
-    /// filesystem from the live session so the browser reflects the
-    /// current state. On failure leaves edit_mode false and reports the
-    /// error via `edit_result`.
-    fn enter_chd_edit_mode(&mut self) {
-        let Some(parent_path) = self.session.source_path.clone() else {
-            self.edit_result = Some("Error: no source path".to_string());
-            return;
-        };
-
-        // Backup copy first — preserves the original CHD as `<name>.chd_backup`
-        // so the user has an easy revert point. No-op if the backup already
-        // exists from a previous edit session.
-        if let Err(e) = make_backup_copy(&parent_path) {
-            self.edit_result = Some(format!("Error creating backup: {e}"));
-            return;
-        }
-
-        let compressed = match is_compressed_chd(&parent_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.edit_result = Some(format!("Error inspecting CHD: {e}"));
-                return;
-            }
-        };
-
-        let (session, diff_path) = if compressed {
-            let diff = Self::diff_path_for(&parent_path);
-            let res = if diff.exists() {
-                ChdEditSession::reopen_with_diff(&parent_path, &diff)
-            } else {
-                ChdEditSession::open_with_diff(&parent_path, &diff)
-            };
-            match res {
-                Ok(s) => (s, Some(diff)),
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening CHD diff: {e}"));
-                    return;
-                }
-            }
-        } else {
-            match ChdEditSession::open_uncompressed(&parent_path) {
-                Ok(s) => (s, None),
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening CHD: {e}"));
-                    return;
-                }
-            }
-        };
-
-        let arc = Arc::new(Mutex::new(session));
-        self.session.chd_edit_session = Some(Arc::clone(&arc));
-        self.chd_edit = Some(ChdEditState {
-            parent_path,
-            diff_path,
-        });
-        self.edit_mode = true;
-        self.edit_free_space = None;
-
-        // Reload the filesystem through the session so any pre-existing
-        // diff content is visible.
-        self.invalidate_all_caches();
-        log::info!(
-            "Entered CHD edit mode (compressed={compressed}, diff={})",
-            self.chd_edit
-                .as_ref()
-                .and_then(|s| s.diff_path.as_ref())
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none>".into())
-        );
-    }
-
-    /// Discard the live CHD edit session, deleting the diff (if any). The
-    /// parent CHD is left untouched. Caller is responsible for any UI state
-    /// transitions (clearing `edit_mode`, etc.).
-    fn discard_chd_edit_session(&mut self) {
-        self.chd_diff_dirty = false;
-        self.session.chd_edit_session = None;
-        if let Some(state) = self.chd_edit.take() {
-            if let Some(diff) = state.diff_path {
-                if diff.exists() {
-                    let _ = std::fs::remove_file(&diff);
-                }
-            }
-        }
-    }
-
-    /// Apply the current CHD edit session by flattening the diff back into
-    /// the parent CHD. For uncompressed CHDs there's no diff — writes were
-    /// already in place — so this just drops the session and reloads.
-    /// Compressed CHDs spawn a background worker that calls
-    /// `flatten_to_parent`; progress is polled by `poll_chd_flatten`.
-    fn start_chd_flatten(&mut self) {
-        // The diff is being committed to the parent; nothing is unsaved now.
-        self.chd_diff_dirty = false;
-        let Some(state) = self.chd_edit.take() else {
-            return;
-        };
-
-        // Drop the session so the diff handle is released before flatten
-        // re-opens it via `reopen_with_diff`.
-        self.session.chd_edit_session = None;
-
-        let Some(diff_path) = state.diff_path else {
-            // Uncompressed: writes already landed in the parent. Just reload.
-            self.invalidate_all_caches();
-            self.edit_result = Some("Changes saved successfully.".to_string());
-            return;
-        };
-
-        let parent_path = state.parent_path;
-        let total = std::fs::metadata(&diff_path).map(|m| m.len()).unwrap_or(0);
-
-        let progress = Arc::new(Mutex::new(ChdFlattenProgress {
-            current: 0,
-            total,
-            finished: false,
-            error: None,
-            cancel_requested: false,
-        }));
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: CHD diff flatten");
-            let cancel = {
-                let p = Arc::clone(&progress_thread);
-                move || p.lock().map(|g| g.cancel_requested).unwrap_or(false)
-            };
-            let result = chd_edit::flatten_to_parent(
-                &parent_path,
-                &diff_path,
-                None,
-                &mut |bytes| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.current = bytes;
-                    }
-                },
-                &cancel,
-                &mut |msg| log::info!("{msg}"),
-            );
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
-                }
-            }
-        });
-        self.chd_flatten_progress = Some(progress);
-    }
-
-    /// Poll the background CHD flatten worker. On completion, reload the
-    /// filesystem from the freshly-merged parent CHD.
-    fn poll_chd_flatten(&mut self, ui: &egui::Ui) {
-        let progress_arc = match &self.chd_flatten_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-        let Ok(p) = progress_arc.lock() else { return };
-        if !p.finished {
-            ui.ctx().request_repaint();
-            return;
-        }
-        let error = p.error.clone();
-        drop(p);
-        self.chd_flatten_progress = None;
-
-        if let Some(err) = error {
-            self.edit_result = Some(format!("Error flattening CHD: {err}"));
-            return;
-        }
-        // Re-open the now-replaced parent CHD for browsing.
-        self.invalidate_all_caches();
-
-        // If the CHD is the body of a single-file-chd backup, refresh
-        // metadata.json so per-partition checksums + container SHA-1 stay
-        // in sync with the new container contents. Best-effort: failure
-        // surfaces in the edit result but doesn't roll back the save —
-        // the bytes on disk are already correct.
-        let mut result_msg = String::from("Changes saved successfully.");
-        if let Some(folder) = self.single_file_chd_backup_folder.clone() {
-            let mut log_lines: Vec<String> = Vec::new();
-            let mut log_cb = |s: &str| log_lines.push(s.to_string());
-            match rusty_backup::backup::single_file_chd::refresh_metadata_after_edit(
-                &folder,
-                &mut log_cb,
-            ) {
-                Ok(()) => {
-                    result_msg.push_str(" Backup metadata.json refreshed.");
-                }
-                Err(e) => {
-                    result_msg.push_str(&format!(
-                        " (Warning: failed to refresh backup metadata.json: {e:#})"
-                    ));
-                }
-            }
-        }
-        self.edit_result = Some(result_msg);
-    }
-
-    /// Spawn a background job that archives the whole volume to a
-    /// `.tar.gz` / `.tar.zst` / `.tar` chosen via a save dialog. Compression
-    /// is inferred from the chosen extension. Real symlinks and
-    /// case-sensitive names are preserved (data fork only). Progress is
-    /// polled by [`Self::poll_tar_export`].
-    /// Archive `target` (the whole volume when its path is `/`, otherwise the
-    /// selected folder or file) to a `.tar.gz` / `.tar.zst` / `.tar` chosen
-    /// via a save dialog. A subtree is rooted under its own basename in the
-    /// archive (like `tar`); a single file becomes a one-entry archive.
-    fn start_tar_export(&mut self, target: &FileEntry) {
-        let whole_volume = target.path == "/";
-        let default_name = if whole_volume {
-            let base = self
-                .session
-                .source_path
-                .as_ref()
-                .and_then(|p| p.file_stem())
-                .and_then(|s| s.to_str())
-                .unwrap_or("volume");
-            format!("{base}.tar.gz")
-        } else {
-            format!("{}.tar.gz", target.name)
-        };
-        let title = if target.is_directory() {
-            "Export folder to tar archive"
-        } else {
-            "Export file to tar archive"
-        };
-        let path = match super::file_dialog()
-            .set_title(title)
-            .set_file_name(&default_name)
-            .save_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-        // A subtree roots its entries under its own name; the whole volume
-        // and single files sit at the archive top level.
-        let archive_prefix = if target.is_directory() && !whole_volume {
-            target.name.clone()
-        } else {
-            String::new()
-        };
-        let target = target.clone();
-        let compression = rusty_backup::fs::tar_export::TarCompression::infer_from_path(&path);
-        let session = self.session.clone();
-        let progress = Arc::new(Mutex::new(TarExportProgress {
-            files: 0,
-            dirs: 0,
-            symlinks: 0,
-            bytes: 0,
-            finished: false,
-            error: None,
-            out_path: path.clone(),
-        }));
-        let progress_thread = Arc::clone(&progress);
-        std::thread::spawn(move || {
-            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: tar export");
-            let result = (|| -> anyhow::Result<()> {
-                let mut fs = session
-                    .open()
-                    .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
-                // Re-fetch the root fresh on the worker's own fs instance; a
-                // subtree/file uses the selected entry directly (its on-disk
-                // identity is stable across fs instances of the same image).
-                let root = if whole_volume {
-                    fs.root()
-                        .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
-                } else {
-                    target
-                };
-                let file = std::fs::File::create(&path)
-                    .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
-                let out = std::io::BufWriter::new(file);
-                let opts = rusty_backup::fs::tar_export::TarExportOptions::default();
-                let cb = |s: &rusty_backup::fs::tar_export::TarExportStats| {
-                    if let Ok(mut p) = progress_thread.lock() {
-                        p.files = s.files;
-                        p.dirs = s.dirs;
-                        p.symlinks = s.symlinks;
-                        p.bytes = s.total_bytes;
-                    }
-                };
-                rusty_backup::fs::tar_export::export_tar(
-                    &mut *fs,
-                    &root,
-                    &archive_prefix,
-                    out,
-                    compression,
-                    &opts,
-                    &cb,
-                )?;
-                Ok(())
-            })();
-            if let Ok(mut p) = progress_thread.lock() {
-                p.finished = true;
-                if let Err(e) = result {
-                    p.error = Some(format!("{e:#}"));
-                }
-            }
-        });
-        self.tar_export_progress = Some(progress);
-    }
-
-    /// Poll the background tar-export worker: show a spinner while running,
-    /// and surface the result when it finishes.
-    /// Enter Edit Mode on a raw image / device, probing the editable open
-    /// up-front so guards like the journaled-HFS+ refusal surface here rather
-    /// than being deferred to the first edit.
-    fn enter_direct_edit_mode(&mut self) {
-        match self.session.open_editable() {
-            // Probe only: discard the fs + commit guard (no mutation, so a
-            // container is left intact).
-            Ok((_efs, _commit)) => {
-                self.edit_mode = true;
-                self.edit_free_space = None;
-            }
-            Err(e) => {
-                self.error = Some(format!("Cannot enter edit mode: {e}"));
-            }
-        }
-    }
-
-    /// Open the size-budget dialog when this volume is a SquashFS that hasn't
-    /// been given a budget yet. Returns true when the dialog took over, meaning
-    /// the caller must not enter Edit Mode — [`Self::poll_squashfs_budget_dialog`]
-    /// does that once the user has chosen.
-    ///
-    /// Measuring walks the directory tree for file sizes only (no content is
-    /// decompressed), so this stays cheap even on a distro rootfs.
-    fn open_squashfs_budget_dialog(&mut self) -> bool {
-        if self.fs_type != "SquashFS" || self.session.rebuild_budget.is_some() {
-            return false;
-        }
-        let mut fs = match self.session.open() {
-            Ok(fs) => fs,
-            Err(e) => {
-                self.error = Some(format!("Cannot measure this image: {e}"));
-                return true;
-            }
-        };
-        let image_len = rusty_backup::fs::squashfs_write::image_footprint(fs.total_size());
-        // A partition bounds the image; a bare file at byte 0 is the image.
-        let capacity = (self.session.partition_offset != 0)
-            .then_some(self.session.partition_size)
-            .flatten();
-        match rusty_backup::fs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
-            Ok(plan) => {
-                self.squashfs_budget_dialog = Some(Box::new(
-                    super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
-                ));
-            }
-            Err(e) => self.error = Some(format!("Cannot measure this image: {e}")),
-        }
-        true
-    }
-
-    /// Draw the budget dialog and act on its outcome: a chosen budget is
-    /// installed on the session and Edit Mode is entered; cancelling just
-    /// closes, leaving the volume read-only.
+    /// Draw the size-budget dialog while the controller asks; Start enters Edit Mode.
     fn poll_squashfs_budget_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(dialog) = self.squashfs_budget_dialog.as_mut() else {
+        let Some(form) = self.ctl.size_budget().copied() else {
             return;
         };
-        dialog.show(ui.ctx());
-        let outcome = dialog.take_outcome();
-        let closed = dialog.is_closed();
-        if let Some(budget) = outcome {
-            self.session.rebuild_budget = budget;
-            self.squashfs_budget_dialog = None;
-            self.enter_direct_edit_mode();
-        } else if closed {
-            self.squashfs_budget_dialog = None;
-        }
-    }
-
-    fn poll_tar_export(&mut self, ui: &mut egui::Ui) {
-        let arc = match &self.tar_export_progress {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-        let Ok(p) = arc.lock() else { return };
-        if !p.finished {
-            ui.ctx().request_repaint();
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!(
-                    "Exporting archive... {} files, {} dirs, {} symlinks",
-                    p.files, p.dirs, p.symlinks
-                ));
-            });
-            return;
-        }
-        let error = p.error.clone();
-        let (files, dirs, symlinks, bytes) = (p.files, p.dirs, p.symlinks, p.bytes);
-        let out = p.out_path.clone();
-        drop(p);
-        self.tar_export_progress = None;
-        match error {
-            Some(e) => self.error = Some(format!("Tar export failed: {e}")),
-            None => {
-                self.edit_result = Some(format!(
-                    "Wrote {} ({} files, {} dirs, {} symlinks, {})",
-                    out.display(),
-                    files,
-                    dirs,
-                    symlinks,
-                    partition::format_size(bytes),
-                ));
-            }
-        }
-    }
-
-    /// Pick a host `.tar.gz` / `.tar.zst` / `.tar` and preflight it against
-    /// the current volume. If the import would lose content (dropped
-    /// symlinks, names this FS can't store), stash it for a confirmation
-    /// modal; otherwise import straight away. Imports into the directory the
-    /// user is currently editing.
-    fn start_tar_import_dialog(&mut self) {
-        let path = match rfd::FileDialog::new()
-            .set_title("Import a tar archive into this volume")
-            .add_filter("tar archive", &["gz", "tgz", "tar", "zst"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-        self.begin_tar_import_from_path(&path);
-    }
-
-    /// Preflight `path` against the current volume and either import it
-    /// straight away (lossless) or stash it for the confirmation modal
-    /// (`render_tar_import_dialog`) when content would be skipped/dropped.
-    /// Shared by the "Import Archive..." button and the add/drop auto-route.
-    fn begin_tar_import_from_path(&mut self, path: &std::path::Path) {
-        // Preflight read-only: open editable (for capability + name checks),
-        // scan, then drop without committing.
-        let preflight = {
-            let (efs, _commit) = match self.session.open_editable() {
-                Ok(pair) => pair,
-                Err(e) => {
-                    self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                    return;
-                }
-            };
-            let opts = rusty_backup::fs::tar_import::TarImportOptions {
-                conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
-                ..Default::default()
-            };
-            match rusty_backup::fs::tar_import::preflight_tar_from_path(&*efs, path, &opts) {
-                Ok(pf) => pf,
-                Err(e) => {
-                    self.edit_result = Some(format!("Could not read archive: {e:#}"));
-                    return;
-                }
-            }
-        };
-
-        if preflight.has_warnings() {
-            self.pending_tar_import = Some(PendingTarImport {
-                archive_path: path.to_path_buf(),
-                preflight,
-            });
-        } else {
-            self.run_tar_import(path);
-        }
-    }
-
-    /// Import `archive` into the current directory. Existing names are
-    /// skipped (not overwritten); macOS `._*` sidecars are dropped. Writes
-    /// immediately (not staged), then reloads the view.
-    fn run_tar_import(&mut self, archive: &std::path::Path) {
-        let dest = self.current_parent_entry();
-        let (mut efs, commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                return;
-            }
-        };
-        let opts = rusty_backup::fs::tar_import::TarImportOptions {
-            conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
-            ..Default::default()
-        };
-        let stats = match rusty_backup::fs::tar_import::import_tar_from_path(
-            &mut *efs,
-            &dest,
-            archive,
-            &opts,
-            &|_| {},
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                self.edit_result = Some(format!("Import failed: {e:#}"));
-                return;
-            }
-        };
-        if let Err(e) = efs.sync_metadata() {
-            self.edit_result = Some(format!("Error saving to disk: {e}"));
-            return;
-        }
-        drop(efs);
-        if let Err(e) = commit.commit() {
-            self.edit_result = Some(format!("Error writing container: {e}"));
-            return;
-        }
-
-        let mut msg = format!(
-            "Imported {} files, {} dirs, {} symlinks into /{}",
-            stats.files,
-            stats.dirs_created,
-            stats.symlinks,
-            if dest.path == "/" {
-                String::new()
-            } else {
-                dest.name.clone()
-            }
-        );
-        if stats.symlinks_skipped > 0 {
-            msg.push_str(&format!("; {} symlink(s) skipped", stats.symlinks_skipped));
-        }
-        if stats.appledouble_skipped > 0 {
-            msg.push_str(&format!(
-                "; {} ._ sidecar(s) skipped",
-                stats.appledouble_skipped
-            ));
-        }
-        if stats.appledouble_paired > 0 {
-            msg.push_str(&format!(
-                "; {} ._ sidecar(s) joined to their file",
-                stats.appledouble_paired
-            ));
-        }
-        if stats.invalid_names_skipped > 0 {
-            msg.push_str(&format!(
-                "; {} bad-name entr(ies) skipped",
-                stats.invalid_names_skipped
-            ));
-        }
-        if stats.skipped_existing > 0 {
-            msg.push_str(&format!("; {} already existed", stats.skipped_existing));
-        }
-        self.edit_result = Some(msg);
-        self.invalidate_all_caches();
-        self.invalidate_cached_fs();
-    }
-
-    /// Modal shown when a tar archive is added/dropped as a host file: import
-    /// its contents into the current folder, or add the archive as a plain
-    /// file. Mirrors the Mac-archive add flow.
-    fn render_tar_add_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(path) = self.pending_tar_add.clone() else {
-            return;
-        };
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("archive")
-            .to_string();
-        let mut open = true;
-        let mut decision: Option<u8> = None; // 0=import, 1=add-as-file, 2=cancel
-        egui::Window::new("Tar archive")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(460.0)
-            .show(ui.ctx(), |ui| {
-                ui.label(format!("\"{name}\" is a tar archive."));
-                ui.add_space(4.0);
-                ui.label(
-                    "Import its contents into the current folder, or add the \
-                     archive itself as a file?",
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Import contents").clicked() {
-                        decision = Some(0);
-                    }
-                    if ui.button("Add as file").clicked() {
-                        decision = Some(1);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(2);
-                    }
-                });
-            });
-        if !open {
-            decision = Some(2);
-        }
-        match decision {
-            Some(0) => {
-                self.pending_tar_add = None;
-                self.begin_tar_import_from_path(&path);
-            }
-            Some(1) => {
-                self.pending_tar_add = None;
-                let parent = self.current_parent_entry();
-                match self.add_host_file(&path, &parent) {
-                    Ok(()) => self.edit_result = Some(format!("Staged \"{name}\" as a file")),
-                    Err(e) => self.edit_result = Some(format!("Could not add \"{name}\": {e}")),
-                }
-            }
-            Some(_) => self.pending_tar_add = None, // cancel / window closed
-            None => {}
-        }
-    }
-
-    /// Modal shown when a tar import's preflight found content the target
-    /// filesystem can't represent. Continue runs the (lossy) import; Cancel
-    /// abandons it.
-    fn render_tar_import_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(pending) = self.pending_tar_import.clone() else {
-            return;
-        };
-        let mut open = true;
-        let mut decision: Option<bool> = None; // Some(true)=continue, Some(false)=cancel
-        egui::Window::new("Import archive - some content can't be kept")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(520.0)
-            .show(ui.ctx(), |ui| {
-                ui.colored_label(
-                    super::theme::warning(ui.visuals()),
-                    format!(
-                        "This [{}] volume can't store everything in the archive:",
-                        self.fs_type
-                    ),
-                );
-                ui.add_space(4.0);
-                for w in pending.preflight.warnings() {
-                    ui.label(format!("- {w}"));
-                }
-                if pending.preflight.appledouble > 0 {
-                    ui.label(format!(
-                        "- {} macOS ._ sidecar(s) will be skipped.",
-                        pending.preflight.appledouble
-                    ));
-                }
-                ui.add_space(6.0);
-                ui.label(format!(
-                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
-                    pending.preflight.files, pending.preflight.dirs
-                ));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Continue").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        if !open {
-            decision = Some(false);
-        }
-        match decision {
-            Some(true) => {
-                self.pending_tar_import = None;
-                self.run_tar_import(&pending.archive_path);
-            }
-            Some(false) => {
-                self.pending_tar_import = None;
-                self.edit_result = Some("Archive import cancelled.".to_string());
-            }
-            None => {}
+        let ctx = ui.ctx().clone();
+        for edit in super::squashfs_budget_dialog::show(&ctx, &form) {
+            self.dispatch(&ctx, CommanderAction::Mode(ModeAction::Budget(edit)));
         }
     }
 
@@ -3379,70 +1866,32 @@ impl BrowseView {
             ui.add_space(8.0);
 
             if ui.button("Add File...").clicked() {
-                self.add_file_dialog();
+                self.add_file_dialog(&ui.ctx().clone());
             }
 
             // Import a host .tar.gz / .tar.zst / .tar into the current
             // directory. Runs a preflight first and prompts if the target
             // filesystem can't represent some of the archive's content.
             if ui.button("Import Archive...").clicked() {
-                self.start_tar_import_dialog();
+                self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ImportTar);
             }
 
             // Alto BFS has a flat namespace — no subdirectories to create.
             if self.fs_type != "Alto BFS" && ui.button("New Folder...").clicked() {
-                self.new_folder_name.clear();
-                self.show_new_folder_dialog = true;
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::RequestNewFolder);
+                let fx = self.ctl.apply(act);
+                self.run_effects(&ui.ctx().clone(), fx);
             }
 
-            // Delete button (enabled when something is selected)
-            let has_selection = self.selected_entry.is_some()
-                && self
-                    .selected_entry
-                    .as_ref()
-                    .map(|e| e.path != "/")
-                    .unwrap_or(false);
+            // Delete acts on the marks, else the cursor row; a full folder asks first.
+            let has_selection = self.selected_entry.as_ref().is_some_and(|e| e.path != "/");
+            let deletable = has_selection || self.ctl.pane(Side::Left).has_selection();
             if ui
-                .add_enabled(has_selection, egui::Button::new("Delete"))
+                .add_enabled(deletable, egui::Button::new("Delete"))
                 .clicked()
             {
-                if let Some(ref sel) = self.selected_entry.clone() {
-                    // If it's a pending-add, just remove it from staged_edits.
-                    // For pending directories, also drop every nested staged
-                    // edit so we don't leave AddFile orphans whose parent.path
-                    // no longer resolves at apply time.
-                    if self.staged_edits.is_pending_add(&sel.path) {
-                        let removed = if sel.is_directory() {
-                            self.staged_edits.remove_pending_subtree(&sel.path)
-                        } else {
-                            self.staged_edits.remove_pending_add(&sel.path) as usize
-                        };
-                        self.edit_result = if sel.is_directory() && removed > 1 {
-                            Some(format!(
-                                "Unstaged '{}' and {} nested edit(s)",
-                                sel.name,
-                                removed - 1
-                            ))
-                        } else {
-                            Some(format!("Unstaged '{}'", sel.name))
-                        };
-                        self.selected_entry = None;
-                        self.content = None;
-                    } else {
-                        // The selection's own parent: a selected directory is
-                        // not its own parent.
-                        let parent = self
-                            .parent_entry_of_path(&sel.path)
-                            .unwrap_or_else(|| self.root.clone().unwrap_or_else(FileEntry::root));
-                        let is_non_empty_dir = sel.is_directory()
-                            && self
-                                .directory_cache
-                                .get(&sel.path)
-                                .map(|c| !c.is_empty())
-                                .unwrap_or(true); // assume non-empty if not cached
-                        self.pending_delete = Some((parent, sel.clone(), is_non_empty_dir));
-                    }
-                }
+                let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::Delete);
+                self.dispatch(&ui.ctx().clone(), act);
             }
 
             // Set ProDOS Type… button (ProDOS only, file selected)
@@ -3463,11 +1912,7 @@ impl BrowseView {
                     )
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits
-                            .push(StagedEdit::BlessFolder { entry: sel.clone() });
-                        self.edit_result = Some(format!("Staged bless folder '{}'", sel.name));
-                    }
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Bless);
                 }
 
                 // Boot Blocks... — copy the 1024-byte boot loader from a
@@ -3490,7 +1935,7 @@ impl BrowseView {
                     .on_hover_text(boot_hint)
                     .clicked()
                 {
-                    self.boot_blocks_dialog();
+                    self.pane_act(&ui.ctx().clone(), BrowserPaneAction::BootBlocks);
                 }
             }
 
@@ -3508,20 +1953,14 @@ impl BrowseView {
                     .on_hover_text("Set the ProDOS access byte to $21 (read + backup only).")
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits.replace_set_prodos_access(sel, 0x21);
-                        self.edit_result = Some(format!("Staged lock '{}'", sel.name));
-                    }
+                    self.prodos_lock(&ui.ctx().clone(), true);
                 }
                 if ui
                     .add_enabled(can_lock, egui::Button::new("Unlock"))
                     .on_hover_text("Set the ProDOS access byte to $C3 (read/write/destroy/rename).")
                     .clicked()
                 {
-                    if let Some(ref sel) = self.selected_entry.clone() {
-                        self.staged_edits.replace_set_prodos_access(sel, 0xC3);
-                        self.edit_result = Some(format!("Staged unlock '{}'", sel.name));
-                    }
+                    self.prodos_lock(&ui.ctx().clone(), false);
                 }
             }
 
@@ -3531,939 +1970,123 @@ impl BrowseView {
 
             // Apply button: only with staged edits, and not while an extraction
             // or tar export is still reading the volume the apply would rewrite.
-            if !self.staged_edits.is_empty() {
-                let label = format!("Apply Edits ({})", self.staged_edits.len());
-                let reading =
-                    self.extraction_progress.is_some() || self.tar_export_progress.is_some();
+            if !self.ctl.pane(Side::Left).queue.is_empty() {
+                let label = format!("Apply Edits ({})", self.ctl.pane(Side::Left).queue.len());
+                let reading = self.extracting || self.exporting;
                 if ui
                     .add_enabled(!reading, egui::Button::new(label))
                     .on_disabled_hover_text("Wait for the running extraction or export to finish")
                     .clicked()
                 {
-                    let applied = self.apply_staged_edits();
-                    if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
-                        self.start_archive_compress();
-                    }
+                    self.dispatch(&ui.ctx().clone(), CommanderAction::Mode(ModeAction::Apply));
                 }
             }
 
             ui.add_space(8.0);
 
-            // Free space, probed once per edit session and again after each write:
-            // opening the editable volume decodes a whole container.
-            if self.edit_free_space.is_none() {
-                self.edit_free_space = Some(
-                    self.session
-                        .open_editable()
-                        .ok()
-                        .and_then(|(mut efs, _commit)| efs.free_space().ok()),
-                );
-            }
-            if let Some(Some(free)) = self.edit_free_space {
-                ui.label(format!("Free: {}", partition::format_size(free)));
-
-                if !self.staged_edits.is_empty() {
-                    let delta = self.staged_edits.space_delta();
-                    let projected = free.saturating_add(delta.freed).saturating_sub(delta.added);
-                    let color = if delta.added > free + delta.freed {
-                        super::theme::danger(ui.visuals()) // red — won't fit
-                    } else if projected < free / 10 {
-                        super::theme::warning(ui.visuals()) // yellow — tight
+            // Free space, probed in a job once per edit session and again after each write.
+            if let Some(space) = self.ctl.space() {
+                ui.label(format!("Free: {}", format_size(space.free)));
+                if let Some(after) = space.after {
+                    let color = if space.overflows {
+                        super::theme::danger(ui.visuals())
+                    } else if space.tight {
+                        super::theme::warning(ui.visuals())
                     } else {
-                        super::theme::success(ui.visuals()) // green — ok
+                        super::theme::success(ui.visuals())
                     };
-                    ui.colored_label(
-                        color,
-                        format!("After: {}", partition::format_size(projected)),
-                    );
+                    ui.colored_label(color, format!("After: {}", format_size(after)));
                 }
             }
         });
     }
 
-    /// Show the "Add File" file picker dialog and add files.
-    fn add_file_dialog(&mut self) {
-        let files = rfd::FileDialog::new()
-            .set_title("Select files to add")
-            .pick_files();
-
-        if let Some(paths) = files {
-            self.add_host_paths(&paths);
-        }
+    /// Stage the cursor entry's ProDOS lock through the pane; its status line is the result.
+    fn prodos_lock(&mut self, ctx: &egui::Context, locked: bool) {
+        self.pane_act(ctx, BrowserPaneAction::SetProdosLock(locked));
+        self.edit_result = Some(self.ctl.status().to_string());
     }
 
-    /// Pick a bootable donor disk and stage copying its 1024-byte boot-block
-    /// region into sector 0 of the current volume. Together with "Bless
-    /// Folder" this makes a bare classic-HFS volume (e.g. an edited
-    /// infinite-mac data disk) bootable. The donor's HFS volume is
-    /// auto-located and its `'LK'` signature validated before staging.
-    fn boot_blocks_dialog(&mut self) {
-        let donor = match rfd::FileDialog::new()
-            .set_title("Select a bootable donor disk to copy boot blocks from")
-            .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-
-        match rusty_backup::fs::hfs_boot::read_donor_boot_blocks_from_image(&donor) {
-            Ok(d) => {
-                self.staged_edits
-                    .push(StagedEdit::WriteBootBlocks { blocks: d.blocks });
-                let donor_name = donor
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("donor");
-                self.edit_result = Some(format!(
-                    "Staged boot blocks from '{donor_name}'. Apply Edits to write them."
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Boot blocks: {e}"));
-            }
+    /// Open the "Add File" picker; [`Self::show`] adds the files once it answers.
+    fn add_file_dialog(&mut self, ctx: &egui::Context) {
+        if self.add_files.is_some() {
+            return;
         }
+        let dialog = rfd::AsyncFileDialog::new().set_title("Select files to add");
+        self.add_files = picker::paths(ctx, dialog);
     }
 
-    /// Stage files/folders from host paths for adding to the current directory.
-    ///
-    /// Individual failures (invalid filename, IO error, …) are collected into
-    /// `staging_errors` and surfaced via the staging-errors modal dialog. The
-    /// rest of the batch is still staged so the user does not lose successful
-    /// items just because one file had a bad name.
-    fn add_host_paths(&mut self, paths: &[PathBuf]) {
-        let parent = self.current_parent_entry();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        let mut staged_count = 0usize;
-
-        for path in paths {
-            if path.is_dir() {
-                staged_count += self.stage_host_directory(path, &parent, &mut errors);
-            } else if path.is_file() {
-                staged_count += self.stage_host_file(path, &parent, &mut errors);
-            }
-        }
-
-        if !errors.is_empty() {
-            self.staging_errors = errors;
-            self.show_staging_errors = true;
-            self.edit_result = Some(format!(
-                "Staged {staged_count} item(s); {} failed - see dialog",
-                self.staging_errors.len()
-            ));
-        } else if staged_count > 0 {
-            self.edit_result = Some(format!("Staged {staged_count} item(s)"));
-        }
-    }
-
-    /// Try to stage a single host file, pushing any error into `errors`.
-    /// Returns 1 on success, 0 on failure/skip.
-    fn stage_host_file(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-        errors: &mut Vec<(PathBuf, String)>,
-    ) -> usize {
-        // Tar archives (.tar / .tar.gz / .tar.zst), content-sniffed so a gzip
-        // disk image isn't mistaken for one: intercept before staging and let
-        // the modal ask whether to import the contents into the image or add
-        // the archive as a plain file. Works on any editable filesystem.
-        if rusty_backup::fs::tar_import::looks_like_tar_archive(host_path) {
-            self.pending_tar_add = Some(host_path.to_path_buf());
-            return 1;
-        }
-
-        // Workflow A: if the target FS is HFS/HFS+ and the file's bytes
-        // sniff as a Mac archive, intercept before staging — the modal
-        // asks the user whether to convert/expand the archive or add it
-        // as-is. Non-HFS targets don't have a resource-fork story so
-        // they fall through to the existing add-as-binary path.
-        if self.is_hfs_type() && self.queue_archive_import_if_applicable(host_path, parent) {
-            return 1;
-        }
-        // Silently skip resource fork sidecars — they'll be consumed
-        // with their primary file.
-        if resource_fork::is_resource_fork_sidecar(host_path) {
-            return 0;
-        }
-        match self.add_host_file(host_path, parent) {
-            Ok(()) => 1,
-            Err(e) => {
-                errors.push((host_path.to_path_buf(), e));
-                0
-            }
-        }
-    }
-
-    /// Try to stage a host directory (and its contents), continuing past
-    /// individual child failures so one bad file does not abort the whole
-    /// tree. Returns the number of items that were successfully staged.
-    fn stage_host_directory(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-        errors: &mut Vec<(PathBuf, String)>,
-    ) -> usize {
-        let name = match host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-        {
-            Some(n) => n,
-            None => {
-                errors.push((host_path.to_path_buf(), "invalid directory name".into()));
-                return 0;
-            }
-        };
-
-        // Validate the directory name against the target filesystem's rules
-        // before staging the CreateDirectory edit.
-        if let Err(e) = self.validate_staged_name(&name) {
-            errors.push((host_path.to_path_buf(), e));
-            return 0;
-        }
-
-        // Duplicate-name check against pending adds in this parent.
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            errors.push((
-                host_path.to_path_buf(),
-                format!("'{name}' is already staged in this directory"),
-            ));
-            return 0;
-        }
-
-        self.staged_edits.push(StagedEdit::CreateDirectory {
-            parent: parent.clone(),
-            name: name.clone(),
-            qnx2_attrs: None,
-        });
-
-        // Build a synthetic FileEntry for children to reference as parent.
-        let dir_path = if parent.path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path)
-        };
-        let new_dir = FileEntry::new_directory(name, dir_path, 0);
-
-        let mut count = 1usize; // count the directory itself
-
-        let entries = match std::fs::read_dir(host_path) {
-            Ok(e) => e,
-            Err(e) => {
-                errors.push((host_path.to_path_buf(), e.to_string()));
-                return count;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    errors.push((host_path.to_path_buf(), e.to_string()));
-                    continue;
-                }
-            };
-            let child_path = entry.path();
-            if child_path.is_dir() {
-                count += self.stage_host_directory(&child_path, &new_dir, errors);
-            } else if child_path.is_file() {
-                count += self.stage_host_file(&child_path, &new_dir, errors);
-            }
-        }
-
-        count
-    }
-
-    /// Workflow A: sniff the picked host file for a Mac archive kind.
-    /// On a hit, push a [`PendingArchiveImport`] so
-    /// [`render_archive_import_dialog`] asks the user how to handle it
-    /// and return `true`. Returning `true` short-circuits the normal
-    /// staging path. Returning `false` means "not a Mac archive — keep
-    /// going with the as-binary staging path."
-    ///
-    /// Sniff failures (unreadable file, opaque bytes) return `false`
-    /// silently — the regular staging path handles its own errors.
-    fn queue_archive_import_if_applicable(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-    ) -> bool {
-        // Detection needs the whole file; past 64 MiB only a Mac-archive extension earns that read.
-        let size = std::fs::metadata(host_path).map(|m| m.len()).unwrap_or(0);
-        let named_archive = host_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| {
-                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(e))
-            });
-        if size > rusty_backup::fs::mem_archive::INLINE_MAX && !named_archive {
-            return false;
-        }
-        let raw = match std::fs::read(host_path) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
-        };
-        let kind = match detect_mac_archive(&raw) {
-            Some(k) => k,
-            None => return false,
-        };
-        self.pending_archive_imports.push(PendingArchiveImport {
-            host_path: host_path.to_path_buf(),
-            parent: parent.clone(),
-            kind,
-            raw,
-        });
-        true
-    }
-
-    /// Get-or-create the BrowseView's archive-import tempdir. Held until
-    /// Discard/Apply/close so the staged AddFile host_path references
-    /// stay valid.
-    fn ensure_archive_import_tempdir(&mut self) -> Result<&Path, String> {
-        if self.archive_import_tempdir.is_none() {
-            let dir = tempfile::Builder::new()
-                .prefix("rusty-archive-import-")
-                .tempdir()
-                .map_err(|e| format!("create tempdir: {e}"))?;
-            self.archive_import_tempdir = Some(dir);
-        }
-        Ok(self.archive_import_tempdir.as_ref().unwrap().path())
-    }
-
-    /// Workflow A "Convert" / "Expand" / "Convert and expand": decode the
-    /// pending archive's contents into an AppleDouble dump inside the
-    /// import tempdir, then re-stage its children as if the user had
-    /// picked them via the regular Add File flow (so resource forks are
-    /// detected via the `._<name>` sidecars).
-    fn apply_archive_import_extract(
-        &mut self,
-        pending: &PendingArchiveImport,
-    ) -> Result<(), String> {
-        // Decode the picked file. For HQX wrappers, peel them; for SIT/SEA
-        // standalone the bytes go straight to the parser.
-        let (bytes, archive) = mac_extract::open_bytes(pending.raw.clone())
-            .map_err(|e| format!("decode {}: {e}", pending.host_path.display()))?;
-
-        // A unique subdir per import so multiple Convert clicks don't
-        // collide on filename.
-        let root = self.ensure_archive_import_tempdir()?.to_path_buf();
-        let subdir = root.join(format!("import-{}", self.pending_archive_imports.len()));
-        std::fs::create_dir_all(&subdir).map_err(|e| format!("create subdir: {e}"))?;
-
-        // AppleDouble preserves data fork + resource fork + type/creator
-        // via a `._<name>` sidecar that the existing
-        // `resource_fork::detect_resource_fork` picks up at staging time.
-        mac_extract::extract_all(
-            &bytes,
-            &archive,
-            &subdir,
-            mac_extract::ForkFormat::AppleDouble,
-            |_, _, _| {},
-            |_| {},
-        )
-        .map_err(|e| format!("extract: {e}"))?;
-
-        // Now stage every direct child of the subdir under `parent`.
-        // (stage_host_file silently skips `._<name>` sidecars and the
-        // primary file's resource fork is detected via the sidecar.)
-        let children: Vec<PathBuf> = std::fs::read_dir(&subdir)
-            .map_err(|e| format!("read subdir: {e}"))?
-            .filter_map(|r| r.ok())
-            .map(|e| e.path())
-            .collect();
-        let parent = pending.parent.clone();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        for p in &children {
-            if p.is_dir() {
-                self.stage_host_directory(p, &parent, &mut errors);
-            } else if p.is_file() {
-                self.stage_host_file(p, &parent, &mut errors);
-            }
-        }
-        if !errors.is_empty() {
-            // Surface partial-failure detail through the standard
-            // staging-errors dialog.
-            self.staging_errors.extend(errors);
-            self.show_staging_errors = true;
-        }
-        Ok(())
-    }
-
-    /// Workflow A "Convert only" (HQX-over-SIT / HQX-over-SEA): strip
-    /// the BinHex wrapper and stage the resulting .sit / .sea as a
-    /// single AddFile under the import tempdir.
-    fn apply_archive_import_convert_only(
-        &mut self,
-        pending: &PendingArchiveImport,
-    ) -> Result<(), String> {
-        let bh = rusty_backup::fs::binhex::parse_binhex(&pending.raw)
-            .map_err(|e| format!("decode BinHex: {e}"))?;
-        let root = self.ensure_archive_import_tempdir()?.to_path_buf();
-        let subdir = root.join(format!("import-{}", self.pending_archive_imports.len()));
-        std::fs::create_dir_all(&subdir).map_err(|e| format!("create subdir: {e}"))?;
-        let inner_name = if bh.name.is_empty() {
-            "archive.sit".to_string()
-        } else {
-            bh.name.replace(['/', '\\'], "_")
-        };
-        let inner_path = subdir.join(&inner_name);
-        std::fs::write(&inner_path, &bh.data_fork)
-            .map_err(|e| format!("write inner archive: {e}"))?;
-        let parent = pending.parent.clone();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
-        self.stage_host_file(&inner_path, &parent, &mut errors);
-        if !errors.is_empty() {
-            self.staging_errors.extend(errors);
-            self.show_staging_errors = true;
-        }
-        Ok(())
-    }
-
-    /// Workflow A "Add as-is": skip the archive intercept and stage the
-    /// picked file unchanged through the regular add-host-file path.
-    /// Direct call (bypasses queue_archive_import_if_applicable).
-    fn apply_archive_import_as_is(&mut self, pending: &PendingArchiveImport) -> Result<(), String> {
-        let parent = pending.parent.clone();
-        match self.add_host_file(&pending.host_path, &parent) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
-        }
+    /// Stage host picks and drops through the pane; a tar or (on HFS) a Mac archive asks first.
+    fn add_host_paths(&mut self, ctx: &egui::Context, paths: &[PathBuf]) {
+        self.pane_act(ctx, BrowserPaneAction::AddPicked(paths.to_vec()));
     }
 
     /// Workflow E trigger: read the selected file's bytes off the disk
     /// image, sniff + decode, and open a floating viewer window with
     /// the archive's entries. Read-only — the user can extract any
     /// subset but can't modify the archive itself.
-    fn open_archive_browse_window(&mut self, entry: &FileEntry) {
-        let raw_bytes = {
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open".into());
-                return;
-            };
-            let result = fs.read_file(entry, usize::MAX);
-            self.return_fs(fs);
-            match result {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("Read failed: {e}"));
-                    return;
-                }
-            }
-        };
-        let kind = match detect_mac_archive(&raw_bytes) {
-            Some(k) => k,
-            None => {
-                self.edit_result = Some(format!("{} is not a recognized Mac archive.", entry.name));
-                return;
-            }
-        };
-        let (bytes, archive) = match mac_extract::open_bytes(raw_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                self.edit_result = Some(format!("{} decode failed: {e}", entry.name));
-                return;
-            }
-        };
-        let selected = vec![true; archive.entries.len()];
-        self.mac_archive_window = Some(MacArchiveWindow {
-            entry_name: entry.name.clone(),
-            kind,
-            bytes,
-            archive,
-            selected,
-            fork_format: mac_extract::ForkFormat::BinHex,
-        });
+    fn open_archive_browse_window(&mut self, ctx: &egui::Context, entry: &FileEntry) {
+        let path = entry.path.clone();
+        let purpose = ArchiveUse::Browse;
+        self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
     }
 
     /// Workflow C trigger: read the selected file's bytes off the disk
     /// image, sniff them via [`detect_mac_archive`], and on a hit open
     /// the Save-as-is / Decode-and-save modal. On a non-archive (or a
     /// read failure), surface a one-line error and don't open the modal.
-    fn open_archive_extract_modal(&mut self, entry: &FileEntry) {
-        let raw_bytes = {
-            let Some(mut fs) = self.take_or_open_fs() else {
-                self.edit_result = Some("Filesystem not open".into());
-                return;
-            };
-            let result = fs.read_file(entry, usize::MAX);
-            self.return_fs(fs);
-            match result {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("Read failed: {e}"));
-                    return;
-                }
-            }
-        };
-        let kind = match detect_mac_archive(&raw_bytes) {
-            Some(k) => k,
-            None => {
-                self.edit_result = Some(format!(
-                    "{} is not a recognized Mac archive (use Extract File to save raw bytes).",
-                    entry.name
-                ));
-                return;
-            }
-        };
-        let (extract_bytes, archive) = match mac_extract::open_bytes(raw_bytes.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.edit_result = Some(format!("{} decode failed: {e}", entry.name));
-                return;
-            }
-        };
-        self.pending_archive_extract = Some(PendingArchiveExtract {
-            entry_name: entry.name.clone(),
-            kind,
-            raw_bytes,
-            extract_bytes,
-            archive,
-            fork_format: mac_extract::ForkFormat::BinHex,
-        });
+    fn open_archive_extract_modal(&mut self, ctx: &egui::Context, entry: &FileEntry) {
+        let path = entry.path.clone();
+        let purpose = ArchiveUse::Extract;
+        self.pane_act(ctx, BrowserPaneAction::ReadArchive { path, purpose });
     }
 
-    /// Walk `entry` (and its children if a directory) on the open
-    /// filesystem, collecting every reachable file into a [`StuffItInputNode`]
-    /// tree. Symlinks and special files are skipped. Used by
-    /// [`export_selection_as_archive`] for Workflow B. Holds the
-    /// filesystem only for the duration of the walk.
-    fn collect_archive_inputs(
-        &mut self,
-        entry: &FileEntry,
-    ) -> Result<Vec<StuffItInputNode>, String> {
-        let mut fs = self
-            .take_or_open_fs()
-            .ok_or_else(|| "filesystem not open".to_string())?;
-        let result = walk_fs_to_input_nodes(&mut *fs, entry);
-        self.return_fs(fs);
-        result
-    }
-
-    /// Workflow B: bundle the selected entry as a Mac archive on the
-    /// host. Single-file selections can be wrapped as BinHex (which is
-    /// always single-file); file-or-folder selections can be SIT or
-    /// SIT-over-BinHex (a `.sit.hqx`). Foreground execution — typical
-    /// classic-Mac payloads are small (Hypercard stacks, dev tools).
-    fn export_selection_as_archive(&mut self, entry: &FileEntry, format: ArchiveExportFormat) {
-        let default_name = format!("{}{}", entry.name, format.extension());
-        let path = match super::file_dialog()
-            .set_title("Save Mac archive")
-            .set_file_name(&default_name)
-            .save_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-
-        let nodes = match self.collect_archive_inputs(entry) {
-            Ok(n) => n,
-            Err(e) => {
-                self.edit_result = Some(format!("Archive collect failed: {e}"));
-                return;
-            }
-        };
-        if nodes.is_empty() {
-            self.edit_result = Some("Nothing to archive (empty selection).".into());
+    /// A small window with the pane's running preflight or write.
+    fn render_apply_job(&self, ui: &mut egui::Ui) {
+        let pane = self.ctl.pane(Side::Left);
+        let Some(snap) = pane.checking().or_else(|| pane.applying()) else {
             return;
-        }
-
-        let bytes = match format {
-            ArchiveExportFormat::Sit => match build_archive_tree(&nodes, WriteMethod::Store) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.edit_result = Some(format!("SIT build failed: {e}"));
-                    return;
-                }
-            },
-            ArchiveExportFormat::Mar => {
-                match rusty_backup::macarchive::mar::build_archive(&entry.name, &nodes) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.edit_result = Some(format!("MAR build failed: {e}"));
-                        return;
-                    }
-                }
-            }
-            ArchiveExportFormat::SitHqx => {
-                let sit = match build_archive_tree(&nodes, WriteMethod::Store) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.edit_result = Some(format!("SIT build failed: {e}"));
-                        return;
-                    }
-                };
-                let bh = rusty_backup::fs::binhex::BinHexFile {
-                    name: format!("{}.sit", entry.name),
-                    type_code: *b"SITD", // StuffIt Deluxe archive type
-                    creator_code: *b"SIT!",
-                    flags: 0,
-                    data_fork: sit,
-                    resource_fork: Vec::new(),
-                };
-                rusty_backup::fs::binhex::build_binhex(&bh).into_bytes()
-            }
-            ArchiveExportFormat::Hqx => {
-                // BinHex is fundamentally single-file. The button is gated
-                // on a single-file selection, so the input tree should be
-                // a one-element Vec<File>; defend against the alternative.
-                let file = match nodes.first() {
-                    Some(StuffItInputNode::File(f)) if nodes.len() == 1 => f.clone(),
-                    _ => {
-                        self.edit_result =
-                            Some("BinHex export requires a single file selection.".into());
-                        return;
-                    }
-                };
-                let bh = rusty_backup::fs::binhex::BinHexFile {
-                    name: file.name,
-                    type_code: file.type_code,
-                    creator_code: file.creator_code,
-                    flags: file.finder_flags,
-                    data_fork: file.data_fork,
-                    resource_fork: file.resource_fork,
-                };
-                rusty_backup::fs::binhex::build_binhex(&bh).into_bytes()
-            }
         };
-
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                self.edit_result = Some(format!(
-                    "Wrote {} ({}, {})",
-                    path.display(),
-                    format.label(),
-                    partition::format_size(bytes.len() as u64),
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Write failed: {e}"));
-            }
-        }
-    }
-
-    /// Add a single host file to a parent directory on the image.
-    fn add_host_file(
-        &mut self,
-        host_path: &std::path::Path,
-        parent: &FileEntry,
-    ) -> Result<(), String> {
-        let raw_name = host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("invalid filename")?
-            .to_string();
-
-        // ProDOS targets: strip any trailing CiderPress `#TTAAAA` suffix from
-        // the host filename and use the decoded (type, aux) as staged
-        // overrides so the round-trip `drag-out → drag-back-in` is lossless.
-        let (name, prodos_type, prodos_aux) = if self.is_prodos_type() {
-            match rusty_backup::fs::prodos_types::decode_cp_suffix(&raw_name) {
-                Some((stem, tt, aa)) => (stem.to_string(), Some(tt), Some(aa)),
-                None => (raw_name, None, None),
-            }
-        } else {
-            (raw_name, None, None)
-        };
-
-        // Detect resource fork from host (native, AppleDouble, MacBinary, .rsrc)
-        let rsrc_import = if self.is_hfs_type() {
-            resource_fork::detect_resource_fork(host_path)
-        } else {
-            None
-        };
-
-        // For MacBinary imports the "file" is a container — use the data fork
-        // size from inside the container, not the container's file size.
-        let (effective_path, size) = if let Some(ref imp) = rsrc_import {
-            if let Some(ref data_fork) = imp.data_fork {
-                // MacBinary: we'll write the extracted data fork, not the .bin file
-                (host_path.to_path_buf(), data_fork.len() as u64)
-            } else {
-                let sz = std::fs::metadata(host_path)
-                    .map_err(|e| e.to_string())?
-                    .len();
-                (host_path.to_path_buf(), sz)
-            }
-        } else {
-            let sz = std::fs::metadata(host_path)
-                .map_err(|e| e.to_string())?
-                .len();
-            (host_path.to_path_buf(), sz)
-        };
-
-        // Validate the name against the target filesystem's rules before
-        // staging so that clearly-bad names are rejected up-front.
-        self.validate_staged_name(&name)
-            .map_err(|e| format!("'{name}': {e}"))?;
-
-        // Check for duplicate name in pending adds for this parent
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            return Err(format!("'{name}' is already staged in this directory"));
-        }
-
-        self.staged_edits.push(StagedEdit::AddFile {
-            parent: parent.clone(),
-            name,
-            host_path: effective_path,
-            size,
-            prodos_type,
-            prodos_aux,
-            resource_fork: rsrc_import,
-            hfs_type_override: None,
-            hfs_creator_override: None,
-            dates: None,
-            // Set from the conflict review shown before Apply; staging one is
-            // not the moment to decide, because the user has not been asked yet.
-            on_conflict: rusty_backup::fs::replace::OnConflict::Fail,
-        });
-        Ok(())
-    }
-
-    /// Stage a delete operation.
-    fn perform_delete(&mut self, parent: &FileEntry, entry: &FileEntry, recursive: bool) {
-        let entry_name = entry.name.clone();
-
-        if recursive {
-            self.staged_edits.push(StagedEdit::DeleteRecursive {
-                parent: parent.clone(),
-                entry: entry.clone(),
+        egui::Window::new(snap.label.clone())
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                super::progress::show_job(ui, &snap);
             });
-        } else {
-            self.staged_edits.push(StagedEdit::DeleteEntry {
-                parent: parent.clone(),
-                entry: entry.clone(),
-            });
-        }
-
-        self.edit_result = Some(format!("Staged delete of '{entry_name}'"));
-    }
-
-    /// Apply all staged edits to the filesystem in a single batch.
-    /// Returns false when the batch was deferred to the conflict review; the
-    /// callers used to read that as success and dropped the queue.
-    fn apply_staged_edits(&mut self) -> bool {
-        self.edit_free_space = None;
-        log::info!(
-            "Applying {} staged edit(s) to {}",
-            self.staged_edits.len(),
-            self.session
-                .source_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        );
-        let (mut efs, commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::error!("Failed to open editable filesystem: {e}");
-                self.edit_result = Some(format!("Error opening filesystem: {e}"));
-                return true;
-            }
-        };
-
-        // Find every collision before writing anything. Staging exists so the
-        // questions can be asked once; discovering them mid-batch would mean
-        // interrupting per file and leaving a half-applied queue if the user
-        // changes their mind at file 7 of 12.
-        if self.conflict_review.is_none() {
-            let conflicts = self.staged_edits.conflicting_adds(&mut *efs);
-            if !conflicts.is_empty() {
-                drop(efs);
-                self.conflict_review = Some(
-                    conflicts
-                        .into_iter()
-                        // Default to Replace: staging an add onto an existing
-                        // name is what "copy this file here" means, and the
-                        // review shows exactly what will happen before any
-                        // write. The replaced file's metadata is carried over.
-                        .map(|(path, name)| {
-                            (path, name, rusty_backup::fs::replace::OnConflict::Replace)
-                        })
-                        .collect(),
-                );
-                return false;
-            }
-        }
-
-        let edits: Vec<StagedEdit> = self.staged_edits.drain().collect();
-        let total = edits.len();
-
-        // Stop at the first failure but keep the failed edit and everything
-        // after it staged: a half-applied batch must not vanish silently.
-        let mut applied = 0usize;
-        let mut failure: Option<String> = None;
-        for (i, edit) in edits.iter().enumerate() {
-            if let Err(e) = edit_queue::apply_edit(&mut *efs, edit) {
-                failure = Some(format!("Error on edit {}/{total}: {e}", i + 1));
-                break;
-            }
-            applied += 1;
-        }
-        if failure.is_some() {
-            for edit in edits.into_iter().skip(applied) {
-                self.staged_edits.push(edit);
-            }
-        }
-
-        // Whatever did land still has to reach the disk and the container.
-        if applied > 0 {
-            if let Err(e) = efs.sync_metadata() {
-                self.edit_result = Some(format!("Error saving to disk: {e}"));
-                return true;
-            }
-        }
-
-        // Persist: re-encode the temp flat back into the container (no-op for
-        // raw images). Drop the editable handle first so its writes are
-        // flushed to the temp before the re-encode reads it.
-        drop(efs);
-        if applied > 0 {
-            if let Err(e) = commit.commit() {
-                self.edit_result = Some(format!("Error writing container: {e}"));
-                return true;
-            }
-            if self.chd_edit.is_some() {
-                self.chd_diff_dirty = true;
-            }
-        }
-
-        if let Some(failure) = failure {
-            let left = total - applied;
-            self.edit_result = Some(format!(
-                "{failure}. Applied {applied} of {total}; {left} edit(s) remain staged"
-            ));
-            self.invalidate_all_caches();
-            self.invalidate_cached_fs();
-            return true;
-        }
-
-        self.edit_result = Some(format!("Applied {total} edit(s) successfully"));
-        // The archive-import tempdir backed the just-applied AddFile
-        // host_paths; safe to drop now that the bytes are on the image.
-        self.archive_import_tempdir = None;
-        self.invalidate_all_caches();
-
-        // Update blessed folder info after apply. The volume bytes were
-        // mutated by the apply pass, so any cached read-only fs is stale —
-        // invalidate before re-opening.
-        self.invalidate_cached_fs();
-        if let Some(mut fs) = self.take_or_open_fs() {
-            self.blessed_folder = fs.blessed_system_folder();
-            self.volume_total = fs.total_size();
-            self.volume_used = fs.used_size();
-            self.return_fs(fs);
-        }
-        true
-    }
-
-    fn has_edit_error(&self) -> bool {
-        self.edit_result
-            .as_ref()
-            .map(|r| r.starts_with("Error"))
-            .unwrap_or(false)
-    }
-
-    /// Invalidate all cached directory listings and reload root.
-    ///
-    /// Called after edit-apply / sync_metadata writes. The cached read-only
-    /// filesystem has stale in-memory tables (catalog, bitmap), so drop it
-    /// and re-open against the freshly written disk bytes.
-    fn invalidate_all_caches(&mut self) {
-        self.directory_cache.clear();
-        self.selected_entry = None;
-        self.content = None;
-        // Checkbox marks hold FileEntry snapshots; after a write they may
-        // name renamed or deleted files, and an export would use them.
-        self.marked.clear();
-        self.invalidate_cached_fs();
-        if let Some(mut fs) = self.take_or_open_fs() {
-            if let Ok(root) = fs.root() {
-                if let Ok(mut children) = fs.list_directory(&root) {
-                    rusty_backup::fs::entry::sort_for_display(&mut children);
-                    self.directory_cache.insert(root.path.clone(), children);
-                }
-                self.root = Some(root);
-            }
-            self.return_fs(fs);
-        }
     }
 
     /// Render the delete confirmation dialog.
-    fn render_delete_dialog(&mut self, ui: &mut egui::Ui) {
-        if let Some((parent, entry, is_non_empty)) = self.pending_delete.clone() {
-            let title = if is_non_empty {
-                format!("Delete '{}' and all its contents?", entry.name)
-            } else {
-                format!("Delete '{}'?", entry.name)
-            };
-            ui.horizontal(|ui| {
-                ui.colored_label(super::theme::warning(ui.visuals()), &title);
-                if ui.button("Yes, delete").clicked() {
-                    self.pending_delete = None;
-                    self.perform_delete(&parent, &entry, is_non_empty);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.pending_delete = None;
-                }
-            });
-        }
-    }
-
     /// Render the unsaved changes confirmation dialog.
     /// Open a text file in the editor window, decoding it the way the CLI and
     /// TUI editors do.
-    fn open_text_editor(&mut self, path: &str, name: &str) {
-        use rusty_backup::model::text_edit::{decode_for_edit, TextEditError};
-        const LIMIT: usize = 1024 * 1024;
+    /// Open a file in the text editor as a job (the editable open decodes a whole container).
+    /// Read the cursor's file for the editor through the pane (Edit Mode only).
+    fn open_text_editor(&mut self) {
+        let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::EditText);
+        self.ctl.apply(act);
+        let said = self.ctl.status().to_string();
+        if !said.is_empty() && self.ctl.pane(Side::Left).tool_working().is_none() {
+            self.edit_result = Some(said);
+        }
+    }
 
-        let (mut fs, _commit) = match self.session.open_editable() {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot open for editing: {e}"));
-                return;
-            }
-        };
-        let entry = match rusty_backup::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), path) {
-            Ok(e) => e,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot find {path}: {e}"));
-                return;
-            }
-        };
-        let fs_type = fs.fs_type().to_string();
-        let bytes = match fs.read_file(&entry, LIMIT) {
-            Ok(b) => b,
-            Err(e) => {
-                self.edit_result = Some(format!("Cannot read {path}: {e}"));
-                return;
-            }
-        };
-        match decode_for_edit(&bytes, &fs_type, None) {
-            Ok(decoded) => {
-                self.text_editor = Some(GuiTextEditor {
-                    path: path.to_string(),
-                    name: name.to_string(),
-                    text: decoded.text,
-                    shape: decoded.shape,
-                    original_ending: decoded.shape.ending,
-                    dirty: false,
-                    status: None,
-                });
-            }
-            Err(TextEditError::NotText { reason }) => {
-                self.edit_result = Some(format!("{name} is not a text file ({reason})"));
-            }
-            Err(e) => self.edit_result = Some(format!("{name}: {e}")),
+    /// Take the file the pane read for the editor.
+    fn poll_editor(&mut self) {
+        if let Some(doc) = self.ctl.take_text_doc() {
+            self.text_editor = Some(GuiTextEditor {
+                name: doc.name,
+                folder: doc.folder,
+                text: doc.text,
+                original_ending: doc.shape.ending,
+                shape: doc.shape,
+                dirty: false,
+                status: None,
+            });
         }
     }
 
     /// The text editor window.
     fn render_text_editor(&mut self, ui: &mut egui::Ui) {
-        use rusty_backup::model::text_edit::LineEnding;
         let Some(mut ed) = self.text_editor.take() else {
             return;
         };
@@ -4533,7 +2156,11 @@ impl BrowseView {
                     ui.colored_label(super::theme::danger(ui.visuals()), msg);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if ui
+                        .button("Save")
+                        .on_hover_text("Stage the new text; Apply Edits writes it.")
+                        .clicked()
+                    {
                         save = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -4546,175 +2173,36 @@ impl BrowseView {
             });
 
         if save {
-            match self.save_text_editor(&ed) {
-                Ok(n) => {
-                    self.edit_result = Some(format!("Saved {} ({n} bytes)", ed.name));
-                    // Drop the cached read so the preview shows what is now on
-                    // disk rather than what was there when it was opened.
-                    self.content = None;
-                    self.invalidate_all_caches();
-                    self.invalidate_cached_fs();
-                    // The invalidation dropped the selection; put the saved file
-                    // back so the preview shows what was written, not "Loading...".
-                    if let Some(mut fs) = self.take_or_open_fs() {
-                        let saved =
-                            rusty_backup::cli::verbs::ls::resolve_path(fs.as_mut(), &ed.path).ok();
-                        self.return_fs(fs);
-                        if let Some(entry) = saved {
-                            self.select_file(&entry);
-                        }
-                    }
-                    // A save is a write like any applied edit: the CHD diff is
-                    // dirty and an archive session must recompress or lose it.
-                    if self.chd_edit.is_some() {
-                        self.chd_diff_dirty = true;
-                    }
-                    if self.archive_edit_ctx.is_some() {
-                        self.start_archive_compress();
-                    }
-                    return; // window closes
-                }
-                Err(e) => {
-                    // Keep the window open with the text intact: losing an edit
-                    // to a failed save is the worst outcome here.
-                    ed.status = Some(format!("{e:#}"));
-                    self.text_editor = Some(ed);
-                    return;
-                }
+            // Staged like any edit; a refusal (an unencodable character) keeps the window and the text.
+            let before = self.ctl.pane(Side::Left).queue.len();
+            let act = BrowserPaneAction::SaveText {
+                name: ed.name.clone(),
+                folder: ed.folder.clone(),
+                text: ed.text.clone(),
+                shape: ed.shape,
+            };
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
+            if self.ctl.pane(Side::Left).queue.len() > before {
+                self.edit_result = Some(format!(
+                    "Staged the new {}; Apply Edits writes it.",
+                    ed.name
+                ));
+                return;
             }
+            ed.status = Some(self.ctl.status().to_string());
         }
         if keep_open {
             self.text_editor = Some(ed);
         }
     }
 
-    /// Encode and write the editor's contents through the shared replace path.
-    fn save_text_editor(&mut self, ed: &GuiTextEditor) -> anyhow::Result<usize> {
-        self.edit_free_space = None;
-        use rusty_backup::model::text_edit::encode_after_edit;
-        let bytes = encode_after_edit(&ed.text, &ed.shape, false)
-            .map_err(|e| anyhow::anyhow!("cannot save as {}: {e}", ed.shape.encoding.label()))?;
-
-        let (mut fs, commit) = self.session.open_editable()?;
-        let (parent, leaf) =
-            rusty_backup::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &ed.path)?;
-        let mut reader = std::io::Cursor::new(bytes.clone());
-        rusty_backup::fs::replace::create_or_replace(
-            fs.as_mut(),
-            &parent,
-            &leaf,
-            &mut reader,
-            bytes.len() as u64,
-            &rusty_backup::fs::filesystem::CreateFileOptions::default(),
-            rusty_backup::fs::replace::ReplacePolicy::replace(),
-        )
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", ed.path))?;
-        fs.sync_metadata()
-            .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-        drop(fs);
-        commit.commit()?;
-        Ok(bytes.len())
-    }
-
-    /// One review of every name collision, before any write happens.
-    ///
-    /// Each row is decided individually because a batch rarely has one answer:
-    /// overwriting a config file you meant to fix and overwriting a document
-    /// you forgot you had are different things, and a single blanket prompt
-    /// makes the user guess which files it covers.
-    fn render_conflict_review(&mut self, ui: &mut egui::Ui) {
-        use rusty_backup::fs::replace::OnConflict;
-        let Some(mut rows) = self.conflict_review.clone() else {
-            return;
-        };
-
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Window::new("Some files already exist")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "{} of the staged file(s) would overwrite something already on the image.",
-                    rows.len()
-                ));
-                ui.label("Replacing keeps the existing file's permissions, dates and type.");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Replace all").clicked() {
-                        for r in rows.iter_mut() {
-                            r.2 = OnConflict::Replace;
-                        }
-                    }
-                    if ui.button("Skip all").clicked() {
-                        for r in rows.iter_mut() {
-                            r.2 = OnConflict::Skip;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        for (path, _name, decision) in rows.iter_mut() {
-                            ui.horizontal(|ui| {
-                                ui.radio_value(decision, OnConflict::Replace, "Replace");
-                                ui.radio_value(decision, OnConflict::Skip, "Skip");
-                                ui.label(path.as_str());
-                            });
-                        }
-                    });
-
-                ui.add_space(6.0);
-                let replacing = rows.iter().filter(|r| r.2 == OnConflict::Replace).count();
-                ui.label(format!(
-                    "{replacing} to replace, {} to skip",
-                    rows.len() - replacing
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("Continue").clicked() {
-                        apply = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-
-        if cancel {
-            // Nothing has been written, and the queue is untouched, so the user
-            // still has every staged edit to reconsider.
-            self.conflict_review = None;
-            self.edit_result = Some("Save cancelled - nothing was written".to_string());
-            return;
-        }
-        if apply {
-            for (path, _name, decision) in &rows {
-                self.staged_edits.set_conflict_for(path, *decision);
-            }
-            // Keep the review non-None so the re-entry does not ask again;
-            // apply_staged_edits clears it when it finishes.
-            self.conflict_review = Some(rows);
-            let applied = self.apply_staged_edits();
-            self.conflict_review = None;
-            if applied && self.archive_edit_ctx.is_some() && !self.has_edit_error() {
-                self.start_archive_compress();
-            }
-            return;
-        }
-        self.conflict_review = Some(rows);
-    }
-
+    /// Leaving Edit Mode or closing with edits staged: discard, apply or stay.
     fn render_unsaved_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_unsaved_dialog {
+        if !self.ctl.unsaved_shown() {
             return;
         }
-
-        let count = self.staged_edits.len();
-
+        let count = self.ctl.pane(Side::Left).queue.len();
+        let mut choice = None;
         egui::Window::new("Unsaved Changes")
             .collapsible(false)
             .resizable(false)
@@ -4722,137 +2210,70 @@ impl BrowseView {
             .show(ui.ctx(), |ui| {
                 ui.label(format!("You have {count} unsaved edit(s)."));
                 ui.add_space(4.0);
-
-                // Summary
-                let mut files_added = 0usize;
-                let mut dirs_added = 0usize;
-                let mut entries_deleted = 0usize;
-                let mut bytes_added: u64 = 0;
-                for edit in self.staged_edits.iter() {
-                    match edit {
-                        StagedEdit::AddFile { size, .. } => {
-                            files_added += 1;
-                            bytes_added += size;
-                        }
-                        StagedEdit::CreateDirectory { .. } => dirs_added += 1,
-                        StagedEdit::DeleteEntry { .. } | StagedEdit::DeleteRecursive { .. } => {
-                            entries_deleted += 1
-                        }
-                        _ => {}
-                    }
+                for line in self.ctl.pane(Side::Left).staged_summary() {
+                    ui.label(line);
                 }
-                let mut parts = Vec::new();
-                if files_added > 0 {
-                    parts.push(format!("{files_added} file(s) added"));
-                }
-                if dirs_added > 0 {
-                    parts.push(format!("{dirs_added} folder(s) added"));
-                }
-                if entries_deleted > 0 {
-                    parts.push(format!("{entries_deleted} item(s) deleted"));
-                }
-                if !parts.is_empty() {
-                    ui.label(parts.join(", "));
-                }
-                if bytes_added > 0 {
-                    ui.label(format!(
-                        "Net data: +{}",
-                        partition::format_size(bytes_added)
-                    ));
-                }
-
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Discard Edits").clicked() {
-                        self.staged_edits.clear();
-                        self.pending_archive_imports.clear();
-                        self.archive_import_tempdir = None;
-                        self.show_unsaved_dialog = false;
-                        // For CHD edit sessions, "Discard" must also drop
-                        // the diff so prior Apply Edits aren't flattened
-                        // into the parent. Without this, a discard followed
-                        // by exit_edit_mode would still flatten any work
-                        // that was previously written to the diff.
-                        if self.chd_edit.is_some() {
-                            self.discard_chd_edit_session();
-                        }
-                        if self.pending_close {
-                            self.close();
-                        } else {
-                            self.exit_edit_mode();
-                        }
+                        choice = Some(UnsavedChoice::Discard);
                     }
                     if ui.button("Apply Edits").clicked() {
-                        self.show_unsaved_dialog = false;
-                        let applied = self.apply_staged_edits();
-                        let ok = applied
-                            && self
-                                .edit_result
-                                .as_ref()
-                                .map(|r| !r.starts_with("Error"))
-                                .unwrap_or(true);
-                        if ok {
-                            if self.pending_close {
-                                self.close();
-                            } else {
-                                self.exit_edit_mode();
-                            }
-                        }
+                        choice = Some(UnsavedChoice::Apply);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.show_unsaved_dialog = false;
-                        self.pending_close = false;
+                        choice = Some(UnsavedChoice::Cancel);
                     }
                 });
             });
+        if let Some(c) = choice {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, CommanderAction::Mode(ModeAction::Unsaved(c)));
+            self.poll_modes();
+        }
     }
 
-    /// Render the Workflow A "Mac archive picked" modal. Shows one
-    /// modal per pending import in queue order; each user click pops
-    /// the front and applies the chosen action. The modal copy varies
-    /// by sniffed archive kind:
-    ///   * BinHexSingleFile -> Convert / Add as-is / Cancel
-    ///   * Sit / Sit5 / Sea -> Expand / Add as-is / Cancel
-    ///   * BinHexOverSit / BinHexOverSea -> Convert and expand / Convert only / Add as-is / Cancel
+    /// The pane's Mac archive waiting for its import choice; the buttons depend on its kind.
     fn render_archive_import_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_archive_imports.is_empty() {
+        let Some((filename, kind)) = self.ctl.pane(Side::Left).pending_import() else {
             return;
-        }
-        // Snapshot the front item to render the modal body. The action
-        // handlers each remove the front entry; this clone keeps the
-        // borrow short and lets the click handlers mutate self.
-        let pending = self.pending_archive_imports[0].clone();
-        let filename = pending
-            .host_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("(no name)")
-            .to_string();
-        let kind_label = pending.kind.label();
-
-        #[derive(Clone, Copy)]
-        enum ImportAction {
-            Extract,     // Convert (HQX) / Expand (SIT/SEA) / Convert+Expand (HQX-over)
-            ConvertOnly, // Only valid for BinHexOverSit / BinHexOverSea
-            AsIs,
-            Cancel,
-        }
-        let mut action: Option<ImportAction> = None;
-
-        let title = match pending.kind {
-            MacArchiveKind::BinHexSingleFile => "Convert HQX file?",
+        };
+        let kind_label = kind.label();
+        let mut choice: Option<ImportChoice> = None;
+        // A single BinHex converts; an archive expands; BinHex over an archive does either.
+        let (title, body, expand) = match kind {
+            MacArchiveKind::BinHexSingleFile => (
+                "Convert HQX file?",
+                format!("Would you like to convert {filename} to binary?"),
+                "Convert",
+            ),
+            MacArchiveKind::BinHexOverSit
+            | MacArchiveKind::BinHexOverSea
+            | MacArchiveKind::BinHexOverCompactPro => (
+                "Convert and/or expand?",
+                format!(
+                    "Would you like to convert {filename} to binary and/or expand the contents?"
+                ),
+                "Convert and expand",
+            ),
             MacArchiveKind::Sit
             | MacArchiveKind::Sit5
             | MacArchiveKind::Sea
             | MacArchiveKind::CompactPro
             | MacArchiveKind::Mar
             | MacArchiveKind::MacBinary
-            | MacArchiveKind::MacZip => "Expand archive?",
-            MacArchiveKind::BinHexOverSit
-            | MacArchiveKind::BinHexOverSea
-            | MacArchiveKind::BinHexOverCompactPro => "Convert and/or expand?",
+            | MacArchiveKind::MacZip => (
+                "Expand archive?",
+                format!("Would you like to expand the contents of {filename}?"),
+                "Expand",
+            ),
         };
-
+        let convert_only = match kind {
+            MacArchiveKind::BinHexOverSea => Some("Convert only (.sea lands here)"),
+            MacArchiveKind::BinHexOverCompactPro => Some("Convert only (inner archive lands here)"),
+            MacArchiveKind::BinHexOverSit => Some("Convert only (.sit lands here)"),
+            _ => None,
+        };
         egui::Window::new(title)
             .id(egui::Id::unique("archive_import_dialog"))
             .collapsible(false)
@@ -4861,102 +2282,22 @@ impl BrowseView {
             .show(ui.ctx(), |ui| {
                 ui.label(format!("{filename} is a {kind_label} archive."));
                 ui.add_space(4.0);
-                let body = match pending.kind {
-                    MacArchiveKind::BinHexSingleFile => {
-                        format!("Would you like to convert {filename} to binary?")
-                    }
-                    MacArchiveKind::Sit
-                    | MacArchiveKind::Sit5
-                    | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro
-                    | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary
-                    | MacArchiveKind::MacZip => {
-                        format!("Would you like to expand the contents of {filename}?")
-                    }
-                    MacArchiveKind::BinHexOverSit
-                    | MacArchiveKind::BinHexOverSea
-                    | MacArchiveKind::BinHexOverCompactPro => {
-                        format!(
-                            "Would you like to convert {filename} to binary and/or expand the contents?"
-                        )
-                    }
-                };
                 ui.label(body);
                 ui.add_space(8.0);
-                ui.horizontal(|ui| match pending.kind {
-                    MacArchiveKind::BinHexSingleFile => {
-                        if ui
-                            .button("Convert")
-                            .on_hover_text(
-                                "Decode the BinHex envelope and add the enclosed file \
-                                 to this directory.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the .hqx file unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(expand)
+                        .on_hover_text(
+                            "Decode the archive and add each enclosed file to this directory \
+                             (resource forks preserved on HFS/HFS+).",
+                        )
+                        .clicked()
+                    {
+                        choice = Some(ImportChoice::Expand);
                     }
-                    MacArchiveKind::Sit
-                    | MacArchiveKind::Sit5
-                    | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro
-                    | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary
-                    | MacArchiveKind::MacZip => {
+                    if let Some(label) = convert_only {
                         if ui
-                            .button("Expand")
-                            .on_hover_text(
-                                "Decompress the archive and add each enclosed file to this \
-                                 directory (resource forks preserved on HFS/HFS+).",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the archive file unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
-                    }
-                    MacArchiveKind::BinHexOverSit
-                    | MacArchiveKind::BinHexOverSea
-                    | MacArchiveKind::BinHexOverCompactPro => {
-                        if ui
-                            .button("Convert and expand")
-                            .on_hover_text(
-                                "Decode BinHex, decompress the inner archive, and add \
-                                 each enclosed file to this directory.",
-                            )
-                            .clicked()
-                        {
-                            action = Some(ImportAction::Extract);
-                        }
-                        let convert_only_label = match pending.kind {
-                            MacArchiveKind::BinHexOverSea => "Convert only (.sea lands here)",
-                            MacArchiveKind::BinHexOverCompactPro => {
-                                "Convert only (inner archive lands here)"
-                            }
-                            _ => "Convert only (.sit lands here)",
-                        };
-                        if ui
-                            .button(convert_only_label)
+                            .button(label)
                             .on_hover_text(
                                 "Strip the BinHex wrapper and add the inner archive file. \
                                  Useful when the target Mac has StuffIt Expander but no \
@@ -4964,291 +2305,240 @@ impl BrowseView {
                             )
                             .clicked()
                         {
-                            action = Some(ImportAction::ConvertOnly);
+                            choice = Some(ImportChoice::ConvertOnly);
                         }
-                        if ui
-                            .button("Add as-is")
-                            .on_hover_text("Add the wrapped archive unchanged.")
-                            .clicked()
-                        {
-                            action = Some(ImportAction::AsIs);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            action = Some(ImportAction::Cancel);
-                        }
+                    }
+                    if ui
+                        .button("Add as-is")
+                        .on_hover_text("Add the file unchanged.")
+                        .clicked()
+                    {
+                        choice = Some(ImportChoice::AsIs);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(ImportChoice::Cancel);
                     }
                 });
             });
-
-        let Some(action) = action else { return };
-        // Pop the queue front (matches the snapshot above).
-        let pending = self.pending_archive_imports.remove(0);
-        let outcome = match action {
-            ImportAction::Extract => self.apply_archive_import_extract(&pending),
-            ImportAction::ConvertOnly => self.apply_archive_import_convert_only(&pending),
-            ImportAction::AsIs => self.apply_archive_import_as_is(&pending),
-            ImportAction::Cancel => return,
-        };
-        match outcome {
-            Ok(()) => {
-                self.edit_result = Some(format!(
-                    "{} {filename}",
-                    match action {
-                        ImportAction::Extract => "Imported contents of",
-                        ImportAction::ConvertOnly => "Imported inner archive from",
-                        ImportAction::AsIs => "Imported (as-is)",
-                        ImportAction::Cancel => "Cancelled",
-                    }
-                ));
-            }
-            Err(e) => {
-                self.staging_errors
-                    .push((pending.host_path.clone(), e.clone()));
-                self.show_staging_errors = true;
-                self.edit_result = Some(format!("Failed to import {filename}: {e}"));
-            }
+        if let Some(c) = choice {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ChooseImport(c));
         }
     }
 
-    /// Render the Workflow E floating "Archive viewer" window. Mirrors
-    /// the standalone Archives tab shape: entry list with per-entry
-    /// checkboxes, fork-format dropdown, Extract All / Extract Selected
-    /// / Close buttons. Read-only — no edit operations inside the
-    /// archive (would need archive repacking, deferred follow-up).
-    fn render_archive_browse_window(&mut self, ui: &mut egui::Ui) {
-        if self.mac_archive_window.is_none() {
+    /// The pane's tar waiting for its choice: import its contents, or add it as a file.
+    fn render_tar_add_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.ctl.pane(Side::Left).pending_tar() else {
             return;
-        }
-        let mut close = false;
-        let mut extract_action: Option<bool> = None; // Some(true)=all, Some(false)=selected
-
-        // Snapshot read-only labels so the closure below doesn't have to
-        // re-borrow self.mac_archive_window through more than the
-        // mutable handle it already takes for checkboxes / format.
-        let (title, file_count, selected_file_count) = {
-            let w = self.mac_archive_window.as_ref().unwrap();
-            let fc = w.archive.entries.iter().filter(|e| !e.is_dir).count();
-            let sfc = w
-                .archive
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| !e.is_dir && w.selected.get(*i).copied().unwrap_or(true))
-                .count();
-            (
-                format!("Archive: {} ({})", w.entry_name, w.kind.label()),
-                fc,
-                sfc,
-            )
         };
+        let mut open = true;
+        let mut choice: Option<TarChoice> = None;
+        egui::Window::new("Tar archive")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("\"{name}\" is a tar archive."));
+                ui.add_space(4.0);
+                ui.label(
+                    "Import its contents into the current folder, or add the \
+                     archive itself as a file?",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Import contents").clicked() {
+                        choice = Some(TarChoice::Import);
+                    }
+                    if ui.button("Add as file").clicked() {
+                        choice = Some(TarChoice::AsFile);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(TarChoice::Cancel);
+                    }
+                });
+            });
+        if !open {
+            choice = Some(TarChoice::Cancel);
+        }
+        if let Some(c) = choice {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ChooseTar(c));
+        }
+    }
 
-        egui::Window::new(title)
+    /// The pane's tar preflight that found content this volume cannot keep: go on or cancel.
+    fn render_tar_import_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(pf) = self.ctl.pane(Side::Left).tar_preview().cloned() else {
+            return;
+        };
+        let mut open = true;
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Import archive - some content can't be kept")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ui.ctx(), |ui| {
+                ui.colored_label(
+                    super::theme::warning(ui.visuals()),
+                    format!(
+                        "This [{}] volume can't store everything in the archive:",
+                        self.fs_type
+                    ),
+                );
+                ui.add_space(4.0);
+                for w in &pf.warnings {
+                    ui.label(format!("- {w}"));
+                }
+                if pf.sidecars > 0 {
+                    ui.label(format!(
+                        "- {} macOS ._ sidecar(s) will be skipped.",
+                        pf.sidecars
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
+                    pf.files, pf.dirs
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if !open {
+            decision = Some(false);
+        }
+        if let Some(yes) = decision {
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ConfirmTarImport(yes));
+        }
+    }
+
+    /// The pane's read-only archive viewer: entries with marks, the fork container, extract.
+    fn render_archive_browse_window(&mut self, ui: &mut egui::Ui) {
+        let Some(w) = self.ctl.pane(Side::Left).archive_viewer().cloned() else {
+            return;
+        };
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
+        let marked = w.marked_files();
+        egui::Window::new(format!("Archive: {} ({})", w.entry_name, w.kind.label()))
             .id(egui::Id::unique("mac_archive_window"))
             .collapsible(false)
             .resizable(true)
             .default_size([640.0, 480.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("{file_count} file(s) in archive (read-only view)."));
+                ui.label(format!(
+                    "{} file(s) in archive (read-only view).",
+                    w.file_count()
+                ));
                 ui.separator();
-
                 egui::ScrollArea::vertical()
                     .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let Some(w) = self.mac_archive_window.as_mut() else {
-                            return;
-                        };
                         egui::Grid::new("mac_archive_window_entries")
                             .striped(true)
                             .num_columns(5)
                             .spacing([12.0, 2.0])
                             .show(ui, |ui| {
-                                ui.strong("Extract");
-                                ui.strong("Name");
-                                ui.strong("Type/Creator");
-                                ui.strong("Size");
-                                ui.strong("Method");
+                                for h in ["Extract", "Name", "Type/Creator", "Size", "Method"] {
+                                    ui.strong(h);
+                                }
                                 ui.end_row();
-
-                                for i in 0..w.archive.entries.len() {
-                                    let e = &w.archive.entries[i];
+                                for (i, e) in w.rows.iter().enumerate() {
                                     if e.is_dir {
                                         ui.label("");
-                                        ui.label(format!("[ {} ]", e.display_path()));
-                                        ui.label("");
-                                        ui.label("");
-                                        ui.label("");
+                                        ui.label(format!("[ {} ]", e.path));
+                                        for _ in 0..3 {
+                                            ui.label("");
+                                        }
                                         ui.end_row();
                                         continue;
                                     }
-                                    let checked = w.selected.get(i).copied().unwrap_or(true);
-                                    let mut new_checked = checked;
-                                    ui.checkbox(&mut new_checked, "");
-                                    if new_checked != checked {
-                                        if let Some(slot) = w.selected.get_mut(i) {
-                                            *slot = new_checked;
-                                        }
+                                    let mut checked = w.marked[i];
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        acts.push(BrowserPaneAction::ArchiveMark(i));
                                     }
-                                    ui.label(e.display_path());
-                                    let tc = String::from_utf8_lossy(&e.type_code);
-                                    let cc = String::from_utf8_lossy(&e.creator_code);
-                                    ui.label(format!("{tc} / {cc}"));
-                                    let (size, method) = e
-                                        .data
-                                        .as_ref()
-                                        .filter(|f| f.uncompressed_len > 0)
-                                        .or(e.rsrc.as_ref())
-                                        .map(|f| (f.uncompressed_len, f.method_name()))
-                                        .unwrap_or((0, "None"));
-                                    ui.label(human_size_b(size as u64));
-                                    ui.label(method);
+                                    ui.label(&e.path);
+                                    ui.label(&e.type_creator);
+                                    ui.label(human_size_b(e.size));
+                                    ui.label(e.method);
                                     ui.end_row();
                                 }
                             });
                     });
-
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Extract as:");
-                    if let Some(w) = self.mac_archive_window.as_mut() {
-                        egui::ComboBox::from_id_salt("mac_archive_window_fork_format")
-                            .selected_text(w.fork_format.label())
-                            .show_ui(ui, |ui| {
-                                for f in mac_extract::ForkFormat::ALL {
-                                    ui.selectable_value(&mut w.fork_format, f, f.label());
-                                }
-                            });
+                    let mut format = w.format;
+                    egui::ComboBox::from_id_salt("mac_archive_window_fork_format")
+                        .selected_text(format.label())
+                        .show_ui(ui, |ui| {
+                            for f in ForkFormat::ALL {
+                                ui.selectable_value(&mut format, f, f.label());
+                            }
+                        });
+                    if format != w.format {
+                        let viewer = true;
+                        acts.push(BrowserPaneAction::ArchiveFormat { viewer, format });
                     }
-
                     if ui.button("Extract All...").clicked() {
-                        extract_action = Some(true);
+                        acts.push(BrowserPaneAction::ArchiveExtract { all: true });
                     }
+                    let label = format!("Extract Selected... ({marked})");
                     if ui
-                        .add_enabled(
-                            selected_file_count > 0,
-                            egui::Button::new(format!(
-                                "Extract Selected... ({selected_file_count})"
-                            )),
-                        )
+                        .add_enabled(marked > 0, egui::Button::new(label))
                         .clicked()
                     {
-                        extract_action = Some(false);
+                        acts.push(BrowserPaneAction::ArchiveExtract { all: false });
                     }
                     if ui.button("Close").clicked() {
-                        close = true;
+                        acts.push(BrowserPaneAction::CloseArchive);
                     }
                 });
             });
-
-        if let Some(extract_all) = extract_action {
-            self.run_archive_window_extract(extract_all);
-        }
-        if close {
-            self.mac_archive_window = None;
+        let ctx = ui.ctx().clone();
+        for a in acts {
+            self.pane_act(&ctx, a);
         }
     }
 
-    /// Drives the Workflow E extract action: picks an output folder and
-    /// runs the same extract pipeline the standalone Archives tab uses.
-    fn run_archive_window_extract(&mut self, all: bool) {
-        let dest = match super::file_dialog()
-            .set_title("Extract archive contents to folder")
-            .pick_folder()
-        {
-            Some(d) => d,
-            None => return,
-        };
-        let Some(w) = self.mac_archive_window.as_ref() else {
-            return;
-        };
-        let bytes = w.bytes.clone();
-        let archive = w.archive.clone();
-        let selected = w.selected.clone();
-        let format = w.fork_format;
-        let result = if all {
-            mac_extract::extract_all(&bytes, &archive, &dest, format, |_, _, _| {}, |_| {})
-        } else {
-            mac_extract::extract_filtered(
-                &bytes,
-                &archive,
-                &dest,
-                format,
-                |i| selected.get(i).copied().unwrap_or(true),
-                |_, _, _| {},
-                |_| {},
-            )
-        };
-        match result {
-            Ok(stats) => {
-                self.edit_result = Some(format!(
-                    "Extracted {} file(s) to {} as {}{}",
-                    stats.files,
-                    dest.display(),
-                    format.label(),
-                    if stats.skipped > 0 {
-                        format!(" ({} skipped)", stats.skipped)
-                    } else {
-                        String::new()
-                    },
-                ));
-            }
-            Err(e) => {
-                self.edit_result = Some(format!("Extract failed: {e}"));
-            }
-        }
-    }
-
-    /// Render the Workflow C "Save Mac archive" modal: the selected
-    /// file inside the disk image sniffed as a Mac archive; the user
-    /// can either dump the raw bytes (Save as-is) or decode into a
-    /// folder using a fork-preserving container (Decode and save).
+    /// The pane's save dialog for a Mac archive on the volume: as stored, or decoded.
     fn render_archive_extract_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_archive_extract.is_none() {
+        let Some(p) = self.ctl.pane(Side::Left).archive_save().cloned() else {
             return;
-        }
-
-        #[derive(Clone, Copy)]
-        enum CAction {
-            SaveAsIs,
-            Decode,
-            Cancel,
-        }
-        let mut action: Option<CAction> = None;
-
-        // Snapshot fields for rendering; the mutable handle is reborrowed
-        // below for the fork-format dropdown.
-        let (entry_name, kind_label) = {
-            let p = self.pending_archive_extract.as_ref().unwrap();
-            (p.entry_name.clone(), p.kind.label())
         };
-
+        let mut acts: Vec<BrowserPaneAction> = Vec::new();
         egui::Window::new("Save Mac archive")
             .id(egui::Id::unique("archive_extract_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("{entry_name} is a {kind_label} archive."));
+                ui.label(format!("{} is a {} archive.", p.entry_name, p.kind.label()));
                 ui.add_space(4.0);
                 ui.label("How would you like to save it?");
                 ui.add_space(8.0);
-
-                // Fork-format dropdown for the Decode path (no effect
-                // when the user picks Save as-is).
                 ui.horizontal(|ui| {
                     ui.label("Decoded fork container:");
-                    if let Some(p) = self.pending_archive_extract.as_mut() {
-                        egui::ComboBox::from_id_salt("archive_extract_fork_format")
-                            .selected_text(p.fork_format.label())
-                            .show_ui(ui, |ui| {
-                                for f in mac_extract::ForkFormat::ALL {
-                                    ui.selectable_value(&mut p.fork_format, f, f.label());
-                                }
-                            });
+                    let mut format = p.format;
+                    egui::ComboBox::from_id_salt("archive_extract_fork_format")
+                        .selected_text(format.label())
+                        .show_ui(ui, |ui| {
+                            for f in ForkFormat::ALL {
+                                ui.selectable_value(&mut format, f, f.label());
+                            }
+                        });
+                    if format != p.format {
+                        let viewer = false;
+                        acts.push(BrowserPaneAction::ArchiveFormat { viewer, format });
                     }
                 });
-
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -5259,203 +2549,30 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        action = Some(CAction::SaveAsIs);
+                        acts.push(BrowserPaneAction::SaveArchive { raw: true });
                     }
                     if ui
                         .button("Decode and save contents to a folder...")
                         .on_hover_text("Decompress on the host into the chosen fork container.")
                         .clicked()
                     {
-                        action = Some(CAction::Decode);
+                        acts.push(BrowserPaneAction::SaveArchive { raw: false });
                     }
                     if ui.button("Cancel").clicked() {
-                        action = Some(CAction::Cancel);
+                        acts.push(BrowserPaneAction::CancelSaveArchive);
                     }
                 });
             });
-
-        let Some(action) = action else { return };
-        // Take the pending state; subsequent actions own it.
-        let pending = self.pending_archive_extract.take().unwrap();
-        match action {
-            CAction::SaveAsIs => {
-                let default = pending.entry_name.clone();
-                if let Some(dest) = super::file_dialog()
-                    .set_title("Save archive as-is")
-                    .set_file_name(&default)
-                    .save_file()
-                {
-                    match std::fs::write(&dest, &pending.raw_bytes) {
-                        Ok(()) => {
-                            self.edit_result = Some(format!(
-                                "Wrote {} ({})",
-                                dest.display(),
-                                partition::format_size(pending.raw_bytes.len() as u64),
-                            ));
-                        }
-                        Err(e) => {
-                            self.edit_result = Some(format!("Write failed: {e}"));
-                        }
-                    }
-                }
-            }
-            CAction::Decode => {
-                if let Some(dest_dir) = super::file_dialog()
-                    .set_title("Save decoded contents to folder")
-                    .pick_folder()
-                {
-                    let result = mac_extract::extract_all(
-                        &pending.extract_bytes,
-                        &pending.archive,
-                        &dest_dir,
-                        pending.fork_format,
-                        |_, _, _| {},
-                        |_| {},
-                    );
-                    match result {
-                        Ok(stats) => {
-                            self.edit_result = Some(format!(
-                                "Extracted {} files to {} as {}{}",
-                                stats.files,
-                                dest_dir.display(),
-                                pending.fork_format.label(),
-                                if stats.skipped > 0 {
-                                    format!(" ({} skipped)", stats.skipped)
-                                } else {
-                                    String::new()
-                                },
-                            ));
-                        }
-                        Err(e) => {
-                            self.edit_result = Some(format!("Extract failed: {e}"));
-                        }
-                    }
-                }
-            }
-            CAction::Cancel => {}
+        let ctx = ui.ctx().clone();
+        for a in acts {
+            self.pane_act(&ctx, a);
         }
     }
 
-    /// Render the overwrite confirmation dialog for extraction.
-    fn render_extract_overwrite_dialog(&mut self, ui: &mut egui::Ui) {
-        if self.pending_extraction.is_none() {
-            return;
-        }
-        let (conflict_list, count) = {
-            let pe = self.pending_extraction.as_ref().unwrap();
-            let list: Vec<String> = pe
-                .conflicts
-                .iter()
-                .map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
-                        .to_string()
-                })
-                .collect();
-            (list, pe.conflicts.len())
-        };
-
-        let mut action: Option<bool> = None; // Some(true)=overwrite, Some(false)=cancel
-        egui::Window::new("Overwrite existing file?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ui.ctx(), |ui| {
-                if count == 1 {
-                    ui.label(format!(
-                        "'{}' already exists at the destination.",
-                        conflict_list[0]
-                    ));
-                } else {
-                    ui.label(format!("{count} items already exist at the destination:"));
-                    for name in &conflict_list {
-                        ui.label(format!("  - {name}"));
-                    }
-                }
-                ui.add_space(4.0);
-                ui.label("Overwriting will replace the existing items.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Overwrite").clicked() {
-                        action = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = Some(false);
-                    }
-                });
-            });
-
-        match action {
-            Some(true) => {
-                let pe = self.pending_extraction.take().unwrap();
-                for path in &pe.conflicts {
-                    let res = if path.is_dir() {
-                        std::fs::remove_dir_all(path)
-                    } else {
-                        std::fs::remove_file(path)
-                    };
-                    if let Err(e) = res {
-                        self.extraction_result =
-                            Some(format!("Could not remove '{}': {e}", path.display()));
-                        return;
-                    }
-                }
-                self.launch_extraction(pe.entry, pe.dest);
-            }
-            Some(false) => {
-                self.pending_extraction = None;
-            }
-            None => {}
-        }
-    }
-
-    /// Exit edit mode, clearing all staged state.
-    fn exit_edit_mode(&mut self) {
-        self.edit_mode = false;
-        self.edit_free_space = None;
-        self.edit_result = None;
-        self.show_new_folder_dialog = false;
-        self.pending_delete = None;
-        self.staged_edits.clear();
-        self.pending_archive_imports.clear();
-        self.archive_import_tempdir = None;
-
-        if self.chd_edit.is_some() {
-            self.start_chd_flatten();
-        } else if self.archive_edit_ctx.is_some() {
-            self.start_archive_compress();
-        }
-    }
-
-    /// Render the new folder name dialog.
-    fn render_new_folder_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_new_folder_dialog {
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Folder name:");
-            let response = ui.text_edit_singleline(&mut self.new_folder_name);
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.create_new_folder();
-                return;
-            }
-            if ui.button("Create").clicked() {
-                self.create_new_folder();
-                return;
-            }
-            if ui.button("Cancel").clicked() {
-                self.show_new_folder_dialog = false;
-            }
-        });
-    }
-
-    /// Render a modal listing files that failed to stage, with the reason
-    /// for each failure. The list is built by `add_host_paths` and persists
-    /// until the user dismisses the dialog.
+    /// The items that could not be staged: the pane's host staging, then an archive import's failure.
     fn render_staging_errors_dialog(&mut self, ui: &mut egui::Ui) {
-        if !self.show_staging_errors {
+        let rows: Vec<(String, String)> = self.ctl.pane(Side::Left).staging_errors().to_vec();
+        if rows.is_empty() {
             return;
         }
         let mut open = true;
@@ -5471,7 +2588,7 @@ impl BrowseView {
                     super::theme::warning(ui.visuals()),
                     format!(
                         "{} item(s) could not be staged for the [{}] filesystem:",
-                        self.staging_errors.len(),
+                        rows.len(),
                         self.fs_type
                     ),
                 );
@@ -5481,18 +2598,18 @@ impl BrowseView {
                     .auto_shrink([false, false])
                     .max_height(220.0)
                     .show(ui, |ui| {
-                        for (path, reason) in &self.staging_errors {
-                            let label = path
+                        for (path, reason) in &rows {
+                            let label = Path::new(path)
                                 .file_name()
                                 .and_then(|n| n.to_str())
-                                .unwrap_or_else(|| path.to_str().unwrap_or("?"));
+                                .unwrap_or(path);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(label).strong());
                                 ui.label("-");
                                 ui.colored_label(super::theme::danger(ui.visuals()), reason);
                             });
                             ui.label(
-                                egui::RichText::new(path.display().to_string())
+                                egui::RichText::new(path)
                                     .small()
                                     .color(super::theme::muted(ui.visuals())),
                             );
@@ -5507,14 +2624,14 @@ impl BrowseView {
                 });
             });
         if !open || dismiss {
-            self.show_staging_errors = false;
-            self.staging_errors.clear();
+            let act = BrowserPaneAction::DismissStagingErrors;
+            self.ctl.apply(CommanderAction::Pane(Side::Left, act));
         }
     }
 
     /// Render the filesystem check results popup.
     fn render_chd_info_popup(&mut self, ui: &mut egui::Ui) {
-        let Some(text) = self.chd_info_text.clone() else {
+        let Some(text) = self.ctl.chd_info().map(str::to_string) else {
             return;
         };
         let mut open = true;
@@ -5537,14 +2654,16 @@ impl BrowseView {
                     });
             });
         if !open {
-            self.chd_info_text = None;
+            self.ctl
+                .apply(CommanderAction::Mode(ModeAction::CloseChdInfo));
         }
     }
 
+    /// The pane's check or repair report as the browser always showed it.
     fn render_fsck_popup(&mut self, ui: &mut egui::Ui) {
-        if !self.show_fsck_popup {
+        let Some(report) = self.ctl.pane(Side::Left).tool_report().cloned() else {
             return;
-        }
+        };
         let mut open = true;
         let mut do_repair = false;
         egui::Window::new("Filesystem Check Results")
@@ -5552,338 +2671,125 @@ impl BrowseView {
             .resizable(true)
             .default_width(500.0)
             .show(ui.ctx(), |ui| {
-                if let Some(result) = &self.fsck_result {
-                    if result.is_clean() {
-                        ui.colored_label(
-                            super::theme::success(ui.visuals()),
-                            "Filesystem is clean.",
-                        );
-                    } else {
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            format!("{} error(s) found.", result.errors.len()),
-                        );
+                let Some(check) = &report.check else {
+                    for line in &report.lines {
+                        ui.label(line);
                     }
-
-                    ui.separator();
-
-                    // Stats
-                    let mut stats_line = format!(
-                        "Files: {}  Directories: {}",
-                        result.stats.files_checked,
-                        result.stats.directories_checked,
+                    return;
+                };
+                if check.clean {
+                    ui.colored_label(super::theme::success(ui.visuals()), "Filesystem is clean.");
+                } else {
+                    ui.colored_label(
+                        super::theme::danger(ui.visuals()),
+                        format!("{} error(s) found.", check.errors.len()),
                     );
-                    for (label, value) in &result.stats.extra {
-                        stats_line.push_str(&format!("  {}: {}", label, value));
-                    }
-                    ui.label(stats_line);
-
-                    // Errors
-                    if !result.errors.is_empty() {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Errors:").strong());
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_errors")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for issue in &result.errors {
-                                    ui.colored_label(
-                                        super::theme::danger(ui.visuals()),
-                                        format!("[{}] {}", issue.code, issue.message),
-                                    );
+                }
+                ui.separator();
+                ui.label(&check.stats_line);
+                if !check.errors.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Errors:").strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_errors")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for e in &check.errors {
+                                ui.colored_label(super::theme::danger(ui.visuals()), e);
+                            }
+                        });
+                }
+                if !check.orphans.is_empty() {
+                    ui.separator();
+                    let total: usize = check.orphans.iter().map(|(_, v)| v.len()).sum();
+                    let parents = check.orphans.len();
+                    ui.colored_label(
+                        super::theme::danger(ui.visuals()),
+                        format!(
+                            "{total} file(s)/folder(s) reference {parents} missing parent director{} - not repairable.",
+                            if parents == 1 { "y" } else { "ies" },
+                        ),
+                    );
+                    ui.label(
+                        "These entries exist in the catalog but their parent directory is gone. \
+                         This typically indicates severe directory corruption.",
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_orphans")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (parent, entries) in &check.orphans {
+                                ui.colored_label(
+                                    super::theme::warning(ui.visuals()),
+                                    format!("Missing parent ID {parent}:"),
+                                );
+                                for e in entries {
+                                    ui.label(format!("    {e}"));
                                 }
-                            });
+                            }
+                        });
+                }
+                let shown: Vec<_> = check
+                    .warnings
+                    .iter()
+                    .filter(|(_, debug)| !debug || self.show_fsck_debug)
+                    .collect();
+                let has_debug = check.warnings.iter().any(|(_, debug)| *debug);
+                if !shown.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Warnings:").strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("fsck_warnings")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (text, debug) in shown {
+                                let color = if *debug {
+                                    super::theme::muted(ui.visuals())
+                                } else {
+                                    super::theme::warning(ui.visuals())
+                                };
+                                ui.colored_label(color, text);
+                            }
+                        });
+                }
+                if has_debug {
+                    ui.checkbox(&mut self.show_fsck_debug, "Show debug messages");
+                }
+                if check.repairable && !self.ctl.has_archive_flow() {
+                    ui.separator();
+                    let resp = ui
+                        .add_enabled(self.ctl.edit_mode(), egui::Button::new("Repair"))
+                        .on_disabled_hover_text("Turn on Edit Mode to repair the volume.");
+                    if resp.clicked() {
+                        do_repair = true;
                     }
-
-                    // Orphaned entries (files/dirs with missing parents)
-                    if !result.orphaned_entries.is_empty() {
-                        ui.separator();
-                        // Group by missing parent CNID
-                        let mut by_parent: std::collections::BTreeMap<u64, Vec<&rusty_backup::fs::OrphanedEntry>> =
-                            std::collections::BTreeMap::new();
-                        for entry in &result.orphaned_entries {
-                            by_parent
-                                .entry(entry.missing_parent_id)
-                                .or_default()
-                                .push(entry);
-                        }
+                }
+                if let Some(repair) = &report.repair {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Repair Report:").strong());
+                    for fix in &repair.applied {
+                        ui.colored_label(super::theme::success(ui.visuals()), format!("  {fix}"));
+                    }
+                    for fail in &repair.failed {
+                        ui.colored_label(super::theme::danger(ui.visuals()), format!("  {fail}"));
+                    }
+                    if repair.unrepairable > 0 {
                         ui.colored_label(
-                            super::theme::danger(ui.visuals()),
+                            super::theme::warning(ui.visuals()),
                             format!(
-                                "{} file(s)/folder(s) reference {} missing parent director{} - not repairable.",
-                                result.orphaned_entries.len(),
-                                by_parent.len(),
-                                if by_parent.len() == 1 { "y" } else { "ies" },
+                                "{} error(s) could not be repaired (missing parent directories).",
+                                repair.unrepairable
                             ),
                         );
-                        ui.label("These entries exist in the catalog but their parent directory is gone. \
-                                  This typically indicates severe directory corruption.");
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_orphans")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for (parent_cnid, entries) in &by_parent {
-                                    ui.colored_label(
-                                        super::theme::warning(ui.visuals()),
-                                        format!("Missing parent ID {}:", parent_cnid),
-                                    );
-                                    for entry in entries {
-                                        let kind = if entry.is_directory { "dir" } else { "file" };
-                                        ui.label(format!(
-                                            "    {} \"{}\" (ID {})",
-                                            kind, entry.name, entry.id
-                                        ));
-                                    }
-                                }
-                            });
-                    }
-
-                    // Warnings (filter out debug-level unless toggled)
-                    let visible_warnings: Vec<_> = result
-                        .warnings
-                        .iter()
-                        .filter(|w| !w.debug || self.show_fsck_debug)
-                        .collect();
-                    let has_debug = result.warnings.iter().any(|w| w.debug);
-                    if !visible_warnings.is_empty() {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Warnings:").strong());
-                        egui::ScrollArea::vertical()
-                            .id_salt("fsck_warnings")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for issue in &visible_warnings {
-                                    if issue.debug {
-                                        ui.colored_label(
-                                            super::theme::muted(ui.visuals()),
-                                            format!("[DEBUG] {}", issue.message),
-                                        );
-                                    } else {
-                                        ui.colored_label(
-                                            super::theme::warning(ui.visuals()),
-                                            format!("[{}] {}", issue.code, issue.message),
-                                        );
-                                    }
-                                }
-                            });
-                    }
-                    if has_debug {
-                        ui.checkbox(
-                            &mut self.show_fsck_debug,
-                            "Show debug messages",
-                        );
-                    }
-
-                    // Repair button — only for repairable errors on non-archive sources
-                    if result.repairable && self.archive_edit_ctx.is_none() {
-                        ui.separator();
-                        if ui.button("Repair").clicked() {
-                            do_repair = true;
-                        }
-                    }
-
-                    // Repair report
-                    if let Some(ref report) = self.repair_report {
-                        ui.separator();
-                        ui.label(egui::RichText::new("Repair Report:").strong());
-                        if !report.fixes_applied.is_empty() {
-                            for fix in &report.fixes_applied {
-                                ui.colored_label(
-                                    super::theme::success(ui.visuals()),
-                                    format!("  {}", fix),
-                                );
-                            }
-                        }
-                        if !report.fixes_failed.is_empty() {
-                            for fail in &report.fixes_failed {
-                                ui.colored_label(
-                                    super::theme::danger(ui.visuals()),
-                                    format!("  {}", fail),
-                                );
-                            }
-                        }
-                        if report.unrepairable_count > 0 {
-                            ui.colored_label(
-                                super::theme::warning(ui.visuals()),
-                                format!(
-                                    "{} error(s) could not be repaired (missing parent directories).",
-                                    report.unrepairable_count
-                                ),
-                            );
-                        }
                     }
                 }
             });
+        let ctx = ui.ctx().clone();
         if !open {
-            self.show_fsck_popup = false;
+            self.pane_act(&ctx, BrowserPaneAction::DismissToolReport);
         }
         if do_repair {
-            self.show_repair_confirm = true;
-        }
-
-        // Repair confirmation dialog
-        self.render_repair_confirm(ui);
-    }
-
-    /// Render the repair confirmation dialog and execute repair if confirmed.
-    fn render_repair_confirm(&mut self, ui: &mut egui::Ui) {
-        if !self.show_repair_confirm {
-            return;
-        }
-        let repairable_count = self
-            .fsck_result
-            .as_ref()
-            .map(|r| r.errors.iter().filter(|e| e.repairable).count())
-            .unwrap_or(0);
-
-        let mut confirmed = false;
-        let mut cancelled = false;
-        egui::Window::new("Repair Filesystem?")
-            .collapsible(false)
-            .resizable(false)
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "This will attempt to fix {} repairable error(s). \
-                     Unrepairable issues (B-tree structural damage) will be skipped.\n\n\
-                     Continue?",
-                    repairable_count
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        confirmed = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
-                    }
-                });
-            });
-
-        if cancelled {
-            self.show_repair_confirm = false;
-        }
-        if confirmed {
-            self.show_repair_confirm = false;
-            self.run_repair();
-        }
-    }
-
-    /// Execute repair on the filesystem and re-run check.
-    fn run_repair(&mut self) {
-        self.edit_free_space = None;
-        match self.session.open_editable() {
-            Ok((mut efs, commit)) => match efs.repair() {
-                Ok(report) => {
-                    self.repair_report = Some(report);
-                    // Re-run fsck to show updated state. Repair wrote to
-                    // disk, so any cached read-only fs is stale.
-                    drop(efs);
-                    // Persist: re-encode the temp flat back into the container
-                    // (no-op for raw images).
-                    if let Err(e) = commit.commit() {
-                        self.error = Some(format!(
-                            "Repair succeeded but writing container failed: {e}"
-                        ));
-                        return;
-                    }
-                    self.invalidate_cached_fs();
-                    match self.take_or_open_fs() {
-                        Some(mut fs) => {
-                            if let Some(Ok(result)) = fs.fsck() {
-                                self.fsck_result = Some(result);
-                            }
-                            self.return_fs(fs);
-                        }
-                        None => {
-                            self.error = Some("Failed to re-check after repair".into());
-                        }
-                    }
-                    // Invalidate directory cache
-                    self.directory_cache.clear();
-                }
-                Err(e) => {
-                    self.error = Some(format!("Repair failed: {}", e));
-                }
-            },
-            Err(e) => {
-                self.error = Some(format!("Failed to open filesystem for repair: {}", e));
-            }
-        }
-    }
-
-    fn generate_tree_text(&mut self) {
-        if self.pending_tree.is_some() {
-            return;
-        }
-        let Some(fs) = self.take_or_open_fs() else {
-            self.error = Some("Failed to open filesystem".into());
-            return;
-        };
-        let show_ids = self.tree_show_ids;
-        let status = Arc::new(Mutex::new(TreeStatus {
-            finished: false,
-            text: None,
-            error: None,
-            fs: None,
-        }));
-        let status_thread = Arc::clone(&status);
-        std::thread::spawn(move || {
-            let mut fs = fs;
-            let result = if show_ids {
-                rusty_backup::fs::tree::format_tree_with_ids(&mut *fs)
-            } else {
-                rusty_backup::fs::tree::format_tree(&mut *fs)
-            };
-            if let Ok(mut g) = status_thread.lock() {
-                match result {
-                    Ok(text) => g.text = Some(text),
-                    Err(e) => g.error = Some(format!("Failed to generate tree: {e}")),
-                }
-                g.fs = Some(fs);
-                g.finished = true;
-            }
-        });
-        self.pending_tree_generation = self.fs_generation;
-        self.pending_tree = Some(status);
-    }
-
-    fn poll_pending_tree(&mut self, ui: &mut egui::Ui) {
-        let mut take_now = false;
-        if let Some(arc) = &self.pending_tree {
-            if let Ok(g) = arc.lock() {
-                if g.finished {
-                    take_now = true;
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label("Generating tree view...");
-                    });
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-        if take_now {
-            if let Some(arc) = self.pending_tree.take() {
-                if let Ok(mut g) = arc.lock() {
-                    if let Some(fs) = g.fs.take() {
-                        // A write since the walk began makes this handle stale.
-                        if self.pending_tree_generation == self.fs_generation {
-                            self.cached_fs = Some(fs);
-                        }
-                    }
-                    if let Some(text) = g.text.take() {
-                        let oversized = text.len() > TREE_INLINE_RENDER_LIMIT;
-                        self.tree_text = Some(text);
-                        if oversized {
-                            self.show_tree_large_dialog = true;
-                        } else {
-                            self.show_tree_popup = true;
-                        }
-                    }
-                    if let Some(err) = g.error.take() {
-                        self.error = Some(err);
-                    }
-                }
-            }
+            self.pane_act(&ctx, BrowserPaneAction::Repair);
         }
     }
 
@@ -5910,7 +2816,8 @@ impl BrowseView {
                         save_requested = true;
                     }
                     ui.add_space(16.0);
-                    if ui.checkbox(&mut self.tree_show_ids, "Show IDs").changed() {
+                    // A disc's tree has no filesystem ids.
+                    if !self.optical && ui.checkbox(&mut self.tree_show_ids, "Show IDs").changed() {
                         regenerate = true;
                     }
                 });
@@ -5931,22 +2838,11 @@ impl BrowseView {
             self.show_tree_popup = false;
         }
         if regenerate {
-            self.generate_tree_text();
+            let ids = self.tree_show_ids;
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ListTree { ids });
         }
         if save_requested {
-            if let Some(text) = &self.tree_text {
-                let text = text.clone();
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save tree view")
-                    .set_file_name("tree.txt")
-                    .add_filter("Text files", &["txt"])
-                    .save_file()
-                {
-                    if let Err(e) = std::fs::write(&path, &text) {
-                        self.error = Some(format!("Failed to save tree: {}", e));
-                    }
-                }
-            }
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::SaveTree);
         }
     }
 
@@ -5994,25 +2890,8 @@ impl BrowseView {
             self.show_tree_large_dialog = false;
         }
         if save_clicked {
-            if let Some(text) = self.tree_text.clone() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Save tree view")
-                    .set_file_name("tree.txt")
-                    .add_filter("Text files", &["txt"])
-                    .save_file()
-                {
-                    match std::fs::write(&path, &text) {
-                        Ok(()) => {
-                            self.show_tree_large_dialog = false;
-                        }
-                        Err(e) => {
-                            self.error = Some(format!("Failed to save tree: {}", e));
-                        }
-                    }
-                }
-            } else {
-                self.show_tree_large_dialog = false;
-            }
+            self.show_tree_large_dialog = false;
+            self.pane_act(&ui.ctx().clone(), BrowserPaneAction::SaveTree);
         }
         if show_anyway {
             self.show_tree_large_dialog = false;
@@ -6020,44 +2899,9 @@ impl BrowseView {
         }
     }
 
-    /// Create a new folder with the name from the dialog.
-    fn create_new_folder(&mut self) {
-        let name = self.new_folder_name.trim().to_string();
-        self.show_new_folder_dialog = false;
-
-        if name.is_empty() {
-            self.edit_result = Some("Error: folder name cannot be empty".into());
-            return;
-        }
-
-        if let Err(e) = self.validate_staged_name(&name) {
-            self.edit_result = Some(format!("Error: {e}"));
-            return;
-        }
-
-        let parent = self.current_parent_entry();
-
-        // Check for duplicate name in pending adds
-        let pending = self.staged_edits.pending_adds_for(&parent.path);
-        if pending.iter().any(|e| e.name == name) {
-            self.edit_result = Some(format!(
-                "Error: '{name}' is already staged in this directory"
-            ));
-            return;
-        }
-
-        self.staged_edits.push(StagedEdit::CreateDirectory {
-            parent,
-            name: name.clone(),
-            qnx2_attrs: None,
-        });
-
-        self.edit_result = Some(format!("Staged folder '{name}'"));
-    }
-
     /// Handle files dropped from the host OS onto the window.
     fn handle_dropped_files(&mut self, ui: &mut egui::Ui) {
-        if !self.edit_mode {
+        if !self.ctl.edit_mode() {
             return;
         }
 
@@ -6070,378 +2914,29 @@ impl BrowseView {
         });
 
         if !dropped.is_empty() {
-            self.add_host_paths(&dropped);
+            self.add_host_paths(&ui.ctx().clone(), &dropped);
         }
     }
 
-    /// Poll extraction progress and update UI state.
-    /// Drain the background-open worker. While it's still running, render a
-    /// spinner + phase label and request a repaint. Once finished, copy the
-    /// fs metadata + root listing into self and clear `pending_open`.
-    fn poll_pending_open(&mut self, ui: &mut egui::Ui) {
-        let mut take_now = false;
-        if let Some(arc) = &self.pending_open {
-            if let Ok(g) = arc.lock() {
-                if g.finished {
-                    take_now = true;
-                } else if g.scan_total > 0 {
-                    // Synthetic carve scan in progress — determinate bar. A
-                    // full scan of a large device is the slow case the
-                    // "Full scan" toggle introduces; show real progress.
-                    let frac = (g.scan_done as f32 / g.scan_total as f32).clamp(0.0, 1.0);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(format!(
-                            "{} ({} / {})",
-                            g.phase,
-                            rusty_backup::partition::format_size(g.scan_done),
-                            rusty_backup::partition::format_size(g.scan_total),
-                        ));
-                    });
-                    ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    ui.ctx().request_repaint();
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(format!("Loading filesystem: {}", g.phase));
-                    });
-                    ui.label(
-                        "Large volumes (e.g. HFS+ catalogs with hundreds of \
-                         thousands of files) can take several seconds.",
-                    );
-                    ui.ctx().request_repaint();
-                }
-            }
+    /// The extraction's status line as the result (an "Open as Disk Image" copy reports through the modes).
+    fn poll_extraction(&mut self) {
+        if !self.extracting || self.ctl.copy_job().is_some() || self.effects.modal_open() {
+            return;
         }
-        if take_now {
-            if let Some(arc) = self.pending_open.take() {
-                if let Ok(mut g) = arc.lock() {
-                    self.fs_type = std::mem::take(&mut g.fs_type);
-                    self.volume_label = std::mem::take(&mut g.volume_label);
-                    self.volume_total = g.total_size;
-                    self.volume_used = g.used_size;
-                    self.blessed_folder = g.blessed_folder.take();
-                    if let Some(root) = g.root.take() {
-                        if let Some(mut entries) = g.root_entries.take() {
-                            rusty_backup::fs::entry::sort_for_display(&mut entries);
-                            self.directory_cache.insert("/".into(), entries);
-                            self.expanded_paths.insert("/".into());
-                        }
-                        self.root = Some(root);
-                    }
-                    if g.needs_password {
-                        self.needs_password = true;
-                        self.error = None;
-                    } else if let Some(err) = g.error.take() {
-                        self.error = Some(err);
-                    }
-                    // Hand the live filesystem into the read cache so we
-                    // don't re-open (and re-read the catalog) for the first
-                    // user action.
-                    self.cached_fs = g.fs.take();
-                }
-            }
+        if self.ctl.host_conflict().is_some() {
+            return;
+        }
+        self.extracting = false;
+        let said = self.ctl.status().to_string();
+        if !said.is_empty() {
+            self.extraction_result = Some(said);
         }
     }
-
-    /// Borrow the cached read-only filesystem, opening fresh if the cache is
-    /// empty. The caller MUST return the fs via [`return_fs`](Self::return_fs)
-    /// after use so subsequent calls can reuse it. Returning an `Option` (vs.
-    /// a `&mut`) keeps the borrow off `self` so callers can also mutate other
-    /// `BrowseView` fields in the same scope.
-    fn take_or_open_fs(&mut self) -> Option<Box<dyn Filesystem>> {
-        if let Some(fs) = self.cached_fs.take() {
-            return Some(fs);
-        }
-        match self.session.open() {
-            Ok(mut fs) => {
-                if self.show_deleted {
-                    fs.set_show_deleted(true);
-                }
-                Some(fs)
-            }
-            Err(e) => {
-                log::debug!("session.open() failed: {e}");
-                None
-            }
-        }
-    }
-
-    /// Return a previously taken filesystem to the cache.
-    fn return_fs(&mut self, fs: Box<dyn Filesystem>) {
-        self.cached_fs = Some(fs);
-    }
-
-    /// Drop the cached filesystem so the next read re-opens from disk.
-    /// Call this whenever the underlying volume bytes may have changed
-    /// (after sync_metadata, archive recompress, etc.).
-    fn invalidate_cached_fs(&mut self) {
-        self.cached_fs = None;
-        self.fs_generation = self.fs_generation.wrapping_add(1);
-        // Boot-block status is recomputed lazily from the (now possibly
-        // changed) backing bytes the next time the header renders.
-        self.boot_blocks_present = None;
-    }
-
-    /// Best-effort: does the open volume have HFS boot blocks at sector 0?
-    /// Reads two bytes from the backing file at the partition offset. Returns
-    /// `None` when unknown — no file-backed source (e.g. a CHD edit session),
-    /// or a read error. Only trustworthy in edit mode, where the backing file
-    /// holds the raw, decompressed image bytes.
-    fn detect_boot_blocks_present(&self) -> Option<bool> {
-        let path = self.session.source_path.as_ref()?;
-        let mut f = std::fs::File::open(path).ok()?;
-        rusty_backup::fs::hfs_boot::has_boot_blocks(&mut f, self.session.partition_offset).ok()
-    }
-
-    fn poll_extraction(&mut self, ui: &egui::Ui) {
-        let finished_msg = if let Some(progress) = &self.extraction_progress {
-            if let Ok(p) = progress.lock() {
-                if p.finished {
-                    Some(if let Some(ref err) = p.error {
-                        format!("Extraction failed: {err}")
-                    } else if p.files_skipped > 0 {
-                        format!(
-                            "Extraction complete: {} files extracted, {} skipped \
-                             (see log for details).",
-                            p.files_extracted, p.files_skipped
-                        )
-                    } else {
-                        format!(
-                            "Extraction complete: {} files extracted.",
-                            p.files_extracted
-                        )
-                    })
-                } else {
-                    ui.ctx().request_repaint();
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(msg) = finished_msg {
-            self.extraction_progress = None;
-            if let Some(temp) = self.nested_open.take() {
-                let extracted = std::fs::read_dir(temp.path())
-                    .ok()
-                    .and_then(|mut d| d.find_map(|e| e.ok()))
-                    .map(|e| e.path());
-                match extracted {
-                    Some(path) if !msg.starts_with("Extraction failed") => {
-                        self.extraction_result =
-                            Some(format!("Opening {} as a disk image...", path.display()));
-                        self.nested_ready = Some((path, temp));
-                    }
-                    _ => {
-                        self.extraction_result =
-                            Some(msg.replacen("Extraction", "Open as disk image", 1));
-                    }
-                }
-                return;
-            }
-            self.extraction_result = Some(msg);
-        }
-    }
-}
-
-/// Run the extraction in a background thread.
-fn run_extraction(
-    session: &BrowseSession,
-    entry: &FileEntry,
-    dest: &std::path::Path,
-    resource_fork_mode: ResourceForkMode,
-    is_prodos: bool,
-    prodos_export_mode: ProdosExportMode,
-    rs_to_lf: bool,
-    progress: &Arc<Mutex<ExtractionProgress>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut counting_fs = session.open()?;
-
-    // Pre-count files and bytes for progress tracking
-    let (total_files, total_bytes) = count_entry(&mut *counting_fs, entry)?;
-    if let Ok(mut p) = progress.lock() {
-        p.total_files = total_files;
-        p.total_bytes = total_bytes;
-    }
-    drop(counting_fs);
-
-    // Open a fresh filesystem for extraction
-    let mut fs = session.open()?;
-
-    extract_entry(
-        &mut *fs,
-        entry,
-        dest,
-        resource_fork_mode,
-        is_prodos,
-        prodos_export_mode,
-        rs_to_lf,
-        progress,
-    )?;
-
-    Ok(())
-}
-
-/// Recursively count files and total bytes for progress tracking.
-fn count_entry(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-) -> Result<(u32, u64), Box<dyn std::error::Error + Send + Sync>> {
-    match entry.entry_type {
-        EntryType::File => {
-            let rsrc = entry.resource_fork_size.unwrap_or(0);
-            Ok((1, entry.size + rsrc))
-        }
-        EntryType::Symlink => Ok((1, 0)),
-        EntryType::Directory => {
-            let children = fs.list_directory(entry)?;
-            let mut total_files = 0u32;
-            let mut total_bytes = 0u64;
-            for child in &children {
-                let (f, b) = count_entry(fs, child)?;
-                total_files += f;
-                total_bytes += b;
-            }
-            Ok((total_files, total_bytes))
-        }
-        EntryType::Special => Ok((0, 0)),
-    }
-}
-
-/// True when the error is the sentinel raised on user cancellation. Such an
-/// error must abort the whole extraction rather than being skipped per-file.
-fn is_cancellation(e: &(dyn std::error::Error + Send + Sync)) -> bool {
-    e.to_string() == "Extraction cancelled"
-}
-
-/// Recursively extract an entry to the destination path.
-#[allow(clippy::too_many_arguments)]
-fn extract_entry(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-    dest: &std::path::Path,
-    resource_fork_mode: ResourceForkMode,
-    is_prodos: bool,
-    prodos_export_mode: ProdosExportMode,
-    rs_to_lf: bool,
-    progress: &Arc<Mutex<ExtractionProgress>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Check for cancellation
-    if let Ok(p) = progress.lock() {
-        if p.cancel_requested {
-            return Err("Extraction cancelled".into());
-        }
-    }
-
-    let base_name = resource_fork::sanitize_filename(&entry.name);
-    // For ProDOS files (not directories) in WithTypeSuffix mode, append the
-    // CiderPress `#TTAAAA` suffix so type and aux round-trip through host.
-    let safe_name =
-        if is_prodos && entry.is_file() && prodos_export_mode == ProdosExportMode::WithTypeSuffix {
-            let tt = entry.prodos_file_type.unwrap_or(0x06);
-            let aux = entry.aux_type.unwrap_or(0);
-            format!(
-                "{}{}",
-                base_name,
-                rusty_backup::fs::prodos_types::encode_cp_suffix(tt, aux)
-            )
-        } else {
-            base_name
-        };
-
-    match entry.entry_type {
-        EntryType::File => {
-            // Update progress with current file name
-            if let Ok(mut p) = progress.lock() {
-                p.current_file = entry.path.clone();
-            }
-
-            if rs_to_lf && entry.size <= 16 << 20 {
-                let data = fs.read_file(entry, usize::MAX)?;
-                if rusty_backup::fs::qnx2::looks_like_rs_text(&data) {
-                    std::fs::write(
-                        dest.join(&safe_name),
-                        rusty_backup::fs::qnx2::rs_to_lf(&data),
-                    )?;
-                    if let Ok(mut p) = progress.lock() {
-                        p.current_bytes += data.len() as u64;
-                        p.files_extracted += 1;
-                    }
-                    return Ok(());
-                }
-            }
-            // All fork formats (MacBinary / BinHex / AppleDouble / Native /
-            // SeparateRsrc / DataForkOnly) go through the shared per-file
-            // exporter so the browse view and Commander produce identical output.
-            // `safe_name` carries any ProDOS `#TTAAAA` suffix computed above.
-            let written =
-                fork_export::export_file_with_fork(fs, entry, dest, &safe_name, resource_fork_mode)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("{e:#}").into()
-                    })?;
-            if let Ok(mut p) = progress.lock() {
-                p.current_bytes += written;
-                p.files_extracted += 1;
-            }
-        }
-        EntryType::Directory => {
-            let dir_path = dest.join(&safe_name);
-            std::fs::create_dir_all(&dir_path)?;
-
-            let children = fs.list_directory(entry)?;
-            for child in &children {
-                match extract_entry(
-                    fs,
-                    child,
-                    &dir_path,
-                    resource_fork_mode,
-                    is_prodos,
-                    prodos_export_mode,
-                    rs_to_lf,
-                    progress,
-                ) {
-                    Ok(()) => {}
-                    // Cancellation must stop the whole run; propagate it.
-                    Err(e) if is_cancellation(&*e) => return Err(e),
-                    // Any other per-entry failure (e.g. an NTFS metafile with
-                    // no $DATA attribute, an unreadable file, or a host I/O
-                    // error) is logged and counted as skipped so extraction
-                    // continues with the remaining entries.
-                    Err(e) => {
-                        log::warn!("Skipped {}: {e}", child.path);
-                        if let Ok(mut p) = progress.lock() {
-                            p.files_skipped += 1;
-                        }
-                    }
-                }
-            }
-        }
-        EntryType::Symlink => {
-            #[cfg(unix)]
-            {
-                let target = entry.symlink_target.as_deref().unwrap_or("");
-                let link_path = dest.join(&safe_name);
-                // Ignore errors for symlinks (target may not exist on host)
-                let _ = std::os::unix::fs::symlink(target, &link_path);
-            }
-            if let Ok(mut p) = progress.lock() {
-                p.files_extracted += 1;
-            }
-        }
-        EntryType::Special => {
-            // Skip special files (block devices, etc.)
-        }
-    }
-
-    Ok(())
 }
 
 /// Compact byte-count formatter for the Workflow E archive viewer
 /// window. Mirrors `archives_tab::human_size` rather than
-/// `partition::format_size` (which uses base-1000 GB/MB and is meant
+/// `format_size` (which uses base-1000 GB/MB and is meant
 /// for storage-media advertising units) so the viewer matches the
 /// Archives tab's display.
 fn human_size_b(bytes: u64) -> String {
@@ -6456,95 +2951,5 @@ fn human_size_b(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
-    }
-}
-
-/// Workflow B: which on-host archive format to write when the user
-/// clicks one of the "Export Mac archive" buttons under the browse-view
-/// extract row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveExportFormat {
-    /// `.hqx` — BinHex 4.0. Single file only.
-    Hqx,
-    /// `.sit` — classic StuffIt. Any selection (file or folder).
-    Sit,
-    /// `.sit.hqx` — StuffIt-over-BinHex. Any selection.
-    SitHqx,
-    /// `.mar` — Hampa Hug's MAR (stored). A single file or folder selection
-    /// (multiple top-level items are wrapped in a folder).
-    Mar,
-}
-
-impl ArchiveExportFormat {
-    fn extension(self) -> &'static str {
-        match self {
-            ArchiveExportFormat::Hqx => ".hqx",
-            ArchiveExportFormat::Sit => ".sit",
-            ArchiveExportFormat::SitHqx => ".sit.hqx",
-            ArchiveExportFormat::Mar => ".mar",
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            ArchiveExportFormat::Hqx => "BinHex 4.0 (.hqx)",
-            ArchiveExportFormat::Sit => "StuffIt (.sit)",
-            ArchiveExportFormat::SitHqx => "StuffIt-over-BinHex (.sit.hqx)",
-            ArchiveExportFormat::Mar => "MAR (.mar)",
-        }
-    }
-}
-
-/// Recursive helper for [`BrowseView::collect_archive_inputs`]: walks
-/// `entry` on the open `fs` and produces zero or more
-/// [`StuffItInputNode`]s. Files become `File` nodes carrying both forks
-/// plus type/creator; directories become `Folder` nodes containing the
-/// recursive walk of their children. Symlinks and special files are
-/// dropped silently — there's no Mac-archive representation for them.
-fn walk_fs_to_input_nodes(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-) -> Result<Vec<StuffItInputNode>, String> {
-    if entry.is_directory() {
-        let children = fs.list_directory(entry).map_err(|e| e.to_string())?;
-        let mut inner: Vec<StuffItInputNode> = Vec::new();
-        for child in children {
-            inner.extend(walk_fs_to_input_nodes(fs, &child)?);
-        }
-        // A directory at the volume root (path "/") expands to its
-        // children directly — bundling the root would yield a strangely-
-        // named outer folder ("/" or ""), and the user almost always
-        // means "bundle these children" when they pick root.
-        if entry.path == "/" {
-            return Ok(inner);
-        }
-        Ok(vec![StuffItInputNode::Folder {
-            name: entry.name.clone(),
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            children: inner,
-        }])
-    } else if entry.is_file() {
-        let data = fs.read_file(entry, usize::MAX).map_err(|e| e.to_string())?;
-        let mut rsrc: Vec<u8> = Vec::new();
-        // Best-effort: missing resource fork support / empty fork =>
-        // zero bytes (the StuffIt writer drops it on the floor).
-        let _ = fs.write_resource_fork_to(entry, &mut rsrc);
-
-        let type_code = entry.type_code.unwrap_or([0; 4]);
-        let creator_code = entry.creator_code.unwrap_or([0; 4]);
-
-        Ok(vec![StuffItInputNode::File(StuffItInput {
-            name: entry.name.clone(),
-            type_code,
-            creator_code,
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            data_fork: data,
-            resource_fork: rsrc,
-        })])
-    } else {
-        Ok(Vec::new())
     }
 }

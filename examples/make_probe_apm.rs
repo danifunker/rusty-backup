@@ -2,9 +2,9 @@
 //! with Apple_HFS at LBA 96 (image byte 0xC000), mirroring the layout
 //! used in the user's `put --boot` regression reproducer.
 
-use rusty_backup::fs::hfs::create_blank_hfs;
+use fs_mac::hfs::create_blank_hfs;
+use part_tables::apm::build_minimal_apm;
 use rusty_backup::fs::hfs_clone::emit_apm_disk_with_hfs;
-use rusty_backup::partition::apm::build_minimal_apm;
 use std::io::Cursor;
 
 fn main() {

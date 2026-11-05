@@ -1,274 +1,119 @@
-//! Archives tab — browse and extract classic Macintosh archives.
+//! Archives tab: browse and extract classic Macintosh archives, a shell over
+//! `controller::archives`.
 //!
-//! Detection is magic-driven via `macarchive::detect::detect_mac_archive`,
-//! so the picker accepts any file the user points at: classic StuffIt
-//! (`SIT!`), StuffIt 5, SEA, BinHex 4.0 (loose `.hqx` carrying a single
-//! Mac file *or* BinHex-wrapped SIT / SEA). Filename extension is a
-//! picker hint only, never load-gating.
-//!
-//! Read-only: pick an archive, see its entries, extract all to a folder
-//! in a chosen fork-preserving container (BinHex / MacBinary /
-//! AppleDouble / raw). All decode + the loose-HQX synthesis live in
-//! `rusty_backup::macarchive::extract`; this tab is just the egui
-//! surface around it.
+//! Detection is magic-driven, so the picker accepts any file the user points at: classic
+//! StuffIt (`SIT!`), StuffIt 5, SEA, BinHex 4.0 (loose `.hqx` carrying a single Mac file *or*
+//! BinHex-wrapped SIT / SEA). Read-only: pick an archive, tick entries, extract all or the
+//! ticked ones in a fork-preserving container, or mount a single-entry disk image in Inspect.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rusty_backup::macarchive::detect::{detect_mountable_image, MountableImageKind};
-use rusty_backup::macarchive::extract::{self, ExtractStats, ForkFormat};
-use rusty_backup::macarchive::stuffit::{self, StuffItArchive};
+use rusty_backup::controller::app::{RecentHandle, RecentMode};
+use rusty_backup::controller::archives::{
+    ArchivesAction, ArchivesController, ForkFormat, HostRequest,
+};
+use rusty_backup::controller::log::LogStore;
+use rusty_backup::controller::{Controller as _, Effect};
 
-use super::progress::LogPanel;
+use super::effects::{EffectHost, Reply};
 
-/// A successfully loaded archive: the decoded bytes plus parsed directory.
-struct Loaded {
-    bytes: Arc<Vec<u8>>,
-    archive: Arc<StuffItArchive>,
-    file_count: usize,
-    /// Set when the archive has exactly one non-folder entry whose data
-    /// fork decompresses to a payload [`detect_mountable_image`] recognizes
-    /// (DiskCopy 4.2 / raw HFS / raw HFS+). Drives the "Mount in new
-    /// Inspect tab" button in `show()` (Workflow D.2 auto-unwrap hint).
-    mountable: Option<MountablePayload>,
-    /// Per-entry "include in extract" checkbox state (Workflow D.3),
-    /// indexed parallel to `archive.entries`. All-true on fresh load;
-    /// the user unchecks entries they don't want before clicking
-    /// "Extract Selected...". Folder markers are always extracted (the
-    /// directory rebuild leans on them) so their checkbox is unused but
-    /// kept for index alignment.
-    selected: Vec<bool>,
-}
-
-/// Cached single-entry payload ready to hand off to the Inspect tab.
-struct MountablePayload {
-    kind: MountableImageKind,
-    /// Decompressed data-fork bytes of the single entry. Owned because
-    /// the user might never click the Mount button; we re-decompress
-    /// from the source archive bytes lazily would also work, but the
-    /// archive-load cost is already paid once.
-    decoded: Vec<u8>,
-    /// Suggested filename for the host-side temp file. Drives both the
-    /// tempfile name and the title rendered in the Inspect tab.
-    name: String,
-}
-
-/// Hand-off the Archives tab signals to the main update loop to open
-/// in the Inspect tab. Drained by `RustyBackupApp::update`.
+/// A decoded archive payload for the Inspect tab; the guard keeps its temporary file alive.
 pub struct PendingInspectOpen {
     pub path: PathBuf,
     pub guard: tempfile::TempDir,
 }
 
-/// Background extraction status, shared with the worker thread.
-#[derive(Default)]
-struct ExtractStatus {
-    done: usize,
-    total: usize,
-    current: String,
-    finished: bool,
-    result: Option<Result<ExtractStats, String>>,
-    log_lines: Vec<String>,
-}
-
 pub struct ArchivesTab {
-    /// MRU of opened archive paths (newest first), mirrored to `config.json` —
-    /// the "Recent:" quick-pick row.
+    ctl: ArchivesController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
+    /// MRU of opened archive paths (newest first), mirrored to `config.json`.
     recent_files: Vec<String>,
-    archive_path: Option<PathBuf>,
-    prev_path: Option<PathBuf>,
-    loaded: Option<Loaded>,
-    load_error: Option<String>,
-    format: ForkFormat,
-    output_dir: Option<PathBuf>,
-    status: Option<Arc<Mutex<ExtractStatus>>>,
-    /// Queued by the "Mount in new Inspect tab" button; drained each
-    /// frame by `RustyBackupApp::update` via [`take_pending_inspect_open`].
+    /// The app's recent-files store; opens are recorded through it.
+    recent: RecentHandle,
+    /// Queued by "Mount in new Inspect tab"; drained by the app via [`Self::take_pending_inspect_open`].
     pending_inspect_open: Option<PendingInspectOpen>,
 }
 
-impl Default for ArchivesTab {
-    fn default() -> Self {
+impl ArchivesTab {
+    pub fn new(recent: RecentHandle) -> Self {
         Self {
-            recent_files: super::load_recent(rusty_backup::update::RecentMode::Archives),
-            archive_path: None,
-            prev_path: None,
-            loaded: None,
-            load_error: None,
-            format: ForkFormat::BinHex,
-            output_dir: None,
-            status: None,
+            ctl: ArchivesController::new(Arc::new(super::ui_logger::EguiWake)),
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+            recent_files: recent.list(RecentMode::Archives),
+            recent,
             pending_inspect_open: None,
         }
     }
 }
 
 impl ArchivesTab {
-    fn load(&mut self) {
-        self.loaded = None;
-        self.load_error = None;
-        let Some(path) = self.archive_path.clone() else {
-            return;
-        };
-        match extract::open(&path) {
-            Ok((bytes, archive)) => {
-                let file_count = archive.entries.iter().filter(|e| !e.is_dir).count();
-                let mountable = sniff_mountable_payload(&bytes, &archive);
-                let selected = vec![true; archive.entries.len()];
-                self.loaded = Some(Loaded {
-                    bytes: Arc::new(bytes),
-                    archive: Arc::new(archive),
-                    file_count,
-                    mountable,
-                    selected,
-                });
-            }
-            Err(e) => self.load_error = Some(format!("{e}")),
-        }
-    }
-
-    /// Drained by the main update loop. When `Some`, the host should
-    /// route the path into the Inspect tab (e.g. via
-    /// `InspectTab::load_image_with_tempdir`) and switch the active tab
-    /// to Inspect.
+    /// Drained by the app: open the payload in Inspect and switch there.
     pub fn take_pending_inspect_open(&mut self) -> Option<PendingInspectOpen> {
         self.pending_inspect_open.take()
     }
 
-    /// Load `path` as the archive source (the next `show` reloads on the path
-    /// change). Used when the Inspect tab redirects a picked Mac-archive file
-    /// here instead of trying to parse it as a disk image.
+    /// Load `path` as the archive (Inspect hands a picked Mac archive over here).
     pub fn open_path(&mut self, path: PathBuf) {
-        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Archives, &path);
-        self.archive_path = Some(path);
+        self.act(ArchivesAction::Open(path));
+        self.carry_out_requests();
     }
 
-    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
-    /// the persisted lists; the mirror otherwise only reloads at construction).
+    /// Drop the in-memory recent list after Settings cleared the persisted one.
     pub(crate) fn clear_recent_files(&mut self) {
         self.recent_files.clear();
     }
 
-    /// Unload the current archive (the "Close" button). Leaves the recent list
-    /// intact so the user can re-open.
-    pub fn close(&mut self) {
-        self.archive_path = None;
-        self.prev_path = None;
-        self.loaded = None;
-        self.load_error = None;
+    fn act(&mut self, action: ArchivesAction) {
+        let fx = self.ctl.apply(action);
+        self.pending_fx.extend(fx);
     }
 
-    /// Spawn the background extractor. When `selected_only` is true,
-    /// only entries whose checkbox is ticked are extracted via
-    /// [`extract::extract_filtered`]; otherwise [`extract::extract_all`]
-    /// pulls everything (Workflow D.3).
-    fn start_extract(&mut self, log: &mut LogPanel, selected_only: bool) {
-        let (Some(loaded), Some(dest)) = (self.loaded.as_ref(), self.output_dir.clone()) else {
-            return;
-        };
-        let bytes = loaded.bytes.clone();
-        let archive = loaded.archive.clone();
-        let selected = loaded.selected.clone();
-        let format = self.format;
-
-        // Total = the file count we're actually about to write so the
-        // progress bar tracks the right denominator.
-        let total = if selected_only {
-            archive
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| !e.is_dir && selected.get(*i).copied().unwrap_or(true))
-                .count()
-        } else {
-            loaded.file_count
-        };
-        let status = Arc::new(Mutex::new(ExtractStatus {
-            total,
-            ..Default::default()
-        }));
-        self.status = Some(status.clone());
-        log.info(format!(
-            "Extracting {} archive entries to {} as {}",
-            if selected_only {
-                format!("selected ({total})")
-            } else {
-                "all".into()
-            },
-            dest.display(),
-            format.label(),
-        ));
-
-        std::thread::spawn(move || {
-            let result = {
-                let progress_status = status.clone();
-                let log_status = status.clone();
-                let progress = move |done: usize, total: usize, name: &str| {
-                    if let Ok(mut s) = progress_status.lock() {
-                        s.done = done;
-                        s.total = total;
-                        s.current = name.to_string();
-                    }
-                };
-                let log_cb = move |line: String| {
-                    if let Ok(mut s) = log_status.lock() {
-                        s.log_lines.push(line);
-                    }
-                };
-                if selected_only {
-                    let keep = move |i: usize| selected.get(i).copied().unwrap_or(true);
-                    extract::extract_filtered(
-                        &bytes, &archive, &dest, format, keep, progress, log_cb,
-                    )
-                } else {
-                    extract::extract_all(&bytes, &archive, &dest, format, progress, log_cb)
+    fn carry_out_requests(&mut self) {
+        for req in self.ctl.take_requests() {
+            match req {
+                HostRequest::RememberRecent(path) => {
+                    self.recent_files =
+                        super::push_recent(&self.recent, RecentMode::Archives, &path);
                 }
-            };
-            if let Ok(mut s) = status.lock() {
-                s.finished = true;
-                s.result = Some(result.map_err(|e| format!("{e}")));
-            }
-        });
-    }
-
-    /// Poll the worker; move completion into the log. Returns true while a job
-    /// is still running.
-    fn poll(&mut self, log: &mut LogPanel) -> bool {
-        let mut running = false;
-        let mut clear = false;
-        if let Some(status) = self.status.as_ref() {
-            if let Ok(s) = status.lock() {
-                if s.finished {
-                    for line in &s.log_lines {
-                        log.warn(line.clone());
-                    }
-                    match &s.result {
-                        Some(Ok(stats)) => log.info(format!(
-                            "Extraction complete: {} files{}",
-                            stats.files,
-                            if stats.skipped > 0 {
-                                format!(", {} skipped", stats.skipped)
-                            } else {
-                                String::new()
-                            }
-                        )),
-                        Some(Err(e)) => log.error(format!("Extraction failed: {e}")),
-                        None => {}
-                    }
-                    clear = true;
-                } else {
-                    running = true;
+                HostRequest::OpenInInspect { path, guard } => {
+                    self.pending_inspect_open = Some(PendingInspectOpen { path, guard });
                 }
             }
         }
-        if clear {
-            self.status = None;
-        }
-        running
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogPanel) {
-        let running = self.poll(log);
+    /// Run the controller's effects and its finished jobs; pickers answer back here.
+    fn pump(&mut self, ctx: &egui::Context, log: &mut LogStore) {
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let replies = self.effects.run(ctx, fx, &mut messages);
+        for m in messages {
+            log.info(m);
+        }
+        for reply in replies {
+            match reply {
+                Reply::Picked { purpose, path } => {
+                    self.act(ArchivesAction::Picked { purpose, path })
+                }
+                Reply::Confirmed { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => {}
+            }
+        }
+        self.carry_out_requests();
+        super::progress::drain_log_lines(self.ctl.take_log(), log);
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogStore) {
+        self.pump(ui.ctx(), log);
+        let running = self.ctl.is_extracting();
+        let mut actions: Vec<ArchivesAction> = Vec::new();
 
         ui.heading("Mac Archives");
         ui.label(
@@ -278,12 +123,12 @@ impl ArchivesTab {
         );
         ui.separator();
 
-        // ── Source picker ────────────────────────────────────────────────
+        // Source picker.
         ui.horizontal(|ui| {
             ui.label("Archive:");
             let text = self
-                .archive_path
-                .as_ref()
+                .ctl
+                .path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(none selected)".to_string());
             ui.label(text);
@@ -291,67 +136,40 @@ impl ArchivesTab {
                 .add_enabled(!running, egui::Button::new("Browse..."))
                 .clicked()
             {
-                if let Some(path) = super::file_dialog()
-                    .add_filter(
-                        "Mac Archives",
-                        &rusty_backup::model::file_types::archives_picker_exts(),
-                    )
-                    .add_filter("All Files", &["*"])
-                    .pick_file()
-                {
-                    self.open_path(path);
-                }
+                actions.push(ArchivesAction::Pick);
             }
-            if self.archive_path.is_some()
+            if self.ctl.path().is_some()
                 && ui
                     .add_enabled(!running, egui::Button::new("Close"))
                     .on_hover_text("Unload the current archive")
                     .clicked()
             {
-                self.close();
+                actions.push(ArchivesAction::Close);
             }
             if let Some(path) = super::recent_combo(ui, "archives_recent", &self.recent_files, 0) {
-                self.open_path(path);
+                actions.push(ArchivesAction::Open(path));
             }
         });
 
-        // Reload on path change.
-        if self.archive_path != self.prev_path {
-            self.prev_path = self.archive_path.clone();
-            self.load();
+        if let Some(snap) = self.ctl.load_snapshot() {
+            super::progress::show_job(ui, &snap);
+        }
+        if let Some(err) = self.ctl.load_error() {
+            ui.colored_label(
+                super::theme::danger(ui.visuals()),
+                format!("Error: {}", err.message),
+            );
         }
 
-        if let Some(err) = &self.load_error {
-            ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
-        }
-
-        // Lift the mount-button hint out of the `&self.loaded` borrow
-        // so the mount-row closure below can mutate `self` (to queue
-        // `pending_inspect_open`) without tangling with the
-        // extraction-row closure's own `&mut self` calls.
-        let mount_hint: Option<(MountableImageKind, String)> = self
-            .loaded
-            .as_ref()
-            .and_then(|l| l.mountable.as_ref())
-            .map(|m| (m.kind, m.name.clone()));
-
-        // ── Entry list ───────────────────────────────────────────────────
-        // `file_count` lifted out so the grid closure can take
-        // `self.loaded.as_mut()` (needed for the per-entry checkbox
-        // state) without tangling with the outer borrow.
-        let file_count_hint = self.loaded.as_ref().map(|l| l.file_count);
-        let has_loaded = self.loaded.is_some();
-        if let Some(fc) = file_count_hint {
+        // Entry list.
+        if self.ctl.is_loaded() {
             ui.separator();
-            ui.label(format!("{fc} files in archive"));
+            ui.label(format!("{} files in archive", self.ctl.file_count()));
 
             egui::ScrollArea::vertical()
                 .max_height(320.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let Some(loaded) = self.loaded.as_mut() else {
-                        return;
-                    };
                     egui::Grid::new("archive_entries")
                         .striped(true)
                         .num_columns(5)
@@ -364,87 +182,54 @@ impl ArchivesTab {
                             ui.strong("Method");
                             ui.end_row();
 
-                            // Iterate by index so the checkbox can mutate
-                            // `loaded.selected[i]` without a borrow on the
-                            // entries slice itself.
-                            for i in 0..loaded.archive.entries.len() {
-                                let e = &loaded.archive.entries[i];
+                            for (i, e) in self.ctl.rows().iter().enumerate() {
                                 if e.is_dir {
-                                    // Folder markers are always extracted
-                                    // (the rebuilt tree needs them), so no
-                                    // checkbox column.
+                                    // Folder markers are always extracted, so no checkbox.
                                     ui.label("");
-                                    ui.label(format!("[ {} ]", e.display_path()));
+                                    ui.label(format!("[ {} ]", e.path));
                                     ui.label("");
                                     ui.label("");
                                     ui.label("");
                                     ui.end_row();
                                     continue;
                                 }
-                                // Per-entry checkbox.
-                                let checked = loaded.selected.get(i).copied().unwrap_or(true);
+                                let checked = self.ctl.is_selected(i);
                                 let mut new_checked = checked;
                                 ui.checkbox(&mut new_checked, "");
                                 if new_checked != checked {
-                                    if let Some(slot) = loaded.selected.get_mut(i) {
-                                        *slot = new_checked;
-                                    }
+                                    actions.push(ArchivesAction::SetSelected(i, new_checked));
                                 }
-                                ui.label(e.display_path());
-                                let tc = rusty_backup::fs::hfs::format_ostype(&e.type_code);
-                                let cc = rusty_backup::fs::hfs::format_ostype(&e.creator_code);
-                                ui.label(format!("{tc} / {cc}"));
-                                let (size, method) = e
-                                    .data
-                                    .as_ref()
-                                    .filter(|f| f.uncompressed_len > 0)
-                                    .or(e.rsrc.as_ref())
-                                    .map(|f| (f.uncompressed_len, f.method_name()))
-                                    .unwrap_or((0, "None"));
-                                ui.label(human_size(size as u64));
-                                ui.label(method);
+                                ui.label(e.path.as_str());
+                                ui.label(format!("{} / {}", e.type_code, e.creator));
+                                ui.label(human_size(e.size));
+                                ui.label(e.method);
                                 ui.end_row();
                             }
                         });
                 });
-        }
 
-        if has_loaded {
-            // ── Extraction controls ──────────────────────────────────────
-            // Pre-compute the selected-file count so the closure below
-            // doesn't have to re-borrow `self.loaded`.
-            let selected_file_count = self
-                .loaded
-                .as_ref()
-                .map(|l| {
-                    l.archive
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, e)| !e.is_dir && l.selected.get(*i).copied().unwrap_or(true))
-                        .count()
-                })
-                .unwrap_or(0);
-
+            // Extraction controls.
+            let selected_file_count = self.ctl.selected_file_count();
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Extract as:");
+                let mut format = self.ctl.format();
                 egui::ComboBox::from_id_salt("archive_fork_format")
-                    .selected_text(self.format.label())
+                    .selected_text(format.label())
                     .show_ui(ui, |ui| {
                         for f in ForkFormat::ALL {
-                            ui.selectable_value(&mut self.format, f, f.label());
+                            ui.selectable_value(&mut format, f, f.label());
                         }
                     });
+                if format != self.ctl.format() {
+                    actions.push(ArchivesAction::SetFormat(format));
+                }
 
                 if ui
                     .add_enabled(!running, egui::Button::new("Extract All..."))
                     .clicked()
                 {
-                    if let Some(dir) = super::file_dialog().pick_folder() {
-                        self.output_dir = Some(dir);
-                        self.start_extract(log, false);
-                    }
+                    actions.push(ArchivesAction::ExtractAll);
                 }
 
                 let extract_selected_label = format!("Extract Selected... ({selected_file_count})");
@@ -460,24 +245,12 @@ impl ArchivesTab {
                     )
                     .clicked()
                 {
-                    if let Some(dir) = super::file_dialog().pick_folder() {
-                        self.output_dir = Some(dir);
-                        self.start_extract(log, true);
-                    }
+                    actions.push(ArchivesAction::ExtractSelected);
                 }
-
-                // Workflow D.2 auto-unwrap hint button is rendered
-                // below so the closure here doesn't have to borrow
-                // `loaded.mountable` (which conflicts with the
-                // `start_extract` &mut self call above).
             });
 
-            // Workflow D.2 auto-unwrap: the archive's single entry
-            // decompressed to a payload the Inspect tab can mount.
-            // `mount_hint` was lifted out of the `&self.loaded` borrow
-            // up-front so the click handler can mutate `self` without
-            // borrow-checker conflicts.
-            if let Some((kind, name)) = mount_hint {
+            // The archive's single entry decodes to a disk image Inspect can mount.
+            if let Some(kind) = self.ctl.mountable() {
                 ui.horizontal(|ui| {
                     let label = format!("Mount in new Inspect tab ({})", kind.label());
                     let tooltip = format!(
@@ -491,99 +264,29 @@ impl ArchivesTab {
                         .on_hover_text(tooltip)
                         .clicked()
                     {
-                        // Re-borrow the decoded bytes through self —
-                        // safe here because the extraction-row closure
-                        // above has already returned.
-                        if let Some(decoded) = self
-                            .loaded
-                            .as_ref()
-                            .and_then(|l| l.mountable.as_ref())
-                            .map(|m| m.decoded.clone())
-                        {
-                            match write_payload_to_tempdir(&name, &decoded) {
-                                Ok(open) => {
-                                    log.info(format!(
-                                        "Routing {} payload to Inspect tab: {}",
-                                        kind.label(),
-                                        open.path.display()
-                                    ));
-                                    self.pending_inspect_open = Some(open);
-                                }
-                                Err(e) => {
-                                    log.error(format!(
-                                        "Failed to materialize archive payload: {e}"
-                                    ));
-                                }
-                            }
-                        }
+                        actions.push(ArchivesAction::Mount);
                     }
                 });
             }
         }
 
-        // ── Progress ─────────────────────────────────────────────────────
-        if running {
-            if let Some(status) = self.status.as_ref() {
-                if let Ok(s) = status.lock() {
-                    let frac = if s.total > 0 {
-                        s.done as f32 / s.total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .text(format!("{} / {}  {}", s.done, s.total, s.current)),
-                    );
-                }
-            }
+        // Progress.
+        if let Some((done, total, current)) = self.ctl.extract_progress() {
+            let frac = if total > 0 {
+                done as f32 / total as f32
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(frac).text(format!("{done} / {total}  {current}")));
             ui.ctx().request_repaint();
         }
-    }
-}
 
-/// Inspect a freshly-loaded archive for the Workflow D.2 auto-unwrap
-/// case: exactly one non-folder entry, whose data fork decompresses to
-/// a payload [`detect_mountable_image`] recognizes. Folders and
-/// resource forks don't count — a disk image lives in the data fork.
-/// Returns `None` for multi-file archives, decompression failures, or
-/// payloads that don't sniff as DC42 / raw HFS / raw HFS+.
-fn sniff_mountable_payload(bytes: &[u8], archive: &StuffItArchive) -> Option<MountablePayload> {
-    let files: Vec<&_> = archive.entries.iter().filter(|e| !e.is_dir).collect();
-    if files.len() != 1 {
-        return None;
+        for a in actions {
+            self.act(a);
+        }
+        self.carry_out_requests();
+        super::progress::drain_log_lines(self.ctl.take_log(), log);
     }
-    let entry = files[0];
-    let fork = entry.data.as_ref()?;
-    if fork.uncompressed_len == 0 {
-        return None;
-    }
-    let decoded = stuffit::decompress_fork(bytes, fork).ok()?;
-    let kind = detect_mountable_image(&decoded)?;
-    Some(MountablePayload {
-        kind,
-        decoded,
-        name: entry.name.clone(),
-    })
-}
-
-/// Write `bytes` to a fresh tempfile under a new [`tempfile::TempDir`]
-/// so the file outlives the click handler's frame. The directory guard
-/// rides on the returned [`PendingInspectOpen`] and is moved onto
-/// `InspectTab::amiga_tempdir` (which already exists for transparent
-/// `.adz` decompression) so the temp survives until the user opens a
-/// different image.
-fn write_payload_to_tempdir(name: &str, bytes: &[u8]) -> std::io::Result<PendingInspectOpen> {
-    let dir = tempfile::Builder::new()
-        .prefix("rusty-archive-mount-")
-        .tempdir()?;
-    let safe_name = if name.is_empty() {
-        "payload.bin".to_string()
-    } else {
-        name.replace(['/', '\\'], "_")
-    };
-    let path = dir.path().join(safe_name);
-    std::fs::write(&path, bytes)?;
-    Ok(PendingInspectOpen { path, guard: dir })
 }
 
 fn human_size(bytes: u64) -> String {

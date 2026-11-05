@@ -1,0 +1,28 @@
+[package]
+name = "disk-core"
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.73"
+license = "MIT"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "Shared base for the rusty-backup filesystem, partition-table and disk-image crates"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["filesystem", "disk-image", "retro", "vintage", "emulator"]
+categories = ["filesystem", "emulators"]
+
+[features]
+default = ["fs"]
+# The Filesystem / EditableFilesystem interface and FileEntry. Partition and
+# disk-image crates turn this off to skip the filesystem types and their deps.
+fs = ["serde", "dep:chrono", "dep:anyhow"]
+# Serialize / Deserialize on the always-available types (e.g. `sgi::SgiLabelByteOrder`).
+serde = ["dep:serde"]
+# Only for a Rust 1.73 toolchain; never enable on a modern one (see src/rust173.rs).
+rust173-polyfill = []
+
+[dependencies]
+# `unix_common::validate` returns `anyhow::Result`.
+anyhow = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+chrono = { version = "0.4", optional = true }

@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
-use rusty_backup::fs::hfs::HfsFilesystem;
-use rusty_backup::partition::apm::Apm;
+use fs_mac::hfs::HfsFilesystem;
+use part_tables::apm::Apm;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 

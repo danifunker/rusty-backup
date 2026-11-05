@@ -23,7 +23,7 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::cli::resolve::{resolve_partition_ro, resolve_partition_rw};
-use crate::partition::format_size;
+use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct ResizeArgs {

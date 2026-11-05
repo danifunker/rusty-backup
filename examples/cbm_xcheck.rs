@@ -13,8 +13,8 @@
 use std::fs;
 use std::io::Cursor;
 
-use rusty_backup::fs::cbm::{create_blank, CbmFilesystem, CbmVariant};
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_8bit::cbm::{create_blank, CbmFilesystem, CbmVariant};
 
 fn variant_from(s: &str) -> CbmVariant {
     match s.to_ascii_lowercase().as_str() {

@@ -23,8 +23,8 @@
 //! `$EDITOR`) and the in-app editors in the TUI and GUI all need exactly this,
 //! and a second implementation would be a second set of corruption bugs.
 
-use crate::fs::fat::{char_to_cp437, cp437_to_char};
-use crate::fs::hfs::{mac_roman_to_utf8, utf8_to_mac_roman};
+use fs_mac::hfs::{mac_roman_to_utf8, utf8_to_mac_roman};
+use fs_pc::fat::{char_to_cp437, cp437_to_char};
 
 /// How a file's bytes represent characters.
 ///
@@ -195,6 +195,8 @@ pub fn conventional_encoding_for(fs_type: &str) -> TextEncoding {
     let t = fs_type.to_ascii_lowercase();
     if t.starts_with("fat") || t.contains("exfat") || t.contains("ntfs") {
         TextEncoding::Cp437
+    } else if t.contains("squashfs") {
+        TextEncoding::Utf8
     } else if t.contains("hfs") || t.contains("mfs") || t.contains("prodos") {
         TextEncoding::MacRoman
     } else if t.contains("human68k") {
@@ -408,6 +410,12 @@ fn encode_char(ch: char, encoding: TextEncoding) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn squashfs_text_is_utf8_although_its_name_contains_hfs() {
+        assert_eq!(conventional_encoding_for("SquashFS"), TextEncoding::Utf8);
+        assert_eq!(conventional_encoding_for("HFS+"), TextEncoding::MacRoman);
+    }
 
     #[test]
     fn line_endings_are_detected_and_restored() {

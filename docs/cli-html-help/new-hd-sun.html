@@ -7,7 +7,7 @@
 <body>
 <nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <a href="new-hd.html">hd</a> &raquo; <span>sun</span></nav>
 <h1><code>rb-cli new hd sun</code></h1>
-<p>Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk &quot;backup&quot; alias</p>
+<p>Sun disk label (SMI VTOC) for SPARC Solaris / SunOS, with slices you size and tag yourself. Cylinder-aligned from `--heads` / `--sectors`; slice 2 is reserved for the whole-disk &quot;backup&quot; alias. Fill a slice with a volume from `new volume ufs-solaris`; Solaris rejects a 4.4BSD `ufs`</p>
 <h2>Usage</h2>
 <pre><code>Usage: sun [OPTIONS] --size &lt;SIZE&gt; --partition &lt;PARTITIONS&gt; &lt;IMAGE&gt;</code></pre>
 <h2>Arguments</h2>

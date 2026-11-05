@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rusty_backup::rbformats::containers::d88;
+use dsk_floppy::d88;
 
 fn cli_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rb-cli"))

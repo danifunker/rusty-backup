@@ -18,12 +18,15 @@
 //! far more of the corpus than the local content match can. If both flags are
 //! given, the CRC index is tried first and `--names` is the fallback.
 
+// `is_multiple_of` & co. come from the rust173 polyfill on 1.73; a 1.73 build is the real check.
+#![allow(clippy::incompatible_msrv)]
+
 use std::collections::HashMap;
 use std::fs;
 
-use rusty_backup::fs::alto::pdi;
-use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_xerox::alto::pdi;
+use fs_xerox::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
 
 /// Index of <dir>'s files by exact byte length -> [(basename, content)]. A
 /// corpus file is the archive file padded with zeros to a 512-byte page, so a

@@ -23,9 +23,9 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use dsk_floppy::msa::decode_msa_bytes;
 use rusty_backup::partition::PartitionTable;
-use rusty_backup::rbformats::containers::msa::decode_msa_bytes;
 
 /// Decompress a zstd-compressed fixture file into memory.
 fn load_fixture(name: &str) -> Vec<u8> {
@@ -95,7 +95,7 @@ fn msa_decoded_floppy_lists_and_reads_files_via_fat12() {
 
     // Reopen with the FAT driver at offset 0 (superfloppy).
     cur.seek(SeekFrom::Start(0)).unwrap();
-    let mut fs = rusty_backup::fs::fat::FatFilesystem::open(cur, 0).unwrap();
+    let mut fs = fs_pc::fat::FatFilesystem::open(cur, 0).unwrap();
     let root = fs.root().unwrap();
     let entries = fs.list_directory(&root).unwrap();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -153,7 +153,7 @@ fn ahdi_disk_detects_two_partitions_with_correct_geometry() {
 
 #[test]
 fn ahdi_root_sector_checksum_validates() {
-    use rusty_backup::partition::atari::AhdiTable;
+    use part_tables::atari::AhdiTable;
     let disk = load_fixture("test_atarist_ahdi.img.zst");
     let table = AhdiTable::parse_root(&disk[..512]).unwrap();
     assert!(

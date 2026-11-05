@@ -1,0 +1,72 @@
+# The Optical tab on an image file: a hybrid ISO 9660 + HFS+ disc converted to BIN/CUE, then
+# browsed on its HFS side in the browser pane (PaneProfile::optical), a forked file previewed and
+# extracted (AppleDouble, the disc walker), the tree listed.
+name = "Optical: convert, browse, extract"
+vm = "optical"
+requires = ["optical"]
+
+[[step]]
+action = "Start"
+expect = { can_start = false, result = "" }
+
+[[step]]
+action = "OpenImage"
+arg = "$hybrid"
+settle = true
+expect = { format = "ISO image", can_start = false }
+
+[[step]]
+action = "SetOutputFormat"
+arg = "bincue"
+
+[[step]]
+action = "PickOutput"
+effects = ["PickFile"]
+
+[[step]]
+action = "Pick"
+expect = { can_start = true }
+
+[[step]]
+action = "Start"
+settle = true
+expect = { result = "ok" }
+
+[[step]]
+action = "BrowseContents"
+settle = true
+expect = { browsing = true, error = "", choices = 2 }
+
+[[step]]
+action = "SelectFs"
+arg = "HFS"
+settle = true
+
+[[step]]
+action = "Expand"
+arg = "/Apps"
+settle = true
+
+[[step]]
+action = "Select"
+arg = "/Apps/GameApp"
+settle = true
+expect = { content = "data fork bytes" }
+
+[[step]]
+action = "Extract"
+effects = ["PickFolder"]
+
+[[step]]
+action = "PickExtract"
+settle = true
+expect = { extract_result = "Copied 1 file(s) to the extract folder.", extracted = "._GameApp,GameApp" }
+
+[[step]]
+action = "Tree"
+settle = true
+expect = { tree = "~GameApp" }
+
+[[step]]
+action = "CloseDisc"
+expect = { browsing = false, source = "", format = "" }

@@ -7,8 +7,8 @@
 //!
 //! Used by `scripts/generate-d88-fixture.sh`.
 
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::fs::human68k::Human68kFilesystem;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_pc::human68k::Human68kFilesystem;
 use std::fs::OpenOptions;
 
 fn main() {

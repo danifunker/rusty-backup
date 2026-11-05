@@ -8,11 +8,13 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use rusty_backup::cli::resolve::resolve_partition_rw;
-use rusty_backup::fs::filesystem::{
+use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, Filesystem, ResourceForkSource,
 };
-use rusty_backup::fs::{fat, hfs, open_editable_filesystem};
+use fs_mac::hfs;
+use fs_pc::fat;
+use rusty_backup::cli::resolve::resolve_partition_rw;
+use rusty_backup::fs::open_editable_filesystem;
 use rusty_backup::remote::{serve_on, RemoteConnection, RemoteFilesystem, RemoteHostFilesystem};
 
 /// Build an 8 MiB FAT image at `path` with `/TOP.BIN` and `/SUB/INNER.BIN`
@@ -348,7 +350,7 @@ fn family_f_write_stages_file_and_dir_into_remote_image() {
 /// has no cached session". Proves the worker recreates the subtree byte-exact.
 #[test]
 fn remote_source_stage_copy_extracts_subtree_over_wire() {
-    use rusty_backup::fs::entry::FileEntry;
+    use disk_core::entry::FileEntry;
     use rusty_backup::model::commander_ops::{spawn_stage_copy, StageSource};
     use rusty_backup::model::edit_queue::StagedEdit;
 
@@ -457,7 +459,7 @@ fn remote_source_stage_copy_extracts_subtree_over_wire() {
 /// the UI. Proves the tree is written to disk byte-exact.
 #[test]
 fn remote_source_host_copy_extracts_tree_over_wire() {
-    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use fs_mac::resource_fork::ResourceForkMode;
     use rusty_backup::model::commander_ops::{spawn_host_copy, HostCopyJob, StageSource};
 
     let dir = tempfile::tempdir().unwrap();
@@ -754,12 +756,12 @@ fn browse_session_opens_remote_image_over_block_tier() {
 fn restore_to_remote_image_round_trips() {
     use std::sync::Mutex;
 
+    use part_tables::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::backup::{
         run_backup, BackupConfig, BackupProgress, ChecksumType, CompressionType,
     };
     use rusty_backup::fs::open_filesystem;
     use rusty_backup::model::restore_remote::restore_to_remote;
-    use rusty_backup::partition::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::remote::RemoteConnection;
     use rusty_backup::restore::{RestoreAlignment, RestoreConfig, RestoreProgress};
 
@@ -1119,8 +1121,8 @@ fn edit_remote_image_over_block_tier() {
 /// unit test, but driven entirely over the daemon.
 #[test]
 fn repair_remote_image_over_block_tier() {
-    use rusty_backup::fs::affs::create_blank_affs;
-    use rusty_backup::fs::affs_common::bitmap_checksum;
+    use fs_amiga::affs::create_blank_affs;
+    use fs_amiga::affs_common::bitmap_checksum;
     use rusty_backup::model::fsck_runner::{run_fsck_reader, run_repair_reader};
     use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
 
@@ -1227,8 +1229,8 @@ fn repair_remote_image_over_block_tier() {
 fn block_reader_parses_remote_partition_table_and_filesystem() {
     use std::io::{Read, Seek, SeekFrom};
 
+    use part_tables::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::fs::open_filesystem;
-    use rusty_backup::partition::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1346,10 +1348,10 @@ fn block_reader_parses_remote_partition_table_and_filesystem() {
 fn run_backup_pulls_remote_image_byte_exact() {
     use std::sync::Mutex;
 
+    use part_tables::mbr::build_minimal_mbr;
     use rusty_backup::backup::{
         run_backup_from, BackupConfig, BackupProgress, BackupSource, ChecksumType, CompressionType,
     };
-    use rusty_backup::partition::mbr::build_minimal_mbr;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -1550,8 +1552,8 @@ fn list_devices_round_trips_and_open_device_reads() {
 /// the partition-load logic is identical either way.
 #[test]
 fn backup_remote_core_lists_and_loads_partitions() {
+    use part_tables::mbr::build_minimal_mbr;
     use rusty_backup::model::backup_remote::{connect_and_list_devices, load_remote_source};
-    use rusty_backup::partition::mbr::build_minimal_mbr;
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1615,11 +1617,11 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::Mutex;
 
+    use part_tables::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::backup::{
         run_backup_from, BackupConfig, BackupProgress, BackupSource, ChecksumType, CompressionType,
     };
     use rusty_backup::fs::open_filesystem;
-    use rusty_backup::partition::mbr::{build_minimal_mbr, Mbr};
     use rusty_backup::rbformats::chd::ChdReader;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2516,7 +2518,7 @@ fn read_only_daemon_refuses_host_writes_but_serves_reads() {
 /// loopback daemon. Verifies the files land byte-exact under `dest_parent`.
 #[test]
 fn upload_host_tree_to_remote_host_over_the_wire() {
-    use rusty_backup::fs::entry::FileEntry;
+    use disk_core::entry::FileEntry;
     use rusty_backup::model::commander_ops::{self, HostCopyJob};
 
     // Local source tree: top.txt + sub/inner.txt.
@@ -2571,7 +2573,7 @@ fn upload_host_tree_to_remote_host_over_the_wire() {
 /// on the worker through a `ReopenRecipe`, its files streamed to the daemon.
 #[test]
 fn upload_image_subtree_to_remote_host_over_the_wire() {
-    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use fs_mac::resource_fork::ResourceForkMode;
     use rusty_backup::model::commander_descend::ReopenRecipe;
     use rusty_backup::model::commander_ops::{self, HostCopyJob, StageSource};
 
@@ -2638,8 +2640,8 @@ fn wait_host_copy(
 /// tree and an image subtree onto a writable loopback daemon, byte-exact.
 #[test]
 fn sync_upload_helpers_push_to_remote_host() {
-    use rusty_backup::fs::entry::FileEntry;
-    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use disk_core::entry::FileEntry;
+    use fs_mac::resource_fork::ResourceForkMode;
     use rusty_backup::model::commander_descend::ReopenRecipe;
     use rusty_backup::model::commander_ops;
 
@@ -2695,7 +2697,7 @@ fn sync_upload_helpers_push_to_remote_host() {
 /// through a RemoteFilesystem. This is the "upload INTO a remote image" path.
 #[test]
 fn sync_apply_edits_to_remote_image_uploads_a_file() {
-    use rusty_backup::fs::entry::FileEntry;
+    use disk_core::entry::FileEntry;
     use rusty_backup::model::commander_ops;
 
     // Writable daemon serving a dir with an 8 MiB FAT image.
@@ -2907,4 +2909,271 @@ fn remote_upload_carries_the_resource_fork() {
         "resource fork length survived the wire"
     );
     assert_eq!(rsrc_back, rsrc_fork, "resource fork is byte-exact");
+}
+
+// --- Commander pane controller over a loopback daemon ---------------------
+
+mod commander_remote {
+    use super::*;
+    use rusty_backup::controller::commander::purpose;
+    use rusty_backup::controller::commander::{BrowserPaneAction as A, BrowserPaneController};
+    use rusty_backup::controller::{Controller, Effect};
+    use std::time::{Duration, Instant};
+
+    /// A daemon serving a temp folder holding `disk.img` (FAT with `SEED.BIN`).
+    fn serve() -> ((tempfile::TempDir, tempfile::TempDir), String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        make_fat_image(&root.join("disk.img"), "DESTVOL", "SEED.BIN", 0x01, 512);
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = staging_dir.path().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = serve_on(listener, root, Some(staging), true);
+        });
+        ((dir, staging_dir), addr)
+    }
+
+    /// Ticks until the pane's jobs finish, returning the messages they produced.
+    fn settle(vm: &mut BrowserPaneController) -> Vec<String> {
+        let start = Instant::now();
+        let mut fx = vm.tick();
+        while vm.is_busy() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "a job never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            fx.extend(vm.tick());
+        }
+        messages(&fx)
+    }
+
+    fn messages(fx: &[Effect]) -> Vec<String> {
+        let text = |e: &Effect| match e {
+            Effect::Message(m) => Some(m.clone()),
+            _ => None,
+        };
+        fx.iter().filter_map(text).collect()
+    }
+
+    fn names(vm: &BrowserPaneController) -> Vec<String> {
+        let entries = vm.listing.entries().iter();
+        entries.map(|e| e.name.clone()).collect()
+    }
+
+    fn connect(vm: &mut BrowserPaneController, addr: &str) -> Vec<String> {
+        let fx = vm.apply(A::Connect);
+        let [Effect::AskText(spec)] = fx.as_slice() else {
+            panic!("expected AskText, got {fx:?}");
+        };
+        assert_eq!(spec.purpose, purpose::CONNECT);
+        assert!(spec.validate(addr).is_ok());
+        vm.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(addr.into()),
+        });
+        assert!(vm.is_opening(), "a connect runs as a job");
+        settle(vm)
+    }
+
+    #[test]
+    fn connect_open_apply_and_close_through_the_pane_controller() {
+        let (_dir, addr) = serve();
+        let mut vm = BrowserPaneController::new();
+        let said = connect(&mut vm, &addr);
+        assert!(vm.source_error().is_none(), "{:?}", vm.source_error());
+        assert_eq!(said, [format!("connected to {addr} (browsing host)")]);
+        assert!(vm.is_remote_host() && !vm.stages_edits() && !vm.can_new_folder());
+        assert_eq!(vm.remote_label(), Some(format!("Remote {addr} (host)")));
+        let rows = vm.display_rows();
+        let disk = rows.iter().find(|r| r.name == "disk.img").unwrap().clone();
+        assert!(disk.is_image && !disk.expandable);
+
+        // Double-clicking an image on the host listing opens it on the same connection.
+        vm.apply(A::Activate(disk.node_id));
+        let said = settle(&mut vm);
+        assert_eq!(said, [format!("opened rb://{addr}/disk.img")]);
+        assert!(vm.is_remote_image(), "{:?}", vm.source_error());
+        assert_eq!(vm.volume().label, "DESTVOL");
+        assert!(vm.base_stage_source().is_some());
+
+        // Delete and rename do not travel over the wire; a new folder does.
+        vm.apply(A::Click {
+            name: "SEED.BIN".into(),
+            ctrl: false,
+            shift: false,
+        });
+        assert!(messages(&vm.apply(A::Delete))[0].contains("not supported"));
+        assert!(
+            messages(&vm.apply(A::RequestRename("SEED.BIN".into())))[0].contains("not supported")
+        );
+        assert!(vm.queue.is_empty());
+        vm.apply(A::RequestNewFolder);
+        vm.apply(A::Answered {
+            purpose: purpose::NEW_FOLDER,
+            text: Some("NEWDIR".into()),
+        });
+        assert_eq!(vm.queue.len(), 1);
+        let fx = vm.apply(A::Apply);
+        assert!(messages(&fx)[0].starts_with("checking 1"), "{fx:?}");
+        let said = settle(&mut vm);
+        assert!(said.iter().any(|m| m == "applied 1 edit(s)."), "{said:?}");
+        assert!(vm.apply_report().is_none(), "{:?}", vm.apply_report());
+        assert!(vm.queue.is_empty() && vm.is_remote_image());
+        assert!(
+            names(&vm).contains(&"NEWDIR".to_string()),
+            "{:?}",
+            names(&vm)
+        );
+        assert!(vm.take_log().iter().any(|l| l == "applied 1 edit(s)."));
+
+        // Close Image returns to the host listing; Disconnect drops the connection.
+        vm.apply(A::CloseRemoteImage);
+        settle(&mut vm);
+        assert!(vm.is_remote_host());
+        assert!(names(&vm).contains(&"disk.img".to_string()));
+        assert_eq!(messages(&vm.apply(A::Disconnect)), ["closed."]);
+        assert!(!vm.is_remote() && !vm.listing.is_loaded());
+    }
+
+    #[test]
+    fn a_conflicting_remote_copy_is_reviewed_and_replace_overwrites_it() {
+        let (_dir, addr) = serve();
+        let mut vm = BrowserPaneController::new();
+        connect(&mut vm, &addr);
+        vm.apply(A::OpenRemoteImage("disk.img".into()));
+        settle(&mut vm);
+        assert!(vm.is_remote_image(), "{:?}", vm.source_error());
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("SEED.BIN"), b"replacement").unwrap();
+        std::fs::write(host.path().join("NEW.BIN"), b"new").unwrap();
+        let root =
+            rusty_backup::model::dir_listing::read_host_root(host.path().to_path_buf()).unwrap();
+        let cwd = vm.listing.cwd().unwrap().clone();
+        let stage = |vm: &mut BrowserPaneController| {
+            let edits =
+                rusty_backup::model::commander_ops::stage_host_to_image(&root.entries, &cwd);
+            vm.stage_edits(edits);
+        };
+        stage(&mut vm);
+        vm.apply(A::Apply);
+        settle(&mut vm);
+        assert_eq!(vm.apply_review().map(|p| p.scan.conflicts.len()), Some(1));
+        // Skip leaves the existing file out of the upload.
+        vm.apply(A::ApplyReviewed(
+            rusty_backup::fs::replace::OnConflict::Skip,
+        ));
+        settle(&mut vm);
+        assert!(vm.queue.is_empty(), "{:?}", vm.apply_report());
+        let seed = |vm: &BrowserPaneController| {
+            let e = vm.listing.entries().iter().find(|e| e.name == "SEED.BIN");
+            e.unwrap().size
+        };
+        assert_eq!(seed(&vm), 512);
+        assert!(
+            names(&vm).contains(&"NEW.BIN".to_string()),
+            "{:?}",
+            names(&vm)
+        );
+        // Replace overwrites it.
+        stage(&mut vm);
+        vm.apply(A::Apply);
+        settle(&mut vm);
+        assert!(vm.apply_review().is_some());
+        vm.apply(A::ApplyReviewed(
+            rusty_backup::fs::replace::OnConflict::Replace,
+        ));
+        settle(&mut vm);
+        assert!(vm.queue.is_empty(), "{:?}", vm.apply_report());
+        assert_eq!(seed(&vm), b"replacement".len() as u64);
+    }
+
+    #[test]
+    fn a_refused_connect_reports_and_leaves_no_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut vm = BrowserPaneController::new();
+        let said = connect(&mut vm, &addr);
+        assert!(said[0].starts_with("remote connect failed"), "{said:?}");
+        assert!(!vm.is_remote() && vm.source_error().is_some());
+    }
+}
+
+/// The Inspect tab's remote picker (`controller::remote_pick`) against a loopback daemon.
+mod inspect_remote_pick {
+    use super::*;
+    use rusty_backup::controller::remote_pick::{
+        purpose, RemotePickAction as A, RemotePickController,
+    };
+    use rusty_backup::controller::{Controller, Effect};
+
+    #[test]
+    fn connect_enter_a_folder_pick_an_image_and_browse_on_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        make_fat_image(
+            &root.join("sub").join("disk.img"),
+            "PICKVOL",
+            "SEED.BIN",
+            0x01,
+            512,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _ = serve_on(listener, root, None, true);
+        });
+
+        let mut ctl =
+            RemotePickController::new(std::sync::Arc::new(rusty_backup::model::job::NoNotify));
+        let fx = ctl.apply(A::Connect);
+        let [Effect::AskText(spec)] = fx.as_slice() else {
+            panic!("expected AskText, got {fx:?}");
+        };
+        assert!(spec.validate("bad host/x").is_err());
+        let again = ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(":7341".into()),
+        });
+        assert!(matches!(&again[..], [Effect::AskText(s)] if s.error.is_some()));
+        ctl.apply(A::Answered {
+            purpose: purpose::CONNECT,
+            text: Some(addr.clone()),
+        });
+        ctl.wait_idle();
+        assert!(ctl.is_active() && ctl.is_loaded(), "{:?}", ctl.error());
+        assert!(ctl.take_log().iter().any(|l| l.contains("browsing host")));
+        let sub = ctl
+            .rows()
+            .into_iter()
+            .find(|r| r.name == "sub")
+            .expect("sub row");
+        assert!(sub.is_dir && !sub.openable);
+        ctl.apply(A::Enter("sub".into()));
+        ctl.wait_idle();
+        let img = ctl
+            .rows()
+            .into_iter()
+            .find(|r| r.name == "disk.img")
+            .expect("image row");
+        assert!(img.openable, "{img:?}");
+        ctl.apply(A::OpenImage(img.path.clone()));
+        let (conn, path) = ctl.take_request().expect("a request for the host");
+        assert!(path.ends_with("disk.img"));
+        assert!(!ctl.is_active(), "the picker collapses after the hand-off");
+
+        ctl.apply(A::BrowseOn((conn, path)));
+        ctl.wait_idle();
+        assert!(ctl.is_loaded() && ctl.addr() == addr.as_str());
+        ctl.apply(A::Disconnect);
+        assert!(!ctl.is_active());
+        assert!(ctl
+            .take_log()
+            .iter()
+            .any(|l| l.starts_with("disconnected from")));
+    }
 }

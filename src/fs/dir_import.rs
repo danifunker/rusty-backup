@@ -1,9 +1,9 @@
 //! Import a host directory tree INTO a disk image's filesystem — the
-//! `mkisofs -graft-points`-shaped counterpart to [`crate::fs::tar_import`],
+//! `mkisofs -graft-points`-shaped counterpart to [`fs_tar::tar_import`],
 //! without needing to stage a tarball first.
 //!
 //! Only the source differs: this walks the host with `std::fs` and hands each
-//! entry to the shared [`crate::fs::import_sink`], which owns path-traversal
+//! entry to the shared [`fs_tar::import_sink`], which owns path-traversal
 //! guarding, mkdir -p, the conflict policy, and attribute inheritance. So a
 //! directory import and a tar import behave identically once an entry has been
 //! classified — including which failures are "skip and count" rather than
@@ -22,14 +22,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::fs::attrs::AttrOverrides;
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::EditableFilesystem;
-use crate::fs::import_sink::{
+use disk_core::attrs::AttrOverrides;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::EditableFilesystem;
+use fs_tar::import_sink::{
     is_appledouble, ImportItem, ImportOptions, ImportPreflight, ImportStats, Importer,
 };
 
-pub use crate::fs::import_sink::{
+pub use fs_tar::import_sink::{
     ImportConflict, ImportPreflight as DirImportPreflight, ImportStats as DirImportStats,
 };
 
@@ -132,7 +132,7 @@ enum ArchiveFlavor {
 /// Classify a host file for expansion. Tar first: its `ustar` sniff reads a
 /// fixed header, while the Mac gate may read the whole (small) archive.
 fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
-    if crate::fs::tar_import::looks_like_tar_archive(path) {
+    if fs_tar::tar_import::looks_like_tar_archive(path) {
         Some(ArchiveFlavor::Tar)
     } else if crate::fs::mac_archive_import::looks_like_mac_archive(path) {
         Some(ArchiveFlavor::Mac)
@@ -144,7 +144,7 @@ fn archive_flavor(path: &Path) -> Option<ArchiveFlavor> {
 /// `(files, dirs, bytes)` the archive expands to, per flavor.
 fn measure_expanded(flavor: ArchiveFlavor, path: &Path) -> Result<(u64, u64, u64)> {
     match flavor {
-        ArchiveFlavor::Tar => crate::fs::tar_import::measure_tar_expanded(path),
+        ArchiveFlavor::Tar => fs_tar::tar_import::measure_tar_expanded(path),
         ArchiveFlavor::Mac => crate::fs::mac_archive_import::measure_mac_archive_expanded(path),
     }
 }
@@ -284,7 +284,7 @@ fn walk_into(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<HostEntry>) -> 
 #[cfg(unix)]
 fn host_overrides(meta: &std::fs::Metadata, apply: bool) -> AttrOverrides {
     use std::os::unix::fs::MetadataExt;
-    let unix_times = Some(super::times::UnixTimes {
+    let unix_times = Some(disk_core::times::UnixTimes {
         mtime: Some(meta.mtime().max(0) as u64),
         atime: Some(meta.atime().max(0) as u64),
         ctime: Some(meta.ctime().max(0) as u64),
@@ -316,7 +316,7 @@ fn host_overrides(meta: &std::fs::Metadata, _apply: bool) -> AttrOverrides {
             .map(|d| d.as_secs())
     }
     AttrOverrides {
-        unix_times: Some(super::times::UnixTimes {
+        unix_times: Some(disk_core::times::UnixTimes {
             mtime: to_secs(meta.modified()),
             atime: to_secs(meta.accessed()),
             ctime: to_secs(meta.created()),
@@ -423,7 +423,7 @@ fn import_dir_inner(
                     // The gzip header records the original file's date; fall back to the .gz's own.
                     let mut overrides = overrides;
                     if let Some(t) = header_mtime {
-                        overrides.unix_times = Some(crate::fs::times::UnixTimes::mtime_only(t));
+                        overrides.unix_times = Some(disk_core::times::UnixTimes::mtime_only(t));
                     }
                     let f = File::open(&e.host).with_context(|| format!("opening {display}"))?;
                     let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
@@ -452,14 +452,14 @@ fn import_dir_inner(
                 // well, so it keeps them; the fork still reaches the primary.
                 if mac_forks_wanted
                     && opts.shared.skip_appledouble
-                    && crate::fs::resource_fork::is_resource_fork_sidecar(&e.host)
+                    && fs_mac::resource_fork::is_resource_fork_sidecar(&e.host)
                 {
                     sink.stats.appledouble_skipped += 1;
                     progress(&sink.stats);
                     continue;
                 }
                 let fork = mac_forks_wanted
-                    .then(|| crate::fs::resource_fork::detect_resource_fork(&e.host))
+                    .then(|| fs_mac::resource_fork::detect_resource_fork(&e.host))
                     .flatten();
                 // A wrapper's own bytes are not the file: use the data fork it
                 // carries, under the Mac name it records.
@@ -527,7 +527,7 @@ fn import_dir_inner(
 /// file.
 ///
 /// Bulk mode stays with the enclosing [`import_dir`] — see
-/// [`crate::fs::tar_import::import_tar_into`] for why this can't just call
+/// [`fs_tar::tar_import::import_tar_into`] for why this can't just call
 /// `import_tar`.
 fn expand_archive(
     efs: &mut dyn EditableFilesystem,
@@ -553,11 +553,10 @@ fn expand_archive(
         comps[last] = expanded_dir_name(&file_name);
     }
 
-    let dir =
-        match sink.ensure_dir_at(efs, &comps, crate::fs::tar_import::archive_times(&e.host))? {
-            Some(d) => d,
-            None => return Ok(false),
-        };
+    let dir = match sink.ensure_dir_at(efs, &comps, fs_tar::tar_import::archive_times(&e.host))? {
+        Some(d) => d,
+        None => return Ok(false),
+    };
     // The nested import's tally is reported against the parent's totals, so
     // the caller's progress callback keeps counting up rather than restarting.
     let base = sink.stats.clone();
@@ -567,13 +566,9 @@ fn expand_archive(
         progress(&merged);
     };
     let nested = match flavor {
-        ArchiveFlavor::Tar => crate::fs::tar_import::import_tar_from_path_into(
-            efs,
-            &dir,
-            &e.host,
-            &opts.shared,
-            report,
-        ),
+        ArchiveFlavor::Tar => {
+            fs_tar::tar_import::import_tar_from_path_into(efs, &dir, &e.host, &opts.shared, report)
+        }
         ArchiveFlavor::Mac => crate::fs::mac_archive_import::import_mac_archive_from_path_into(
             efs,
             &dir,
@@ -745,10 +740,10 @@ pub fn projected_volume_bytes(files: u64, dirs: u64, content_bytes: u64, block_s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
 
     fn blank_fat() -> Vec<u8> {
-        crate::fs::fat::create_blank_fat(16 * 1024 * 1024, Some("DIRIMP")).expect("format")
+        fs_pc::fat::create_blank_fat(16 * 1024 * 1024, Some("DIRIMP")).expect("format")
     }
 
     fn tree(root: &Path) {
@@ -764,8 +759,7 @@ mod tests {
         tree(tmp.path());
 
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let stats = import_dir(
             &mut fs,
@@ -825,8 +819,7 @@ mod tests {
         std::os::unix::fs::symlink("real.txt", tmp.path().join("link.txt")).unwrap();
 
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let stats = import_dir(
             &mut fs,
@@ -900,8 +893,7 @@ mod tests {
         assert_eq!((files, bytes), (2, 300_006));
 
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let opts = DirImportOptions {
             expand_archives: true,
@@ -909,7 +901,7 @@ mod tests {
         };
         let stats = import_dir(&mut fs, &root, tmp.path(), &opts, &|_| {}).expect("import");
         assert_eq!((stats.archives_expanded, stats.files), (1, 2));
-        let find = |fs: &mut crate::fs::fat::FatFilesystem<_>, dir: &FileEntry, name: &str| {
+        let find = |fs: &mut fs_pc::fat::FatFilesystem<_>, dir: &FileEntry, name: &str| {
             fs.list_directory(dir)
                 .unwrap()
                 .into_iter()
@@ -935,8 +927,7 @@ mod tests {
 
         // Default: one opaque file, no expansion.
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let stats = import_dir(
             &mut fs,
@@ -958,8 +949,7 @@ mod tests {
 
         // Opt in: the archive becomes a directory of its contents.
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let opts = DirImportOptions {
             expand_archives: true,
@@ -1008,7 +998,7 @@ mod tests {
         enc.finish().unwrap();
     }
 
-    fn root_names(fs: &mut crate::fs::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
+    fn root_names(fs: &mut fs_pc::fat::FatFilesystem<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
         let root = Filesystem::root(fs).unwrap();
         fs.list_directory(&root)
             .unwrap()
@@ -1022,14 +1012,13 @@ mod tests {
     const MEMBER_DATE: u64 = 900_374_400;
 
     fn blank_next_ufs() -> Box<dyn EditableFilesystem> {
-        let img =
-            crate::fs::ufs_format::create_blank_ufs1(&crate::fs::ufs_format::Ufs1FormatParams {
-                size_bytes: 8 * 1024 * 1024,
-                cg_layout: crate::fs::ufs::CgLayout::Bsd43,
-                endian: crate::fs::ufs::UfsEndian::Big,
-                ..Default::default()
-            })
-            .unwrap();
+        let img = fs_unix::ufs_format::create_blank_ufs1(&fs_unix::ufs_format::Ufs1FormatParams {
+            size_bytes: 8 * 1024 * 1024,
+            cg_layout: fs_unix::ufs::CgLayout::Bsd43,
+            endian: fs_unix::ufs::UfsEndian::Big,
+            ..Default::default()
+        })
+        .unwrap();
         crate::fs::open_editable_filesystem(std::io::Cursor::new(img), 0, 0, None).unwrap()
     }
 
@@ -1157,8 +1146,7 @@ mod tests {
         // Named .gz but not gzip: copied through untouched.
         std::fs::write(tmp.path().join("fake.gz"), b"plain text").unwrap();
 
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
         let root = Filesystem::root(&mut fs).unwrap();
         let opts = DirImportOptions {
             expand_gunzip: true,
@@ -1189,8 +1177,7 @@ mod tests {
         write_tgz(&tmp.path().join("pkg.tar.gz"), &[("one.txt", b"one")]);
         write_gz(&tmp.path().join("readme.txt.gz"), b"read me");
 
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(blank_fat()), 0).unwrap();
         let root = Filesystem::root(&mut fs).unwrap();
         let opts = DirImportOptions {
             expand_archives: true,
@@ -1233,8 +1220,7 @@ mod tests {
         );
 
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let opts = DirImportOptions {
             expand_archives: true,
@@ -1279,8 +1265,7 @@ mod tests {
         }
 
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let opts = DirImportOptions {
             // What the CLI builds for --flatten-folders: Skip, not Error.
@@ -1324,8 +1309,7 @@ mod tests {
             );
         }
         let img = blank_fat();
-        let mut fs =
-            crate::fs::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let mut fs = fs_pc::fat::FatFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
         let root = Filesystem::root(&mut fs).expect("root");
         let opts = DirImportOptions {
             expand_archives: true,

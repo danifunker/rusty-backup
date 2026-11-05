@@ -14,8 +14,8 @@ restore is a byte copy unless a size changes.
 
 ## The disk-label schemes
 
-Sun, NeXT, SGI volume header, SGI disk label, Amiga RDB, Atari AHDI and Sharp
-X68k are backed up **whole**: everything before the first partition (label
+Sun, NeXT, SGI volume header, SGI disk label, Amiga RDB, Atari AHDI, Sharp
+X68k and the pre-1986 Apple `TS` partition map are backed up **whole**: everything before the first partition (label
 copies, the RDSK/PART/FSHD/LSEG chain, the IPL and its table, boot blocks)
 rides verbatim inside the CHD. Nothing on the restore side has to understand
 the label to put the disk back.
@@ -28,6 +28,7 @@ the label to put the disk back.
 | SGI disk label | refused | eight slots rewritten in the label's own word order | 512-byte block |
 | Amiga RDB | refused | RDSK + PART blocks overlaid, driver chain untouched (raw / VHD export has its own older path) | cylinder, per partition |
 | Atari AHDI | refused | root-sector entries rewritten, 0x1234 word-sum restamped | 512-byte sector |
+| Apple `TS` map | refused | DDR block count and the `TS` entries rewritten; the driver blocks stay put | 512-byte block |
 | Sharp X68k | allowed (`zstd` etc.) | table entries rewritten, sector-size aware | logical sector (256 / 512 / 1024) |
 
 The per-partition layouts are refused for the label schemes because their

@@ -382,6 +382,49 @@ Test matrix to add:
 
 ---
 
+## 6a. Damaged StuffIt archives
+
+Classic StuffIt has no index: each 112-byte entry header is found by adding
+the previous entry's compressed fork lengths. One stray block therefore hides
+every later entry. `stuffit::parse` handles that the way a damaged-archive
+reader must: when a header fails its CRC (or is an all-zero block, whose CRC is
+also zero) it scans forward to the next plausible, CRC-valid header, records a
+`SitDamage { offset, skipped }`, and carries on. `rb-cli archive list/extract`
+and the GUI extract log print one warning per gap. With no valid header after
+the bad one, the original "entry header CRC mismatch" error stands.
+
+The #101 samples (`KPT Convolver.sit`, `Painter 4.0.sit`, `Poser 1.0.sit`, ...)
+were checked against The Unarchiver 1.10.8 (`lsar -t`). It fails all nine at the
+same offset we do, and passes an undamaged control archive. In each sample the
+first file entry is followed by 149 bytes that no length field counts:
+- the folder header's compressed-size field and the entry's next-entry link
+  both match the stored fork lengths, not the bytes on disk;
+- the first entry's forks fail their CRC whether decoded at the stored
+  length or 149 bytes longer;
+- the archive's declared length (and the MacBinary data-fork length, when
+  wrapped) is 149 bytes short, so the last entry runs past the end. In the
+  MacBinary samples the missing tail is in the MacBinary padding after the
+  data fork, so the extra bytes were already there when the file was wrapped
+  on the Mac.
+What wrote them is unknown. After the skip, the later entries in most of these
+archives decode with good CRCs.
+
+StuffIt 5 archives keep absolute offsets, so a text conversion cannot be
+skipped over. `damage_hint` names the two conversions it can prove from byte
+statistics alone (files of 4 KiB or more, where every byte value should occur):
+- **No 0x0d byte anywhere** (#102, `LogoWriter.sea.hqx`, `POV-Ray ... .hqx`):
+  the file went through a Mac-to-Unix line-ending conversion. CR LF became LF,
+  which shifted the header's flags byte (0x10) into the version slot and gave
+  "version 16", and every other CR became LF. A StuffIt 5 header whose bytes
+  78..80 are not CR LF is reported as damaged.
+- **No C0, C1 or F5-FF byte anywhere** (#103, `MacPaint.sit`): those are the
+  byte values UTF-8 never uses, so the file was decoded and re-encoded as text.
+  Every 0xA5 of the 0xA5A5A5A5 entry ids was lost with them.
+
+Neither kind of damage can be undone: the conversions are many-to-one.
+
+---
+
 ## 7. Primary format sources (for future maintainers)
 
 - MacBinary I: "Macintosh Binary Transfer Format Standard Proposal", rev 3,

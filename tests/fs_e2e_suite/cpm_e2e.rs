@@ -13,9 +13,9 @@
 
 use std::io::{Cursor, Read};
 
-use rusty_backup::fs::cpm::CpmFilesystem;
-use rusty_backup::fs::cpm_diskdefs::AMSTRAD_DATA;
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_cpm::cpm::CpmFilesystem;
+use fs_cpm::cpm_diskdefs::AMSTRAD_DATA;
 
 fn load_fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");

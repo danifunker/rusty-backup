@@ -80,7 +80,7 @@ default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seek
 # out only so the vintage macOS 10.7 build (rb-cli-vintage/, Rust 1.73) can drop
 # it: those edition-2024 crates need rustc >= 1.85, and unencrypted APFS / IMZ /
 # DMG browse keeps working without it (encrypted inputs bail with a clear error).
-crypto = ["dep:aes", "dep:cbc", "dep:des"]
+crypto = ["dep:aes", "dep:cbc", "dep:des", "fs-apfs/crypto", "dsk-dmg/crypto", "dsk-imz/crypto"]
 # `--format yaml` for the read-only verbs. ON BY DEFAULT — the desktop and the
 # vintage builds ship it. Split out only so the PowerPC mrustc build can drop it:
 # serde_yml's backend (`libyml`) hits an mrustc macro-expansion gap
@@ -113,7 +113,7 @@ native-zlib = ["flate2/zlib-ng"]
 # interchangeable. Slim build: `--no-default-features --features pure-zstd`.
 # The seekable-zstd cache (zeekstd) is C-only; the pure path full-decompresses
 # such caches to a tempfile instead of seeking. See docs/linux_486_build.md.
-native-zstd = ["dep:zstd"]
+native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd"]
 # Seekable-zstd random-access cache (zeekstd). Splits out from native-zstd so the
 # vintage macOS 10.7 build (Rust 1.73) can take the C `zstd` backend WITHOUT
 # zeekstd — every zeekstd release is edition 2024 (needs rustc >= 1.85). Requires
@@ -121,7 +121,7 @@ native-zstd = ["dep:zstd"]
 # `gui`; when off, browse_session full-decompresses a seekable cache instead of
 # random-accessing it. See src/model/browse_session.rs.
 seekable-zstd = ["dep:zeekstd", "native-zstd"]
-pure-zstd = ["dep:libzstd-bitexact-rs"]
+pure-zstd = ["dep:libzstd-bitexact-rs", "dsk-clonezilla/pure-zstd", "fs-squashfs/pure-zstd", "fs-tar/pure-zstd"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -180,8 +180,9 @@ windows-legacy = []
 # compiles on Rust 1.73 for the macOS 10.7 build. OFF here — the desktop uses
 # the real std methods. Enabled ONLY by the vintage manifest (rb-cli-vintage/).
 # Do NOT enable on a modern toolchain: std's inherent is_multiple_of would then
-# collide with the polyfill trait. See src/rust173_compat.rs.
-rust173-polyfill = []
+# collide with the polyfill trait. See crates/disk-core. Forwarded to every
+# extracted crate under crates/ (docs/crate_split_plan.md).
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
 # (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
 # MiSTer builds so they link no networking; desktop packagers opt in. When the
@@ -189,6 +190,36 @@ rust173-polyfill = []
 tui-update = ["dep:reqwest"]
 
 [dependencies]
+# Reusable MIT crates extracted from this tree (docs/crate_split_plan.md).
+disk-core = { path = "crates/disk-core" }
+fs-8bit = { path = "crates/fs-8bit" }
+fs-cpm = { path = "crates/fs-cpm" }
+fs-apple2 = { path = "crates/fs-apple2" }
+fs-qnx = { path = "crates/fs-qnx" }
+fs-xerox = { path = "crates/fs-xerox" }
+dsk-tape = { path = "crates/dsk-tape", default-features = false, features = ["sun2tape"] }
+dsk-imz = { path = "crates/dsk-imz", default-features = false }
+arc-mac = { path = "crates/arc-mac" }
+fs-tar = { path = "crates/fs-tar", default-features = false, features = ["appledouble", "zip"] }
+rb-fsexporter = { path = "crates/rb-fsexporter" }
+fs-adfs = { path = "crates/fs-adfs" }
+dsk-ghost = { path = "crates/dsk-ghost" }
+dsk-vm = { path = "crates/dsk-vm" }
+dsk-floppy = { path = "crates/dsk-floppy" }
+dsk-dmg = { path = "crates/dsk-dmg", default-features = false, features = ["stuffit"] }
+dsk-apple = { path = "crates/dsk-apple" }
+dsk-flux = { path = "crates/dsk-flux" }
+part-tables = { path = "crates/part-tables" }
+fs-mac = { path = "crates/fs-mac" }
+fs-mac-unicode = { path = "crates/fs-mac-unicode" }
+fs-apfs = { path = "crates/fs-apfs", default-features = false }
+fs-hpfs = { path = "crates/fs-hpfs" }
+fs-pc = { path = "crates/fs-pc" }
+fs-squashfs = { path = "crates/fs-squashfs", default-features = false }
+fs-xfs = { path = "crates/fs-xfs" }
+fs-unix = { path = "crates/fs-unix", features = ["ofs"] }
+fs-amiga = { path = "crates/fs-amiga" }
+dsk-clonezilla = { path = "crates/dsk-clonezilla", default-features = false }
 # Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
 # already a non-optional dependency below, so this adds no new C/native code.
 ratatui = { version = "0.30", optional = true }
@@ -196,7 +227,7 @@ ratatui = { version = "0.30", optional = true }
 eframe = { version = "0.37", features = ["glow"], optional = true }
 egui = { version = "0.37", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.289.3", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.289.4", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
@@ -209,7 +240,7 @@ webbrowser = { version = "1.0", optional = true }
 #   0.13.0 — `physical` / `open_physical`: reading a disc from the drive as flat
 #            cooked sectors, which is what makes DVD and Blu-ray work at all
 #            (the CD-only MMC ioctls fail on that media with ENOTTY).
-opticaldiscs = { version = "0.16.0", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.16.2", features = ["drives"], optional = true }
 # Back on the upstream crate as of 1.0.0, which absorbed everything the
 # `danifunker/rust-cd-da-reader` fork carried (PR #58): `CdReader::from_file`
 # for a pre-opened elevated handle, and the streaming reader
@@ -251,7 +282,7 @@ cbc = { version = "0.2", optional = true }
 crc32c = "0.6"
 crc32fast = "1"
 # QNX 2 (Unisys ICON) reader, writer and checker, shared with icon-emu; MIT.
-qnx2fs = "0.3"
+qnx2fs = { path = "crates/qnx2fs", features = ["disk-core"] }
 chrono = "0.4"
 tempfile = "3"
 image = "0.25"
@@ -325,6 +356,8 @@ winres = "0.1"
 cargo-husky = { version = "1.5.0", features = ["user-hooks"] }
 # Verify the bundled CJK font actually covers Japanese (same parser egui uses).
 ab_glyph = "0.2"
+# UI scenario files (tests/ui_scenarios.rs); 0.5 builds on Rust 1.73.
+toml = "0.5"
 
 # Debian package metadata
 [package.metadata.deb]
@@ -369,6 +402,14 @@ openssl = "*"
 # Arch package metadata
 [package.metadata.aur]
 depends = ["gtk3", "openssl"]
+
+# The extracted reusable crates (fs-*, part-*, dsk-*, rb-*). The vintage
+# manifests (rb-cli-vintage, rb-cli-ppc, rb-cli-sol9) stay their own workspace
+# roots and reach these through path dependencies. docs/crate_split_plan.md.
+[workspace]
+members = ["crates/*"]
+# A separate project with its own lockfile; without this it "believes it's in a workspace" and won't build.
+exclude = ["regression-tests/runner"]
 
 # Debug builds carry line tables only. With full debuginfo the lib test binary
 # was 839 MB and each integration test 350-440 MB; linking several of those in

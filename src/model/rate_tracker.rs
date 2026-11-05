@@ -105,7 +105,7 @@ impl RateTracker {
 }
 
 /// Format a bytes-per-second rate as KiB/s / MiB/s / GiB/s.
-fn format_rate(bytes_per_sec: f64) -> String {
+pub fn format_rate(bytes_per_sec: f64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
@@ -121,7 +121,7 @@ fn format_rate(bytes_per_sec: f64) -> String {
 }
 
 /// Format an ETA in seconds as `Hh Mm` / `Mm Ss` / `Ss`.
-fn format_eta(total_secs: u64) -> String {
+pub fn format_eta(total_secs: u64) -> String {
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;

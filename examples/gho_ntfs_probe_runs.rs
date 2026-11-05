@@ -7,7 +7,7 @@
 //   cargo run --release --example gho_ntfs_probe_runs -- PATH.GHO [REC ...]
 // Defaults to records 9 ($Secure) and 10 ($UpCase) when no recs given.
 
-use rusty_backup::rbformats::gho::GhoReader;
+use dsk_ghost::gho::GhoReader;
 use std::io::{Read, Seek, SeekFrom};
 
 fn rd_u16(b: &[u8], o: usize) -> u16 {

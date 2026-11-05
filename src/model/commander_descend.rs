@@ -4,7 +4,7 @@
 //!
 //! A pane row is *descendable* when it's a Mac archive or a disk-image
 //! container. Activating it opens the wrapper's contents as a
-//! [`Filesystem`](crate::fs::filesystem::Filesystem) and pushes a layer onto
+//! [`Filesystem`](disk_core::filesystem::Filesystem) and pushes a layer onto
 //! the pane's [`DirListing`](crate::model::dir_listing::DirListing); copying out
 //! then works through the existing generic copy path.
 //!
@@ -18,11 +18,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::fs::archive_fs::ArchiveFilesystem;
-use crate::fs::entry::FileEntry;
-use crate::fs::filesystem::Filesystem;
 use crate::model::commander_source;
 use crate::model::file_types::{DISK_IMAGE_EXTS, MAC_ARCHIVE_EXTS};
 use crate::partition::PartitionInfo;
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::Filesystem;
 
 /// What kind of wrapper a descendable row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +167,7 @@ pub fn open_archive(path: &Path, label: Option<String>) -> Result<Box<dyn Filesy
         .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
         .with_context(|| format!("read {}", path.display()))?;
     if is_zip_or_tar(&head[..n], name) {
-        let fs = crate::fs::mem_archive::open_path(path, label)
+        let fs = fs_tar::mem_archive::open_path(path, label)
             .map_err(|e| anyhow::anyhow!("open archive '{name}': {e}"))?;
         return Ok(Box::new(fs));
     }
@@ -190,14 +190,14 @@ fn is_zip_or_tar(head: &[u8], file_name: &str) -> bool {
 
 /// Open archive bytes as a read-only filesystem, routing by content + name to
 /// the right reader: ZIP and tar (plain / `.tgz` / `.tar.gz` / `.tar.zst`) via
-/// [`crate::fs::mem_archive`], otherwise a classic-Mac archive (StuffIt /
+/// [`fs_tar::mem_archive`], otherwise a classic-Mac archive (StuffIt /
 /// Compact Pro / MacBinary / BinHex) via [`ArchiveFilesystem`].
 pub fn open_archive_bytes(
     bytes: Vec<u8>,
     file_name: &str,
     label: Option<String>,
 ) -> Result<Box<dyn Filesystem>> {
-    use crate::fs::mem_archive;
+    use fs_tar::mem_archive;
     let lower = file_name.to_ascii_lowercase();
 
     if bytes.starts_with(b"PK\x03\x04")
@@ -288,18 +288,31 @@ pub struct OpticalFsChoice {
     pub hybrid_index: Option<usize>,
 }
 
+/// A disc image file, or the disc in a drive (`physical`, read through the device-backed reader).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscSource {
+    pub path: PathBuf,
+    pub physical: bool,
+}
+
+/// The picker names of opticaldiscs `FilesystemType` debug tokens.
+pub const OPTICAL_FS_NAMES: &[(&str, &str)] = &[
+    ("Iso9660", "ISO 9660"),
+    ("HighSierra", "High Sierra"),
+    ("Hfs", "HFS (Mac)"),
+    ("HfsPlus", "HFS+ (Mac)"),
+    ("Efs", "IRIX EFS"),
+];
+
 /// Turn an opticaldiscs `FilesystemType` debug token + optional volume label
 /// into a friendly picker label. Only the optical build enumerates filesystems.
 #[cfg(feature = "optical")]
 fn optical_fs_label(ty: &str, label: Option<&str>) -> String {
-    let nice = match ty {
-        "Iso9660" => "ISO 9660",
-        "HighSierra" => "High Sierra",
-        "Hfs" => "HFS (Mac)",
-        "HfsPlus" => "HFS+ (Mac)",
-        "Efs" => "IRIX EFS",
-        other => other,
-    };
+    let nice = OPTICAL_FS_NAMES
+        .iter()
+        .find(|(t, _)| *t == ty)
+        .map(|(_, n)| *n)
+        .unwrap_or(ty);
     match label {
         Some(l) if !l.trim().is_empty() => format!("{l} ({nice})"),
         _ => nice.to_string(),
@@ -317,30 +330,36 @@ pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
     let Ok(info) = DiscImageInfo::open(path) else {
         return Vec::new();
     };
-    let mut choices = vec![OpticalFsChoice {
-        label: optical_fs_label(
-            &format!("{:?}", info.filesystem),
-            info.volume_label.as_deref(),
-        ),
-        hybrid_index: None,
-    }];
-    for (i, h) in info.hybrid_filesystems.iter().enumerate() {
-        choices.push(OpticalFsChoice {
-            label: optical_fs_label(&format!("{:?}", h.filesystem), h.volume_label.as_deref()),
-            hybrid_index: Some(i),
-        });
-    }
-    let hybrids = info.hybrid_filesystems.len();
-    for (j, area) in crate::optical::boot_area::detect(path)
+    let areas = crate::optical::boot_area::detect(path);
+    let labels = optical_choice_labels(&info, areas.as_slice());
+    let hybrid = |i: usize| if i == 0 { None } else { Some(i - 1) };
+    labels
         .into_iter()
         .enumerate()
-    {
-        choices.push(OpticalFsChoice {
-            label: area.label,
-            hybrid_index: Some(hybrids + j),
-        });
+        .map(|(i, label)| OpticalFsChoice {
+            label,
+            hybrid_index: hybrid(i),
+        })
+        .collect()
+}
+
+/// The picker labels of a disc: its primary filesystem, the hybrid sides, then the boot areas.
+#[cfg(feature = "optical")]
+pub fn optical_choice_labels(
+    info: &opticaldiscs::detect::DiscImageInfo,
+    areas: &[crate::optical::boot_area::BootArea],
+) -> Vec<String> {
+    let primary = format!("{:?}", info.filesystem);
+    let mut labels = vec![optical_fs_label(
+        primary.as_str(),
+        info.volume_label.as_deref(),
+    )];
+    for h in &info.hybrid_filesystems {
+        let ty = format!("{:?}", h.filesystem);
+        labels.push(optical_fs_label(ty.as_str(), h.volume_label.as_deref()));
     }
-    choices
+    labels.extend(areas.iter().map(|a| a.label.clone()));
+    labels
 }
 
 /// Stub for builds without the `optical` feature.
@@ -470,6 +489,12 @@ pub enum ReopenRecipe {
         path: PathBuf,
         label: Option<String>,
     },
+    /// Reopen an archive held in memory (an archive expanded from inside another source).
+    ArchiveBytes {
+        bytes: std::sync::Arc<Vec<u8>>,
+        file_name: String,
+        label: Option<String>,
+    },
     /// Reopen a disk-image container's first browsable volume by path.
     DiskImage { path: PathBuf },
     /// Reopen a multi-partition disk image as a [`MultiVolumeFilesystem`]
@@ -494,6 +519,9 @@ pub enum ReopenRecipe {
         path: PathBuf,
         label: Option<String>,
     },
+    /// Reopen the chosen filesystem of a browser pane's disc source (an image file or a drive).
+    #[cfg(feature = "optical")]
+    Disc(Box<crate::model::optical_browse::DiscChoice>),
 }
 
 impl ReopenRecipe {
@@ -501,6 +529,11 @@ impl ReopenRecipe {
     pub fn open(&self) -> Result<Box<dyn Filesystem>> {
         match self {
             ReopenRecipe::Archive { path, label } => open_archive(path, label.clone()),
+            ReopenRecipe::ArchiveBytes {
+                bytes,
+                file_name,
+                label,
+            } => open_archive_bytes(bytes.as_ref().clone(), file_name, label.clone()),
             ReopenRecipe::DiskImage { path } => {
                 let parts = browsable_partitions(path)?;
                 let (_, first) = parts.first().ok_or_else(|| {
@@ -515,6 +548,8 @@ impl ReopenRecipe {
             ReopenRecipe::OpticalHybrid { path, index, label } => {
                 open_optical_hybrid(path, *index, label.clone())
             }
+            #[cfg(feature = "optical")]
+            ReopenRecipe::Disc(disc) => disc.filesystem().map_err(|e| anyhow::anyhow!(e)),
             ReopenRecipe::OpticalMulti { path, label } => {
                 #[cfg(feature = "optical")]
                 {
@@ -541,8 +576,9 @@ impl ReopenRecipe {
 /// for; shared by the `commander_descend` and `wrapper_tree` tests.
 #[cfg(test)]
 pub(crate) fn build_two_partition_fat_image() -> (tempfile::TempDir, PathBuf) {
-    use crate::fs::filesystem::CreateFileOptions;
-    use crate::fs::{fat, open_editable_filesystem};
+    use crate::fs::open_editable_filesystem;
+    use disk_core::filesystem::CreateFileOptions;
+    use fs_pc::fat;
     use std::fs::OpenOptions;
 
     fn set_entry(img: &mut [u8], i: usize, start: usize, p_size: usize) {
@@ -687,9 +723,7 @@ mod tests {
 
     #[test]
     fn materialize_then_open_archive_round_trips() {
-        use crate::macarchive::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let tree = vec![StuffItInputNode::File(StuffItInput {
             name: "hi.txt".into(),
             type_code: *b"TEXT",
@@ -716,9 +750,7 @@ mod tests {
     /// of the pane's live fs).
     #[test]
     fn reopen_recipe_reopens_archive_by_path_repeatedly() {
-        use crate::macarchive::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
+        use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
         let tree = vec![StuffItInputNode::File(StuffItInput {
             name: "hi.txt".into(),
             type_code: *b"TEXT",
@@ -751,8 +783,9 @@ mod tests {
     /// path — the inline-`+`-expanded CD-ROM / hard-disk-image copy path.
     #[test]
     fn reopen_recipe_reopens_disk_image_by_path() {
-        use crate::fs::filesystem::CreateFileOptions;
-        use crate::fs::{fat, open_editable_filesystem};
+        use crate::fs::open_editable_filesystem;
+        use disk_core::filesystem::CreateFileOptions;
+        use fs_pc::fat;
 
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("disk.img");
@@ -829,8 +862,9 @@ mod tests {
     /// — no root-node layer — so ordinary single-volume browsing is unchanged.
     #[test]
     fn diskimage_mount_single_opens_the_volume_directly() {
-        use crate::fs::filesystem::CreateFileOptions;
-        use crate::fs::{fat, open_editable_filesystem};
+        use crate::fs::open_editable_filesystem;
+        use disk_core::filesystem::CreateFileOptions;
+        use fs_pc::fat;
 
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("one.img");

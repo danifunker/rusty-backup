@@ -46,7 +46,7 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: gho_ntfs_scope <path>");
-    let mut r = rusty_backup::rbformats::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
+    let mut r = dsk_ghost::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
 
     r.seek(SeekFrom::Start(0)).unwrap();
     let vbr = rd(&mut r, 512);

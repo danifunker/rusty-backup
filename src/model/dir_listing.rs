@@ -21,8 +21,24 @@
 
 use std::path::Path;
 
-use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::filesystem::{Filesystem, FilesystemError};
+use crate::fs::entry::FileEntryTypeDisplay as _;
+use disk_core::entry::{EntryType, FileEntry};
+use disk_core::filesystem::{Filesystem, FilesystemError};
+
+/// A host folder and its children, read ahead of [`DirListing::load_host_prepared`].
+pub struct HostRoot {
+    pub dir: FileEntry,
+    pub entries: Vec<FileEntry>,
+}
+
+/// Read a host folder as a listing root; the slow half of [`DirListing::load_host_root`].
+pub fn read_host_root(root: std::path::PathBuf) -> Result<HostRoot, FilesystemError> {
+    let path = root.to_string_lossy().to_string();
+    let entries = list_host_dir(&path)?;
+    let name = host_dir_name(&root, &path);
+    let dir = FileEntry::new_directory(name, path, 0);
+    Ok(HostRoot { dir, entries })
+}
 
 /// Where a [`DirListing`] reads its directory listings from.
 #[derive(Default)]
@@ -110,13 +126,14 @@ impl DirListing {
     /// Load a host-OS folder as the listing root (a `std::fs` read). The pane
     /// can navigate below it, and `..` may ascend above it on the real tree.
     pub fn load_host_root(&mut self, root: std::path::PathBuf) -> Result<(), FilesystemError> {
-        let path = root.to_string_lossy().to_string();
-        let entries = list_host_dir(&path)?;
-        let name = host_dir_name(&root, &path);
-        let dir = FileEntry::new_directory(name, path, 0);
-        self.reset(ListingSource::Host, true);
-        self.push_dir(dir, entries);
+        self.load_host_prepared(read_host_root(root)?);
         Ok(())
+    }
+
+    /// Install a host folder read earlier by [`read_host_root`] (off the UI thread).
+    pub fn load_host_prepared(&mut self, root: HostRoot) {
+        self.reset(ListingSource::Host, true);
+        self.push_dir(root.dir, root.entries);
     }
 
     /// Reset to a fresh source, clearing the stack and selection.
@@ -202,6 +219,37 @@ impl DirListing {
             .ok_or_else(|| FilesystemError::NotFound(format!("directory '{name}'")))?;
         let entries = self.list_children(&child)?;
         self.push_dir(child, entries);
+        self.clear_selection();
+        Ok(())
+    }
+
+    /// The off-thread half of [`enter`](Self::enter): take what listing `name` needs, so a slow
+    /// (remote) read can run on a worker; hand the result to [`finish_enter`](Self::finish_enter).
+    pub fn begin_enter(&mut self, name: &str) -> Result<PendingEnter, FilesystemError> {
+        let child = self
+            .entries()
+            .iter()
+            .find(|e| e.is_directory() && e.name == name)
+            .cloned()
+            .ok_or_else(|| FilesystemError::NotFound(format!("directory '{name}'")))?;
+        let fs = match &mut self.source {
+            ListingSource::Image(_) => match std::mem::take(&mut self.source) {
+                ListingSource::Image(fs) => Some(fs),
+                _ => unreachable!("matched Image above"),
+            },
+            ListingSource::Host => None,
+            ListingSource::None => return Err(FilesystemError::Parse("no source loaded".into())),
+        };
+        Ok(PendingEnter { child, fs })
+    }
+
+    /// Finish an [`begin_enter`](Self::begin_enter): put the filesystem back and, on success, show the child.
+    pub fn finish_enter(&mut self, done: EnteredDir) -> Result<(), FilesystemError> {
+        if let Some(fs) = done.fs {
+            self.source = ListingSource::Image(fs);
+        }
+        let entries = done.entries?;
+        self.push_dir(done.child, entries);
         self.clear_selection();
         Ok(())
     }
@@ -374,12 +422,7 @@ impl DirListing {
         let Some(frame) = self.stack.last_mut() else {
             return;
         };
-        frame.entries.sort_by(|a, b| cmp_by(a, b, col));
-        if desc {
-            frame.entries.reverse();
-        }
-        // Stable: keeps the just-applied within-group order, groups dirs first.
-        frame.entries.sort_by_key(|e| !e.is_directory());
+        sort_entries(&mut frame.entries, col, desc);
     }
 
     // --- selection ---------------------------------------------------------
@@ -454,6 +497,41 @@ impl DirListing {
             _ => None,
         }
     }
+}
+
+/// Sort `entries` by `col` (flipped when `desc`), folders first, as a listing sorts its folder.
+pub fn sort_entries(entries: &mut [FileEntry], col: SortColumn, desc: bool) {
+    entries.sort_by(|a, b| cmp_by(a, b, col));
+    if desc {
+        entries.reverse();
+    }
+    // Stable: keeps the just-applied within-group order, groups dirs first.
+    entries.sort_by_key(|e| !e.is_directory());
+}
+
+/// Where a folder below the listing's own is read from, on a worker.
+#[derive(Clone)]
+pub enum FolderSource {
+    Host,
+    /// A fresh handle on the pane's image, opened once and kept in the caller's reader.
+    Image(crate::model::commander_ops::StageSource),
+}
+
+/// List `dir` on a worker; `reader` keeps the opened image between calls.
+pub fn list_folder(
+    source: FolderSource,
+    reader: &mut Option<Box<dyn Filesystem>>,
+    dir: &FileEntry,
+) -> Result<Vec<FileEntry>, String> {
+    let source = match source {
+        FolderSource::Host => return list_host_dir(&dir.path).map_err(|e| e.to_string()),
+        FolderSource::Image(source) => source,
+    };
+    if reader.is_none() {
+        *reader = Some(source.open().map_err(|e| format!("{e:#}"))?);
+    }
+    let fs = reader.as_mut().ok_or("no reader")?;
+    fs.list_directory(dir).map_err(|e| e.to_string())
 }
 
 /// Read a host directory into `FileEntry`s (one stack frame's worth). Each
@@ -564,6 +642,35 @@ fn fat_attr_tag(attrs: u16) -> String {
     let s = if attrs & 0x04 != 0 { 'S' } else { '-' };
     let r = if attrs & 0x01 != 0 { 'R' } else { '-' };
     format!("{a}{h}{s}{r}")
+}
+
+/// What listing a child directory needs, taken out of a [`DirListing`] to run on a worker.
+pub struct PendingEnter {
+    child: FileEntry,
+    /// The image filesystem (out of the listing while the worker reads); `None` for a host pane.
+    fs: Option<Box<dyn Filesystem>>,
+}
+
+/// A worker's answer for [`DirListing::finish_enter`].
+pub struct EnteredDir {
+    child: FileEntry,
+    fs: Option<Box<dyn Filesystem>>,
+    entries: Result<Vec<FileEntry>, FilesystemError>,
+}
+
+impl PendingEnter {
+    /// List the child directory; safe to call on a worker thread.
+    pub fn run(mut self) -> EnteredDir {
+        let entries = match &mut self.fs {
+            Some(fs) => fs.list_directory(&self.child),
+            None => list_host_dir(&self.child.path),
+        };
+        EnteredDir {
+            child: self.child,
+            fs: self.fs,
+            entries,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -710,11 +817,11 @@ mod tests {
     fn navigation_through_a_real_filesystem() {
         // Build a blank FAT12 floppy on disk, add a subdirectory with a file in
         // it, then drive DirListing's enter/up over the re-opened filesystem.
-        use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions};
+        use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
         use std::fs::OpenOptions;
         use std::io::Cursor;
 
-        let flat = crate::fs::fat::create_blank_fat(737280, Some("NAV")).unwrap();
+        let flat = fs_pc::fat::create_blank_fat(737280, Some("NAV")).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &flat).unwrap();
 
@@ -862,9 +969,9 @@ mod tests {
     /// slash-named folder, not a decoy `Acquire` beside it.
     #[test]
     fn navigate_to_enters_slash_named_folders() {
-        use crate::fs::filesystem::{CreateDirectoryOptions, EditableFilesystem};
-        let img = crate::fs::hfs::create_blank_hfs(8 << 20, 4096, "Nav").unwrap();
-        let mut fs = crate::fs::hfs::HfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        use disk_core::filesystem::{CreateDirectoryOptions, EditableFilesystem};
+        let img = fs_mac::hfs::create_blank_hfs(8 << 20, 4096, "Nav").unwrap();
+        let mut fs = fs_mac::hfs::HfsFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
         let root = fs.root().unwrap();
         let opts = CreateDirectoryOptions::default();
         let plug = fs.create_directory(&root, "Plug-ins", &opts).unwrap();
@@ -880,5 +987,20 @@ mod tests {
         l.navigate_to("/Plug-ins/Acquire/Export").unwrap();
         assert_eq!(l.cwd().unwrap().name, "Acquire/Export");
         assert!(l.navigate_to("/Plug-ins/Nope").is_err());
+    }
+
+    #[test]
+    fn entering_in_two_steps_matches_enter() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("sub/inner.txt"), b"x").unwrap();
+        let mut l = DirListing::new();
+        l.load_host_root(root.path().to_path_buf()).unwrap();
+        let pending = l.begin_enter("sub").unwrap();
+        let done = std::thread::spawn(move || pending.run()).join().unwrap();
+        l.finish_enter(done).unwrap();
+        assert_eq!(l.cwd().unwrap().name, "sub");
+        assert!(l.entries().iter().any(|e| e.name == "inner.txt"));
+        assert!(l.begin_enter("missing").is_err());
     }
 }

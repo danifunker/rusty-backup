@@ -1,4 +1,4 @@
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
 
 fn main() {
     env_logger::init();
@@ -7,10 +7,10 @@ fn main() {
         .expect("usage: test_ntfs_gho <path>");
     let path = std::path::Path::new(&path);
 
-    let reader = rusty_backup::rbformats::gho::GhoReader::open(path).unwrap();
+    let reader = dsk_ghost::gho::GhoReader::open(path).unwrap();
     println!("Runs: {}", reader.block_count());
 
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(reader, 0).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(reader, 0).unwrap();
     println!("Volume: {:?}", fs.volume_label());
 
     let root = fs.root().unwrap();

@@ -1,0 +1,35 @@
+# Every job ends: done with its result, failed with its error, failed with a
+# panic's message (never stuck "running"), or cancelled.
+name = "Job lifecycle: done, error, panic, cancel"
+vm = "job_probe"
+
+[[step]]
+expect = { status = "idle" }
+
+[[step]]
+action = "Start"
+arg = "ok"
+settle = true
+expect = { status = "done", result = "finished" }
+
+[[step]]
+action = "Start"
+arg = "error"
+settle = true
+expect = { status = "failed", error = "the disk is full" }
+
+[[step]]
+action = "Start"
+arg = "panic"
+settle = true
+expect = { status = "failed", error = "~worker panicked: index out of bounds" }
+
+[[step]]
+action = "Start"
+arg = "wait_for_cancel"
+expect = { status = "running" }
+
+[[step]]
+action = "Cancel"
+settle = true
+expect = { status = "cancelled" }

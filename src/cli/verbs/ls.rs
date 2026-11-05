@@ -5,6 +5,7 @@
 //! XFS, ProDOS, ISO9660, AFFS, PFS3, SFS, EFS, and any superfloppy
 //! the magic-byte sniffer recognizes.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use serde::Serialize;
@@ -14,7 +15,7 @@ use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_csv_or_tsv, emit_envelope, Envelope, OutputFormat};
 use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
-use crate::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
 pub struct LsArgs {
@@ -112,9 +113,9 @@ struct LsRow {
 
 impl LsRow {
     fn from_entry(
-        entry: &crate::fs::entry::FileEntry,
+        entry: &disk_core::entry::FileEntry,
         display_name: &str,
-        id_names: Option<&crate::fs::id_names::IdNameMap>,
+        id_names: Option<&disk_core::id_names::IdNameMap>,
     ) -> Self {
         Self {
             kind: if entry.is_directory() { "DIR" } else { "FILE" },
@@ -201,9 +202,9 @@ pub fn run(args: LsArgs) -> Result<()> {
     // files. Cheap and best-effort; an image with no `/etc/passwd` yields an
     // empty map and we fall back to raw numbers.
     let id_names = if args.owner {
-        crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs)
+        disk_core::id_names::IdNameMap::from_filesystem(&mut *fs)
     } else {
-        crate::fs::id_names::IdNameMap::default()
+        disk_core::id_names::IdNameMap::default()
     };
 
     // `--literal` forces the exact-path branch even when the name contains
@@ -245,7 +246,7 @@ pub fn run(args: LsArgs) -> Result<()> {
     if args.format == OutputFormat::Text {
         for c in children {
             // A NeXTSTEP / EUC name's raw bytes print as `\xNN` rather than as placeholder glyphs.
-            let shown = crate::fs::raw_name::display(&c.name);
+            let shown = disk_core::raw_name::display(&c.name);
             print_entry(&c, &shown, args.owner.then_some(&id_names), args.time);
         }
         return Ok(());
@@ -320,7 +321,7 @@ fn wire_row(entry: &crate::remote::protocol::WireEntry) -> LsRow {
         creator_code: entry
             .creator_code
             .as_ref()
-            .map(crate::fs::hfs_common::decode_ostype),
+            .map(fs_mac::hfs_common::decode_ostype),
         // The wire protocol carries no mode / ownership / date today.
         mode: None,
         uid: None,
@@ -338,7 +339,7 @@ fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
     let cr = entry
         .creator_code
         .as_ref()
-        .map(crate::fs::hfs_common::decode_ostype);
+        .map(fs_mac::hfs_common::decode_ostype);
     let t = t.as_deref().unwrap_or("    ");
     let cr = cr.as_deref().unwrap_or("    ");
     out_stdout(format!(
@@ -348,9 +349,9 @@ fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
 }
 
 fn print_entry(
-    entry: &crate::fs::entry::FileEntry,
+    entry: &disk_core::entry::FileEntry,
     display_name: &str,
-    id_names: Option<&crate::fs::id_names::IdNameMap>,
+    id_names: Option<&disk_core::id_names::IdNameMap>,
     time: bool,
 ) {
     let kind = if entry.is_directory() { "DIR " } else { "FILE" };
@@ -406,7 +407,7 @@ pub fn colon_mode(fs: &dyn Filesystem, path: &str) -> bool {
 /// The path is tokenised with [`crate::cli::parse::split_image_path`], so a
 /// literal `/` inside a name can be addressed as `\/` (slash grammar) or by
 /// using `:` separators on HFS / HFS+ (colon grammar). See that function.
-pub fn resolve_path(fs: &mut dyn Filesystem, path: &str) -> Result<crate::fs::entry::FileEntry> {
+pub fn resolve_path(fs: &mut dyn Filesystem, path: &str) -> Result<disk_core::entry::FileEntry> {
     let colon = colon_mode(fs, path);
     let components = crate::cli::parse::split_image_path(path, colon);
     resolve_components(fs, &components)
@@ -416,13 +417,13 @@ pub fn resolve_path(fs: &mut dyn Filesystem, path: &str) -> Result<crate::fs::en
 pub fn resolve_components(
     fs: &mut dyn Filesystem,
     components: &[String],
-) -> Result<crate::fs::entry::FileEntry> {
+) -> Result<disk_core::entry::FileEntry> {
     match resolve_components_strict(fs, components) {
         Ok(entry) => Ok(entry),
         Err(strict_err) => {
             // An unescaped path (Commander's remote apply) may split a slash-bearing name.
             let parts: Vec<&str> = components.iter().map(String::as_str).collect();
-            match crate::fs::filesystem::resolve_components_joined(fs, &parts, false) {
+            match disk_core::filesystem::resolve_components_joined(fs, &parts, false) {
                 Ok(Some(entry)) => Ok(entry),
                 _ => Err(strict_err),
             }
@@ -433,7 +434,7 @@ pub fn resolve_components(
 fn resolve_components_strict(
     fs: &mut dyn Filesystem,
     components: &[String],
-) -> Result<crate::fs::entry::FileEntry> {
+) -> Result<disk_core::entry::FileEntry> {
     let fold_case = fs.case_insensitive_lookup();
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
     for component in components {
@@ -462,7 +463,7 @@ fn resolve_components_strict(
 pub fn resolve_parent(
     fs: &mut dyn Filesystem,
     path: &str,
-) -> Result<(crate::fs::entry::FileEntry, String)> {
+) -> Result<(disk_core::entry::FileEntry, String)> {
     let colon = colon_mode(fs, path);
     let (parent_components, name) = crate::cli::parse::split_image_parent(path, colon);
     let parent = resolve_components(fs, &parent_components)?;
@@ -472,8 +473,8 @@ pub fn resolve_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
-    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+    use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
     use std::io::Cursor;
 
     /// Build a blank HFS volume holding `/Oxyd 3.6/Oxyd b/w` — a folder with a
@@ -536,8 +537,8 @@ mod tests {
 
     #[test]
     fn ntfs_path_lookup_folds_case() {
-        use crate::fs::ntfs::NtfsFilesystem;
-        use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+        use fs_pc::ntfs::NtfsFilesystem;
+        use fs_pc::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
         use std::io::{Seek, SeekFrom};
 
         let mut cur = Cursor::new(Vec::new());

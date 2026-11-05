@@ -1,0 +1,32 @@
+# Build Disk through the partition window's actions: a plan that cannot be placed, a fixed one,
+# a second row, then the build onto an image file.
+name = "Restore: Build Disk plan and build"
+vm = "restore"
+
+[[step]]
+action = "BuildTarget"
+arg = "64M"
+expect = { build_rows = -1 }
+
+[[step]]
+action = "BuildDefine"
+expect = { build_rows = 1, build_layout = "ok" }
+
+[[step]]
+action = "BuildRowSize"
+arg = "0:900M"
+expect = { build_layout = "~Layout:" }
+
+[[step]]
+action = "BuildRowSize"
+arg = "0:16M"
+expect = { build_layout = "ok" }
+
+[[step]]
+action = "BuildAddRow"
+expect = { build_rows = 2, build_layout = "ok" }
+
+[[step]]
+action = "BuildApply"
+settle = true
+expect = { build_rows = -1, build_result = "ok", built_mbr = true }

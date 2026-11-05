@@ -17,13 +17,13 @@
 
 use std::io::{Cursor, Write};
 
-use rusty_backup::fs::apple_dos::{TYPE_B, TYPE_T};
-use rusty_backup::model::source_reader;
-use rusty_backup::partition::PartitionTable;
-use rusty_backup::rbformats::containers::sector_order::{
+use fs_apple2::apple_dos::{TYPE_B, TYPE_T};
+use fs_apple2::sector_order::{
     convert_do_to_po_bytes, APPLE_II_DISK_BYTES, APPLE_II_SECTORS_PER_TRACK, APPLE_II_SECTOR_BYTES,
     APPLE_II_TRACK_BYTES,
 };
+use rusty_backup::model::source_reader;
+use rusty_backup::partition::PartitionTable;
 
 /// Build a 140 KB DOS-order DOS 3.3 disk with:
 /// - VTOC at T17S0 (the standard fields + bitmap with the catalog +

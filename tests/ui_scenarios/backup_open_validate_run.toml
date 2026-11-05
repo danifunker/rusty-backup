@@ -1,0 +1,64 @@
+# The Backup tab's controller: open an image, walk Start's refusals, open and close the VHD
+# window, then run a zstd backup to the end and close the source.
+name = "Backup: open, validate, VHD window, run, close"
+vm = "backup"
+
+[[step]]
+expect = { source = "none", partitions = 0, error = "Select a source first." }
+
+[[step]]
+action = "OpenImage"
+arg = "$blank_fat"
+settle = true
+expect = { source = "image", partitions = 1, selected = 1, log = "~Source has 1 partition(s)" }
+
+[[step]]
+action = "Start"
+expect = { result = "Choose a destination folder.", error = "Choose a destination folder." }
+
+[[step]]
+action = "SetDestination"
+arg = "$out"
+
+[[step]]
+action = "SetName"
+arg = "b"
+
+[[step]]
+action = "SelectNone"
+expect = { selected = 0, error = "Select at least one partition." }
+
+[[step]]
+action = "SelectAll"
+expect = { selected = 1, error = "" }
+
+[[step]]
+action = "SetFormat"
+arg = "vhd"
+
+[[step]]
+action = "Start"
+expect = { vhd_open = true }
+
+[[step]]
+action = "VhdClose"
+expect = { vhd_open = false, result = "" }
+
+[[step]]
+action = "SetFormat"
+arg = "zstd"
+
+[[step]]
+action = "Start"
+settle = true
+expect = { result = "ok", output = true, log = "~Starting backup: " }
+
+[[step]]
+action = "Close"
+expect = { source = "none", partitions = 0 }
+
+[[step]]
+action = "OpenImage"
+arg = "/nonexistent/rb-ui-scenario/missing.img"
+settle = true
+expect = { source = "image", error = "Source not found." }

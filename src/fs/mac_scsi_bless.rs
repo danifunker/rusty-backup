@@ -35,8 +35,8 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::fs::filesystem::FilesystemError;
-use crate::partition::apm::{Apm, ApmPartitionEntry, DriverInfo};
+use disk_core::filesystem::FilesystemError;
+use part_tables::apm::{Apm, ApmPartitionEntry, DriverInfo};
 
 const APM_BLOCK_SIZE: u64 = 512;
 const APM_ENTRY_SIGNATURE: u16 = 0x504D;
@@ -447,7 +447,7 @@ fn insert_driver_entry(apm: &mut Apm, block: u32, blocks: u32, partition_type: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::apm::build_minimal_apm;
+    use part_tables::apm::build_minimal_apm;
     use std::io::Cursor;
 
     /// Build a driverless APM disk: partition map + one Apple_HFS at block 64.

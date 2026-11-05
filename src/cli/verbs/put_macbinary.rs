@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::resolve::resolve_partition_rw;
-use crate::fs::filesystem::{CreateFileOptions, ResourceForkSource};
+use disk_core::filesystem::{CreateFileOptions, ResourceForkSource};
 
 #[derive(Debug, Args)]
 pub struct PutMacBinaryArgs {
@@ -50,7 +50,7 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
     // I/II/III and returns both forks already sliced. It is lenient (no CRC
     // enforcement) — put-macbinary is an explicit "this is a MacBinary file"
     // command, so we don't gate it behind the stricter is_macbinary heuristic.
-    let hdr = crate::macarchive::macbinary::parse(&bytes)
+    let hdr = arc_mac::macbinary::parse(&bytes)
         .with_context(|| format!("parsing {}", args.host_file.display()))?;
     let data_fork = hdr.data_fork.clone();
     let rsrc_fork = hdr.resource_fork.clone();
@@ -190,14 +190,14 @@ mod tests {
         byteorder::BigEndian::write_u32(&mut hdr[83..87], 1);
         hdr[122] = 129;
         hdr[123] = 129;
-        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        let crc = fs_mac::resource_fork::macbinary_crc16(&hdr[0..124]);
         byteorder::BigEndian::write_u16(&mut hdr[124..126], crc);
         let mut buf = hdr.to_vec();
         buf.push(b'D'); // 1-byte data fork
         while buf.len() % 128 != 0 {
             buf.push(0);
         }
-        let f = crate::macarchive::macbinary::parse(&buf).unwrap();
+        let f = arc_mac::macbinary::parse(&buf).unwrap();
         assert_eq!(f.filename, "x");
         assert_eq!(&f.type_code, b"TEXT");
         assert_eq!(f.finder_flags, 0x2000);

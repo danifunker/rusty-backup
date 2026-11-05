@@ -147,3 +147,22 @@ fn new_hd_targets_present() {
         );
     }
 }
+
+#[cfg(feature = "optical")]
+#[test]
+fn optical_extract_flags_present() {
+    let h = help(&["optical", "extract"]);
+    for flag in &[
+        "--to",
+        "--tar",
+        "--path",
+        "--on-collision",
+        "--on-error",
+        "--resource-forks",
+    ] {
+        assert!(h.contains(flag), "`optical extract` missing {flag:?}:\n{h}");
+    }
+    for value in &["ask", "skip", "stop"] {
+        assert!(h.contains(value), "`--on-error` missing {value:?}:\n{h}");
+    }
+}

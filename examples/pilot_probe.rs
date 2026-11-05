@@ -13,9 +13,9 @@
 
 use std::fs;
 
-use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
-use rusty_backup::fs::alto::{open_pack, pdi};
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
+use fs_xerox::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
+use fs_xerox::alto::{open_pack, pdi};
 
 fn parse_gen(s: &str) -> Generation {
     match s.to_ascii_lowercase().as_str() {

@@ -5,6 +5,7 @@
 //! filenames so there's no ambiguity. The HFS native separator `:` is
 //! not accepted to keep the surface small and shell-friendly.
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use std::fs::OpenOptions;
@@ -13,9 +14,9 @@ use std::path::PathBuf;
 
 use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::cli::parse::{parse_size, pick_block_size, split_mac_path, ZeroReader};
-use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use crate::fs::hfs::{create_blank_hfs_sized, validate_hfs_integrity, HfsFilesystem};
-use crate::partition::apm::Apm;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_mac::hfs::{create_blank_hfs_sized, validate_hfs_integrity, HfsFilesystem};
+use part_tables::apm::Apm;
 
 #[derive(Subcommand, Debug)]
 pub enum HfsCommand {
@@ -274,7 +275,7 @@ pub(crate) fn cmd_new(
 
 /// Variant of [`cmd_new`] that exposes B-tree sizing overrides. When
 /// `catalog_bytes` / `extents_bytes` are `None`, falls back to
-/// [`crate::fs::hfs::default_btree_sizes`] (~0.5 % of volume, clump-
+/// [`fs_mac::hfs::default_btree_sizes`] (~0.5 % of volume, clump-
 /// aligned, 24-block floor) so steady-state file activity doesn't
 /// trigger B-tree extensions.
 pub(crate) fn cmd_new_sized(
@@ -299,7 +300,7 @@ pub(crate) fn cmd_new_sized(
         None => pick_block_size(size),
     };
 
-    let (default_cat, default_ext) = crate::fs::hfs::default_btree_sizes(size, block_size);
+    let (default_cat, default_ext) = fs_mac::hfs::default_btree_sizes(size, block_size);
     let catalog_bytes = catalog_bytes.unwrap_or(default_cat);
     let extents_bytes = extents_bytes.unwrap_or(default_ext);
 
@@ -352,7 +353,7 @@ pub(crate) fn cmd_new_hfsplus_sized(
         );
     }
 
-    let bytes = crate::fs::hfsplus::create_blank_hfsplus_sized(
+    let bytes = fs_mac::hfsplus::create_blank_hfsplus_sized(
         size,
         block_size,
         name,
@@ -462,7 +463,7 @@ pub(crate) fn cmd_put(
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let existing = crate::fs::filesystem::find_child(fold, &children, &name).cloned();
+    let existing = disk_core::filesystem::find_child(fold, &children, &name).cloned();
     if let Some(ref e) = existing {
         if !force {
             bail!("{mac_path} already exists (pass --force to overwrite)");
@@ -475,7 +476,7 @@ pub(crate) fn cmd_put(
     // dictionary (the same list the GUI's picker offers) name the file, and only
     // fall back to BINA/???? when it doesn't recognize the extension. This path
     // is HFS-only, so no filesystem-family gate is needed.
-    let auto_from_extension = crate::fs::hfs_common::type_creator_for_filename(&name).is_some();
+    let auto_from_extension = fs_mac::hfs_common::type_creator_for_filename(&name).is_some();
     let options = CreateFileOptions {
         type_code: type_code
             .map(str::to_string)
@@ -546,7 +547,7 @@ pub(crate) fn cmd_rm(image: PathBuf, mac_path: &str, partition: Option<u32>) -> 
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let entry = crate::fs::filesystem::find_child(fold, &children, &name)
+    let entry = disk_core::filesystem::find_child(fold, &children, &name)
         .cloned()
         .ok_or_else(|| anyhow!("not found: {mac_path}"))?;
     fs.delete_entry(&parent, &entry)
@@ -597,7 +598,7 @@ pub(crate) fn cmd_validate(image: PathBuf, partition: Option<u32>) -> Result<()>
 pub fn resolve_path<R: Read + Seek + Send>(
     fs: &mut HfsFilesystem<R>,
     path: &str,
-) -> Result<crate::fs::entry::FileEntry> {
+) -> Result<disk_core::entry::FileEntry> {
     // HFS reserves `:`, so a `:` in the path is always a separator (colon
     // grammar) and `/` is plain data; a plain `/`-path uses `\/` for a literal
     // slash. See `crate::cli::parse::split_image_path`.
@@ -608,7 +609,7 @@ pub fn resolve_path<R: Read + Seek + Send>(
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
-        let next = crate::fs::filesystem::find_child(fold, &children, component)
+        let next = disk_core::filesystem::find_child(fold, &children, component)
             .cloned()
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;

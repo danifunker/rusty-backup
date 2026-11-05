@@ -4,7 +4,7 @@
 //! two consequences worth handling in one place rather than three:
 //!
 //! * The old file's metadata is gone the instant it is deleted, so anything
-//!   worth keeping has to be captured first ([`super::attrs::PreservedMeta`]).
+//!   worth keeping has to be captured first ([`disk_core::attrs::PreservedMeta`]).
 //! * If the write fails after the delete, the original is gone and the
 //!   replacement is incomplete. On a config file being edited in place that is
 //!   the worst possible outcome.
@@ -20,9 +20,9 @@
 //! and Commander, and the TUI's import all need identical semantics, and
 //! `CONTRIBUTING.md` is explicit that one operation gets one implementation.
 
-use super::attrs::{preserved_meta, PreservedMeta};
-use super::entry::FileEntry;
-use super::filesystem::{CreateFileOptions, EditableFilesystem, FilesystemError};
+use disk_core::attrs::{preserved_meta, PreservedMeta};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, FilesystemError};
 
 /// What to do when the destination name is already taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -112,7 +112,7 @@ pub fn create_or_replace(
     } = policy;
     let fold_case = efs.case_insensitive_lookup();
     let siblings = efs.list_directory(parent)?;
-    let existing = crate::fs::copy::select_child(&siblings, fold_case, name).cloned();
+    let existing = disk_core::entry::select_child(&siblings, fold_case, name).cloned();
 
     let Some(existing) = existing else {
         let created = efs.create_file(parent, name, data, data_len, opts)?;
@@ -280,8 +280,8 @@ fn temp_name(taken: &[String], slot: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::fat::{create_blank_fat, FatFilesystem};
-    use crate::fs::filesystem::Filesystem;
+    use disk_core::filesystem::Filesystem;
+    use fs_pc::fat::{create_blank_fat, FatFilesystem};
     use std::io::Cursor;
 
     fn blank() -> FatFilesystem<Cursor<Vec<u8>>> {

@@ -9,7 +9,7 @@ use crate::cli::logging::log_stderr;
 #[cfg(feature = "remote")]
 use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::resolve_partition_rw;
-use crate::fs::filesystem::CreateDirectoryOptions;
+use disk_core::filesystem::CreateDirectoryOptions;
 
 #[derive(Debug, Args)]
 pub struct MkdirArgs {
@@ -66,7 +66,7 @@ pub fn run(args: MkdirArgs) -> Result<()> {
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
-    let already = crate::fs::filesystem::find_child(fold, &children, &name).is_some();
+    let already = disk_core::filesystem::find_child(fold, &children, &name).is_some();
     if already {
         bail!("{} already exists", args.path);
     }

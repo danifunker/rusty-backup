@@ -4,7 +4,7 @@
 //! the UI.
 //!
 //! The probe itself reads only ~16 KB (volume header + 2 catalog B-tree nodes)
-//! through `fs::hfsplus::probe_hfsplus_volume_label`, but for zstd-compressed
+//! through `fs_mac::hfsplus::probe_hfsplus_volume_label`, but for zstd-compressed
 //! backups the catalog can sit megabytes into the partition stream, so the
 //! work goes on a background thread and the GUI polls
 //! `Arc<Mutex<VolumeLabelStatus>>` like every other inspect-tab worker.
@@ -13,11 +13,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
-use crate::fs::hfsplus::probe_hfsplus_volume_label;
 use crate::fs::zstd_stream::{ZstdStreamCache, ZstdStreamReader};
 use crate::rbformats::chd::ChdReader;
+use fs_mac::hfsplus::probe_hfsplus_volume_label;
 
 /// Shared state between the GUI poll loop and the worker thread.
 pub struct VolumeLabelStatus {
@@ -77,7 +76,7 @@ pub struct VolumeLabelRequest {
 pub fn spawn(req: VolumeLabelRequest) -> Arc<Mutex<VolumeLabelStatus>> {
     let status = Arc::new(Mutex::new(VolumeLabelStatus::new(req.partition_index)));
     let status_thread = Arc::clone(&status);
-    thread::spawn(move || {
+    crate::model::worker::spawn_guarded(Arc::clone(&status), "volume labels", move || {
         let result = probe(req.source);
         if let Ok(mut s) = status_thread.lock() {
             match result {
@@ -86,6 +85,7 @@ pub fn spawn(req: VolumeLabelRequest) -> Arc<Mutex<VolumeLabelStatus>> {
             }
             s.finished = true;
         }
+        Ok(())
     });
     status
 }
@@ -116,3 +116,5 @@ fn probe(source: VolumeLabelSource) -> Result<Option<String>, String> {
         }
     }
 }
+
+crate::model::worker::finished_with_error!(VolumeLabelStatus);

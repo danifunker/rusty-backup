@@ -472,7 +472,7 @@ pub fn shrink_sgi_disk_to_chd(
     cancel_check: &impl Fn() -> bool,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<ShrinkSgiReport> {
-    use crate::partition::sgi::SgiVolumeHeader;
+    use part_tables::sgi::SgiVolumeHeader;
 
     // Path validation. See `feedback_path_resolution_for_destructive_ops`
     // in memory: this exact dance was missing in an earlier draft and a

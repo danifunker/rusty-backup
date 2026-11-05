@@ -8,19 +8,19 @@
 //! whole integration: `list_directory` / `write_file_to` /
 //! `write_resource_fork_to` are all the copy path needs.
 //!
-//! The archive is fully decoded in memory by [`crate::macarchive::extract`];
+//! The archive is fully decoded in memory by [`arc_mac::extract`];
 //! fork bytes are produced lazily per read via
-//! [`crate::macarchive::stuffit::decompress_fork`]. Volumes are tiny (a few MB
+//! [`arc_mac::stuffit::decompress_fork`]. Volumes are tiny (a few MB
 //! at most), so holding the decoded buffer is fine.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
-use crate::macarchive::extract;
-use crate::macarchive::stuffit::{decompress_fork, StuffItArchive};
+use arc_mac::extract;
+use arc_mac::stuffit::{decompress_fork, StuffItArchive};
+use disk_core::entry::FileEntry;
+use disk_core::filesystem::{Filesystem, FilesystemError};
 
 /// Sentinel `location` for a synthesized intermediate directory — one that has
 /// children but no explicit archive entry of its own. Such a node is never
@@ -147,7 +147,7 @@ fn to_file_entry(archive: &StuffItArchive, idx: usize) -> FileEntry {
     if e.is_dir {
         let mut fe = FileEntry::new_directory(e.name.clone(), path, idx as u64);
         fe.mac_dates = Some((e.create_date, e.mod_date, 0));
-        fe.modified = crate::fs::hfs_common::format_mac_date(e.mod_date);
+        fe.modified = fs_mac::hfs_common::format_mac_date(e.mod_date);
         fe
     } else {
         let size = e
@@ -161,7 +161,7 @@ fn to_file_entry(archive: &StuffItArchive, idx: usize) -> FileEntry {
         fe.finder_flags = Some(e.finder_flags);
         fe.resource_fork_size = e.rsrc.as_ref().map(|f| f.uncompressed_len as u64);
         fe.mac_dates = Some((e.create_date, e.mod_date, 0));
-        fe.modified = crate::fs::hfs_common::format_mac_date(e.mod_date);
+        fe.modified = fs_mac::hfs_common::format_mac_date(e.mod_date);
         fe
     }
 }
@@ -253,9 +253,7 @@ impl Filesystem for ArchiveFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macarchive::stuffit::{
-        build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-    };
+    use arc_mac::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
 
     fn file_node(
         name: &str,

@@ -1,0 +1,2 @@
+# Lint the app like the crates (rust-version 1.73): no fixes that need a newer std, e.g. `as_chunks`.
+msrv = "1.73"

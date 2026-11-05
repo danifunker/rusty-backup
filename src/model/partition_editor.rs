@@ -449,10 +449,46 @@ impl PartitionEditor {
     }
 }
 
+/// Write `edits` to the partition table of the image or device at `path`; meant to run as a job.
+/// Returns the engine's progress messages, and the error text when it failed.
+pub fn apply_to_source(
+    path: &std::path::Path,
+    is_device: bool,
+    table: &PartitionTable,
+    edits: &[PartitionTableEdit],
+    disk_size: u64,
+) -> (Vec<String>, Result<(), String>) {
+    let mut messages = Vec::new();
+    let result = if is_device {
+        match crate::os::open_target_for_writing(path) {
+            Ok(mut handle) => {
+                pt_editor::apply_edits(&mut handle.file, table, edits, disk_size, &mut |msg| {
+                    messages.push(msg.to_string())
+                })
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                pt_editor::apply_edits(&mut file, table, edits, disk_size, &mut |msg| {
+                    messages.push(msg.to_string())
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    };
+    (messages, result.map_err(|e| format!("{e:#}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition::mbr::Mbr;
+    use part_tables::mbr::Mbr;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -639,5 +675,40 @@ mod tests {
         editor.build_and_validate(&table);
         assert!(editor.errors.is_empty(), "errors: {:?}", editor.errors);
         assert_eq!(editor.edits.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use part_tables::mbr::{build_minimal_mbr, Mbr};
+
+    #[test]
+    fn apply_to_source_writes_an_image_and_reports_a_missing_one() {
+        let mbr_bytes = build_minimal_mbr(0x1234_5678, &[(0x0C, 2048, 1000, true)], 255, 63);
+        let mut disk = vec![0u8; 100_000 * 512];
+        disk[..512].copy_from_slice(&mbr_bytes);
+        let img = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(img.path(), &disk).unwrap();
+        let table = PartitionTable::Mbr(Mbr::parse(&mbr_bytes).unwrap());
+        let edits = vec![PartitionTableEdit::ResizeEntry {
+            index: 0,
+            new_size_bytes: 2000 * 512,
+        }];
+
+        let (_messages, result) = apply_to_source(img.path(), false, &table, &edits, 100_000 * 512);
+        assert_eq!(result, Ok(()));
+        let written = std::fs::read(img.path()).unwrap();
+        let mbr = Mbr::parse(written[..512].try_into().unwrap()).unwrap();
+        assert_eq!(mbr.entries[0].total_sectors, 2000);
+
+        let (_, missing) = apply_to_source(
+            std::path::Path::new("/nonexistent/disk.img"),
+            false,
+            &table,
+            &edits,
+            100_000 * 512,
+        );
+        assert!(missing.is_err());
     }
 }

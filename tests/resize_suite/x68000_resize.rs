@@ -29,17 +29,17 @@ use std::io::{Cursor, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
+use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use fs_pc::fat::create_blank_fat;
+use fs_pc::human68k::Human68kFilesystem;
+use part_tables::x68k::{
+    X68kEntry, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_MAGIC, X68K_TABLE_OFFSET,
+};
+use part_tables::PartitionSizeOverride;
 use rusty_backup::backup::metadata::{
     AlignmentMetadata, BackupLayout, BackupMetadata, PartitionMetadata,
 };
-use rusty_backup::fs::fat::create_blank_fat;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use rusty_backup::fs::human68k::Human68kFilesystem;
 use rusty_backup::fs::resize_filesystem_for;
-use rusty_backup::partition::x68k::{
-    X68kEntry, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_MAGIC, X68K_TABLE_OFFSET,
-};
-use rusty_backup::partition::PartitionSizeOverride;
 use rusty_backup::rbformats::reconstruct_disk_from_backup;
 
 /// First sector of the partition body. 64 × 512 = byte 32768 — the
@@ -366,7 +366,7 @@ fn x68k_disk_round_trips_through_restore_with_resize() {
 ///   - Human68k opens at byte 8448 and the seed file survives.
 #[test]
 fn x68k_sasi_256byte_partition_round_trips_at_true_byte_offset() {
-    use rusty_backup::partition::x68k::X68K_TABLE_OFFSET_SASI;
+    use part_tables::x68k::X68K_TABLE_OFFSET_SASI;
 
     const SASI_SECTOR: u64 = 256;
     const START_SECTOR: u64 = 33; // 33 * 256 = 8448, NOT 512-aligned

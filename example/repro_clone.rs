@@ -1,5 +1,6 @@
-use rusty_backup::fs::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
-use rusty_backup::fs::hfs_clone::{clone_hfs_volume, emit_apm_disk_with_hfs};
+use fs_mac::hfs::{create_blank_hfs_sized, HfsFilesystem, HFS_MAX_BTREE_FILE_SIZE};
+use rusty_backup::fs::hfs_clone::{emit_apm_disk_with_hfs};
+use fs_mac::hfs_clone::clone_hfs_volume;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Seek};
 

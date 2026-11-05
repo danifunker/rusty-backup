@@ -5,7 +5,7 @@
 //!
 //! - **HP LIF** (HP-UX install DVDs, NetBSD/hppa CDs): a LIF volume at byte 0 whose
 //!   directory names the PA-RISC boot programs (`ISL`, `HPUX`, `CDBOOT`, ...). Read
-//!   with [`crate::fs::lif`].
+//!   with [`fs_8bit::lif`].
 //! - **PReP boot partitions** (AIX CHRP diagnostics CDs, OS/2 Warp for PowerPC): an
 //!   MBR at byte 0 whose type-`0x41` entry holds the PowerPC boot image. It has no
 //!   filesystem, so it is offered as one file, the partition's bytes.
@@ -65,7 +65,7 @@ pub fn detect(path: &Path) -> Vec<BootArea> {
 /// [`detect`] over an already-open image.
 pub fn detect_in<R: Read + Seek>(r: &mut R) -> Vec<BootArea> {
     let mut areas = Vec::new();
-    if let Some(vol) = crate::fs::lif::parse_lif(r, 0) {
+    if let Some(vol) = fs_8bit::lif::parse_lif(r, 0) {
         let label = if vol.label.is_empty() {
             "LIF boot area".to_string()
         } else {

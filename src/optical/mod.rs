@@ -1,8 +1,4 @@
 pub mod boot_area;
-// `browse_view` is an egui widget; it only exists in GUI builds. The CLI/mini
-// build enables `optical` without `gui`, so gate it to keep that build green.
-#[cfg(feature = "gui")]
-pub mod browse_view;
 // CD-DA playback for the Optical tab's in-app audio player. `audio` implies
 // `chd` + `optical`, so the libchdman_rs / cd-da-reader imports always resolve.
 #[cfg(feature = "audio")]
@@ -79,7 +75,7 @@ pub use source::{LocalCdReader, OpticalSource};
 /// which extraction writes as zero dates just as before.
 pub fn mac_dates_from(
     ts: &Option<opticaldiscs::FileTimestamps>,
-) -> crate::fs::resource_fork::MacFileDates {
+) -> fs_mac::resource_fork::MacFileDates {
     use opticaldiscs::FileTimestamps as T;
     let (created, modified) = match ts {
         Some(T::Hfs {
@@ -92,7 +88,7 @@ pub fn mac_dates_from(
         }) => (*created, *content_modified),
         _ => (0, 0),
     };
-    crate::fs::resource_fork::MacFileDates { created, modified }
+    fs_mac::resource_fork::MacFileDates { created, modified }
 }
 
 /// Format a game disc's identity into a single ASCII line for logs and UI

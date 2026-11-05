@@ -4,16 +4,15 @@
 //!
 //! usage: gho_ntfs_used <path-to.gho>
 
-use rusty_backup::fs::filesystem::Filesystem;
+use disk_core::filesystem::Filesystem;
 
 fn main() {
     env_logger::init();
     let path = std::env::args()
         .nth(1)
         .expect("usage: gho_ntfs_used <path>");
-    let reader =
-        rusty_backup::rbformats::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
-    let mut fs = rusty_backup::fs::ntfs::NtfsFilesystem::open(reader, 0).unwrap();
+    let reader = dsk_ghost::gho::GhoReader::open(std::path::Path::new(&path)).unwrap();
+    let mut fs = fs_pc::ntfs::NtfsFilesystem::open(reader, 0).unwrap();
     fs.ensure_used_bytes();
     let total = fs.total_size();
     let used = fs.used_size();

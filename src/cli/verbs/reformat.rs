@@ -76,7 +76,7 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         None => crate::cli::parse::pick_block_size(ctx.size),
     };
 
-    let (default_cat, default_ext) = crate::fs::hfs::default_btree_sizes(ctx.size, block_size);
+    let (default_cat, default_ext) = fs_mac::hfs::default_btree_sizes(ctx.size, block_size);
     let catalog_bytes = args
         .catalog_size
         .as_deref()
@@ -92,7 +92,7 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         .map(|v| v.min(u32::MAX as u64) as u32)
         .unwrap_or(default_ext);
 
-    let volume = crate::fs::hfs::create_blank_hfs_sized(
+    let volume = fs_mac::hfs::create_blank_hfs_sized(
         ctx.size,
         block_size,
         &args.name,

@@ -64,6 +64,7 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
         PartitionTable::Mbr(mbr) => extract_chs_geometry(mbr),
         PartitionTable::Gpt { protective_mbr, .. } => extract_chs_geometry(protective_mbr),
         PartitionTable::Apm(_)
+        | PartitionTable::ApmTs(_)
         | PartitionTable::Rdb(_)
         | PartitionTable::Sgi(_)
         | PartitionTable::SgiDkLabel(_)

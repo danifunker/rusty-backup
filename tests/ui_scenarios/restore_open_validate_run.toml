@@ -1,0 +1,52 @@
+# The Restore tab's controller: refuse an empty folder, load a backup, walk Start's refusals,
+# confirm, restore to an image file byte for byte, and close the backup.
+name = "Restore: open, validate, confirm, run, close"
+vm = "restore"
+
+[[step]]
+expect = { backup = false, error = "Choose a backup folder." }
+
+[[step]]
+action = "OpenBackup"
+arg = "$empty"
+settle = true
+expect = { backup = false, load_error = "No backup found (metadata.json or Clonezilla image)" }
+
+[[step]]
+action = "OpenBackup"
+arg = "$backup"
+settle = true
+expect = { backup = true, partitions = 1, load_error = "", log = "~Loaded backup: 1 partition(s)" }
+
+[[step]]
+action = "Start"
+effects = []
+expect = { result = "Choose a target device.", error = "Choose a target device." }
+
+[[step]]
+action = "SetTargetIsDevice"
+arg = false
+expect = { error = "Enter a target image path." }
+
+[[step]]
+action = "SetTargetImage"
+arg = "$out"
+expect = { error = "" }
+
+[[step]]
+action = "SetSize"
+arg = "original"
+
+[[step]]
+action = "Start"
+effects = ["Confirm"]
+expect = { result = "" }
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok", output = true, log = "~Restore completed successfully." }
+
+[[step]]
+action = "ClearBackup"
+expect = { backup = false, partitions = 0 }

@@ -16,8 +16,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use anyhow::{bail, Context, Result};
 
 use crate::fs::patch_hidden_sectors_for;
-use crate::partition::gpt::{build_minimal_gpt, Gpt, Guid};
-use crate::partition::mbr::build_minimal_mbr;
+use part_tables::gpt::{build_minimal_gpt, Gpt, Guid};
+use part_tables::mbr::build_minimal_mbr;
 
 const SECTOR_SIZE: u64 = 512;
 const STREAM_CHUNK: usize = 1024 * 1024;
@@ -211,7 +211,7 @@ fn write_table<W: Read + Write + Seek>(
             // A bootable partition needs MBR boot code to chainload it;
             // build_minimal_mbr only writes the partition table.
             if *bootable {
-                crate::partition::mbr::install_mbr_boot_code(&mut mbr);
+                part_tables::mbr::install_mbr_boot_code(&mut mbr);
             }
             target.write_all(&mbr).context("writing synthetic MBR")?;
             log_cb(&format!(
@@ -729,7 +729,10 @@ pub fn suggest_wrap_params(
 /// can override in the UI.
 pub fn mbr_type_byte_for_fs(fs_hint: &str) -> u8 {
     let lower = fs_hint.to_ascii_lowercase();
-    if lower.contains("ntfs") || lower.contains("exfat") {
+    // "squashfs" contains "hfs", so it is matched before the HFS rung.
+    if lower.contains("squashfs") {
+        0x83
+    } else if lower.contains("ntfs") || lower.contains("exfat") {
         0x07
     } else if lower.contains("fat32") {
         0x0C
@@ -750,9 +753,12 @@ pub fn mbr_type_byte_for_fs(fs_hint: &str) -> u8 {
 
 fn gpt_guid_for_fs(fs_hint: &str) -> Guid {
     let lower = fs_hint.to_ascii_lowercase();
-    let s = if lower.contains("hfs") {
+    let s = if lower.contains("hfs") && !lower.contains("squashfs") {
         GPT_APPLE_HFS
-    } else if lower.contains("ext") || lower.contains("linux") || lower.contains("xfs") {
+    } else if ["ext", "linux", "xfs", "squashfs"]
+        .iter()
+        .any(|k| lower.contains(*k))
+    {
         GPT_LINUX_FILESYSTEM
     } else {
         GPT_MICROSOFT_BASIC_DATA
@@ -1247,6 +1253,12 @@ mod tests {
         assert_eq!(mbr_type_byte_for_fs("Linux"), 0x83);
         assert_eq!(mbr_type_byte_for_fs("xfs"), 0x83);
         assert_eq!(mbr_type_byte_for_fs("HFS+"), 0xAF);
+        assert_eq!(
+            mbr_type_byte_for_fs("squashfs"),
+            0x83,
+            "squashfs contains hfs"
+        );
+        assert_eq!(gpt_guid_for_fs("squashfs"), gpt_guid_for_fs("ext4"));
         assert_eq!(mbr_type_byte_for_fs("???"), 0x07);
     }
 }

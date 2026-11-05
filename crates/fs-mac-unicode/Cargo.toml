@@ -1,0 +1,18 @@
+[package]
+name = "fs-mac-unicode"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+license = "GPL-2.0-only"
+authors = ["Dani Sarfati <dani@funkervogt.com>"]
+description = "HFS and HFS+ catalog-name ordering: Apple's Unicode case-fold and decomposition tables and the Mac Roman sort order"
+repository = "https://github.com/danifunker/rusty-backup"
+readme = "README.md"
+keywords = ["hfs", "hfsplus", "unicode", "apple", "filesystem"]
+categories = ["filesystem", "text-processing"]
+
+[features]
+# No-op: nothing here needs the polyfill, but every crate takes the flag so the manifests can forward it uniformly.
+rust173-polyfill = []
+
+[dependencies]

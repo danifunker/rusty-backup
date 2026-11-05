@@ -1,0 +1,31 @@
+# Settings: the form loads config, Save writes it, Clear Recent Files empties every list.
+name = "Settings: save and clear recent files"
+vm = "settings"
+
+[[step]]
+action = "Open"
+expect = { open = true, update_check = true, recent_count = 2, status = "", clear_label = "Clear Recent Files (2)" }
+
+[[step]]
+action = "SetUpdateCheck"
+arg = false
+
+[[step]]
+action = "SetRepoUrl"
+arg = "https://github.com/owner/repo"
+
+[[step]]
+action = "Save"
+expect = { status = "~Settings saved successfully!" }
+
+[[step]]
+action = "ClearRecent"
+expect = { recent_count = 0, status = "Cleared 2 recent files.", clear_label = "Clear Recent Files" }
+
+[[step]]
+action = "Close"
+expect = { open = false }
+
+[[step]]
+action = "Open"
+expect = { update_check = false, repo_url = "https://github.com/owner/repo", recent_count = 0 }

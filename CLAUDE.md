@@ -8,8 +8,16 @@ Rusty Backup is a cross-platform GUI application (Rust, egui/eframe) for backing
 
 Licensed under AGPL-3.0. The full specification lives in `PROJECT-SPEC.md`.
 
-## Coding Style
-Read CONTRIBUTING.md prior to making code changes in this repository.
+## Architecture policy (mandatory)
+
+**Before adding or changing any code, read [CONTRIBUTING.md § Architecture policy (MVC)](CONTRIBUTING.md#architecture-policy-mvc--read-before-adding-any-code) in full, every session.** It is binding. In short:
+
+- **Model** (`crates/*`, `src/{fs,partition,rbformats,backup,restore,os,optical,...}`, `src/model/`) owns formats, domain operations and persistence. No UI.
+- **Controller** (`src/controller/`) owns what the user is doing: state, `Action`s in, `Effect`s out, validation rules, key bindings, widget ids, jobs. One controller per task, shared by the GUI, the TUI and the CLI. No toolkit, no raw threads.
+- **View** (`src/gui/`, the TUI, `src/cli/` verbs, future native shells written in Rust) renders, maps input to actions through the controller's key map, and fulfils effects. No domain logic, no direct model imports, no threads.
+- Slow work is a `model::job::Job`; a crate fix ships with a version bump and a publish; regression runs per change and in full at milestones.
+
+The rest of CONTRIBUTING.md (coding style, comments, the Rust 1.73 floor) applies too.
 
 ## Build Commands
 
@@ -18,7 +26,7 @@ cargo build                    # Debug build (version: x.y.z-dev)
 cargo build --release          # Release build (version from Cargo.toml or RELEASE_VERSION env)
 cargo run                      # Run (debug)
 cargo run --release            # Run (release)
-cargo test                     # All tests
+cargo test --workspace         # All tests (a bare `cargo test` skips crates/)
 cargo test test_name           # Single test
 cargo test --lib               # Unit tests only
 cargo test --test '*'          # Integration tests only
@@ -59,6 +67,7 @@ only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
 - GitHub Actions workflow: `.github/workflows/release.yml`
 - Builds for: Windows (x86/x64), macOS (arm64/x64), Linux (x64 AppImage)
 - Auto-release on push to main/master with generated version tag
+- Feature branches can build a subset: put `[ci: sol9,linux]` (or `[ci: none]`) in the head commit message, or a comma list in `.github/ci-targets` on the branch. main/master always build everything, and tag pushes don't run this workflow. Target names and groups are listed at the `plan` job in `release.yml`.
 - Artifacts: ZIP (Windows), DMG (macOS), AppImage (Linux)
 
 ### Update Checking
@@ -70,6 +79,8 @@ only: `CARGO_PROFILE_DEV_DEBUG=2 cargo build` (or `cargo test`). Never put
 ## Architecture
 
 The codebase separates GUI from core logic with these major modules:
+
+- **`crates/`** - The reusable format code, split out of the app as a Cargo workspace (`docs/crate_split_plan.md`): `disk-core` (the `Filesystem` trait, `FileEntry`, shared helpers, 1.73 shims), the filesystem families (`fs-*`), `part-tables`, and the disk-image containers (`dsk-*`). Each is MIT unless its code is derived from GPL / LGPL / BSD-4 sources (`fs-xfs`, `fs-hpfs`, `fs-adfs`, `fs-mac-unicode`, `fs-amiga`); see `docs/license_audit.md`. The app imports them by crate path (`fs_unix::ufs`, `part_tables::mbr`, …); the old `crate::fs::*` re-export shims are gone (Step 7). New format code goes into a crate, and app glue (dispatch, backup / restore, resize, builders) stays in `src/`. App-side tests of moved code (dispatch, detection) live in `src/{fs,partition,rbformats}/moved_tests.rs`. `scripts/test-crates-msrv.sh` runs every crate's tests on Rust 1.73.
 
 - **`gui/`** - egui/eframe UI layer with tabs (Backup, Restore, Inspect), progress indicators, log panel, version display, and update notifications. Long-running disk operations run on separate threads to keep the UI responsive.
 - **`partition/`** - MBR and GPT partition table parsing, export, alignment detection, `PartitionSizeOverride` for resize/restore, and `patch_mbr_entries`/`lba_to_chs` for MBR patching.
@@ -121,23 +132,23 @@ backed up whole with their head region verbatim and resized on restore by
 
 Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the three filesystems that matter on Classic Amiga hardware (AFFS, PFS3, SFS) are first-class:
 
-- **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`src/partition/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
+- **Partition table**: `PartitionTable::Rdb` parses RDSK + PART chain (`crates/part-tables/src/rdb.rs`). Each `PartitionInfo` carries the 4-byte `DosType` as `partition_type_string` (e.g. `"DOS\\3"`, `"PFS\\3"`, `"SFS\\0"`).
 - **Filesystem dispatch**: extend the `partition_type_string` matchers in `src/fs/mod.rs` (`fs_name_for`, `is_layout_preserving_fs`, `is_expensive_minimum`, `open_filesystem_by_string`, `open_editable_filesystem_by_string`, `compact_partition_reader_by_string`). Helpers `is_amiga_dos_type` / `is_amiga_pfs3_type` / `is_amiga_sfs_type` group the relevant strings.
 - **Filesystems**:
-  - **AFFS** (`src/fs/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
-  - **PFS3** (`src/fs/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
-  - **SFS** (`src/fs/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
+  - **AFFS** (`crates/fs-amiga/src/affs.rs`) — DOS\0..DOS\7, read + edit + Disk Validator fsck. Files inherit `amiga_protection` (offset 0x140) and `amiga_comment` (BSTR at 0x148) via `CreateFileOptions`; the same fields surface on `FileEntry` for the browse view.
+  - **PFS3** (`crates/fs-amiga/src/pfs3.rs`) — PFS\3, PDS\3, muFS. Read + edit (allocator + EditableFilesystem with snapshot/rollback). `create_blank_pfs3` formats a blank volume for tests.
+  - **SFS** (`crates/fs-amiga/src/sfs.rs`) — SFS\0, SFS\2. Read + edit at any B-tree depth: the extent B-tree splits, promotes a new root and prunes emptied nodes, and the object-node tree is walked rather than assumed to be one leaf. *Growing* the object-node tree is still unimplemented, so a volume reports DiskFull once every existing leaf is full. Journal blocks (TRST/TRFA) are not maintained — we use sync-boundary atomicity instead. `create_blank_sfs` formats a blank volume.
 - **Bitmap convention**: All three filesystems use **set bit = free** (opposite of most other FS we deal with). Easy bug source.
 - **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
-- **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.
+- **`.adz` / `.hdz`**: browsing, Inspect and Commander open them as containers (`model::source_reader::open_read` peels the gzip, and edits re-gzip in place), while Backup / Restore decode them to a flat tempfile through `model::image_prep::prepare_disk_image_path`, whose `TempDir` the caller keeps alive.
 
-Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives under `src/fs/{affs,pfs3,sfs}.rs` and follows the existing patterns there.
+Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives in the `fs-amiga` crate (`crates/fs-amiga/src/{affs,pfs3,sfs}.rs`; `src/fs/` keeps re-export shims) and follows the existing patterns there.
 
 ### BasiliskII HFV Support
 
 `.hfv` / `.HFV` files are flat, partition-less raw images of a single **classic HFS** volume (boot blocks at sector 0, MDB at byte 1024, no MBR/GPT/APM) used by the BasiliskII / SheepShaver 68k Mac emulators. They flow through the existing **superfloppy** path: `partition::detect_superfloppy` finds the MDB at offset 1024 → `PartitionTable::None { fs_hint: "HFS" }` → `open_filesystem(.., 0, 0, None)` auto-detects HFS at offset 0. So read / inspect / browse / fsck / edit / backup / restore all work with no HFV-specific code — only the file-picker extensions and a few superfloppy-HFS gating helpers (`is_superfloppy_hfs`) needed touching.
 
-The **write** side lives in `src/fs/hfv.rs`, the single source of truth for the HFV limits: **classic HFS only** (never HFS+) and **≤ 2047 MB** (the 2 GiB signed-32-bit boundary classic Mac OS won't cross). `build_blank_hfv` / `clone_into_hfv` produce a flat HFS image with **no** APM wrapper (an HFV is the bare volume). Creation is `rb-cli new --fs hfv`; conversion/resize to HFV is `rb-cli expand --to-hfv` (and the GUI "Expand HFS Volume…" dialog's "Flat HFV" output mode), which reuse the HFS clone path and skip `emit_apm_disk_with_hfs`.
+The **write** side lives in `crates/fs-mac/src/hfv.rs` (the `fs-mac` crate), the single source of truth for the HFV limits: **classic HFS only** (never HFS+) and **≤ 2047 MB** (the 2 GiB signed-32-bit boundary classic Mac OS won't cross). `build_blank_hfv` / `clone_into_hfv` produce a flat HFS image with **no** APM wrapper (an HFV is the bare volume). Creation is `rb-cli new --fs hfv`; conversion/resize to HFV is `rb-cli expand --to-hfv` (and the GUI "Expand HFS Volume…" dialog's "Flat HFV" output mode), which reuse the HFS clone path and skip `emit_apm_disk_with_hfs`.
 
 ### Platform-Specific Concerns
 
@@ -152,15 +163,29 @@ All OS-specific code lives in `src/os/`:
 ## Development Guidelines
 
 - Separate business logic from GUI code; core modules should be independently testable.
-- **GUI / CLI feature parity.** When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. Check `rb-cli --help` and `docs/cli-reference.md` for the canonical grammar before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
-- **Shared business logic between GUI and CLI.** When implementing a feature, put the logic in a core module (e.g. `src/backup/`, `src/fs/`, `src/model/`) and have both `src/gui/` and `src/cli.rs` call into it. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules.
+- **GUI / CLI feature parity** (the architecture policy above governs; this is the CLI angle). When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. Check `rb-cli --help` and `docs/cli-reference.md` for the canonical grammar before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
+- **Shared business logic between GUI and CLI.** Per the architecture policy, logic lives in the model and the task's controller (`src/controller/`), and the GUI, TUI and CLI all drive that same controller. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules.
 - Use streaming I/O with large blocks (64KB-1MB chunks) for disk operations; never load entire partitions into RAM.
 - Disk I/O must be sector-aligned (512 bytes or 4KB).
 - Disable UI controls during active operations to prevent conflicts.
 - Use `Result<T>` and `?` for error propagation throughout.
-- **Engine code (`src/`) must compile on Rust 1.73.** The vintage macOS-10.7 / Windows-7 build (`rb-cli-vintage/`) reuses these sources on a pinned 1.73 toolchain, so no std API newer than 1.73 may be used in `src/`. Your modern `cargo build` will NOT catch a violation — and clippy's autofixes (`is_multiple_of`, `io::Error::other`, `iter::repeat_n`) all postdate 1.73, so accepting one silently breaks the vintage build. Route through the shims: `crate::compat::io_other` / `crate::compat::repeat_n` (always-compiled, `#[cfg]`-split) and the `crate::rust173_compat` extension traits (`is_multiple_of`, `is_none_or`, imported under `#[cfg(feature = "rust173-polyfill")]`). `div_ceil`/`next_multiple_of` (1.73) and `is_some_and` (1.70) are safe. Full details + the verify command are in CONTRIBUTING.md § "Rust 1.73 floor for engine code".
+- **Engine code (`src/` and `crates/`) must compile on Rust 1.73.** `scripts/test-crates-msrv.sh` runs every crate's tests on 1.73. The vintage macOS-10.7 / Windows-7 build (`rb-cli-vintage/`) reuses these sources on a pinned 1.73 toolchain, so no std API newer than 1.73 may be used in `src/`. Your modern `cargo build` will NOT catch a violation — and clippy's autofixes (`is_multiple_of`, `io::Error::other`, `iter::repeat_n`) all postdate 1.73, so accepting one silently breaks the vintage build. Route through the shims: `crate::compat::io_other` / `crate::compat::repeat_n` (always-compiled, `#[cfg]`-split) and the `crate::rust173_compat` extension traits (`is_multiple_of`, `is_none_or`, imported under `#[cfg(feature = "rust173-polyfill")]`). `div_ceil`/`next_multiple_of` (1.73) and `is_some_and` (1.70) are safe. Full details + the verify command are in CONTRIBUTING.md § "Rust 1.73 floor for engine code".
 - **Comments in `.rs` files are one line — two at the absolute most, never three or more.** This covers inline `//` and doc `///` alike. If the explanation needs more room it is documentation, not a comment: put it in the module's `//!` header, `src/fs/README.md`, `src/rbformats/README.md`, or a `docs/` page and point at it from the one-line comment. Say *why*, not what. Existing multi-line blocks are grandfathered — don't retrofit files you aren't otherwise touching, but never add new ones. See CONTRIBUTING.md § "Comments".
 - **No Unicode glyphs in UI text or log messages.** The default egui font does not include emoji or symbol glyphs (e.g. `✓ ✗ ⚠ ← → • ✖ ℹ`), so they render as blank boxes on the user's screen. Use plain ASCII alternatives instead — `OK`, `Skipped`, `Warning`, `Back`, `->`, `-`, `X`, `Info:` — for log lines, button labels, dialog text, and any other user-visible string. The only exception is content read directly from a filesystem (e.g. symlink target arrows in the optical browse view), which we render verbatim.
+
+### Feature fan-out (mandatory)
+
+Every feature reaches every front-end and build target by default. Before writing a user-facing feature:
+
+1. **Put the logic in the engine, `src/model/` or a `src/controller/` view-model, never in a shell** (`src/gui/`, the TUI, future `frontends/`). Slow work runs as a `model::job::Job`, so every shell gets the same wait state, cancel and panic guard.
+2. **Read [docs/platform_matrix.md](docs/platform_matrix.md)** and decide, per row, whether the feature works there.
+3. **Handle every new `Action` / `Effect` in every shell.** Shells match them with no `_` arm, so the compiler lists the ones you missed.
+4. **Check each target's constraints:** the Rust 1.73 floor for engine, model and vm code; mrustc gaps (no proc-macros, no inline asm) for Solaris 9 and PowerPC; slim builds without `chd`, `optical` or `crypto`.
+5. **Where it can't work, say so** in the matrix row's Limits column, with the reason.
+6. **Add a view-model scenario** under `tests/ui_scenarios/` (runner: `tests/ui_scenarios.rs`).
+7. **Extend the CLI** if the feature is scriptable (the parity rule above).
+
+`scripts/check-boundaries.sh` reports shell code that reaches past the view-models; `scripts/check-platform-matrix.py` keeps the matrix in step with CI's targets. Both run in CI.
 
 ### Pre-commit documentation sync
 
@@ -189,5 +214,7 @@ The quick checklist when finishing a feature:
 - [ ] If yes — README Image-formats / Filesystems / MiSTer-cores table updated?
 - [ ] If yes — `docs/full_MiSTer_support_status.md` intro + per-core matrix walked?
 - [ ] If a new picker-visible file extension — `DISK_IMAGE_EXTS` updated + regression test extended?
+- [ ] Feature fan-out walked: every shell handles the new actions, and `docs/platform_matrix.md` notes any target it can't reach?
+- [ ] A new build target or CI job — row added to `docs/platform_matrix.md`?
 
 If the answer to all four is "no, nothing user-visible changed," commit as normal. Otherwise the doc / picker updates land in the same commit as the code change so reviewers see the intent.
