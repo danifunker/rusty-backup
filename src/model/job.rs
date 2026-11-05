@@ -18,7 +18,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -567,7 +567,8 @@ struct Entry {
 #[derive(Clone, Default)]
 pub struct JobRegistry {
     entries: Arc<Mutex<Vec<Entry>>>,
-    next_id: Arc<AtomicU64>,
+    // AtomicUsize: 32-bit PowerPC has no 64-bit atomics.
+    next_id: Arc<AtomicUsize>,
 }
 
 impl JobRegistry {
@@ -584,7 +585,7 @@ impl JobRegistry {
         body: impl FnOnce(&JobCtx) -> anyhow::Result<R> + Send + 'static,
     ) -> Result<Job<R>, Busy> {
         let label = label.into();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         {
             let mut entries = lock_status(&self.entries);
             for r in &resources {
@@ -632,7 +633,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    struct CountWakes(AtomicU64);
+    struct CountWakes(AtomicUsize);
 
     impl Notify for CountWakes {
         fn wake(&self) {
@@ -739,7 +740,7 @@ mod tests {
 
     #[test]
     fn phase_and_progress_show_in_the_snapshot_and_wake_the_shell() {
-        let wakes = Arc::new(CountWakes(AtomicU64::new(0)));
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
         let (go, wait) = mpsc::channel::<()>();
         let (seen, check) = mpsc::channel::<()>();
         let job = Job::spawn("copy", wakes.clone() as Arc<dyn Notify>, move |ctx| {
@@ -789,7 +790,7 @@ mod tests {
 
     #[test]
     fn progress_wakes_are_throttled() {
-        let wakes = Arc::new(CountWakes(AtomicU64::new(0)));
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
         let job = Job::spawn("tight", wakes.clone() as Arc<dyn Notify>, |ctx| {
             for i in 0..10_000u64 {
                 ctx.set_bytes(i, 10_000);
