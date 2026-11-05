@@ -622,8 +622,8 @@ pub fn format_into<W: Write + Seek>(
         }),
         FsKind::Os9 => {
             let name = sanitize_os9_volume_name(label);
-            in_ram(w, "OS-9", &name, || {
-                Ok(fs_8bit::os9::create_blank_os9(&name)?)
+            in_ram(w, "OS-9", name.as_str(), || {
+                Ok(fs_8bit::os9::create_blank_os9(name.as_str())?)
             })
         }
         FsKind::Cpm => {
@@ -770,7 +770,7 @@ fn minix<W: Write + Seek>(
     size: u64,
     version: fs_unix::minix::MinixVersion,
 ) -> Result<Formatted> {
-    in_ram(w, &format!("Minix {version:?}"), "", || {
+    in_ram(w, format!("Minix {version:?}").as_str(), "", || {
         fs_unix::minix::create_blank_minix(size, version)
             .map_err(|e| anyhow!("formatting Minix: {e}"))
     })

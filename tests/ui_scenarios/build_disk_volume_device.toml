@@ -1,0 +1,46 @@
+# A bare FAT volume onto a device (a file standing in for an SD card full of old data): the size
+# follows the device, the typed path gates the build, and the whole card is written.
+name = "Build Disk: a volume onto a device"
+vm = "build_disk"
+
+[[step]]
+action = "SetKind"
+arg = "volume"
+expect = { steps = "Kind,Output,Disk,Options,Review,Build" }
+
+[[step]]
+action = "VolumeFs"
+arg = "fat"
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "OutputDevice"
+arg = "32M"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk", blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Options" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", blocked = "~Type the device path" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review" }
+
+[[step]]
+action = "TypeDevicePath"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { result = "ok", opens = 1, tail_zero = true }

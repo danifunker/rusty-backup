@@ -1,18 +1,17 @@
-//! The partition window, a shell over `controller::partition_edit`, for two jobs.
+//! The partition window, a shell over `controller::partition_edit`.
 //!
-//! [`show_table`] is the Inspect tab's "Edit Partition Table" window; [`show_build`] is the
-//! Restore tab's Build Disk window (a table-type picker and a source image per row). They share the
-//! type field, the layout bars and the button row. Each draws the controller's plain view and
-//! returns the edits the user made this frame plus what the host should do next; the host sends
-//! the edits to its controller (`InspectAction::Table`, `RestoreAction::Build`). Both bars place
-//! partitions at their real byte offsets with free space between, so they answer "where on the
-//! disk does this land". See docs/phase2_commander_plan.md § "Slice 14b".
+//! [`show_table`] is the Inspect tab's "Edit Partition Table" window. It draws the controller's
+//! plain view and returns the edits the user made this frame plus what the host should do next;
+//! the host sends the edits to `InspectAction::Table`. The layout bar and the type field are shared
+//! with the Build Disk tab. Bars place partitions at their real byte offsets with free space
+//! between, so they answer "where on the disk does this land". See
+//! docs/phase2_commander_plan.md § "Slice 14b".
 
 use eframe::egui;
 
 use rusty_backup::controller::partition_edit::{
-    describe_type, format_size, type_choices, type_note, BarSegment, BootStyle, BuildAction,
-    BuildView, LayoutBar, SizeMode, TableEditAction, TableEditView, TableKind,
+    describe_type, type_choices, type_note, BarSegment, BootStyle, LayoutBar, SizeMode,
+    TableEditAction, TableEditView, TableKind,
 };
 
 /// What the caller should do after a frame.
@@ -276,252 +275,8 @@ pub fn show_table(ui: &mut egui::Ui, view: &TableEditView) -> (Vec<TableEditActi
     (edits, action)
 }
 
-/// The Build Disk window: table type, one row per partition, a source image per row. Rows carry
-/// a size, not a start: the controller places them, so the bar is what will be written.
-pub fn show_build(
-    ui: &mut egui::Ui,
-    view: &BuildView,
-    probing: bool,
-) -> (Vec<BuildAction>, Action) {
-    let mut open = true;
-    let mut action = Action::Stay;
-    let mut edits = Vec::new();
-    let kind = view.kind;
-
-    egui::Window::new("Build Disk")
-        .open(&mut open)
-        .resizable(true)
-        .default_width(880.0)
-        .show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Table type:");
-                for &k in view.kinds {
-                    if ui.radio(kind == k, k.label()).clicked() && k != kind {
-                        edits.push(BuildAction::SetKind(k));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Target size:");
-                ui.label(format_size(view.disk_size));
-                ui.add_space(12.0);
-                ui.label("Alignment:");
-                let mut align = view.align_text.clone();
-                ui.add(
-                    egui::TextEdit::singleline(&mut align)
-                        .desired_width(80.0)
-                        .hint_text(view.align_hint.as_str()),
-                )
-                .on_hover_text(
-                    "Partition starts are rounded up to this. Blank uses the \
-                     table default -- 1 MiB, or one cylinder on SGI / RDB / \
-                     Sun. Accepts 1M / 63s (sectors).",
-                );
-                if align != view.align_text {
-                    edits.push(BuildAction::SetAlign(align));
-                }
-                if let Some((heads, sectors)) = view.geometry {
-                    ui.label("Heads:");
-                    let mut h = heads;
-                    if ui
-                        .add(egui::DragValue::new(&mut h).range(1..=255))
-                        .changed()
-                    {
-                        edits.push(BuildAction::SetHeads(h));
-                    }
-                    ui.label("Sectors/track:");
-                    let mut s = sectors;
-                    if ui
-                        .add(egui::DragValue::new(&mut s).range(1..=1024))
-                        .changed()
-                    {
-                        edits.push(BuildAction::SetSectorsPerTrack(s));
-                    }
-                }
-            });
-
-            ui.add_space(6.0);
-            match &view.layout {
-                Ok(bar) => show_bar(ui, bar),
-                Err(e) => {
-                    ui.colored_label(super::theme::danger(ui.visuals()), e);
-                }
-            }
-            ui.add_space(8.0);
-
-            let row_count = view.rows.len();
-            egui::Grid::new("builder_grid")
-                .striped(true)
-                .min_col_width(50.0)
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("#").strong());
-                    ui.label(egui::RichText::new("Size").strong());
-                    ui.label(egui::RichText::new("Type").strong());
-                    if view.names {
-                        ui.label(egui::RichText::new("Name").strong());
-                    }
-                    ui.label(egui::RichText::new("Start LBA").strong());
-                    ui.label(egui::RichText::new("Source image").strong());
-                    ui.label(egui::RichText::new("").strong());
-                    ui.end_row();
-
-                    for (i, row) in view.rows.iter().enumerate() {
-                        ui.label(format!("{}", i + 1));
-                        let mut size = row.size_text.clone();
-                        ui.add(
-                            egui::TextEdit::singleline(&mut size)
-                                .desired_width(80.0)
-                                .id(egui::Id::unique(format!("bld_size_{}", i))),
-                        )
-                        .on_hover_text(
-                            "20M / 1G / a plain byte count, or `rest` for whatever \
-                             is left. Only one partition may claim the rest.",
-                        );
-                        if size != row.size_text {
-                            edits.push(BuildAction::SetRowSize { row: i, text: size });
-                        }
-                        let mut ty = row.type_text.clone();
-                        type_field(ui, kind, &format!("bld_type_{}", i), &mut ty);
-                        if ty != row.type_text {
-                            edits.push(BuildAction::SetRowType { row: i, text: ty });
-                        }
-                        if view.names {
-                            let mut name = row.name.clone();
-                            ui.add(
-                                egui::TextEdit::singleline(&mut name)
-                                    .desired_width(110.0)
-                                    .id(egui::Id::unique(format!("bld_name_{}", i))),
-                            )
-                            .on_hover_text("Entry name. X68000 truncates it to 8 characters.");
-                            if name != row.name {
-                                edits.push(BuildAction::SetRowName { row: i, text: name });
-                            }
-                        }
-                        match (row.start_lba, row.planned_size) {
-                            (Some(lba), Some(size)) => {
-                                ui.label(format!("{}", lba))
-                                    .on_hover_text(format_size(size));
-                            }
-                            _ => {
-                                ui.label(egui::RichText::new("-").weak());
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            match &row.source {
-                                Some(path) => {
-                                    let name = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| path.display().to_string());
-                                    ui.label(format!(
-                                        "{} ({})",
-                                        name,
-                                        format_size(row.source_size)
-                                    ))
-                                    .on_hover_text(path.display().to_string());
-                                    if ui.small_button("Clear").clicked() {
-                                        edits.push(BuildAction::ClearRowSource(i));
-                                    }
-                                }
-                                None => {
-                                    ui.label(egui::RichText::new("(empty)").weak());
-                                }
-                            }
-                            if ui
-                                .add_enabled(!probing, egui::Button::new("Choose...").small())
-                                .on_hover_text(
-                                    "Image poured into this partition after the table is \
-                                     written. Any format Rusty Backup can read works.",
-                                )
-                                .clicked()
-                            {
-                                edits.push(BuildAction::PickRowSource(i));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(i > 0, egui::Button::new("Up").small())
-                                .clicked()
-                            {
-                                edits.push(BuildAction::MoveRow { row: i, delta: -1 });
-                            }
-                            if ui
-                                .add_enabled(i + 1 < row_count, egui::Button::new("Down").small())
-                                .clicked()
-                            {
-                                edits.push(BuildAction::MoveRow { row: i, delta: 1 });
-                            }
-                            if ui
-                                .add_enabled(row_count > 1, egui::Button::new("Remove").small())
-                                .clicked()
-                            {
-                                edits.push(BuildAction::RemoveRow(i));
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(view.can_add_row, egui::Button::new("Add Partition"))
-                    .clicked()
-                {
-                    edits.push(BuildAction::AddRow);
-                }
-                if let Some((used, total)) = view.slots {
-                    ui.label(egui::RichText::new(format!("{used} of {total} slots used")).weak());
-                }
-                if probing {
-                    ui.label(egui::RichText::new("Measuring the source image...").weak());
-                }
-            });
-
-            ui.add_space(8.0);
-            for err in &view.errors {
-                let color = if err.starts_with("Warning:") {
-                    super::theme::warning(ui.visuals())
-                } else {
-                    super::theme::danger(ui.visuals())
-                };
-                ui.colored_label(color, err);
-            }
-            if let Some(status) = &view.status {
-                ui.colored_label(super::theme::success(ui.visuals()), status);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Validate").clicked() {
-                    edits.push(BuildAction::Validate);
-                }
-                if ui
-                    .add_enabled(
-                        view.can_create && !probing,
-                        egui::Button::new("Create Disk"),
-                    )
-                    .on_hover_text(
-                        "Writes the partition table, then pours each assigned \
-                         image into its partition. This erases the target.",
-                    )
-                    .clicked()
-                {
-                    action = Action::Apply;
-                }
-                if ui.button("Cancel").clicked() {
-                    action = Action::Close;
-                }
-            });
-        });
-
-    if !open {
-        action = Action::Close;
-    }
-    (edits, action)
-}
-
 /// One layout bar with its caption.
-fn show_bar(ui: &mut egui::Ui, bar: &LayoutBar) {
+pub(crate) fn show_bar(ui: &mut egui::Ui, bar: &LayoutBar) {
     use super::partition_bar::{PartitionBar, Segment, SegmentKind};
     ui.label(bar.caption.as_str());
     let segments = bar
@@ -551,7 +306,7 @@ fn show_bar(ui: &mut egui::Ui, bar: &LayoutBar) {
 
 /// Partition-type field: free text plus a catalog dropdown and the resolved type name. The text
 /// stays authoritative (the dropdown only stamps a value), so an uncatalogued type is still typed.
-fn type_field(ui: &mut egui::Ui, kind: TableKind, id: &str, text: &mut String) {
+pub(crate) fn type_field(ui: &mut egui::Ui, kind: TableKind, id: &str, text: &mut String) {
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(text)
@@ -594,7 +349,7 @@ fn type_field(ui: &mut egui::Ui, kind: TableKind, id: &str, text: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_backup::controller::partition_edit::{BuildRowView, TableRowView};
+    use rusty_backup::controller::partition_edit::TableRowView;
 
     fn bar() -> LayoutBar {
         LayoutBar {
@@ -618,9 +373,9 @@ mod tests {
     }
 
     /// Renders headlessly: guards against egui's panics for a Grid whose rows disagree on cell
-    /// count, or an id clash between the two windows' widgets, which no compile catches.
+    /// count, which no compile catches.
     #[test]
-    fn both_windows_render_every_row_shape() {
+    fn the_table_window_renders_every_row_shape() {
         let row = |deleted, extended, logical| TableRowView {
             index: 1,
             deleted,
@@ -661,46 +416,6 @@ mod tests {
             egui::__run_test_ui(|ui| {
                 let (edits, action) = show_table(ui, &view);
                 assert!(edits.is_empty());
-                assert_eq!(action, Action::Stay);
-            });
-        }
-        for (kind, names, geometry, layout) in [
-            (TableKind::Mbr, false, None, Ok(bar())),
-            (
-                TableKind::Gpt,
-                true,
-                None,
-                Err("Layout: too big".to_string()),
-            ),
-            (TableKind::Sgi, false, Some((16, 63)), Ok(bar())),
-        ] {
-            let view = BuildView {
-                kind,
-                kinds: &[TableKind::Mbr, TableKind::Gpt, TableKind::Sgi],
-                disk_size: 64 << 20,
-                align_text: String::new(),
-                align_hint: "1 MiB".into(),
-                geometry,
-                names,
-                rows: vec![BuildRowView {
-                    size_text: "rest".into(),
-                    type_text: "0x06".into(),
-                    name: String::new(),
-                    start_lba: Some(2048),
-                    planned_size: Some(8 << 20),
-                    source: Some(std::path::PathBuf::from("/tmp/example.img")),
-                    source_size: 8 << 20,
-                }],
-                can_add_row: true,
-                slots: Some((1, 4)),
-                layout,
-                errors: vec!["Warning: x".into()],
-                status: None,
-                can_create: true,
-            };
-            egui::__run_test_ui(|ui| {
-                let (edits, action) = show_build(ui, &view, false);
-                assert!(edits.is_empty(), "{}", kind.label());
                 assert_eq!(action, Action::Stay);
             });
         }

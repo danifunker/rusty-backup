@@ -2,6 +2,7 @@ mod alto_resize_dialog;
 mod archives_tab;
 mod backup_tab;
 mod browse_view;
+mod build_disk_tab;
 mod bulk_convert_dialog;
 mod chd_options_ui;
 mod commander;
@@ -35,6 +36,7 @@ pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
 use backup_tab::BackupTab;
+use build_disk_tab::BuildDiskTab;
 use bulk_convert_dialog::BulkConvertDialog;
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
@@ -169,6 +171,7 @@ fn file_dialog() -> rfd::AsyncFileDialog {
 pub struct RustyBackupApp {
     backup_tab: BackupTab,
     restore_tab: RestoreTab,
+    build_disk_tab: BuildDiskTab,
     inspect_tab: InspectTab,
     optical_tab: OpticalTab,
     archives_tab: ArchivesTab,
@@ -209,6 +212,7 @@ impl Default for RustyBackupApp {
         Self {
             backup_tab: BackupTab::new(app.recent_handle()),
             restore_tab: RestoreTab::new(app.recent_handle()),
+            build_disk_tab: BuildDiskTab::default(),
             inspect_tab: InspectTab::new(app.recent_handle()),
             optical_tab,
             archives_tab: ArchivesTab::new(app.recent_handle()),
@@ -341,6 +345,10 @@ impl RustyBackupApp {
                 on(self.restore_tab.is_running(), "Restore"),
             ),
             (
+                AppTab::Build,
+                on(self.build_disk_tab.is_running(), "Build Disk"),
+            ),
+            (
                 AppTab::Optical,
                 on(self.optical_tab.is_running(), "Optical"),
             ),
@@ -361,6 +369,7 @@ impl eframe::App for RustyBackupApp {
         if self.progress.active
             || self.backup_tab.is_running()
             || self.restore_tab.is_running()
+            || self.build_disk_tab.is_running()
             || self.optical_tab.is_running()
             || self.bulk_convert.is_running()
         {
@@ -447,6 +456,7 @@ impl eframe::App for RustyBackupApp {
                 let mut tab = self.app.active_tab();
                 ui.selectable_value(&mut tab, AppTab::Backup, "Backup");
                 ui.selectable_value(&mut tab, AppTab::Restore, "Restore");
+                ui.selectable_value(&mut tab, AppTab::Build, "Build Disk");
                 ui.selectable_value(&mut tab, AppTab::Inspect, "Inspect");
                 ui.selectable_value(&mut tab, AppTab::Optical, "Optical");
                 ui.selectable_value(&mut tab, AppTab::Archives, "Archives");
@@ -618,6 +628,10 @@ impl eframe::App for RustyBackupApp {
                 self.restore_tab
                     .poll_background(&mut ctx, &mut self.progress);
             }
+            if active != AppTab::Build {
+                self.build_disk_tab
+                    .poll_background(&mut ctx, &mut self.progress);
+            }
         }
         if active != AppTab::Optical {
             self.optical_tab
@@ -678,6 +692,12 @@ impl eframe::App for RustyBackupApp {
                 let mut ctx = context::TabContext::new(devices, log);
                 self.inspect_tab.show(ui, &mut ctx);
             }
+            AppTab::Build => {
+                let busy = self.busy_elsewhere(AppTab::Build);
+                let (devices, log) = self.app.devices_and_log();
+                let mut ctx = context::TabContext::new(devices, log).busy_elsewhere(busy);
+                self.build_disk_tab.show(ui, &mut ctx, &mut self.progress);
+            }
             AppTab::Optical => {
                 let busy = self.busy_elsewhere(AppTab::Optical);
                 self.optical_tab
@@ -695,6 +715,12 @@ impl eframe::App for RustyBackupApp {
         if let Some(open) = self.archives_tab.take_pending_inspect_open() {
             self.inspect_tab
                 .load_image_with_tempdir(open.path, Some(open.guard));
+            self.app.select_tab(AppTab::Inspect);
+        }
+
+        // Build Disk's "Open in Inspect" on the image it just wrote.
+        if let Some(path) = self.build_disk_tab.take_open_inspect() {
+            self.inspect_tab.load_image_with_tempdir(path, None);
             self.app.select_tab(AppTab::Inspect);
         }
 

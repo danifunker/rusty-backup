@@ -277,7 +277,7 @@ pub(crate) fn cmd_new(
         ..Default::default()
     };
     let done = crate::model::format::format_to_file(
-        &image,
+        image.as_path(),
         size,
         crate::model::format::FsKind::Hfs,
         &opts,

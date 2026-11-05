@@ -1,13 +1,13 @@
 //! Restore: a backup folder (or one image) onto a disk, an image file or a remote drive.
 //!
-//! [`RestoreController`] owns the five modes of the Restore tab and everything they hold: the
+//! [`RestoreController`] owns the four modes of the Restore tab and everything they hold: the
 //! backup folder and what loading it found (per-partition size rows, alignment, trailing free
 //! space), the single-partition / new-disk source (a partition of the backup or an image file,
 //! decoded first when wrapped), each mode's target (a device row, an image path, a drive or file
-//! on an `rb-cli serve` daemon), the single-partition target scan, Write Image File's source, and
-//! Build Disk's target and partition plan. Every slow step is a job: the backup load, the image
-//! decode, the target scan, the decoded-size probe, the remote connect, the restore and the build.
-//! A destructive start is a `Confirm` effect (Build Disk on a device asks for the device's name).
+//! on an `rb-cli serve` daemon), the single-partition target scan and Write Image File's source.
+//! Every slow step is a job: the backup load, the image decode, the target scan, the remote
+//! connect and the restore. A destructive start is a `Confirm` effect. Building a fresh disk is
+//! the Build Disk tab's (`controller::build_disk`).
 //! The sizing rules live in `model::restore_plan`; the layouts in `crate::restore`.
 //!
 //! The egui Restore tab (`src/gui/restore_tab.rs`) and the TUI Restore screen are shells over it:
@@ -33,7 +33,6 @@ use crate::model::job::{Job, Notify};
 use crate::model::restore_plan::LoadedBackup;
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
-pub use crate::model::disk_builder::DiskBuilder;
 pub use crate::model::disk_write_plan::WriteOpen;
 pub use crate::model::job::{JobRegistry, NoNotify, Snapshot};
 pub use crate::model::restore_plan::{
@@ -49,11 +48,8 @@ pub mod purpose {
     pub const SOURCE_IMAGE: &str = "restore.source_image";
     pub const TARGET_IMAGE: &str = "restore.target_image";
     pub const NEW_DISK_IMAGE: &str = "restore.new_disk_image";
-    pub const BUILD_IMAGE: &str = "restore.build_image";
     pub const WRITE_IMAGE: &str = "restore.write_image";
     pub const RESTORE: &str = "restore.confirm";
-    pub const BUILD: &str = "restore.build_confirm";
-    pub const BUILD_SOURCE: &str = "restore.build_source";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -73,9 +69,6 @@ pub mod ids {
     pub const SCAN_TARGET: &str = "restore.scan_target";
     pub const WRITE_IMAGE: &str = "restore.write_image";
     pub const WRITE_TARGET: &str = "restore.write_target";
-    pub const BUILD_SIZE: &str = "restore.build_size";
-    pub const BUILD_DEFINE: &str = "restore.build_define";
-    pub const BUILD_CANCEL: &str = "restore.build_cancel";
     pub const START: &str = "restore.start";
     pub const CANCEL: &str = "restore.cancel";
 }
@@ -91,8 +84,6 @@ pub enum RestoreMode {
     NewDisk,
     /// A plain image file onto a device or one of its partitions.
     WriteImage,
-    /// A fresh table on a blank disk, partitions optionally filled.
-    BuildDisk,
 }
 
 /// The target each device-picking mode holds.
@@ -101,7 +92,6 @@ pub enum TargetSlot {
     FullDisk,
     SinglePartition,
     NewDisk,
-    BuildDisk,
 }
 
 /// User intents.
@@ -152,15 +142,6 @@ pub enum RestoreAction {
     OpenWriteImage(PathBuf),
     /// "Choose target and write...": hands the image to the shell's disk writer.
     WriteImageTarget,
-    SetBuildSize(String),
-    /// "Define Partitions...": open the partition plan.
-    BuildDefine,
-    BuildClose,
-    /// An edit in the plan's window.
-    Build(crate::controller::partition_edit::BuildAction),
-    /// The plan's Apply: an image target builds at once, a device asks for its name first.
-    BuildApply,
-    BuildCancel,
     /// The Restore button: asks for confirmation.
     Start,
     /// Cancel the running restore.
@@ -369,12 +350,12 @@ impl RestoreController {
 
     // --- running ------------------------------------------------------------------------
 
-    /// A restore or a disk build is in flight.
+    /// A restore is in flight.
     pub fn is_running(&self) -> bool {
-        self.run.running() || self.run.building()
+        self.run.running()
     }
 
-    /// A restore (not a build) is in flight: the Restore button becomes Cancel.
+    /// A restore is in flight: the Restore button becomes Cancel.
     pub fn restore_running(&self) -> bool {
         self.run.running()
     }
@@ -387,16 +368,6 @@ impl RestoreController {
     /// How the last restore ended, until the next one starts.
     pub fn last_result(&self) -> Option<&Result<(), String>> {
         self.run.last.as_ref()
-    }
-
-    /// The disk build in progress or finished, for its inline bar.
-    pub fn build_progress(&self) -> Option<Snapshot> {
-        self.run.build_snapshot()
-    }
-
-    /// How the last disk build ended.
-    pub fn build_result(&self) -> Option<&Result<(), String>> {
-        self.run.build_last.as_ref()
     }
 
     /// Why the Restore button is disabled, or `Ok` (each mode's own rule).
@@ -429,7 +400,7 @@ impl RestoreController {
                     return Err("Choose a target.".into());
                 }
             }
-            RestoreMode::WriteImage | RestoreMode::BuildDisk => {
+            RestoreMode::WriteImage => {
                 return Err("This mode starts from its own window.".into());
             }
         }
@@ -477,7 +448,6 @@ impl Controller for RestoreController {
             RestoreAction::PickTargetImage(slot) => {
                 let purpose = match slot {
                     TargetSlot::NewDisk => purpose::NEW_DISK_IMAGE,
-                    TargetSlot::BuildDisk => purpose::BUILD_IMAGE,
                     TargetSlot::FullDisk | TargetSlot::SinglePartition => purpose::TARGET_IMAGE,
                 };
                 let mut spec = Self::picker(
@@ -525,12 +495,6 @@ impl Controller for RestoreController {
             }
             RestoreAction::OpenWriteImage(path) => self.open_write_image(path),
             RestoreAction::WriteImageTarget => self.write_image_target(),
-            RestoreAction::SetBuildSize(text) => self.targets.build_size_text = text,
-            RestoreAction::BuildDefine => self.build_define(),
-            RestoreAction::BuildClose => self.targets.builder = None,
-            RestoreAction::Build(edit) => return self.build_edit(edit),
-            RestoreAction::BuildApply => return self.build_apply(),
-            RestoreAction::BuildCancel => self.run.cancel_build(),
             RestoreAction::Start => return self.start(),
             RestoreAction::Cancel => self.cancel(),
             RestoreAction::SetRemote(on) => self.set_remote(on),
@@ -545,11 +509,7 @@ impl Controller for RestoreController {
                     self.start_confirmed();
                 }
             }
-            RestoreAction::Answered { purpose, text } => {
-                if let (purpose::BUILD, Some(text)) = (purpose, text) {
-                    return self.build_answered(text.as_str());
-                }
-            }
+            RestoreAction::Answered { .. } => {}
         }
         Vec::new()
     }
@@ -559,7 +519,6 @@ impl Controller for RestoreController {
         self.poll_decode();
         self.poll_write_probe();
         self.poll_scan();
-        self.poll_build_source();
         self.poll_remote();
         self.poll_run();
         Vec::new()
@@ -576,9 +535,7 @@ impl RestoreController {
             purpose::SOURCE_IMAGE => self.open_source_image(path),
             purpose::TARGET_IMAGE => self.targets.full.image = Some(path),
             purpose::NEW_DISK_IMAGE => self.targets.new_disk.image = Some(path),
-            purpose::BUILD_IMAGE => self.targets.build.image = Some(path),
             purpose::WRITE_IMAGE => self.open_write_image(path),
-            purpose::BUILD_SOURCE => self.build_source_picked(path),
             _ => {}
         }
     }
@@ -605,8 +562,7 @@ impl RestoreController {
     pub fn wait_idle(&mut self) {
         loop {
             self.tick();
-            let probing = self.targets.build_source.is_some();
-            if !self.src.busy() && !self.targets.scanning() && !self.remote.busy() && !probing {
+            if !self.src.busy() && !self.targets.scanning() && !self.remote.busy() {
                 self.tick();
                 return;
             }
@@ -614,7 +570,7 @@ impl RestoreController {
         }
     }
 
-    /// Block until the running restore or build ends; for a headless shell or a test.
+    /// Block until the running restore ends; for a headless shell or a test.
     pub fn wait_finished(&mut self) {
         loop {
             self.tick();

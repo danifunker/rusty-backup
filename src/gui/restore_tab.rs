@@ -3,8 +3,8 @@
 //! The tab draws each mode's form from the controller's accessors, maps clicks to
 //! `RestoreAction`s, answers the controller's pickers, confirmations and the Build Disk name
 //! prompt through an `EffectHost`, moves its log lines into the log panel and mirrors a running
-//! restore onto the shared progress bar. It hosts two dialogs of its own: the Physical Disk Export
-//! window Write Image File hands its image to, and the partition editor Build Disk fills.
+//! restore onto the shared progress bar. It hosts the Physical Disk Export window Write Image File
+//! hands its image to.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -216,13 +216,6 @@ impl RestoreTab {
                          partitions. Any format Rusty Backup can read works, \
                          including DMG, CHD, VHD and compressed images.",
                     ),
-                    (
-                        RestoreMode::BuildDisk,
-                        "Build Disk",
-                        "Lay a fresh MBR / GPT / APM / SGI / X68000 partition \
-                         table on a blank disk or image file, and optionally \
-                         pour an image into each partition in one pass.",
-                    ),
                 ];
                 for (m, label, hover) in modes {
                     let mut resp = ui.radio(mode == m, label);
@@ -244,13 +237,9 @@ impl RestoreTab {
             }
             RestoreMode::NewDisk => self.show_new_disk_mode(ui, ctx, controls_enabled),
             RestoreMode::WriteImage => self.show_write_image_mode(ui, controls_enabled),
-            RestoreMode::BuildDisk => self.show_build_disk_mode(ui, ctx, controls_enabled),
         }
 
         self.image_write.show(ui.ctx(), ctx);
-        if self.ctl.builder_open() {
-            self.show_build_disk_modal(ui);
-        }
         self.run_effects(ui, ctx);
     }
 
@@ -1063,121 +1052,6 @@ impl RestoreTab {
                     .weak(),
                 );
             }
-        }
-    }
-
-    /// Build Disk: pick a blank target, then define its partitions in the shared modal.
-    fn show_build_disk_mode(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &mut TabContext,
-        controls_enabled: bool,
-    ) {
-        ui.label(egui::RichText::new("Target").strong());
-        ui.separator();
-
-        ui.add_enabled_ui(controls_enabled, |ui| {
-            let is_device = self.ctl.target_is_device(TargetSlot::BuildDisk);
-            ui.horizontal(|ui| {
-                if ui.radio(!is_device, "New image file").clicked() {
-                    self.act(RestoreAction::SetTargetIsDevice(
-                        TargetSlot::BuildDisk,
-                        false,
-                    ));
-                }
-                if ui.radio(is_device, "Physical device").clicked() {
-                    self.act(RestoreAction::SetTargetIsDevice(
-                        TargetSlot::BuildDisk,
-                        true,
-                    ));
-                }
-            });
-            if is_device {
-                ui.horizontal(|ui| {
-                    ui.label("Device:");
-                    self.device_combo(ui, ctx, TargetSlot::BuildDisk, "bd_target_device", false);
-                });
-                ui.label(
-                    egui::RichText::new("Building erases everything on the selected device.")
-                        .color(super::theme::warning(ui.visuals())),
-                );
-            } else {
-                self.target_image_row(ui, TargetSlot::BuildDisk, "Image file:");
-                ui.horizontal(|ui| {
-                    ui.label("Disk size:");
-                    let mut text = self.ctl.build_size_text().to_string();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut text).desired_width(90.0))
-                        .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.")
-                        .changed()
-                    {
-                        self.act(RestoreAction::SetBuildSize(text));
-                    }
-                    match self.ctl.build_size() {
-                        Ok(n) => {
-                            ui.label(egui::RichText::new(format_size(n)).weak());
-                        }
-                        Err(e) => {
-                            ui.colored_label(super::theme::danger(ui.visuals()), e);
-                        }
-                    }
-                });
-            }
-        });
-
-        ui.add_space(8.0);
-        let has_target = self.ctl.build_target().is_some();
-        ui.add_enabled_ui(controls_enabled && has_target, |ui| {
-            if ui
-                .button("Define Partitions...")
-                .on_hover_text("Choose the table type and lay out the partitions")
-                .clicked()
-            {
-                self.act(RestoreAction::BuildDefine);
-            }
-        });
-        if !has_target {
-            ui.label(egui::RichText::new("Pick a target first.").weak());
-        }
-        self.show_build_progress(ui);
-    }
-
-    fn show_build_disk_modal(&mut self, ui: &mut egui::Ui) {
-        let Some(view) = self.ctl.build_view() else {
-            return;
-        };
-        let probing = self.ctl.build_source_probing().is_some();
-        let (edits, action) = super::partition_editor_modal::show_build(ui, &view, probing);
-        for edit in edits {
-            self.act(RestoreAction::Build(edit));
-        }
-        match action {
-            super::partition_editor_modal::Action::Stay => {}
-            super::partition_editor_modal::Action::Close => self.act(RestoreAction::BuildClose),
-            super::partition_editor_modal::Action::Apply => self.act(RestoreAction::BuildApply),
-        }
-    }
-
-    fn show_build_progress(&mut self, ui: &mut egui::Ui) {
-        let Some(snap) = self.ctl.build_progress() else {
-            return;
-        };
-        ui.add_space(8.0);
-        ui.separator();
-        if snap.is_running() {
-            if super::progress::show_job(ui, &snap) {
-                self.act(RestoreAction::BuildCancel);
-            }
-            return;
-        }
-        match self.ctl.build_result() {
-            Some(Err(err)) => {
-                ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {err}"));
-            }
-            Some(Ok(())) => {
-                ui.label("Disk build complete.");
-            }
-            None => {}
         }
     }
 

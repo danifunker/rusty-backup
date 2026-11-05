@@ -203,6 +203,8 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         geometry,
         partitions: placed.clone(),
         sources,
+        formats: Vec::new(),
+        full_write: false,
     };
     let status = Arc::new(Mutex::new(
         crate::model::physical_write_runner::PhysicalWriteStatus {

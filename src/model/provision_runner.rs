@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::model::disk_builder::RowFormat;
+use crate::model::format::{self, Window};
 use crate::model::physical_write_runner::{self, PhysicalWriteStatus, WriteExtent};
 use crate::os::{open_target_preserving, SectorAlignedWriter};
 use crate::partition::provision::{self, Geometry, Placed};
@@ -42,6 +44,29 @@ pub struct ProvisionRequest {
     pub partitions: Vec<Placed>,
     /// Source image per entry of `partitions`; `None` leaves it empty.
     pub sources: Vec<Option<PathBuf>>,
+    /// Filesystem to format per entry of `partitions` (a source wins); empty means none.
+    pub formats: Vec<Option<RowFormat>>,
+    /// Write every byte of a formatted partition: the target may hold old data (a device).
+    pub full_write: bool,
+}
+
+/// What a build makes: a partitioned disk, or one volume across the whole target.
+#[derive(Debug, Clone)]
+pub enum BuildRequest {
+    Partitioned(ProvisionRequest),
+    Volume {
+        target_path: PathBuf,
+        size: u64,
+        format: RowFormat,
+        /// As [`ProvisionRequest::full_write`].
+        full_write: bool,
+    },
+}
+
+/// A target that may hold old data (a device) gets every byte of a formatted volume written,
+/// so nothing stale shows through the holes a fresh-file format leaves.
+fn writes_in_full(target: &std::path::Path, asked: bool) -> bool {
+    asked || crate::os::is_device_path(target)
 }
 
 impl ProvisionRequest {
@@ -49,11 +74,30 @@ impl ProvisionRequest {
     /// total. Unreadable sources contribute nothing and fail later, in the
     /// worker, where the error can be reported properly.
     pub fn total_source_bytes(&self) -> u64 {
-        self.sources
+        let sources: u64 = self
+            .sources
             .iter()
             .flatten()
             .filter_map(|p| physical_write_runner::decoded_source_size(p).ok())
-            .sum()
+            .sum();
+        let formats: u64 = if writes_in_full(self.target_path.as_path(), self.full_write) {
+            self.formatted().map(|(p, _)| p.size_bytes).sum()
+        } else {
+            0
+        };
+        sources + formats
+    }
+
+    /// The partitions to format, with no source image.
+    fn formatted(&self) -> impl Iterator<Item = (&Placed, &RowFormat)> {
+        self.partitions
+            .iter()
+            .zip(self.sources.iter())
+            .zip(self.formats.iter())
+            .filter_map(|((p, src), f)| match (src, f) {
+                (None, Some(f)) => Some((p, f)),
+                _ => None,
+            })
     }
 }
 
@@ -86,6 +130,121 @@ pub fn start_provision(req: ProvisionRequest) -> Arc<Mutex<PhysicalWriteStatus>>
     });
 
     status
+}
+
+/// Spawn any build: a partitioned disk or a bare volume.
+pub fn start_build(req: BuildRequest) -> Arc<Mutex<PhysicalWriteStatus>> {
+    match req {
+        BuildRequest::Partitioned(p) => start_provision(p),
+        BuildRequest::Volume {
+            target_path,
+            size,
+            format,
+            full_write,
+        } => {
+            let full = writes_in_full(target_path.as_path(), full_write);
+            let total = if full { size } else { 0 };
+            let status = new_status(total);
+            let status_thread = Arc::clone(&status);
+            crate::model::worker::spawn_guarded(Arc::clone(&status), "build volume", move || {
+                let _wake = crate::os::wakelock::acquire("Rusty Backup: build disk");
+                let result = run_volume(
+                    target_path.as_path(),
+                    size,
+                    &format,
+                    full,
+                    Arc::clone(&status_thread),
+                );
+                if let Ok(mut s) = status_thread.lock() {
+                    s.finished = true;
+                    if let Err(e) = result {
+                        s.error = Some(format!("{e:#}"));
+                    }
+                }
+                Ok(())
+            });
+            status
+        }
+    }
+}
+
+/// Format one volume across the whole target.
+pub fn run_volume(
+    target: &std::path::Path,
+    size: u64,
+    f: &RowFormat,
+    full: bool,
+    status: Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<()> {
+    let log = |msg: String| {
+        if let Ok(mut s) = status.lock() {
+            s.log_messages.push(msg);
+        }
+    };
+    if !full {
+        let done = format::format_to_file(target, size, f.kind, &f.opts)?;
+        log(format!(
+            "Wrote {} ({} bytes, {})",
+            target.display(),
+            done.len,
+            done.summary
+        ));
+        return Ok(());
+    }
+    let handle = open_target_preserving(target)
+        .with_context(|| format!("opening target {} for writing", target.display()))?;
+    let mut dev = SectorAlignedWriter::new(handle.file);
+    format_through_temp(&mut dev, 0, size, f, 0, &status)?;
+    dev.flush().context("flushing target after build")?;
+    dev.sync_all().context("syncing the target")?;
+    log("Disk build complete".to_string());
+    Ok(())
+}
+
+/// Format into a sparse temp image, then write every byte of it over `[offset, offset + size)`.
+fn format_through_temp<W: Write + std::io::Seek>(
+    target: &mut W,
+    offset: u64,
+    size: u64,
+    f: &RowFormat,
+    progress_base: u64,
+    status: &Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<u64> {
+    let dir = tempfile::tempdir().context("creating a temporary folder")?;
+    let tmp = dir.path().join("volume.img");
+    let done = format::format_to_file(tmp.as_path(), size, f.kind, &f.opts)?;
+    // The rest of the extent past the volume is zeroed too.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .and_then(|file| file.set_len(size))
+        .context("sizing the temporary volume")?;
+    let push = |msg: &str| {
+        if let Ok(mut s) = status.lock() {
+            s.log_messages.push(msg.to_string());
+        }
+    };
+    push(&format!(
+        "Formatted {} ({})",
+        f.kind.display_name(),
+        done.summary
+    ));
+    let mut progress = |n: u64| {
+        if let Ok(mut s) = status.lock() {
+            s.current_bytes = n;
+        }
+    };
+    let cancel = || status.lock().map(|s| s.cancel_requested).unwrap_or(false);
+    let mut log = |m: &str| push(m);
+    physical_write_runner::write_image_into(
+        target,
+        tmp.as_path(),
+        WriteExtent::partition_at(offset, size),
+        progress_base,
+        &mut progress,
+        &cancel,
+        &mut log,
+    )
 }
 
 /// Worker function. Public for unit testing — call this inline with a
@@ -142,7 +301,7 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(!req.full_write)
             .open(&req.target_path)
             .with_context(|| format!("creating {}", req.target_path.display()))?;
         file.set_len(req.target_size_bytes).with_context(|| {
@@ -178,6 +337,64 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
     }
 
     let mut done: u64 = 0;
+    if !req.formats.is_empty() && req.formats.len() != req.partitions.len() {
+        anyhow::bail!(
+            "internal error: {} partitions but {} format slots",
+            req.partitions.len(),
+            req.formats.len(),
+        );
+    }
+    let full = writes_in_full(req.target_path.as_path(), req.full_write);
+    let jobs: Vec<(usize, Placed, RowFormat)> = req
+        .partitions
+        .iter()
+        .enumerate()
+        .zip(req.sources.iter())
+        .zip(req.formats.iter().map(Some).chain(std::iter::repeat(None)))
+        .filter_map(
+            |(((i, p), src), f)| match (src, f.and_then(|f| f.as_ref())) {
+                (None, Some(f)) => Some((i, p.clone(), f.clone())),
+                _ => None,
+            },
+        )
+        .collect();
+    for (i, placed, f) in &jobs {
+        if cancel_check() {
+            anyhow::bail!("build cancelled");
+        }
+        log_cb(&format!(
+            "Formatting partition {} as {}",
+            i + 1,
+            f.kind.display_name()
+        ));
+        if full {
+            done += format_through_temp(
+                &mut target,
+                placed.start_byte(),
+                placed.size_bytes,
+                f,
+                done,
+                &status,
+            )
+            .with_context(|| format!("formatting partition {}", i + 1))?;
+        } else {
+            let file = target.inner_mut().context("flushing before the format")?;
+            let mut w = Window::new(file, placed.start_byte(), placed.size_bytes);
+            let r = format::format_into(&mut w, placed.size_bytes, f.kind, &f.opts)
+                .with_context(|| format!("formatting partition {}", i + 1))?;
+            log_cb(&format!("Partition {}: {}", i + 1, r.summary));
+        }
+        let file = target.inner_mut().context("flushing before the fit")?;
+        crate::fs::fit_apple_volume_to_partition(
+            file,
+            placed.start_byte(),
+            placed.size_bytes,
+            &mut log_cb,
+        )
+        .with_context(|| format!("fitting the volume to partition {}", i + 1))?;
+        progress_cb(done);
+    }
+
     for (i, (placed, source)) in req.partitions.iter().zip(req.sources.iter()).enumerate() {
         let Some(path) = source else { continue };
         if cancel_check() {
@@ -278,6 +495,8 @@ mod tests {
             geometry: Geometry::default(),
             partitions: placed.clone(),
             sources: vec![Some(src.path().to_path_buf()), None],
+            formats: Vec::new(),
+            full_write: false,
         };
         run_worker(&req, new_status(0)).expect("worker");
 
@@ -320,6 +539,8 @@ mod tests {
             geometry: Geometry::default(),
             partitions: placed.clone(),
             sources: vec![Some(src.path().to_path_buf()), None],
+            formats: Vec::new(),
+            full_write: false,
         };
         run_worker(&req, new_status(0)).expect("worker");
         (target_path, placed)
@@ -380,6 +601,8 @@ mod tests {
             geometry: Geometry::default(),
             partitions: placed,
             sources: vec![Some(src.path().to_path_buf())],
+            formats: Vec::new(),
+            full_write: false,
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(
@@ -404,6 +627,8 @@ mod tests {
             geometry: Geometry::default(),
             partitions: placed,
             sources: vec![None],
+            formats: Vec::new(),
+            full_write: false,
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(format!("{err:#}").contains("past the end"), "{err:#}");

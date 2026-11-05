@@ -23,6 +23,7 @@ pub mod app;
 pub mod archives;
 pub mod backup;
 pub mod browser;
+pub mod build_disk;
 pub mod bulk_convert;
 pub mod commander;
 pub mod disk_write;

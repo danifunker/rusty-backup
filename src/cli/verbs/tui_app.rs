@@ -52,6 +52,7 @@ use crate::controller::app::{DiskDevice, RecentMode};
 mod archives;
 mod ask;
 mod backup;
+mod build_disk;
 mod bulk;
 mod commander;
 mod dialogs;
@@ -68,6 +69,7 @@ mod writer;
 
 use archives::ArchiveState;
 use backup::BackupState;
+use build_disk::BuildDiskState;
 use bulk::{BulkState, BulkStep};
 use inspect::InspectState;
 #[cfg(feature = "optical")]
@@ -764,6 +766,7 @@ impl Palette {
 enum TabId {
     Backup,
     Restore,
+    Build,
     Inspect,
     NewDisk,
     Optical,
@@ -777,6 +780,7 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Backup, "Backup"),
     (TabId::Restore, "Restore"),
     (TabId::Inspect, "Inspect"),
+    (TabId::Build, "Build Disk"),
     (TabId::NewDisk, "New Disk"),
     (TabId::Optical, "Optical"),
     (TabId::Archives, "Archives"),
@@ -1213,6 +1217,8 @@ struct App {
     backup: Option<BackupState>,
     /// The Restore screen state (lazily created on first visit).
     restore: Option<RestoreState>,
+    /// The Build Disk screen state (lazily created on first visit).
+    build_disk: Option<BuildDiskState>,
     /// The Bulk convert screen state (lazily created on first visit).
     bulk: Option<BulkState>,
     /// The Optical screen state (lazily created on first visit).
@@ -1279,6 +1285,7 @@ impl App {
             newdisk: None,
             backup: None,
             restore: None,
+            build_disk: None,
             bulk: None,
             #[cfg(feature = "optical")]
             optical: None,
@@ -1524,6 +1531,11 @@ impl App {
 
         // The Restore screen owns most keys on its tab.
         if self.current() == TabId::Restore && self.handle_restore_key(key.code) {
+            return;
+        }
+
+        // The Build Disk screen owns most keys on its tab.
+        if self.current() == TabId::Build && self.handle_build_disk_key(key.code) {
             return;
         }
 
@@ -1813,6 +1825,12 @@ impl App {
         }
         if self.current() == TabId::Restore && self.restore.is_none() {
             self.restore = Some(RestoreState::new(self.shell.recent_handle()));
+        }
+        if self.current() == TabId::Build {
+            if self.build_disk.is_none() {
+                self.build_disk = Some(BuildDiskState::default());
+            }
+            self.load_devices_once();
         }
         if self.current() == TabId::Bulk && self.bulk.is_none() {
             self.bulk = Some(BulkState::default());
@@ -2312,6 +2330,7 @@ impl App {
         self.share_backup_tick();
         self.backup_tick();
         self.restore_tick();
+        self.build_disk_tick();
         self.inspect_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
         self.archive_tick();
@@ -2622,6 +2641,12 @@ impl App {
         if self.current() == TabId::Restore {
             if let Some(r) = &self.restore {
                 self.draw_restore(frame, area, r);
+                return;
+            }
+        }
+        if self.current() == TabId::Build {
+            if let Some(b) = &self.build_disk {
+                self.draw_build_disk(frame, area, b);
                 return;
             }
         }
@@ -3115,6 +3140,8 @@ impl App {
             self.backup_footer_keys()
         } else if self.current() == TabId::Restore {
             self.restore_footer_keys()
+        } else if self.current() == TabId::Build {
+            self.build_disk_footer_keys()
         } else if self.current() == TabId::Bulk {
             let step = self.bulk.as_ref().map(|b| b.step);
             match step {
@@ -3271,6 +3298,9 @@ impl App {
         if self.current() == TabId::Restore {
             return self.restore_key_context();
         }
+        if self.current() == TabId::Build {
+            return ("Build Disk", build_disk::HINTS_BUILD_DISK);
+        }
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical {
             return self.optical_key_context();
@@ -3413,13 +3443,22 @@ impl App {
                 "M8 - reuses bulk_convert_runner.",
             ),
             TabId::NewDisk => self.newdisk_content(),
+            TabId::Build => self.stub(
+                "Build a disk: partitioned or one volume, to an image file or a device.",
+                &[
+                    "Choose a partitioned disk or a bare volume.",
+                    "Save as an image file, or pick a device (SD / CF card, USB stick).",
+                    "Lay out partitions; format each, fill it from an image, or leave it empty.",
+                ],
+                "docs/build_disk_plan.md",
+            ),
             TabId::Settings => self.settings_content(),
         };
         // Tabs whose real operations touch a physical disk carry an elevation
         // caution when we're not running elevated.
         if matches!(
             self.current(),
-            TabId::Backup | TabId::Restore | TabId::Inspect
+            TabId::Backup | TabId::Restore | TabId::Build | TabId::Inspect
         ) {
             if let Some(note) = self.device_note() {
                 text.lines.push(Line::raw(""));

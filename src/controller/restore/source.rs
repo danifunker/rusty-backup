@@ -112,7 +112,7 @@ impl RestoreController {
     pub fn has_other_source(&self) -> bool {
         self.src.image.is_some()
             || self.src.decode.is_some()
-            || matches!(self.mode, RestoreMode::WriteImage | RestoreMode::BuildDisk)
+            || matches!(self.mode, RestoreMode::WriteImage)
     }
 
     pub fn load_error(&self) -> Option<&str> {

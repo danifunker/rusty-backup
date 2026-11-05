@@ -334,9 +334,9 @@ impl FloppyArgs {
             ..FormatOptions::default()
         };
         format_cli(
-            &self.image,
-            &self.size,
-            &self.name,
+            self.image.as_path(),
+            self.size.as_str(),
+            self.name.as_str(),
             self.fs.to_fs_kind(),
             opts,
         )
@@ -439,9 +439,9 @@ impl VolumeArgs {
             ..FormatOptions::default()
         };
         format_cli(
-            &self.image,
-            &self.size,
-            &self.name,
+            self.image.as_path(),
+            self.size.as_str(),
+            self.name.as_str(),
             self.fs.to_fs_kind(),
             opts,
         )

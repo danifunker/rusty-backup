@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::model::format::{self, FormatOptions, FsKind};
 use crate::partition::parse_size;
 use crate::partition::provision::{self, Geometry, PartSpec, Placed};
 use crate::partition::type_catalog::{self, TableKind};
@@ -37,6 +38,128 @@ pub struct BuilderRow {
     /// Decoded size of `source`, cached by the caller so validation can flag
     /// an image too big for the partition without re-opening it every frame.
     pub source_size: u64,
+    /// Format this partition blank; ignored when `source` is set.
+    pub format: Option<RowFormat>,
+}
+
+/// A filesystem to format and its options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFormat {
+    pub kind: FsKind,
+    pub opts: FormatOptions,
+}
+
+impl RowFormat {
+    /// `kind` with its default options (CP/M gets its first preset).
+    pub fn new(kind: FsKind) -> Self {
+        // The CLI's default name is longer than some labels allow; those start as UNTITLED.
+        let max = kind.caps().label_max;
+        let label = match kind.default_label() {
+            l if max == 0 || l.len() <= max => l.to_string(),
+            _ => "UNTITLED".chars().take(max).collect(),
+        };
+        let mut opts = FormatOptions {
+            label,
+            ..FormatOptions::default()
+        };
+        if kind == FsKind::Cpm {
+            opts.cpm_preset = fs_cpm::cpm_diskdefs::ALL_PRESETS
+                .first()
+                .map(|d| d.name.to_string());
+        }
+        RowFormat { kind, opts }
+    }
+
+    /// The options and label are ones this filesystem takes.
+    pub fn check(&self) -> Result<(), String> {
+        format::check_options(self.kind, &self.opts).map_err(|e| format!("{e:#}"))?;
+        let max = self.kind.caps().label_max;
+        if max > 0 && self.opts.label.len() > max {
+            return Err(format!(
+                "the {} label is at most {max} bytes",
+                self.kind.display_name()
+            ));
+        }
+        if self.opts.affs_variant > 7 {
+            return Err("the AFFS variant is 0 to 7".to_string());
+        }
+        Ok(())
+    }
+
+    /// A volume of `size` bytes is one this filesystem can be formatted at.
+    pub fn fits(&self, size: u64) -> Result<(), String> {
+        let caps = self.kind.caps();
+        let name = self.kind.display_name();
+        if caps.fixed_size {
+            return if caps.min_size > size {
+                Err(format!(
+                    "{name} needs {}, more than {}",
+                    format_size(caps.min_size),
+                    format_size(size)
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if size < caps.min_size {
+            return Err(format!(
+                "{name} needs at least {}, not {}",
+                format_size(caps.min_size),
+                format_size(size)
+            ));
+        }
+        if size > caps.max_buildable() {
+            return Err(format!(
+                "{name} can be at most {}, not {}",
+                format_size(caps.max_buildable()),
+                format_size(size)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The partition type a row formatted with `fs` should carry on a `kind` table, when the table
+/// has one for it. `size` picks FAT's type byte.
+pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64) -> Option<String> {
+    use FsKind as F;
+    let t = match (kind, fs) {
+        (TableKind::Mbr, F::Fat) => {
+            let fat = fs_pc::fat::compute_fat_blank_layout(size.max(64 * 1024)).ok()?;
+            match fat.fat_type {
+                fs_pc::fat::FatType::Fat12 => "01",
+                fs_pc::fat::FatType::Fat16 if size < 32 * 1024 * 1024 => "04",
+                fs_pc::fat::FatType::Fat16 => "06",
+                fs_pc::fat::FatType::Fat32 => "0C",
+            }
+        }
+        (TableKind::Mbr, F::Ntfs | F::Hpfs) => "07",
+        (TableKind::Mbr, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => "83",
+        (TableKind::Mbr, F::Hfs | F::Hfsplus | F::Hfv) => "AF",
+        (TableKind::Mbr, F::Bfs) => "EB",
+        (TableKind::Mbr, F::Ufs) => "A5",
+        (TableKind::Gpt, F::Fat | F::Ntfs) => "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+        (TableKind::Gpt, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => {
+            "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+        }
+        (TableKind::Gpt, F::Hfs | F::Hfsplus | F::Hfv) => "48465300-0000-11AA-AA11-00306543ECAC",
+        (TableKind::Gpt, F::Ufs) => "516E7CB4-6ECF-11D6-8FF8-00022D09712B",
+        (TableKind::Apm, F::Hfs | F::Hfsplus | F::Hfv) => "Apple_HFS",
+        (TableKind::Apm, F::Prodos) => "Apple_ProDOS",
+        (TableKind::Apm, F::Mfs) => "Apple_MFS",
+        (TableKind::Apm, F::Ufs) => "Apple_UFS",
+        (TableKind::Apm, F::Bfs) => "Be_BFS",
+        (TableKind::Sgi, F::Xfs) => "XFS",
+        (TableKind::Sgi, F::Efs) => "EFS",
+        (TableKind::Rdb, F::Pfs3) => "PFS\\3",
+        (TableKind::Rdb, F::Sfs) => "SFS\\0",
+        (TableKind::Rdb, F::Affs) => "DOS\\3",
+        (TableKind::Next, F::Ufs43) => "4.3BSD",
+        (TableKind::Atari, F::Fat) if size > 16 * 1024 * 1024 => "BGM",
+        (TableKind::Atari, F::Fat) => "GEM",
+        _ => return None,
+    };
+    Some(t.to_string())
 }
 
 impl BuilderRow {
@@ -218,6 +341,20 @@ impl DiskBuilder {
         self.rows.iter().map(|r| r.source.clone()).collect()
     }
 
+    /// The filesystem to format per row, in the shape the build request wants.
+    pub fn formats(&self) -> Vec<Option<RowFormat>> {
+        self.rows
+            .iter()
+            .map(|r| {
+                if r.source.is_some() {
+                    None
+                } else {
+                    r.format.clone()
+                }
+            })
+            .collect()
+    }
+
     /// Plan the layout and check every assigned source fits. Populates
     /// `errors` and `status`; returns the plan when it is clean.
     pub fn validate(&mut self) -> Option<Vec<Placed>> {
@@ -241,6 +378,11 @@ impl DiskBuilder {
                     format_size(p.size_bytes),
                 ));
             }
+            if let (None, Some(f)) = (&row.source, &row.format) {
+                if let Err(e) = f.fits(p.size_bytes).and_then(|()| f.check()) {
+                    self.errors.push(format!("Partition {}: {e}", i + 1));
+                }
+            }
             if !row.type_text.trim().is_empty()
                 && !type_catalog::choices(self.kind).is_empty()
                 && type_catalog::describe(self.kind, &row.type_text).is_none()
@@ -256,10 +398,12 @@ impl DiskBuilder {
 
         if self.errors.iter().all(|e| e.starts_with("Warning:")) {
             let filled = self.rows.iter().filter(|r| r.source.is_some()).count();
+            let formatted = self.formats().iter().filter(|f| f.is_some()).count();
             self.status = Some(format!(
-                "Ready: {} partition(s), {} with a source image.",
+                "Ready: {} partition(s), {} with a source image, {} formatted.",
                 placed.len(),
                 filled,
+                formatted,
             ));
             Some(placed)
         } else {

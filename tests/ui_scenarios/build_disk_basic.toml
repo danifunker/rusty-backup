@@ -1,0 +1,85 @@
+# The Build Disk wizard on a partitioned image: Next blocked with a reason, a layout that cannot
+# be placed, two formatted rows, then the build; every partition opens.
+name = "Build Disk: partitioned image with formatted rows"
+vm = "build_disk"
+
+[[step]]
+expect = { step = "Kind", steps = "Kind,Output,Disk,Partitions,Review,Build", blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Output", blocked = "~save" }
+
+[[step]]
+action = "Next"
+expect = { step = "Output" }
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "SetSize"
+arg = "64M"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Partitions", rows = 1, layout = "ok" }
+
+[[step]]
+action = "RowSize"
+arg = "0:900M"
+expect = { layout = "~Layout:" }
+
+[[step]]
+action = "RowSize"
+arg = "0:24M"
+expect = { layout = "ok" }
+
+[[step]]
+action = "AddRow"
+expect = { rows = 2, layout = "ok" }
+
+[[step]]
+action = "RowFs"
+arg = "0:fat"
+expect = { row_type = "04", steps = "Kind,Output,Disk,Partitions,Options,Review,Build" }
+
+[[step]]
+action = "RowFs"
+arg = "1:ext"
+
+[[step]]
+action = "Next"
+expect = { step = "Options", blocked = "" }
+
+[[step]]
+action = "Label"
+arg = "A LABEL FAR TOO LONG FOR FAT"
+expect = { blocked = "~label" }
+
+[[step]]
+action = "Label"
+arg = "BUILT"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", blocked = "" }
+
+[[step]]
+action = "Back"
+expect = { step = "Options" }
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", opens = 2 }

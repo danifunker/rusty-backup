@@ -1,14 +1,13 @@
 //! The targets: each mode's device or image, the full-disk sizing form, the single-partition
-//! target scan, the new-disk table choice and Build Disk's target and plan.
+//! target scan and the new-disk table choice.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::source::finished;
 use super::{
-    purpose, AlignmentChoice, DiskBuilder, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType,
-    Picked, PlanSegment, RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
+    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType, Picked, PlanSegment,
+    RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
 };
-use crate::controller::{Effect, PickSpec};
 use crate::device::{DeviceIdentity, DiskDevice};
 use crate::model::job::{Job, Snapshot};
 use crate::model::source_scan::ScanFailure;
@@ -21,7 +20,6 @@ pub(super) struct TargetState {
     pub full: Target,
     pub single: Target,
     pub new_disk: Target,
-    pub build: Target,
     pub alignment: AlignmentChoice,
     pub custom_alignment: u32,
     pub expand: ExpandPlan,
@@ -32,13 +30,6 @@ pub(super) struct TargetState {
     pub sp_scan: Option<(DeviceIdentity, Job<TargetScan>)>,
     pub sp_scan_error: Option<String>,
     pub new_disk_choice: NewDiskChoice,
-    /// An image target's size, in the `rb-cli new hd --size` grammar.
-    pub build_size_text: String,
-    /// The partition plan, while Build Disk's editor is open.
-    pub builder: Option<DiskBuilder>,
-    /// The plan row a picked source image goes to, then its decoded-size probe.
-    pub build_source_row: Option<usize>,
-    pub build_source: Option<(usize, Job<(PathBuf, u64)>)>,
 }
 
 impl Default for TargetState {
@@ -47,7 +38,6 @@ impl Default for TargetState {
             full: Target::new(true),
             single: Target::new(true),
             new_disk: Target::new(true),
-            build: Target::new(false),
             alignment: AlignmentChoice::Original,
             custom_alignment: 2048,
             expand: ExpandPlan::default(),
@@ -62,10 +52,6 @@ impl Default for TargetState {
                 custom_alignment: 2048,
                 bootable: false,
             },
-            build_size_text: "512M".to_string(),
-            builder: None,
-            build_source_row: None,
-            build_source: None,
         }
     }
 }
@@ -76,7 +62,6 @@ impl TargetState {
             TargetSlot::FullDisk => &self.full,
             TargetSlot::SinglePartition => &self.single,
             TargetSlot::NewDisk => &self.new_disk,
-            TargetSlot::BuildDisk => &self.build,
         }
     }
 
@@ -85,7 +70,6 @@ impl TargetState {
             TargetSlot::FullDisk => &mut self.full,
             TargetSlot::SinglePartition => &mut self.single,
             TargetSlot::NewDisk => &mut self.new_disk,
-            TargetSlot::BuildDisk => &mut self.build,
         }
     }
 
@@ -131,7 +115,6 @@ impl RestoreController {
             TargetSlot::FullDisk,
             TargetSlot::SinglePartition,
             TargetSlot::NewDisk,
-            TargetSlot::BuildDisk,
         ] {
             let t = self.targets.target_mut(slot);
             let Some(picked) = &t.device else {
@@ -401,123 +384,5 @@ impl RestoreController {
             c.table,
             crate::model::restore_plan::new_disk_alignment_sectors(c.alignment, c.custom_alignment),
         )
-    }
-
-    // --- build disk ---------------------------------------------------------------------
-
-    pub fn build_size_text(&self) -> &str {
-        self.targets.build_size_text.as_str()
-    }
-
-    /// The typed image size, or why it does not parse.
-    pub fn build_size(&self) -> Result<u64, String> {
-        crate::partition::parse_size(self.targets.build_size_text.as_str())
-            .map_err(|e| format!("{e:#}"))
-    }
-
-    /// Build Disk's target as `(path, size)`, once complete.
-    pub fn build_target(&self) -> Option<(PathBuf, u64)> {
-        let t = &self.targets.build;
-        if t.is_device {
-            let p = t.device.as_ref()?;
-            Some((p.device.path.clone(), p.device.size_bytes))
-        } else {
-            let path = t.image.clone()?;
-            let size = self.build_size().ok()?;
-            (size > 0).then_some((path, size))
-        }
-    }
-
-    /// Build Disk's partition window content, while it is open.
-    pub fn build_view(&self) -> Option<crate::controller::partition_edit::BuildView> {
-        self.targets
-            .builder
-            .as_ref()
-            .map(crate::controller::partition_edit::build_view)
-    }
-
-    /// A row's source image is being measured.
-    pub fn build_source_probing(&self) -> Option<Snapshot> {
-        self.targets
-            .build_source
-            .as_ref()
-            .map(|(_, j)| j.snapshot())
-    }
-
-    /// An edit in Build Disk's partition window; a source pick asks for the file first.
-    pub(super) fn build_edit(
-        &mut self,
-        action: crate::controller::partition_edit::BuildAction,
-    ) -> Vec<Effect> {
-        use crate::controller::partition_edit::BuildAction;
-        let Some(builder) = self.targets.builder.as_mut() else {
-            return Vec::new();
-        };
-        if let BuildAction::PickRowSource(row) = action {
-            if row >= builder.rows.len() {
-                return Vec::new();
-            }
-            self.targets.build_source_row = Some(row);
-            let mut filters = vec![(
-                "Disk images".to_string(),
-                Self::ext(crate::model::file_types::DISK_IMAGE_EXTS),
-            )];
-            filters.push(("All Files".to_string(), vec!["*".to_string()]));
-            return vec![Effect::PickFile(PickSpec {
-                purpose: purpose::BUILD_SOURCE,
-                title: format!("Source image for partition {}", row + 1),
-                filters,
-                save: false,
-                file_name: String::new(),
-            })];
-        }
-        crate::controller::partition_edit::apply_build(builder, action);
-        Vec::new()
-    }
-
-    /// A row's source image was picked: measure its decoded size off the UI thread.
-    pub(super) fn build_source_picked(&mut self, path: PathBuf) {
-        let Some(row) = self.targets.build_source_row.take() else {
-            return;
-        };
-        let job = self.spawn("Measuring the source image...", move |_| {
-            let size = crate::model::source_reader::decoded_image_size(path.as_path()).unwrap_or(0);
-            Ok((path, size))
-        });
-        self.targets.build_source = Some((row, job));
-    }
-
-    pub(super) fn poll_build_source(&mut self) {
-        let Some(done) = self
-            .targets
-            .build_source
-            .as_ref()
-            .and_then(|(_, j)| finished(j))
-        else {
-            return;
-        };
-        let Some((row, _)) = self.targets.build_source.take() else {
-            return;
-        };
-        if let (Ok((path, size)), Some(builder)) = (done, self.targets.builder.as_mut()) {
-            crate::controller::partition_edit::set_row_source(builder, row, path, size);
-        }
-    }
-
-    pub fn builder_open(&self) -> bool {
-        self.targets.builder.is_some()
-    }
-
-    pub(super) fn build_define(&mut self) {
-        let Some((_, size)) = self.build_target() else {
-            return;
-        };
-        let kind = self
-            .targets
-            .builder
-            .as_ref()
-            .map(|b| b.kind)
-            .unwrap_or(crate::partition::type_catalog::TableKind::Mbr);
-        self.targets.builder = Some(DiskBuilder::new(kind, size));
     }
 }

@@ -93,6 +93,7 @@ impl Target for AppController {
             "SelectTab" => AppAction::SelectTab(match arg_str(arg)? {
                 "backup" => AppTab::Backup,
                 "restore" => AppTab::Restore,
+                "build" => AppTab::Build,
                 "inspect" => AppTab::Inspect,
                 "optical" => AppTab::Optical,
                 "archives" => AppTab::Archives,
@@ -693,16 +694,14 @@ impl Target for BackupTarget {
 
 /// The Restore tab's controller. Actions: `OpenBackup` (a path, `$backup` for a fresh zstd backup
 /// of a blank FAT image, or `$empty` for an empty folder), `SetMode` (`full`, `single`, `new`,
-/// `write`, `build`), `SetTargetIsDevice` (bool), `SetTargetImage` (a path, or `$out`),
-/// `SetSize` (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`, and
-/// Build Disk's `BuildTarget` (an image target of this size), `BuildDefine`, `BuildRowSize`
-/// (`row:size`), `BuildAddRow`, `BuildApply`, `SetCustomSize` / `SetCustomAlignment` /
-/// `SetExpandMib` (integers), `OpenWriteImage` (`$superfloppy`), `WriteImageTarget`.
+/// `write`), `SetTargetIsDevice` (bool), `SetTargetImage` (a path, or `$out`), `SetSize`
+/// (`original` or `minimum`, for every partition), `Start`, `Confirm`, `ClearBackup`,
+/// `SetCustomSize` / `SetCustomAlignment` / `SetExpandMib` (integers), `OpenWriteImage`
+/// (`$superfloppy`), `WriteImageTarget`.
 /// Probes: `backup` (one is loaded), `partitions`, `error` (why Start is refused, empty when it is
 /// not), `load_error`, `result` (`ok`, the failure, or empty), `output` (the restored image equals
-/// the image backed up), `log` (every line so far), `build_rows` (-1 with no plan open),
-/// `build_layout` (`ok` or why it cannot be placed), `build_result`, `built_mbr`, `modes`,
-/// `custom_mib`, `alignment`, `expand_mib`, `expand_cap`, `write_superfloppy`, `write_request`.
+/// the image backed up), `log` (every line so far), `modes`, `custom_mib`, `alignment`,
+/// `expand_mib`, `expand_cap`, `write_superfloppy`, `write_request`.
 struct RestoreTarget {
     ctl: rusty_backup::controller::restore::RestoreController,
     dir: tempfile::TempDir,
@@ -787,7 +786,6 @@ impl Target for RestoreTarget {
                 "single" => RestoreMode::SinglePartition,
                 "new" => RestoreMode::NewDisk,
                 "write" => RestoreMode::WriteImage,
-                "build" => RestoreMode::BuildDisk,
                 other => return Err(format!("unknown mode {other:?}")),
             }),
             "SetTargetIsDevice" => RestoreAction::SetTargetIsDevice(
@@ -864,35 +862,6 @@ impl Target for RestoreTarget {
                 yes: true,
             },
             "ClearBackup" => RestoreAction::ClearBackup,
-            "BuildTarget" => {
-                self.ctl
-                    .apply(RestoreAction::SetMode(RestoreMode::BuildDisk));
-                self.ctl.apply(RestoreAction::SetTargetIsDevice(
-                    TargetSlot::BuildDisk,
-                    false,
-                ));
-                self.ctl.apply(RestoreAction::SetTargetImage(
-                    TargetSlot::BuildDisk,
-                    Some(self.dir.path().join("built.img")),
-                ));
-                RestoreAction::SetBuildSize(arg_str(arg)?.to_string())
-            }
-            "BuildDefine" => RestoreAction::BuildDefine,
-            "BuildRowSize" => {
-                use rusty_backup::controller::partition_edit::BuildAction;
-                let text = arg_str(arg)?;
-                let (row, text) = text
-                    .split_once(':')
-                    .ok_or("BuildRowSize wants `row:size`")?;
-                RestoreAction::Build(BuildAction::SetRowSize {
-                    row: row.parse().map_err(|_| "bad row".to_string())?,
-                    text: text.to_string(),
-                })
-            }
-            "BuildAddRow" => {
-                RestoreAction::Build(rusty_backup::controller::partition_edit::BuildAction::AddRow)
-            }
-            "BuildApply" => RestoreAction::BuildApply,
             other => return Err(format!("RestoreController has no action {other:?}")),
         };
         let fx = self.ctl.apply(a);
@@ -953,24 +922,6 @@ impl Target for RestoreTarget {
                     None => String::new(),
                 },
             ),
-            "build_rows" => {
-                Value::Integer(self.ctl.build_view().map_or(-1, |v| v.rows.len() as i64))
-            }
-            "build_layout" => Value::String(match self.ctl.build_view().map(|v| v.layout) {
-                Some(Ok(_)) => "ok".to_string(),
-                Some(Err(e)) => e,
-                None => String::new(),
-            }),
-            "build_result" => Value::String(match self.ctl.build_result() {
-                Some(Ok(())) => "ok".to_string(),
-                Some(Err(e)) => e.clone(),
-                None => String::new(),
-            }),
-            "built_mbr" => Value::Boolean(
-                std::fs::read(self.dir.path().join("built.img"))
-                    .map(|d| d.len() > 512 && d[510..512] == [0x55, 0xAA])
-                    .unwrap_or(false),
-            ),
             other => return Err(format!("RestoreController has no probe {other:?}")),
         })
     }
@@ -980,6 +931,198 @@ impl Target for RestoreTarget {
         self.ctl.wait_finished();
         let fx = self.ctl.tick();
         self.note(fx)
+    }
+}
+
+/// The Build Disk wizard. Actions: `Next`, `Back`, `SetKind` (`partitioned`, `volume`),
+/// `OutputImage` (`$out`), `OutputDevice` (a size such as `32M`: a file of that size standing in
+/// for a device, pre-filled with 0xA5), `SetSize`, `SetTable` (a table label such as `MBR`),
+/// `RowSize` (`row:size`), `AddRow`, `RowFs` (`row:fs-id` or `row:empty`), `VolumeFs` (an fs id),
+/// `Label` (the first formatted target's label), `TypeDevicePath` (types the path asked for).
+/// Probes: `step`, `steps` (comma list), `blocked` (why Next is refused, empty when it is not),
+/// `rows`, `layout` (`ok` or why), `row_type` (row 0's type), `result` (`ok`, the failure, or
+/// empty), `opens` (how many volumes of the output open: the bare volume or each partition),
+/// `tail_zero` (the output's last 64 KiB were written as zeros, so no old data shows).
+struct BuildDiskTarget {
+    ctl: rusty_backup::controller::build_disk::BuildDiskController,
+    dir: tempfile::TempDir,
+    out: Option<PathBuf>,
+}
+
+impl BuildDiskTarget {
+    fn new() -> Self {
+        BuildDiskTarget {
+            ctl: rusty_backup::controller::build_disk::BuildDiskController::new(
+                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
+            ),
+            dir: tempfile::tempdir().expect("temp dir"),
+            out: None,
+        }
+    }
+
+    fn opens(&self) -> i64 {
+        let Some(path) = &self.out else { return 0 };
+        let open = |off: u64| {
+            std::fs::File::open(path)
+                .ok()
+                .and_then(|f| rusty_backup::fs::open_filesystem(f, off, 0, None).ok())
+                .is_some()
+        };
+        let parts = std::fs::File::open(path).ok().and_then(|f| {
+            let mut r = std::io::BufReader::new(f);
+            rusty_backup::partition::PartitionTable::detect(&mut r).ok()
+        });
+        match parts.map(|t| t.partitions()) {
+            Some(p) if !p.is_empty() => p.iter().filter(|p| open(p.start_lba * 512)).count() as i64,
+            _ => i64::from(open(0)),
+        }
+    }
+}
+
+impl Target for BuildDiskTarget {
+    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
+        use rusty_backup::controller::build_disk::{
+            purpose, BuildDiskAction as A, DiskDevice, DiskKind, FsKind, TableKind,
+        };
+        use rusty_backup::controller::partition_edit::BuildAction;
+        let row_arg = |arg: Option<&Value>| -> Result<(usize, String), String> {
+            let (r, t) = arg_str(arg)?.split_once(':').ok_or("wants `row:value`")?;
+            Ok((r.parse().map_err(|_| "bad row".to_string())?, t.to_string()))
+        };
+        let a = match action {
+            "Next" => A::Next,
+            "Back" => A::Back,
+            "SetKind" => A::SetKind(match arg_str(arg)? {
+                "partitioned" => DiskKind::Partitioned,
+                "volume" => DiskKind::Volume,
+                other => return Err(format!("unknown kind {other:?}")),
+            }),
+            "OutputImage" => {
+                let path = self.dir.path().join("built.img");
+                self.out = Some(path.clone());
+                self.ctl.apply(A::SetOutputIsDevice(false));
+                A::Picked {
+                    purpose: purpose::OUTPUT_IMAGE,
+                    path: Some(path),
+                }
+            }
+            "OutputDevice" => {
+                let size = rusty_backup::partition::parse_size(arg_str(arg)?)
+                    .map_err(|e| e.to_string())?;
+                let path = self.dir.path().join("card.bin");
+                std::fs::write(&path, vec![0xA5u8; size as usize]).map_err(|e| e.to_string())?;
+                self.out = Some(path.clone());
+                self.ctl.apply(A::SetOutputIsDevice(true));
+                A::SelectDevice {
+                    row: 0,
+                    device: DiskDevice {
+                        name: "card".into(),
+                        path,
+                        size_bytes: size,
+                        is_removable: true,
+                        is_read_only: false,
+                        is_system: false,
+                        bus_protocol: "USB".into(),
+                        media_name: "Scenario card".into(),
+                        partitions: Vec::new(),
+                    },
+                }
+            }
+            "SetSize" => A::SetSize(arg_str(arg)?.to_string()),
+            "SetTable" => {
+                let want = arg_str(arg)?;
+                let kind = self
+                    .ctl
+                    .table_view()
+                    .kinds
+                    .iter()
+                    .copied()
+                    .find(|k: &TableKind| k.label() == want)
+                    .ok_or_else(|| format!("no table {want:?}"))?;
+                A::Table(BuildAction::SetKind(kind))
+            }
+            "RowSize" => {
+                let (row, text) = row_arg(arg)?;
+                A::Table(BuildAction::SetRowSize { row, text })
+            }
+            "AddRow" => A::Table(BuildAction::AddRow),
+            "RowFs" => {
+                let (row, id) = row_arg(arg)?;
+                let fs = match id.as_str() {
+                    "empty" => None,
+                    id => Some(FsKind::from_id(id).ok_or_else(|| format!("no fs {id:?}"))?),
+                };
+                A::SetRowFs { row, fs }
+            }
+            "VolumeFs" => A::SetVolumeFs(
+                FsKind::from_id(arg_str(arg)?).ok_or_else(|| "no such fs".to_string())?,
+            ),
+            "Label" => {
+                let t = self
+                    .ctl
+                    .format_targets()
+                    .into_iter()
+                    .next()
+                    .ok_or("nothing formats")?;
+                let mut opts = t.opts.clone();
+                opts.label = arg_str(arg)?.to_string();
+                match t.row {
+                    Some(row) => A::SetRowOptions { row, opts },
+                    None => A::SetVolumeOptions(opts),
+                }
+            }
+            "TypeDevicePath" => A::SetConfirmText(self.ctl.confirm_expected().unwrap_or_default()),
+            other => return Err(format!("BuildDiskController has no action {other:?}")),
+        };
+        Ok(self.ctl.apply(a))
+    }
+
+    fn probe(&self, name: &str) -> Result<Value, String> {
+        Ok(match name {
+            "step" => Value::String(self.ctl.step().label().to_string()),
+            "steps" => Value::String(
+                self.ctl
+                    .steps()
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            "blocked" => Value::String(self.ctl.next_blocked().unwrap_or_default()),
+            "rows" => Value::Integer(self.ctl.table_view().rows.len() as i64),
+            "layout" => Value::String(match self.ctl.table_view().layout {
+                Ok(_) => "ok".to_string(),
+                Err(e) => e,
+            }),
+            "row_type" => Value::String(
+                self.ctl
+                    .table_view()
+                    .rows
+                    .first()
+                    .map(|r| r.type_text.clone())
+                    .unwrap_or_default(),
+            ),
+            "result" => Value::String(match self.ctl.outcome() {
+                Some(Ok(())) => "ok".to_string(),
+                Some(Err(e)) => e.clone(),
+                None => String::new(),
+            }),
+            "opens" => Value::Integer(self.opens()),
+            "tail_zero" => Value::Boolean(
+                self.out
+                    .as_ref()
+                    .and_then(|p| std::fs::read(p).ok())
+                    .is_some_and(|d| {
+                        d.len() >= 65536 && d[d.len() - 65536..].iter().all(|&b| b == 0)
+                    }),
+            ),
+            other => return Err(format!("BuildDiskController has no probe {other:?}")),
+        })
+    }
+
+    fn settle(&mut self) -> Vec<Effect> {
+        self.ctl.wait();
+        self.ctl.tick()
     }
 }
 
@@ -2208,6 +2351,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "backup" => Ok(Box::new(BackupTarget::new())),
         "inspect" => Ok(Box::new(InspectTarget::new())),
         "restore" => Ok(Box::new(RestoreTarget::new())),
+        "build_disk" => Ok(Box::new(BuildDiskTarget::new())),
         "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),

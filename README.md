@@ -364,14 +364,18 @@ The app has five tabs:
   Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
   gzip- or zip-wrapped images are decoded on the way to the disk). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
-  A **Build Disk** mode goes the other way: pick a blank device or name a
-  new image file, choose a table type (MBR / GPT / APM / SGI volume header
-  / SGI disk label / X68000), lay out the partitions in the shared
-  partition editor, and
-  optionally assign a source image to each one. Applying writes the table
-  and pours every assigned image into its partition in a single pass. The
-  CLI equivalent is
-  `rb-cli new hd {mbr|gpt|apm|sgi|sgi-dklabel|x68k} IMG --size 2G --partition 512M:0C:DOS --partition rest --fill 1=dos.img`.
+- **Build Disk** — a wizard that makes a new disk from nothing: a partitioned
+  disk (MBR / GPT / APM / RDB / SGI volume header / SGI disk label / Sun /
+  NeXT / Solaris x86 / X68000 / Atari AHDI) or one bare volume, saved as an
+  image file or written straight to a physical disk such as an SD or CF card.
+  Each partition is formatted blank with any of the 34 filesystems Rusty
+  Backup can create, filled from a source image, or left empty; its type
+  follows the filesystem. The wizard checks each filesystem's size limits and
+  label rules before it lets you go on, and a device build asks you to type
+  the device path first. On a device every byte of a formatted partition is
+  written, so old data on a used card cannot show through. The CLI
+  equivalents are `rb-cli new volume` and
+  `rb-cli new hd {mbr|gpt|apm|...} IMG --size 2G --partition 512M:0C:DOS --partition rest --fill 1=dos.img`.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox

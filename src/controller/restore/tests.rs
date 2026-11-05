@@ -289,40 +289,6 @@ fn fake_device(path: &Path) -> DiskDevice {
 }
 
 #[test]
-fn building_on_a_device_asks_for_its_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let dev = fake_device(dir.path().join("dev").as_path());
-    let mut ctl = controller();
-    ctl.apply(RestoreAction::SetMode(RestoreMode::BuildDisk));
-    ctl.apply(RestoreAction::BuildDefine);
-    assert!(!ctl.builder_open(), "no target yet");
-    ctl.apply(RestoreAction::SetTargetIsDevice(
-        TargetSlot::BuildDisk,
-        true,
-    ));
-    ctl.apply(RestoreAction::SelectDevice {
-        slot: TargetSlot::BuildDisk,
-        row: 0,
-        device: dev.clone(),
-    });
-    ctl.apply(RestoreAction::BuildDefine);
-    assert!(ctl.builder_open());
-    let fx = ctl.apply(RestoreAction::BuildApply);
-    let spec = match &fx[..] {
-        [Effect::AskText(spec)] => spec.clone(),
-        other => panic!("expected the typed confirmation, got {other:?}"),
-    };
-    assert!(spec.validate("nope").is_err());
-    assert!(spec.validate(dev.display_name().as_str()).is_ok());
-    ctl.apply(RestoreAction::Answered {
-        purpose: purpose::BUILD,
-        text: Some("nope".into()),
-    });
-    assert!(!ctl.is_running());
-    assert!(ctl.builder_open());
-}
-
-#[test]
 fn a_refreshed_list_drops_the_old_disks_scan() {
     let dir = tempfile::tempdir().unwrap();
     let a = fake_device(dir.path().join("a").as_path());

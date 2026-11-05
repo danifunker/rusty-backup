@@ -5,8 +5,8 @@
 //! space; alignment; per-partition sizes with the layout-fit check), Single Partition (target
 //! scan and partition pick), New Disk (table, alignment, bootable) and Write Image File, whose
 //! image goes to a headless `DiskWriteController` drawn as the GUI's Physical Disk Export window
-//! (target, region, synthesized table, the typed device name). Build Disk is planned separately
-//! (docs/build_disk_plan.md). See docs/phase2_commander_plan.md § "Slice 25".
+//! (target, region, synthesized table, the typed device name). Building a fresh disk is the Build
+//! Disk screen's. See docs/phase2_commander_plan.md § "Slice 25".
 
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +36,7 @@ pub(super) enum RestoreStep {
     Run,
 }
 
-/// The modes the screen offers, in order (Build Disk has its own plan).
+/// The modes the screen offers, in order.
 const MODES: &[(RestoreMode, &str)] = &[
     (RestoreMode::FullDisk, "Full Disk Restore"),
     (RestoreMode::SinglePartition, "Restore Single Partition"),
@@ -311,7 +311,6 @@ impl RestoreState {
         match self.ctl.mode() {
             RestoreMode::SinglePartition => TargetSlot::SinglePartition,
             RestoreMode::NewDisk => TargetSlot::NewDisk,
-            RestoreMode::BuildDisk => TargetSlot::BuildDisk,
             RestoreMode::FullDisk | RestoreMode::WriteImage => TargetSlot::FullDisk,
         }
     }
@@ -418,7 +417,6 @@ impl RestoreState {
                     f.push(Field::WriteTarget);
                 }
             }
-            RestoreMode::BuildDisk => {}
         }
         f
     }
@@ -1077,10 +1075,7 @@ impl App {
             };
             let (label, value): (String, String) = match f {
                 Field::Mode => {
-                    let name = MODES
-                        .iter()
-                        .find(|m| m.0 == c.mode())
-                        .map_or("Build Disk", |m| m.1);
+                    let name = MODES.iter().find(|m| m.0 == c.mode()).map_or("?", |m| m.1);
                     ("Mode:".into(), format!("< {name} >"))
                 }
                 Field::Backup => (
@@ -1392,10 +1387,6 @@ impl App {
             ]));
             // What each row found, under it.
             match f {
-                Field::Mode if c.mode() == RestoreMode::BuildDisk => dim(
-                    lines,
-                    "Build Disk is planned for the TUI (docs/build_disk_plan.md).".into(),
-                ),
                 Field::Backup => {
                     if let Some(snap) = c.loading() {
                         dim(lines, format!("{}...", snap.label));
