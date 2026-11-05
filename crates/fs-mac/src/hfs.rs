@@ -3049,6 +3049,32 @@ pub fn write_blank_hfs_into<W: Write + Seek>(
     )
 }
 
+/// [`write_blank_hfs_into`] with B-tree size floors, the streaming twin of [`create_blank_hfs_sized`].
+pub fn write_blank_hfs_sized_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    min_extents_bytes: u32,
+    min_catalog_bytes: u32,
+) -> Result<u64, FilesystemError> {
+    let (front, mdb, image_size) = build_blank_hfs_front(
+        target_size_bytes,
+        block_size,
+        volume_name,
+        min_extents_bytes,
+        min_catalog_bytes,
+        hfs_common::hfs_now(),
+    )?;
+    target.seek(SeekFrom::Start(at_offset))?;
+    target.write_all(&front)?;
+    target.seek(SeekFrom::Start(at_offset + image_size - 1024))?;
+    target.write_all(&mdb)?;
+    target.write_all(&[0u8; 512])?;
+    Ok(image_size)
+}
+
 /// [`write_blank_hfs_into`] with the volume dates fixed at `now`.
 pub(crate) fn write_blank_hfs_into_at<W: Write + Seek>(
     target: &mut W,
@@ -7882,5 +7908,25 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn sized_streaming_matches_in_memory() {
+        // The dates come from the clock, so a pair built across a second boundary is redone.
+        for _ in 0..5 {
+            let t0 = hfs_common::hfs_now();
+            let mem = create_blank_hfs_sized(20 << 20, 1024, "Vol", 64 << 10, 128 << 10).unwrap();
+            let mut cur = std::io::Cursor::new(vec![0u8; 20 << 20]);
+            let len =
+                write_blank_hfs_sized_into(&mut cur, 0, 20 << 20, 1024, "Vol", 64 << 10, 128 << 10)
+                    .unwrap();
+            if hfs_common::hfs_now() != t0 {
+                continue;
+            }
+            assert_eq!(len as usize, mem.len());
+            assert!(cur.get_ref()[..mem.len()] == mem[..]);
+            return;
+        }
+        panic!("the clock ticked during every attempt");
     }
 }

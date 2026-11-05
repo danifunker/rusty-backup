@@ -5980,6 +5980,35 @@ fn build_blank_hfsplus_front(
     (front, vh_bytes, image_size)
 }
 
+/// Streaming twin of [`create_blank_hfsplus_sized`]; returns the volume's image size.
+#[allow(clippy::too_many_arguments)]
+pub fn write_blank_hfsplus_sized_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+    min_catalog_bytes: u32,
+    min_extents_bytes: u32,
+) -> std::io::Result<u64> {
+    let (front, vh_bytes, image_size) = build_blank_hfsplus_front(
+        size_bytes,
+        block_size,
+        name,
+        case_sensitive,
+        min_catalog_bytes,
+        min_extents_bytes,
+    );
+    let image_size = image_size as u64;
+    target.seek(SeekFrom::Start(at_offset))?;
+    target.write_all(&front)?;
+    target.seek(SeekFrom::Start(at_offset + image_size - 1024))?;
+    target.write_all(&vh_bytes)?;
+    target.write_all(&[0u8; 512])?;
+    Ok(image_size)
+}
+
 /// Streaming variant of [`create_blank_hfsplus`]. Writes the metadata
 /// regions (boot, VH, bitmap, B-trees, alt-VH) into `target` at `at_offset`
 /// and leaves the free middle untouched. Caller is responsible for sizing
@@ -10049,5 +10078,25 @@ mod tests {
             "shuffled multi-dir leaf occupancy {occupancy:.3} (<0.80) over {leaves} leaves — \
              the rotation is not packing densely"
         );
+    }
+
+    #[test]
+    fn sized_streaming_matches_in_memory() {
+        // The dates come from the clock, so a pair built across a second boundary is redone.
+        for _ in 0..5 {
+            let t0 = hfs_common::hfs_now();
+            let mem = create_blank_hfsplus_sized(20 << 20, 4096, "Vol", true, 8192, 0);
+            let mut cur = std::io::Cursor::new(vec![0u8; 20 << 20]);
+            let len =
+                write_blank_hfsplus_sized_into(&mut cur, 0, 20 << 20, 4096, "Vol", true, 8192, 0)
+                    .unwrap();
+            if hfs_common::hfs_now() != t0 {
+                continue;
+            }
+            assert_eq!(len as usize, mem.len());
+            assert!(cur.get_ref()[..mem.len()] == mem[..]);
+            return;
+        }
+        panic!("the clock ticked during every attempt");
     }
 }

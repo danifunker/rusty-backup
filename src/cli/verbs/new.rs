@@ -14,183 +14,18 @@
 //!
 //! Each class exposes only the filesystems and flags valid for it, so
 //! `new floppy --help` no longer lists NTFS/ext4 and `--cpm-preset` only
-//! appears where CP/M can be formatted. All three ultimately funnel through
-//! the shared [`FsKind`] dispatch in [`format_image`].
+//! appears where CP/M can be formatted. `floppy` and `volume` both format
+//! through [`crate::model::format`], the dispatch Build Disk uses too.
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// The `--name` default every `new` subcommand shares.
-pub const DEFAULT_VOLUME_NAME: &str = "rusty-backup";
-
-/// ProDOS allows only letters, digits and `.`, so it cannot take the shared
-/// default and `new volume prodos` always failed with no arguments (R-006).
-/// Kept recognisably the same name rather than something generic.
-pub const PRODOS_DEFAULT_VOLUME_NAME: &str = "RUSTY.BACKUP";
+use crate::model::format::{FormatOptions, FsKind};
+pub use crate::model::format::{DEFAULT_VOLUME_NAME, PRODOS_DEFAULT_VOLUME_NAME};
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use fs_pc::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum FsKind {
-    /// Classic HFS (Mac OS Standard).
-    Hfs,
-    /// HFS+ / HFSX (Mac OS Extended). A bare single volume, no partition
-    /// map. Use --case-sensitive for HFSX and --min-catalog to floor the
-    /// catalog B-tree size.
-    Hfsplus,
-    /// BasiliskII HFV — a flat classic-HFS volume, no partition table.
-    /// Same on-disk bytes as `hfs`, but capped at 2047 MB and with the
-    /// allocation block size auto-floored so the result is mountable by
-    /// BasiliskII / SheepShaver and classic Mac OS.
-    Hfv,
-    /// FAT12 / FAT16 / FAT32, auto-selected: FAT32 above 2 GiB, otherwise
-    /// FAT12 or FAT16 by cluster count (small volumes are FAT12).
-    Fat,
-    /// IRIX EFS (single cylinder group).
-    Efs,
-    /// SGI EFS v1 (IRIS 2000 / 3000). Written in native byte order; run
-    /// `rb-cli swab16` to match a byte-swapped capture.
-    #[value(name = "efs-v1")]
-    EfsV1,
-    /// XFS (IRIX 6 / Linux). A v5/CRC volume with 4 KiB blocks, 512-byte
-    /// inodes and an internal log; minimum 32 MiB.
-    Xfs,
-    /// Amiga FFS / OFS (variant selected via --affs-variant).
-    Affs,
-    /// Amiga PFS3 (`PFS\3`). A bare volume; reserved-block size scales with
-    /// the volume (1 KiB below ~1 GB, 4 KiB above).
-    Pfs3,
-    /// Amiga SFS (`SFS\0`). A bare volume, 512-byte blocks, minimum 64 blocks.
-    Sfs,
-    /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
-    /// --cluster-size / --sector-size; both auto-selected when unset.
-    Ntfs,
-    /// HPFS (OS/2 High Performance File System). A bare single volume with
-    /// boot/super/spare blocks, free-space bitmaps, a directory band, and an
-    /// empty root directory. `--name` sets the volume label.
-    Hpfs,
-    /// ext2 (Linux). A plain rev-1 ext2 volume (128-byte inodes, no journal or
-    /// checksums); block size auto-selected (1 KiB below 8 MiB, else 4 KiB).
-    #[value(alias = "ext2")]
-    Ext,
-    /// ext3 (Linux). ext2 plus an empty jbd2 journal; 4 KiB blocks, minimum
-    /// ~8 MiB (must hold the 4 MiB journal).
-    Ext3,
-    /// ext4 (Linux). Extents + metadata_csum (crc32c) + a jbd2 journal; 256-byte
-    /// inodes, 4 KiB blocks, minimum ~8 MiB.
-    Ext4,
-    /// ProDOS (Apple II / IIgs). A bare volume with boot blocks, a 4-block
-    /// volume directory, and a bitmap; size rounds to 512-byte blocks, from a
-    /// 8 KiB minimum up to a ~32 MiB (65535-block) maximum. The name is
-    /// uppercased and must follow ProDOS rules: up to 15 of A-Z / 0-9 / '.',
-    /// with a leading letter.
-    Prodos,
-    /// Atari DOS 2.0S (Atari 8-bit). A single-density 90 KB floppy (720 × 128 B
-    /// sectors) with boot / VTOC / directory reserved. Fixed geometry, so
-    /// `--size` and `--name` are ignored (enhanced density is read-only).
-    Atari,
-    /// Apple DOS 3.3 (Apple II). A 140 KB 5.25" floppy (35 × 16 × 256, DOS
-    /// order) with a VTOC + empty catalog and only track 17 reserved (a
-    /// non-bootable data disk). Fixed geometry, so `--size` / `--name` are
-    /// ignored.
-    #[value(alias = "appledos", alias = "dos33")]
-    AppleDos,
-    /// CP/M (Amstrad / PCW, Einstein, SV-328, Altair, MultiComp, ZX +3). The
-    /// geometry comes from the disk-parameter block chosen with `--cpm-preset`
-    /// (required); `--size` / `--name` are ignored. A blank CP/M disk is just
-    /// its reserved tracks + data area filled with 0xE5.
-    Cpm,
-    /// OS-9 / NitrOS-9 RBF (Tandy CoCo, Dragon). A standard 35-track floppy
-    /// (630 × 256-byte sectors): identification sector, allocation bitmap, and
-    /// an empty root directory. Fixed geometry, so `--size` is ignored; `--name`
-    /// is sanitized to the OS-9 name set (A-Z a-z 0-9 . _ $).
-    #[value(alias = "nitros9", alias = "rbf")]
-    Os9,
-    /// Minix V1 (Minix, early Linux). Classic 30-char-name filesystem (magic
-    /// 0x138F), 1 KiB blocks, geometry matching `mkfs.minix -1`; up to 64 MiB.
-    /// `--name` is ignored (Minix has no volume label).
-    #[value(alias = "minix1")]
-    Minix,
-    /// Minix V2 (magic 0x2478): like V1 with 32-bit zone pointers and triple
-    /// indirection, matching `mkfs.minix -2`.
-    Minix2,
-    /// Minix V3 (magic 0x4D5A): 60-char names, matching `mkfs.minix -3`.
-    Minix3,
-    /// UCSD p-System (UCSD Pascal — Apple II/III, PC). A flat volume with a
-    /// zeroed bootstrap and an empty directory. `--name` sets the volume label
-    /// (uppercased, ≤ 7 chars). Defaults to a 140 KB Apple II floppy.
-    #[value(alias = "pascal", alias = "psystem")]
-    Ucsd,
-    /// TR-DOS (ZX Spectrum Beta Disk). A flat volume with an empty catalogue.
-    /// `--name` sets the 8-char disk label. Geometry follows `--size`: the
-    /// smallest of 160 KB (40-track SS), 320 KB (80-track SS), or 640 KB
-    /// (80-track DS, the default and maximum) that covers it.
-    #[value(alias = "beta", alias = "betadisk", alias = "zx")]
-    Trdos,
-    /// TI-99/4A disk. An empty VIB + FDIR (flat V9T9 `.dsk`). `--name` sets the
-    /// 10-char disk name. Geometry follows `--size`: the smallest of 90 KB
-    /// (SSSD), 180 KB (DSSD), or 360 KB (DSDD, the default and maximum).
-    #[value(alias = "ti99_4a", alias = "ti994a")]
-    Ti99,
-    /// Oric Jasmin (Oric-1 / Atmos / Telestrat). A flat 256-byte-sector image
-    /// with an empty directory. Single-sided (178432 bytes / 697 blocks);
-    /// `--name` sets the 8-char volume name. `--size` is ignored.
-    #[value(alias = "jasmin")]
-    Oric,
-    /// BFS (BeOS / Haiku). A bare volume with 1 KiB blocks, an allocation
-    /// bitmap, a 2 MiB log, and an empty root directory in allocation group 8
-    /// — which is why the minimum size is 72 MiB. Little-endian by default
-    /// (BeOS/Intel); pass `--big-endian` for the BeOS/PPC byte order.
-    #[value(alias = "befs", alias = "beos")]
-    Bfs,
-    /// BeOS OFS (the pre-BFS filesystem of the Hobbit BeBox and the early
-    /// PowerPC Developer Releases). A version-1 volume: table of contents,
-    /// sector bitmap, and an empty root directory. Big-endian, 512-byte
-    /// sectors. `--name` sets the volume name.
-    #[value(alias = "beos-ofs")]
-    Ofs,
-    /// MFS (Macintosh File System — Mac 128K / 512K / Plus). A flat, pre-HFS
-    /// 400 KB / 800 KB floppy volume: zeroed boot blocks, an MDB, an all-free
-    /// allocation map, and an empty directory. `--name` sets the volume label
-    /// (Mac Roman, up to 27 chars). Geometry follows `--size` (which defaults
-    /// to 800 KB; pass `--size 400K` for the classic single-sided floppy).
-    #[value(alias = "macintosh")]
-    Mfs,
-    /// Acorn ADFS E-format (Archimedes / RISC OS). An 800 KB double-sided
-    /// floppy: 1024-byte sectors, single-zone new-map Free Space Map, and an
-    /// empty Hugo root directory. Fixed geometry, so `--size` is ignored;
-    /// `--name` sets the 10-char disc name (space-padded).
-    #[value(alias = "acorn")]
-    Adfs,
-    /// UFS1 / FFS (4.4BSD, FreeBSD, NetBSD, OpenBSD, Solaris). A `newfs`
-    /// volume with the 4.4BSD `struct cg`: 8 KiB blocks over 1 KiB fragments
-    /// by default, one inode per 4 fragments, and an empty root directory.
-    /// `--block-size` sets `fs_bsize` (fragments are an eighth of it),
-    /// `--bytes-per-inode` the inode density, `--big-endian` the SPARC / m68k
-    /// byte order, and `--name` the volume label.
-    #[value(alias = "ufs1", alias = "ffs")]
-    Ufs,
-    /// UFS1 in the pre-4.4BSD on-disk format (NeXTSTEP / OPENSTEP): the
-    /// 4.3BSD `struct cg`, 16-bit `d_namlen` directory entries with no
-    /// `d_type`, device blocks the size of a fragment, cylinder groups
-    /// staggered across tracks, and live rotational-layout tables. This is
-    /// what goes inside a `new hd next` partition; a 4.4BSD volume there
-    /// parses but NeXTSTEP cannot read its directories. Big-endian by
-    /// default, which is the byte order every NeXT disk uses; `--name` is
-    /// ignored because 4.3BSD has no volume-label field.
-    #[value(name = "ufs-43bsd", alias = "ufs43", alias = "nextstep")]
-    Ufs43,
-    /// UFS1 as Solaris / SunOS 5 writes it: real drive geometry, cylinder
-    /// groups staggered across tracks, live rotational tables, 16-bit
-    /// `d_namlen` directory entries and Sun's `fs_state` stamp. This is what
-    /// goes inside a `new hd sun` slice; Solaris's fsck rejects a 4.4BSD
-    /// volume there. Big-endian by default (SPARC); `--name` is ignored.
-    #[value(name = "ufs-solaris", alias = "solaris")]
-    UfsSun,
-}
 
 /// The three media classes `new` creates. CD-ROM images are not here —
 /// they live under `optical new`.
@@ -332,7 +167,7 @@ pub enum FloppyFs {
 }
 
 impl FloppyFs {
-    fn to_fs_kind(self) -> FsKind {
+    pub fn to_fs_kind(self) -> FsKind {
         match self {
             FloppyFs::Fat => FsKind::Fat,
             FloppyFs::Hfs => FsKind::Hfs,
@@ -415,7 +250,7 @@ pub enum VolumeFs {
 }
 
 impl VolumeFs {
-    fn to_fs_kind(self) -> FsKind {
+    pub fn to_fs_kind(self) -> FsKind {
         match self {
             VolumeFs::Hfs => FsKind::Hfs,
             VolumeFs::Hfsplus => FsKind::Hfsplus,
@@ -489,26 +324,22 @@ pub struct FloppyArgs {
 }
 
 impl FloppyArgs {
-    fn into_new_args(self) -> NewArgs {
-        NewArgs {
-            image: self.image,
-            fs: self.fs.to_fs_kind(),
-            size: self.size,
-            name: self.name,
+    fn format(self) -> Result<()> {
+        let opts = FormatOptions {
             block_size: self.block_size,
-            big_endian: false,
-            catalog_size: self.catalog_size,
-            extents_size: self.extents_size,
-            case_sensitive: false,
-            min_catalog: None,
-            affs_variant: 1,
+            catalog_bytes: parse_opt_size(self.catalog_size.as_deref(), "--catalog-size")?,
+            extents_bytes: parse_opt_size(self.extents_size.as_deref(), "--extents-size")?,
             fat32: self.fat32,
             cpm_preset: self.cpm_preset,
-            inodes: None,
-            bytes_per_inode: None,
-            cluster_size: None,
-            sector_size: None,
-        }
+            ..FormatOptions::default()
+        };
+        format_cli(
+            &self.image,
+            &self.size,
+            &self.name,
+            self.fs.to_fs_kind(),
+            opts,
+        )
     }
 }
 
@@ -591,34 +422,37 @@ pub struct VolumeArgs {
 }
 
 impl VolumeArgs {
-    fn into_new_args(self) -> NewArgs {
-        NewArgs {
-            image: self.image,
-            fs: self.fs.to_fs_kind(),
-            size: self.size,
-            name: self.name,
+    fn format(self) -> Result<()> {
+        let opts = FormatOptions {
             block_size: self.block_size,
             big_endian: self.big_endian,
-            catalog_size: self.catalog_size,
-            extents_size: self.extents_size,
+            catalog_bytes: parse_opt_size(self.catalog_size.as_deref(), "--catalog-size")?,
+            extents_bytes: parse_opt_size(self.extents_size.as_deref(), "--extents-size")?,
             case_sensitive: self.case_sensitive,
-            min_catalog: self.min_catalog,
-            affs_variant: self.affs_variant,
+            min_catalog: parse_opt_size(self.min_catalog.as_deref(), "--min-catalog")?,
             fat32: self.fat32,
-            cpm_preset: None,
+            affs_variant: self.affs_variant,
             inodes: self.inodes,
             bytes_per_inode: self.bytes_per_inode,
-            cluster_size: self.cluster_size,
+            cluster_bytes: parse_opt_size(self.cluster_size.as_deref(), "--cluster-size")?,
             sector_size: self.sector_size,
-        }
+            ..FormatOptions::default()
+        };
+        format_cli(
+            &self.image,
+            &self.size,
+            &self.name,
+            self.fs.to_fs_kind(),
+            opts,
+        )
     }
 }
 
 /// Dispatch a parsed `new` subcommand to its formatter.
 pub fn run(cmd: NewCommand) -> Result<()> {
     match cmd {
-        NewCommand::Floppy(args) => format_image(args.into_new_args()),
-        NewCommand::Volume(args) => format_image(args.into_new_args()),
+        NewCommand::Floppy(args) => args.format(),
+        NewCommand::Volume(args) => args.format(),
         NewCommand::Hd { cmd } => match cmd {
             HdCommand::X68k(args) => super::new_x68k_hdd::run(args),
             HdCommand::SgiEfs(args) => super::new_sgi_hdd::run(args),
@@ -659,639 +493,37 @@ pub fn run(cmd: NewCommand) -> Result<()> {
     }
 }
 
-/// Internal plumbing struct: the union of every `new` flag, built from a
-/// class-specific arg struct and dispatched by [`format_image`]. Still derives
-/// `Args` so its field attributes stay valid, but it is never wired to a
-/// top-level command — the class subcommands construct it directly.
-#[derive(Debug, Args)]
-pub struct NewArgs {
-    /// Image file to create. Overwritten if it already exists.
-    pub image: PathBuf,
-
-    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
-    /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
-    /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
-    /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx),
-    /// ti99 (alias ti99_4a / ti994a), mfs (alias macintosh), adfs (alias acorn).
-    #[arg(long, value_enum)]
-    pub fs: FsKind,
-
-    /// Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB`
-    /// suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy).
-    #[arg(long, default_value = "800K")]
-    pub size: String,
-
-    /// Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac
-    /// Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`).
-    /// EFS: 6-byte fname/fpack. AFFS: up to 30 bytes.
-    #[arg(long, default_value = DEFAULT_VOLUME_NAME)]
-    pub name: String,
-
-    /// HFS allocation block size in bytes. Must be a non-zero multiple of
-    /// 512. When unset, the smallest size that keeps `total_blocks <=
-    /// 65535` is chosen automatically. On `--fs bfs` this is the BFS block
-    /// size (a power of two in 1024..=8192, default 1024); on `--fs ufs` it is
-    /// `fs_bsize` (default 8192) and the fragment is an eighth of it. Ignored
-    /// for other filesystems.
-    #[arg(long = "block-size")]
-    pub block_size: Option<u32>,
-
-    /// BFS and UFS: write the big-endian byte order (BeOS/PPC; SPARC / m68k /
-    /// MIPS) instead of the little-endian default. Ignored elsewhere.
-    #[arg(long = "big-endian")]
-    pub big_endian: bool,
-
-    /// HFS Catalog B-tree initial size in bytes (rounded up to a whole
-    /// allocation block). When unset, scales with volume size like
-    /// hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other
-    /// filesystems.
-    #[arg(long = "catalog-size")]
-    pub catalog_size: Option<String>,
-
-    /// HFS Extents-overflow B-tree initial size in bytes (rounded up to a
-    /// whole allocation block). When unset, ~half the catalog size.
-    /// Ignored for other filesystems.
-    #[arg(long = "extents-size")]
-    pub extents_size: Option<String>,
-
-    /// HFS+ only: format a case-sensitive (HFSX) volume instead of the
-    /// default case-insensitive HFS+. Ignored for other filesystems.
-    #[arg(long = "case-sensitive")]
-    pub case_sensitive: bool,
-
-    /// HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up
-    /// to whole 4096-byte nodes). Set this *small* to make the catalog easy
-    /// to outgrow and exercise the fork grow-on-full path. Ignored for other
-    /// filesystems.
-    #[arg(long = "min-catalog")]
-    pub min_catalog: Option<String>,
-
-    /// FAT only: format FAT32 regardless of size. Without this the type is
-    /// picked from the capacity and only reaches FAT32 above 2 GiB, which
-    /// cannot express an EFI System Partition - FAT32, and usually
-    /// 100-512 MiB.
-    #[arg(long = "fat32")]
-    pub fat32: bool,
-
-    /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
-    /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
-    #[arg(long = "affs-variant", default_value = "1")]
-    pub affs_variant: u8,
-
-    /// CP/M disk-parameter-block preset (required with `--fs cpm`). One of:
-    /// amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm,
-    /// altair_8in, altair_cf, multicomp, zxplus3.
-    #[arg(long = "cpm-preset")]
-    pub cpm_preset: Option<String>,
-
-    /// EFS only: approximate total inode count. The formatter scales its
-    /// cylinder groups to hit roughly this many inodes. Mutually exclusive with
-    /// `--bytes-per-inode`; default density is ~1 inode/4 KiB.
-    #[arg(long, conflicts_with = "bytes_per_inode")]
-    pub inodes: Option<u64>,
-
-    /// EFS and UFS: inode density in bytes per inode (smaller = more inodes),
-    /// floored at one inode per 512-byte block on EFS and at one per fragment
-    /// on UFS, which defaults to one per 4 fragments. Mutually exclusive with
-    /// `--inodes`.
-    #[arg(long)]
-    pub bytes_per_inode: Option<u64>,
-
-    /// NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain
-    /// byte count. A power of two from 512 to 2 MiB and at least the sector
-    /// size. When unset, chosen automatically from the volume size (the classic
-    /// mkntfs default-by-size table). Ignored for other filesystems.
-    #[arg(long = "cluster-size")]
-    pub cluster_size: Option<String>,
-
-    /// NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512.
-    /// Ignored for other filesystems.
-    #[arg(long = "sector-size")]
-    pub sector_size: Option<u32>,
+/// A size flag in bytes, clamped to `u32` as the formatters take it.
+fn parse_opt_size(s: Option<&str>, flag: &str) -> Result<Option<u32>> {
+    s.map(|s| parse_size(s).with_context(|| format!("parsing {flag}")))
+        .transpose()
+        .map(|v| v.map(|v| v.min(u32::MAX as u64) as u32))
 }
 
-/// Shared formatter: validate cross-flag/fs constraints, then dispatch on
-/// [`FsKind`]. Fed by the class subcommands via `into_new_args`.
-fn format_image(args: NewArgs) -> Result<()> {
-    if (args.inodes.is_some() || args.bytes_per_inode.is_some()) && args.fs != FsKind::Efs {
-        anyhow::bail!("--inodes / --bytes-per-inode are only valid with --fs efs");
-    }
-    let cluster_bytes = args
-        .cluster_size
-        .as_deref()
-        .map(|s| parse_size(s).context("parsing --cluster-size"))
-        .transpose()?
-        .map(|v| v.min(u32::MAX as u64) as u32);
-    if (cluster_bytes.is_some() || args.sector_size.is_some()) && args.fs != FsKind::Ntfs {
-        anyhow::bail!("--cluster-size / --sector-size are only valid with --fs ntfs");
-    }
-    if (args.case_sensitive || args.min_catalog.is_some()) && args.fs != FsKind::Hfsplus {
-        anyhow::bail!("--case-sensitive / --min-catalog are only valid with --fs hfsplus");
-    }
-    if args.cpm_preset.is_some() && args.fs != FsKind::Cpm {
-        anyhow::bail!("--cpm-preset is only valid with --fs cpm");
-    }
-    match args.fs {
-        FsKind::Hfs => {
-            let catalog_bytes = args
-                .catalog_size
-                .as_deref()
-                .map(|s| parse_size(s).context("parsing --catalog-size"))
-                .transpose()?
-                .map(|v| v.min(u32::MAX as u64) as u32);
-            let extents_bytes = args
-                .extents_size
-                .as_deref()
-                .map(|s| parse_size(s).context("parsing --extents-size"))
-                .transpose()?
-                .map(|v| v.min(u32::MAX as u64) as u32);
-            crate::cli::api::hfs::cmd_new_sized(
-                args.image,
-                &args.size,
-                &args.name,
-                args.block_size,
-                catalog_bytes,
-                extents_bytes,
-            )
-        }
-        FsKind::Hfsplus => {
-            let min_catalog = args
-                .min_catalog
-                .as_deref()
-                .map(|s| parse_size(s).context("parsing --min-catalog"))
-                .transpose()?
-                .map(|v| v.min(u32::MAX as u64) as u32);
-            crate::cli::api::hfs::cmd_new_hfsplus_sized(
-                args.image,
-                &args.size,
-                &args.name,
-                args.block_size,
-                args.case_sensitive,
-                min_catalog,
-            )
-        }
-        FsKind::Hfv => {
-            // A flat HFV is just a blank classic-HFS volume with the BasiliskII
-            // limits enforced: <= 2047 MB and a block size that keeps
-            // total_blocks <= 65535. build_blank_hfv validates the cap.
-            let explicit_bs = args.block_size;
-            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
-                let bs = explicit_bs.unwrap_or_else(|| fs_mac::hfv::suggest_block_size(size));
-                Ok(fs_mac::hfv::build_blank_hfv(size, bs, name)?)
-            })
-        }
-        FsKind::Fat => {
-            let fat32 = args.fat32;
-            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
-                if fat32 {
-                    fs_pc::fat::create_blank_fat32(size, Some(name))
-                } else {
-                    fs_pc::fat::create_blank_fat(size, Some(name))
-                }
-            })
-        }
-        FsKind::Efs => write_blank_efs_image(
-            &args.image,
-            &args.size,
-            &args.name,
-            fs_unix::efs::resolve_bytes_per_inode(
-                parse_size(&args.size).context("parsing --size")?,
-                args.inodes,
-                args.bytes_per_inode,
-            ),
-        ),
-        FsKind::EfsV1 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            fs_unix::efs_v1::create_blank_efs_v1(size, name)
-        }),
-        FsKind::Xfs => write_blank_xfs_image(&args.image, &args.size, &args.name),
-        FsKind::Affs => {
-            let variant = args.affs_variant;
-            format_and_write(&args.image, &args.size, &args.name, |size, name| {
-                fs_amiga::affs::create_blank_affs(size, variant, name)
-            })
-        }
-        // Both Amiga builders count 512-byte blocks, not bytes, and both
-        // already existed — they were only ever reachable from unit tests.
-        FsKind::Pfs3 => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            let blocks = blocks_512(size, "PFS3")?;
-            Ok(fs_amiga::pfs3::create_blank_pfs3(blocks, name)?)
-        }),
-        FsKind::Sfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            let blocks = blocks_512(size, "SFS")?;
-            Ok(fs_amiga::sfs::create_blank_sfs(blocks, name)?)
-        }),
-        FsKind::Ntfs => {
-            let raw = parse_size(&args.size).context("parsing --size")?;
-            let sector = args.sector_size.unwrap_or(512);
-            // Auto cluster follows the mkntfs default-by-size table (512-byte
-            // sectors); when an explicit sector size is given the cluster is
-            // floored to it so the geometry stays valid.
-            let geometry = match cluster_bytes {
-                Some(c) => NtfsGeometry::with_cluster_size(c, sector)?,
-                None => {
-                    let auto = NtfsGeometry::for_volume_size(raw).cluster_size() as u32;
-                    NtfsGeometry::with_cluster_size(auto.max(sector), sector)?
-                }
-            };
-            let cluster = geometry.cluster_size();
-            let total_size = raw / cluster * cluster;
-            if total_size == 0 {
-                anyhow::bail!("--size {raw} is smaller than one {cluster}-byte NTFS cluster");
-            }
-            if total_size != raw {
-                log_stderr(format!(
-                    "Note: NTFS size rounded down to {total_size} bytes (multiple of the {cluster}-byte cluster)"
-                ));
-            }
-            // ~1 MFT record per 256 KiB, with a 128-record floor for headroom.
-            let mft_records_hint = (total_size / (256 * 1024)).clamp(128, 1 << 20);
-            write_blank_ntfs_image(
-                &args.image,
-                total_size,
-                geometry,
-                mft_records_hint,
-                &args.name,
-            )
-        }
-        FsKind::Hpfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            Ok(fs_hpfs::hpfs::create_blank_hpfs(size, name)?)
-        }),
-        FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
-        FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
-        FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
-        // ProDOS forbids '-', so the shared default is invalid there and the
-        // verb always failed with no arguments (R-006). Only the untouched
-        // default is substituted — an explicit --name still gets a real error.
-        FsKind::Prodos => {
-            let name = if args.name == DEFAULT_VOLUME_NAME {
-                PRODOS_DEFAULT_VOLUME_NAME
-            } else {
-                &args.name
-            };
-            format_and_write(&args.image, &args.size, name, |size, name| {
-                fs_apple2::prodos::create_blank_prodos(size, name)
-            })
-        }
-        FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
-            Ok(fs_8bit::atari_dos::create_blank_atari_sd())
-        }),
-        FsKind::AppleDos => {
-            format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
-                Ok(fs_apple2::apple_dos::create_blank_apple_dos())
-            })
-        }
-        FsKind::Os9 => {
-            let vname = sanitize_os9_volume_name(&args.name);
-            format_and_write(&args.image, &args.size, &vname, |_size, name| {
-                Ok(fs_8bit::os9::create_blank_os9(name)?)
-            })
-        }
-        FsKind::Cpm => {
-            let preset_name = args.cpm_preset.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--fs cpm requires --cpm-preset <name> (e.g. amstrad_data)")
-            })?;
-            let dpb = *fs_cpm::cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
-                let valid: Vec<&str> = fs_cpm::cpm_diskdefs::ALL_PRESETS
-                    .iter()
-                    .map(|d| d.name)
-                    .collect();
-                anyhow::anyhow!(
-                    "unknown CP/M preset '{preset_name}'; valid presets: {}",
-                    valid.join(", ")
-                )
-            })?;
-            format_and_write(&args.image, &args.size, &args.name, move |_size, _name| {
-                Ok(fs_cpm::cpm::create_blank(dpb))
-            })
-        }
-        FsKind::Minix => {
-            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V1)
-        }
-        FsKind::Minix2 => {
-            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V2)
-        }
-        FsKind::Minix3 => {
-            write_blank_minix_image(&args.image, &args.size, fs_unix::minix::MinixVersion::V3)
-        }
-        FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
-        FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
-        FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
-        FsKind::Oric => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
-            Ok(fs_8bit::oric::create_blank_oric(false, name))
-        }),
-        FsKind::Bfs => {
-            let endian = if args.big_endian {
-                fs_unix::bfs::BfsEndian::Big
-            } else {
-                fs_unix::bfs::BfsEndian::Little
-            };
-            let block_size = args.block_size.unwrap_or(1024);
-            format_and_write(&args.image, &args.size, &args.name, move |size, name| {
-                Ok(fs_unix::bfs_write::create_blank_bfs(
-                    size, block_size, name, endian,
-                )?)
-            })
-        }
-        FsKind::Ofs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            Ok(fs_unix::ofs_write::create_blank_ofs(size, name)?)
-        }),
-        FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            fs_mac::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
-        }),
-        FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
-            Ok(fs_adfs::adfs::create_blank_adfs(name))
-        }),
-        FsKind::Ufs => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, false),
-        FsKind::Ufs43 => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Bsd43, false),
-        FsKind::UfsSun => write_blank_ufs_image(&args, fs_unix::ufs::CgLayout::Modern, true),
-    }
-}
-
-fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let img = fs_apple2::ucsd::create_blank_ucsd(size, name)
-        .map_err(|e| anyhow::anyhow!("formatting UCSD p-System: {e}"))?;
-    crate::compat::write_sparse(image, &img)
-        .with_context(|| format!("writing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({} bytes, UCSD p-System volume)",
-        image.display(),
-        img.len()
-    ));
-    Ok(())
-}
-
-fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let img = fs_8bit::trdos::create_blank_trdos(size, name)
-        .map_err(|e| anyhow::anyhow!("formatting TR-DOS: {e}"))?;
-    crate::compat::write_sparse(image, &img)
-        .with_context(|| format!("writing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({} bytes, TR-DOS volume)",
-        image.display(),
-        img.len()
-    ));
-    Ok(())
-}
-
-fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let img = fs_8bit::ti99::create_blank_ti99(size, name)
-        .map_err(|e| anyhow::anyhow!("formatting TI-99: {e}"))?;
-    crate::compat::write_sparse(image, &img)
-        .with_context(|| format!("writing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({} bytes, TI-99 volume)",
-        image.display(),
-        img.len()
-    ));
-    Ok(())
-}
-
-fn write_blank_minix_image(
-    image: &std::path::Path,
-    size_str: &str,
-    version: fs_unix::minix::MinixVersion,
-) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let img = fs_unix::minix::create_blank_minix(size, version)
-        .map_err(|e| anyhow::anyhow!("formatting Minix: {e}"))?;
-    crate::compat::write_sparse(image, &img)
-        .with_context(|| format!("writing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({} bytes, Minix {:?})",
-        image.display(),
-        img.len(),
-        version
-    ));
-    Ok(())
-}
-
-/// Convert a byte size to a 512-byte block count for the builders that take
-/// blocks rather than bytes, refusing a size that would overflow their `u32`
-/// block field (2 TiB) rather than silently wrapping to a tiny volume.
-fn blocks_512(size_bytes: u64, fs: &str) -> anyhow::Result<u32> {
-    let blocks = size_bytes / 512;
-    if blocks == 0 {
-        anyhow::bail!("--size {size_bytes} is smaller than one 512-byte {fs} block");
-    }
-    u32::try_from(blocks)
-        .map_err(|_| anyhow::anyhow!("--size {size_bytes} exceeds the {fs} 2 TiB block limit"))
-}
-
-fn format_and_write(
-    image: &std::path::Path,
-    size_str: &str,
+/// Format through the model and report it the way every `new` verb does.
+fn format_cli(
+    image: &Path,
+    size: &str,
     name: &str,
-    formatter: impl FnOnce(u64, &str) -> anyhow::Result<Vec<u8>>,
+    kind: FsKind,
+    mut opts: FormatOptions,
 ) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let bytes = formatter(size, name)?;
-    crate::compat::write_sparse(image, &bytes)
-        .with_context(|| format!("writing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({} bytes, volume {:?})",
-        image.display(),
-        bytes.len(),
-        name
-    ));
-    Ok(())
-}
-
-/// Coerce a free-form `--name` into a valid OS-9 volume name: keep only
-/// `A-Z a-z 0-9 . _ $`, cap at 29 chars, and guarantee a leading letter (the
-/// generic default `rusty-backup` becomes `rustybackup`; a digit-leading or
-/// empty result is prefixed with `OS9`).
-fn sanitize_os9_volume_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
-        .take(29)
-        .collect();
-    match cleaned.chars().next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '.' => cleaned,
-        _ => format!("OS9{cleaned}").chars().take(29).collect(),
-    }
-}
-
-/// Format a bare NTFS superfloppy straight into the target file. `create_ntfs`
-/// seeks and writes only the populated regions (boot, MFT, metadata, backup
-/// boot at the last sector), so the bulk of the volume stays sparse rather than
-/// being materialized in RAM.
-/// UFS is streamed rather than built in memory: a blank volume is almost all
-/// zeros, and the sizes people format are the ones a `Vec` cannot hold.
-fn write_blank_ufs_image(
-    args: &NewArgs,
-    cg_layout: fs_unix::ufs::CgLayout,
-    sun: bool,
-) -> Result<()> {
-    use fs_unix::ufs::{CgLayout, UfsEndian};
-    use fs_unix::ufs_format::{write_blank_ufs1, Ufs1FormatParams};
-
-    let size = parse_size(&args.size).context("parsing --size")?;
-    let block_size = u64::from(args.block_size.unwrap_or(8192));
-    // Every NeXT disk is big-endian, so the 4.3BSD format defaults that way
-    // rather than making --big-endian mandatory for the only case it has.
-    let big_endian = args.big_endian || cg_layout == CgLayout::Bsd43 || sun;
-    let params = Ufs1FormatParams {
-        size_bytes: size,
-        block_size,
-        // FFS puts eight fragments in a block; `newfs` has never shipped
-        // another default and the reader's MAXFRAG gate matches.
-        frag_size: block_size / 8,
-        bytes_per_inode: args.bytes_per_inode.unwrap_or(0),
-        endian: if big_endian {
-            UfsEndian::Big
-        } else {
-            UfsEndian::Little
-        },
-        cg_layout,
-        // 4.3BSD has no `fs_volname`; the bytes 4.4BSD keeps it in are
-        // `fs_fsmnt` there, so a label would land inside the mount point.
-        label: (cg_layout == CgLayout::Modern && !sun).then(|| args.name.clone()),
-        bsd43_geometry: None,
-        sun,
+    let size = parse_size(size).context("parsing --size")?;
+    // Only the untouched default is swapped (ProDOS forbids its `-`); a typed name still errors.
+    opts.label = if name == DEFAULT_VOLUME_NAME {
+        kind.default_label().to_string()
+    } else {
+        name.to_string()
     };
-    let mut file = std::fs::File::create(&args.image)
-        .with_context(|| format!("creating {}", args.image.display()))?;
-    file.set_len(size)
-        .with_context(|| format!("sizing {}", args.image.display()))?;
-    let geo = write_blank_ufs1(&mut file, &params)
-        .with_context(|| format!("formatting UFS1 into {}", args.image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({size} bytes, UFS1 {} bsize={} fsize={} {} cylinder group(s), {} inodes)",
-        args.image.display(),
-        if sun {
-            "Solaris"
-        } else if cg_layout == CgLayout::Bsd43 {
-            "4.3BSD"
-        } else {
-            "4.4BSD"
-        },
-        geo.bsize,
-        geo.fsize,
-        geo.ncg,
-        geo.ncg * geo.ipg,
-    ));
-    Ok(())
-}
-
-fn write_blank_ntfs_image(
-    image: &std::path::Path,
-    total_size: u64,
-    geometry: NtfsGeometry,
-    mft_records_hint: u64,
-    name: &str,
-) -> Result<()> {
-    let mut file =
-        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    create_ntfs(
-        &mut file,
-        &NtfsFormatParams {
-            total_size,
-            geometry,
-            mft_records_hint,
-            label: Some(name.to_string()),
-        },
-    )
-    .with_context(|| format!("formatting NTFS into {}", image.display()))?;
-    // Ensure the file is exactly the requested size even though the trailing
-    // clusters are sparse.
-    file.set_len(total_size)
-        .with_context(|| format!("sizing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({total_size} bytes, NTFS cluster={} sector={}, volume {:?})",
-        image.display(),
-        geometry.cluster_size(),
-        geometry.bytes_per_sector,
-        name
-    ));
-    Ok(())
-}
-
-/// Format a bare ext2/ext3 superfloppy by streaming only its populated metadata
-/// regions to the output file (the rest stays sparse). Returns the exact
-/// formatted length, which may be slightly under `--size` when a trailing runt
-/// block group is dropped.
-fn write_blank_ext_image(
-    image: &std::path::Path,
-    size_str: &str,
-    name: &str,
-    kind: &str,
-) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let mut file =
-        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    let disk_bytes = match kind {
-        "ext3" => fs_unix::ext_format::write_blank_ext3(&mut file, 0, size, name),
-        "ext4" => fs_unix::ext_format::write_blank_ext4(&mut file, 0, size, name),
-        _ => fs_unix::ext_format::write_blank_ext2(&mut file, 0, size, name),
+    let done = crate::model::format::format_to_file(image, size, kind, &opts)?;
+    for note in &done.notes {
+        log_stderr(format!("Note: {note}"));
     }
-    .with_context(|| format!("formatting {kind} into {}", image.display()))?;
-    // Extend to the exact formatted length; the trailing region stays sparse.
-    file.set_len(disk_bytes)
-        .with_context(|| format!("sizing {}", image.display()))?;
     log_stderr(format!(
-        "wrote {} ({disk_bytes} bytes, {kind}, volume {:?})",
+        "wrote {} ({} bytes, {})",
         image.display(),
-        name
-    ));
-    Ok(())
-}
-
-/// Format a bare XFS superfloppy by streaming only its metadata regions to the
-/// output file; the log body and the free space past them stay sparse. The
-/// formatted length can be a touch under `--size` when the trailing partial
-/// allocation group is dropped.
-fn write_blank_xfs_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    let mut file =
-        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    let disk_bytes = fs_xfs::xfs::format::write_blank_xfs(&mut file, 0, size, name)
-        .with_context(|| format!("formatting XFS into {}", image.display()))?;
-    file.set_len(disk_bytes)
-        .with_context(|| format!("sizing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({disk_bytes} bytes, XFS v5, volume {:?})",
-        image.display(),
-        name
-    ));
-    Ok(())
-}
-
-/// Format a bare EFS superfloppy by streaming only its non-zero regions to the
-/// output file (the rest stays sparse), so large volumes never materialize the
-/// whole image in memory. `bytes_per_inode` sets the inode density.
-fn write_blank_efs_image(
-    image: &std::path::Path,
-    size_str: &str,
-    name: &str,
-    bytes_per_inode: u64,
-) -> Result<()> {
-    let size = parse_size(size_str).context("parsing --size")?;
-    if size < 32 * 1024 {
-        anyhow::bail!("EFS volume must be at least 32 KiB, got {size}");
-    }
-    let total_blocks_u64 = size / 512;
-    if total_blocks_u64 > u32::MAX as u64 {
-        anyhow::bail!("EFS volume size {size} exceeds u32 block range");
-    }
-    let total_blocks = total_blocks_u64 as u32;
-    let disk_bytes = total_blocks as u64 * 512;
-
-    let mut file =
-        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    fs_unix::efs::write_blank_efs(&mut file, 0, total_blocks, name, bytes_per_inode)
-        .with_context(|| format!("writing {}", image.display()))?;
-    // Ensure the file is exactly the requested size even though the trailing
-    // blocks past the replica superblock are sparse.
-    file.set_len(disk_bytes)
-        .with_context(|| format!("sizing {}", image.display()))?;
-    log_stderr(format!(
-        "wrote {} ({disk_bytes} bytes, volume {:?})",
-        image.display(),
-        name
+        done.len,
+        done.summary
     ));
     Ok(())
 }

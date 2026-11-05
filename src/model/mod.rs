@@ -33,6 +33,7 @@ pub mod export_runner;
 pub mod extract;
 pub mod file_types;
 pub mod floppy_convert;
+pub mod format;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod host_ops;

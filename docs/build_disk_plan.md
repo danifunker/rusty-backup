@@ -177,6 +177,17 @@ All of these belong in the model or a crate, never in a shell.
 | G10 | Missing table writers: MBR extended / logical, AHDI XGM, BSD disklabel, APM-TS, DSD. | `part-tables`, `provision` | S-M each |
 | G11 | Missing filesystem creators: QNX 2, HP LIF, QXL.WIN, SquashFS (empty), ADFS D / F, Atari ED first. APFS / btrfs / JFS / ReiserFS / VxFS / QNX 4/6 / Lisa are L and read-mostly today. Each needs its own oracle. | the fs crate | S-L |
 
+### Found in phase 1
+
+- **Streaming writers assume a zeroed target.** Every formatter writes only its metadata and
+  leaves the rest to read as zero, which a fresh or sparse file does. A physical disk or a
+  reused image does not: old inode-table or directory bytes would surface as garbage. Phase 4
+  (formatting rows on a device) has to zero what each formatter skips that its fs reads (the
+  inode tables, directory areas and bitmaps), not the whole partition. `FsCaps` grows a
+  "regions that must read zero" answer per fs, or the writers take a `zero_fill` flag.
+- **UFS writes its inode tables** (as `newfs` does), so a 1 TiB UFS1 writes tens of GB. That is
+  correct, but Build Disk shows progress for it.
+
 ## 3. Proposed design
 
 ### One controller
@@ -266,7 +277,7 @@ Each phase ships on its own: tests green, `scripts/check-boundaries.sh`, GUI bui
 
 | # | Phase | Tests |
 |---|---|---|
-| 1 | G1: format dispatch in `model::format`. `rb-cli new floppy / volume` call it; byte-identical output. | existing `new-volume*.toml` tier-1 cases, plus a model test that hashes every `FsKind`'s blank volume before and after |
+| 1 | G1: format dispatch in `model::format`. `rb-cli new floppy / volume` call it; byte-identical output. **Done 2026-11-05**: `model::format::{FsKind, FsCaps, FormatOptions, format_into, format_to_file, Window}`; FAT, HFS, HFS+ and HFV now stream (`fs-mac` 0.1.5 adds the sized HFS / HFS+ writers); `new volume ufs --bytes-per-inode` works (it was refused). | existing `new-volume*.toml` tier-1 cases, plus a model test that formats every `FsKind` at its minimum, a middle size and its largest buildable size (capped at 4 GiB) and opens and fscks it; images compared byte for byte with the old CLI (only clock / UUID bytes differ) |
 | 2 | `controller::build_disk` over `DiskBuilder` with the wizard's step machine (§ 7), and the GUI's top-level **Build Disk** tab drawing it. It covers today's capability (partitioned disk, empty or image rows, image or device target); Restore's Build Disk mode moves here and leaves the Restore tab. | `tests/ui_scenarios/restore_build_disk.toml` moves to `build_disk_basic.toml`; wizard step tests (Next blocked with a reason, Back keeps entries) |
 | 3 | TUI Build Disk screen on the same steps: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list, its `NewWizard` and its `NewCommand` building. | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
 | 3b | G3: streaming writers for HPFS, AFFS, PFS3, SFS, BFS, OFS, each byte-identical to today's blank volume, each published. | per fs: old-vs-new hash test; its existing fsck oracle on a 4 GiB blank volume built with a small memory limit (`ulimit -v`) |

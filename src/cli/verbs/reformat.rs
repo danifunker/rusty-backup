@@ -15,7 +15,13 @@ use std::io::{Seek, SeekFrom, Write};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use crate::cli::verbs::new::FsKind;
+
+/// The filesystems `reformat` can write in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReformatFs {
+    /// Classic HFS (Mac OS Standard).
+    Hfs,
+}
 
 #[derive(Debug, Args)]
 pub struct ReformatArgs {
@@ -25,7 +31,7 @@ pub struct ReformatArgs {
     /// Filesystem to format the partition with. Only `hfs` is supported
     /// today.
     #[arg(long, value_enum)]
-    pub fs: FsKind,
+    pub fs: ReformatFs,
 
     /// New volume name. HFS: up to 27 Mac Roman bytes.
     #[arg(long, default_value = "rusty-backup")]
@@ -48,9 +54,7 @@ pub struct ReformatArgs {
 }
 
 pub fn run(args: ReformatArgs) -> Result<()> {
-    if args.fs != FsKind::Hfs {
-        bail!("reformat: only --fs hfs is supported today");
-    }
+    let ReformatFs::Hfs = args.fs;
 
     // Open the image read-write (decoding a CHD / container as needed) and
     // resolve which partition we're targeting (offset + size). We don't open a
