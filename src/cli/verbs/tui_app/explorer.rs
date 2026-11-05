@@ -1452,7 +1452,6 @@ mod tests {
     /// An in-place source enters Edit Mode once listed; a SquashFS asks for its size budget first.
     #[test]
     fn a_squashfs_volume_asks_for_its_size_budget_before_edit_mode() {
-        use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
         let dir = tempfile::tempdir().unwrap();
         let fat = explorer_app(&fat_volume(dir.path()));
         assert!(
@@ -1460,15 +1459,7 @@ mod tests {
             "a FAT image is editable at once"
         );
         assert!(!view(&fat).ctl.pane(Side::Left).is_read_only());
-        let img = dir.path().join("vol.sqfs");
-        let root = BuildNode::dir(
-            "",
-            0o755,
-            vec![BuildNode::file("a.txt", 0o644, b"hi".to_vec())],
-        );
-        let mut out = std::fs::File::create(&img).unwrap();
-        write_squashfs(&mut out, &root, &BuildOptions::default()).unwrap();
-        drop(out);
+        let img = crate::controller::test_fixtures::squashfs_volume(dir.path());
         let open = BrowseOpen {
             session: BrowseSession {
                 source_path: Some(img),

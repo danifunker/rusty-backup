@@ -83,6 +83,40 @@ pub fn hfs_volume_with_text(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// A StuffIt archive at `dir/disk.sit` whose one entry is a 1 MiB raw HFS disk.
+pub fn sit_holding_hfs_disk(dir: &std::path::Path) -> std::path::PathBuf {
+    use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
+    let disk = fs_mac::hfs::create_blank_hfs(1024 * 1024, 512, "Disk").expect("blank HFS");
+    let entry = StuffItInput {
+        name: "Disk.image".into(),
+        type_code: *b"rohd",
+        creator_code: *b"ddsk",
+        finder_flags: 0,
+        create_date: 0,
+        mod_date: 0,
+        data_fork: disk,
+        resource_fork: Vec::new(),
+    };
+    let path = dir.join("disk.sit");
+    let bytes = build_archive(&[entry], WriteMethod::Store).expect("StuffIt archive");
+    std::fs::write(&path, bytes).expect("write disk.sit");
+    path
+}
+
+/// A SquashFS image at `dir/vol.sqfs` holding `a.txt`.
+pub fn squashfs_volume(dir: &std::path::Path) -> std::path::PathBuf {
+    use fs_squashfs::squashfs_write::{write_squashfs, BuildNode, BuildOptions};
+    let root = BuildNode::dir(
+        "",
+        0o755,
+        vec![BuildNode::file("a.txt", 0o644, b"hi".to_vec())],
+    );
+    let path = dir.join("vol.sqfs");
+    let mut out = std::fs::File::create(&path).expect("create vol.sqfs");
+    write_squashfs(&mut out, &root, &BuildOptions::default()).expect("SquashFS image");
+    path
+}
+
 /// A blank 1.2 MB X68000 XDF floppy.
 pub fn blank_xdf(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("disk.xdf");

@@ -559,21 +559,8 @@ mod tests {
     /// A one-entry archive holding a raw HFS disk mounts on the Inspect screen.
     #[test]
     fn mount_in_inspect_opens_the_payload_on_the_inspect_screen() {
-        use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
         let dir = tempfile::tempdir().expect("tempdir");
-        let disk = fs_mac::hfs::create_blank_hfs(1024 * 1024, 512, "Disk").unwrap();
-        let entry = StuffItInput {
-            name: "Disk.image".into(),
-            type_code: *b"rohd",
-            creator_code: *b"ddsk",
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            data_fork: disk,
-            resource_fork: Vec::new(),
-        };
-        let sit = dir.path().join("disk.sit");
-        std::fs::write(&sit, build_archive(&[entry], WriteMethod::Store).unwrap()).unwrap();
+        let sit = crate::controller::test_fixtures::sit_holding_hfs_disk(dir.path());
         let archives = TABS.iter().position(|t| t.0 == TabId::Archives).unwrap();
         let mut app = App::headless_on(archives);
         app.load_archive(sit);
