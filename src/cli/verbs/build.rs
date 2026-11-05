@@ -127,6 +127,18 @@ pub struct BuildArgs {
     #[arg(long = "fill", value_name = "N=PATH")]
     pub fills: Vec<String>,
 
+    /// Mark partition N bootable: the MBR active flag (one partition) or the
+    /// RDB bootable flag. Repeatable on RDB.
+    #[arg(long = "bootable", value_name = "N")]
+    pub bootable: Vec<usize>,
+
+    /// Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`
+    /// (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`,
+    /// `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot
+    /// mount unaided.
+    #[arg(long = "filesystem", value_name = "DOSTYPE=PATH")]
+    pub filesystems: Vec<String>,
+
     /// Partition-start alignment, e.g. `1M` or `63s`; blank uses the
     /// table's default.
     #[arg(long, default_value = "")]
@@ -377,6 +389,31 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
             opts.label = label;
             c.apply(A::SetRowOptions { row, opts });
         }
+    }
+    for &n in &args.bootable {
+        if n == 0 || n > specs.len() {
+            bail!(
+                "--bootable {n} names partition {n}, but only {} were defined",
+                specs.len()
+            );
+        }
+        c.apply(A::Table(BuildAction::SetRowBootable {
+            row: n - 1,
+            on: true,
+        }));
+    }
+    for spec in &args.filesystems {
+        let (dostype, path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--filesystem wants DOSTYPE=PATH, got '{spec}'"))?;
+        if !c.takes_handlers() {
+            bail!("--filesystem is an Amiga RDB feature; give --table rdb");
+        }
+        c.apply(A::AddHandler(dostype.trim().to_string()));
+        c.apply(A::Picked {
+            purpose: purpose::RDB_HANDLER,
+            path: Some(PathBuf::from(path.trim())),
+        });
     }
     for spec in &args.fills {
         let (row, path) = numbered(spec.as_str(), "--fill", specs.len())?;

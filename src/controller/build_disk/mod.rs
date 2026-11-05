@@ -115,6 +115,7 @@ pub fn parse_size_field(text: &str) -> Result<Option<u64>, String> {
 pub mod purpose {
     pub const OUTPUT_IMAGE: &str = "build_disk.output_image";
     pub const ROW_SOURCE: &str = "build_disk.row_source";
+    pub const RDB_HANDLER: &str = "build_disk.rdb_handler";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -234,6 +235,9 @@ pub enum BuildDiskAction {
     SetVolumeFs(FsKind),
     SetVolumeOptions(FormatOptions),
     SetConfirmText(String),
+    /// "Add handler...": pick the AmigaDOS load file for this DosType (RDB only).
+    AddHandler(String),
+    RemoveHandler(usize),
     Picked {
         purpose: &'static str,
         path: Option<PathBuf>,
@@ -270,6 +274,9 @@ pub struct BuildDiskController {
     image: Option<PathBuf>,
     container: ExportFormat,
     confirm_text: String,
+    /// RDB filesystem handlers to embed, and the DosType a handler pick is for.
+    handlers: Vec<(String, PathBuf)>,
+    handler_for: Option<String>,
     source_row: Option<usize>,
     probe: Option<(usize, Job<(PathBuf, u64)>)>,
     job: Option<Job<Result<(), String>>>,
@@ -292,6 +299,8 @@ impl BuildDiskController {
             image: None,
             container: ExportFormat::Raw,
             confirm_text: String::new(),
+            handlers: Vec::new(),
+            handler_for: None,
             source_row: None,
             probe: None,
             job: None,
@@ -468,6 +477,36 @@ impl BuildDiskController {
         }
     }
 
+    /// The RDB filesystem handlers to embed: `(DosType, load file)`.
+    pub fn handlers(&self) -> &[(String, PathBuf)] {
+        self.handlers.as_slice()
+    }
+
+    /// Whether the table takes filesystem handlers (RDB).
+    pub fn takes_handlers(&self) -> bool {
+        self.kind == DiskKind::Partitioned && self.builder.kind == TableKind::Rdb
+    }
+
+    /// The DosTypes the rows use that no handler covers yet, ROM ones (`DOS\x`) left out.
+    pub fn handlers_missing(&self) -> Vec<String> {
+        if !self.takes_handlers() {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = Vec::new();
+        for r in &self.builder.rows {
+            let t = r.type_text.trim().to_string();
+            let rom = t.starts_with("DOS");
+            let covered = self
+                .handlers
+                .iter()
+                .any(|(d, _)| d.eq_ignore_ascii_case(&t));
+            if !rom && !covered && !t.is_empty() && !v.contains(&t) {
+                v.push(t);
+            }
+        }
+        v
+    }
+
     pub fn confirm_text(&self) -> &str {
         self.confirm_text.as_str()
     }
@@ -612,6 +651,9 @@ impl BuildDiskController {
             DiskKind::Volume => v.push(format!("One {} volume", self.volume.describe())),
             DiskKind::Partitioned => {
                 v.push(format!("{} partition table", self.builder.kind.label()));
+                for (t, p) in &self.handlers {
+                    v.push(format!("Embedded {t} handler: {}", p.display()));
+                }
                 if let Ok(placed) = self.builder.plan() {
                     for (i, (row, p)) in self.builder.rows.iter().zip(placed.iter()).enumerate() {
                         let content = match (&row.source, &row.format) {
@@ -640,6 +682,12 @@ impl BuildDiskController {
             let mut b = self.builder.clone();
             b.validate();
             v.extend(b.errors.into_iter().filter(|e| e.starts_with("Warning:")));
+        }
+        for t in self.handlers_missing() {
+            v.push(format!(
+                "Warning: {t} has no handler in the Kickstart ROM and none was added; the \
+                 Amiga cannot mount it until its handler is installed"
+            ));
         }
         if self.output_is_device
             && (self.kind == DiskKind::Volume
@@ -742,6 +790,12 @@ impl BuildDiskController {
                 }
                 self.image = Some(path);
             }
+            purpose::RDB_HANDLER => {
+                if let Some(t) = self.handler_for.take() {
+                    self.handlers.retain(|(d, _)| !d.eq_ignore_ascii_case(&t));
+                    self.handlers.push((t, path));
+                }
+            }
             purpose::ROW_SOURCE => {
                 let Some(row) = self.source_row.take() else {
                     return;
@@ -831,6 +885,11 @@ impl BuildDiskController {
                         sources: self.builder.sources(),
                         formats: self.builder.formats(),
                         full_write: self.output_is_device,
+                        rdb_handlers: if self.takes_handlers() {
+                            self.handlers.clone()
+                        } else {
+                            Vec::new()
+                        },
                     },
                 )
             }
@@ -990,6 +1049,24 @@ impl Controller for BuildDiskController {
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
             BuildDiskAction::SetConfirmText(t) => self.confirm_text = t,
+            BuildDiskAction::AddHandler(dostype) => {
+                if !self.takes_handlers() {
+                    return Vec::new();
+                }
+                self.handler_for = Some(dostype.clone());
+                return vec![Effect::PickFile(PickSpec {
+                    purpose: purpose::RDB_HANDLER,
+                    title: format!("AmigaDOS handler for {dostype} (e.g. L:SmartFilesystem)"),
+                    filters: vec![("All Files".to_string(), vec!["*".to_string()])],
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
+            BuildDiskAction::RemoveHandler(i) => {
+                if i < self.handlers.len() {
+                    self.handlers.remove(i);
+                }
+            }
             BuildDiskAction::Create => self.create(),
         }
         self.sync_size();

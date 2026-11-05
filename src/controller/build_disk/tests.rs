@@ -279,3 +279,25 @@ fn the_system_disk_is_refused() {
     walk_to(&mut c, Step::Output);
     assert!(c.next_blocked().unwrap().contains("system disk"));
 }
+
+#[test]
+fn only_one_mbr_partition_stays_bootable() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::Table(BuildAction::AddRow));
+    act(
+        &mut c,
+        BuildDiskAction::Table(BuildAction::SetRowBootable { row: 0, on: true }),
+    );
+    act(
+        &mut c,
+        BuildDiskAction::Table(BuildAction::SetRowBootable { row: 1, on: true }),
+    );
+    let v = c.table_view();
+    assert_eq!(v.boot, Some(true));
+    assert!(!v.rows[0].bootable && v.rows[1].bootable);
+    act(
+        &mut c,
+        BuildDiskAction::Table(BuildAction::SetKind(TableKind::Gpt)),
+    );
+    assert_eq!(c.table_view().boot, None, "GPT has no flag here");
+}

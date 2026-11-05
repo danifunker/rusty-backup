@@ -40,6 +40,8 @@ pub struct BuilderRow {
     pub source_size: u64,
     /// Format this partition blank; ignored when `source` is set.
     pub format: Option<RowFormat>,
+    /// Boot from this partition, where the table has a flag for it.
+    pub bootable: bool,
 }
 
 /// A filesystem to format and its options.
@@ -335,13 +337,19 @@ impl DiskBuilder {
                 return Err(e);
             }
         }
-        provision::place(
+        let mut placed = provision::place(
             &self.specs()?,
             self.kind,
             self.disk_size,
             self.align_bytes(),
             self.geometry,
-        )
+        )?;
+        if provision::bootable_rule(self.kind).is_some() {
+            for (p, row) in placed.iter_mut().zip(self.rows.iter()) {
+                p.bootable = row.bootable;
+            }
+        }
+        Ok(placed)
     }
 
     /// Source image per row, in the shape
@@ -378,6 +386,13 @@ impl DiskBuilder {
             }
         };
 
+        let boots = placed.iter().filter(|p| p.bootable).count();
+        if provision::bootable_rule(self.kind) == Some(true) && boots > 1 {
+            self.errors.push(format!(
+                "Only one {} partition can be marked bootable; {boots} are",
+                self.kind.label()
+            ));
+        }
         for (i, (row, p)) in self.rows.iter().zip(placed.iter()).enumerate() {
             if row.source.is_some() && row.source_size > p.size_bytes {
                 self.errors.push(format!(

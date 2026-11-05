@@ -53,7 +53,12 @@ pub(super) enum Row {
     PType(usize),
     PName(usize),
     PContent(usize),
+    PBoot(usize),
     AddPartition,
+    /// An embedded RDB handler (Enter removes it).
+    Handler(usize),
+    /// Add a handler for the n-th DosType that has none.
+    AddHandler(usize),
     Label(Option<usize>),
     Opt(Option<usize>, FsOption),
     Confirm,
@@ -196,9 +201,16 @@ impl BuildDiskState {
                         r.push(Row::PName(i));
                     }
                     r.push(Row::PContent(i));
+                    if v.boot.is_some() {
+                        r.push(Row::PBoot(i));
+                    }
                 }
                 if v.can_add_row {
                     r.push(Row::AddPartition);
+                }
+                if c.takes_handlers() {
+                    r.extend((0..c.handlers().len()).map(Row::Handler));
+                    r.extend((0..c.handlers_missing().len()).map(Row::AddHandler));
                 }
                 r
             }
@@ -371,6 +383,13 @@ impl BuildDiskState {
                 let k = cycle(&FsKind::ALL, c.volume_fs(), forward);
                 self.act(BuildDiskAction::SetVolumeFs(k));
             }
+            Row::PBoot(i) => {
+                let on = !c.table_view().rows.get(i).is_some_and(|r| r.bootable);
+                self.act(BuildDiskAction::Table(BuildAction::SetRowBootable {
+                    row: i,
+                    on,
+                }));
+            }
             Row::PContent(i) => {
                 let cur = match c.row_content(i) {
                     RowContent::Image => None,
@@ -527,7 +546,13 @@ impl App {
                 if step == Step::Partitions =>
             {
                 let part = match row {
-                    Some(Row::PSize(i) | Row::PType(i) | Row::PName(i) | Row::PContent(i)) => i,
+                    Some(
+                        Row::PSize(i)
+                        | Row::PType(i)
+                        | Row::PName(i)
+                        | Row::PContent(i)
+                        | Row::PBoot(i),
+                    ) => i,
                     _ => return true,
                 };
                 let a = match code {
@@ -558,6 +583,12 @@ impl App {
                 }
                 Some(Row::OutputImage) => s.act(BuildDiskAction::PickOutputImage),
                 Some(Row::AddPartition) => s.act(BuildDiskAction::Table(BuildAction::AddRow)),
+                Some(Row::Handler(i)) => s.act(BuildDiskAction::RemoveHandler(i)),
+                Some(Row::AddHandler(i)) => {
+                    if let Some(t) = s.ctl.handlers_missing().get(i).cloned() {
+                        s.act(BuildDiskAction::AddHandler(t));
+                    }
+                }
                 Some(r) => match s.text_of(r) {
                     Some(t) => s.edit = Some(t),
                     None => {
@@ -789,7 +820,29 @@ impl App {
                         }
                     },
                 ),
+                Row::PBoot(p) => (
+                    "  Bootable".into(),
+                    if v.rows.get(*p).is_some_and(|r| r.bootable) {
+                        "[x]".into()
+                    } else {
+                        "[ ]".into()
+                    },
+                ),
                 Row::AddPartition => ("".into(), "[ Add partition ]".into()),
+                Row::Handler(i) => (
+                    "Handler".into(),
+                    c.handlers()
+                        .get(*i)
+                        .map(|(t, p)| format!("{t}: {}  (Enter removes)", p.display()))
+                        .unwrap_or_default(),
+                ),
+                Row::AddHandler(i) => (
+                    "".into(),
+                    c.handlers_missing()
+                        .get(*i)
+                        .map(|t| format!("[ Add {t} handler ]"))
+                        .unwrap_or_default(),
+                ),
                 Row::Label(r) => (
                     "  Label".into(),
                     opts(*r).map(|o| o.label).unwrap_or_default(),

@@ -441,6 +441,9 @@ impl BuildDiskTab {
                 if view.names {
                     ui.label(egui::RichText::new("Name").strong());
                 }
+                if view.boot.is_some() {
+                    ui.label(egui::RichText::new("Boot").strong());
+                }
                 for h in ["Start LBA", "Content", ""] {
                     ui.label(egui::RichText::new(h).strong());
                 }
@@ -484,6 +487,20 @@ impl BuildDiskTab {
                             acts.push(BuildDiskAction::Table(BuildAction::SetRowName {
                                 row: i,
                                 text: name,
+                            }));
+                        }
+                    }
+                    if let Some(only_one) = view.boot {
+                        let mut on = row.bootable;
+                        let hint = if only_one {
+                            "The MBR active flag: the BIOS boots this partition"
+                        } else {
+                            "The RDB bootable flag: Kickstart may boot this partition"
+                        };
+                        if ui.checkbox(&mut on, "").on_hover_text(hint).changed() {
+                            acts.push(BuildDiskAction::Table(BuildAction::SetRowBootable {
+                                row: i,
+                                on,
                             }));
                         }
                     }
@@ -570,6 +587,32 @@ impl BuildDiskTab {
                 ui.label(egui::RichText::new("Measuring the source image...").weak());
             }
         });
+        if self.ctl.takes_handlers() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Filesystem handlers in the RDB").strong());
+            for (i, (t, p)) in self.ctl.handlers().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{t}: {}", p.display()));
+                    if ui.small_button("Remove").clicked() {
+                        acts.push(BuildDiskAction::RemoveHandler(i));
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                for t in self.ctl.handlers_missing() {
+                    if ui
+                        .button(format!("Add {t} handler..."))
+                        .on_hover_text(
+                            "The AmigaDOS load file, e.g. L:PFS3 or L:SmartFilesystem; the \
+                             strap loads it from the RDB",
+                        )
+                        .clicked()
+                    {
+                        acts.push(BuildDiskAction::AddHandler(t));
+                    }
+                }
+            });
+        }
         for a in acts {
             self.act(a);
         }

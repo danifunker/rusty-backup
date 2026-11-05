@@ -181,3 +181,81 @@ fn a_floppy_container_is_refused_for_a_disk_it_cannot_hold() {
     let info = run(&["inspect", dc.to_str().unwrap()]);
     assert!(info.contains("HFS"), "{info}");
 }
+
+#[test]
+fn bootable_sets_the_mbr_active_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("boot.img");
+    let s = img.to_str().unwrap();
+    run(&[
+        "build",
+        s,
+        "--size",
+        "64M",
+        "--table",
+        "mbr",
+        "--partition",
+        "20M",
+        "--partition",
+        "rest",
+        "--format",
+        "1=fat",
+        "--bootable",
+        "1",
+    ]);
+    let b = std::fs::read(&img).unwrap();
+    assert_eq!(b[0x1BE], 0x80, "partition 1 active");
+    assert_eq!(b[0x1CE], 0x00, "partition 2 not");
+}
+
+/// An RDB build embeds the handler (an FSHD block) and flags the boot partition.
+#[test]
+fn an_rdb_build_embeds_its_handler_and_boot_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = dir.path().join("PFS3");
+    // The shortest AmigaDOS load file: HUNK_HEADER and nothing a strap would run here.
+    let mut load = vec![0x00, 0x00, 0x03, 0xF3];
+    load.extend_from_slice(&[0u8; 60]);
+    std::fs::write(&handler, &load).unwrap();
+    let img = dir.path().join("amiga.img");
+    let s = img.to_str().unwrap();
+    let spec = format!("PFS\\3={}", handler.display());
+    run(&[
+        "build",
+        s,
+        "--size",
+        "80M",
+        "--table",
+        "rdb",
+        "--partition",
+        "rest",
+        "--format",
+        "1=pfs3:Work",
+        "--bootable",
+        "1",
+        "--filesystem",
+        spec.as_str(),
+    ]);
+    let b = std::fs::read(&img).unwrap();
+    let head = &b[..256 * 512];
+    assert!(head.windows(4).any(|w| w == b"FSHD"), "no FileSystemHeader");
+    let part = head.chunks(512).find(|blk| &blk[0..4] == b"PART").unwrap();
+    assert_eq!(
+        u32::from_be_bytes(part[20..24].try_into().unwrap()) & 1,
+        1,
+        "bootable"
+    );
+    fsck_clean(&format!("{s}@1"));
+    let (ok, out) = run_raw(&[
+        "build",
+        s,
+        "--force",
+        "--size",
+        "80M",
+        "--table",
+        "rdb",
+        "--filesystem",
+        format!("PFS\\3={}", img.display()).as_str(),
+    ]);
+    assert!(!ok && out.contains("AmigaDOS load file"), "{out}");
+}

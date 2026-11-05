@@ -49,6 +49,47 @@ pub struct ProvisionRequest {
     pub formats: Vec<Option<RowFormat>>,
     /// Write every byte of a formatted partition: the target may hold old data (a device).
     pub full_write: bool,
+    /// Amiga filesystem handlers to embed in an RDB: `(DosType text, AmigaDOS load file)`.
+    pub rdb_handlers: Vec<(String, PathBuf)>,
+}
+
+/// Read and check the handlers for `write_rdb_filesystems`: one per DosType, each an AmigaDOS
+/// load file (a strap would hang on anything else rather than fail).
+pub fn load_rdb_handlers(
+    kind: TableKind,
+    specs: &[(String, PathBuf)],
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if kind != TableKind::Rdb {
+        anyhow::bail!(
+            "filesystem handlers are an Amiga RDB feature; this table is {}",
+            kind.label()
+        );
+    }
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for (type_text, path) in specs {
+        let dostype = part_tables::rdb::parse_dos_type(type_text.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("bad Amiga DosType '{type_text}' for a filesystem handler")
+        })?;
+        if seen.contains(&dostype) {
+            anyhow::bail!("DosType '{type_text}' has more than one handler");
+        }
+        let image = std::fs::read(path)
+            .with_context(|| format!("reading filesystem handler {}", path.display()))?;
+        if image.get(..4) != Some(&[0x00, 0x00, 0x03, 0xF3]) {
+            anyhow::bail!(
+                "{} is not an AmigaDOS load file (no HUNK_HEADER); a handler is the \
+                 binary itself, e.g. L:SmartFilesystem",
+                path.display()
+            );
+        }
+        seen.push(dostype);
+        out.push((dostype, image));
+    }
+    Ok(out)
 }
 
 /// What a build makes: a partitioned disk, or one volume across the whole target.
@@ -421,6 +462,19 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
         req.target_size_bytes,
         req.geometry,
     )?;
+    // The FSHD chain lands past the PART blocks, inside the RDSK's reserved area.
+    let handlers = load_rdb_handlers(req.kind, req.rdb_handlers.as_slice())?;
+    if !handlers.is_empty() {
+        provision::write_rdb_filesystems(&mut target, handlers.as_slice())
+            .context("embedding filesystem handlers in the RDB")?;
+        for (dostype, image) in &handlers {
+            log_cb(&format!(
+                "Embedded the {} handler ({}) in the RDB",
+                part_tables::rdb::format_dos_type(*dostype),
+                disk_core::display::format_size(image.len() as u64),
+            ));
+        }
+    }
     log_cb(&format!(
         "Wrote a {} table with {} partition(s) to {}",
         req.kind.label(),
@@ -592,6 +646,7 @@ mod tests {
             sources: vec![Some(src.path().to_path_buf()), None],
             formats: Vec::new(),
             full_write: false,
+            rdb_handlers: Vec::new(),
         };
         run_worker(&req, new_status(0)).expect("worker");
 
@@ -636,6 +691,7 @@ mod tests {
             sources: vec![Some(src.path().to_path_buf()), None],
             formats: Vec::new(),
             full_write: false,
+            rdb_handlers: Vec::new(),
         };
         run_worker(&req, new_status(0)).expect("worker");
         (target_path, placed)
@@ -698,6 +754,7 @@ mod tests {
             sources: vec![Some(src.path().to_path_buf())],
             formats: Vec::new(),
             full_write: false,
+            rdb_handlers: Vec::new(),
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(
@@ -713,6 +770,7 @@ mod tests {
             size_bytes: 900 * MIB,
             type_text: "83".into(),
             name: "P1".into(),
+            bootable: false,
         }];
         let target = tempfile::NamedTempFile::new().unwrap();
         let req = ProvisionRequest {
@@ -724,6 +782,7 @@ mod tests {
             sources: vec![None],
             formats: Vec::new(),
             full_write: false,
+            rdb_handlers: Vec::new(),
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(format!("{err:#}").contains("past the end"), "{err:#}");

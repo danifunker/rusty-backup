@@ -450,6 +450,8 @@ Usage: build [OPTIONS] <TARGET>
 - `--partition` — A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition
 - `--format` — Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one
 - `--fill` — Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works
+- `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
 - `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables

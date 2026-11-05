@@ -27,6 +27,10 @@
 <dd>Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one</dd>
 <dt><code>--fill</code></dt>
 <dd>Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works</dd>
+<dt><code>--bootable</code></dt>
+<dd>Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB</dd>
+<dt><code>--filesystem</code></dt>
+<dd>Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided</dd>
 <dt><code>--align</code></dt>
 <dd>Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default</dd>
 <dt><code>--heads</code></dt>
