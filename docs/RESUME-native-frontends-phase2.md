@@ -25,7 +25,7 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
   `/run/media/dani/BigDisk/rb-build/target-nf-release` and runs
   `rb-regress run --require-clean --scratch-root /run/media/dani/BigDisk/rb-build/regress-scratch`.
 - **Published 2026-11-04:** part-tables 0.1.1, arc-mac 0.1.3, dsk-dmg 0.1.1, fs-mac 0.1.3,
-  rb-fsexporter 0.1.3, fs-pc 0.1.2, opticaldiscs 0.16.2 (its release workflow now has a
+  rb-fsexporter 0.1.3, fs-pc 0.1.2, opticaldiscs 0.16.2, libchdman-rs 0.289.4 (its release workflow now has a
   `skip_macos` input for GitHub macOS runner outages; test on `dani@dani-dev.local` first).
 - **Issues #98-#104** closed (silently). Fixtures for them and the NT4 TSE disk (R-079) are
   in `/run/media/dani/BigDisk/rb-fixtures` and on the NAS (`smb://daninas.local/software`,
@@ -47,9 +47,8 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
 
 ## Open bugs
 
-- **R-081** (`docs/Regression_Bugs.md`): a CHD of an image of 8 KiB or less aborts in
-  libchdman-rs's vendored MAME `compress_v5_map`. Awaiting the user: patch libchdman-rs
-  (new release, rebuilt prebuilts) or refuse CHD output under 12 KiB.
+- R-081 (tiny CHDs aborted) is FIXED in libchdman-rs 0.289.4; the MAME bug itself is not
+  reported upstream yet.
 - `ntfs_fsck`'s "N files checked" count still starts at record 24 (R-079 Left).
 
 ## Rules that bite
