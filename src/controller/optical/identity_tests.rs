@@ -123,7 +123,12 @@ pub(super) fn manifest(root: &Path) -> String {
         };
         for e in rd.flatten() {
             let p = e.path();
-            let rel = p.strip_prefix(base).unwrap().display().to_string();
+            let rel = p
+                .strip_prefix(base)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
             let meta = std::fs::symlink_metadata(&p).unwrap();
             if meta.file_type().is_symlink() {
                 let t = std::fs::read_link(&p).unwrap();
@@ -260,6 +265,10 @@ const PANE_DIFFERS: &[(&str, &str)] = &[
     ("rr-prep fs0 preview /link", "none"),
 ];
 
+fn mac_native(case: &str) -> bool {
+    cfg!(target_os = "macos") && case.ends_with(" Native")
+}
+
 /// Check `got` against `GOLDEN`, `differs` excepted (or print it with `RB_IDENTITY_PRINT=1`).
 pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
     if std::env::var("RB_IDENTITY_PRINT").is_ok() {
@@ -275,6 +284,10 @@ pub(super) fn check(got: &[(String, String)], differs: &[(&str, &str)]) {
         }
         match GOLDEN.iter().find(|(g, _)| g == c) {
             Some((_, want)) if want == d => {}
+            // Native forks only write on macOS; elsewhere the golden records the refusal.
+            Some((_, "ERR")) if mac_native(c) && d != "ERR" => {}
+            // Windows has no symlinks and no `:` in names, and the Rock Ridge disc has both.
+            Some(_) if cfg!(windows) && c.starts_with("rr") && c.contains(" extract ") => {}
             Some((_, want)) => bad.push(format!("{c}: {d} (want {want})")),
             None => bad.push(format!("{c}: not in GOLDEN")),
         }

@@ -35,9 +35,11 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
 
 1. **GUI smoke on macOS and Windows** (needs the user): async pickers, the Inspect / Restore
    dialogs moved in Phase 2. Then Phase 2 is closed.
-2. **Interim release from `main`** with all the fixes, before the native re-skin. PR #96
-   (native-frontends -> main) exists; remove `.github/ci-targets` first. Ask before
-   anything goes into `main`.
+2. **Interim release: done 2026-11-04.** PR #96 merged into `main` (7c8f80d9) after
+   `.github/ci-targets` was removed; the push to `main` builds every target and auto-releases.
+   Branch pushes now build every target too (no ci-targets file); add one back only for a
+   long run of branch work, and remove it before the next merge. Ask before anything else
+   goes into `main`.
 3. **Build Disk** (`docs/build_disk_plan.md`): decisions are in § 6. New `rb-cli build`
    verb (`new` kept a few months), its own top-level section in the app, presets for the
    fixed builders, streaming writers for AFFS / PFS3 / SFS / HPFS / BFS with a shown cap

@@ -50,8 +50,14 @@ fn on_error_skip_carries_on_and_lists_the_skipped_entries() {
     let (ok, err) = extract(&disc, &out, Some("skip"));
     assert!(ok, "{err}");
     assert!(err.contains("warning: skipping /empty.dat:"), "{err}");
-    assert!(err.contains("skipped 3 entry/entries:"), "{err}");
-    assert!(err.contains("  /colon_name.txt: "), "{err}");
+    // A case-insensitive destination renames the second `colon_name.txt` instead.
+    if err.contains("info: case-collision: colon_name.txt -> colon_name.txt~1") {
+        assert!(err.contains("skipped 2 entry/entries:"), "{err}");
+        assert!(out.join("colon_name.txt~1").is_file(), "{err}");
+    } else {
+        assert!(err.contains("skipped 3 entry/entries:"), "{err}");
+        assert!(err.contains("  /colon_name.txt: "), "{err}");
+    }
     assert!(out.join("docs").is_dir(), "the rest was extracted");
 }
 
@@ -60,7 +66,9 @@ fn on_error_stop_ends_at_the_first_failure_and_is_the_default_without_a_terminal
     let dir = tempfile::tempdir().unwrap();
     let disc = rock_ridge(dir.path());
     for mode in [Some("stop"), None] {
-        let out = dir.path().join(format!("out-{mode:?}"));
+        let out = dir
+            .path()
+            .join(format!("out-{}", mode.unwrap_or("default")));
         let (ok, err) = extract(&disc, &out, mode);
         assert!(!ok, "{mode:?}: {err}");
         assert!(err.contains("extraction stopped at /"), "{mode:?}: {err}");

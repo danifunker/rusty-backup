@@ -100,7 +100,12 @@ fn listing(root: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
             let p = e.path();
-            let rel = p.strip_prefix(base).unwrap().display().to_string();
+            let rel = p
+                .strip_prefix(base)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
             let meta = std::fs::symlink_metadata(&p).unwrap();
             if meta.file_type().is_symlink() {
                 let t = std::fs::read_link(&p).unwrap();
