@@ -248,7 +248,14 @@ impl InspectController {
         edit: BrowseEdit,
     ) {
         if let Some(cache) = self.browse.seekable.get(&index).cloned() {
-            if cache.exists() {
+            // Edit Mode recompresses the archive, so a cache older than it lists stale contents.
+            let modified =
+                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let fresh = match (modified(cache.as_path()), modified(data.as_path())) {
+                (Some(c), Some(d)) => c > d,
+                _ => false,
+            };
+            if fresh {
                 self.info(format!(
                     "Browsing partition {index} from cached seekable file"
                 ));
@@ -261,7 +268,7 @@ impl InspectController {
                 self.open_browse(session, edit, None);
                 return;
             }
-            // Deleted since: build it again.
+            // Deleted or stale since: build it again.
             self.browse.seekable.remove(&index);
         }
         if self.browse.build.is_some() {
