@@ -1,4 +1,4 @@
-# RESUME: native front-ends, Phase 2 (handoff 2026-11-02)
+# RESUME: native front-ends, end of Phase 2 (handoff 2026-11-04)
 
 Branch **`native-frontends`**, checked out in `~/repos/rusty-backup` on m900. Stay on it:
 no other branches, no worktrees, no PR or merge into `main` unless the user asks.
@@ -6,75 +6,76 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
 ## Paste this into the new session
 
 > Read `docs/RESUME-native-frontends-phase2.md`, then CONTRIBUTING.md § Architecture policy
-> (MVC) and `docs/phase2_commander_plan.md` from "Decisions (answered 2026-11-02)" to the
-> end. Check `git status` and `git log origin/native-frontends..HEAD`: local commits wait
-> for my OK before any push. Then start **Next steps, item 1 (slice 19: one extractor in a
-> crate)**, one agent at a time, verifying and committing each step.
+> (MVC), `docs/native_frontends_plan.md` § Phase 2 "Done" and § Phases 3-4, and
+> `docs/build_disk_plan.md` § 6 (decisions). Check `git status` and
+> `git log origin/native-frontends..HEAD`. Then ask me which comes first: the interim
+> release from `main`, Build Disk, or Phase 3 / 4.
 
 ## Where things stand
 
-- **Phase 2 (view-models / controllers): slices 1-18b done.** The GUI, the TUI and the CLI
-  drive shared controllers in `src/controller/`. All of `src/gui` is enforced at 0 engine
-  references by `scripts/check-boundaries.sh`; 20 references remain, all in
-  `src/cli/verbs/tui_app.rs`.
-- **Last session's work:** Inspect tab, Backup, Restore, the disk writer and partition window,
-  the Inspect dialogs, Optical, the rest of the egui shell, the disc browser on the shared
-  browser pane (slice 18), and slice 18b:
-  - `opticaldiscs` 0.16.1 (published) fixes hybrid discs listing every Mac file twice.
-  - Picker format names are italic.
-- **Push state:** everything through `3119ea34` is pushed, and CI was green on every slice
-  through 18, including the Solaris 9 / mrustc job. The docs commit that adds this file is
-  **local only**: the user wants to give the OK before the next push.
-- **Not yet run on Phase 2 code:** the full fixture regression suite. The last full run was
-  450/450 at `7fc076cd`.
+- **Phase 2 is done** (slices 1-29) apart from the macOS / Windows GUI smoke:
+  - Every egui screen and dialog and the whole TUI drive the controllers in
+    `src/controller/`; `scripts/check-boundaries.sh` enforces 0 engine references in both.
+  - The TUI has the GUI's feature set. The only exceptions are the CD-DA player (GUI only)
+    and Build Disk. Every other gap in `docs/platform_matrix.md` is a terminal limit.
+  - GUI file pickers are async (slice 23).
+- **Pushed and green:** everything through 4e0ee6a6; CI green incl. Solaris 9 / mrustc.
+- **Full fixture suite: 461/461** at 4e0ee6a6 (release rb-cli, 26.5 min). Recipe:
+  `scratchpad/full-regress.sh` in the old session; it builds a release rb-cli into
+  `/run/media/dani/BigDisk/rb-build/target-nf-release` and runs
+  `rb-regress run --require-clean --scratch-root /run/media/dani/BigDisk/rb-build/regress-scratch`.
+- **Published 2026-11-04:** part-tables 0.1.1, arc-mac 0.1.3, dsk-dmg 0.1.1, fs-mac 0.1.3,
+  rb-fsexporter 0.1.3, fs-pc 0.1.2, opticaldiscs 0.16.2 (its release workflow now has a
+  `skip_macos` input for GitHub macOS runner outages; test on `dani@dani-dev.local` first).
+- **Issues #98-#104** closed (silently). Fixtures for them and the NT4 TSE disk (R-079) are
+  in `/run/media/dani/BigDisk/rb-fixtures` and on the NAS (`smb://daninas.local/software`,
+  mount it from the file manager; it needs the saved password).
 
-## Next steps (detail in `docs/phase2_commander_plan.md` § Next steps)
+## Next (the user picks the order)
 
-1. **Slice 19:** one extractor, in a new MIT crate. It replaces `model::extract`, the disc
-   walker, and possibly `rb-cli optical extract`. The four byte changes the user accepted
-   are listed in slice 18's Decisions; everything else must stay byte-identical. Version,
-   publish, and update all four lockfiles.
-2. **Slice 20:** the TUI's last 20 references, then enforce the whole TUI.
-3. **TUI parity gaps:** add each one, or record it as N/A in `docs/platform_matrix.md`.
-4. **Pickers off the UI thread.**
-5. **Full regression suite** (about 95 min) plus macOS and Windows GUI smoke tests, then close
-   Phase 2.
-6. **Phase 4 (GTK4) or Phase 3 (AppKit).**
+1. **GUI smoke on macOS and Windows** (needs the user): async pickers, the Inspect / Restore
+   dialogs moved in Phase 2. Then Phase 2 is closed.
+2. **Interim release from `main`** with all the fixes, before the native re-skin. PR #96
+   (native-frontends -> main) exists; remove `.github/ci-targets` first. Ask before
+   anything goes into `main`.
+3. **Build Disk** (`docs/build_disk_plan.md`): decisions are in § 6. New `rb-cli build`
+   verb (`new` kept a few months), its own top-level section in the app, presets for the
+   fixed builders, streaming writers for AFFS / PFS3 / SFS / HPFS / BFS with a shown cap
+   until then, image-file or device targets. Bootable work is in
+   `docs/bootable_disks_backlog.md`, not in scope.
+4. **Phase 4 (GTK4) or Phase 3 (AppKit)** per `native_frontends_plan.md`.
 
-## Rules that bit last session
+## Open bugs
 
-- **Build output goes to BigDisk.** Use
-  `CARGO_TARGET_DIR=/run/media/dani/BigDisk/rb-build/target-nf-dev` for every cargo
-  command, including `git commit` (the pre-commit hook builds).
-  - The root disk filled up on 2026-11-02 and truncated a source file mid-write.
-  - Check `df -h /` before big work.
-  - Never run two cargo builds at once.
-- **mrustc (the Solaris 9 CI job) only:**
-  - Write deref conversions out (`.as_str()`, `.as_path()`, `.as_slice()`, `.as_ref()`).
-  - Never put a relative `include_str!` / `include_bytes!` inside an inline `mod {}`.
-  - Read the job's log with `grep "error:0"`.
-- **Engine code stays on Rust 1.73.** Comments are one line, two at most. No Unicode
-  glyphs in UI strings.
-- **Don't run `cargo fmt` on the whole tree.** Run `rustfmt` on touched files only.
-- **The pre-commit hook runs `git add -u`.** When other changes are in the tree, commit
-  with explicit paths and `--no-verify`.
-- **Never chain `pkill -f <pattern>` in a shell whose own command line contains the
-  pattern:** it kills the shell. Anchor the pattern (`'^/path/binary$'`).
-- **Crate fixes ship with a version bump and a publish.**
-  - `crates/*`: `gh workflow run publish-crates.yml --ref native-frontends`.
-  - opticaldiscs (danifunker/opticaldiscs-rs, clone at
-    `/run/media/dani/BigDisk/rb-build/opticaldiscs-rs`): its own Release workflow.
-  - Ask before publishing.
+- **R-081** (`docs/Regression_Bugs.md`): a CHD of an image of 8 KiB or less aborts in
+  libchdman-rs's vendored MAME `compress_v5_map`. Awaiting the user: patch libchdman-rs
+  (new release, rebuilt prebuilts) or refuse CHD output under 12 KiB.
+- `ntfs_fsck`'s "N files checked" count still starts at record 24 (R-079 Left).
+
+## Rules that bite
+
+- **Build output goes to BigDisk:** `CARGO_TARGET_DIR=/run/media/dani/BigDisk/rb-build/target-nf-dev`,
+  `TMPDIR=/run/media/dani/BigDisk/rb-tmp/tmp`. Root disk has ~6 GB free. Never run two
+  cargo builds at once (OOM-killed sessions before).
+- **Engine code stays on Rust 1.73**; vintage check: from `rb-cli-vintage`,
+  `cargo +1.73.0 build --bin rb-cli --no-default-features --features native-zstd,remote,tui,rust173-polyfill,yaml --ignore-rust-version`
+  with its own target dir.
+- **mrustc (Solaris 9 CI):** write deref conversions out (`.as_str()`, `.as_path()`,
+  `.as_slice()`, `*k` in closures); no proc-macros; no relative `include_str!` in inline mods.
+- **TUI tests:** never assert on wrapped dialog text next to a temp path (CI's longer paths
+  wrap differently); assert on controller state or message payloads.
+- **Comments** one line, two at most. No Unicode glyphs in UI strings. `rustfmt` touched
+  files only, never `cargo fmt` on the tree.
+- **Commits:** the pre-commit hook does `git add -u`; commit with explicit paths and
+  `--no-verify`.
+- **Crate fixes** ship with a version bump, a CHANGELOG line, all four lockfiles
+  (root, vintage, ppc, sol9; edit only the crate's entry) and a publish
+  (`gh workflow run publish-crates.yml --ref native-frontends -f dry_run=false`).
+- **Never `pkill -f`** with a pattern that matches your own shell; anchor it.
+- **Hands off DECAlphaStation200-MiSTer files**, including its /tmp session folders.
 
 ## GUI preview
 
-A debug build is copied to `/run/media/dani/BigDisk/rb-tmp/gui-preview/rusty-backup` and
-run from `/run/media/dani/BigDisk/rb-tmp/gui-test/`. That folder holds `fat-preview.img`,
-`hfs.img` and two optical fixtures: `optical.hfs.opentransport.cd.iso` (a hybrid HFS/ISO
-disc) and `optical.iso9660.joliet.cd.iso`.
-
-To relaunch:
-
-```bash
-setsid -f /run/media/dani/BigDisk/rb-tmp/gui-preview/rusty-backup
-```
+Debug builds are copied to `/run/media/dani/BigDisk/rb-tmp/gui-preview/` and run from
+`/run/media/dani/BigDisk/rb-tmp/gui-test/` with `setsid -f <binary>`. Copy to a new name
+when an older preview is still running (a running binary can't be overwritten).

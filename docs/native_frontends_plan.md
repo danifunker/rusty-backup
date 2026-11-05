@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 0 and Phase 1 done (2026-11-01). Phase 2 nearly done (2026-11-02):** every egui screen and dialog runs on `src/controller/` (slices 1-18b); 20 engine references remain in the TUI. Progress, decisions and next steps: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
+Status: **Phase 0 and Phase 1 done (2026-11-01). Phase 2 done (2026-11-04)** apart from the macOS / Windows GUI smoke: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -204,6 +204,8 @@ Then go screen by screen, ordered by logic weight:
 - The boundary check is switched to enforcing for egui and the TUI.
 - `src/gui` is pure view.
 - The TUI reaches feature parity with the GUI, or every gap is documented in the platform matrix as N/A with a reason.
+
+**Done (2026-11-04), slices 1-29:** the boundary check enforces `src/gui` and the whole TUI at 0 engine references (979 at the start). Every gap left in `docs/platform_matrix.md` is a terminal limit (no drag-and-drop, text layout bars, OSC 52 may be refused, no disc-browser preview column) or one of the two agreed exceptions: the CD-DA player (GUI only) and Build Disk (`build_disk_plan.md`, its own top-level section). GUI pickers are async (slice 23). Full fixture suite 461/461 at 4e0ee6a6 (release rb-cli, 26.5 min); CI green on every slice incl. Solaris 9 / mrustc. Open before Phase 3/4: a GUI smoke on macOS and Windows (async pickers above all).
 
 ### Phase 3: macOS modern (AppKit)
 

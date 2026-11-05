@@ -2370,10 +2370,11 @@ All behaviour changes listed in slices 11-18 stand. In particular:
   `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
-- CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
-  pushed with CI running. Commits after 3119ea34 are local until the user says push.
-- Not yet run on the Phase 2 code: the full fixture regression suite (last full run
-  450/450 at 7fc076cd, before slice 10). Suggest it (about 95 min) before Phase 2 exit.
+- Everything is pushed (through 4e0ee6a6) and CI is green on it, Solaris 9 / mrustc included.
+- Full fixture regression suite: **461/461 pass** at 4e0ee6a6 (2026-11-04, release rb-cli,
+  26.5 min, clean tree). It includes the new R-079 NT4 NTFS case.
+- Found along the way: R-079 (NT4 NTFS hid MFT records 16-23, fs-pc 0.1.2), R-080 (a bare
+  SquashFS image browsed as HFS), R-081 (OPEN: libchdman aborts on CHDs of 8 KiB or less).
 
 ## Next steps
 
@@ -2396,7 +2397,8 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    which comes next).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
-5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
-   Windows, then close Phase 2 in `native_frontends_plan.md`.
+5. **Full regression suite** (done: 461/461 at 4e0ee6a6). **Left: a GUI smoke on macOS and
+   Windows** (async pickers, the moved dialogs), then Phase 2 is closed; the closing note is
+   already in `native_frontends_plan.md`.
 6. **Phase 4 (GTK4) or Phase 3 (AppKit)** per `native_frontends_plan.md`; the GTK4 and Qt6 /
    Kirigami dev packages are installed on m900.
