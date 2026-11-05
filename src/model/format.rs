@@ -66,6 +66,11 @@ pub enum FsKind {
     Ufs,
     Ufs43,
     UfsSun,
+    Exfat,
+    Cbm,
+    Dfs,
+    Rsdos,
+    DragonDos,
 }
 
 /// A per-filesystem option a front-end may show; [`FsCaps::options`] lists the ones that apply.
@@ -79,6 +84,8 @@ pub enum FsOption {
     Fat32,
     AffsVariant,
     CpmPreset,
+    /// A fixed geometry from [`geometries`] (CBM drive, DFS / RS-DOS / DragonDOS tracks).
+    Geometry,
     Inodes,
     BytesPerInode,
     ClusterSize,
@@ -119,7 +126,7 @@ impl FsCaps {
 }
 
 impl FsKind {
-    pub const ALL: [FsKind; 34] = [
+    pub const ALL: [FsKind; 39] = [
         FsKind::Hfs,
         FsKind::Hfsplus,
         FsKind::Hfv,
@@ -154,6 +161,11 @@ impl FsKind {
         FsKind::Ufs,
         FsKind::Ufs43,
         FsKind::UfsSun,
+        FsKind::Exfat,
+        FsKind::Cbm,
+        FsKind::Dfs,
+        FsKind::Rsdos,
+        FsKind::DragonDos,
     ];
 
     /// The stable id, which is also the CLI's value name.
@@ -193,6 +205,11 @@ impl FsKind {
             FsKind::Ufs => "ufs",
             FsKind::Ufs43 => "ufs-43bsd",
             FsKind::UfsSun => "ufs-solaris",
+            FsKind::Exfat => "exfat",
+            FsKind::Cbm => "cbm",
+            FsKind::Dfs => "dfs",
+            FsKind::Rsdos => "rsdos",
+            FsKind::DragonDos => "dragondos",
         }
     }
 
@@ -238,6 +255,11 @@ impl FsKind {
             FsKind::Ufs => "UFS1 (4.4BSD)",
             FsKind::Ufs43 => "UFS1 (4.3BSD / NeXTSTEP)",
             FsKind::UfsSun => "UFS1 (Solaris)",
+            FsKind::Exfat => "exFAT",
+            FsKind::Cbm => "Commodore DOS (1541 / 1571 / 1581 / 8050)",
+            FsKind::Dfs => "Acorn DFS (BBC Micro)",
+            FsKind::Rsdos => "RS-DOS (TRS-80 Color Computer)",
+            FsKind::DragonDos => "DragonDOS (Dragon 32 / 64)",
         }
     }
 
@@ -361,6 +383,25 @@ impl FsKind {
                 options: &[BlockSize, BigEndian, BytesPerInode],
                 ..c(MIB, TIB, true, 0)
             },
+            FsKind::Exfat => c(MIB, 16 * TIB, true, 11),
+            FsKind::Cbm => FsCaps {
+                options: &[Geometry],
+                min_size: 0,
+                max_size: 0,
+                ..fixed(0, 16)
+            },
+            FsKind::Dfs => FsCaps {
+                options: &[Geometry],
+                min_size: 0,
+                max_size: 0,
+                ..fixed(0, 12)
+            },
+            FsKind::Rsdos | FsKind::DragonDos => FsCaps {
+                options: &[Geometry],
+                min_size: 0,
+                max_size: 0,
+                ..fixed(0, 0)
+            },
         }
     }
 }
@@ -386,6 +427,8 @@ pub struct FormatOptions {
     pub affs_variant: u8,
     /// CP/M disk-parameter-block preset name.
     pub cpm_preset: Option<String>,
+    /// A geometry id from [`geometries`]; `None` is the kind's first.
+    pub geometry: Option<String>,
     /// EFS approximate inode count.
     pub inodes: Option<u64>,
     /// EFS and UFS inode density.
@@ -408,6 +451,7 @@ impl Default for FormatOptions {
             fat32: false,
             affs_variant: 1,
             cpm_preset: None,
+            geometry: None,
             inodes: None,
             bytes_per_inode: None,
             cluster_bytes: None,
@@ -451,7 +495,59 @@ pub fn check_options(kind: FsKind, opts: &FormatOptions) -> Result<()> {
     if kind == FsKind::Cpm {
         cpm_dpb(opts)?;
     }
+    if opts.geometry.is_some() && !has(FsOption::Geometry) {
+        bail!("a geometry choice only applies to the fixed-geometry floppy formats");
+    }
+    if has(FsOption::Geometry) {
+        geometry_id(kind, opts)?;
+    }
     Ok(())
+}
+
+/// The fixed geometries a kind with [`FsOption::Geometry`] offers: `(id, label)`, default first.
+pub fn geometries(kind: FsKind) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        FsKind::Cbm => &[
+            ("d64", "1541, 35 tracks (D64, 170 KB)"),
+            ("d64-40", "1541, 40 tracks (D64, 192 KB)"),
+            ("d71", "1571 (D71, 340 KB)"),
+            ("d81", "1581 (D81, 800 KB)"),
+            ("d80", "8050 (D80, 520 KB)"),
+            ("d82", "8250 (D82, 1 MB)"),
+        ],
+        FsKind::Dfs => &[
+            ("40", "40 tracks, single-sided (100 KB)"),
+            ("80", "80 tracks, single-sided (200 KB)"),
+        ],
+        FsKind::Rsdos => &[
+            ("35", "35 tracks (157 KB)"),
+            ("40", "40 tracks (180 KB)"),
+            ("80", "80 tracks (360 KB)"),
+        ],
+        FsKind::DragonDos => &[
+            ("40ss", "40 tracks, single-sided (180 KB)"),
+            ("40ds", "40 tracks, double-sided (360 KB)"),
+            ("80ss", "80 tracks, single-sided (360 KB)"),
+            ("80ds", "80 tracks, double-sided (720 KB)"),
+        ],
+        _ => &[],
+    }
+}
+
+/// The geometry id `opts` names for `kind`, or its default.
+fn geometry_id(kind: FsKind, opts: &FormatOptions) -> Result<&'static str> {
+    let all = geometries(kind);
+    match opts.geometry.as_deref() {
+        None => Ok(all[0].0),
+        Some(want) => all.iter().map(|g| g.0).find(|g| *g == want).ok_or_else(|| {
+            let ids: Vec<&str> = all.iter().map(|g| g.0).collect();
+            anyhow!(
+                "unknown {} geometry '{want}'; one of: {}",
+                kind.display_name(),
+                ids.join(", ")
+            )
+        }),
+    }
 }
 
 /// Format `kind` into a new file at `path`, which ends up exactly the volume's length.
@@ -670,6 +766,63 @@ pub fn format_into<W: Write + Seek>(
         FsKind::Adfs => in_ram(w, "ADFS E", label, || {
             Ok(fs_adfs::adfs::create_blank_adfs(label))
         }),
+        FsKind::Exfat => {
+            // The cluster sizes Windows picks: 4 KiB to 256 MiB, 32 KiB to 32 GiB, 128 KiB above.
+            let cluster = if size <= 256 * MIB {
+                4 * KIB
+            } else if size <= 32 * GIB {
+                32 * KIB
+            } else {
+                128 * KIB
+            };
+            let template = fs_pc::exfat::ExfatFormatTemplate {
+                bytes_per_sector: 512,
+                sectors_per_cluster: cluster / 512,
+                label: (!label.is_empty()).then(|| label.to_string()),
+            };
+            let len = size / 512 * 512;
+            fs_pc::exfat::create_blank_exfat(w, &template, len)?;
+            Ok(done(
+                len,
+                format!("exFAT, cluster {cluster}, volume {label:?}"),
+            ))
+        }
+        FsKind::Cbm => {
+            use fs_8bit::cbm::CbmVariant as V;
+            let variant = match geometry_id(kind, opts)? {
+                "d64-40" => V::D64_40,
+                "d71" => V::D71,
+                "d81" => V::D81,
+                "d80" => V::D80,
+                "d82" => V::D82,
+                _ => V::D64,
+            };
+            in_ram(w, "Commodore DOS", label, || {
+                Ok(fs_8bit::cbm::create_blank(variant, label, "RB")?)
+            })
+        }
+        FsKind::Dfs => {
+            let sectors = if geometry_id(kind, opts)? == "80" {
+                800
+            } else {
+                400
+            };
+            in_ram(w, "Acorn DFS", label, || {
+                Ok(fs_8bit::dfs::create_blank_dfs(sectors, label))
+            })
+        }
+        FsKind::Rsdos => {
+            let tracks: u64 = geometry_id(kind, opts)?.parse().unwrap_or(35);
+            in_ram(w, "RS-DOS", "", || Ok(fs_8bit::rsdos::create_blank(tracks)))
+        }
+        FsKind::DragonDos => {
+            let g = geometry_id(kind, opts)?;
+            let tracks = if g.starts_with("80") { 80 } else { 40 };
+            let sides = if g.ends_with("ds") { 2 } else { 1 };
+            in_ram(w, "DragonDOS", "", || {
+                Ok(fs_8bit::dragondos::create_blank(tracks, sides))
+            })
+        }
         FsKind::Ufs => format_ufs(w, size, opts, fs_unix::ufs::CgLayout::Modern, false),
         FsKind::Ufs43 => format_ufs(w, size, opts, fs_unix::ufs::CgLayout::Bsd43, false),
         FsKind::UfsSun => format_ufs(w, size, opts, fs_unix::ufs::CgLayout::Modern, true),

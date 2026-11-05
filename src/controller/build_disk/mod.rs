@@ -21,7 +21,7 @@ use crate::model::disk_builder::{DiskBuilder, RowFormat};
 use crate::model::job::{Job, Notify, Snapshot};
 
 pub use crate::device::DiskDevice;
-pub use crate::model::format::{FormatOptions, FsCaps, FsKind, FsOption};
+pub use crate::model::format::{geometries, FormatOptions, FsCaps, FsKind, FsOption};
 pub use crate::model::job::NoNotify;
 pub use crate::partition::type_catalog::TableKind;
 pub use crate::rbformats::export::ExportFormat;

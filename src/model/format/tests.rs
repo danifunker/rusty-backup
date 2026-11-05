@@ -81,7 +81,8 @@ fn every_kind_formats_at_a_middle_size_and_opens() {
 fn fixed_geometry_kinds_report_their_size() {
     for k in FsKind::ALL {
         let c = k.caps();
-        if c.fixed_size && k != FsKind::Cpm {
+        // A size of 0 means a preset or geometry picks it.
+        if c.fixed_size && c.min_size > 0 {
             let bytes = format_vec(k, 800 * KIB).unwrap();
             assert_eq!(bytes.len() as u64, c.min_size, "{}", k.id());
         }
@@ -164,4 +165,23 @@ fn every_kind_formats_at_its_largest_buildable_size() {
         let _ = std::fs::remove_file(&path);
     }
     assert!(bad.is_empty(), "failed at the claimed maximum: {bad:#?}");
+}
+
+#[test]
+fn every_geometry_formats_and_opens() {
+    for k in FsKind::ALL {
+        for (id, _) in geometries(k) {
+            let opts = FormatOptions {
+                geometry: Some(id.to_string()),
+                ..opts_for(k)
+            };
+            let mut cur = Cursor::new(Vec::new());
+            let done = format_into(&mut cur, 0, k, &opts)
+                .unwrap_or_else(|e| panic!("{} {id}: {e:#}", k.id()));
+            let mut v = cur.into_inner();
+            v.resize(done.len as usize, 0);
+            let r = std::panic::catch_unwind(|| check_opens(k, v));
+            assert!(r.is_ok(), "{} {id} fails its check", k.id());
+        }
+    }
 }

@@ -16,7 +16,7 @@ use ratatui::Frame;
 use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
-    containers, cpm_presets, format_size, parse_size_field, purpose, BuildDiskAction,
+    containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
     BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, NoNotify, RowContent, Step,
     TableKind,
 };
@@ -398,6 +398,19 @@ impl BuildDiskState {
                         let cur = o.cpm_preset.as_deref().unwrap_or("");
                         let cur = all.iter().copied().find(|p| *p == cur).unwrap_or(all[0]);
                         o.cpm_preset = Some(cycle(all.as_slice(), cur, forward).to_string());
+                    }
+                    FsOption::Geometry => {
+                        let kind = self
+                            .ctl
+                            .format_targets()
+                            .into_iter()
+                            .find(|t| t.row == r)
+                            .map(|t| t.fs);
+                        let Some(kind) = kind else { return false };
+                        let all: Vec<&str> = geometries(kind).iter().map(|g| g.0).collect();
+                        let cur = o.geometry.as_deref().unwrap_or(all[0]);
+                        let cur = all.iter().copied().find(|g| *g == cur).unwrap_or(all[0]);
+                        o.geometry = Some(cycle(all.as_slice(), cur, forward).to_string());
                     }
                     FsOption::SectorSize => {
                         let s = cycle(
@@ -809,6 +822,17 @@ impl App {
                             "  Cluster size".into(),
                             auto(x.cluster_bytes.map(u64::from)),
                         ),
+                        FsOption::Geometry => {
+                            let t = targets.iter().find(|t| t.row == *r);
+                            let label = t
+                                .and_then(|t| {
+                                    let all = geometries(t.fs);
+                                    let id = x.geometry.as_deref().unwrap_or(all.first()?.0);
+                                    all.iter().find(|g| g.0 == id).map(|g| g.1)
+                                })
+                                .unwrap_or("?");
+                            ("  Geometry".into(), format!("< {label} >"))
+                        }
                         FsOption::SectorSize => (
                             "  Sector size".into(),
                             format!("< {} >", x.sector_size.unwrap_or(512)),

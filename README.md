@@ -368,7 +368,7 @@ The app has five tabs:
   disk (MBR / GPT / APM / RDB / SGI volume header / SGI disk label / Sun /
   NeXT / Solaris x86 / X68000 / Atari AHDI) or one bare volume, saved as an
   image file or written straight to a physical disk such as an SD or CF card.
-  Each partition is formatted blank with any of the 34 filesystems Rusty
+  Each partition is formatted blank with any of the 39 filesystems Rusty
   Backup can create, filled from a source image, or left empty; its type
   follows the filesystem. The wizard checks each filesystem's size limits and
   label rules before it lets you go on, and a device build asks you to type

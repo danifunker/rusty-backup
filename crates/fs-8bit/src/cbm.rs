@@ -1585,8 +1585,11 @@ pub fn create_blank(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>
     // Reserve header + BAM + first directory sector.
     bam.set(dir_track, 0, false);
     bam.set(dir_track, first_dir_sector, false);
+    // A 1571 reserves all of track 53 (its second-side BAM), as fsck and the allocator expect.
     if variant == CbmVariant::D71 {
-        bam.set(53, 0, false);
+        for sec in 0..variant.sectors_in_track(53) {
+            bam.set(53, sec, false);
+        }
     }
     if variant == CbmVariant::D81 {
         bam.set(40, 1, false);
@@ -1779,6 +1782,14 @@ fn create_blank_pet(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_blank_1571_disk_reserves_track_53_and_checks_clean() {
+        let img = create_blank(CbmVariant::D71, "BLANK", "RB").unwrap();
+        let mut fs = CbmFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
     use super::*;
     use std::io::Cursor;
 

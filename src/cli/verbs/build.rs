@@ -149,6 +149,12 @@ pub struct BuildArgs {
     #[arg(long)]
     pub label: Option<String>,
 
+    /// With no `--table`: the fixed geometry of a floppy format, e.g. `d71`
+    /// for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds`
+    /// (`dragondos`). The default is the format's first.
+    #[arg(long)]
+    pub geometry: Option<String>,
+
     /// Container to encode an image target into: raw, vhd, vhd-dynamic,
     /// qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the
     /// target's extension names (`.chd`, `.vhd`, ...), else raw.
@@ -250,14 +256,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
             act(&mut c, A::SetKind(DiskKind::Volume));
             act(&mut c, A::SetVolumeFs(fs_named(fs)?));
-            if let Some(label) = &args.label {
+            if args.label.is_some() || args.geometry.is_some() {
                 let mut opts = c.format_targets()[0].opts.clone();
-                opts.label = label.clone();
+                if let Some(label) = &args.label {
+                    opts.label = label.clone();
+                }
+                opts.geometry = args.geometry.clone();
                 act(&mut c, A::SetVolumeOptions(opts));
             }
         }
         Some(table) => {
-            if args.fs.is_some() || args.label.is_some() {
+            if args.fs.is_some() || args.label.is_some() || args.geometry.is_some() {
                 bail!("--fs / --label are for a bare volume; use --format N=FS:LABEL with --table");
             }
             act(&mut c, A::SetKind(DiskKind::Partitioned));

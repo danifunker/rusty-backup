@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
-    containers, cpm_presets, format_size, ids, parse_size_field, BuildDiskAction,
+    containers, cpm_presets, format_size, geometries, ids, parse_size_field, BuildDiskAction,
     BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, RowContent, Step,
 };
 use rusty_backup::controller::log::LogLevel;
@@ -776,6 +776,21 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                             for p in cpm_presets() {
                                 if ui.selectable_label(cur == p, p).clicked() {
                                     o.cpm_preset = Some(p.to_string());
+                                }
+                            }
+                        });
+                }
+                FsOption::Geometry => {
+                    ui.label("Geometry:");
+                    let all = geometries(t.fs);
+                    let cur = o.geometry.clone().unwrap_or_else(|| all[0].0.to_string());
+                    let shown = all.iter().find(|g| g.0 == cur).map_or("?", |g| g.1);
+                    egui::ComboBox::from_id_salt(("bd_geo", key))
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (id, label) in all {
+                                if ui.selectable_label(cur == *id, *label).clicked() {
+                                    o.geometry = Some(id.to_string());
                                 }
                             }
                         });
