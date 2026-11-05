@@ -35,8 +35,9 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
 
 1. **GUI smoke on macOS and Windows** (needs the user): async pickers, the Inspect / Restore
    dialogs moved in Phase 2. Then Phase 2 is closed.
-2. **Interim release: done 2026-11-04.** PR #96 merged into `main` (7c8f80d9) after
-   `.github/ci-targets` was removed; the push to `main` builds every target and auto-releases.
+2. **Interim release: done 2026-11-05** as v2026-11-05-11-36. PR #96 (7c8f80d9) failed on
+   main; PR #107 (fbe7c9ec) fixed ppc32 `AtomicU64` plus the Windows / macOS bugs and tests
+   the first full-target run found. The push to `main` builds every target and auto-releases.
    Branch pushes now build every target too (no ci-targets file); add one back only for a
    long run of branch work, and remove it before the next merge. Ask before anything else
    goes into `main`.
