@@ -2234,6 +2234,120 @@ desktop audio stack; not planned for the TUI).
   Explorer does.
 - TUI parity is complete except Build Disk (`docs/build_disk_plan.md`).
 
+## Slice 29: the remaining TUI parity gaps
+
+The user decided (2026-11-04) that the TUI reaches the egui GUI's feature set before Phase 2
+closes, except the CD-DA player (GUI only) and Build Disk (`docs/build_disk_plan.md`). After
+slice 28 the matrix still listed: Commander's type/creator, ProDOS and date editors and the
+clipboard; Settings' repository URL and Clear Recent Files; the app shell's update banner and
+shared backup folder; Archives' ticks and Mount in Inspect; Bulk Convert's CD / floppy formats,
+CHD options, multi-bin and extension; the Explorer's Edit Mode for zstd / CHD backups; and the
+disc browser's preview pane.
+
+### Steps
+
+1. (7ea1deed) Controller lift, so both shells offer the same rules:
+   - `RecentHandle` is a `ConfigStore`: Settings (GUI and TUI) saves and clears through the
+     app's store, so Clear Recent Files empties every screen's list (slice 22's Left item).
+     `SettingsController::clear_recent_label` / `can_clear_recent`.
+   - `controller::app::update` builds with `gui` or `tui-update`.
+   - `bulk_convert::format_label` / `format_note` / `MULTI_BIN_*`; the egui radio list is
+     built from `FORMATS` with them.
+   - Commander File Info: `DetailField` gains `TypeCreator`, `ProdosType`, `Created`,
+     `Modified`, `Backup`; `detail_fields()` (what the entry offers), `detail_metadata()`
+     (values with staged edits applied) and `detail_suggestions()` (the type/creator and ProDOS
+     dictionaries). Each prompt stages the `MetadataEdit` the egui editors stage.
+   - Edit Mode: `Command::EditMode` (Explorer: Ctrl+W); writes into an archive's temp copy
+     count as unsaved like a CHD diff; the close question's Apply saves the copy (flatten /
+     recompress) before closing, Discard drops it; a single-pane `RequestClose` with such writes
+     goes to the modes' question; `BrowseOpen::edits_through_modes`.
+   - Tests: `settings_clear_goes_through_the_app_store`,
+     `file_info_offers_the_mac_fields_and_stages_type_creator_and_a_date`,
+     `the_explorer_edits_a_zstd_backup_in_edit_mode_and_saves_it_on_close`,
+     `discarding_a_written_archive_copy_leaves_the_archive_as_it_was`,
+     `closing_a_chd_with_a_written_diff_flattens_it_before_closing` (its control failed without
+     the fix); `tests/ui_scenarios/{archives_mount,bulk_convert_formats}.toml`.
+2. (e4fcf5f1) Settings and the app shell: `src/cli/verbs/tui_app/settings.rs` (the toggles,
+   the repository URL typed in place, Clear Recent Files with its count; `?` keys) and
+   `src/cli/verbs/tui_app/shell.rs`: a `tui-update` build runs the shell's start-up release
+   check and shows the banner under the tab bar (install with `:` `update --apply`, F12 hides
+   it); Restore and Inspect share the backup folder through `share_backup` (the showing screen
+   publishes or adopts; closing it on either closes both; the line under the tab bar names it).
+3. (bd19baf2) Archives (`src/cli/verbs/tui_app/archives.rs`): entry ticks (Space), Extract All
+   (`e`) / Extract Selected (`s`) through the controller's folder prompt, Mount in Inspect
+   (`m`) opening the payload on the Inspect screen; every `Effect` and `HostRequest` matched.
+4. (62cccc16) Bulk Convert (`src/cli/verbs/tui_app/bulk.rs`): every dialog format with its
+   note, the CHD options per profile (an off-unit hunk refused before Start), multi-bin
+   BIN/CUE, the output extension (Tab resets it), all / none ticks. Controller: a format changed
+   while a scan runs lists the folder again when that scan lands.
+5. (b4074ad3) File Info prompts in Commander and the Explorer (`t` type/creator with Up / Down
+   through the dictionary, `p` ProDOS type, `c` / `d` / `b` the dates, beside `m` / `o` / `x`)
+   and the values shown with staged edits applied; a `CopyToClipboard` is sent through OSC 52
+   (best effort, up to 74 KiB) and still shown to select.
+6. (0d492d2e) Engine fix: a compacted backup partition decompressed for Edit Mode kept the packed
+   volume's size, so it had no free space and every add was refused; the decompress grows the
+   filesystem to the partition size (`resize_filesystem_for`), as a restore does.
+7. (505efb6d) Controller fix: a zstd partition's seekable cache older than its archive is
+   rebuilt, so a browse after an Edit Mode save shows the edits (GUI too).
+8. (32d8d731, aa748adc, 9814006a) The Explorer opens every writable source through the
+   controller's Inspect modes: an in-place source enters Edit Mode once listed (edits still
+   written at once; a SquashFS asks its size budget first, the GUI's dialog as a window), a
+   zstd backup partition or a CHD stays read-only until Ctrl+W, writes go to the copy, and
+   Ctrl+W / Esc / `q` ask Discard / Apply / Cancel before the copy is saved; the copy is released
+   when the Explorer closes; the title shows the free space.
+9. (c35cbc5d, 283594f3, a1bd1c3e, 5d20563d) The Settings scenario checks the Clear label; the
+   TUI tests' archive and SquashFS fixtures come from `controller::test_fixtures` (boundaries);
+   clippy's `div_ceil`; explicit `as_str` at the new call sites (mrustc).
+10. (this commit) Docs: this section, `docs/platform_matrix.md` (Commander, App shell, Settings,
+    Bulk Convert, Archives, Inspect tab, Disc browser, TUI Explorer, and a New Disk row),
+    `docs/tui_plan.md`.
+
+Tests added in the TUI: `a_settings_toggle_saves_through_the_settings_controller` (now on the
+headless shell), `the_repository_url_is_edited_and_recent_files_are_cleared_through_the_app`,
+`restore_and_inspect_share_the_backup_folder`, `the_update_banner_follows_the_shell_and_f12_hides_it`,
+`ticked_entries_extract_through_the_controllers_folder_prompt`,
+`mount_in_inspect_opens_the_payload_on_the_inspect_screen`,
+`the_form_offers_every_format_multi_bin_and_the_extension`,
+`chd_options_reach_the_start_and_an_off_unit_hunk_is_refused` (cfg `chd`),
+`file_info_stages_the_type_creator_and_a_date_through_its_prompts`,
+`osc52_payloads_are_base64_and_capped`, `the_explorer_edits_a_zstd_backup_partition_in_edit_mode`,
+`a_squashfs_volume_asks_for_its_size_budget_before_edit_mode`. They assert on controller state,
+files and payloads, not on wrapped text.
+
+### Behaviour changes
+
+- TUI: Settings edits the repository URL and clears the recent files; `tui-update` builds show
+  the update banner; Restore and Inspect share the backup folder (Restore's `c` on the backup
+  row now closes it on Inspect too).
+- TUI: Archives ticks entries, extracts the ticked ones and mounts a disk-image payload in
+  Inspect; Extract All asks for its folder through the controller (the title "Extract All To").
+- TUI: Bulk offers every format (it opened on Raw; it now opens on VHD, as the GUI), the CHD
+  options, multi-bin and the extension.
+- TUI: File Info shows and edits the type / creator, ProDOS type and Mac dates; copies go to the
+  terminal clipboard through OSC 52 as well as on screen.
+- TUI: the Explorer works through Edit Mode: in-place sources are editable once listed as
+  before, but a source that cannot be opened for writing now says so at once; a SquashFS asks
+  its size budget; zstd backups and CHDs are edited (read-only before); `q` with unsaved Edit
+  Mode writes asks first.
+- GUI: Settings' Clear goes through the app's store (the same config.json); closing the browse
+  view with a written CHD diff and answering Apply now flattens it before closing (it closed and
+  removed the diff, losing the edits); a stale seekable cache is rebuilt; Edit Mode on a
+  compacted backup has its free space; the Bulk Convert radio list and multi-bin texts come from
+  the controller (same labels and hovers).
+- CLI: `rb-cli` archive edits of a compacted backup partition grow the copy to the partition
+  size (the shared `extract_partition_sync`); nothing else.
+
+### Left
+
+- Genuine terminal limits, recorded in the matrix: no drag-and-drop, OSC 52 can be refused, no
+  preview column beside the disc browser's tree and listing (F3 File Info shows it), the TUI's
+  own tab bar.
+- The CD-DA player stays GUI only; Build Disk and the New Disk wizard's own controller come with
+  `docs/build_disk_plan.md`.
+- Engine finding, not fixed (external `libchdman-rs`): a CHD conversion of an image of 8 KiB or
+  less aborts the process in MAME's `compress_v5_map` (`!bitbuf.overflow()`); 16 KiB works.
+  Reproduce: `head -c 8192 /dev/zero > z.img; rb-cli convert z.img out --format chd`.
+
 ## Decisions taken 2026-11-02 (assumed accepted)
 
 All behaviour changes listed in slices 11-18 stand. In particular:
@@ -2246,11 +2360,14 @@ All behaviour changes listed in slices 11-18 stand. In particular:
 
 ## Where Phase 2 stands (2026-11-04)
 
-- Slices 1-28 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
+- Slices 1-29 done; every GUI picker is async (slice 23); the TUI Backup and Restore screens
   have the GUI's feature set (slices 24, 25; Build Disk planned separately), the TUI Inspect
   screen its disk tools, Calc min and Export (slice 26) and its dialogs: the table editor, Add
-  Partition, Resize, Alto resize, Expand HFS and floppy convert (slice 27), and the TUI Optical
-  screen the Optical tab's (slice 28; not the CD-DA player). `src/gui` and the whole TUI are enforced at 0 engine references
+  Partition, Resize, Alto resize, Expand HFS and floppy convert (slice 27), the TUI Optical
+  screen the Optical tab's (slice 28; not the CD-DA player), and slice 29 closed the rest:
+  Settings, the update banner and shared backup, Archives, Bulk Convert, the File Info editors
+  and Edit Mode in the Explorer. **TUI parity is done** except the CD-DA player and Build Disk.
+  `src/gui` and the whole TUI are enforced at 0 engine references
   (`crate::update` counted since slice 22, so recent files go through the `AppController`).
   Shell engine references: 979 at the start of Phase 2, **0** now (slice 20).
 - CI was green on every slice through 18 (Solaris 9 / mrustc included); 3119ea34 was
@@ -2274,8 +2391,9 @@ All behaviour changes listed in slices 11-18 stand. In particular:
    publish `rb-fsexporter` 0.1.1.
 3. **TUI parity gaps** the controllers already support (Backup done in slice 24, Restore and
    the disk writer in slice 25, Inspect disk tools / Calc min / Export in slice 26, the Inspect
-   dialogs in slice 27, Optical in slice 28): done (user decision 2026-11-04: full parity
-   except the CD-DA player and Build Disk, `docs/build_disk_plan.md`, which comes next).
+   dialogs in slice 27, Optical in slice 28, the rest in slice 29): done (user decision
+   2026-11-04: full parity except the CD-DA player and Build Disk, `docs/build_disk_plan.md`,
+   which comes next).
 4. **Pickers off the UI thread** (done, slice 23 above): every egui picker is an rfd
    `AsyncFileDialog` polled from the frame, one at a time.
 5. **Full regression suite** (`regression-tests`, ~95 min) and a GUI smoke on macOS and
