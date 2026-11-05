@@ -494,7 +494,12 @@ fn source_sort_partition_and_log_commands() {
     assert!(ctl.log_shown());
     ctl.apply(key(Key::Escape));
     assert!(!ctl.log_shown());
-    assert_eq!(ctl.key_hint(Command::Checksums), "Ctrl+G");
+    let primary = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    };
+    assert_eq!(ctl.key_hint(Command::Checksums), format!("{primary}+G"));
 }
 
 #[test]

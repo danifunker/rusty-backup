@@ -416,6 +416,6 @@ fn closing_a_chd_with_a_written_diff_flattens_it_before_closing() {
     assert!(ctl.unsaved_shown());
     mode(&mut ctl, ModeAction::Unsaved(UnsavedChoice::Apply));
     settle(&mut ctl);
-    assert!(ctl.take_close_request());
+    assert!(ctl.take_close_request(), "{:?}", ctl.take_mode_notice());
     assert!(root_names(&chd).contains(&"KEPT".to_string()));
 }

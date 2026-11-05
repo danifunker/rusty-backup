@@ -111,7 +111,10 @@ impl BrowserPaneController {
         let rel = cwd.strip_prefix(root.path.as_str()).unwrap_or(&cwd);
         let mut at = 0;
         self.tree_expand(0);
-        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+        // A Windows host folder separates with `\`; image paths never do.
+        let host = cfg!(windows) && self.listing.is_host();
+        let sep = |c: char| c == '/' || (host && c == '\\');
+        for comp in rel.split(sep).filter(|c| !c.is_empty()) {
             self.tree_expand(at);
             let depth = self.folders.nodes[at].depth + 1;
             let child = (at + 1..self.folders.nodes.len())

@@ -602,6 +602,8 @@ impl CommanderController {
             self.saved_for_close(true);
             return;
         };
+        // The pane's readers hold the parent open; Windows can't replace an open file.
+        self.left.release_source();
         let folder = self.modes.backup_folder.clone();
         let job = self.spawn_mode("Flattening CHD...", move |job| {
             flatten_chd(&chd.parent, &diff, folder.as_deref(), job)
