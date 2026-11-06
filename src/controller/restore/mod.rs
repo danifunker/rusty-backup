@@ -68,6 +68,7 @@ pub mod ids {
     pub const REMOTE_USE_IMAGE: &str = "restore.remote_use_image";
     pub const EXPAND: &str = "restore.expand";
     pub const ALIGNMENT: &str = "restore.alignment";
+    pub const MAC_DRIVER: &str = "restore.mac_driver";
     pub const SCAN_TARGET: &str = "restore.scan_target";
     pub const WRITE_IMAGE: &str = "restore.write_image";
     pub const WRITE_TARGET: &str = "restore.write_target";
@@ -135,6 +136,8 @@ pub enum RestoreAction {
     SetExpand(bool),
     SetExpandMib(u32),
     SetExtendLast(bool),
+    /// Whether a disk whose backup lost its Mac driver gets the bundled one.
+    SetInstallMacDriver(bool),
     /// Read the single-partition target's table.
     ScanTarget,
     SetTargetPartition(usize),
@@ -488,6 +491,7 @@ impl Controller for RestoreController {
                 self.targets.expand.free_mib = n.min(self.expand_cap_mib())
             }
             RestoreAction::SetExtendLast(on) => self.targets.expand.extend_last = on,
+            RestoreAction::SetInstallMacDriver(on) => self.targets.install_mac_driver = on,
             RestoreAction::ScanTarget => self.scan_target(),
             RestoreAction::SetTargetPartition(idx) => self.targets.sp_part = Some(idx),
             RestoreAction::SetNewDisk(mut choice) => {

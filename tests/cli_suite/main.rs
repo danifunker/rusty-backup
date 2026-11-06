@@ -37,6 +37,7 @@ mod cli_optical_extract;
 mod cli_provision;
 mod cli_put_case;
 mod cli_ql;
+mod cli_restore_apm_driver;
 mod cli_restore_hfs;
 mod cli_sgi_hdd;
 mod cli_show_partmap;

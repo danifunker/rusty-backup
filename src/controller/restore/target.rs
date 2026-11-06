@@ -30,6 +30,8 @@ pub(super) struct TargetState {
     pub sp_scan: Option<(DeviceIdentity, Job<TargetScan>)>,
     pub sp_scan_error: Option<String>,
     pub new_disk_choice: NewDiskChoice,
+    /// Put the bundled Mac driver on a disk whose backup lost its own.
+    pub install_mac_driver: bool,
 }
 
 impl Default for TargetState {
@@ -46,6 +48,7 @@ impl Default for TargetState {
             sp_part: None,
             sp_scan: None,
             sp_scan_error: None,
+            install_mac_driver: true,
             new_disk_choice: NewDiskChoice {
                 table: NewTableType::Mbr,
                 alignment: AlignmentChoice::Modern1MB,
@@ -235,6 +238,15 @@ impl RestoreController {
         ))
     }
 
+    /// The backup lost its Mac driver, so the form offers the bundled one.
+    pub fn mac_driver_missing(&self) -> bool {
+        self.mode == RestoreMode::FullDisk && self.loaded().is_some_and(|l| l.mac_driver_missing)
+    }
+
+    pub fn install_mac_driver(&self) -> bool {
+        self.targets.install_mac_driver
+    }
+
     /// What each volume asks of the machine reading it, at the sizes chosen; worst first per row.
     pub fn size_caveats(&self) -> Vec<RowCaveat> {
         use crate::model::restore_plan::{plan_caveats, volume_caveats};
@@ -246,6 +258,7 @@ impl RestoreController {
                     &self.resolved_alignment(),
                     self.partition_sizes(is_device).as_slice(),
                     self.target_size(),
+                    self.targets.install_mac_driver,
                 )
             }),
             RestoreMode::SinglePartition | RestoreMode::NewDisk => {

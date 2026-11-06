@@ -855,6 +855,7 @@ fn restore_to_remote_image_round_trips() {
         alignment: RestoreAlignment::Original,
         partition_sizes: Vec::new(),
         write_zeros_to_unused: false,
+        install_mac_driver: true,
     };
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
     restore_to_remote(
@@ -877,6 +878,7 @@ fn restore_to_remote_image_round_trips() {
         alignment: RestoreAlignment::Original,
         partition_sizes: Vec::new(),
         write_zeros_to_unused: false,
+        install_mac_driver: true,
     };
     let refused = restore_to_remote(
         again(),

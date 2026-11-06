@@ -65,6 +65,7 @@ pub(super) enum Field {
     Expand,
     ExpandMib,
     ExtendLast,
+    MacDriver,
     Alignment,
     AlignCustom,
     /// A partition's size row, by its index.
@@ -377,6 +378,9 @@ impl RestoreState {
                     }
                 }
                 f.extend(c.size_rows().iter().map(|r| Field::Size(r.index)));
+                if c.mac_driver_missing() {
+                    f.push(Field::MacDriver);
+                }
                 f.push(Field::Start);
             }
             RestoreMode::SinglePartition | RestoreMode::NewDisk => {
@@ -471,6 +475,10 @@ impl RestoreState {
             Field::ExtendLast => {
                 let on = !self.ctl.expand().extend_last;
                 self.act(RestoreAction::SetExtendLast(on));
+            }
+            Field::MacDriver => {
+                let on = !self.ctl.install_mac_driver();
+                self.act(RestoreAction::SetInstallMacDriver(on));
             }
             Field::Alignment => {
                 let all = [
@@ -1220,6 +1228,17 @@ impl App {
                         ),
                     )
                 }
+                Field::MacDriver => (
+                    "Mac driver:".into(),
+                    format!(
+                        "< {} >",
+                        if c.install_mac_driver() {
+                            "Install the bundled driver"
+                        } else {
+                            "None"
+                        }
+                    ),
+                ),
                 Field::ExtendLast => (
                     "  Use:".into(),
                     format!(

@@ -360,6 +360,7 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                             yes: true,
                             write_to_system_disk: false,
                             write_zeros_to_unused: false,
+                            no_mac_driver: false,
                         });
                         report(r, "restore");
                     } else {

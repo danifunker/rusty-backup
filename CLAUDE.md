@@ -100,6 +100,7 @@ Each backup is a folder. Two layouts depending on the chosen output:
 - `metadata.json` - partition info, alignment data, checksums, bad sectors
 - `mbr.bin` / `mbr.json` or `gpt.json` - partition table exports
 - `mbr-gap.bin` - the sectors between the MBR and the first partition (GRUB core.img, DDO), only when non-zero; restored after the MBR as far as the new layout has room
+- `apm-extras.bin` - an APM disk's driver and patch partitions back to back, in map order; `apm.json` says where each goes. A Mac can't start up without them, so a backup without this file gets the bundled driver on restore
 - `partition-N.<ext>` - one compressed file per partition (`.zst`, `.raw`, `.vhd`)
 - Per-file checksum files (`.sha256` or `.crc32`)
 

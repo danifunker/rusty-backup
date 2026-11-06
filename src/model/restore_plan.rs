@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backup::metadata::{BackupLayout, BackupMetadata, PartitionMetadata};
-use crate::model::fs_limits::{caveats, Caveat, VolumeFacts, HEAD_BYTES};
+use crate::model::fs_limits::{caveats, Caveat, CaveatLevel, VolumeFacts, HEAD_BYTES};
 use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 use crate::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
@@ -123,6 +123,8 @@ pub struct LoadedBackup {
     pub loaded_line: String,
     /// Keeps a `.cbk`'s unpacked folder alive.
     pub guard: Option<tempfile::TempDir>,
+    /// The disk had a Mac driver and this backup did not keep it.
+    pub mac_driver_missing: bool,
 }
 
 impl LoadedBackup {
@@ -190,6 +192,7 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
             row
         })
         .collect();
+    let mac_driver_missing = mac_driver_missing(folder, &metadata);
     let loaded_line = format!(
         "Loaded backup: {} partition(s) from {}",
         metadata.partitions.len(),
@@ -202,7 +205,19 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
         rows,
         loaded_line,
         guard: None,
+        mac_driver_missing,
     })
+}
+
+/// A whole-disk CHD holds the driver itself; a per-partition backup needs the sidecar.
+fn mac_driver_missing(folder: &Path, metadata: &BackupMetadata) -> bool {
+    if metadata.partition_table_type != "APM" || metadata.layout == BackupLayout::SingleFileChd {
+        return false;
+    }
+    std::fs::File::open(folder.join("apm.json"))
+        .ok()
+        .and_then(|f| serde_json::from_reader(f).ok())
+        .is_some_and(|apm| crate::backup::apm_extras::driver_missing(folder, &apm))
 }
 
 /// The first [`HEAD_BYTES`] of a backed-up partition; `None` when they cannot be read.
@@ -258,6 +273,7 @@ pub fn plan_caveats(
     alignment: &RestoreAlignment,
     sizes: &[RestorePartitionSize],
     target_size: u64,
+    install_mac_driver: bool,
 ) -> Vec<RowCaveat> {
     // The layout is what knows how big Fill makes a row.
     let layout = loaded
@@ -268,6 +284,26 @@ pub fn plan_caveats(
             crate::restore::calculate_restore_layout(m, alignment, sizes, target_size).ok()
         });
     let mut out = Vec::new();
+    if loaded.mac_driver_missing {
+        let text = if install_mac_driver {
+            format!(
+                "This backup did not keep the disk's Mac driver, so the bundled {} goes in its \
+                 place; it covers SCSI disks, and an IDE Mac needs its own",
+                crate::fs::mac_scsi_bless::BUILTIN_DRIVER_NAME
+            )
+        } else {
+            "This backup did not keep the disk's Mac driver and none will be added, so a Mac \
+             cannot start up from this disk"
+                .to_string()
+        };
+        out.push(RowCaveat {
+            position: None,
+            caveat: Caveat {
+                level: CaveatLevel::Warning,
+                text,
+            },
+        });
+    }
     for (pos, row) in loaded.rows.iter().enumerate() {
         let Some(facts) = row.facts else { continue };
         let size = layout
@@ -340,6 +376,7 @@ fn load_clonezilla(folder: &Path, cz_folder: &Path) -> Result<LoadedBackup, Stri
         rows,
         loaded_line,
         guard: None,
+        mac_driver_missing: false,
     })
 }
 

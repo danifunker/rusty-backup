@@ -1,3 +1,4 @@
+pub mod apm_extras;
 pub mod disk_image_stream;
 pub mod format;
 pub mod mbr_gap;
@@ -1175,6 +1176,22 @@ fn run_backup_inner(
                     LogLevel::Info,
                     "Exported APM (apm.json + apm.bin)",
                 );
+                match apm_extras::export(&mut source, apm, &backup_folder) {
+                    Ok(0) => {}
+                    Ok(bytes) => log(
+                        &progress,
+                        LogLevel::Info,
+                        format!(
+                            "Exported {bytes} byte(s) of Mac driver partitions ({})",
+                            apm_extras::FILE_NAME
+                        ),
+                    ),
+                    Err(e) => log(
+                        &progress,
+                        LogLevel::Warning,
+                        format!("Could not read the Mac driver partitions: {e:#}"),
+                    ),
+                }
             }
         }
         PartitionTable::Rdb(rdb) => {

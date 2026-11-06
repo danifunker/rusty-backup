@@ -1975,6 +1975,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--yes` — Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
+- `--no-mac-driver` — Leave out the bundled Mac driver a backup that lost its own would otherwise get
 
 ### `rm`
 

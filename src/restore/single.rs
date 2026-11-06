@@ -492,6 +492,15 @@ pub fn run_single_partition_restore(
         }
     }
 
+    // A fresh APM disk has no driver at all, and a Mac won't mount it without one.
+    if let Some(nd) = config
+        .new_disk
+        .as_ref()
+        .filter(|nd| matches!(nd.table_type, NewTableType::Apm))
+    {
+        super::install_bundled_mac_driver(&mut target, nd.disk_size_bytes, &progress);
+    }
+
     target.flush()?;
     target.sync_all()?;
 

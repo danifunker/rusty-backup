@@ -53,8 +53,7 @@ only then overwrites the old one. Build Disk and all four Restore paths (per-par
 CHD, Clonezilla, single partition) share it.
 
 A bootable System 7.5.5 disk restored from 70 MiB to 600 MiB this way starts up to the desktop on a
-Quadra 800 under QEMU (`docs/evidence/restore-rebuilt-system755-quadra.png`). That run had its Mac
-driver copied back by hand, because a zstd or raw backup does not keep the driver partition.
+Quadra 800 under QEMU (`docs/evidence/restore-rebuilt-system755-quadra.png`).
 
 The temp file sits beside an image target, or in the system temp folder for a device; it holds about
 as much as the volume's files. Point `TMPDIR` at a larger drive if that folder is short of room, and

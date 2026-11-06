@@ -755,7 +755,16 @@ impl RestoreTab {
     }
 
     /// What each volume asks of the machine reading it, from the shared limits table.
-    fn show_caveats(&self, ui: &mut egui::Ui) {
+    fn show_caveats(&mut self, ui: &mut egui::Ui) {
+        if self.ctl.mac_driver_missing() {
+            let mut on = self.ctl.install_mac_driver();
+            if ui
+                .checkbox(&mut on, "Install the bundled Mac driver")
+                .changed()
+            {
+                self.act(RestoreAction::SetInstallMacDriver(on));
+            }
+        }
         for c in self.ctl.size_caveats() {
             let color = match c.caveat.level {
                 CaveatLevel::Info => super::theme::muted(ui.visuals()),

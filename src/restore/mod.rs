@@ -41,6 +41,8 @@ pub struct RestoreConfig {
     /// Write zeros to unused filesystem space. Generally not needed for FAT.
     /// Set to true only if you encounter issues with specific filesystem types.
     pub write_zeros_to_unused: bool,
+    /// Put the bundled Mac driver on a disk whose backup did not keep its own.
+    pub install_mac_driver: bool,
 }
 
 /// Alignment choice for the restore.
@@ -128,6 +130,31 @@ fn set_operation(progress: &Arc<Mutex<RestoreProgress>>, op: impl Into<String>) 
 
 fn is_cancelled(progress: &Arc<Mutex<RestoreProgress>>) -> bool {
     progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
+}
+
+/// Put the bundled Mac driver on `target`; a disk that can't take it still restores.
+pub(crate) fn install_bundled_mac_driver(
+    target: &mut SectorAlignedWriter,
+    disk_len: u64,
+    progress: &Arc<Mutex<RestoreProgress>>,
+) {
+    use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver};
+    let driver = MacScsiDriver::builtin();
+    match bless_apm_disk(target, disk_len, &driver, &BlessOptions::default()) {
+        Ok(_) => log(
+            progress,
+            LogLevel::Info,
+            format!(
+                "Installed the {}",
+                crate::fs::mac_scsi_bless::BUILTIN_DRIVER_NAME
+            ),
+        ),
+        Err(e) => log(
+            progress,
+            LogLevel::Warning,
+            format!("Could not install a Mac driver, so this disk cannot start up a Mac: {e}"),
+        ),
+    }
 }
 
 /// Rebuild an HFS volume `size` is past the reach of; every restore path runs this before its resize.
@@ -1139,6 +1166,17 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         }
     };
 
+    if let Some(apm) = apm_data.as_ref().filter(|_| config.install_mac_driver) {
+        if crate::backup::apm_extras::driver_missing(&config.backup_folder, apm) {
+            log(
+                &progress,
+                LogLevel::Warning,
+                "This backup did not keep the disk's Mac driver; using the bundled one",
+            );
+            install_bundled_mac_driver(&mut target, config.target_size, &progress);
+        }
+    }
+
     // Step 8: Filesystem resize operations (using inner File to avoid buffer flush on every seek)
     set_operation(&progress, "Finalizing filesystems...");
 
@@ -1746,6 +1784,7 @@ fn run_single_file_chd_restore_resize(
     set_operation(&progress, "Writing partition table...");
     let mut gpt_for_backup_header: Option<Gpt> = None;
     let mut ebr_result: Option<EbrChainResult> = None;
+    let mut chd_apm: Option<Apm> = None;
     if is_superfloppy {
         // No table to write.
     } else if patched_head.is_some() {
@@ -1780,10 +1819,8 @@ fn run_single_file_chd_restore_resize(
         target
             .write_all(&blocks)
             .context("failed to write APM head")?;
-        // Driver partitions sit AFTER the APM entry blocks but BEFORE
-        // the first user partition; their bodies come through the
-        // normal partition loop below since they appear in
-        // `metadata.partitions`.
+        // Driver bodies are not in `metadata.partitions`; they are copied after the partitions.
+        chd_apm = Some(apm);
     } else {
         // MBR: pull sector 0 from the CHD (it already carries any Stage
         // 4b patches from backup time) and re-patch with the new
@@ -2012,6 +2049,16 @@ fn run_single_file_chd_restore_resize(
             .write_all(head)
             .context("write the rewritten head region")?;
         target.flush().context("flush the head region")?;
+    }
+    if let Some(apm) = &chd_apm {
+        crate::backup::apm_extras::copy_from(
+            &mut chd_reader,
+            apm,
+            &overrides,
+            config.target_size,
+            &mut target,
+            &mut |m| log(&progress, LogLevel::Info, m),
+        )?;
     }
 
     // Step 3: filesystem resize + hidden-sector patches per partition.
@@ -3514,6 +3561,7 @@ mod tests {
             alignment: RestoreAlignment::Original,
             partition_sizes: vec![],
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         };
         let progress = Arc::new(Mutex::new(RestoreProgress::new()));
         run_restore(cfg, progress.clone()).expect("restore");
@@ -3683,6 +3731,7 @@ mod tests {
                 alignment: RestoreAlignment::Original,
                 partition_sizes: vec![],
                 write_zeros_to_unused: false,
+                install_mac_driver: true,
             },
             Arc::new(Mutex::new(RestoreProgress::new())),
         )
@@ -3831,6 +3880,7 @@ mod tests {
                 size_choice: RestoreSizeChoice::Custom(new_part_bytes),
             }],
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         };
         let progress = Arc::new(Mutex::new(RestoreProgress::new()));
         run_restore(cfg, progress.clone()).expect("restore");
@@ -4004,6 +4054,7 @@ mod tests {
             alignment: RestoreAlignment::Original,
             partition_sizes: vec![],
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         };
         let progress = Arc::new(Mutex::new(RestoreProgress::new()));
         run_restore(cfg, progress.clone()).expect("restore");
@@ -4239,6 +4290,7 @@ mod tests {
                 size_choice: RestoreSizeChoice::Custom(L0_NEW_SECTORS as u64 * SECTOR_SIZE),
             }],
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         };
         let progress = Arc::new(Mutex::new(RestoreProgress::new()));
         run_restore(cfg, progress.clone()).expect("restore");
@@ -4493,6 +4545,7 @@ mod tests {
                 size_choice: RestoreSizeChoice::Original,
             }],
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         };
         let progress = Arc::new(Mutex::new(RestoreProgress::new()));
         run_restore(cfg, progress.clone()).expect("restore");

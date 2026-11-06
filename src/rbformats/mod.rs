@@ -818,6 +818,19 @@ pub fn reconstruct_disk_from_backup(
     }
 
     writer.flush()?;
+    // Mac drivers sit outside the partitions just written, so they go in last.
+    if let Some(apm_data) = apm {
+        let end = writer.stream_position()?;
+        crate::backup::apm_extras::restore(
+            backup_folder,
+            apm_data,
+            partition_sizes,
+            target_size,
+            writer,
+            log_cb,
+        )?;
+        writer.seek(SeekFrom::Start(end))?;
+    }
     Ok(total_written)
 }
 

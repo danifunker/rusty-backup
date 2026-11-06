@@ -72,6 +72,10 @@ pub struct RestoreArgs {
     /// Write zeros to unused filesystem space.
     #[arg(long = "write-zeros-to-unused")]
     pub write_zeros_to_unused: bool,
+
+    /// Leave out the bundled Mac driver a backup that lost its own would otherwise get.
+    #[arg(long = "no-mac-driver")]
+    pub no_mac_driver: bool,
 }
 
 pub fn run(args: RestoreArgs) -> Result<()> {
@@ -150,7 +154,13 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
     };
     let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
-    report_caveats(&args.backup_dir, &alignment, &partition_sizes, target_size)?;
+    report_caveats(
+        &args.backup_dir,
+        &alignment,
+        &partition_sizes,
+        target_size,
+        !args.no_mac_driver,
+    )?;
 
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
@@ -162,6 +172,7 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         // choice per partition; `--size` is uniform across all of them.
         partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
+        install_mac_driver: !args.no_mac_driver,
     };
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
@@ -221,7 +232,13 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
     };
 
     let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
-    report_caveats(&args.backup_dir, &alignment, &partition_sizes, target_size)?;
+    report_caveats(
+        &args.backup_dir,
+        &alignment,
+        &partition_sizes,
+        target_size,
+        !args.no_mac_driver,
+    )?;
 
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
@@ -233,6 +250,7 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         alignment,
         partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
+        install_mac_driver: !args.no_mac_driver,
     };
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
@@ -326,13 +344,14 @@ fn report_caveats(
     alignment: &RestoreAlignment,
     sizes: &[crate::restore::RestorePartitionSize],
     target_size: u64,
+    install_mac_driver: bool,
 ) -> Result<()> {
     use crate::model::fs_limits::CaveatLevel;
     use crate::model::restore_plan::{load_backup, plan_caveats};
     let Ok(loaded) = load_backup(backup_dir) else {
         return Ok(());
     };
-    let caveats = plan_caveats(&loaded, alignment, sizes, target_size);
+    let caveats = plan_caveats(&loaded, alignment, sizes, target_size, install_mac_driver);
     for c in &caveats {
         log_stderr(format!("rb-cli restore: {}", c.line()));
     }

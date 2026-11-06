@@ -887,6 +887,7 @@ fn open_cbk_as_disk(path: &Path) -> Result<CbkTempReader> {
         alignment: RestoreAlignment::Original,
         partition_sizes: Vec::new(),
         write_zeros_to_unused: false,
+        install_mac_driver: true,
     };
     let progress = std::sync::Arc::new(std::sync::Mutex::new(RestoreProgress::default()));
     run_restore(cfg, progress).context("reconstruct .cbk into a temp disk")?;

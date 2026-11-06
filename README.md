@@ -358,7 +358,9 @@ The app has five tabs:
   for its block size is rebuilt with bigger blocks, up to 4063 MB. The form
   lists what each volume asks of the machine reading it, such as "FAT32 needs
   Windows 95 OSR2 or later" and where a volume stops growing
-  ([docs/fs_limits.md](docs/fs_limits.md)). Alignment (DOS/cylinder,
+  ([docs/fs_limits.md](docs/fs_limits.md)). A Mac disk keeps its driver
+  partition; a backup from an older version that lost it gets the bundled
+  Apple SCSI driver 7.3.5 (`--no-mac-driver` leaves it out). Alignment (DOS/cylinder,
   1 MB, or custom) is preserved from the source by default. A top-level
   "Add free space for in-OS expansion" toggle pads the target image so
   the guest OS can extend partitions there after boot — see the *Disk

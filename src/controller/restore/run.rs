@@ -192,6 +192,7 @@ impl RestoreController {
             alignment: self.resolved_alignment(),
             partition_sizes: self.partition_sizes(target_is_device),
             write_zeros_to_unused: false,
+            install_mac_driver: self.targets.install_mac_driver,
         };
         self.info(format!("Starting restore to {}", target_path.display()));
         self.spawn_restore(
@@ -223,6 +224,7 @@ impl RestoreController {
             alignment: self.resolved_alignment(),
             partition_sizes: self.partition_sizes(is_device),
             write_zeros_to_unused: false,
+            install_mac_driver: self.targets.install_mac_driver,
         };
         self.info(format!("Starting restore to {display}"));
         self.spawn_restore(

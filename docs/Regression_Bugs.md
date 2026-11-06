@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-086](#r-086)~~ | ~~**High**~~ **FIXED** | `src/backup` (`apm_extras`), `src/restore` | ~~A Mac disk restored from a zstd or raw backup, or from a CHD at a new size, came back with its driver partition zeroed, so it could not start up~~ — the driver is kept in `apm-extras.bin`, CHD restores copy it, and a backup that lost it gets the bundled driver, 2026-11-06 |
 | ~~[R-085](#r-085)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-mac` (`hfs_outgrows_in_place`) | ~~A partition under one block past a volume's limit counted as outgrowing it, which would rebuild a volume on a same-size restore~~ — less than a block past the limit is a remainder, 2026-11-06 |
 | ~~[R-084](#r-084)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (`pick_block_size`) | ~~A classic HFS volume with 65536-byte allocation blocks bombs System 7.5 at the desktop: every auto-sized volume past 2 GB, and Expand HFS's largest block choice~~ — blocks are the smallest multiple of 512 that fits, capped at 65024, 2026-11-06 |
 | ~~[R-083](#r-083)~~ | ~~**High**~~ **FIXED** | `crates/fs-amiga` (AFFS fsck) | ~~fsck reports a bitmap extension block as allocated but unreachable, and repair frees it, on any AFFS volume past about 49 MiB~~ — the blocks of the `bm_ext` chain count as metadata, 2026-11-06 |
@@ -109,6 +110,14 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-086 — a restored Mac disk lost its driver {#r-086}
+
+The map and driver entries are not data partitions, so they never reached `metadata.partitions`,
+and only the 2 KB map was saved. The map came back still pointing at a driver, over zeros: the Quadra
+showed the blinking disk. Only a CHD restored at its own size worked, since that copies the whole
+disk. The old comment in the CHD resize path said driver bodies came through the partition loop;
+they never did. Tests: `tests/cli_suite/cli_restore_apm_driver.rs`.
 
 ### R-085 — a remainder under one block looked like outgrowing the volume {#r-085}
 
