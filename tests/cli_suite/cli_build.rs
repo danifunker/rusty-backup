@@ -531,3 +531,98 @@ fn a_copied_hfs_past_four_gib_is_refused() {
     ]);
     assert!(!ok && text.contains("classic HFS stops at"), "{text}");
 }
+
+/// How many `Apple_Driver43` entries the partition map holds; `inspect` hides them.
+fn drivers(image: &str) -> usize {
+    let map = std::fs::read(image).unwrap();
+    let map = &map[512..512 * 64];
+    map.chunks(512)
+        .filter(|e| e[48..].starts_with(b"Apple_Driver43"))
+        .count()
+}
+
+/// An APM disk gets a driver by default, so a Mac mounts it; none and a chosen disk are options.
+#[test]
+fn an_apm_disk_gets_a_mac_driver_unless_told_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    let build = |out: &str, extra: &[&str]| {
+        let mut args = vec![
+            "build",
+            out,
+            "--size",
+            "32M",
+            "--table",
+            "apm",
+            "--partition",
+            "rest",
+            "--format",
+            "1=hfs:KEEP",
+        ];
+        args.extend_from_slice(extra);
+        run_raw(args.as_slice())
+    };
+    let (a, b, c, d) = (p("a.img"), p("b.img"), p("c.img"), p("d.img"));
+
+    let (ok, text) = build(a.as_str(), &[]);
+    assert!(ok && text.contains("Installed the Mac driver"), "{text}");
+    assert_eq!(drivers(a.as_str()), 1);
+    fsck_clean(&format!("{a}@1"));
+
+    let (ok, text) = build(b.as_str(), &["--mac-driver", "none"]);
+    assert!(ok && !text.contains("Installed the Mac driver"), "{text}");
+    assert_eq!(drivers(b.as_str()), 0);
+
+    let (ok, text) = build(c.as_str(), &["--mac-driver", a.as_str()]);
+    assert!(ok && text.contains("Installed the Mac driver"), "{text}");
+    assert_eq!(drivers(c.as_str()), 1);
+
+    // A disk with no driver to give fails before the target is written.
+    let (ok, text) = build(d.as_str(), &["--mac-driver", b.as_str()]);
+    assert!(!ok && text.contains("reading the driver"), "{text}");
+    let (ok, text) = run_raw(&[
+        "build",
+        d.as_str(),
+        "--size",
+        "8M",
+        "--table",
+        "mbr",
+        "--partition",
+        "rest",
+        "--mac-driver",
+        "none",
+    ]);
+    assert!(!ok && text.contains("APM feature"), "{text}");
+}
+
+/// A donor's own driver travels to the bigger disk, and its partition still opens.
+#[test]
+fn an_apm_donor_keeps_its_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "32M",
+        "--table",
+        "apm",
+        "--partition",
+        "rest",
+        "--format",
+        "1=hfs:KEEP",
+    ]);
+    let text = run(&[
+        "build",
+        &p("b.img"),
+        "--size",
+        "64M",
+        "--from",
+        &p("a.img"),
+        "--partition",
+        "rest",
+    ]);
+    assert!(text.contains("Mac driver from the donor"), "{text}");
+    assert_eq!(drivers(&p("b.img")), 1);
+    fsck_clean(&format!("{}@1", p("b.img")));
+}

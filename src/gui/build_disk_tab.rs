@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, ids, parse_size_field, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, PresetKind,
-    RowContent, Step,
+    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, MacDriver,
+    PresetKind, RowContent, Step,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -722,6 +722,32 @@ impl BuildDiskTab {
                     }
                 }
             });
+        }
+        if self.ctl.takes_mac_driver() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Mac driver").strong());
+            let cur = self.ctl.mac_driver().clone();
+            ui.horizontal(|ui| {
+                for d in [MacDriver::Bundled, MacDriver::Off] {
+                    let label = d.label();
+                    if ui
+                        .radio(cur == d, label)
+                        .on_hover_text(
+                            "A Mac mounts an APM disk only through a driver on the disk. \
+                             Bundled uses a donor's own driver when it has one",
+                        )
+                        .clicked()
+                    {
+                        acts.push(BuildDiskAction::SetMacDriver(d));
+                    }
+                }
+                if ui.button("From a disk...").clicked() {
+                    acts.push(BuildDiskAction::PickMacDriver);
+                }
+            });
+            if matches!(cur, MacDriver::FromDisk(_)) {
+                ui.label(cur.label());
+            }
         }
         for a in acts {
             self.act(a);

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver, BUILTIN_DRIVER_NAME};
 use crate::model::disk_builder::RowFormat;
 use crate::model::format::{self, Window};
 use crate::model::physical_write_runner::{self, PhysicalWriteStatus, WriteExtent};
@@ -29,6 +30,26 @@ use crate::os::{open_target_preserving, SectorAlignedWriter};
 use crate::partition::provision::{self, Geometry, Placed};
 use crate::partition::type_catalog::TableKind;
 use crate::rbformats::export::ExportFormat;
+
+/// What goes in an APM disk's driver slot; a Mac won't mount a disk that has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacDriver {
+    /// A donor's own driver if it has one, otherwise the bundled one.
+    Bundled,
+    Off,
+    /// The driver of this Apple-formatted disk.
+    FromDisk(PathBuf),
+}
+
+impl MacDriver {
+    pub fn label(&self) -> String {
+        match self {
+            MacDriver::Bundled => format!("{} (bundled)", BUILTIN_DRIVER_NAME),
+            MacDriver::Off => "None".to_string(),
+            MacDriver::FromDisk(p) => format!("From {}", p.display()),
+        }
+    }
+}
 
 /// Inputs for a build-a-disk job.
 #[derive(Debug, Clone)]
@@ -57,6 +78,32 @@ pub struct ProvisionRequest {
     pub donor: Option<PathBuf>,
     /// `(partition, donor start byte, length)`: donor bytes copied to the partition's start.
     pub copies: Vec<(usize, u64, u64)>,
+    /// The driver an APM disk gets; other tables ignore it.
+    pub mac_driver: MacDriver,
+}
+
+/// The driver to install and where it came from, or `None`. An unusable chosen disk is an error.
+fn load_mac_driver(req: &ProvisionRequest) -> Result<Option<(MacScsiDriver, String)>> {
+    if req.kind != TableKind::Apm {
+        return Ok(None);
+    }
+    let read = |path: &std::path::Path| -> Result<MacScsiDriver> {
+        let mut disk = crate::model::source_reader::open_read(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        MacScsiDriver::from_donor(&mut disk)
+            .map_err(|e| anyhow::anyhow!("reading the driver of {}: {e}", path.display()))
+    };
+    match &req.mac_driver {
+        MacDriver::Off => Ok(None),
+        MacDriver::FromDisk(path) => Ok(Some((read(path)?, path.display().to_string()))),
+        MacDriver::Bundled => {
+            let donor = req.donor.as_ref().and_then(|p| Some((read(p).ok()?, p)));
+            Ok(Some(match donor {
+                Some((driver, path)) => (driver, format!("the donor {}", path.display())),
+                None => (MacScsiDriver::builtin(), BUILTIN_DRIVER_NAME.to_string()),
+            }))
+        }
+    }
 }
 
 /// Read and check the handlers for `write_rdb_filesystems`: one per DosType, each an AmigaDOS
@@ -705,6 +752,9 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
         );
     }
 
+    // Before the target is touched, so a bad driver disk costs nothing.
+    let mac_driver = load_mac_driver(req)?;
+
     // A regular-file target has to exist at full length before the table is
     // written, or GPT's backup header lands past EOF in a sparse hole the
     // reparse can't find.
@@ -788,6 +838,16 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
             .write_all(head)
             .context("writing the donor's patched label")?;
         log_cb("Wrote the donor's label, resized for this disk");
+    }
+    if let Some((driver, from)) = &mac_driver {
+        let opts = BlessOptions::default();
+        match bless_apm_disk(&mut target, req.target_size_bytes, driver, &opts) {
+            Ok(_) => log_cb(&format!("Installed the Mac driver from {from}")),
+            Err(e) if req.mac_driver == MacDriver::Bundled => log_cb(&format!(
+                "Warning: no Mac driver installed, so a Mac won't mount this disk: {e}"
+            )),
+            Err(e) => anyhow::bail!("installing the Mac driver: {e}"),
+        }
     }
     // The FSHD chain lands past the PART blocks, inside the RDSK's reserved area.
     let handlers = load_rdb_handlers(req.kind, req.rdb_handlers.as_slice())?;
@@ -974,6 +1034,7 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
             head: None,
             donor: None,
             copies: Vec::new(),
@@ -1022,6 +1083,7 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
             head: None,
             donor: None,
             copies: Vec::new(),
@@ -1088,6 +1150,7 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
             head: None,
             donor: None,
             copies: Vec::new(),
@@ -1119,6 +1182,7 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
             head: None,
             donor: None,
             copies: Vec::new(),

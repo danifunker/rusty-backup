@@ -452,6 +452,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--fill` — Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works
 - `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
+- `--mac-driver` — The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it
 - `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables
@@ -718,9 +719,9 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 **Options**
 
 - `--size` — Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)
-- `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
+- `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65024. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
 - `--output` — Destination path for the new image. Created (or truncated)
-- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 4095 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
+- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 4063 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
 
 ### `floppy`
 

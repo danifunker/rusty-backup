@@ -938,11 +938,12 @@ impl Target for RestoreTarget {
 /// `OutputImage` (`$out`), `OutputDevice` (a size such as `32M`: a file of that size standing in
 /// for a device, pre-filled with 0xA5), `SetSize`, `SetTable` (a table label such as `MBR`),
 /// `RowSize` (`row:size`), `AddRow`, `RowFs` (`row:fs-id` or `row:empty`), `VolumeFs` (an fs id),
-/// `Label` (the first formatted target's label), `TypeDevicePath` (types the path asked for).
+/// `Label` (the first formatted target's label), `TypeDevicePath` (types the path asked for),
+/// `SetMacDriver` (`bundled` or `none`).
 /// Probes: `step`, `steps` (comma list), `blocked` (why Next is refused, empty when it is not),
 /// `rows`, `layout` (`ok` or why), `row_type` (row 0's type), `result` (`ok`, the failure, or
 /// empty), `opens` (how many volumes of the output open: the bare volume or each partition),
-/// `tail_zero` (the output's last 64 KiB were written as zeros, so no old data shows).
+/// `tail_zero` (the output's last 64 KiB were written as zeros, so no old data shows), `mac_driver`.
 struct BuildDiskTarget {
     ctl: rusty_backup::controller::build_disk::BuildDiskController,
     dir: tempfile::TempDir,
@@ -1029,6 +1030,10 @@ impl Target for BuildDiskTarget {
                 }
             }
             "SetSize" => A::SetSize(arg_str(arg)?.to_string()),
+            "SetMacDriver" => A::SetMacDriver(match arg_str(arg)? {
+                "none" => rusty_backup::controller::build_disk::MacDriver::Off,
+                _ => rusty_backup::controller::build_disk::MacDriver::Bundled,
+            }),
             "SetTable" => {
                 let want = arg_str(arg)?;
                 let kind = self
@@ -1089,6 +1094,10 @@ impl Target for BuildDiskTarget {
                     .join(","),
             ),
             "blocked" => Value::String(self.ctl.next_blocked().unwrap_or_default()),
+            "mac_driver" if self.ctl.takes_mac_driver() => {
+                Value::String(self.ctl.mac_driver().label())
+            }
+            "mac_driver" => Value::String(String::new()),
             "rows" => Value::Integer(self.ctl.table_view().rows.len() as i64),
             "layout" => Value::String(match self.ctl.table_view().layout {
                 Ok(_) => "ok".to_string(),

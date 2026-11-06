@@ -54,6 +54,8 @@ const APM_ENTRY_SIGNATURE: u16 = 0x504D;
 /// bundled blob can point `--driver-from <donor.hda>` at any Apple-formatted
 /// disk they own to copy that disk's driver instead.
 const BUILTIN_DRIVER: &[u8] = include_bytes!("apple_scsi_driver.bin");
+/// What the bundled driver's own `vers` resource calls it.
+pub const BUILTIN_DRIVER_NAME: &str = "Apple SCSI driver 7.3.5";
 const BUILTIN_DRIVER_PAD: &[u8] = include_bytes!("apple_scsi_driver_pad.bin");
 const BUILTIN_BOOT_SIZE: u32 = 9392;
 const BUILTIN_BOOT_CKSUM: u32 = 0xf624;

@@ -17,8 +17,8 @@ use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, NoNotify, PresetKind,
-    RowContent, Step, TableKind,
+    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, MacDriver, NoNotify,
+    PresetKind, RowContent, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -66,6 +66,8 @@ pub(super) enum Row {
     Handler(usize),
     /// Add a handler for the n-th DosType that has none.
     AddHandler(usize),
+    /// The APM driver: Left / Right switch bundled and none, Enter picks a disk.
+    MacDriver,
     Label(Option<usize>),
     Opt(Option<usize>, FsOption),
     Confirm,
@@ -245,6 +247,9 @@ impl BuildDiskState {
                 if c.takes_handlers() {
                     r.extend((0..c.handlers().len()).map(Row::Handler));
                     r.extend((0..c.handlers_missing().len()).map(Row::AddHandler));
+                }
+                if c.takes_mac_driver() {
+                    r.push(Row::MacDriver);
                 }
                 r
             }
@@ -440,6 +445,13 @@ impl BuildDiskState {
                 let mut p = c.preset().clone();
                 p.x68k_scsi = !p.x68k_scsi;
                 self.act(BuildDiskAction::SetPreset(p));
+            }
+            Row::MacDriver => {
+                let next = match c.mac_driver() {
+                    MacDriver::Bundled => MacDriver::Off,
+                    _ => MacDriver::Bundled,
+                };
+                self.act(BuildDiskAction::SetMacDriver(next));
             }
             Row::PBoot(i) => {
                 let on = !c.table_view().rows.get(i).is_some_and(|r| r.bootable);
@@ -663,6 +675,7 @@ impl App {
                         s.act(BuildDiskAction::AddHandler(t));
                     }
                 }
+                Some(Row::MacDriver) => s.act(BuildDiskAction::PickMacDriver),
                 Some(r) => match s.text_of(r) {
                     Some(t) => s.edit = Some(t),
                     None => {
@@ -936,6 +949,10 @@ impl App {
                     },
                 ),
                 Row::AddPartition => ("".into(), "[ Add partition ]".into()),
+                Row::MacDriver => (
+                    "Mac driver".into(),
+                    format!("< {} >  (Enter: from a disk)", c.mac_driver().label()),
+                ),
                 Row::Handler(i) => (
                     "Handler".into(),
                     c.handlers()

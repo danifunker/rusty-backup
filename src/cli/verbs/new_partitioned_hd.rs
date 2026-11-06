@@ -206,6 +206,7 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         formats: Vec::new(),
         full_write: false,
         rdb_handlers: handler_specs(&args.filesystems)?,
+        mac_driver: crate::model::provision_runner::MacDriver::Off,
         head: None,
         donor: None,
         copies: Vec::new(),

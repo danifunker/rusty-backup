@@ -15,7 +15,7 @@ use clap::{Args, ValueEnum};
 use crate::cli::logging::log_stderr;
 use crate::controller::build_disk::{
     containers, purpose, BuildDiskAction as A, BuildDiskController, DiskKind, ExportFormat, FsKind,
-    NoNotify, PresetKind, Step, TableKind,
+    MacDriver, NoNotify, PresetKind, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::Controller as _;
@@ -146,6 +146,13 @@ pub struct BuildArgs {
     /// mount unaided.
     #[arg(long = "filesystem", value_name = "DOSTYPE=PATH")]
     pub filesystems: Vec<String>,
+
+    /// The Mac driver on an APM disk: `bundled` (the default: a donor's own
+    /// driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path
+    /// of an Apple-formatted disk to take the driver from. The driver serves
+    /// SCSI; a Mac with the disk on IDE won't mount it.
+    #[arg(long = "mac-driver", value_name = "bundled|none|DISK")]
+    pub mac_driver: Option<String>,
 
     /// Partition-start alignment, e.g. `1M` or `63s`; blank uses the
     /// table's default.
@@ -528,6 +535,24 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
             purpose: purpose::RDB_HANDLER,
             path: Some(PathBuf::from(path.trim())),
         });
+    }
+    if let Some(spec) = &args.mac_driver {
+        if !c.takes_mac_driver() {
+            bail!("--mac-driver is an APM feature; give --table apm or an APM donor");
+        }
+        let (driver, path) = match spec.as_str() {
+            "bundled" => (MacDriver::Bundled, None),
+            "none" => (MacDriver::Off, None),
+            path => (MacDriver::Bundled, Some(PathBuf::from(path))),
+        };
+        c.apply(A::SetMacDriver(driver));
+        if path.is_some() {
+            c.apply(A::PickMacDriver);
+            c.apply(A::Picked {
+                purpose: purpose::MAC_DRIVER,
+                path,
+            });
+        }
     }
     for spec in &args.fills {
         let (row, path) = numbered(spec.as_str(), "--fill", specs.len())?;

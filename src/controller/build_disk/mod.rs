@@ -111,11 +111,14 @@ pub fn parse_size_field(text: &str) -> Result<Option<u64>, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+pub use crate::model::provision_runner::MacDriver;
+
 /// The `purpose` of each picker this controller asks for.
 pub mod purpose {
     pub const OUTPUT_IMAGE: &str = "build_disk.output_image";
     pub const ROW_SOURCE: &str = "build_disk.row_source";
     pub const RDB_HANDLER: &str = "build_disk.rdb_handler";
+    pub const MAC_DRIVER: &str = "build_disk.mac_driver";
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const DONOR: &str = "build_disk.donor";
 }
@@ -287,6 +290,9 @@ pub enum BuildDiskAction {
     /// "Add handler...": pick the AmigaDOS load file for this DosType (RDB only).
     AddHandler(String),
     RemoveHandler(usize),
+    SetMacDriver(MacDriver),
+    /// "From a disk...": pick the Apple-formatted disk whose driver to use (APM only).
+    PickMacDriver,
     Picked {
         purpose: &'static str,
         path: Option<PathBuf>,
@@ -327,6 +333,7 @@ pub struct BuildDiskController {
     /// RDB filesystem handlers to embed, and the DosType a handler pick is for.
     handlers: Vec<(String, PathBuf)>,
     handler_for: Option<String>,
+    mac_driver: MacDriver,
     source_row: Option<usize>,
     probe: Option<(usize, Job<(PathBuf, u64)>)>,
     donor_job: Option<Job<Result<crate::model::disk_builder::Donor, String>>>,
@@ -360,6 +367,7 @@ impl BuildDiskController {
             confirm_text: String::new(),
             handlers: Vec::new(),
             handler_for: None,
+            mac_driver: MacDriver::Bundled,
             source_row: None,
             probe: None,
             donor_job: None,
@@ -581,6 +589,16 @@ impl BuildDiskController {
         self.kind == DiskKind::Partitioned
             && self.builder.kind == TableKind::Rdb
             && !self.builder.fixed_slots()
+    }
+
+    /// Whether the table takes a Mac driver (APM).
+    pub fn takes_mac_driver(&self) -> bool {
+        self.kind == DiskKind::Partitioned && self.builder.kind == TableKind::Apm
+    }
+
+    /// The driver an APM disk gets.
+    pub fn mac_driver(&self) -> &MacDriver {
+        &self.mac_driver
     }
 
     /// The DosTypes the rows use that no handler covers yet, ROM ones (`DOS\x`) left out.
@@ -812,6 +830,9 @@ impl BuildDiskController {
                 for (t, p) in &self.handlers {
                     v.push(format!("Embedded {t} handler: {}", p.display()));
                 }
+                if self.takes_mac_driver() {
+                    v.push(format!("Mac driver: {}", self.mac_driver.label()));
+                }
                 if let Ok(placed) = self.builder.plan() {
                     for (i, (row, p)) in self.builder.rows.iter().zip(placed.iter()).enumerate() {
                         let content = match (&row.source, &row.format, row.copy_from) {
@@ -973,6 +994,7 @@ impl BuildDiskController {
                     self.handlers.push((t, path));
                 }
             }
+            purpose::MAC_DRIVER => self.mac_driver = MacDriver::FromDisk(path),
             purpose::ROW_SOURCE => {
                 let Some(row) = self.source_row.take() else {
                     return;
@@ -1095,6 +1117,7 @@ impl BuildDiskController {
                         donor: self.builder.donor.as_ref().map(|d| d.path.clone()),
                         copies: self.builder.copies(placed.as_slice()),
                         partitions: placed,
+                        mac_driver: self.mac_driver.clone(),
                     },
                 )
             }
@@ -1328,6 +1351,19 @@ impl Controller for BuildDiskController {
                 if i < self.handlers.len() {
                     self.handlers.remove(i);
                 }
+            }
+            BuildDiskAction::SetMacDriver(d) => self.mac_driver = d,
+            BuildDiskAction::PickMacDriver => {
+                if !self.takes_mac_driver() {
+                    return Vec::new();
+                }
+                return vec![Effect::PickFile(PickSpec {
+                    purpose: purpose::MAC_DRIVER,
+                    title: "An Apple-formatted disk to take the driver from".to_string(),
+                    filters: vec![("All Files".to_string(), vec!["*".to_string()])],
+                    save: false,
+                    file_name: String::new(),
+                })];
             }
             BuildDiskAction::Create => self.create(),
         }
