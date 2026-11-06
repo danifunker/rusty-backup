@@ -2991,7 +2991,9 @@ pub fn hfs_outgrows_in_place(
     if read.is_err() || BigEndian::read_u16(&sector[0x7C..0x7E]) == 0x482B {
         return false;
     }
-    hfs_max_growable_size(device, partition_offset).is_some_and(|max| max < new_size)
+    // Less than a block past the limit is a remainder the resize rounds off, not growth.
+    let block_size = BigEndian::read_u32(&sector[20..24]) as u64;
+    hfs_max_growable_size(device, partition_offset).is_some_and(|max| new_size >= max + block_size)
 }
 
 /// Pick the smallest 512-byte-multiple allocation block size that keeps a volume
@@ -5222,6 +5224,18 @@ mod tests {
         img[byte] &= !(0x80 >> (tail % 8));
         resize_hfs_in_place(&mut Cursor::new(&mut img), 0, SIZE / 2, &mut |_| {})
             .expect("with the tail free the shrink goes through");
+    }
+
+    /// R-085: a partition under one block past the volume's limit needs no rebuild.
+    #[test]
+    fn a_remainder_under_one_block_is_not_outgrowing() {
+        const SIZE: u64 = 8 * 1024 * 1024;
+        let img = create_blank_hfs(SIZE, 1024, "T").unwrap();
+        let mut disk = Cursor::new(img);
+        let max = hfs_max_growable_size(&mut disk, 0).unwrap();
+        assert!(!hfs_outgrows_in_place(&mut disk, 0, max));
+        assert!(!hfs_outgrows_in_place(&mut disk, 0, max + 1023));
+        assert!(hfs_outgrows_in_place(&mut disk, 0, max + 1024));
     }
 
     /// R-078: the minimum size left no room for the alternate MDB, so a shrink to it cut the last block.

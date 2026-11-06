@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-085](#r-085)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-mac` (`hfs_outgrows_in_place`) | ~~A partition under one block past a volume's limit counted as outgrowing it, which would rebuild a volume on a same-size restore~~ — less than a block past the limit is a remainder, 2026-11-06 |
 | ~~[R-084](#r-084)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (`pick_block_size`) | ~~A classic HFS volume with 65536-byte allocation blocks bombs System 7.5 at the desktop: every auto-sized volume past 2 GB, and Expand HFS's largest block choice~~ — blocks are the smallest multiple of 512 that fits, capped at 65024, 2026-11-06 |
 | ~~[R-083](#r-083)~~ | ~~**High**~~ **FIXED** | `crates/fs-amiga` (AFFS fsck) | ~~fsck reports a bitmap extension block as allocated but unreachable, and repair frees it, on any AFFS volume past about 49 MiB~~ — the blocks of the `bm_ext` chain count as metadata, 2026-11-06 |
 | ~~[R-082](#r-082)~~ | ~~Medium~~ **FIXED** | `crates/fs-mac` (`hfs_common`, HFS fsck) | ~~B-tree map nodes hold a 494-byte record where Apple's hold 492, so hfsutils refuses any volume with one ("malformed b*-tree map node"), and repair rewrites a real Mac's map node into that form~~ — written the way ExtendBTree writes them, 2026-11-06 |
@@ -108,6 +109,14 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-085 — a remainder under one block looked like outgrowing the volume {#r-085}
+
+`hfs_outgrows_in_place` compared the new size with the exact limit, but the in-place resize rounds
+down to whole blocks and handles a remainder fine. Apple's formatters leave one on most volumes
+near the block limit. Build Disk only rebuilt needlessly; Restore now asks on every HFS partition,
+so a same-size restore would have rewritten the volume. Test:
+`a_remainder_under_one_block_is_not_outgrowing`.
 
 ### R-084 — a 64 KiB allocation block bombs System 7.5 {#r-084}
 
