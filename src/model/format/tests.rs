@@ -187,3 +187,24 @@ fn every_geometry_formats_and_opens() {
         }
     }
 }
+
+/// The streaming rule: only a true floppy format may build in memory.
+#[test]
+fn only_floppy_sized_formats_build_in_memory() {
+    for k in FsKind::ALL {
+        let c = k.caps();
+        if c.streams {
+            continue;
+        }
+        let mut largest = c.max_size.max(c.min_size);
+        for (id, _) in geometries(k) {
+            let opts = FormatOptions {
+                geometry: Some(id.to_string()),
+                ..opts_for(k)
+            };
+            let mut cur = Cursor::new(Vec::new());
+            largest = largest.max(format_into(&mut cur, 0, k, &opts).unwrap().len);
+        }
+        assert!(largest <= IN_RAM_LIMIT, "{} builds {largest} bytes in RAM", k.id());
+    }
+}

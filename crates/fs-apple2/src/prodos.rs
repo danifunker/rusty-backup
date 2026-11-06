@@ -1724,6 +1724,22 @@ pub fn validate_prodos_integrity(
 /// block below is reserved by clearing its bit. The result round-trips through
 /// [`ProDosFilesystem::open`] and passes `fsck` clean.
 pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_prodos_into(&mut cur, 0, size_bytes, name)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_prodos`]: writes the boot, directory and bitmap blocks
+/// at `at_offset`, and returns the volume's length.
+pub fn write_blank_prodos_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    name: &str,
+) -> anyhow::Result<u64> {
     let vname = validate_prodos_name(name, "volume name").map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // total_blocks is a u16 field: ProDOS tops out at 65535 blocks (~32 MiB).
@@ -1739,7 +1755,8 @@ pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
     let bitmap_pointer = 6u16;
     let reserved_end = bitmap_pointer + bitmap_blocks; // first free data block
 
-    let mut img = vec![0u8; total_blocks as usize * BLOCK_SIZE as usize];
+    // Only the boot, directory and bitmap blocks hold anything; the rest stays zero.
+    let mut img = vec![0u8; reserved_end as usize * BLOCK_SIZE as usize];
 
     // --- Volume directory: 4 blocks, chained 2→3→4→5. ---
     let put_u16 = |img: &mut [u8], off: usize, v: u16| {
@@ -1777,7 +1794,9 @@ pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
         img[bitmap_base + block / 8] &= !(1 << (7 - (block % 8))); // used
     }
 
-    Ok(img)
+    w.seek(SeekFrom::Start(at_offset))?;
+    w.write_all(&img)?;
+    Ok(u64::from(total_blocks) * BLOCK_SIZE)
 }
 
 // ─────────────────────────────── internal helpers ────────────────────────────
@@ -2234,6 +2253,81 @@ fn parse_prodos_datetime(date: u16, time: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+        let vname =
+            validate_prodos_name(name, "volume name").map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // total_blocks is a u16 field: ProDOS tops out at 65535 blocks (~32 MiB).
+        // Floor at 16 blocks (8 KiB) so boot + directory + bitmap always fit with
+        // free space to spare.
+        let raw_blocks = size_bytes / BLOCK_SIZE;
+        if raw_blocks < 16 {
+            anyhow::bail!("ProDOS volume too small: {size_bytes} bytes is under the 8 KiB minimum");
+        }
+        let total_blocks = raw_blocks.min(65535) as u16;
+        let bitmap_blocks = (total_blocks as u32).div_ceil(4096) as u16;
+        // Reserved: boot(0,1) + volume directory(2..=5) + bitmap(6..6+bitmap_blocks).
+        let bitmap_pointer = 6u16;
+        let reserved_end = bitmap_pointer + bitmap_blocks; // first free data block
+
+        let mut img = vec![0u8; total_blocks as usize * BLOCK_SIZE as usize];
+
+        // --- Volume directory: 4 blocks, chained 2→3→4→5. ---
+        let put_u16 = |img: &mut [u8], off: usize, v: u16| {
+            img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        for (blk, prev, next) in [(2u16, 0u16, 3u16), (3, 2, 4), (4, 3, 5), (5, 4, 0)] {
+            let base = blk as usize * BLOCK_SIZE as usize;
+            put_u16(&mut img, base, prev);
+            put_u16(&mut img, base + 2, next);
+        }
+
+        // Volume directory header entry (39 bytes) at block 2, offset 4.
+        let (date, time) = make_prodos_datetime_now();
+        let entry_base = 2 * BLOCK_SIZE as usize + 4;
+        let name_bytes = vname.as_bytes();
+        let name_len = name_bytes.len() as u8; // validated to 1..=15
+        img[entry_base] = (0xF << 4) | name_len; // storage_type=0xF + name_length
+        img[entry_base + 1..entry_base + 1 + name_len as usize].copy_from_slice(name_bytes);
+        put_u16(&mut img, entry_base + 24, date); // creation date  (entry offset 24)
+        put_u16(&mut img, entry_base + 26, time); // creation time  (entry offset 26)
+        img[entry_base + 30] = 0xC3; // access (destroy/rename/backup/write/read)
+        img[entry_base + 31] = 39; // entry_length
+        img[entry_base + 32] = 13; // entries_per_block
+                                   // file_count (entry offset 33-34) stays 0
+        put_u16(&mut img, entry_base + 35, bitmap_pointer); // bit_map_pointer
+        put_u16(&mut img, entry_base + 37, total_blocks); // total_blocks
+
+        // --- Volume bitmap at block 6: every block free (bit=1), then reserve the
+        // boot/directory/bitmap blocks by clearing their bits. ---
+        let bitmap_base = bitmap_pointer as usize * BLOCK_SIZE as usize;
+        for block in 0..total_blocks as usize {
+            img[bitmap_base + block / 8] |= 1 << (7 - (block % 8)); // free
+        }
+        for block in 0..reserved_end as usize {
+            img[bitmap_base + block / 8] &= !(1 << (7 - (block % 8))); // used
+        }
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for kib in [8u64, 140, 800, 5_120, 32_000, 40_000] {
+            // The directory stamps the clock, so a pair built across a minute is redone.
+            let (old, new) = loop {
+                let t = make_prodos_datetime_now();
+                let old = old_create_blank_prodos(kib * 1024, "VOL").unwrap();
+                let new = create_blank_prodos(kib * 1024, "VOL").unwrap();
+                if make_prodos_datetime_now() == t {
+                    break (old, new);
+                }
+            };
+            assert!(old == new, "{kib} KiB differs");
+        }
+    }
     use super::*;
     use std::io::Cursor;
 

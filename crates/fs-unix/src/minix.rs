@@ -1338,6 +1338,22 @@ pub fn create_blank_minix(
     size_bytes: u64,
     version: MinixVersion,
 ) -> Result<Vec<u8>, FilesystemError> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_minix_into(&mut cur, 0, size_bytes, version)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_minix`]: writes the superblock, bitmaps, root inode and
+/// root directory at `at_offset`, and returns the volume's length.
+pub fn write_blank_minix_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    version: MinixVersion,
+) -> Result<u64, FilesystemError> {
     let block_size: u64 = 1024;
     let blocks = size_bytes / block_size;
     let inode_size: u64 = if version == MinixVersion::V1 { 32 } else { 64 };
@@ -1358,7 +1374,8 @@ pub fn create_blank_minix(
         ninodes = ipb;
     }
     let max_inodes = if version == MinixVersion::V3 {
-        (u32::MAX as u64 / ipb) * ipb
+        // `s_firstdatazone` is 16 bits, so the inode table has to end below block 65536.
+        (u32::MAX as u64 / ipb).min(60_000) * ipb
     } else {
         (65535 / ipb) * ipb
     };
@@ -1397,11 +1414,15 @@ pub fn create_blank_minix(
         2 + name_len
     };
 
-    let mut img = vec![0u8; (blocks * block_size) as usize];
+    let put = |w: &mut W, at: u64, bytes: &[u8]| -> Result<(), FilesystemError> {
+        w.seek(SeekFrom::Start(at_offset + at))?;
+        w.write_all(bytes)?;
+        Ok(())
+    };
 
     // ---- superblock (block 1) ----
     {
-        let sb = &mut img[block_size as usize..block_size as usize + 64];
+        let mut sb = [0u8; 64];
         if version == MinixVersion::V3 {
             sb[0..4].copy_from_slice(&(ninodes as u32).to_le_bytes());
             sb[6..8].copy_from_slice(&(imap_blocks as u16).to_le_bytes());
@@ -1432,34 +1453,35 @@ pub fn create_blank_minix(
                 sb[20..24].copy_from_slice(&(zones as u32).to_le_bytes());
             }
         }
+        put(w, block_size, &sb)?;
     }
 
     // ---- inode bitmap (block 2) ----
     {
-        let start = 2 * block_size as usize;
-        let imap = &mut img[start..start + (imap_blocks * block_size) as usize];
+        let mut imap = vec![0u8; (imap_blocks * block_size) as usize];
         imap[0] |= 1; // bit 0 sentinel
         imap[0] |= 1 << 1; // inode 1 (root)
                            // Padding: inodes beyond ninodes don't exist -> mark used.
         set_bit_range(
-            imap,
+            &mut imap,
             (ninodes + 1) as usize,
             (imap_blocks * bpb - 1) as usize,
         );
+        put(w, 2 * block_size, &imap)?;
     }
 
     // ---- zone bitmap (block 2 + imap_blocks) ----
     {
-        let start = ((2 + imap_blocks) * block_size) as usize;
-        let zmap = &mut img[start..start + (zmap_blocks * block_size) as usize];
+        let mut zmap = vec![0u8; (zmap_blocks * block_size) as usize];
         zmap[0] |= 1; // bit 0 sentinel
         zmap[0] |= 1 << 1; // bit 1 = firstdatazone (root directory)
                            // Padding beyond the last real data zone.
         set_bit_range(
-            zmap,
+            &mut zmap,
             (zones - firstdatazone + 1) as usize,
             (zmap_blocks * bpb - 1) as usize,
         );
+        put(w, (2 + imap_blocks) * block_size, &zmap)?;
     }
 
     // ---- root inode (inode 1) ----
@@ -1470,29 +1492,19 @@ pub fn create_blank_minix(
         root.size = (dir_entry_size * 2) as u32;
         root.zones[0] = firstdatazone as u32;
         let raw = root.serialize(version);
-        let off = ((2 + imap_blocks + zmap_blocks) * block_size) as usize;
-        img[off..off + raw.len()].copy_from_slice(&raw);
+        put(w, (2 + imap_blocks + zmap_blocks) * block_size, &raw)?;
     }
 
     // ---- root directory zone (firstdatazone): "." and ".." ----
     {
         let ino_field = if version == MinixVersion::V3 { 4 } else { 2 };
-        let off = (firstdatazone * block_size) as usize;
-        encode_dirent(
-            &mut img[off..off + dir_entry_size],
-            ino_field,
-            ROOT_INO,
-            b".",
-        );
-        encode_dirent(
-            &mut img[off + dir_entry_size..off + dir_entry_size * 2],
-            ino_field,
-            ROOT_INO,
-            b"..",
-        );
+        let mut dir = vec![0u8; dir_entry_size * 2];
+        encode_dirent(&mut dir[..dir_entry_size], ino_field, ROOT_INO, b".");
+        encode_dirent(&mut dir[dir_entry_size..], ino_field, ROOT_INO, b"..");
+        put(w, firstdatazone * block_size, &dir)?;
     }
 
-    Ok(img)
+    Ok(blocks * block_size)
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
@@ -1778,6 +1790,179 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_minix(
+        size_bytes: u64,
+        version: MinixVersion,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let block_size: u64 = 1024;
+        let blocks = size_bytes / block_size;
+        let inode_size: u64 = if version == MinixVersion::V1 { 32 } else { 64 };
+        let ipb = block_size / inode_size; // inodes per block
+        let bpb = block_size * 8; // bits per block
+        let zones = blocks; // log_zone_size = 0
+
+        if version == MinixVersion::V1 && blocks > 65_535 {
+            return Err(FilesystemError::Unsupported(
+                "Minix V1 volumes are limited to 64 MiB (use --fs minix2/minix3)".into(),
+            ));
+        }
+
+        // ninodes = round_up(blocks/3, ipb), matching mkfs.minix; clamp to the
+        // u16 inode-count ceiling on V1/V2.
+        let mut ninodes = (blocks / 3).div_ceil(ipb) * ipb;
+        if ninodes < ipb {
+            ninodes = ipb;
+        }
+        let max_inodes = if version == MinixVersion::V3 {
+            (u32::MAX as u64 / ipb) * ipb
+        } else {
+            (65535 / ipb) * ipb
+        };
+        ninodes = ninodes.min(max_inodes);
+
+        let imap_blocks = (ninodes + 1).div_ceil(bpb);
+        let inode_blocks = ninodes / ipb;
+
+        // firstdatazone and zmap_blocks are mutually dependent; iterate to a fixed
+        // point (mkfs does the same).
+        let mut zmap_blocks = 1u64;
+        for _ in 0..64 {
+            let fdz = 2 + imap_blocks + zmap_blocks + inode_blocks;
+            if fdz >= zones {
+                return Err(FilesystemError::Unsupported(
+                    "image too small for a Minix filesystem".into(),
+                ));
+            }
+            let nz = (zones - fdz + 1).div_ceil(bpb);
+            if nz == zmap_blocks {
+                break;
+            }
+            zmap_blocks = nz;
+        }
+        let firstdatazone = 2 + imap_blocks + zmap_blocks + inode_blocks;
+        if firstdatazone >= zones {
+            return Err(FilesystemError::Unsupported(
+                "image too small for a Minix filesystem".into(),
+            ));
+        }
+
+        let (magic, name_len) = blank_magic(version);
+        let dir_entry_size = if version == MinixVersion::V3 {
+            4 + name_len
+        } else {
+            2 + name_len
+        };
+
+        let mut img = vec![0u8; (blocks * block_size) as usize];
+
+        // ---- superblock (block 1) ----
+        {
+            let sb = &mut img[block_size as usize..block_size as usize + 64];
+            if version == MinixVersion::V3 {
+                sb[0..4].copy_from_slice(&(ninodes as u32).to_le_bytes());
+                sb[6..8].copy_from_slice(&(imap_blocks as u16).to_le_bytes());
+                sb[8..10].copy_from_slice(&(zmap_blocks as u16).to_le_bytes());
+                sb[10..12].copy_from_slice(&(firstdatazone as u16).to_le_bytes());
+                sb[12..14].copy_from_slice(&0u16.to_le_bytes()); // log_zone_size
+                sb[16..20].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // max_size
+                sb[20..24].copy_from_slice(&(zones as u32).to_le_bytes());
+                sb[24..26].copy_from_slice(&magic.to_le_bytes());
+                sb[28..30].copy_from_slice(&(block_size as u16).to_le_bytes());
+            } else {
+                sb[0..2].copy_from_slice(&(ninodes as u16).to_le_bytes());
+                // nzones@2 (u16) is used on V1; V2 carries the count at @20 instead.
+                let nzones16 = if version == MinixVersion::V1 {
+                    zones as u16
+                } else {
+                    0
+                };
+                sb[2..4].copy_from_slice(&nzones16.to_le_bytes());
+                sb[4..6].copy_from_slice(&(imap_blocks as u16).to_le_bytes());
+                sb[6..8].copy_from_slice(&(zmap_blocks as u16).to_le_bytes());
+                sb[8..10].copy_from_slice(&(firstdatazone as u16).to_le_bytes());
+                sb[10..12].copy_from_slice(&0u16.to_le_bytes()); // log_zone_size
+                sb[12..16].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // max_size
+                sb[16..18].copy_from_slice(&magic.to_le_bytes());
+                sb[18..20].copy_from_slice(&1u16.to_le_bytes()); // state = clean
+                if version == MinixVersion::V2 {
+                    sb[20..24].copy_from_slice(&(zones as u32).to_le_bytes());
+                }
+            }
+        }
+
+        // ---- inode bitmap (block 2) ----
+        {
+            let start = 2 * block_size as usize;
+            let imap = &mut img[start..start + (imap_blocks * block_size) as usize];
+            imap[0] |= 1; // bit 0 sentinel
+            imap[0] |= 1 << 1; // inode 1 (root)
+                               // Padding: inodes beyond ninodes don't exist -> mark used.
+            set_bit_range(
+                imap,
+                (ninodes + 1) as usize,
+                (imap_blocks * bpb - 1) as usize,
+            );
+        }
+
+        // ---- zone bitmap (block 2 + imap_blocks) ----
+        {
+            let start = ((2 + imap_blocks) * block_size) as usize;
+            let zmap = &mut img[start..start + (zmap_blocks * block_size) as usize];
+            zmap[0] |= 1; // bit 0 sentinel
+            zmap[0] |= 1 << 1; // bit 1 = firstdatazone (root directory)
+                               // Padding beyond the last real data zone.
+            set_bit_range(
+                zmap,
+                (zones - firstdatazone + 1) as usize,
+                (zmap_blocks * bpb - 1) as usize,
+            );
+        }
+
+        // ---- root inode (inode 1) ----
+        {
+            let mut root = MinixInode::empty(ROOT_INO);
+            root.mode = 0o040755;
+            root.nlinks = 2; // "." and ".."
+            root.size = (dir_entry_size * 2) as u32;
+            root.zones[0] = firstdatazone as u32;
+            let raw = root.serialize(version);
+            let off = ((2 + imap_blocks + zmap_blocks) * block_size) as usize;
+            img[off..off + raw.len()].copy_from_slice(&raw);
+        }
+
+        // ---- root directory zone (firstdatazone): "." and ".." ----
+        {
+            let ino_field = if version == MinixVersion::V3 { 4 } else { 2 };
+            let off = (firstdatazone * block_size) as usize;
+            encode_dirent(
+                &mut img[off..off + dir_entry_size],
+                ino_field,
+                ROOT_INO,
+                b".",
+            );
+            encode_dirent(
+                &mut img[off + dir_entry_size..off + dir_entry_size * 2],
+                ino_field,
+                ROOT_INO,
+                b"..",
+            );
+        }
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for v in [MinixVersion::V1, MinixVersion::V2, MinixVersion::V3] {
+            for kib in [64u64, 1440, 10_240, 65_000] {
+                let old = old_create_blank_minix(kib * 1024, v).unwrap();
+                let new = create_blank_minix(kib * 1024, v).unwrap();
+                assert!(old == new, "{v:?} {kib} KiB differs");
+            }
+        }
+    }
     use super::*;
     use std::io::Cursor;
     use std::path::PathBuf;

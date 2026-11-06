@@ -21,8 +21,8 @@ pub const DEFAULT_VOLUME_NAME: &str = "rusty-backup";
 /// ProDOS forbids `-`, so it gets a default of its own that keeps the same name.
 pub const PRODOS_DEFAULT_VOLUME_NAME: &str = "RUSTY.BACKUP";
 
-/// The largest volume a non-streaming formatter is asked to build in memory by Build Disk.
-pub const IN_RAM_LIMIT: u64 = 64 * 1024 * 1024;
+/// The largest volume built in memory: only true floppy formats may (CONTRIBUTING.md § Streaming rule).
+pub const IN_RAM_LIMIT: u64 = 3 * 1024 * 1024;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -317,7 +317,7 @@ impl FsKind {
                 options: &[Inodes, BytesPerInode],
                 ..c(32 * KIB, 8 * GIB, true, 6)
             },
-            FsKind::EfsV1 => c(MIB, 2 * GIB, false, 6),
+            FsKind::EfsV1 => c(MIB, 2 * GIB, true, 6),
             FsKind::Xfs => c(32 * MIB, 16 * TIB, true, 12),
             FsKind::Affs => FsCaps {
                 options: &[AffsVariant],
@@ -332,26 +332,27 @@ impl FsKind {
             FsKind::Hpfs => c(MIB, 64 * GIB, true, 11),
             FsKind::Ext => c(256 * KIB, 16 * TIB, true, 16),
             FsKind::Ext3 | FsKind::Ext4 => c(8 * MIB, 16 * TIB, true, 16),
-            FsKind::Prodos => c(8 * KIB, 32 * MIB, false, 15),
+            FsKind::Prodos => c(8 * KIB, 32 * MIB, true, 15),
             FsKind::Atari => fixed(92_160, 0),
             FsKind::AppleDos => fixed(143_360, 0),
             FsKind::Cpm => FsCaps {
                 options: &[CpmPreset],
                 min_size: 0,
                 max_size: 0,
+                streams: true,
                 ..fixed(0, 0)
             },
             FsKind::Os9 => fixed(161_280, 29),
             FsKind::Minix => FsCaps {
                 floppy: true,
                 volume: false,
-                ..c(64 * KIB, 65_535 * KIB, false, 0)
+                ..c(64 * KIB, 65_535 * KIB, true, 0)
             },
-            FsKind::Minix2 | FsKind::Minix3 => c(64 * KIB, 4 * GIB, false, 0),
+            FsKind::Minix2 | FsKind::Minix3 => c(64 * KIB, 4 * GIB, true, 0),
             FsKind::Ucsd => FsCaps {
                 floppy: true,
                 volume: false,
-                ..c(4 * KIB, 65_535 * 512, false, 7)
+                ..c(4 * KIB, 65_535 * 512, true, 7)
             },
             FsKind::Trdos => FsCaps {
                 floppy: true,
@@ -669,9 +670,10 @@ pub fn format_into<W: Write + Seek>(
                 format!("EFS, volume {label:?}"),
             ))
         }
-        FsKind::EfsV1 => in_ram(w, "EFS v1", label, || {
-            fs_unix::efs_v1::create_blank_efs_v1(size, label)
-        }),
+        FsKind::EfsV1 => {
+            let len = fs_unix::efs_v1::write_blank_efs_v1_into(w, 0, size, label)?;
+            Ok(done(len, format!("EFS v1, volume {label:?}")))
+        }
         FsKind::Xfs => {
             let len = fs_xfs::xfs::format::write_blank_xfs(w, 0, size, label)?;
             Ok(done(len, format!("XFS v5, volume {label:?}")))
@@ -709,9 +711,10 @@ pub fn format_into<W: Write + Seek>(
             let len = fs_unix::ext_format::write_blank_ext4(w, 0, size, label)?;
             Ok(done(len, format!("ext4, volume {label:?}")))
         }
-        FsKind::Prodos => in_ram(w, "ProDOS", label, || {
-            fs_apple2::prodos::create_blank_prodos(size, label)
-        }),
+        FsKind::Prodos => {
+            let len = fs_apple2::prodos::write_blank_prodos_into(w, 0, size, label)?;
+            Ok(done(len, format!("ProDOS, volume {label:?}")))
+        }
         FsKind::Atari => in_ram(w, "Atari DOS 2.0S", "", || {
             Ok(fs_8bit::atari_dos::create_blank_atari_sd())
         }),
@@ -726,15 +729,17 @@ pub fn format_into<W: Write + Seek>(
         }
         FsKind::Cpm => {
             let dpb = cpm_dpb(opts)?;
-            in_ram(w, "CP/M", "", || Ok(fs_cpm::cpm::create_blank(dpb)))
+            let len = fs_cpm::cpm::write_blank_into(w, 0, dpb)?;
+            Ok(done(len, "CP/M".to_string()))
         }
         FsKind::Minix => minix(w, size, fs_unix::minix::MinixVersion::V1),
         FsKind::Minix2 => minix(w, size, fs_unix::minix::MinixVersion::V2),
         FsKind::Minix3 => minix(w, size, fs_unix::minix::MinixVersion::V3),
-        FsKind::Ucsd => in_ram(w, "UCSD p-System", label, || {
-            fs_apple2::ucsd::create_blank_ucsd(size, label)
-                .map_err(|e| anyhow!("formatting UCSD p-System: {e}"))
-        }),
+        FsKind::Ucsd => {
+            let len = fs_apple2::ucsd::write_blank_ucsd_into(w, 0, size, label)
+                .map_err(|e| anyhow!("formatting UCSD p-System: {e}"))?;
+            Ok(done(len, format!("UCSD p-System, volume {label:?}")))
+        }
         FsKind::Trdos => in_ram(w, "TR-DOS", label, || {
             fs_8bit::trdos::create_blank_trdos(size, label)
                 .map_err(|e| anyhow!("formatting TR-DOS: {e}"))
@@ -923,9 +928,12 @@ fn minix<W: Write + Seek>(
     size: u64,
     version: fs_unix::minix::MinixVersion,
 ) -> Result<Formatted> {
-    in_ram(w, format!("Minix {version:?}").as_str(), "", || {
-        fs_unix::minix::create_blank_minix(size, version)
-            .map_err(|e| anyhow!("formatting Minix: {e}"))
+    let len = fs_unix::minix::write_blank_minix_into(w, 0, size, version)
+        .map_err(|e| anyhow!("formatting Minix: {e}"))?;
+    Ok(Formatted {
+        len,
+        summary: format!("Minix {version:?}"),
+        notes: Vec::new(),
     })
 }
 

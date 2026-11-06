@@ -336,7 +336,9 @@ mention creation), `docs/cli-reference.md`, `docs/platform_matrix.md`, and
 6. **Filesystems:** Build Disk can create every filesystem we support writing. The E rows
    with no creator stay on the filesystem backlog until a writer exists; each writer that
    lands joins Build Disk.
-7. **Size limits:** AFFS, PFS3 (plus its multi-MI formatting for large disks), SFS, HPFS and
+7. **Streaming (revised 2026-11-05):** every filesystem streams, except a true floppy format of
+   3 MB or less; see CONTRIBUTING.md § Streaming rule. It replaces the 64 MB cap below.
+   **Earlier size limits:** AFFS, PFS3 (plus its multi-MI formatting for large disks), SFS, HPFS and
    BFS get streaming writers (G3). **Revised 2026-11-05:** all five, plus BeOS OFS, go
    streaming *before* Build Disk offers them (G3 moves ahead of phase 4's formatted rows),
    because rb-cli also runs on vintage machines (the Rust 1.73 / PowerPC / Solaris builds)
