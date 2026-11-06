@@ -151,6 +151,16 @@ impl ContainerEditSession {
     /// atomically replace the original file. Consumes the session. The temp
     /// flat is removed automatically (whether this succeeds or fails).
     pub fn commit(self) -> Result<()> {
+        // Atomic replace: a sibling temp renamed over the original, so a crash can't truncate it.
+        let dir = self
+            .original_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".rb-container-")
+            .tempfile_in(dir)
+            .context("create sibling temp for atomic container write")?;
         let encoded: Vec<u8> = match self.format {
             EditFormat::Floppy(kind) => {
                 let flat = std::fs::read(self.temp.path())
@@ -169,15 +179,16 @@ impl ContainerEditSession {
                     .with_context(|| format!("re-encode {} container", kind.display_name()))?
             }
             EditFormat::Gzip => {
-                // Re-gzip the edited flat (any size is fine for a gzip wrapper).
+                // A gzip image can be any size, so it goes straight to the temp file.
                 let mut input =
                     BufReader::new(std::fs::File::open(self.temp.path()).with_context(|| {
                         format!("read edited flat {}", self.temp.path().display())
                     })?);
                 let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    flate2::write::GzEncoder::new(&mut tmp, flate2::Compression::default());
                 std::io::copy(&mut input, &mut encoder).context("re-gzip edited image")?;
-                encoder.finish().context("finish gzip stream")?
+                encoder.finish().context("finish gzip stream")?;
+                Vec::new()
             }
             EditFormat::Woz => {
                 let flat = std::fs::read(self.temp.path())
@@ -212,19 +223,6 @@ impl ContainerEditSession {
             }
         };
 
-        // Atomic replace: write a sibling temp in the same directory then
-        // rename over the original, so a crash mid-write can't truncate the
-        // user's only copy. tempfile_in keeps it on the same filesystem so the
-        // persist() rename is atomic.
-        let dir = self
-            .original_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".rb-container-")
-            .tempfile_in(dir)
-            .context("create sibling temp for atomic container write")?;
         tmp.write_all(&encoded)
             .context("write re-encoded container")?;
         tmp.flush()?;

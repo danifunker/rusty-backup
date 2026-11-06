@@ -306,6 +306,17 @@ fn write_moof_from_sectors(
     Ok(())
 }
 
+/// Largest source the floppy encoders (WOZ, MOOF, DiskCopy 4.2) may buffer.
+const FLOPPY_EXPORT_MAX: u64 = 3 * 1024 * 1024;
+
+/// Refuse a non-floppy source before it is buffered for a floppy encoder.
+fn check_floppy_export_size(size: u64) -> Result<()> {
+    if size > FLOPPY_EXPORT_MAX {
+        bail!("this format holds floppies only; the source is {size} bytes");
+    }
+    Ok(())
+}
+
 /// Slurp a source path (via decompress_to_writer) into an in-memory buffer.
 /// Intended for floppy-sized content only — bounded by `max_bytes`.
 fn read_source_to_memory(
@@ -679,6 +690,7 @@ pub fn export_whole_disk(
     // .dsk, DC42, etc.); backup-folder path reconstructs the whole disk first.
     if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let buf = if let Some(meta) = backup_metadata {
+            check_floppy_export_size(meta.source_size_bytes)?;
             let mut buf: Vec<u8> = Vec::new();
             let (gpt_sidecar, apm_sidecar) =
                 super::load_table_sidecars(source_path, &meta.partition_table_type, &mut log_cb)?;
@@ -702,6 +714,7 @@ pub fn export_whole_disk(
             // Unwrap any container (WOZ, 2MG, DMG, VHD, DiskCopy 4.2, DOS-order
             // .do/.dsk, GHO/IMZ) so we feed the encoder flat sector data.
             let (mut reader, data_size) = open_source_reader(source_path)?;
+            check_floppy_export_size(data_size)?;
             let mut buf = vec![0u8; data_size as usize];
             reader
                 .read_exact(&mut buf)
@@ -1019,14 +1032,16 @@ pub fn export_partition(
     // WOZ / DiskCopy 4.2: slurp into memory, encode, write.  Requires the
     // decompressed partition size to be a recognised floppy size.
     if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
+        let cap = FLOPPY_EXPORT_MAX + 1;
         let buf = read_source_to_memory(
             members,
             compression_type,
-            max_bytes,
+            Some(max_bytes.map_or(cap, |m| m.min(cap))),
             &mut progress_cb,
             &cancel_check,
             &mut log_cb,
         )?;
+        check_floppy_export_size(buf.len() as u64)?;
         return if format == ExportFormat::Woz {
             write_woz_from_sectors(&buf, dest_path, &mut log_cb)
         } else if format == ExportFormat::Moof {
@@ -1782,6 +1797,34 @@ mod tests {
         v[510] = 0x55;
         v[511] = 0xAA;
         v
+    }
+
+    /// A hard-disk source must be refused by size, never buffered for a floppy encoder.
+    #[test]
+    fn floppy_export_refuses_a_large_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.img");
+        std::fs::File::create(&src)
+            .unwrap()
+            .set_len(FLOPPY_EXPORT_MAX + 512)
+            .unwrap();
+        let dest = dir.path().join("out.dsk");
+        for format in [ExportFormat::Woz, ExportFormat::Moof, ExportFormat::Dc42] {
+            let err = export_whole_disk(
+                format,
+                &src,
+                None,
+                None,
+                &[],
+                &dest,
+                |_| {},
+                || false,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("floppies only"), "{err:#}");
+        }
+        assert!(!dest.exists());
     }
 
     /// Regression guard for the GHO->VMDK/VHD/etc. "no files in the image" bug:
