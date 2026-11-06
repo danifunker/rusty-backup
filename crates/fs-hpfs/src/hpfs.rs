@@ -2542,9 +2542,11 @@ mod tests {
     /// A 64 GiB volume streams into a sparse file without building it in memory.
     #[test]
     fn a_large_volume_streams_into_a_sparse_file() {
+        // Windows files are not sparse by default, so a CI runner would reserve all of it.
+        let size: u64 = if cfg!(windows) { 2 << 30 } else { 64 << 30 };
         let path = std::env::temp_dir().join(format!("hpfs-big-{}.img", std::process::id()));
         let mut f = std::fs::File::create(&path).unwrap();
-        let len = write_blank_hpfs_into(&mut f, 0, 64 << 30, "BIG").unwrap();
+        let len = write_blank_hpfs_into(&mut f, 0, size, "BIG").unwrap();
         f.set_len(len).unwrap();
         drop(f);
         let f = std::fs::File::open(&path).unwrap();

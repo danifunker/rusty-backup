@@ -145,7 +145,9 @@ fn every_kind_formats_at_its_largest_buildable_size() {
         if c.fixed_size {
             continue;
         }
+        // Windows files are not sparse by default, so a CI runner would reserve all of it.
         let cap = match k {
+            _ if cfg!(windows) => GIB,
             FsKind::Ufs | FsKind::Ufs43 | FsKind::UfsSun => GIB,
             _ => 4 * GIB,
         };
