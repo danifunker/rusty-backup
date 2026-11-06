@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-087](#r-087)~~ | ~~**Medium**~~ **FIXED** | `src/fs/make_bootable.rs` | ~~`make-bootable` called a disk bootable when its DDR named a driver with no code behind it~~ — it looks for the code and installs the driver when there is none, 2026-11-06 |
 | ~~[R-086](#r-086)~~ | ~~**High**~~ **FIXED** | `src/backup` (`apm_extras`), `src/restore` | ~~A Mac disk restored from a zstd or raw backup, or from a CHD at a new size, came back with its driver partition zeroed, so it could not start up~~ — the driver is kept in `apm-extras.bin`, CHD restores copy it, and a backup that lost it gets the bundled driver, 2026-11-06 |
 | ~~[R-085](#r-085)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-mac` (`hfs_outgrows_in_place`) | ~~A partition under one block past a volume's limit counted as outgrowing it, which would rebuild a volume on a same-size restore~~ — less than a block past the limit is a remainder, 2026-11-06 |
 | ~~[R-084](#r-084)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (`pick_block_size`) | ~~A classic HFS volume with 65536-byte allocation blocks bombs System 7.5 at the desktop: every auto-sized volume past 2 GB, and Expand HFS's largest block choice~~ — blocks are the smallest multiple of 512 that fits, capped at 65024, 2026-11-06 |
@@ -110,6 +111,11 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-087 — make-bootable trusted the DDR over the disk {#r-087}
+
+`assess_bootability` only read `driver_count`, so a disk restored with a zeroed driver (R-086) was
+reported as "already bootable" and left alone. Test: `a_registered_driver_with_no_code_is_installed`.
 
 ### R-086 — a restored Mac disk lost its driver {#r-086}
 
