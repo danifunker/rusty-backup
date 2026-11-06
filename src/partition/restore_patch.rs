@@ -136,14 +136,26 @@ fn patch_sun(
         .min()
         .unwrap_or(0);
     let adjusted = repack(overrides, unit, floor)?;
-    let data_bytes = label.ncyl as u64 * unit;
-    check_fits(
-        &adjusted,
-        target_size.min(data_bytes),
-        "the label's data cylinders",
-    )?;
+    // The label describes the target: its data cylinders, and the backup slice that spans them.
+    let acyl = BigEndian::read_u16(&head[434..436]) as u64;
+    let ncyl = (target_size / unit)
+        .saturating_sub(acyl)
+        .min(u16::MAX as u64);
+    check_fits(&adjusted, ncyl * unit, "the label's data cylinders")?;
 
     let mut out = head.to_vec();
+    BigEndian::write_u16(&mut out[432..434], ncyl as u16);
+    BigEndian::write_u16(
+        &mut out[422..424],
+        (ncyl + acyl).min(u16::MAX as u64) as u16,
+    );
+    for i in 0..label.slices.len() {
+        if label.is_whole_disk_slice(i) && !adjusted.iter().any(|o| o.index == i) {
+            let base = 444 + i * 8;
+            BigEndian::write_u32(&mut out[base..base + 4], 0);
+            BigEndian::write_u32(&mut out[base + 4..base + 8], (ncyl * spc) as u32);
+        }
+    }
     for o in &adjusted {
         let slice = label
             .slices
@@ -272,6 +284,26 @@ fn patch_sgi(
         }
         e.first = o.effective_start_lba() as u32;
         e.blocks = (o.export_size / 512) as u32;
+    }
+    // The VOLUME slot and the cylinder count describe the target disk, in whole cylinders.
+    let dp = &mut vh.device_parameters;
+    let cyl = dp.trks0 as u64 * dp.secs as u64;
+    let blocks = match (target_size / 512).checked_div(cyl) {
+        Some(c) => {
+            let cylinders = c as u32;
+            dp.cyls = (cylinders & 0xFFFF) as u16;
+            dp.cylshi = (cylinders >> 16) as u8;
+            cylinders as u64 * cyl
+        }
+        None => target_size / 512,
+    };
+    for (i, e) in vh.partitions.iter_mut().enumerate() {
+        if e.partition_type() == part_tables::sgi::SgiPartitionType::Volume
+            && !adjusted.iter().any(|o| o.index == i)
+        {
+            e.first = 0;
+            e.blocks = blocks as u32;
+        }
     }
     let mut out = head.to_vec();
     out[..512].copy_from_slice(&vh.to_bytes());

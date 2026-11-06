@@ -117,6 +117,7 @@ pub mod purpose {
     pub const ROW_SOURCE: &str = "build_disk.row_source";
     pub const RDB_HANDLER: &str = "build_disk.rdb_handler";
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
+    pub const DONOR: &str = "build_disk.donor";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -230,6 +231,8 @@ pub struct PresetView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowContent {
     Empty,
+    /// The donor partition's bytes, verbatim.
+    Copy,
     /// Formatted blank with a filesystem.
     Format,
     /// A source image poured in.
@@ -274,6 +277,12 @@ pub enum BuildDiskAction {
     SetPreset(PresetView),
     /// "Choose..." for the X68000 preset's system floppy.
     PickSystemDisk,
+    /// "Start from an existing disk...": pick a donor image to lay the table out from.
+    PickDonor,
+    /// Start from a blank table again.
+    ClearDonor,
+    /// Copy the donor partition the row was laid out from.
+    SetRowCopy(usize),
     SetConfirmText(String),
     /// "Add handler...": pick the AmigaDOS load file for this DosType (RDB only).
     AddHandler(String),
@@ -320,6 +329,8 @@ pub struct BuildDiskController {
     handler_for: Option<String>,
     source_row: Option<usize>,
     probe: Option<(usize, Job<(PathBuf, u64)>)>,
+    donor_job: Option<Job<Result<crate::model::disk_builder::Donor, String>>>,
+    donor_error: Option<String>,
     job: Option<Job<Result<(), String>>>,
     outcome: Option<Result<(), String>>,
     finished: Option<Snapshot>,
@@ -351,6 +362,8 @@ impl BuildDiskController {
             handler_for: None,
             source_row: None,
             probe: None,
+            donor_job: None,
+            donor_error: None,
             job: None,
             outcome: None,
             finished: None,
@@ -466,6 +479,7 @@ impl BuildDiskController {
         match self.builder.rows.get(row) {
             Some(r) if r.source.is_some() => RowContent::Image,
             Some(r) if r.format.is_some() => RowContent::Format,
+            Some(r) if r.copy_from.is_some() => RowContent::Copy,
             _ => RowContent::Empty,
         }
     }
@@ -485,6 +499,31 @@ impl BuildDiskController {
 
     pub fn preset(&self) -> &PresetView {
         &self.preset
+    }
+
+    /// The donor the layout started from: its path and table name.
+    pub fn donor(&self) -> Option<(&Path, &str)> {
+        self.builder
+            .donor
+            .as_ref()
+            .map(|d| (d.path.as_path(), d.table_type.as_str()))
+    }
+
+    /// The donor is being read, or why it was refused.
+    pub fn donor_reading(&self) -> bool {
+        self.donor_job.is_some()
+    }
+
+    pub fn donor_error(&self) -> Option<&str> {
+        self.donor_error.as_deref()
+    }
+
+    /// A row was laid out from a donor partition, so Copy is one of its contents.
+    pub fn row_can_copy(&self, row: usize) -> bool {
+        self.builder
+            .rows
+            .get(row)
+            .is_some_and(|r| r.donor_part.is_some())
     }
 
     /// The filesystems a volume or row can be formatted with, in a stable order.
@@ -539,7 +578,9 @@ impl BuildDiskController {
 
     /// Whether the table takes filesystem handlers (RDB).
     pub fn takes_handlers(&self) -> bool {
-        self.kind == DiskKind::Partitioned && self.builder.kind == TableKind::Rdb
+        self.kind == DiskKind::Partitioned
+            && self.builder.kind == TableKind::Rdb
+            && !self.builder.fixed_slots()
     }
 
     /// The DosTypes the rows use that no handler covers yet, ROM ones (`DOS\x`) left out.
@@ -756,16 +797,28 @@ impl BuildDiskController {
                 }
             }
             DiskKind::Partitioned => {
-                v.push(format!("{} partition table", self.builder.kind.label()));
+                match self.donor() {
+                    Some((p, t)) if self.builder.fixed_slots() => v.push(format!(
+                        "{t} label from {}, resized for this disk",
+                        p.display()
+                    )),
+                    Some((p, _)) => v.push(format!(
+                        "{} partition table, laid out from {}",
+                        self.builder.kind.label(),
+                        p.display()
+                    )),
+                    None => v.push(format!("{} partition table", self.builder.kind.label())),
+                }
                 for (t, p) in &self.handlers {
                     v.push(format!("Embedded {t} handler: {}", p.display()));
                 }
                 if let Ok(placed) = self.builder.plan() {
                     for (i, (row, p)) in self.builder.rows.iter().zip(placed.iter()).enumerate() {
-                        let content = match (&row.source, &row.format) {
-                            (Some(path), _) => format!("from {}", path.display()),
-                            (None, Some(f)) => f.describe(),
-                            (None, None) => "empty".to_string(),
+                        let content = match (&row.source, &row.format, row.copy_from) {
+                            (Some(path), _, _) => format!("from {}", path.display()),
+                            (None, Some(f), _) => f.describe(),
+                            (None, None, Some(_)) => "copied from the donor".to_string(),
+                            (None, None, None) => "empty".to_string(),
                         };
                         v.push(format!(
                             "Partition {}: {} at LBA {}, type {}, {content}",
@@ -901,6 +954,17 @@ impl BuildDiskController {
                 self.image = Some(path);
             }
             purpose::SYSTEM_DISK => self.preset.x68k_system_disk = Some(path),
+            purpose::DONOR => {
+                self.donor_error = None;
+                self.donor_job = Some(Job::spawn(
+                    "Reading the donor's layout...",
+                    Arc::clone(&self.notify),
+                    move |_| {
+                        Ok(crate::model::disk_builder::Donor::read(path.as_path())
+                            .map_err(|e| format!("{e:#}")))
+                    },
+                ));
+            }
             purpose::RDB_HANDLER => {
                 if let Some(t) = self.handler_for.take() {
                     self.handlers.retain(|(d, _)| !d.eq_ignore_ascii_case(&t));
@@ -937,6 +1001,7 @@ impl BuildDiskController {
         let Some(r) = self.builder.rows.get_mut(row) else {
             return;
         };
+        r.copy_from = None;
         match fs {
             None => r.format = None,
             Some(fs) => {
@@ -946,9 +1011,10 @@ impl BuildDiskController {
                 if let Some(label) = r.format.as_ref().and_then(|old| typed_label(old, fs)) {
                     f.opts.label = label;
                 }
-                // A type still at the table's default follows the filesystem.
+                // A default or donor type follows the filesystem; one the user typed stays.
                 if r.type_text.trim().is_empty()
                     || r.type_text.trim() == crate::partition::provision::default_type(kind)
+                    || r.donor_part.is_some()
                 {
                     if let Some(t) = crate::model::disk_builder::suggested_type(kind, fs, size) {
                         r.type_text = t;
@@ -1009,7 +1075,6 @@ impl BuildDiskController {
                         target_size_bytes: size,
                         kind: self.builder.kind,
                         geometry: self.builder.geometry,
-                        partitions: placed,
                         sources: self.builder.sources(),
                         formats: self.builder.formats(),
                         full_write: self.output_is_device,
@@ -1018,6 +1083,16 @@ impl BuildDiskController {
                         } else {
                             Vec::new()
                         },
+                        head: match self.builder.patched_head() {
+                            Ok(h) => h.map(|(head, _)| head),
+                            Err(e) => {
+                                self.push(LogLevel::Error, format!("{e:#}"));
+                                return;
+                            }
+                        },
+                        donor: self.builder.donor.as_ref().map(|d| d.path.clone()),
+                        copies: self.builder.copies(placed.as_slice()),
+                        partitions: placed,
                     },
                 )
             }
@@ -1064,12 +1139,23 @@ impl BuildDiskController {
     }
 
     fn poll(&mut self) {
+        if let Some(done) = self.donor_job.as_ref().and_then(job_outcome) {
+            self.donor_job = None;
+            match done.and_then(|r| r) {
+                Ok(d) => {
+                    let size = self.disk_size().unwrap_or(d.disk_size);
+                    self.builder = DiskBuilder::from_donor(d, size);
+                }
+                Err(e) => self.donor_error = Some(e),
+            }
+        }
         if let Some(done) = self.probe.as_ref().and_then(|(_, j)| job_outcome(j)) {
             if let Some((row, _)) = self.probe.take() {
                 if let Ok((path, size)) = done {
                     partition_edit::set_row_source(&mut self.builder, row, path, size);
                     if let Some(r) = self.builder.rows.get_mut(row) {
                         r.format = None;
+                        r.copy_from = None;
                     }
                 }
             }
@@ -1089,6 +1175,9 @@ impl BuildDiskController {
     pub fn wait(&mut self) {
         if let Some(j) = self.probe.as_ref() {
             j.1.wait();
+        }
+        if let Some(j) = self.donor_job.as_ref() {
+            j.wait();
         }
         if let Some(j) = self.job.as_ref() {
             j.wait();
@@ -1177,6 +1266,30 @@ impl Controller for BuildDiskController {
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
             BuildDiskAction::SetPreset(p) => self.preset = p,
+            BuildDiskAction::PickDonor => {
+                return vec![Effect::PickFile(PickSpec {
+                    purpose: purpose::DONOR,
+                    title: "A disk to take the layout from".to_string(),
+                    filters: vec![("All Files".to_string(), vec!["*".to_string()])],
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
+            BuildDiskAction::ClearDonor => {
+                let kind = self.builder.kind;
+                self.builder = DiskBuilder::new(kind, self.builder.disk_size);
+                self.donor_error = None;
+            }
+            BuildDiskAction::SetRowCopy(row) => {
+                if let Some(r) = self.builder.rows.get_mut(row) {
+                    if r.donor_part.is_some() {
+                        r.copy_from = r.donor_part;
+                        r.format = None;
+                        r.source = None;
+                        r.source_size = 0;
+                    }
+                }
+            }
             BuildDiskAction::PickSystemDisk => {
                 return vec![Effect::PickFile(PickSpec {
                     purpose: purpose::SYSTEM_DISK,

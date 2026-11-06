@@ -165,6 +165,18 @@ pub struct BuildArgs {
     #[arg(long)]
     pub fs: Option<String>,
 
+    /// Start from this disk image's layout: its table, special partitions
+    /// and their contents, at the new `--size`. Each partition is copied
+    /// unless `--format N=FS` or `--empty N` says otherwise; `--partition
+    /// SIZE` sets the sizes in order. A label (SGI, Sun, NeXT, RDB, AHDI,
+    /// X68000) keeps its head region verbatim, resized for the new disk.
+    #[arg(long = "from", value_name = "DONOR", conflicts_with_all = ["table", "fs", "preset"])]
+    pub from: Option<PathBuf>,
+
+    /// With `--from`: leave partition N empty instead of copying it.
+    #[arg(long = "empty", value_name = "N")]
+    pub empty: Vec<usize>,
+
     /// Build a fixed bootable preset instead of a table or a volume:
     /// `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS
     /// root). The same disks `new hd x68k` / `new hd sgi-efs` make.
@@ -284,6 +296,57 @@ pub fn run(args: BuildArgs) -> Result<()> {
         act(&mut c, A::SetContainer(fmt));
     }
 
+    if let Some(donor) = &args.from {
+        act(&mut c, A::SetKind(DiskKind::Partitioned));
+        act(
+            &mut c,
+            A::Picked {
+                purpose: purpose::DONOR,
+                path: Some(donor.clone()),
+            },
+        );
+        c.wait();
+        c.tick();
+        if let Some(e) = c.donor_error() {
+            bail!("reading {}: {e}", donor.display());
+        }
+        let rows = c.table_view().rows.len();
+        for (i, spec) in args.partitions.iter().enumerate() {
+            if i >= rows {
+                bail!("the donor has {rows} partitions; --partition gave more");
+            }
+            let size = spec.split(':').next().unwrap_or("").trim().to_string();
+            c.apply(A::Table(BuildAction::SetRowSize { row: i, text: size }));
+        }
+        for &n in &args.empty {
+            if n == 0 || n > rows {
+                bail!("--empty {n} names partition {n}, but the donor has {rows}");
+            }
+            c.apply(A::SetRowFs {
+                row: n - 1,
+                fs: None,
+            });
+        }
+        for spec in &args.formats {
+            let (row, v) = numbered(spec.as_str(), "--format", rows)?;
+            let (fs, label) = match v.split_once(':') {
+                Some((f, l)) => (f.to_string(), Some(l.to_string())),
+                None => (v, None),
+            };
+            c.apply(A::SetRowFs {
+                row,
+                fs: Some(fs_named(fs.as_str())?),
+            });
+            if let Some(label) = label {
+                if let Some(t) = c.format_targets().into_iter().find(|t| t.row == Some(row)) {
+                    let mut opts = t.opts;
+                    opts.label = label;
+                    c.apply(A::SetRowOptions { row, opts });
+                }
+            }
+        }
+        return finish(c);
+    }
     if let Some(p) = args.preset {
         act(&mut c, A::SetKind(DiskKind::Preset));
         let mut view = c.preset().clone();

@@ -298,3 +298,89 @@ fn presets_match_the_new_hd_builders() {
     let (ok, out) = run_raw(&["build", &p("c.hds"), "--size", "1500K", "--preset", "x68k"]);
     assert!(!ok && out.contains("MiB"), "{out}");
 }
+
+/// A bigger SGI disk from a small one: the volume header rides over, resized, and the EFS root
+/// is copied into the grown slot.
+#[test]
+fn an_sgi_donor_lays_out_a_bigger_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "new",
+        "hd",
+        "sgi-efs",
+        &p("small.img"),
+        "--size",
+        "64M",
+        "--name",
+        "irix",
+    ]);
+    std::fs::write(p("motd"), b"welcome\n").unwrap();
+    run(&["put", &format!("{}@1", p("small.img")), &p("motd"), "/motd"]);
+    let before = run(&["inspect", &p("small.img")]);
+    run(&[
+        "build",
+        &p("big.img"),
+        "--size",
+        "128M",
+        "--from",
+        &p("small.img"),
+        "--partition",
+        "rest",
+    ]);
+    let after = run(&["inspect", &p("big.img")]);
+    assert!(after.contains("SGI"), "{after}");
+    // VOLUME (slot 10) spans the new disk in whole cylinders; the EFS slot grew to the rest.
+    assert!(after.contains("262080"), "{after}");
+    assert_eq!(std::fs::metadata(p("big.img")).unwrap().len(), 128 << 20);
+    let count = |s: &str| s.matches("EFS").count();
+    assert_eq!(count(&before), count(&after), "{before}\n---\n{after}");
+    let ls = run(&["ls", &format!("{}@1", p("big.img"))]);
+    assert!(ls.contains("motd"), "{ls}");
+}
+
+/// An MBR donor: partition 1 is copied, partition 2 formatted afresh at a new size.
+#[test]
+fn an_mbr_donor_copies_one_partition_and_formats_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "64M",
+        "--table",
+        "mbr",
+        "--partition",
+        "20M",
+        "--partition",
+        "rest",
+        "--format",
+        "1=fat:KEEP",
+        "--format",
+        "2=fat:OLD",
+    ]);
+    std::fs::write(p("host"), b"m900\n").unwrap();
+    run(&["put", &format!("{}@1", p("a.img")), &p("host"), "/HOST.TXT"]);
+    run(&[
+        "build",
+        &p("b.img"),
+        "--size",
+        "200M",
+        "--from",
+        &p("a.img"),
+        "--partition",
+        "20M",
+        "--partition",
+        "rest",
+        "--format",
+        "2=ext4:NEW",
+    ]);
+    assert!(run(&["ls", &format!("{}@1", p("b.img"))]).contains("HOST.TXT"));
+    fsck_clean(&format!("{}@2", p("b.img")));
+    let info = run(&["inspect", &p("b.img")]);
+    assert!(
+        info.contains("Linux"),
+        "the type follows the new filesystem: {info}"
+    );
+}

@@ -427,13 +427,45 @@ impl BuildDiskTab {
             }
             DiskKind::Partitioned => {
                 let view = self.ctl.table_view();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Table type:");
-                    for &k in view.kinds {
-                        if ui.radio(view.kind == k, k.label()).clicked() && k != view.kind {
-                            self.act(BuildDiskAction::Table(BuildAction::SetKind(k)));
-                        }
+                ui.horizontal(|ui| {
+                    ui.label("Start from:");
+                    let donor = self
+                        .ctl
+                        .donor()
+                        .map(|(p, t)| (p.to_path_buf(), t.to_string()));
+                    if ui.radio(donor.is_none(), "A blank table").clicked() && donor.is_some() {
+                        self.act(BuildDiskAction::ClearDonor);
                     }
+                    if ui
+                        .radio(donor.is_some(), "An existing disk's layout...")
+                        .on_hover_text(
+                            "Take the table, its special partitions and their contents from \
+                             another disk image, at this disk's size. A label (SGI, Sun, NeXT, \
+                             RDB, ...) keeps its volume header or boot blocks verbatim.",
+                        )
+                        .clicked()
+                    {
+                        self.act(BuildDiskAction::PickDonor);
+                    }
+                    if let Some((p, t)) = donor {
+                        ui.label(egui::RichText::new(format!("{t}: {}", p.display())).weak());
+                    }
+                    if self.ctl.donor_reading() {
+                        ui.spinner();
+                    }
+                });
+                if let Some(e) = self.ctl.donor_error() {
+                    ui.colored_label(super::theme::danger(ui.visuals()), e.to_string());
+                }
+                ui.add_enabled_ui(!view.fixed, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Table type:");
+                        for &k in view.kinds {
+                            if ui.radio(view.kind == k, k.label()).clicked() && k != view.kind {
+                                self.act(BuildDiskAction::Table(BuildAction::SetKind(k)));
+                            }
+                        }
+                    });
                 });
                 self.size_row(ui, None);
                 ui.horizontal(|ui| {
@@ -519,12 +551,17 @@ impl BuildDiskTab {
                         }));
                     }
                     let mut ty = row.type_text.clone();
-                    super::partition_editor_modal::type_field(
-                        ui,
-                        view.kind,
-                        &format!("bd_type_{i}"),
-                        &mut ty,
-                    );
+                    if view.fixed {
+                        ui.label(ty.as_str())
+                            .on_hover_text("From the donor's label; the label keeps it");
+                    } else {
+                        super::partition_editor_modal::type_field(
+                            ui,
+                            view.kind,
+                            &format!("bd_type_{i}"),
+                            &mut ty,
+                        );
+                    }
                     if ty != row.type_text {
                         acts.push(BuildDiskAction::Table(BuildAction::SetRowType {
                             row: i,
@@ -571,7 +608,23 @@ impl BuildDiskTab {
                         let content = self.ctl.row_content(i);
                         let fs = self.ctl.row_fs(i);
                         let id = format!("{}_{i}", ids::ROW_CONTENT);
-                        if let Some(choice) = fs_combo(ui, &id, fs, true) {
+                        if self.ctl.row_can_copy(i) {
+                            let copying = content == RowContent::Copy;
+                            if ui
+                                .selectable_label(copying, "Copy")
+                                .on_hover_text("The donor partition's bytes, verbatim")
+                                .clicked()
+                                && !copying
+                            {
+                                acts.push(BuildDiskAction::SetRowCopy(i));
+                            }
+                        }
+                        let shown = if content == RowContent::Copy {
+                            None
+                        } else {
+                            fs
+                        };
+                        if let Some(choice) = fs_combo(ui, &id, shown, true) {
                             acts.push(BuildDiskAction::SetRowFs { row: i, fs: choice });
                         }
                         if content == RowContent::Image {
@@ -599,31 +652,33 @@ impl BuildDiskTab {
                             acts.push(BuildDiskAction::Table(BuildAction::PickRowSource(i)));
                         }
                     });
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(i > 0, egui::Button::new("Up").small())
-                            .clicked()
-                        {
-                            acts.push(BuildDiskAction::Table(BuildAction::MoveRow {
-                                row: i,
-                                delta: -1,
-                            }));
-                        }
-                        if ui
-                            .add_enabled(i + 1 < n, egui::Button::new("Down").small())
-                            .clicked()
-                        {
-                            acts.push(BuildDiskAction::Table(BuildAction::MoveRow {
-                                row: i,
-                                delta: 1,
-                            }));
-                        }
-                        if ui
-                            .add_enabled(n > 1, egui::Button::new("Remove").small())
-                            .clicked()
-                        {
-                            acts.push(BuildDiskAction::Table(BuildAction::RemoveRow(i)));
-                        }
+                    ui.add_enabled_ui(!view.fixed, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(i > 0, egui::Button::new("Up").small())
+                                .clicked()
+                            {
+                                acts.push(BuildDiskAction::Table(BuildAction::MoveRow {
+                                    row: i,
+                                    delta: -1,
+                                }));
+                            }
+                            if ui
+                                .add_enabled(i + 1 < n, egui::Button::new("Down").small())
+                                .clicked()
+                            {
+                                acts.push(BuildDiskAction::Table(BuildAction::MoveRow {
+                                    row: i,
+                                    delta: 1,
+                                }));
+                            }
+                            if ui
+                                .add_enabled(n > 1, egui::Button::new("Remove").small())
+                                .clicked()
+                            {
+                                acts.push(BuildDiskAction::Table(BuildAction::RemoveRow(i)));
+                            }
+                        })
                     });
                     ui.end_row();
                 }

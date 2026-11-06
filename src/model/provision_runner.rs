@@ -51,6 +51,12 @@ pub struct ProvisionRequest {
     pub full_write: bool,
     /// Amiga filesystem handlers to embed in an RDB: `(DosType text, AmigaDOS load file)`.
     pub rdb_handlers: Vec<(String, PathBuf)>,
+    /// A label donor's patched head, written in place of a fresh table (after the copies).
+    pub head: Option<Vec<u8>>,
+    /// The donor disk the copies read from.
+    pub donor: Option<PathBuf>,
+    /// `(partition, donor start byte, length)`: donor bytes copied to the partition's start.
+    pub copies: Vec<(usize, u64, u64)>,
 }
 
 /// Read and check the handlers for `write_rdb_filesystems`: one per DosType, each an AmigaDOS
@@ -209,7 +215,7 @@ impl ProvisionRequest {
         } else {
             0
         };
-        sources + formats
+        sources + formats + self.copies.iter().map(|c| c.2).sum::<u64>()
     }
 
     /// The partitions to format, with no source image.
@@ -416,6 +422,32 @@ fn run_preset_on(
     Ok(())
 }
 
+/// Copy `len` bytes at `from` in `src` to `to` in `dst`, a MiB at a time.
+fn copy_range<R: std::io::Read + std::io::Seek, W: Write + std::io::Seek>(
+    src: &mut R,
+    from: u64,
+    dst: &mut W,
+    to: u64,
+    len: u64,
+    cancel: &impl Fn() -> bool,
+) -> Result<()> {
+    use std::io::SeekFrom;
+    src.seek(SeekFrom::Start(from))?;
+    dst.seek(SeekFrom::Start(to))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        if cancel() {
+            anyhow::bail!("build cancelled");
+        }
+        let n = left.min(buf.len() as u64) as usize;
+        src.read_exact(&mut buf[..n])?;
+        dst.write_all(&buf[..n])?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
 /// Encode the built raw image at `raw` into `fmt` at `dest`, reporting on `status`.
 fn encode(
     fmt: ExportFormat,
@@ -601,13 +633,47 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
     // alive until the write finishes; bind it so it drops at end of scope.
     let mut target = SectorAlignedWriter::new(handle.file);
 
-    provision::write_table(
-        &mut target,
-        req.kind,
-        &req.partitions,
-        req.target_size_bytes,
-        req.geometry,
-    )?;
+    if req.head.is_none() {
+        provision::write_table(
+            &mut target,
+            req.kind,
+            &req.partitions,
+            req.target_size_bytes,
+            req.geometry,
+        )?;
+    }
+    // A donor's partitions, copied before its head: a volume header starts at byte 0.
+    if let Some(donor) = &req.donor {
+        let mut src = crate::model::source_reader::open_read(donor.as_path())
+            .with_context(|| format!("opening the donor {}", donor.display()))?;
+        for &(i, from, len) in &req.copies {
+            let Some(p) = req.partitions.get(i) else {
+                continue;
+            };
+            log_cb(&format!(
+                "Copying partition {} ({}) from the donor",
+                i + 1,
+                disk_core::display::format_size(len)
+            ));
+            copy_range(
+                &mut src,
+                from,
+                &mut target,
+                p.start_byte(),
+                len,
+                &cancel_check,
+            )
+            .with_context(|| format!("copying partition {} from the donor", i + 1))?;
+        }
+    }
+    if let Some(head) = &req.head {
+        use std::io::Seek as _;
+        target.seek(std::io::SeekFrom::Start(0))?;
+        target
+            .write_all(head)
+            .context("writing the donor's patched label")?;
+        log_cb("Wrote the donor's label, resized for this disk");
+    }
     // The FSHD chain lands past the PART blocks, inside the RDSK's reserved area.
     let handlers = load_rdb_handlers(req.kind, req.rdb_handlers.as_slice())?;
     if !handlers.is_empty() {
@@ -793,6 +859,9 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            head: None,
+            donor: None,
+            copies: Vec::new(),
         };
         run_worker(&req, new_status(0)).expect("worker");
 
@@ -838,6 +907,9 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            head: None,
+            donor: None,
+            copies: Vec::new(),
         };
         run_worker(&req, new_status(0)).expect("worker");
         (target_path, placed)
@@ -901,6 +973,9 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            head: None,
+            donor: None,
+            copies: Vec::new(),
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(
@@ -929,6 +1004,9 @@ mod tests {
             formats: Vec::new(),
             full_write: false,
             rdb_handlers: Vec::new(),
+            head: None,
+            donor: None,
+            copies: Vec::new(),
         };
         let err = run_worker(&req, new_status(0)).expect_err("must refuse");
         assert!(format!("{err:#}").contains("past the end"), "{err:#}");

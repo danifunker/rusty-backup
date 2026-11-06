@@ -42,6 +42,103 @@ pub struct BuilderRow {
     pub format: Option<RowFormat>,
     /// Boot from this partition, where the table has a flag for it.
     pub bootable: bool,
+    /// Copy the donor's partition at this position into the row (its bytes, verbatim).
+    pub copy_from: Option<usize>,
+    /// The donor partition this row was laid out from, kept when its content changes.
+    pub donor_part: Option<usize>,
+}
+
+/// A disk whose layout a build starts from: its table and partitions, and for the label
+/// schemes the head region that rides verbatim (resized by `partition::restore_patch`).
+#[derive(Debug, Clone)]
+pub struct Donor {
+    pub path: PathBuf,
+    /// The table type as `PartitionTable::type_name` spells it.
+    pub table_type: String,
+    pub kind: TableKind,
+    pub disk_size: u64,
+    /// The bytes before the first partition; written back patched for a label scheme.
+    pub head: Vec<u8>,
+    pub parts: Vec<DonorPart>,
+}
+
+/// One partition of a donor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DonorPart {
+    /// `PartitionInfo::index`, which the label patchers key on.
+    pub index: usize,
+    pub start_byte: u64,
+    pub size: u64,
+    /// The type in the table's own vocabulary, and its display name.
+    pub type_text: String,
+    pub type_name: String,
+}
+
+impl Donor {
+    /// Read `path`'s table (any container the engine opens).
+    pub fn read(path: &std::path::Path) -> Result<Donor> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut r = crate::model::source_reader::open_read(path)?;
+        let table = crate::partition::PartitionTable::detect(&mut r)
+            .map_err(|e| anyhow::anyhow!("no partition table found: {e}"))?;
+        let kind = type_catalog::kind_of(&table);
+        if !provision::WRITABLE_TABLES.contains(&kind) {
+            anyhow::bail!("a {} table cannot be built from yet", table.type_name());
+        }
+        let infos: Vec<_> = table
+            .partitions()
+            .into_iter()
+            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+            .collect();
+        if infos.is_empty() {
+            anyhow::bail!("the donor has no partitions");
+        }
+        if crate::partition::partitions_overlap(infos.as_slice()) {
+            anyhow::bail!("the donor's partitions overlap; it describes several layouts at once");
+        }
+        if kind == TableKind::Mbr && infos.iter().any(|p| p.is_logical) {
+            anyhow::bail!("the donor has logical partitions, which Build Disk cannot write yet");
+        }
+        let disk_size = r.seek(SeekFrom::End(0))?;
+        let head_len = infos
+            .iter()
+            .map(|p| p.byte_offset())
+            .min()
+            .unwrap_or(512)
+            .max(512);
+        let mut head = vec![0u8; head_len as usize];
+        r.seek(SeekFrom::Start(0))?;
+        r.read_exact(&mut head)?;
+        let parts = infos
+            .iter()
+            .map(|p| DonorPart {
+                index: p.index,
+                start_byte: p.byte_offset(),
+                size: p.size_bytes,
+                type_text: match kind {
+                    TableKind::Mbr => format!("{:02X}", p.partition_type_byte),
+                    _ => p
+                        .partition_type_string
+                        .clone()
+                        .unwrap_or_else(|| p.type_name.clone()),
+                },
+                type_name: p.type_name.clone(),
+            })
+            .collect();
+        Ok(Donor {
+            path: path.to_path_buf(),
+            table_type: table.type_name().to_string(),
+            kind,
+            disk_size,
+            head,
+            parts,
+        })
+    }
+
+    /// The table is a label the patchers rewrite in the verbatim head (SGI, Sun, NeXT, RDB, ...).
+    pub fn keeps_head(&self) -> bool {
+        crate::partition::restore_patch::can_patch(self.table_type.as_str())
+    }
 }
 
 /// A filesystem to format and its options.
@@ -192,6 +289,8 @@ impl BuilderRow {
 #[derive(Debug, Clone)]
 pub struct DiskBuilder {
     pub kind: TableKind,
+    /// The disk this layout started from, when it did.
+    pub donor: Option<Donor>,
     /// Size of the disk being built, in bytes.
     pub disk_size: u64,
     /// Alignment for partition starts; the same grammar as `--align`
@@ -208,6 +307,7 @@ impl Default for DiskBuilder {
     fn default() -> Self {
         Self {
             kind: TableKind::Mbr,
+            donor: None,
             disk_size: 0,
             // Blank means "the table's own default" — 1 MiB, or a cylinder on SGI.
             align_text: String::new(),
@@ -228,6 +328,106 @@ impl DiskBuilder {
             rows: vec![BuilderRow::new(kind, "rest")],
             ..Default::default()
         }
+    }
+
+    /// A builder laid out like `donor`: one row per donor partition at its own size, each
+    /// copying the donor's bytes.
+    pub fn from_donor(donor: Donor, disk_size: u64) -> Self {
+        let rows = donor
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| BuilderRow {
+                size_text: p.size.to_string(),
+                type_text: p.type_text.clone(),
+                copy_from: Some(i),
+                donor_part: Some(i),
+                ..Default::default()
+            })
+            .collect();
+        Self {
+            kind: donor.kind,
+            disk_size,
+            rows,
+            donor: Some(donor),
+            ..Default::default()
+        }
+    }
+
+    /// The donor keeps its head and its slots: rows cannot be added, removed or moved.
+    pub fn fixed_slots(&self) -> bool {
+        self.donor.as_ref().is_some_and(|d| d.keeps_head())
+    }
+
+    /// The donor's head patched for this layout, and where each row lands, for a label donor.
+    pub fn patched_head(&self) -> Result<Option<(Vec<u8>, Vec<Placed>)>> {
+        let Some(d) = self.donor.as_ref().filter(|d| d.keeps_head()) else {
+            return Ok(None);
+        };
+        if self.rows.len() != d.parts.len() {
+            anyhow::bail!("the donor's layout has {} slots", d.parts.len());
+        }
+        let fixed: u64 = self
+            .rows
+            .iter()
+            .filter(|r| !r.is_rest())
+            .map(|r| parse_size(&r.size_text).unwrap_or(0))
+            .sum();
+        let rest = self.disk_size.saturating_sub(fixed + d.head.len() as u64) / 512 * 512;
+        let mut overrides = Vec::new();
+        for (i, (row, part)) in self.rows.iter().zip(d.parts.iter()).enumerate() {
+            let size = if row.is_rest() {
+                rest
+            } else {
+                parse_size(&row.size_text)
+                    .map_err(|e| anyhow::anyhow!("partition {}: {e:#}", i + 1))?
+            };
+            overrides.push(part_tables::PartitionSizeOverride::size_only(
+                part.index,
+                part.start_byte / 512,
+                part.size,
+                size,
+            ));
+        }
+        let patched = crate::partition::restore_patch::patch_head_for_restore(
+            d.table_type.as_str(),
+            d.head.as_slice(),
+            overrides.as_slice(),
+            self.disk_size,
+            &mut |_| {},
+        )?;
+        let placed = patched
+            .overrides
+            .iter()
+            .zip(d.parts.iter())
+            .zip(self.rows.iter())
+            .map(|((ov, part), row)| Placed {
+                start_lba: ov.effective_start_lba(),
+                size_bytes: ov.export_size,
+                type_text: part.type_text.clone(),
+                name: String::new(),
+                bootable: row.bootable,
+            })
+            .collect();
+        Ok(Some((patched.head, placed)))
+    }
+
+    /// The donor bytes each row copies: `(row, donor start byte, length)`, the length capped at
+    /// the row's planned size.
+    pub fn copies(&self, placed: &[Placed]) -> Vec<(usize, u64, u64)> {
+        let Some(d) = self.donor.as_ref() else {
+            return Vec::new();
+        };
+        self.rows
+            .iter()
+            .zip(placed.iter())
+            .enumerate()
+            .filter(|(_, (r, _))| r.source.is_none() && r.format.is_none())
+            .filter_map(|(i, (r, p))| {
+                let part = d.parts.get(r.copy_from?)?;
+                Some((i, part.start_byte, part.size.min(p.size_bytes)))
+            })
+            .collect()
     }
 
     /// Switch table type, re-stamping the default partition type on any row
@@ -332,6 +532,9 @@ impl DiskBuilder {
         if self.disk_size == 0 {
             anyhow::bail!("target size is unknown");
         }
+        if let Some((_, placed)) = self.patched_head()? {
+            return Ok(placed);
+        }
         if let Err(e) = provision::parse_align(&self.align_text) {
             if !self.align_text.trim().is_empty() {
                 return Err(e);
@@ -401,6 +604,20 @@ impl DiskBuilder {
                     format_size(row.source_size),
                     format_size(p.size_bytes),
                 ));
+            }
+            let donor_part = row
+                .copy_from
+                .and_then(|k| self.donor.as_ref().and_then(|d| d.parts.get(k)));
+            if let (None, None, Some(part)) = (&row.source, &row.format, donor_part) {
+                if part.size > p.size_bytes {
+                    self.errors.push(format!(
+                        "Partition {}: the donor's {} is {}, more than the {} it would copy into",
+                        i + 1,
+                        part.type_name,
+                        format_size(part.size),
+                        format_size(p.size_bytes),
+                    ));
+                }
             }
             if let (None, Some(f)) = (&row.source, &row.format) {
                 if let Err(e) = f.fits(p.size_bytes).and_then(|()| f.check()) {

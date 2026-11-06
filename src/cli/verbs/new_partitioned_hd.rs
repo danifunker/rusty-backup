@@ -206,6 +206,9 @@ pub fn run(cmd: PartitionedHdCommand) -> Result<()> {
         formats: Vec::new(),
         full_write: false,
         rdb_handlers: handler_specs(&args.filesystems)?,
+        head: None,
+        donor: None,
+        copies: Vec::new(),
     };
     let status = Arc::new(Mutex::new(
         crate::model::physical_write_runner::PhysicalWriteStatus {

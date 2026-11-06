@@ -44,6 +44,8 @@ pub(super) enum Row {
     Container,
     OutputDevice,
     Table,
+    /// Start from a blank table or a donor disk's layout.
+    Donor,
     Size,
     Align,
     Heads,
@@ -99,10 +101,24 @@ impl Default for BuildDiskState {
 }
 
 /// Every content choice of a partition row, in cycling order: empty, each filesystem, an image.
-fn contents() -> Vec<Option<Option<FsKind>>> {
-    let mut v = vec![Some(None)];
-    v.extend(FsKind::ALL.iter().map(|k| Some(Some(*k))));
-    v.push(None);
+/// A row's content as the cycle steps through it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Content {
+    Copy,
+    Empty,
+    Fs(FsKind),
+    Image,
+}
+
+/// Every content choice of a partition row, in cycling order.
+fn contents(can_copy: bool) -> Vec<Content> {
+    let mut v = Vec::new();
+    if can_copy {
+        v.push(Content::Copy);
+    }
+    v.push(Content::Empty);
+    v.extend(FsKind::ALL.iter().map(|k| Content::Fs(*k)));
+    v.push(Content::Image);
     v
 }
 
@@ -197,6 +213,7 @@ impl BuildDiskState {
                         }
                     }
                     DiskKind::Partitioned => {
+                        r.push(Row::Donor);
                         r.push(Row::Table);
                         if !c.output_is_device() {
                             r.push(Row::Size);
@@ -433,13 +450,28 @@ impl BuildDiskState {
             }
             Row::PContent(i) => {
                 let cur = match c.row_content(i) {
-                    RowContent::Image => None,
-                    RowContent::Empty => Some(None),
-                    RowContent::Format => Some(c.row_fs(i)),
+                    RowContent::Image => Content::Image,
+                    RowContent::Empty => Content::Empty,
+                    RowContent::Copy => Content::Copy,
+                    RowContent::Format => c.row_fs(i).map_or(Content::Empty, Content::Fs),
                 };
-                match cycle(contents().as_slice(), cur, forward) {
-                    Some(fs) => self.act(BuildDiskAction::SetRowFs { row: i, fs }),
-                    None => self.act(BuildDiskAction::Table(BuildAction::PickRowSource(i))),
+                match cycle(contents(c.row_can_copy(i)).as_slice(), cur, forward) {
+                    Content::Copy => self.act(BuildDiskAction::SetRowCopy(i)),
+                    Content::Empty => self.act(BuildDiskAction::SetRowFs { row: i, fs: None }),
+                    Content::Fs(fs) => self.act(BuildDiskAction::SetRowFs {
+                        row: i,
+                        fs: Some(fs),
+                    }),
+                    Content::Image => {
+                        self.act(BuildDiskAction::Table(BuildAction::PickRowSource(i)))
+                    }
+                }
+            }
+            Row::Donor => {
+                if c.donor().is_some() {
+                    self.act(BuildDiskAction::ClearDonor);
+                } else {
+                    self.act(BuildDiskAction::PickDonor);
                 }
             }
             Row::Opt(r, opt) => {
@@ -785,6 +817,19 @@ impl App {
                         .unwrap_or_else(|| "(Enter to choose)".into()),
                 ),
                 Row::Table => ("Table".into(), format!("< {} >", v.kind.label())),
+                Row::Donor => (
+                    "Start from".into(),
+                    match (c.donor(), c.donor_reading(), c.donor_error()) {
+                        (Some((p, t)), _, _) => {
+                            format!("{t} layout of {}  (Enter: blank)", p.display())
+                        }
+                        (None, true, _) => "reading the donor...".into(),
+                        (None, false, Some(e)) => format!("blank table ({e})"),
+                        (None, false, None) => {
+                            "blank table  (Enter: an existing disk's layout)".into()
+                        }
+                    },
+                ),
                 Row::Size => (
                     "Size".into(),
                     format!(
@@ -866,6 +911,7 @@ impl App {
                     "  Content".into(),
                     match c.row_content(*p) {
                         RowContent::Empty => "< Empty >".into(),
+                        RowContent::Copy => "< Copy from the donor >".into(),
                         RowContent::Format => format!(
                             "< {} >",
                             c.row_fs(*p).map(|k| k.display_name()).unwrap_or("?")
@@ -1062,6 +1108,8 @@ mod tests {
             Some(img.as_path())
         );
         key(&mut app, KeyCode::Char('n'));
+        // Disk step: Start from, Table, Size.
+        key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Enter);
         for _ in 0..8 {

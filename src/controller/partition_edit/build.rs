@@ -82,10 +82,29 @@ pub struct BuildView {
     pub status: Option<String>,
     /// Create Disk is enabled (the layout places).
     pub can_create: bool,
+    /// The layout comes from a donor's label: the table, slots, types and names are fixed.
+    pub fixed: bool,
 }
 
 /// Carry out one intent on the plan; `PickRowSource` is the host's (it needs a picker and a job).
 pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
+    // A label donor keeps its table and slots; only sizes, bootable flags and content change.
+    if builder.fixed_slots()
+        && matches!(
+            action,
+            BuildAction::SetKind(_)
+                | BuildAction::SetRowType { .. }
+                | BuildAction::SetRowName { .. }
+                | BuildAction::MoveRow { .. }
+                | BuildAction::RemoveRow(_)
+                | BuildAction::AddRow
+                | BuildAction::SetAlign(_)
+                | BuildAction::SetHeads(_)
+                | BuildAction::SetSectorsPerTrack(_)
+        )
+    {
+        return;
+    }
     match action {
         BuildAction::SetKind(kind) => builder.set_kind(kind),
         BuildAction::SetAlign(t) => builder.align_text = t,
@@ -210,7 +229,8 @@ pub(crate) fn build_view(builder: &DiskBuilder) -> BuildView {
         names: provision::carries_entry_name(builder.kind),
         boot: provision::bootable_rule(builder.kind),
         rows,
-        can_add_row: builder.can_add_row(),
+        can_add_row: builder.can_add_row() && !builder.fixed_slots(),
+        fixed: builder.fixed_slots(),
         slots: builder.remaining_slots().map(|left| (n, n + left)),
         can_create: planned.is_ok(),
         layout,

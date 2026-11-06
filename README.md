@@ -371,7 +371,11 @@ The app has five tabs:
   image file or written straight to a physical disk such as an SD or CF card.
   Each partition is formatted blank with any of the 39 filesystems Rusty
   Backup can create, filled from a source image, or left empty; its type
-  follows the filesystem, and a partition can be marked bootable (MBR active,
+  follows the filesystem. A build can also start from an existing disk image's
+  layout at a new size, for example a bigger SGI disk from a small one: its
+  table, volume header or boot blocks and partitions come along (each copied,
+  formatted afresh or left empty), and the label is rewritten for the new
+  size. A partition can be marked bootable (MBR active,
   RDB bootable). An Amiga RDB disk can carry its filesystem handlers (`L:PFS3`,
   `L:SmartFilesystem`) so the ROM mounts PFS3 / SFS unaided. The wizard checks each filesystem's size limits and
   label rules before it lets you go on, and a device build asks you to type

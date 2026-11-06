@@ -456,6 +456,8 @@ Usage: build [OPTIONS] <TARGET>
 - `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
 - `--sectors` — Sectors per track for the cylinder-aligned tables
 - `--fs` — With no `--table`: the filesystem of the one bare volume
+- `--from` — Start from this disk image's layout: its table, special partitions and their contents, at the new `--size`. Each partition is copied unless `--format N=FS` or `--empty N` says otherwise; `--partition SIZE` sets the sizes in order. A label (SGI, Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized for the new disk
+- `--empty` — With `--from`: leave partition N empty instead of copying it
 - `--preset` — Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make
 - `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
 - `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
