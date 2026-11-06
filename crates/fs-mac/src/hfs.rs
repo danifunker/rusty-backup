@@ -2964,8 +2964,11 @@ pub fn clone_target_btree_sizes(
     (catalog, extents)
 }
 
-/// The largest classic HFS volume we write: 65535 64 KiB blocks and the sectors around them.
-pub const HFS_MAX_VOLUME_BYTES: u64 = 4 << 30;
+/// Largest allocation block: System 7.5 bombs on 65536, the first size past 16 bits.
+pub const HFS_MAX_BLOCK_SIZE: u32 = 65024;
+
+/// The largest classic HFS volume we write: 65535 blocks of [`HFS_MAX_BLOCK_SIZE`], about 4 GB.
+pub const HFS_MAX_VOLUME_BYTES: u64 = 4063 * 1024 * 1024;
 
 /// What a volume of this size asks of Mac OS, for sizes past System 7's limit.
 pub fn mac_os_size_note(volume_bytes: u64) -> Option<&'static str> {
@@ -2991,19 +2994,24 @@ pub fn hfs_outgrows_in_place(
     hfs_max_growable_size(device, partition_offset).is_some_and(|max| max < new_size)
 }
 
-/// Pick the smallest 512-byte-multiple allocation block size that keeps a
-/// volume of `volume_bytes` within HFS's 65535-block (`drNmAlBlks`) ceiling.
+/// Pick the smallest 512-byte-multiple allocation block size that keeps a volume
+/// of `volume_bytes` within HFS's 65535-block (`drNmAlBlks`) ceiling, as Apple's
+/// formatters do. Capped at [`HFS_MAX_BLOCK_SIZE`].
 pub fn pick_block_size(volume_bytes: u64) -> u32 {
     // Boot blocks, MDB, a full bitmap, the alternate MDB and the last sector.
     let allocatable = volume_bytes.saturating_sub((3 + 16) * 512 + 1024);
-    let mut bs: u32 = 512;
-    while allocatable / bs as u64 > 65535 {
-        bs = bs.saturating_mul(2);
-        if bs == 0 {
-            return 1 << 16;
-        }
+    let sectors = allocatable.div_ceil(65535).div_ceil(512).max(1);
+    (sectors * 512).min(HFS_MAX_BLOCK_SIZE as u64) as u32
+}
+
+/// [`pick_block_size`] for a CD: a block divides or fills whole 2048-byte sectors, under the limit.
+pub fn pick_cd_block_size(volume_bytes: u64) -> u32 {
+    let bs = pick_block_size(volume_bytes);
+    if bs <= 2048 {
+        return bs.next_power_of_two();
     }
-    bs
+    bs.next_multiple_of(2048)
+        .min(HFS_MAX_BLOCK_SIZE / 2048 * 2048)
 }
 
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
@@ -4897,6 +4905,18 @@ mod tests {
     /// The streaming and in-memory blank formatters must agree byte for byte —
     /// the streaming one only skips writing the free middle, which reads back
     /// as zeros from a `set_len`'d file.
+    /// Blocks are any multiple of 512, and never 65536, which bombs System 7.5.
+    #[test]
+    fn pick_block_size_stays_under_the_system_75_limit() {
+        assert_eq!(pick_block_size(10 * 1024 * 1024), 512);
+        assert_eq!(pick_block_size(2200 * 1024 * 1024), 35328);
+        assert_eq!(pick_block_size(HFS_MAX_VOLUME_BYTES), HFS_MAX_BLOCK_SIZE);
+        assert_eq!(pick_cd_block_size(650 * 1024 * 1024), 12288);
+        assert_eq!(pick_cd_block_size(HFS_MAX_VOLUME_BYTES), 63488);
+        let front = (3 + 16) * 512 + 1024;
+        assert!((HFS_MAX_VOLUME_BYTES - front) / HFS_MAX_BLOCK_SIZE as u64 <= 65535);
+    }
+
     /// A volume at 65535 blocks still fits a partition that ends less than a block past it.
     #[test]
     fn fit_moves_the_alternate_mdb_past_a_short_remainder() {

@@ -193,7 +193,7 @@ pub enum VolumeFs {
     Hfs,
     /// HFS+ / HFSX (Mac OS Extended). Use --case-sensitive for HFSX.
     Hfsplus,
-    /// BasiliskII HFV — a flat classic-HFS volume, capped at 4095 MB.
+    /// BasiliskII HFV — a flat classic-HFS volume, capped at 4063 MB.
     Hfv,
     /// FAT12 / FAT16 / FAT32, auto-selected by size.
     Fat,

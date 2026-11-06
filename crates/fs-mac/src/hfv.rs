@@ -18,10 +18,10 @@
 //! * **Classic HFS only — never HFS+.** A flat HFV is mounted by the 68k ROM's
 //!   classic HFS driver. HFS+ in a flat image needs Mac OS 8.1+ plus a driver
 //!   shim and is out of scope.
-//! * **Total size ≤ 4095 MB.** Classic HFS uses a 16-bit allocation-block count
-//!   (`drNmAlBlks`, max 65,535), which 64 KiB blocks take to 4 GiB. System 6 and
-//!   7 stop at 2 GB; System 7.5 and later reach 4 GB, on 68k and PowerPC alike
-//!   (see [`crate::hfs::mac_os_size_note`]). The ceiling is [`HFV_MAX_BYTES`].
+//! * **Total size ≤ 4063 MB.** Classic HFS uses a 16-bit allocation-block count
+//!   (`drNmAlBlks`, max 65,535), and System 7.5 bombs on a block of 65536 bytes,
+//!   so [`crate::hfs::HFS_MAX_BLOCK_SIZE`] sets the ceiling. System 6 and 7 stop
+//!   at 2 GB (see [`crate::hfs::mac_os_size_note`]).
 //! * The allocation-block-size floor follows from the size: [`suggest_block_size`]
 //!   picks the smallest standard block size keeping `drNmAlBlks ≤ 65,535`.
 
@@ -31,13 +31,13 @@ use crate::hfs::{create_blank_hfs_sized, HfsFilesystem};
 use crate::hfs_clone::{clone_hfs_at, CloneReport};
 use disk_core::filesystem::{Filesystem, FilesystemError};
 
-/// Maximum byte size of an HFV (classic-HFS) volume: **4095 MB**, what 65,535 64 KiB blocks hold.
-pub const HFV_MAX_BYTES: u64 = 4095 * 1024 * 1024;
+/// Maximum byte size of an HFV (classic-HFS) volume: **4063 MB**.
+pub const HFV_MAX_BYTES: u64 = crate::hfs::HFS_MAX_VOLUME_BYTES;
 
 /// Allocation block sizes an HFV may use. Each maps to a 2 GB-class ceiling
 /// defined by HFS's 65,535-block `u16`. Canonical list — the HFS expand
 /// runner re-exports these so there is a single source of truth.
-pub const BLOCK_SIZE_CHOICES: &[u32] = &[4096, 8192, 16384, 32768, 65536];
+pub const BLOCK_SIZE_CHOICES: &[u32] = &[4096, 8192, 16384, 32768, crate::hfs::HFS_MAX_BLOCK_SIZE];
 
 /// Maximum HFS volume size addressable with a given allocation block size
 /// (`65,535 × block_size`).
@@ -92,7 +92,7 @@ pub fn validate_hfv_target(size_bytes: u64, kind: HfvVolumeKind) -> Result<(), F
     }
     if size_bytes > HFV_MAX_BYTES {
         return Err(FilesystemError::InvalidData(format!(
-            "HFV volume size {} bytes exceeds the classic-HFS limit of {} bytes (4095 MB)",
+            "HFV volume size {} bytes exceeds the classic-HFS limit of {} bytes (4063 MB)",
             size_bytes, HFV_MAX_BYTES
         )));
     }
@@ -170,16 +170,16 @@ mod tests {
         // Exactly the cap is allowed; one byte over is not.
         assert!(validate_hfv_target(HFV_MAX_BYTES, HfvVolumeKind::Hfs).is_ok());
         let err = validate_hfv_target(HFV_MAX_BYTES + 1, HfvVolumeKind::Hfs).unwrap_err();
-        assert!(err.to_string().contains("4095 MB"));
+        assert!(err.to_string().contains("4063 MB"));
     }
 
     #[test]
     fn suggest_block_size_covers_full_range() {
         assert_eq!(suggest_block_size(10 * MIB), 4096);
-        // 4095 MB must be coverable by a single choice keeping blocks <= 65535.
+        // 4063 MB must be coverable by a single choice keeping blocks <= 65535.
         let bs = suggest_block_size(HFV_MAX_BYTES);
         assert!(max_volume_for_block_size(bs) >= HFV_MAX_BYTES);
-        assert_eq!(bs, 65536);
+        assert_eq!(bs, crate::hfs::HFS_MAX_BLOCK_SIZE);
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn build_blank_hfv_refuses_hfs_plus_and_oversize() {
         // Oversize is refused before create_blank touches it.
-        assert!(build_blank_hfv(HFV_MAX_BYTES + MIB, 65536, "X").is_err());
+        assert!(build_blank_hfv(HFV_MAX_BYTES + MIB, 65024, "X").is_err());
     }
 
     #[test]

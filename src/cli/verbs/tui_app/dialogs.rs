@@ -424,7 +424,7 @@ impl App {
             if row == DRow::HfsFormat && c.flat_hfv() {
                 lines.push(Line::styled(
                     "    Bare classic-HFS volume with no partition table (BasiliskII / \
-                     SheepShaver .hfv). Capped at 4095 MB.",
+                     SheepShaver .hfv). Capped at 4063 MB.",
                     pal.dim(),
                 ));
             }

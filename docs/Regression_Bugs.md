@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-084](#r-084)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (`pick_block_size`) | ~~A classic HFS volume with 65536-byte allocation blocks bombs System 7.5 at the desktop: every auto-sized volume past 2 GB, and Expand HFS's largest block choice~~ — blocks are the smallest multiple of 512 that fits, capped at 65024, 2026-11-06 |
 | ~~[R-083](#r-083)~~ | ~~**High**~~ **FIXED** | `crates/fs-amiga` (AFFS fsck) | ~~fsck reports a bitmap extension block as allocated but unreachable, and repair frees it, on any AFFS volume past about 49 MiB~~ — the blocks of the `bm_ext` chain count as metadata, 2026-11-06 |
 | ~~[R-082](#r-082)~~ | ~~Medium~~ **FIXED** | `crates/fs-mac` (`hfs_common`, HFS fsck) | ~~B-tree map nodes hold a 494-byte record where Apple's hold 492, so hfsutils refuses any volume with one ("malformed b*-tree map node"), and repair rewrites a real Mac's map node into that form~~ — written the way ExtendBTree writes them, 2026-11-06 |
 | ~~[R-081](#r-081)~~ | ~~Medium~~ **FIXED** | `libchdman-rs` 0.289.x (vendored MAME `chd.cpp`) | ~~A CHD of a source of 8 KiB or less aborts the process: `compress_v5_map`'s buffer leaves no room for the Huffman tree with one or two hunks~~ — libchdman-rs 0.289.4 allows 160 bits for the tree, 2026-11-04 |
@@ -107,6 +108,17 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-084 — a 64 KiB allocation block bombs System 7.5 {#r-084}
+
+`pick_block_size` only doubled, so anything past 2 GB got 65536-byte blocks. On a
+Quadra 800 under QEMU, System 7.5.5 draws a system-error bomb as the Finder comes
+up: 1900 MB at 32 KiB mounts, 2200 MB at 64 KiB bombs, and 2200 MB at 34.5 KiB
+mounts. Mac OS 9 takes 65536 without complaint, so testing only there hides it.
+65024 is the largest multiple of 512 below 65536, and 65535 of those is the
+"4,063 MB" period sources give for System 7.5. A 4063 MB volume from Build Disk
+mounts there with the bundled driver, the Finder writes to it, and Disk First Aid
+calls it OK (`docs/evidence/dfa-system755-quadra-hfs-4gb.png`).
 
 ### R-083 — AFFS fsck frees a live bitmap extension block {#r-083}
 

@@ -75,7 +75,7 @@ pub const EXPORT_FORMATS: &[ExportFormatChoice] = &[
         ExportFormat::Hfv,
         "HFV (BasiliskII)",
         "Flat classic-HFS volume for BasiliskII / SheepShaver (no partition table, \
-         classic-HFS-only, max 4095 MB). Exported per-partition: one .hfv per HFS partition, \
+         classic-HFS-only, max 4063 MB). Exported per-partition: one .hfv per HFS partition, \
          cloned and re-floored to the chosen size.",
     ),
     fmt(

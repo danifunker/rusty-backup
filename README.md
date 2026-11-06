@@ -617,7 +617,7 @@ readable.
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically. An NTFS-compressed image's MFT is parsed as it streams in, not gathered into memory |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
-| BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 4095 MB; past 2 GB needs System 7.5 or later) for 68k Mac emulators |
+| BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 4063 MB; past 2 GB needs System 7.5 or later) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images. Apple Twiggy / FileWare 871 KB prototype images (the recovered MacPaint 0.5 / early Finder disks, disk-format byte `0x54`) are auto-detected and de-interleaved into their MFS/HFS volume — the two sides are stored sequentially, so the volume is recovered by rotating the sector array onto its Master Directory Block. |
@@ -809,9 +809,9 @@ On restore the EBR chain for logical partitions is rebuilt, like Clonezilla's ow
   source volume into a freshly formatted target with a larger allocation
   block size and a verified-bootable APM layout (DDR + APM map + driver
   partitions + alt MDB). Useful when a classic-HFS volume runs out of
-  16-bit block addresses. Classic HFS reaches 4 GB here (64 KiB blocks); past
-  2 GB it needs System 7.5 or later. A 4 GB volume is verified by Mac OS 9's
-  Disk First Aid.
+  16-bit block addresses. Classic HFS reaches 4063 MB here; past 2 GB it needs
+  System 7.5 or later. A full-size volume passes Disk First Aid on System 7.5.5
+  on a Quadra 800 under QEMU.
 - **SGI EFS / XFS**: EFS is fully read/write/resize. XFS gained a full
   edit + repair surface (R1-R8 repair pipeline; oracle-validated against
   `xfs_repair`) on the v4 format. Open XFS holes (multi-block leaf/node

@@ -72,7 +72,7 @@ pub enum ExpandOutput {
     ApmDisk,
     /// Write the cloned volume as a flat **HFV** (`.hfv`) — the bare HFS volume
     /// with no partition table, as BasiliskII / SheepShaver expect. Capped at
-    /// [`fs_mac::hfv::HFV_MAX_BYTES`] (4095 MB).
+    /// [`fs_mac::hfv::HFV_MAX_BYTES`] (4063 MB).
     FlatHfv,
 }
 
@@ -142,7 +142,7 @@ fn run_expand(
         }
     };
 
-    // A flat HFV must respect the classic-HFS 4095 MB ceiling (APM output is
+    // A flat HFV must respect the classic-HFS 4063 MB ceiling (APM output is
     // bounded only by the 65535-block limit, which can be larger).
     if output == ExpandOutput::FlatHfv {
         fs_mac::hfv::validate_hfv_target(target_size_bytes, fs_mac::hfv::HfvVolumeKind::Hfs)

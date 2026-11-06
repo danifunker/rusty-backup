@@ -145,7 +145,7 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     let block = match fs {
         MacCdFs::Hfs => {
             let rough = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
-            fs_mac::hfs::pick_block_size(rough) as u64
+            fs_mac::hfs::pick_cd_block_size(rough) as u64
         }
         MacCdFs::HfsPlus => 4096,
     };

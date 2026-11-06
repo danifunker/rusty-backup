@@ -111,7 +111,7 @@ fn plan_volume(opts: &MacCdOptions) -> Result<(u32, u64)> {
     let block_size = match opts.block_size {
         Some(bs) => bs,
         None => match opts.fs {
-            MacCdFs::Hfs => fs_mac::hfs::pick_block_size(avail_bytes),
+            MacCdFs::Hfs => fs_mac::hfs::pick_cd_block_size(avail_bytes),
             // Apple's default, and the largest our HFS+ formatter supports.
             MacCdFs::HfsPlus => 4096,
         },
@@ -369,7 +369,8 @@ mod tests {
             write_mac_hfs_cd(&mut file, &MacCdOptions::new(big, "Big", MacCdFs::Hfs)).unwrap();
         // No `set_len`: only the metadata regions matter here, and reserving
         // 650 MB of runner disk for a layout assertion is its own hazard.
-        assert!(layout.block_size >= 16384, "auto block size scales up");
+        assert!(layout.block_size >= 10240, "auto block size scales up");
+        assert_eq!(layout.block_size % 2048, 0, "whole CD sectors");
         assert!(layout.hfs_bytes() / layout.block_size as u64 <= 65535);
 
         let mut too_small = MacCdOptions::new(big, "Big", MacCdFs::Hfs);
