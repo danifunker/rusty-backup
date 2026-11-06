@@ -55,6 +55,36 @@ pub fn patch_head_for_restore(
     }
 }
 
+/// A label's layout grid and the bytes it keeps free at the end of the disk, as `(unit, tail)`.
+pub fn layout_limits(table_type: &str, head: &[u8]) -> (u64, u64) {
+    let limits = match table_type {
+        "Sun" => head
+            .get(..512)
+            .and_then(|h| part_tables::sun::SunDiskLabel::parse(h).ok())
+            .map(|l| (l.sectors_per_cylinder * 512, 0)),
+        "NeXT" => head
+            .get(..part_tables::next::LABEL_SPAN)
+            .and_then(|h| part_tables::next::NextDiskLabel::parse(h, 0).ok())
+            .map(|l| {
+                (
+                    l.sector_size as u64,
+                    l.back_porch as u64 * l.sector_size as u64,
+                )
+            }),
+        "RDB" => part_tables::rdb::Rdb::parse(&mut Cursor::new(head.to_vec()))
+            .ok()
+            .and_then(|rdb| {
+                rdb.partitions
+                    .iter()
+                    .map(|p| p.surfaces as u64 * p.blk_per_trk as u64 * p.fs_block_size())
+                    .max()
+            })
+            .map(|unit| (unit, 0)),
+        _ => None,
+    };
+    limits.filter(|&(unit, _)| unit != 0).unwrap_or((512, 0))
+}
+
 /// Lay `overrides` out in start order on a grid of `unit_bytes`, never below
 /// `floor_byte`, rounding each size up; the shifted list is what gets written.
 fn repack(

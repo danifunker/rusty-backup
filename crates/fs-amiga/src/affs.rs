@@ -2095,7 +2095,7 @@ pub fn resize_affs_in_place(
     //        update bm_pages[] + headerKey, rewrite checksum. ---
     let mut new_root_buf = old_root_buf;
     // headerKey at long 1 (offset 4..8).
-    BigEndian::write_u32(&mut new_root_buf[4..8], new_root);
+    BigEndian::write_u32(&mut new_root_buf[4..8], 0);
     // bm_pages[0..25] at 0x13C onward, zero-fill unused slots.
     for i in 0..AFFS_BM_PAGES_ROOT as usize {
         let off = 0x13C + i * 4;
@@ -2195,7 +2195,7 @@ pub fn resize_affs_in_place(
     Ok(())
 }
 
-/// Scan for an ST_ROOT block whose header-key matches its own block
+/// Scan for an ST_ROOT block whose header-key is 0 or its own block
 /// number. Tries `(2 + upper_total - 1) / 2` first (cheap path for
 /// volumes that haven't been resized yet), then walks the plausible
 /// range upward looking for the marker. Returns the block number, or
@@ -2214,10 +2214,9 @@ fn find_affs_root_block(
         if read_i32(&buf, 0) != T_HEADER {
             return Ok(false);
         }
-        if read_u32(&buf, 4) != blk {
-            return Ok(false);
-        }
-        Ok(true)
+        // A real root's header_key is 0 (R-020); an older image of ours holds its own block.
+        let key = read_u32(&buf, 4);
+        Ok((key == 0 || key == blk) && read_u32(&buf, 12) == HT_SIZE as u32)
     };
 
     // Adapter: Read+Seek -> AffsRootProbe trait so we can reuse one helper.
@@ -3148,6 +3147,18 @@ mod tests {
         // 880/881 were inside the volume but get marked free in the new
         // bitmap.)
         assert_eq!(alloc, 4, "expected 4 alloc, got {alloc}");
+    }
+
+    /// A formatted volume's root has header_key 0, like a real disk's, and still resizes.
+    #[test]
+    fn resize_grows_a_formatted_volume() {
+        let mut img = create_blank_affs(1024 * 1024, 1, "Real").expect("format");
+        let new_size = 4 * 1024 * 1024usize;
+        img.resize(new_size, 0);
+        let mut cur = Cursor::new(img);
+        resize_affs_in_place(&mut cur, 0, new_size as u64, &mut |_| {}).expect("grow");
+        let fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after grow");
+        assert_eq!(fs.total_blocks(), (new_size / BSIZE) as u32);
     }
 
     /// Refuse to shrink past a file's data block. The AFFS allocator

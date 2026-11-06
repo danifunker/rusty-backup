@@ -241,12 +241,12 @@ pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64) -> Option<String> 
                 fs_pc::fat::FatType::Fat32 => "0C",
             }
         }
-        (TableKind::Mbr, F::Ntfs | F::Hpfs) => "07",
+        (TableKind::Mbr, F::Ntfs | F::Hpfs | F::Exfat) => "07",
         (TableKind::Mbr, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => "83",
         (TableKind::Mbr, F::Hfs | F::Hfsplus | F::Hfv) => "AF",
         (TableKind::Mbr, F::Bfs) => "EB",
         (TableKind::Mbr, F::Ufs) => "A5",
-        (TableKind::Gpt, F::Fat | F::Ntfs) => "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+        (TableKind::Gpt, F::Fat | F::Ntfs | F::Exfat) => "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
         (TableKind::Gpt, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => {
             "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
         }
@@ -367,13 +367,16 @@ impl DiskBuilder {
         if self.rows.len() != d.parts.len() {
             anyhow::bail!("the donor's layout has {} slots", d.parts.len());
         }
+        let (unit, tail) =
+            crate::partition::restore_patch::layout_limits(d.table_type.as_str(), &d.head);
         let fixed: u64 = self
             .rows
             .iter()
             .filter(|r| !r.is_rest())
-            .map(|r| parse_size(&r.size_text).unwrap_or(0))
+            .map(|r| parse_size(&r.size_text).unwrap_or(0).div_ceil(unit) * unit)
             .sum();
-        let rest = self.disk_size.saturating_sub(fixed + d.head.len() as u64) / 512 * 512;
+        let floor = d.parts.iter().map(|p| p.start_byte).min().unwrap_or(0);
+        let rest = self.disk_size.saturating_sub(fixed + floor + tail) / unit * unit;
         let mut overrides = Vec::new();
         for (i, (row, part)) in self.rows.iter().zip(d.parts.iter()).enumerate() {
             let size = if row.is_rest() {

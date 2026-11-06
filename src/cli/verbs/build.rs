@@ -168,8 +168,10 @@ pub struct BuildArgs {
     /// Start from this disk image's layout: its table, special partitions
     /// and their contents, at the new `--size`. Each partition is copied
     /// unless `--format N=FS` or `--empty N` says otherwise; `--partition
-    /// SIZE` sets the sizes in order. A label (SGI, Sun, NeXT, RDB, AHDI,
-    /// X68000) keeps its head region verbatim, resized for the new disk.
+    /// SIZE` sets the sizes in order. A copied filesystem that can resize
+    /// grows to its partition; one that can't keeps its size. A label (SGI,
+    /// Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized
+    /// for the new disk.
     #[arg(long = "from", value_name = "DONOR", conflicts_with_all = ["table", "fs", "preset"])]
     pub from: Option<PathBuf>,
 

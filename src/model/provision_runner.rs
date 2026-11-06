@@ -423,6 +423,35 @@ fn run_preset_on(
 }
 
 /// Copy `len` bytes at `from` in `src` to `to` in `dst`, a MiB at a time.
+/// Fit a copied filesystem to its new place: grow it to the row and restamp its start LBA.
+fn grow_copied_partition<T: std::io::Read + Write + std::io::Seek>(
+    target: &mut T,
+    p: &Placed,
+    copied: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let offset = p.start_byte();
+    if p.size_bytes > copied {
+        use crate::fs::InPlaceResize;
+        match crate::fs::in_place_resize_support(target, offset, Some(p.type_text.as_str())) {
+            InPlaceResize::Supported(name) => {
+                log_cb(&format!(
+                    "Growing {name} toward {}",
+                    disk_core::display::format_size(p.size_bytes)
+                ));
+                crate::fs::resize_filesystem_for(target, offset, p.size_bytes, log_cb)?;
+            }
+            InPlaceResize::Unsupported(name) => log_cb(&format!(
+                "{name} can't be resized here: it keeps its size and the rest of the partition is empty"
+            )),
+            InPlaceResize::NoFilesystem => {}
+        }
+    }
+    crate::fs::patch_hidden_sectors_for(target, offset, p.start_lba, log_cb)?;
+    fs_pc::ntfs::ensure_backup_boot_sector(target, offset, log_cb)?;
+    Ok(())
+}
+
 fn copy_range<R: std::io::Read + std::io::Seek, W: Write + std::io::Seek>(
     src: &mut R,
     from: u64,
@@ -664,6 +693,8 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
                 &cancel_check,
             )
             .with_context(|| format!("copying partition {} from the donor", i + 1))?;
+            grow_copied_partition(&mut target, p, len, &mut log_cb)
+                .with_context(|| format!("resizing partition {} after the copy", i + 1))?;
         }
     }
     if let Some(head) = &req.head {

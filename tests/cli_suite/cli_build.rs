@@ -384,3 +384,110 @@ fn an_mbr_donor_copies_one_partition_and_formats_another() {
         "the type follows the new filesystem: {info}"
     );
 }
+
+/// A copied filesystem grows to its bigger row: a file too big for the donor's volume fits.
+#[test]
+fn a_copied_filesystem_grows_to_its_row() {
+    // AFFS stops at the 25 bitmap pages its root block holds, about 49 MiB.
+    for (table, fs, disk, file) in [
+        ("mbr", "fat", "128M", 64),
+        ("mbr", "ext4", "128M", 64),
+        ("mbr", "ntfs", "128M", 64),
+        ("rdb", "affs", "48M", 36),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+        run(&[
+            "build",
+            &p("a.img"),
+            "--size",
+            "32M",
+            "--table",
+            table,
+            "--partition",
+            "rest",
+            "--format",
+            &format!("1={fs}:KEEP"),
+        ]);
+        std::fs::write(p("host"), b"m900\n").unwrap();
+        run(&["put", &format!("{}@1", p("a.img")), &p("host"), "/HOST.TXT"]);
+        run(&[
+            "build",
+            &p("b.img"),
+            "--size",
+            disk,
+            "--from",
+            &p("a.img"),
+            "--partition",
+            "rest",
+        ]);
+        let vol = format!("{}@1", p("b.img"));
+        assert!(run(&["ls", &vol]).contains("HOST.TXT"), "{fs}");
+        fsck_clean(&vol);
+        std::fs::write(p("big"), vec![0x5A; file * 1024 * 1024]).unwrap();
+        run(&["put", &vol, &p("big"), "/BIG.BIN"]);
+        fsck_clean(&vol);
+    }
+}
+
+/// exFAT's FAT is fixed at format, so a copy grows only as far as it reaches, and warns.
+#[test]
+fn a_copied_exfat_stays_clean_and_warns_when_its_fat_is_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "32M",
+        "--table",
+        "mbr",
+        "--partition",
+        "rest",
+        "--format",
+        "1=exfat:KEEP",
+    ]);
+    assert!(run(&["ls", &format!("{}@1", p("a.img"))]).contains("0x07"));
+    let out = run(&[
+        "build",
+        &p("b.img"),
+        "--size",
+        "128M",
+        "--from",
+        &p("a.img"),
+        "--partition",
+        "rest",
+    ]);
+    assert!(out.contains("cannot grow"), "{out}");
+    fsck_clean(&format!("{}@1", p("b.img")));
+}
+
+/// HFS can't change its block size in place, so a copy past its limit stops with the reason.
+#[test]
+fn a_copied_hfs_past_its_block_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "32M",
+        "--table",
+        "apm",
+        "--partition",
+        "rest",
+        "--format",
+        "1=hfs:KEEP",
+    ]);
+    let (ok, text) = run_raw(&[
+        "build",
+        &p("b.img"),
+        "--size",
+        "128M",
+        "--from",
+        &p("a.img"),
+        "--partition",
+        "rest",
+    ]);
+    assert!(!ok && text.contains("HFS caps at"), "{text}");
+}

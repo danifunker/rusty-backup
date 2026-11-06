@@ -817,7 +817,9 @@ impl BuildDiskController {
                         let content = match (&row.source, &row.format, row.copy_from) {
                             (Some(path), _, _) => format!("from {}", path.display()),
                             (None, Some(f), _) => f.describe(),
-                            (None, None, Some(_)) => "copied from the donor".to_string(),
+                            (None, None, Some(_)) => {
+                                "copied from the donor, grown to fit if it can".to_string()
+                            }
                             (None, None, None) => "empty".to_string(),
                         };
                         v.push(format!(
