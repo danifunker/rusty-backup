@@ -19,6 +19,7 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-088](#r-088)~~ | ~~**Medium**~~ **FIXED** | `src/cli/verbs/{restore,backup}.rs` | ~~`rb-cli restore` and `backup` could exit with log lines unprinted, final warnings included~~ — the verb waits for its log thread, 2026-11-06 |
 | ~~[R-087](#r-087)~~ | ~~**Medium**~~ **FIXED** | `src/fs/make_bootable.rs` | ~~`make-bootable` called a disk bootable when its DDR named a driver with no code behind it~~ — it looks for the code and installs the driver when there is none, 2026-11-06 |
 | ~~[R-086](#r-086)~~ | ~~**High**~~ **FIXED** | `src/backup` (`apm_extras`), `src/restore` | ~~A Mac disk restored from a zstd or raw backup, or from a CHD at a new size, came back with its driver partition zeroed, so it could not start up~~ — the driver is kept in `apm-extras.bin`, CHD restores copy it, and a backup that lost it gets the bundled driver, 2026-11-06 |
 | ~~[R-085](#r-085)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-mac` (`hfs_outgrows_in_place`) | ~~A partition under one block past a volume's limit counted as outgrowing it, which would rebuild a volume on a same-size restore~~ — less than a block past the limit is a remainder, 2026-11-06 |
@@ -111,6 +112,12 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-088 — the CLI could exit before printing its log {#r-088}
+
+The log thread woke every 200 ms and nothing waited for it, so whatever came in the last wake was
+lost. A fast machine finished a small restore inside one wake and printed none of it. Found by the
+macOS CI runner failing `a_zstd_backup_grows_past_the_block_limit`.
 
 ### R-087 — make-bootable trusted the DDR over the disk {#r-087}
 

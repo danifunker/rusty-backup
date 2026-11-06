@@ -171,7 +171,7 @@ pub fn run(args: BackupArgs) -> Result<()> {
     };
 
     let progress = Arc::new(Mutex::new(BackupProgress::default()));
-    spawn_progress_pump(progress.clone());
+    let pump = spawn_progress_pump(progress.clone());
     let _status = crate::cli::status::watch({
         let p = Arc::clone(&progress);
         move || {
@@ -192,7 +192,9 @@ pub fn run(args: BackupArgs) -> Result<()> {
         config.backup_name
     ));
 
-    run_backup(config, progress).context("backup failed")
+    let result = run_backup(config, progress);
+    pump.finish();
+    result.context("backup failed")
 }
 
 fn default_name(source: &std::path::Path) -> String {
@@ -257,13 +259,13 @@ fn resolve_partition_filter(source: &std::path::Path, list: &str) -> Result<Vec<
 /// Background thread that prints progress + log messages to stderr.
 /// Runs until the worker sets `finished = true`. Drains
 /// `log_messages` so each line surfaces exactly once.
-fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
+fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) -> crate::cli::status::LogPump {
     use std::time::Duration;
-    std::thread::spawn(move || {
+    crate::cli::status::LogPump::spawn(move |stop| {
         let mut last_op = String::new();
         let mut last_pct: i32 = -1;
         loop {
-            std::thread::sleep(Duration::from_millis(200));
+            let stopping = stop.wait(Duration::from_millis(200));
             let snapshot = match progress.lock() {
                 Ok(mut p) => {
                     let drained: Vec<crate::backup::LogMessage> =
@@ -301,11 +303,11 @@ fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
                     last_pct = pct;
                 }
             }
-            if finished {
+            if finished || stopping {
                 return;
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

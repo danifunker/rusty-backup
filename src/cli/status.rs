@@ -108,6 +108,40 @@ fn line(s: &Sample, rate: &RateTracker, elapsed: Duration) -> String {
     out
 }
 
+/// The stop signal a [`LogPump`] body polls instead of sleeping.
+pub struct PumpStop(std::sync::mpsc::Receiver<()>);
+
+impl PumpStop {
+    /// Wait up to `interval`; true once the verb has finished, so this pass is the last.
+    pub fn wait(&self, interval: std::time::Duration) -> bool {
+        !matches!(
+            self.0.recv_timeout(interval),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+}
+
+/// A thread printing a verb's log; [`Self::finish`] waits for its last lines before the exit.
+pub struct LogPump {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl LogPump {
+    pub fn spawn(body: impl FnOnce(PumpStop) + Send + 'static) -> Self {
+        let (stop, rx) = std::sync::mpsc::channel();
+        LogPump {
+            stop,
+            thread: std::thread::spawn(move || body(PumpStop(rx))),
+        }
+    }
+
+    pub fn finish(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
