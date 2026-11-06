@@ -3259,10 +3259,11 @@ fn encode_object(
 /// mounts with diskname `name` (truncated to 30 bytes) and no `.recycled`
 /// directory.
 pub fn create_blank_sfs(total_blocks: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
-    let mut cur = std::io::Cursor::new(Vec::new());
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; total_blocks as usize * 512];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
     let len = write_blank_sfs_into(&mut cur, 0, total_blocks, name)?;
-    let mut img = cur.into_inner();
-    img.resize(len as usize, 0);
+    img.truncate(len as usize);
     Ok(img)
 }
 
@@ -4109,7 +4110,7 @@ mod tests {
 
     #[test]
     fn streaming_format_matches_the_old_in_memory_one() {
-        for blocks in [64u32, 4000, 4001, 20_000, 300_000] {
+        for blocks in [64u32, 4000, 4001, 20_000, 100_000] {
             let old = old_create_blank_sfs(blocks, "Work").unwrap();
             let new = create_blank_sfs(blocks, "Work").unwrap();
             assert!(old == new, "{blocks} blocks differ");

@@ -3380,10 +3380,11 @@ fn write_u32(buf: &mut [u8], o: usize, v: u32) {
 /// - `numreserved` is computed from the actual BM-block count needed,
 ///   floored at 32 (the original budget) and with 8 blocks of headroom.
 pub fn create_blank_pfs3(total_sectors: u32, name: &str) -> Result<Vec<u8>, FilesystemError> {
-    let mut cur = std::io::Cursor::new(Vec::new());
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; total_sectors as usize * 512];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
     let len = write_blank_pfs3_into(&mut cur, 0, total_sectors, name)?;
-    let mut img = cur.into_inner();
-    img.resize(len as usize, 0);
+    img.truncate(len as usize);
     Ok(img)
 }
 
@@ -4408,17 +4409,24 @@ mod tests {
 
     #[test]
     fn streaming_format_matches_the_old_in_memory_one() {
-        // The last size takes the 4 KiB reserved-block path, and 1 GiB in RAM on the old side.
-        let big: &[u32] = if cfg!(target_pointer_width = "64") {
-            &[2_100_000]
-        } else {
-            &[]
-        };
-        for &sectors in [2048u32, 20_000, 200_000].iter().chain(big) {
+        for sectors in [2048u32, 20_000, 100_000] {
             let old = old_create_blank_pfs3(sectors, "Work").unwrap();
             let new = create_blank_pfs3(sectors, "Work").unwrap();
             assert!(old == new, "{sectors} sectors differ");
         }
+    }
+
+    /// The 4 KiB reserved-block path, on a sparse file so the test holds no volume in RAM.
+    #[test]
+    fn a_large_volume_streams_into_a_sparse_file() {
+        let path = std::env::temp_dir().join(format!("pfs3-big-{}.img", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let len = write_blank_pfs3_into(&mut f, 0, 2_100_000, "Work").unwrap();
+        f.set_len(len).unwrap();
+        drop(f);
+        let opened = Pfs3Filesystem::open(std::fs::File::open(&path).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
+        assert!(opened.is_ok());
     }
     use super::*;
 

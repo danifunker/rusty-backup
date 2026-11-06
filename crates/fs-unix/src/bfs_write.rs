@@ -1451,10 +1451,11 @@ pub fn create_blank_bfs(
     name: &str,
     endian: BfsEndian,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let mut cur = std::io::Cursor::new(Vec::new());
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
     let len = write_blank_bfs_into(&mut cur, 0, size_bytes, block_size, name, endian)?;
-    let mut img = cur.into_inner();
-    img.resize(len as usize, 0);
+    img.truncate(len as usize);
     Ok(img)
 }
 

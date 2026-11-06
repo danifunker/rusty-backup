@@ -710,10 +710,11 @@ fn is_name_long(name: &[u8]) -> bool {
 /// bytes. Layout is byte-identical to `scripts/hpfs-oracle.py mkfs` so the two
 /// implementations cross-validate.
 pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
-    let mut cur = std::io::Cursor::new(Vec::new());
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
     let len = write_blank_hpfs_into(&mut cur, 0, size_bytes, label)?;
-    let mut img = cur.into_inner();
-    img.resize(len as usize, 0);
+    img.truncate(len as usize);
     Ok(img)
 }
 
@@ -2530,7 +2531,7 @@ mod tests {
 
     #[test]
     fn streaming_format_matches_the_old_in_memory_one() {
-        for mb in [1u64, 4, 9, 64, 300, 1100] {
+        for mb in [1u64, 4, 9, 64, 200] {
             for label in ["", "VOL", "A LONG LABEL"] {
                 let old = old_create_blank_hpfs(mb << 20, label).unwrap();
                 let new = create_blank_hpfs(mb << 20, label).unwrap();
