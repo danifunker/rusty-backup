@@ -118,7 +118,10 @@ mounts. Mac OS 9 takes 65536 without complaint, so testing only there hides it.
 65024 is the largest multiple of 512 below 65536, and 65535 of those is the
 "4,063 MB" period sources give for System 7.5. A 4063 MB volume from Build Disk
 mounts there with the bundled driver, the Finder writes to it, and Disk First Aid
-calls it OK (`docs/evidence/dfa-system755-quadra-hfs-4gb.png`).
+calls it OK (`docs/evidence/dfa-system755-quadra-hfs-4gb.png`). The same disk passes
+on Mac OS 8.1 on the Quadra, booted from a Build Disk output with the bundled driver
+(`dfa-macos81-quadra-hfs-4gb.png`), and on Mac OS 9.2.2 on QEMU `mac99` behind OS 9's
+own ATA drivers (`dfa-macos9-mac99-hfs-4gb.png`).
 
 ### R-083 — AFFS fsck frees a live bitmap extension block {#r-083}
 

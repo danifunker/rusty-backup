@@ -811,7 +811,7 @@ On restore the EBR chain for logical partitions is rebuilt, like Clonezilla's ow
   partitions + alt MDB). Useful when a classic-HFS volume runs out of
   16-bit block addresses. Classic HFS reaches 4063 MB here; past 2 GB it needs
   System 7.5 or later. A full-size volume passes Disk First Aid on System 7.5.5
-  on a Quadra 800 under QEMU.
+  and Mac OS 8.1 on a Quadra 800 and on Mac OS 9.2.2, all under QEMU.
 - **SGI EFS / XFS**: EFS is fully read/write/resize. XFS gained a full
   edit + repair surface (R1-R8 repair pipeline; oracle-validated against
   `xfs_repair`) on the v4 format. Open XFS holes (multi-block leaf/node
