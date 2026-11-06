@@ -701,7 +701,7 @@ impl Target for BackupTarget {
 /// Probes: `backup` (one is loaded), `partitions`, `error` (why Start is refused, empty when it is
 /// not), `load_error`, `result` (`ok`, the failure, or empty), `output` (the restored image equals
 /// the image backed up), `log` (every line so far), `modes`, `custom_mib`, `alignment`,
-/// `expand_mib`, `expand_cap`, `write_superfloppy`, `write_request`.
+/// `expand_mib`, `expand_cap`, `caveats`, `write_superfloppy`, `write_request`.
 struct RestoreTarget {
     ctl: rusty_backup::controller::restore::RestoreController,
     dir: tempfile::TempDir,
@@ -734,12 +734,29 @@ impl RestoreTarget {
 
     /// A zstd backup of a blank FAT image, made by the Backup controller.
     fn make_backup(&self) -> Result<PathBuf, String> {
+        let bytes =
+            fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).map_err(|e| e.to_string())?;
+        self.backup_of(bytes)
+    }
+
+    /// A backup of a 16 MiB MBR disk with one 4 MiB FAT16 partition, which can change size.
+    fn make_mbr_backup(&self) -> Result<PathBuf, String> {
+        let vol = fs_pc::fat::create_blank_fat(4 << 20, Some("T")).map_err(|e| e.to_string())?;
+        let mut bytes = vec![0u8; 16 << 20];
+        bytes[2048 * 512..2048 * 512 + vol.len()].copy_from_slice(&vol);
+        bytes[0x1BE + 4] = 0x06;
+        bytes[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
+        bytes[0x1BE + 12..0x1BE + 16].copy_from_slice(&((vol.len() / 512) as u32).to_le_bytes());
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+        self.backup_of(bytes)
+    }
+
+    fn backup_of(&self, bytes: Vec<u8>) -> Result<PathBuf, String> {
         use rusty_backup::controller::backup::{
             BackupAction, BackupController, BackupServices, JobRegistry, NoNotify,
         };
         let img = self.dir.path().join("vol.img");
-        let bytes =
-            fs_pc::fat::create_blank_fat(2 * 1024 * 1024, Some("T")).map_err(|e| e.to_string())?;
         std::fs::write(&img, bytes).map_err(|e| e.to_string())?;
         let mut b = BackupController::new(BackupServices {
             jobs: JobRegistry::new(),
@@ -772,6 +789,7 @@ impl Target for RestoreTarget {
             "OpenBackup" => {
                 let path = match arg_str(arg)? {
                     "$backup" => self.make_backup()?,
+                    "$mbr_backup" => self.make_mbr_backup()?,
                     "$empty" => {
                         let p = self.dir.path().join("empty");
                         std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
@@ -905,6 +923,14 @@ impl Target for RestoreTarget {
             "alignment" => Value::Integer(self.ctl.alignment().1 as i64),
             "expand_mib" => Value::Integer(self.ctl.expand().free_mib as i64),
             "expand_cap" => Value::Integer(self.ctl.expand_cap_mib() as i64),
+            "caveats" => Value::String(
+                self.ctl
+                    .size_caveats()
+                    .iter()
+                    .map(|c| c.line())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
             "write_superfloppy" => {
                 Value::String(self.ctl.write_image_superfloppy().unwrap_or("").to_string())
             }

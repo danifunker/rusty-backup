@@ -1969,7 +1969,7 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 **Options**
 
 - `--target-size` — Target size in bytes (defaults to the original disk size from the backup metadata)
-- `--size` — Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set
+- `--size` — Per-partition size policy: `original`, `minimum` or `fill`. Defaults to `original`, or `[restore] size` from the config file when set
 - `--alignment` — Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set
 - `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
 - `--yes` — Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file

@@ -130,6 +130,29 @@ fn is_cancelled(progress: &Arc<Mutex<RestoreProgress>>) -> bool {
     progress.lock().map(|p| p.cancel_requested).unwrap_or(false)
 }
 
+/// Rebuild an HFS volume `size` is past the reach of; every restore path runs this before its resize.
+pub(crate) fn rebuild_outgrown_hfs(
+    target: &mut SectorAlignedWriter,
+    offset: u64,
+    size: u64,
+    target_path: &std::path::Path,
+    target_is_device: bool,
+    progress: &Arc<Mutex<RestoreProgress>>,
+) -> Result<()> {
+    let near = target_path
+        .parent()
+        .filter(|dir| !target_is_device && dir.is_dir());
+    crate::fs::hfs_rebuild::rebuild_outgrown_hfs(
+        target,
+        offset,
+        size,
+        near,
+        &|| is_cancelled(progress),
+        &mut |m| log(progress, LogLevel::Info, m),
+    )?;
+    Ok(())
+}
+
 fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, total: u64) {
     if let Ok(mut p) = progress.lock() {
         p.current_bytes = current;
@@ -1127,6 +1150,17 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         let part_offset = ov.effective_start_lba() * 512;
         let export_size = ov.export_size;
 
+        if !pm.defragmented_clone {
+            rebuild_outgrown_hfs(
+                &mut target,
+                part_offset,
+                export_size,
+                &config.target_path,
+                config.target_is_device,
+                &progress,
+            )?;
+        }
+
         // Get direct access to the File for filesystem operations (avoids SectorAlignedWriter overhead)
         let inner_file = target
             .inner_mut()
@@ -1982,6 +2016,18 @@ fn run_single_file_chd_restore_resize(
 
     // Step 3: filesystem resize + hidden-sector patches per partition.
     set_operation(&progress, "Finalizing filesystems...");
+    for pm in &metadata.partitions {
+        if let Some(ov) = overrides.iter().find(|o| o.index == pm.index) {
+            rebuild_outgrown_hfs(
+                &mut target,
+                get_partition_lba(pm) * 512,
+                ov.export_size,
+                &config.target_path,
+                config.target_is_device,
+                &progress,
+            )?;
+        }
+    }
     {
         let inner_file = target
             .inner_mut()
@@ -2509,6 +2555,15 @@ fn run_clonezilla_restore(
 
         let part_offset = ov.effective_start_lba() * 512;
         let export_size = ov.export_size;
+
+        rebuild_outgrown_hfs(
+            &mut target,
+            part_offset,
+            export_size,
+            &config.target_path,
+            config.target_is_device,
+            &progress,
+        )?;
 
         let inner_file = target
             .inner_mut()

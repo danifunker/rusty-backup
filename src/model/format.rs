@@ -589,6 +589,20 @@ pub fn format_into<W: Write + Seek>(
     kind: FsKind,
     opts: &FormatOptions,
 ) -> Result<Formatted> {
+    let mut made = format_volume(w, size, kind, opts)?;
+    if let Some(facts) = crate::model::fs_limits::VolumeFacts::of_kind(kind, size, opts) {
+        let caveats = crate::model::fs_limits::caveats(&facts, size);
+        made.notes.extend(caveats.into_iter().map(|c| c.text));
+    }
+    Ok(made)
+}
+
+fn format_volume<W: Write + Seek>(
+    w: &mut W,
+    size: u64,
+    kind: FsKind,
+    opts: &FormatOptions,
+) -> Result<Formatted> {
     check_options(kind, opts)?;
     let label = opts.label.as_str();
     let done = |len: u64, what: String| Formatted {
@@ -607,9 +621,7 @@ pub fn format_into<W: Write + Seek>(
             let ext = opts.extents_bytes.unwrap_or(ext);
             let len = fs_mac::hfs::write_blank_hfs_sized_into(w, 0, size, bs, label, ext, cat)
                 .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
-            let mut made = done(len, format!("HFS, block size {bs}, volume {label:?}"));
-            made.notes.extend(mac_size_note(size));
-            Ok(made)
+            Ok(done(len, format!("HFS, block size {bs}, volume {label:?}")))
         }
         FsKind::Hfsplus => {
             let bs = match opts.block_size {
@@ -648,9 +660,7 @@ pub fn format_into<W: Write + Seek>(
                 .block_size
                 .unwrap_or_else(|| fs_mac::hfv::suggest_block_size(size));
             let len = fs_mac::hfs::write_blank_hfs_into(w, 0, size, bs, label)?;
-            let mut made = done(len, format!("HFV, block size {bs}, volume {label:?}"));
-            made.notes.extend(mac_size_note(size));
-            Ok(made)
+            Ok(done(len, format!("HFV, block size {bs}, volume {label:?}")))
         }
         FsKind::Fat => {
             let layout = fs_pc::fat::compute_fat_blank_layout_forced(size, 512, opts.fat32)?;
@@ -949,10 +959,6 @@ fn minix<W: Write + Seek>(
         summary: format!("Minix {version:?}"),
         notes: Vec::new(),
     })
-}
-
-fn mac_size_note(size: u64) -> Option<String> {
-    fs_mac::hfs::mac_os_size_note(size).map(str::to_string)
 }
 
 fn hfs_block_size(explicit: Option<u32>, size: u64) -> Result<u32> {

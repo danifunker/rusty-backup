@@ -30,6 +30,7 @@ use fs_pc::fat;
 use fs_unix::ext;
 pub mod hfs_boot;
 pub mod hfs_clone;
+pub mod hfs_rebuild;
 use fs_8bit::lif;
 use fs_hpfs::hpfs;
 use fs_mac::hfsplus;

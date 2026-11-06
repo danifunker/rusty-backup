@@ -513,58 +513,12 @@ where
     R: std::io::Read + std::io::Seek + Send,
     T: Write + std::io::Seek,
 {
-    if p.size_bytes > fs_mac::hfs::HFS_MAX_VOLUME_BYTES {
-        anyhow::bail!(
-            "classic HFS stops at {}; this row is {}",
-            disk_core::display::format_size(fs_mac::hfs::HFS_MAX_VOLUME_BYTES),
-            disk_core::display::format_size(p.size_bytes)
-        );
-    }
-    let block_size = fs_mac::hfs::pick_block_size(p.size_bytes);
-    log_cb(&format!(
-        "HFS can't grow to {} at its block size: rebuilding it at {} KiB blocks",
-        disk_core::display::format_size(p.size_bytes),
-        block_size / 1024
-    ));
-    if let Some(note) = fs_mac::hfs::mac_os_size_note(p.size_bytes) {
-        log_cb(note);
-    }
     // A device has no folder to hold the volume, and a device build must not format in place.
-    let mut temp = match target_path.parent().filter(|d| d.is_dir()) {
-        Some(dir) if !crate::os::is_device_path(target_path) => tempfile::tempfile_in(dir),
-        _ => tempfile::tempfile(),
-    }
-    .context("creating a temporary file for the rebuilt volume")?;
-
-    let mut source = fs_mac::hfs::HfsFilesystem::open(&mut *src, from)
-        .map_err(|e| anyhow::anyhow!("opening the donor's HFS volume: {e}"))?;
-    let inherited: std::collections::HashSet<String> = source
-        .fsck()
-        .map(|r| r.errors.into_iter().map(|e| e.code).collect())
-        .unwrap_or_default();
-    let name = source.volume_summary().volume_name;
-    let (_, report) =
-        fs_mac::hfs_clone::clone_hfs_at(&mut source, &mut temp, 0, p.size_bytes, block_size, &name)
-            .map_err(|e| anyhow::anyhow!("cloning the HFS volume: {e}"))?;
-    // A block size that doesn't divide the row leaves a remainder; the alternate MDB follows it.
-    temp.set_len(p.size_bytes)?;
-    fs_mac::hfs::fit_hfs_volume_to_partition(&mut temp, 0, p.size_bytes, log_cb)?;
-    let result = fs_mac::hfs::HfsFilesystem::open(&mut temp, 0)
-        .and_then(|mut fs| fs.fsck())
-        .map_err(|e| anyhow::anyhow!("checking the rebuilt volume: {e}"))?;
-    let fresh: Vec<&str> = result
-        .errors
-        .iter()
-        .filter(|e| !inherited.contains(&e.code))
-        .map(|e| e.code.as_str())
-        .collect();
-    if !fresh.is_empty() {
-        anyhow::bail!("the rebuilt HFS volume fails its check: {fresh:?}");
-    }
-    log_cb(&format!(
-        "Copied {} file(s) and {} folder(s) into the rebuilt volume",
-        report.files_copied, report.dirs_copied
-    ));
+    let near = target_path
+        .parent()
+        .filter(|d| d.is_dir() && !crate::os::is_device_path(target_path));
+    let mut temp =
+        crate::fs::hfs_rebuild::rebuild_hfs_volume(src, from, p.size_bytes, near, log_cb)?;
     copy_range(&mut temp, 0, target, p.start_byte(), p.size_bytes, cancel)
 }
 

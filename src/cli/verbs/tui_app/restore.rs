@@ -25,8 +25,9 @@ use super::{
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::restore::{
-    format_size, purpose, AlignmentChoice, HostRequest, JobRegistry, LayoutFit, NewTableType,
-    NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
+    format_size, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry, LayoutFit,
+    NewTableType, NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices,
+    SizeMode, TargetSlot,
 };
 use crate::controller::{Controller as _, Effect, PickSpec};
 
@@ -1470,6 +1471,13 @@ impl App {
             }
         }
         lines.push(Line::raw(""));
+        for c in r.ctl.size_caveats() {
+            let style = match c.caveat.level {
+                CaveatLevel::Info => pal.dim(),
+                CaveatLevel::Warning | CaveatLevel::Blocked => pal.warn(),
+            };
+            lines.push(Line::styled(format!("  {}", c.line()), style));
+        }
         if let Some(last) = r.log.last() {
             lines.push(Line::styled(format!("  {last}"), pal.dim()));
         }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::{HostRequest, RestoreController, RestoreMode, SizeMode, SourcePartition, WriteOpen};
 use crate::backup::metadata::BackupMetadata;
+use crate::model::fs_limits::VolumeFacts;
 use crate::model::job::{Job, Snapshot, Status};
 use crate::model::restore_plan::LoadedBackup;
 use disk_core::display::format_size;
@@ -28,6 +29,9 @@ pub(super) struct SourceState {
     /// The partition image for a single-partition or new-disk restore.
     image: Option<Prepared>,
     decode: Option<(PathBuf, Job<Prepared>)>,
+    /// What the source image holds, read by `facts_probe`.
+    pub image_facts: Option<VolumeFacts>,
+    facts_probe: Option<Job<Option<VolumeFacts>>>,
     pub source_partition: Option<usize>,
     /// Write Image File's source as the disk writer takes it (size 0 when unreadable).
     pub write: Option<WriteOpen>,
@@ -60,7 +64,10 @@ impl SourceState {
 
     /// A load, decode or probe runs.
     pub fn busy(&self) -> bool {
-        self.load.is_some() || self.decode.is_some() || self.probe.is_some()
+        self.load.is_some()
+            || self.decode.is_some()
+            || self.probe.is_some()
+            || self.facts_probe.is_some()
     }
 
     /// A switch into Custom starts at the original size, as the GUI's size cell did.
@@ -212,6 +219,8 @@ impl RestoreController {
 
     pub(super) fn open_backup(&mut self, path: PathBuf) {
         self.src.image = None;
+        self.src.image_facts = None;
+        self.src.facts_probe = None;
         self.src.decode = None;
         if self.src.folder.as_deref() == Some(path.as_path())
             && (self.src.loaded.is_some()
@@ -270,10 +279,12 @@ impl RestoreController {
         // A partition image is written as a flat sector stream, so wrapped images are decoded.
         if !crate::model::image_prep::needs_decoding(path.as_path(), true) {
             self.src.decode = None;
+            self.probe_image_facts(path.clone());
             self.src.image = Some((path, None));
             return;
         }
         self.src.image = None;
+        self.src.image_facts = None;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -306,6 +317,25 @@ impl RestoreController {
                 (original, None)
             }
         });
+        if let Some(path) = self.src.image_path().map(Path::to_path_buf) {
+            self.probe_image_facts(path);
+        }
+    }
+
+    fn probe_image_facts(&mut self, path: PathBuf) {
+        self.src.image_facts = None;
+        let job = self.spawn("Reading the image", move |_| {
+            Ok(crate::model::restore_plan::image_facts(path.as_path()))
+        });
+        self.src.facts_probe = Some(job);
+    }
+
+    pub(super) fn poll_image_facts(&mut self) {
+        let Some(done) = self.src.facts_probe.as_ref().and_then(finished) else {
+            return;
+        };
+        self.src.facts_probe = None;
+        self.src.image_facts = done.ok().flatten();
     }
 
     pub(super) fn open_dropped(&mut self, path: PathBuf) {

@@ -34,9 +34,11 @@ use crate::model::restore_plan::LoadedBackup;
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::disk_write_plan::WriteOpen;
+pub use crate::model::fs_limits::{Caveat, CaveatLevel};
 pub use crate::model::job::{JobRegistry, NoNotify, Snapshot};
 pub use crate::model::restore_plan::{
-    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, PlanSegment, SizeRow, ALIGN_SECTORS_MAX,
+    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, PlanSegment, RowCaveat, SizeRow,
+    ALIGN_SECTORS_MAX,
 };
 pub use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 pub use crate::restore::single::NewTableType;
@@ -404,7 +406,14 @@ impl RestoreController {
                 return Err("This mode starts from its own window.".into());
             }
         }
-        Ok(())
+        match self
+            .size_caveats()
+            .into_iter()
+            .find(|c| c.caveat.level == CaveatLevel::Blocked)
+        {
+            Some(c) => Err(c.caveat.text),
+            None => Ok(()),
+        }
     }
 
     /// The Restore button is enabled.
@@ -517,6 +526,7 @@ impl Controller for RestoreController {
     fn tick(&mut self) -> Vec<Effect> {
         self.poll_load();
         self.poll_decode();
+        self.poll_image_facts();
         self.poll_write_probe();
         self.poll_scan();
         self.poll_remote();

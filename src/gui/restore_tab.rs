@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
-    format_size, AlignmentChoice, HostRequest, LayoutFit, NewTableType, RestoreAction,
+    format_size, AlignmentChoice, CaveatLevel, HostRequest, LayoutFit, NewTableType, RestoreAction,
     RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
 };
 use rusty_backup::controller::{Controller as _, Effect};
@@ -754,8 +754,22 @@ impl RestoreTab {
         .show(ui);
     }
 
+    /// What each volume asks of the machine reading it, from the shared limits table.
+    fn show_caveats(&self, ui: &mut egui::Ui) {
+        for c in self.ctl.size_caveats() {
+            let color = match c.caveat.level {
+                CaveatLevel::Info => super::theme::muted(ui.visuals()),
+                CaveatLevel::Warning => super::theme::warning(ui.visuals()),
+                CaveatLevel::Blocked => super::theme::danger(ui.visuals()),
+            };
+            ui.colored_label(color, c.line());
+        }
+    }
+
     fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
-        ui.add_space(16.0);
+        ui.add_space(8.0);
+        self.show_caveats(ui);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             if !self.ctl.restore_running() && ctx.busy_elsewhere.is_none() {
                 if ui

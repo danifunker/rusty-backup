@@ -857,6 +857,33 @@ impl BuildDiskController {
         v
     }
 
+    /// What each volume being formatted asks of the machine reading it (model::fs_limits).
+    fn format_caveats(&self) -> Vec<String> {
+        use crate::model::fs_limits::{caveats, line, VolumeFacts};
+        let lines = |f: &RowFormat, size: u64| -> Vec<String> {
+            VolumeFacts::of_kind(f.kind, size, &f.opts)
+                .map(|facts| caveats(&facts, size).iter().map(line).collect())
+                .unwrap_or_default()
+        };
+        match self.kind {
+            DiskKind::Volume => self
+                .disk_size()
+                .map(|size| lines(&self.volume, size))
+                .unwrap_or_default(),
+            DiskKind::Partitioned => {
+                let placed = self.builder.plan().unwrap_or_default();
+                let formats = self.builder.formats();
+                placed
+                    .iter()
+                    .zip(formats.iter())
+                    .filter_map(|(p, f)| f.as_ref().map(|f| lines(f, p.size_bytes)))
+                    .flatten()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Warnings shown on Review that do not block the build.
     pub fn warnings(&self) -> Vec<String> {
         let mut v = Vec::new();
@@ -865,6 +892,7 @@ impl BuildDiskController {
             b.validate();
             v.extend(b.errors.into_iter().filter(|e| e.starts_with("Warning:")));
         }
+        v.extend(self.format_caveats());
         for t in self.handlers_missing() {
             v.push(format!(
                 "Warning: {t} has no handler in the Kickstart ROM and none was added; the \

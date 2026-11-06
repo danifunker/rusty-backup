@@ -310,3 +310,113 @@ fn a_refreshed_list_drops_the_old_disks_scan() {
     ctl.reconcile_devices(&[]);
     assert!(ctl.device(TargetSlot::SinglePartition).is_none());
 }
+
+/// A 16 MiB HFS volume at 512-byte blocks on an MBR disk, backed up through the Backup controller.
+fn hfs_backup(dir: &Path) -> PathBuf {
+    use crate::controller::backup::{BackupAction, BackupController, BackupServices};
+    const MIB: u64 = 1024 * 1024;
+    let img = dir.join("hfs.img");
+    let mut disk = std::io::Cursor::new(vec![0u8; (17 * MIB) as usize]);
+    {
+        let mut part = crate::model::format::Window::new(&mut disk, MIB, 16 * MIB);
+        fs_mac::hfs::write_blank_hfs_into(&mut part, 0, 16 * MIB, 512, "Mac").unwrap();
+    }
+    let mut raw = disk.into_inner();
+    raw[446 + 4] = 0xAF;
+    raw[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    raw[446 + 12..446 + 16].copy_from_slice(&((16 * MIB / 512) as u32).to_le_bytes());
+    raw[510] = 0x55;
+    raw[511] = 0xAA;
+    std::fs::write(&img, raw).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut b = BackupController::new(BackupServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(NoNotify),
+    });
+    b.apply(BackupAction::OpenImage {
+        path: img,
+        rename: false,
+    });
+    b.wait_idle();
+    b.apply(BackupAction::SetDestination(Some(out.clone())));
+    b.apply(BackupAction::SetName("b".into()));
+    b.apply(BackupAction::SetResize(false));
+    b.apply(BackupAction::Start(None));
+    b.wait_finished();
+    assert_eq!(b.last_result(), Some(&Ok(())));
+    out.join("b")
+}
+
+/// The first switch into Custom only seeds the original size, so the size goes in second.
+fn custom_size(ctl: &mut RestoreController, mib: u32) {
+    let index = ctl.size_rows()[0].index;
+    for _ in 0..2 {
+        ctl.apply(RestoreAction::SetPartitionSize {
+            index,
+            mode: SizeMode::Custom,
+            custom_mib: mib,
+        });
+    }
+}
+
+#[test]
+fn caveats_follow_the_size_and_a_volume_past_its_limit_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = hfs_backup(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    let target = dir.path().join("r.img");
+    ctl.apply(RestoreAction::SetTargetIsDevice(
+        TargetSlot::FullDisk,
+        false,
+    ));
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(target),
+    ));
+    assert!(ctl.size_caveats().is_empty(), "nothing to say at 16 MiB");
+    assert!(ctl.validate().is_ok());
+
+    custom_size(&mut ctl, 3 * 1024);
+    let lines: Vec<String> = ctl.size_caveats().iter().map(|c| c.line()).collect();
+    assert!(lines.iter().any(|l| l.contains("rebuilt")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("System 7.5")), "{lines:?}");
+    assert!(lines[0].starts_with("Partition 1: "), "{lines:?}");
+    assert!(ctl.validate().is_ok());
+
+    custom_size(&mut ctl, 5 * 1024);
+    assert_eq!(ctl.size_caveats()[0].caveat.level, CaveatLevel::Blocked);
+    assert!(ctl.validate().unwrap_err().contains("Classic HFS stops"));
+    assert!(!ctl.can_start());
+}
+
+#[test]
+fn a_single_partition_restore_rebuilds_an_outgrown_hfs() {
+    use crate::model::restore_plan::{single_partition_config, PartitionSource};
+    use crate::restore::RestoreProgress;
+    use disk_core::filesystem::Filesystem as _;
+    const MIB: u64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hfs.img");
+    let mut file = std::fs::File::create(&source).unwrap();
+    fs_mac::hfs::write_blank_hfs_into(&mut file, 0, 16 * MIB, 512, "Mac").unwrap();
+    file.set_len(16 * MIB).unwrap();
+    let target = dir.path().join("disk.img");
+    std::fs::File::create(&target)
+        .unwrap()
+        .set_len(64 * MIB)
+        .unwrap();
+
+    let mut config =
+        single_partition_config(&PartitionSource::Image(&source), &target, 2048, 48 * MIB);
+    config.target_is_device = false;
+    let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+    crate::restore::single::run_single_partition_restore(config, progress).unwrap();
+
+    let mut disk = std::fs::File::open(&target).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(&mut disk, MIB).unwrap();
+    assert_eq!(fs.volume_summary().volume_name, "Mac");
+    assert!(fs.fsck().unwrap().errors.is_empty());
+    assert!(fs.total_size() > 40 * MIB, "{}", fs.total_size());
+}

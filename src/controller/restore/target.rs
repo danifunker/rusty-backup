@@ -6,7 +6,7 @@ use std::path::Path;
 use super::source::finished;
 use super::{
     AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType, Picked, PlanSegment,
-    RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
+    RestoreController, RestoreMode, RowCaveat, SizeRow, Target, TargetPartition, TargetSlot,
 };
 use crate::device::{DeviceIdentity, DiskDevice};
 use crate::model::job::{Job, Snapshot};
@@ -233,6 +233,67 @@ impl RestoreController {
             self.partition_sizes(is_device).as_slice(),
             target,
         ))
+    }
+
+    /// What each volume asks of the machine reading it, at the sizes chosen; worst first per row.
+    pub fn size_caveats(&self) -> Vec<RowCaveat> {
+        use crate::model::restore_plan::{plan_caveats, volume_caveats};
+        match self.mode {
+            RestoreMode::FullDisk => self.loaded().map_or_else(Vec::new, |loaded| {
+                let is_device = self.targets.full.is_device;
+                plan_caveats(
+                    loaded,
+                    &self.resolved_alignment(),
+                    self.partition_sizes(is_device).as_slice(),
+                    self.target_size(),
+                )
+            }),
+            RestoreMode::SinglePartition | RestoreMode::NewDisk => {
+                let facts = if self.src.has_image() {
+                    self.src.image_facts
+                } else {
+                    let index = self.src.source_partition;
+                    self.size_rows()
+                        .iter()
+                        .find(|r| Some(r.index) == index)
+                        .and_then(|r| r.facts)
+                };
+                match self.partition_target_size() {
+                    Some(size) => volume_caveats(facts, size),
+                    None => Vec::new(),
+                }
+            }
+            RestoreMode::WriteImage => Vec::new(),
+        }
+    }
+
+    /// The partition a single-partition or new-disk restore fills, once its target is known.
+    fn partition_target_size(&self) -> Option<u64> {
+        if self.mode == RestoreMode::SinglePartition {
+            let index = self.targets.sp_part?;
+            let parts = &self.targets.sp_parts;
+            return parts
+                .iter()
+                .find(|p| p.index == index)
+                .map(|p| p.size_bytes);
+        }
+        let source = self.partition_source()?;
+        let t = &self.targets.new_disk;
+        let device_size = t.device.as_ref().map(|p| p.device.size_bytes);
+        let path = t
+            .device
+            .as_ref()
+            .map(|p| p.device.path.clone())
+            .or(t.image.clone())?;
+        let config = crate::model::restore_plan::new_disk_config(
+            &source,
+            path.as_path(),
+            t.is_device,
+            device_size.filter(|_| t.is_device),
+            &self.targets.new_disk_choice,
+        );
+        let disk = config.new_disk.as_ref().map(|d| d.disk_size_bytes)?;
+        Some(disk.saturating_sub(config.target_offset_bytes))
     }
 
     pub(super) fn resolved_alignment(&self) -> crate::restore::RestoreAlignment {

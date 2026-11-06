@@ -537,6 +537,16 @@ pub fn run_single_partition_restore(
     let alt_header_fixup = !verbatim && !needs_resize && write_size != source_data_size;
     if needs_resize || alt_header_fixup {
         set_operation(&progress, "Resizing filesystem...");
+        if needs_resize {
+            super::rebuild_outgrown_hfs(
+                &mut target,
+                config.target_offset_bytes,
+                write_size,
+                &config.target_path,
+                config.target_is_device,
+                &progress,
+            )?;
+        }
         let inner_file = target
             .inner_mut()
             .context("failed to access device for resize")?;
