@@ -2285,7 +2285,7 @@ pub fn write_blank_efs_v1_into<W: Write + Seek>(
     let mut sector = vec![0u8; EFS_V1_BLOCKSIZE as usize];
     sb.write_into(&mut sector);
     sb.recompute_checksum(&mut sector);
-    put(u64::from(EFS_V1_SUPERBB) * EFS_V1_BLOCKSIZE, &sector)?;
+    put(EFS_V1_SUPERBB * EFS_V1_BLOCKSIZE, &sector)?;
 
     Ok(u64::from(total_blocks) * EFS_V1_BLOCKSIZE)
 }

@@ -1815,6 +1815,22 @@ pub fn create_blank_human68k(
     template: &Human68kFormatTemplate,
     target_size_bytes: u64,
 ) -> Result<Vec<u8>, FilesystemError> {
+    let mut img = vec![0u8; target_size_bytes as usize];
+    write_blank_human68k_into(
+        &mut std::io::Cursor::new(img.as_mut_slice()),
+        template,
+        target_size_bytes,
+    )?;
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_human68k`]: writes the reserved region and the FATs'
+/// reserved entries from position 0; the rest of the target must read as zero.
+pub fn write_blank_human68k_into<W: Write + Seek>(
+    w: &mut W,
+    template: &Human68kFormatTemplate,
+    target_size_bytes: u64,
+) -> Result<(), FilesystemError> {
     let bpb = &template.bpb;
     if bpb.fat_kind != FatKind::Fat16 {
         return Err(FilesystemError::InvalidData(
@@ -1864,8 +1880,6 @@ pub fn create_blank_human68k(
         )));
     }
 
-    let mut image = vec![0u8; target_size_bytes as usize];
-
     // Reserved region: copy the template verbatim (boot stub + OEM), then
     // re-patch the size fields of the BPB in the first 512 bytes.
     let mut reserved_region = template.reserved_region.clone();
@@ -1879,8 +1893,9 @@ pub fn create_blank_human68k(
     } else {
         patch_std_bpb(&mut reserved_region, new_total, new_spf as u16);
     }
-    let copy_len = reserved_region.len().min(image.len());
-    image[..copy_len].copy_from_slice(&reserved_region[..copy_len]);
+    let copy_len = (reserved_region.len() as u64).min(target_size_bytes) as usize;
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(&reserved_region[..copy_len])?;
 
     // FAT reserved entries in each FAT copy, honoring the table endianness.
     let entry0 = 0xFF00u16 | media as u16;
@@ -1891,12 +1906,13 @@ pub fn create_blank_human68k(
         (entry0.to_le_bytes(), entry1.to_le_bytes())
     };
     for i in 0..num_fats {
-        let fat_off = (reserved + i * new_spf) as usize * bps as usize;
-        image[fat_off..fat_off + 2].copy_from_slice(&e0);
-        image[fat_off + 2..fat_off + 4].copy_from_slice(&e1);
+        let fat_off = (reserved + i * new_spf) as u64 * bps as u64;
+        w.seek(SeekFrom::Start(fat_off))?;
+        w.write_all(&e0)?;
+        w.write_all(&e1)?;
     }
 
-    Ok(image)
+    Ok(())
 }
 
 #[cfg(test)]

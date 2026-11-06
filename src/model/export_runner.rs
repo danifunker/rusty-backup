@@ -641,11 +641,28 @@ fn run_per_partition_hfv(
         let name = source_fs.volume_summary().volume_name;
         let block_size = fs_mac::hfv::suggest_block_size(target_size);
 
-        let (bytes, report) =
-            fs_mac::hfv::clone_into_hfv(&mut source_fs, target_size, block_size, &name)
-                .map_err(|e| anyhow::anyhow!("partition-{} -> HFV: {e}", part.index))?;
-        std::fs::write(&dest_path, &bytes)
-            .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest_path.display()))?;
+        let mut out = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest_path)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dest_path.display()))?;
+        let cloned = fs_mac::hfv::clone_into_hfv(
+            &mut source_fs,
+            &mut out,
+            target_size,
+            block_size,
+            name.as_str(),
+        );
+        let (len, report) = match cloned {
+            Ok(done) => done,
+            Err(e) => {
+                drop(out);
+                let _ = std::fs::remove_file(&dest_path);
+                anyhow::bail!("partition-{} -> HFV: {e}", part.index);
+            }
+        };
 
         log(
             status,
@@ -654,7 +671,7 @@ fn run_per_partition_hfv(
                 part.index,
                 report.files_copied,
                 report.dirs_copied,
-                bytes.len() / (1024 * 1024),
+                len / (1024 * 1024),
             ),
         );
 

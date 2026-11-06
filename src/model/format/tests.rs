@@ -205,6 +205,10 @@ fn only_floppy_sized_formats_build_in_memory() {
             let mut cur = Cursor::new(Vec::new());
             largest = largest.max(format_into(&mut cur, 0, k, &opts).unwrap().len);
         }
-        assert!(largest <= IN_RAM_LIMIT, "{} builds {largest} bytes in RAM", k.id());
+        assert!(
+            largest <= IN_RAM_LIMIT,
+            "{} builds {largest} bytes in RAM",
+            k.id()
+        );
     }
 }

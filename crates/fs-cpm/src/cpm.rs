@@ -1058,7 +1058,7 @@ pub fn create_blank(dpb: Dpb) -> Vec<u8> {
 
 /// The length of a blank disk: its reserved tracks and data area.
 fn blank_size(dpb: &Dpb) -> u64 {
-    dpb.off as u64 * dpb.spt as u64 * 128 + dpb.data_bytes() as u64
+    dpb.off as u64 * dpb.spt as u64 * 128 + dpb.data_bytes()
 }
 
 /// The streaming form of [`create_blank`]: fills the disk with 0xE5 at `at_offset`, 64 KiB at a

@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-ghost"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "disk-core",
@@ -1868,7 +1868,7 @@ dependencies = [
  "fs-pc",
  "log",
  "tempfile",
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2532,14 +2532,14 @@ version = "0.1.0"
 
 [[package]]
 name = "fs-pc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "byteorder",
  "disk-core",
  "encoding_rs",
  "tempfile",
- "zstd 0.14.3",
+ "zstd 0.13.3",
 ]
 
 [[package]]

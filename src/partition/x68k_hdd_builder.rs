@@ -81,11 +81,12 @@
 //! `A:\BIN\SWITCH.X /HD` — SWITCH.X writes the Sharp boot sector at
 //! that point. One manual step, no donor HDD required.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use byteorder::{BigEndian, ByteOrder};
 
+use crate::model::format::Window;
 use crate::partition::x68k_ipl::{
     build_sasi_boot_block_with_stub_bytes, build_scsi_boot_block_with_stub_bytes,
     render_ipl_stub_bytes, IplStub, SASI_BOOT_BLOCK_BYTES, SCSI_BOOT_BLOCK_BYTES,
@@ -95,7 +96,7 @@ use disk_core::entry::{EntryType, FileEntry};
 use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
 };
-use fs_pc::fat::create_blank_fat_with_sector_size;
+use fs_pc::fat::{compute_fat_blank_layout_with_sector_size, write_blank_fat_metadata_to_sink};
 use fs_pc::human68k::Human68kFilesystem;
 use part_tables::x68k::{
     X68kPartitionTable, X68K_ENTRY_SIZE, X68K_FIRST_PARTITION_SECTOR, X68K_MAGIC,
@@ -317,216 +318,230 @@ pub fn build_x68k_hdd(
     let donor_tree: Option<Vec<DonorEntry>> = system_disk.map(read_donor_tree).transpose()?;
     let from_donor = donor_tree.is_some();
 
-    // Create + populate each partition body. Partition 0 gets the
-    // donor system tree (or seed files); partitions 1..N stay blank.
-    let mut partition_bodies: Vec<Vec<u8>> = Vec::with_capacity(partitions);
-    let mut total_files_written: usize = 0;
-    let mut total_dirs_written: usize = 0;
-    for idx in 0..partitions {
-        // Human68k volume labels are limited to 11 ASCII chars; tag
-        // each as RBHDD-N so the user can tell partitions apart in
-        // multi-partition layouts.
-        let label_buf = format!("RBHDD-{}", idx + 1);
-        let label = if partitions == 1 {
-            Some("RBHDD")
-        } else {
-            Some(label_buf.as_str())
-        };
-        // When we'll overlay a SCSI `--boot-sector-donor`, the donor's
-        // Sharp/KG BPB expects 1024-byte FAT sectors (real Sharp SCSI
-        // HDDs use 1024-B BPB sectors). Force the FAT layout to match
-        // so the donor's boot code reads our FAT at the right byte
-        // offsets after the BPB-patch step. Otherwise stick with the
-        // default 512-byte FAT BPB — it interops cleanly with the
-        // X68000 IPL ROM on any sector size, and our existing tests
-        // assume it.
-        let want_donor_overlay = !matches!(boot_sector_source, BootSectorSource::None);
-        let fat_bps: u32 = if matches!(variant, HddVariant::Scsi) && want_donor_overlay && idx == 0
-        {
-            1024
-        } else {
-            512
-        };
-        let mut body = create_blank_fat_with_sector_size(per_partition_bytes, fat_bps, label)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "create_blank_fat on partition {} body (bps={fat_bps}): {e}",
-                    idx + 1
-                )
-            })?;
-        if idx == 0 {
-            let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
-                .map_err(|e| anyhow::anyhow!("open partition 0 as Human68k: {e}"))?;
-            let (files, dirs) = if let Some(tree) = &donor_tree {
-                apply_donor_tree(&mut fs, tree)
-                    .map_err(|e| anyhow::anyhow!("apply donor tree to partition 0: {e}"))?
+    // Everything streams into the output file, which is removed if the build fails.
+    let mut out = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", out_path.display()))?;
+    out.set_len(total_bytes)
+        .map_err(|e| anyhow::anyhow!("size {}: {e}", out_path.display()))?;
+    let built = (|| -> anyhow::Result<BuildSummary> {
+        // Create + populate each partition body. Partition 0 gets the
+        // donor system tree (or seed files); partitions 1..N stay blank.
+        let mut total_files_written: usize = 0;
+        let mut total_dirs_written: usize = 0;
+        for idx in 0..partitions {
+            // Human68k volume labels are limited to 11 ASCII chars; tag
+            // each as RBHDD-N so the user can tell partitions apart in
+            // multi-partition layouts.
+            let label_buf = format!("RBHDD-{}", idx + 1);
+            let label = if partitions == 1 {
+                Some("RBHDD")
             } else {
-                seed_validation_files(&mut fs)
-                    .map_err(|e| anyhow::anyhow!("seed validation files in partition 0: {e}"))?;
-                (3, 0)
+                Some(label_buf.as_str())
             };
-            fs.sync_metadata()
-                .map_err(|e| anyhow::anyhow!("sync partition 0 metadata: {e}"))?;
-            total_files_written += files;
-            total_dirs_written += dirs;
-        } else {
-            // Partitions 1..N are formatted FAT12/16 but otherwise
-            // empty. We still open + sync to make sure the blank FS
-            // structures land correctly.
-            let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
-                .map_err(|e| anyhow::anyhow!("open partition {} as Human68k: {e}", idx + 1))?;
-            fs.sync_metadata()
-                .map_err(|e| anyhow::anyhow!("sync partition {} metadata: {e}", idx + 1))?;
+            // When we'll overlay a SCSI `--boot-sector-donor`, the donor's
+            // Sharp/KG BPB expects 1024-byte FAT sectors (real Sharp SCSI
+            // HDDs use 1024-B BPB sectors). Force the FAT layout to match
+            // so the donor's boot code reads our FAT at the right byte
+            // offsets after the BPB-patch step. Otherwise stick with the
+            // default 512-byte FAT BPB — it interops cleanly with the
+            // X68000 IPL ROM on any sector size, and our existing tests
+            // assume it.
+            let want_donor_overlay = !matches!(boot_sector_source, BootSectorSource::None);
+            let fat_bps: u32 =
+                if matches!(variant, HddVariant::Scsi) && want_donor_overlay && idx == 0 {
+                    1024
+                } else {
+                    512
+                };
+            let part_off = part_start_byte + (idx as u64) * per_partition_bytes;
+            let layout = compute_fat_blank_layout_with_sector_size(per_partition_bytes, fat_bps)
+                .and_then(|l| {
+                    let mut w = Window::new(&mut out, part_off, per_partition_bytes);
+                    write_blank_fat_metadata_to_sink(&mut w, &l, label).map(|()| l)
+                })
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "formatting FAT on partition {} (bps={fat_bps}): {e}",
+                        idx + 1
+                    )
+                })?;
+            let body = Window::new(&mut out, part_off, layout.image_size());
+            if idx == 0 {
+                let mut fs = Human68kFilesystem::open(body, 0)
+                    .map_err(|e| anyhow::anyhow!("open partition 0 as Human68k: {e}"))?;
+                let (files, dirs) = if let Some(tree) = &donor_tree {
+                    apply_donor_tree(&mut fs, tree)
+                        .map_err(|e| anyhow::anyhow!("apply donor tree to partition 0: {e}"))?
+                } else {
+                    seed_validation_files(&mut fs).map_err(|e| {
+                        anyhow::anyhow!("seed validation files in partition 0: {e}")
+                    })?;
+                    (3, 0)
+                };
+                fs.sync_metadata()
+                    .map_err(|e| anyhow::anyhow!("sync partition 0 metadata: {e}"))?;
+                total_files_written += files;
+                total_dirs_written += dirs;
+            } else {
+                // Partitions 1..N are formatted FAT12/16 but otherwise
+                // empty. We still open + sync to make sure the blank FS
+                // structures land correctly.
+                let mut fs = Human68kFilesystem::open(body, 0)
+                    .map_err(|e| anyhow::anyhow!("open partition {} as Human68k: {e}", idx + 1))?;
+                fs.sync_metadata()
+                    .map_err(|e| anyhow::anyhow!("sync partition {} metadata: {e}", idx + 1))?;
+            }
         }
-        partition_bodies.push(body);
-    }
 
-    // Optional Phase D.2: overlay the donor HDD's Sharp partition boot
-    // sector onto partition 0's first sector. Other partitions keep our
-    // own generated BPB (the donor's boot code is single-partition by
-    // design, so multi-partition layouts only use the donor on slot 0).
-    //
-    // Critical: the donor's boot CODE survives intact, but the donor's
-    // Sharp/KG BPB at offset 0x12..0x26 is REPLACED by our partition's
-    // actual FAT geometry so the boot code reads the right FAT/root/data
-    // sectors. Without this patch the donor's BPB (configured for its
-    // own size, e.g. 100 MB for hd0.hds) would silently steer the boot
-    // code at our smaller / different-shaped partition — non-bootable.
-    let boot_sector_donor_applied = if !matches!(boot_sector_source, BootSectorSource::None) {
-        let mut donor_sector: Vec<u8> = match boot_sector_source {
-            BootSectorSource::Donor(p) => extract_partition_boot_sector(p, variant)?,
-            BootSectorSource::BuiltIn => {
-                anyhow::ensure!(
-                    matches!(variant, HddVariant::Scsi),
-                    "built-in boot sector is SCSI only — for SASI output, omit \
+        // Optional Phase D.2: overlay the donor HDD's Sharp partition boot
+        // sector onto partition 0's first sector. Other partitions keep our
+        // own generated BPB (the donor's boot code is single-partition by
+        // design, so multi-partition layouts only use the donor on slot 0).
+        //
+        // Critical: the donor's boot CODE survives intact, but the donor's
+        // Sharp/KG BPB at offset 0x12..0x26 is REPLACED by our partition's
+        // actual FAT geometry so the boot code reads the right FAT/root/data
+        // sectors. Without this patch the donor's BPB (configured for its
+        // own size, e.g. 100 MB for hd0.hds) would silently steer the boot
+        // code at our smaller / different-shaped partition — non-bootable.
+        let boot_sector_donor_applied = if !matches!(boot_sector_source, BootSectorSource::None) {
+            let mut donor_sector: Vec<u8> = match boot_sector_source {
+                BootSectorSource::Donor(p) => extract_partition_boot_sector(p, variant)?,
+                BootSectorSource::BuiltIn => {
+                    anyhow::ensure!(
+                        matches!(variant, HddVariant::Scsi),
+                        "built-in boot sector is SCSI only — for SASI output, omit \
                      --builtin-boot-sector and use the SWITCH.X /HD workflow on \
                      first FDD0 boot, or pass --boot-sector-donor PATH with a \
                      SASI donor file."
-                );
-                HERO_SOFT_BOOT_SECTOR.to_vec()
-            }
-            BootSectorSource::None => unreachable!(),
-        };
-        anyhow::ensure!(
-            donor_sector.len() as u64 == sector_size,
-            "donor partition boot sector is {} bytes but variant {} expects {}",
-            donor_sector.len(),
-            variant.name(),
-            sector_size,
-        );
-        let p0 = &partition_bodies[0];
-        anyhow::ensure!(
-            (p0.len() as u64) >= sector_size,
-            "partition 0 is smaller than one sector — can't overlay boot sector",
-        );
-        match variant {
-            HddVariant::Scsi => {
-                // Read our generated FAT BPB (standard PC layout, LE at
-                // offsets 0x0B..0x24) and re-encode the same fields into
-                // the donor's Sharp/KG BE layout at 0x12..0x22 so the
-                // donor's boot code reads our actual partition geometry.
-                // Tested + MAME-oracle-validated on hd0.hds.
-                patch_sharp_kg_bpb_from_pc_bpb(&mut donor_sector, p0)?;
-            }
-            HddVariant::Sasi => {
-                // SASI overlay is experimental — we don't have a validated
-                // Sharp/KG SASI donor to develop the BPB-patch against, so
-                // the donor's BPB ships verbatim. For the boot to succeed,
-                // the output partition needs to match the donor's size and
-                // FAT geometry exactly. If the donor is a Hudson game disc
-                // (Bomberman-style), the partition body needs to match its
-                // custom format too — which our FAT-formatted partition
-                // doesn't.
-                eprintln!(
-                    "warning: --boot-sector-donor on SASI variant is experimental and \
+                    );
+                    HERO_SOFT_BOOT_SECTOR.to_vec()
+                }
+                BootSectorSource::None => unreachable!(),
+            };
+            anyhow::ensure!(
+                donor_sector.len() as u64 == sector_size,
+                "donor partition boot sector is {} bytes but variant {} expects {}",
+                donor_sector.len(),
+                variant.name(),
+                sector_size,
+            );
+            anyhow::ensure!(
+                per_partition_bytes >= sector_size,
+                "partition 0 is smaller than one sector — can't overlay boot sector",
+            );
+            let mut p0 = vec![0u8; sector_size as usize];
+            out.seek(SeekFrom::Start(part_start_byte))?;
+            out.read_exact(&mut p0)?;
+            match variant {
+                HddVariant::Scsi => {
+                    // Read our generated FAT BPB (standard PC layout, LE at
+                    // offsets 0x0B..0x24) and re-encode the same fields into
+                    // the donor's Sharp/KG BE layout at 0x12..0x22 so the
+                    // donor's boot code reads our actual partition geometry.
+                    // Tested + MAME-oracle-validated on hd0.hds.
+                    patch_sharp_kg_bpb_from_pc_bpb(&mut donor_sector, p0.as_slice())?;
+                }
+                HddVariant::Sasi => {
+                    // SASI overlay is experimental — we don't have a validated
+                    // Sharp/KG SASI donor to develop the BPB-patch against, so
+                    // the donor's BPB ships verbatim. For the boot to succeed,
+                    // the output partition needs to match the donor's size and
+                    // FAT geometry exactly. If the donor is a Hudson game disc
+                    // (Bomberman-style), the partition body needs to match its
+                    // custom format too — which our FAT-formatted partition
+                    // doesn't.
+                    eprintln!(
+                        "warning: --boot-sector-donor on SASI variant is experimental and \
                      unverified. The donor's BPB ships verbatim (no patching), so the \
                      output partition needs to match the donor's geometry exactly. If \
                      the output HDD doesn't boot in MAME `x68000 -sasi`, fall back to \
                      `--system-disk` + the SWITCH.X /HD workflow on first FDD0 boot."
-                );
+                    );
+                }
             }
+            out.seek(SeekFrom::Start(part_start_byte))?;
+            out.write_all(&donor_sector)?;
+            true
+        } else {
+            false
+        };
+
+        // Build the X68K partition table — populate `partitions` slots,
+        // each pointing at the right disk-relative start sector.
+        let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
+        BigEndian::write_u32(&mut table[0..4], X68K_MAGIC);
+        BigEndian::write_u32(&mut table[4..8], disk_sectors as u32);
+        BigEndian::write_u32(&mut table[8..12], disk_sectors as u32);
+        for idx in 0..partitions {
+            let e_off = X68K_TABLE_HEADER_SIZE + idx * X68K_ENTRY_SIZE;
+            table[e_off..e_off + 8].copy_from_slice(b"Human   ");
+            let entry_start = part_start_sector + (idx as u64) * per_partition_sectors;
+            BigEndian::write_u32(&mut table[e_off + 8..e_off + 12], entry_start as u32);
+            BigEndian::write_u32(
+                &mut table[e_off + 12..e_off + 16],
+                per_partition_sectors as u32,
+            );
         }
-        partition_bodies[0][..donor_sector.len()].copy_from_slice(&donor_sector);
-        true
-    } else {
-        false
-    };
 
-    // Build the X68K partition table — populate `partitions` slots,
-    // each pointing at the right disk-relative start sector.
-    let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
-    BigEndian::write_u32(&mut table[0..4], X68K_MAGIC);
-    BigEndian::write_u32(&mut table[4..8], disk_sectors as u32);
-    BigEndian::write_u32(&mut table[8..12], disk_sectors as u32);
-    for idx in 0..partitions {
-        let e_off = X68K_TABLE_HEADER_SIZE + idx * X68K_ENTRY_SIZE;
-        table[e_off..e_off + 8].copy_from_slice(b"Human   ");
-        let entry_start = part_start_sector + (idx as u64) * per_partition_sectors;
-        BigEndian::write_u32(&mut table[e_off + 8..e_off + 12], entry_start as u32);
-        BigEndian::write_u32(
-            &mut table[e_off + 12..e_off + 16],
-            per_partition_sectors as u32,
-        );
-    }
+        // Build the partition-list for the IPL stub. For multi-partition
+        // builds, each slot gets a drive letter (C, D, E, ...) + its size
+        // in MiB so the IPL stub's print banner renders a real partition
+        // map at boot time. Single-partition builds pass an empty list and
+        // fall back to the legacy single-partition banner.
+        let stub_partitions: Vec<(char, u64)> = if partitions > 1 {
+            (0..partitions)
+                .map(|i| {
+                    (
+                        char::from(b'C' + i as u8),
+                        per_partition_bytes / (1024 * 1024),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let stub_bytes = render_ipl_stub_bytes(stub, &stub_partitions);
 
-    // Build the partition-list for the IPL stub. For multi-partition
-    // builds, each slot gets a drive letter (C, D, E, ...) + its size
-    // in MiB so the IPL stub's print banner renders a real partition
-    // map at boot time. Single-partition builds pass an empty list and
-    // fall back to the legacy single-partition banner.
-    let stub_partitions: Vec<(char, u64)> = if partitions > 1 {
-        (0..partitions)
-            .map(|i| {
-                (
-                    char::from(b'C' + i as u8),
-                    per_partition_bytes / (1024 * 1024),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let stub_bytes = render_ipl_stub_bytes(stub, &stub_partitions);
-
-    // Assemble the disk: boot block + N partition bodies, contiguous.
-    let mut disk = vec![0u8; total_bytes as usize];
-    let boot_block: Vec<u8> = match variant {
-        HddVariant::Sasi => build_sasi_boot_block_with_stub_bytes(&stub_bytes, &table).to_vec(),
-        HddVariant::Scsi => {
-            build_scsi_boot_block_with_stub_bytes(&SCSI_DESCRIPTOR, &stub_bytes, &table).to_vec()
-        }
-    };
-    disk[..boot_block.len()].copy_from_slice(&boot_block);
-    for (idx, body) in partition_bodies.iter().enumerate() {
-        let part_off = (part_start_byte + (idx as u64) * per_partition_bytes) as usize;
-        // `disk` starts zeroed; copying only non-zero pieces keeps its untouched pages unbacked.
-        for (k, piece) in body.chunks(64 * 1024).enumerate() {
-            if piece.iter().any(|&b| b != 0) {
-                let at = part_off + k * 64 * 1024;
-                disk[at..at + piece.len()].copy_from_slice(piece);
+        // The boot block goes in front of the partitions already on disk.
+        let boot_block: Vec<u8> = match variant {
+            HddVariant::Sasi => build_sasi_boot_block_with_stub_bytes(&stub_bytes, &table).to_vec(),
+            HddVariant::Scsi => {
+                build_scsi_boot_block_with_stub_bytes(&SCSI_DESCRIPTOR, &stub_bytes, &table)
+                    .to_vec()
             }
-        }
+        };
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(&boot_block)?;
+        out.sync_all()?;
+
+        Ok(BuildSummary {
+            variant,
+            total_bytes,
+            disk_sectors,
+            sector_size,
+            boot_block_bytes,
+            partition_count: partitions,
+            partition_start_sector: part_start_sector,
+            partition_start_byte: part_start_byte,
+            partition_sectors: per_partition_sectors,
+            partition_bytes: per_partition_bytes,
+            files_written: total_files_written,
+            dirs_written: total_dirs_written,
+            from_donor,
+            boot_sector_donor_applied,
+        })
+    })();
+    if built.is_err() {
+        drop(out);
+        let _ = std::fs::remove_file(out_path);
     }
-
-    crate::compat::write_sparse(out_path, &disk)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", out_path.display()))?;
-
-    Ok(BuildSummary {
-        variant,
-        total_bytes,
-        disk_sectors,
-        sector_size,
-        boot_block_bytes,
-        partition_count: partitions,
-        partition_start_sector: part_start_sector,
-        partition_start_byte: part_start_byte,
-        partition_sectors: per_partition_sectors,
-        partition_bytes: per_partition_bytes,
-        files_written: total_files_written,
-        dirs_written: total_dirs_written,
-        from_donor,
-        boot_sector_donor_applied,
-    })
+    built
 }
 
 /// Extract the partition boot sector from a real Sharp X68000 HDD donor.

@@ -875,7 +875,17 @@ impl<W: Write + Seek> Write for Window<'_, W> {
     }
 }
 
-impl<W: Write + Seek> Seek for Window<'_, W> {
+impl<W: std::io::Read + Seek> std::io::Read for Window<'_, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        self.inner.seek(SeekFrom::Start(self.base + self.pos))?;
+        let got = self.inner.read(&mut buf[..n])?;
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl<W: Seek> Seek for Window<'_, W> {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         let next = match to {
             SeekFrom::Start(n) => Some(n),

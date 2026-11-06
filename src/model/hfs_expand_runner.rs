@@ -7,14 +7,14 @@
 //! summary helper and `ExpandSource` shape live here too so both
 //! surfaces validate inputs the same way.
 
-use std::io::{Cursor, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::hfs_clone::{emit_apm_disk_with_hfs, EmitReport};
+use crate::fs::hfs_clone::{emit_apm_disk_from, EmitReport};
 use crate::model::source_reader::open_read;
 use crate::model::status::ExpandStatus;
-use fs_mac::hfs::{create_blank_hfs_sized, HfsFilesystem};
+use fs_mac::hfs::{write_blank_hfs_sized_into, HfsFilesystem};
 use fs_mac::hfs_clone::{clone_hfs_volume, CloneReport};
 
 // The allocation-block-size choices and ceiling helpers are classic-HFS
@@ -159,14 +159,23 @@ fn run_expand(
         source.source_catalog_size,
         source.source_extents_size,
     );
-    let mut target_buf = create_blank_hfs_sized(
+    // The target lives in an unnamed temp file beside the output, never in RAM.
+    let out_dir = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut target_file = tempfile::tempfile_in(out_dir)
+        .map_err(|e| anyhow::anyhow!("creating a temp file in {}: {e}", out_dir.display()))?;
+    let target_len = write_blank_hfs_sized_into(
+        &mut target_file,
+        0,
         target_size_bytes,
         target_block_size,
-        &source.volume_name,
+        source.volume_name.as_str(),
         extents_min,
         catalog_min,
     )
-    .map_err(|e| anyhow::anyhow!("create_blank_hfs failed: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("formatting the target HFS failed: {e}"))?;
     push(&format!(
         "Target B-trees sized: catalog >= {} KiB (source {} KiB), extents-overflow >= {} KiB (source {} KiB)",
         catalog_min / 1024,
@@ -176,7 +185,7 @@ fn run_expand(
     ));
     push(&format!(
         "Allocated {} MiB target image at {} KiB blocks",
-        target_buf.len() / (1024 * 1024),
+        target_len / (1024 * 1024),
         target_block_size / 1024
     ));
 
@@ -205,11 +214,12 @@ fn run_expand(
     }
 
     step("Cloning files...");
-    let target_cursor = Cursor::new(&mut target_buf);
-    let mut target_fs = HfsFilesystem::open(target_cursor, 0)
-        .map_err(|e| anyhow::anyhow!("open target HFS: {e}"))?;
-    let clone_report = clone_hfs_volume(&mut source_fs, &mut target_fs)
-        .map_err(|e| anyhow::anyhow!("clone failed: {e}"))?;
+    let clone_report = {
+        let mut target_fs = HfsFilesystem::open(&mut target_file, 0)
+            .map_err(|e| anyhow::anyhow!("open target HFS: {e}"))?;
+        clone_hfs_volume(&mut source_fs, &mut target_fs)
+            .map_err(|e| anyhow::anyhow!("clone failed: {e}"))?
+    };
     push(&format!(
         "Copied {} file(s) and {} directory(ies); {} bytes data + {} bytes resource fork",
         clone_report.files_copied,
@@ -220,7 +230,7 @@ fn run_expand(
 
     step("Verifying target with fsck...");
     {
-        let mut verify_fs = HfsFilesystem::open(Cursor::new(&target_buf), 0)
+        let mut verify_fs = HfsFilesystem::open(&mut target_file, 0)
             .map_err(|e| anyhow::anyhow!("reopen target for fsck: {e}"))?;
         let result = verify_fs
             .fsck()
@@ -254,11 +264,16 @@ fn run_expand(
             // APM/driver wrapper. The source's boot blocks were copied by the
             // clone, so a bootable source stays bootable under BasiliskII.
             step("Writing flat HFV image...");
-            std::fs::write(&output_path, &target_buf)
+            target_file
+                .seek(SeekFrom::Start(0))
+                .map_err(|e| anyhow::anyhow!("write HFV: {e}"))?;
+            let mut out = std::fs::File::create(&output_path)
+                .map_err(|e| anyhow::anyhow!("write HFV: {e}"))?;
+            std::io::copy(&mut target_file, &mut out)
                 .map_err(|e| anyhow::anyhow!("write HFV: {e}"))?;
             push(&format!(
                 "Wrote {} MiB flat HFV (classic HFS, no partition table)",
-                target_buf.len() / (1024 * 1024)
+                target_len / (1024 * 1024)
             ));
             Ok((clone_report, None))
         }
@@ -275,10 +290,11 @@ fn run_expand(
                 .map_err(|e| anyhow::anyhow!("reopen source: {e}"))?;
             let emit_report = {
                 let mut writer = output_file;
-                emit_apm_disk_with_hfs(
+                emit_apm_disk_from(
                     &mut source_for_apm,
                     source_disk_size,
-                    &target_buf,
+                    &mut target_file,
+                    target_len,
                     &mut writer,
                 )
                 .map_err(|e| anyhow::anyhow!("emit APM: {e}"))?

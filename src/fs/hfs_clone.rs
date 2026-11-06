@@ -68,13 +68,31 @@ where
     R: Read + Seek,
     W: Read + Write + Seek,
 {
-    if !hfs_image.len().is_multiple_of(512) {
+    let len = hfs_image.len() as u64;
+    let mut hfs = std::io::Cursor::new(hfs_image);
+    emit_apm_disk_from(source_disk, source_data_size, &mut hfs, len, output)
+}
+
+/// [`emit_apm_disk_with_hfs`] with the HFS volume read from `hfs_image`, `hfs_len` bytes long,
+/// so a large volume is copied through rather than held in memory.
+pub fn emit_apm_disk_from<R, H, W>(
+    source_disk: &mut R,
+    source_data_size: u64,
+    hfs_image: &mut H,
+    hfs_len: u64,
+    output: &mut W,
+) -> Result<EmitReport, FilesystemError>
+where
+    R: Read + Seek,
+    H: Read + Seek,
+    W: Read + Write + Seek,
+{
+    if !hfs_len.is_multiple_of(512) {
         return Err(FilesystemError::InvalidData(format!(
-            "hfs_image length {} is not a multiple of 512",
-            hfs_image.len()
+            "hfs_image length {hfs_len} is not a multiple of 512"
         )));
     }
-    let hfs_block_count_u64 = (hfs_image.len() / 512) as u64;
+    let hfs_block_count_u64 = hfs_len / 512;
     if hfs_block_count_u64 == 0 {
         return Err(FilesystemError::InvalidData(
             "hfs_image is empty".to_string(),
@@ -133,8 +151,7 @@ where
 
     let hfs_block_count: u32 = hfs_block_count_u64.try_into().map_err(|_| {
         FilesystemError::InvalidData(format!(
-            "hfs_image too large for u32 block count: {} bytes",
-            hfs_image.len()
+            "hfs_image too large for u32 block count: {hfs_len} bytes"
         ))
     })?;
     let target_block_count: u32 = hfs_start_block
@@ -247,6 +264,8 @@ where
     struct Region {
         start: u64,
         bytes: Vec<u8>,
+        /// The HFS volume, copied from `hfs_image` instead of `bytes`.
+        is_hfs: bool,
     }
     let mut regions: Vec<Region> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -271,11 +290,13 @@ where
         regions.push(Region {
             start: d.start_block as u64 * 512,
             bytes: data,
+            is_hfs: false,
         });
     }
     regions.push(Region {
         start: hfs_start_block as u64 * 512,
-        bytes: hfs_image.to_vec(),
+        bytes: Vec::new(),
+        is_hfs: true,
     });
     regions.sort_by_key(|r| r.start);
 
@@ -297,8 +318,17 @@ where
             }
             cursor = region.start;
         }
+        if region.is_hfs {
+            hfs_image.seek(std::io::SeekFrom::Start(0))?;
+            let copied = std::io::copy(&mut (&mut *hfs_image).take(hfs_len), output)?;
+            if copied != hfs_len {
+                return Err(FilesystemError::InvalidData(format!(
+                    "APM emit: the HFS volume ended after {copied} of {hfs_len} bytes"
+                )));
+            }
+        }
         output.write_all(&region.bytes)?;
-        cursor += region.bytes.len() as u64;
+        cursor += region.bytes.len() as u64 + if region.is_hfs { hfs_len } else { 0 };
     }
 
     Ok(EmitReport {

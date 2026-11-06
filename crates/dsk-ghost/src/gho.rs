@@ -4026,7 +4026,7 @@ pub fn emit_file_aware_fat_image_to_sink<R: Read + Seek, S: Read + Write + Seek 
     use disk_core::filesystem::{
         CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
     };
-    use fs_pc::fat::{create_blank_fat, FatFilesystem};
+    use fs_pc::fat::{compute_fat_blank_layout, write_blank_fat_metadata_to_sink, FatFilesystem};
     use std::collections::HashMap;
 
     // Decide output image size.
@@ -4041,24 +4041,19 @@ pub fn emit_file_aware_fat_image_to_sink<R: Read + Seek, S: Read + Write + Seek 
         );
     }
 
-    // Format a blank FAT in RAM (cheap: just BPB + zeroed FAT tables +
-    // FSInfo, not the full partition), then stream it into the sink and
-    // pad with zeros to the partition size.
-    let blank = create_blank_fat(size, None).context("formatting blank FAT for emit")?;
+    // Zero the partition, then stream the blank FAT's metadata over it: the image stays
+    // sector-complete, which some FAT writers need when extending cluster chains.
+    let layout = compute_fat_blank_layout(size).context("laying out blank FAT for emit")?;
     sink.seek(SeekFrom::Start(0))?;
-    sink.write_all(&blank)?;
-    if (blank.len() as u64) < size {
-        // Pad with zeros to the full partition size so the FAT image is
-        // sector-complete (some FAT writers won't tolerate a truncated
-        // backing store when extending cluster chains).
-        let mut remaining = size - blank.len() as u64;
-        let chunk = vec![0u8; 1 << 20];
-        while remaining > 0 {
-            let n = remaining.min(chunk.len() as u64) as usize;
-            sink.write_all(&chunk[..n])?;
-            remaining -= n as u64;
-        }
+    let chunk = vec![0u8; 1 << 20];
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len() as u64) as usize;
+        sink.write_all(&chunk[..n])?;
+        remaining -= n as u64;
     }
+    write_blank_fat_metadata_to_sink(sink, &layout, None)
+        .context("formatting blank FAT for emit")?;
     sink.flush()?;
     sink.seek(SeekFrom::Start(0))?;
 

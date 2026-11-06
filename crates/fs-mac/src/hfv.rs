@@ -25,9 +25,9 @@
 //! * The allocation-block-size floor follows from the size: [`suggest_block_size`]
 //!   picks the smallest standard block size keeping `drNmAlBlks ≤ 65,535`.
 
-use std::io::{Cursor, Read, Seek};
+use std::io::{Read, Seek, Write};
 
-use crate::hfs::{create_blank_hfs_sized, HfsFilesystem};
+use crate::hfs::{create_blank_hfs_sized, write_blank_hfs_sized_into, HfsFilesystem};
 use crate::hfs_clone::{clone_hfs_volume, CloneReport};
 use disk_core::filesystem::{Filesystem, FilesystemError};
 
@@ -122,7 +122,7 @@ pub fn build_blank_hfv(
 }
 
 /// Clone an open classic-HFS `source` into a freshly-built, defragmented flat
-/// HFV image of `target_size` bytes, returning the image bytes.
+/// HFV image of `target_size` bytes, written to `target`; returns its length.
 ///
 /// This is the engine primitive behind "export to HFV" and "expand HFV": it
 /// builds a blank target sized to comfortably hold the source's catalog and
@@ -134,14 +134,16 @@ pub fn build_blank_hfv(
 ///
 /// `target_size` must satisfy [`validate_hfv_target`]; the source must be
 /// classic HFS (HFS+ sources are refused).
-pub fn clone_into_hfv<RS>(
+pub fn clone_into_hfv<RS, T>(
     source: &mut HfsFilesystem<RS>,
+    target: &mut T,
     target_size: u64,
     block_size: u32,
     volume_name: &str,
-) -> Result<(Vec<u8>, CloneReport), FilesystemError>
+) -> Result<(u64, CloneReport), FilesystemError>
 where
     RS: Read + Seek + Send,
+    T: Read + Write + Seek + Send,
 {
     if source.fs_type() != "HFS" {
         return Err(FilesystemError::InvalidData(format!(
@@ -162,7 +164,9 @@ where
         summary.extents_file_size,
     );
 
-    let mut target_buf = create_blank_hfs_sized(
+    let len = write_blank_hfs_sized_into(
+        target,
+        0,
         target_size,
         block_size,
         volume_name,
@@ -170,19 +174,16 @@ where
         catalog_min,
     )?;
 
-    let report = {
-        let target_cursor = Cursor::new(&mut target_buf);
-        let mut target_fs = HfsFilesystem::open(target_cursor, 0)?;
-        clone_hfs_volume(source, &mut target_fs)?
-    };
-
-    Ok((target_buf, report))
+    let mut target_fs = HfsFilesystem::open(&mut *target, 0)?;
+    let report = clone_hfs_volume(source, &mut target_fs)?;
+    Ok((len, report))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hfs::create_blank_hfs;
+    use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -254,11 +255,14 @@ mod tests {
 
         // Clone it into a larger flat HFV.
         let mut source_fs = HfsFilesystem::open(Cursor::new(src_img), 0).unwrap();
-        let (hfv, report) = clone_into_hfv(&mut source_fs, 16 * MIB, 4096, "Cloned").unwrap();
+        let mut hfv = Cursor::new(Vec::new());
+        let (len, report) =
+            clone_into_hfv(&mut source_fs, &mut hfv, 16 * MIB, 4096, "Cloned").unwrap();
         assert_eq!(report.files_copied, 1);
+        assert_eq!(len, hfv.get_ref().len() as u64);
 
         // The clone is a valid HFV with the file present.
-        let mut out = HfsFilesystem::open(Cursor::new(hfv), 0).unwrap();
+        let mut out = HfsFilesystem::open(hfv, 0).unwrap();
         assert_eq!(out.volume_summary().volume_name, "Cloned");
         let root = out.root().unwrap();
         let kids = out.list_directory(&root).unwrap();
