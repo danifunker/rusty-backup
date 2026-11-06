@@ -452,6 +452,75 @@ fn grow_copied_partition<T: std::io::Read + Write + std::io::Seek>(
     Ok(())
 }
 
+/// Clone a classic HFS volume into its row at a bigger block size, which no in-place grow can change.
+fn rebuild_copied_hfs<R, T>(
+    src: &mut R,
+    from: u64,
+    target: &mut T,
+    p: &Placed,
+    target_path: &std::path::Path,
+    cancel: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek + Send,
+    T: Write + std::io::Seek,
+{
+    if p.size_bytes > fs_mac::hfs::HFS_MAX_VOLUME_BYTES {
+        anyhow::bail!(
+            "classic HFS stops at {}; this row is {}",
+            disk_core::display::format_size(fs_mac::hfs::HFS_MAX_VOLUME_BYTES),
+            disk_core::display::format_size(p.size_bytes)
+        );
+    }
+    let block_size = fs_mac::hfs::pick_block_size(p.size_bytes);
+    log_cb(&format!(
+        "HFS can't grow to {} at its block size: rebuilding it at {} KiB blocks",
+        disk_core::display::format_size(p.size_bytes),
+        block_size / 1024
+    ));
+    if let Some(note) = fs_mac::hfs::mac_os_size_note(p.size_bytes) {
+        log_cb(note);
+    }
+    // A device has no folder to hold the volume, and a device build must not format in place.
+    let mut temp = match target_path.parent().filter(|d| d.is_dir()) {
+        Some(dir) if !crate::os::is_device_path(target_path) => tempfile::tempfile_in(dir),
+        _ => tempfile::tempfile(),
+    }
+    .context("creating a temporary file for the rebuilt volume")?;
+
+    let mut source = fs_mac::hfs::HfsFilesystem::open(&mut *src, from)
+        .map_err(|e| anyhow::anyhow!("opening the donor's HFS volume: {e}"))?;
+    let inherited: std::collections::HashSet<String> = source
+        .fsck()
+        .map(|r| r.errors.into_iter().map(|e| e.code).collect())
+        .unwrap_or_default();
+    let name = source.volume_summary().volume_name;
+    let (_, report) =
+        fs_mac::hfs_clone::clone_hfs_at(&mut source, &mut temp, 0, p.size_bytes, block_size, &name)
+            .map_err(|e| anyhow::anyhow!("cloning the HFS volume: {e}"))?;
+    // A block size that doesn't divide the row leaves a remainder; the alternate MDB follows it.
+    temp.set_len(p.size_bytes)?;
+    fs_mac::hfs::fit_hfs_volume_to_partition(&mut temp, 0, p.size_bytes, log_cb)?;
+    let result = fs_mac::hfs::HfsFilesystem::open(&mut temp, 0)
+        .and_then(|mut fs| fs.fsck())
+        .map_err(|e| anyhow::anyhow!("checking the rebuilt volume: {e}"))?;
+    let fresh: Vec<&str> = result
+        .errors
+        .iter()
+        .filter(|e| !inherited.contains(&e.code))
+        .map(|e| e.code.as_str())
+        .collect();
+    if !fresh.is_empty() {
+        anyhow::bail!("the rebuilt HFS volume fails its check: {fresh:?}");
+    }
+    log_cb(&format!(
+        "Copied {} file(s) and {} folder(s) into the rebuilt volume",
+        report.files_copied, report.dirs_copied
+    ));
+    copy_range(&mut temp, 0, target, p.start_byte(), p.size_bytes, cancel)
+}
+
 fn copy_range<R: std::io::Read + std::io::Seek, W: Write + std::io::Seek>(
     src: &mut R,
     from: u64,
@@ -684,6 +753,21 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
                 i + 1,
                 disk_core::display::format_size(len)
             ));
+            if p.size_bytes > len
+                && fs_mac::hfs::hfs_outgrows_in_place(&mut src, from, p.size_bytes)
+            {
+                rebuild_copied_hfs(
+                    &mut src,
+                    from,
+                    &mut target,
+                    p,
+                    req.target_path.as_path(),
+                    &cancel_check,
+                    &mut log_cb,
+                )
+                .with_context(|| format!("rebuilding partition {} from the donor", i + 1))?;
+                continue;
+            }
             copy_range(
                 &mut src,
                 from,

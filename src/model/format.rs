@@ -298,7 +298,7 @@ impl FsKind {
             FsKind::Hfs => FsCaps {
                 options: &[BlockSize, BtreeSizes],
                 floppy: true,
-                ..c(400 * KIB, 4 * GIB, true, 27)
+                ..c(400 * KIB, fs_mac::hfs::HFS_MAX_VOLUME_BYTES, true, 27)
             },
             FsKind::Hfsplus => FsCaps {
                 options: &[BlockSize, CaseSensitive, MinCatalog],
@@ -607,7 +607,9 @@ pub fn format_into<W: Write + Seek>(
             let ext = opts.extents_bytes.unwrap_or(ext);
             let len = fs_mac::hfs::write_blank_hfs_sized_into(w, 0, size, bs, label, ext, cat)
                 .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
-            Ok(done(len, format!("HFS, block size {bs}, volume {label:?}")))
+            let mut made = done(len, format!("HFS, block size {bs}, volume {label:?}"));
+            made.notes.extend(mac_size_note(size));
+            Ok(made)
         }
         FsKind::Hfsplus => {
             let bs = match opts.block_size {
@@ -646,7 +648,9 @@ pub fn format_into<W: Write + Seek>(
                 .block_size
                 .unwrap_or_else(|| fs_mac::hfv::suggest_block_size(size));
             let len = fs_mac::hfs::write_blank_hfs_into(w, 0, size, bs, label)?;
-            Ok(done(len, format!("HFV, block size {bs}, volume {label:?}")))
+            let mut made = done(len, format!("HFV, block size {bs}, volume {label:?}"));
+            made.notes.extend(mac_size_note(size));
+            Ok(made)
         }
         FsKind::Fat => {
             let layout = fs_pc::fat::compute_fat_blank_layout_forced(size, 512, opts.fat32)?;
@@ -945,6 +949,10 @@ fn minix<W: Write + Seek>(
         summary: format!("Minix {version:?}"),
         notes: Vec::new(),
     })
+}
+
+fn mac_size_note(size: u64) -> Option<String> {
+    fs_mac::hfs::mac_os_size_note(size).map(str::to_string)
 }
 
 fn hfs_block_size(explicit: Option<u32>, size: u64) -> Result<u32> {

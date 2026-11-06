@@ -388,12 +388,11 @@ fn an_mbr_donor_copies_one_partition_and_formats_another() {
 /// A copied filesystem grows to its bigger row: a file too big for the donor's volume fits.
 #[test]
 fn a_copied_filesystem_grows_to_its_row() {
-    // AFFS stops at the 25 bitmap pages its root block holds, about 49 MiB.
     for (table, fs, disk, file) in [
         ("mbr", "fat", "128M", 64),
         ("mbr", "ext4", "128M", 64),
         ("mbr", "ntfs", "128M", 64),
-        ("rdb", "affs", "48M", 36),
+        ("rdb", "affs", "128M", 64),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
@@ -462,9 +461,50 @@ fn a_copied_exfat_stays_clean_and_warns_when_its_fat_is_full() {
     fsck_clean(&format!("{}@1", p("b.img")));
 }
 
-/// HFS can't change its block size in place, so a copy past its limit stops with the reason.
+/// HFS can't change its block size in place, so a copy past its limit is rebuilt with its files.
 #[test]
-fn a_copied_hfs_past_its_block_limit_is_refused() {
+fn a_copied_hfs_past_its_block_limit_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    run(&[
+        "build",
+        &p("a.img"),
+        "--size",
+        "32M",
+        "--table",
+        "apm",
+        "--partition",
+        "rest",
+        "--format",
+        "1=hfs:KEEP",
+    ]);
+    std::fs::write(p("kept.txt"), vec![0x4Bu8; 300_000]).unwrap();
+    let part = format!("{}@1", p("a.img"));
+    run(&["put", &part, &p("kept.txt"), "/kept.txt"]);
+
+    let text = run(&[
+        "build",
+        &p("b.img"),
+        "--size",
+        "128M",
+        "--from",
+        &p("a.img"),
+        "--partition",
+        "rest",
+    ]);
+    assert!(text.contains("rebuilding it at"), "{text}");
+    let part = format!("{}@1", p("b.img"));
+    fsck_clean(&part);
+    assert!(run(&["ls", &part]).contains("kept.txt"), "file kept");
+    std::fs::write(p("big.bin"), vec![7u8; 64 * 1024 * 1024]).unwrap();
+    run(&["put", &part, &p("big.bin"), "/big.bin"]);
+    fsck_clean(&part);
+}
+
+/// Classic HFS stops at 4 GiB, so a row past that fails with the reason.
+#[cfg(unix)]
+#[test]
+fn a_copied_hfs_past_four_gib_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
     run(&[
@@ -483,11 +523,11 @@ fn a_copied_hfs_past_its_block_limit_is_refused() {
         "build",
         &p("b.img"),
         "--size",
-        "128M",
+        "5G",
         "--from",
         &p("a.img"),
         "--partition",
         "rest",
     ]);
-    assert!(!ok && text.contains("HFS caps at"), "{text}");
+    assert!(!ok && text.contains("classic HFS stops at"), "{text}");
 }

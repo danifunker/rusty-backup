@@ -865,8 +865,9 @@ pub fn btree_remove_record(node: &mut [u8], node_size: usize, rec_idx: usize) {
 //   header.fLink → mapNode₁ → mapNode₂ → … → 0
 //
 // Each map node carries a single record (record 0) of bitmap bytes covering
-// (node_size − 14 − 4) × 8 = 3952 bits at node_size=512 — i.e. each map node
-// extends the addressable range by 3952 nodes.
+// (node_size − 14 − 6) × 8 = 3936 bits at node_size=512 — i.e. each map node
+// extends the addressable range by 3936 nodes. Apple's ExtendBTree leaves two
+// spare bytes before the offset table, and hfsutils refuses a node without them.
 
 /// Header-node bitmap range — first segment of the bitmap chain.
 /// Returns `(byte_offset_in_catalog_data, size_in_bytes)`.
@@ -882,8 +883,8 @@ pub fn btree_node_bitmap_range(catalog_data: &[u8], node_size: usize) -> (usize,
 
 /// Bytes of bitmap stored in a single map node at the given node_size.
 pub fn map_node_bitmap_bytes(node_size: usize) -> usize {
-    // descriptor (14) + record-0 offset u16 + free-space offset u16 = 18.
-    node_size.saturating_sub(18)
+    // Descriptor (14), the two offsets, and the two spare bytes Apple keeps before them.
+    node_size.saturating_sub(20)
 }
 
 /// Number of map nodes (BTNodeKind=2) needed to extend the node-allocation
@@ -1478,7 +1479,7 @@ pub fn init_map_node(
     node[8] = 2; // BTNodeKind::MapNode
     node[9] = 0;
     BigEndian::write_u16(&mut node[10..12], 1);
-    // Record 0 starts at offset 14 and runs to (node_size - 4).
+    // Record 0 starts at offset 14 and runs to (node_size - 6).
     let bitmap_bytes = map_node_bitmap_bytes(node_size) as u16;
     let free_off = 14u16 + bitmap_bytes;
     // Offset table at the end: [free_space_offset, record0_offset] (last entry first).
@@ -2897,6 +2898,15 @@ mod tests {
         BigEndian::write_u16(&mut data[n1 + node_size - 2..n1 + node_size], 14); // free-space offset
 
         data
+    }
+
+    /// Apple's map record stops at node_size - 6; hfsutils refuses a node that doesn't.
+    #[test]
+    fn a_map_node_matches_apples_layout() {
+        let mut data = vec![0u8; 1024];
+        init_map_node(&mut data, 512, 1, 0, 0);
+        assert_eq!(BigEndian::read_u16(&data[1022..1024]), 0x00E);
+        assert_eq!(BigEndian::read_u16(&data[1020..1022]), 0x1FA);
     }
 
     #[test]

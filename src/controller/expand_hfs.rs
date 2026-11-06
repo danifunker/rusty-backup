@@ -20,7 +20,7 @@ use crate::model::job::{Job, Notify, Snapshot};
 pub use crate::model::hfs_expand_runner::ExpandSource;
 
 const MIB: u64 = 1024 * 1024;
-/// HFV's 2047 MB ceiling in whole MiB.
+/// HFV's 4095 MB ceiling in whole MiB.
 const HFV_MAX_MIB: u32 = (fs_mac::hfv::HFV_MAX_BYTES / MIB) as u32;
 
 /// The `purpose` of each picker this controller asks for.

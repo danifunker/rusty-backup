@@ -69,7 +69,7 @@ pub enum ExportFormat {
     /// streaming codec: the GUI/CLI intercept it and route to the HFV clone
     /// path (`fs_mac::hfv::clone_into_hfv` via `export_runner::start_per_partition_hfv`),
     /// so it never reaches `write_header`/`write_footer` or the whole-disk /
-    /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
+    /// per-partition streaming functions. HFS-only, per-partition only, ≤4095 MB.
     Hfv,
     /// X68000 XDF — raw headerless floppy dump. Intercepted by the bulk
     /// runner and routed through [`crate::rbformats::containers::convert_floppy_container`].

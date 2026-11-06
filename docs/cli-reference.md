@@ -720,7 +720,7 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 - `--size` — Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)
 - `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
 - `--output` — Destination path for the new image. Created (or truncated)
-- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 2047 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
+- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 4095 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
 
 ### `floppy`
 

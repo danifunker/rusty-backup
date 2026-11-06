@@ -19,6 +19,8 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-083](#r-083)~~ | ~~**High**~~ **FIXED** | `crates/fs-amiga` (AFFS fsck) | ~~fsck reports a bitmap extension block as allocated but unreachable, and repair frees it, on any AFFS volume past about 49 MiB~~ — the blocks of the `bm_ext` chain count as metadata, 2026-11-06 |
+| ~~[R-082](#r-082)~~ | ~~Medium~~ **FIXED** | `crates/fs-mac` (`hfs_common`, HFS fsck) | ~~B-tree map nodes hold a 494-byte record where Apple's hold 492, so hfsutils refuses any volume with one ("malformed b*-tree map node"), and repair rewrites a real Mac's map node into that form~~ — written the way ExtendBTree writes them, 2026-11-06 |
 | ~~[R-081](#r-081)~~ | ~~Medium~~ **FIXED** | `libchdman-rs` 0.289.x (vendored MAME `chd.cpp`) | ~~A CHD of a source of 8 KiB or less aborts the process: `compress_v5_map`'s buffer leaves no room for the Huffman tree with one or two hunks~~ — libchdman-rs 0.289.4 allows 160 bits for the tree, 2026-11-04 |
 | ~~[R-080](#r-080)~~ | ~~Medium~~ **FIXED** | `src/restore/superfloppy_wrap.rs`, `src/model/{backup_loader,text_edit}.rs` | ~~A bare SquashFS image opened in Inspect fails to Browse ("bad MDB signature"): "squashfs" contains "hfs", so its row got MBR type 0xAF and opened as HFS; the same match chose the Apple HFS GPT type and Mac Roman text~~ — SquashFS is matched first (0x83, Linux filesystem GUID, UTF-8), 2026-11-04 |
 | ~~[R-079](#r-079)~~ | ~~**High**~~ **FIXED** | `crates/fs-pc` (NTFS directory listing) | ~~An NT4 NTFS volume hides every file in MFT records 16-23: NT4 Terminal Server's `WTSRV` (record 17) and its 3,600 files were missing from browse, backup sizing and extract~~ — only the fixed metafiles 0-15 are hidden, 2026-11-04 |
@@ -105,6 +107,25 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-083 — AFFS fsck frees a live bitmap extension block {#r-083}
+
+`bitmap_page_owns_block` knew the bitmap pages but not the `bm_ext` blocks that
+list them, so on a volume with more than 25 pages fsck called each extension
+block unreachable and `repair` marked it free, ready for a new file to overwrite.
+Found when the in-place resizer learned to write extension chains
+(`resize_crosses_the_bitmap_extension_boundary`). `fsck_counts_bitmap_extension_blocks`
+pins it.
+
+### R-082 — HFS map nodes are two bytes too long {#r-082}
+
+Apple's `ExtendBTree` sizes a map record as `nodeSize - sizeof(BTNodeDescriptor) - 6`
+and puts the free-space offset at `nodeSize - 6`; `hfsutils` checks for exactly
+`0x1fa`. We used `- 4`, so every volume whose catalog needs a map node (one over
+1 MiB, so roughly 200 MB and up at the default sizing) failed `hmount`. Mac OS 9
+mounts the old form, so volumes already written stay usable, and our reader follows
+each node's own offsets, so both forms open. `repair_map_nodes` leaves the old form
+alone rather than shifting its bits, and no longer rewrites Apple's.
 
 ### R-081 — a CHD of an image of 8 KiB or less aborts the process {#r-081}
 
