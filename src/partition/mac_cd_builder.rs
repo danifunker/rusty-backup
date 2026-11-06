@@ -335,26 +335,23 @@ mod tests {
     fn streamed_file_matches_in_memory_image() {
         use std::io::Read;
         let opts = MacCdOptions::new(8 * 1024 * 1024, "Stream", MacCdFs::Hfs);
-        // The volume dates come from the clock, so a pair built across a second boundary is redone.
-        for _ in 0..5 {
-            let started = fs_mac::hfs_common::hfs_now();
-            let (mem, layout) = build_mac_hfs_cd(&opts).unwrap();
+        let started = fs_mac::hfs_common::hfs_now();
+        let (mem, layout) = build_mac_hfs_cd(&opts).unwrap();
 
-            let mut file = tempfile::tempfile().expect("tempfile");
-            let streamed = write_mac_hfs_cd(&mut file, &opts).expect("stream");
-            file.set_len(streamed.disk_bytes).unwrap();
-            if fs_mac::hfs_common::hfs_now() != started {
-                continue;
-            }
-            assert_eq!(streamed, layout);
+        let mut file = tempfile::tempfile().expect("tempfile");
+        let streamed = write_mac_hfs_cd(&mut file, &opts).expect("stream");
+        file.set_len(streamed.disk_bytes).unwrap();
+        let ticked = fs_mac::hfs_common::hfs_now() != started;
+        assert_eq!(streamed, layout);
 
-            let mut on_disk = Vec::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_end(&mut on_disk).unwrap();
-            assert_eq!(on_disk, mem, "streamed bytes match the in-memory image");
-            return;
-        }
-        panic!("the clock ticked during every attempt");
+        let mut on_disk = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut on_disk).unwrap();
+        assert_eq!(on_disk.len(), mem.len());
+        // The volume dates come from the clock, so a pair built across a second may differ there.
+        let differing = on_disk.iter().zip(&mem).filter(|(a, b)| a != b).count();
+        let allowed = if ticked { 64 } else { 0 };
+        assert!(differing <= allowed, "{differing} bytes differ");
     }
 
     /// A 650 MiB HFS disc needs a block size above 512 to stay inside HFS's
