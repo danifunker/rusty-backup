@@ -5096,16 +5096,20 @@ mod tests {
     fn blank_volume_scales_to_real_amiga_partition_sizes() {
         // 650 MB target (DH0-style): single MI, 1024-byte reserved
         // blocks, numreserved scaled past 32 to ~180.
-        let img_650 = create_blank_pfs3(1_331_576, "DH0").expect("format 650 MB");
-        let mut cur = std::io::Cursor::new(img_650);
+        let mut cur = std::io::Cursor::new(Vec::new());
+        write_blank_pfs3_into(&mut cur, 0, 1_331_576, "DH0").expect("format 650 MB");
         let fs = Pfs3Filesystem::open(&mut cur, 0).expect("open 650 MB");
         assert_eq!(fs.volume_label(), Some("DH0"));
         assert_eq!(fs.root.reserved_blksize, 1024);
 
         // 9 GB target (DH1-style): forces resblksize=4096 so a single
         // MI's 1021 index slots cover all BM blocks.
-        let img_9g = create_blank_pfs3(18_740_736, "DH1").expect("format 9 GB");
-        let mut cur = std::io::Cursor::new(img_9g);
+        let mut cur = std::io::Cursor::new(Vec::new());
+        write_blank_pfs3_into(&mut cur, 0, 18_740_736, "DH1").expect("format 9 GB");
+        assert!(
+            cur.get_ref().len() < 16 << 20,
+            "streaming writes only the metadata"
+        );
         let fs = Pfs3Filesystem::open(&mut cur, 0).expect("open 9 GB");
         assert_eq!(fs.volume_label(), Some("DH1"));
         assert_eq!(fs.root.reserved_blksize, 4096);
