@@ -52,6 +52,9 @@ SIDECAR_CHOICES = {
     "mac": ["Use as resource forks", "Leave as-is", "Exclude"],
 }
 
+# Newer AT-SPI names a push button "button".
+BUTTON_ROLES = ("push button", "button")
+
 WORK = ""
 WINDOW = ""
 
@@ -102,7 +105,7 @@ def describe(n):
             extra += f" actions={names}"
         states = n.get_state_set().get_states()
         flags = [Atspi.StateType(st).value_nick for st in states
-                 if Atspi.StateType(st).value_nick in ("sensitive", "enabled", "checked", "focused")]
+                 if Atspi.StateType(st).value_nick in ("sensitive", "checked", "pressed", "focused")]
         extra += f" [{','.join(flags)}]"
         return f"{n.get_role_name()} {n.get_name()!r}{extra}"
     except Exception as e:
@@ -164,12 +167,12 @@ def sibling_button(root, beside, name, wait=20.0):
     while time.time() < end:
         for n in nodes(root):
             try:
-                if n.get_role_name() != "push button" or n.get_name() != beside:
+                if n.get_role_name() not in BUTTON_ROLES or n.get_name() != beside:
                     continue
                 parent = n.get_parent()
                 for i in range(parent.get_child_count()):
                     c = parent.get_child_at_index(i)
-                    if c.get_name() == name and c.get_role_name() == "push button" and is_showing(c):
+                    if c.get_name() == name and c.get_role_name() in BUTTON_ROLES and is_showing(c):
                         return c
             except Exception:
                 continue
@@ -233,7 +236,7 @@ def key(name, times=1):
 def press(n):
     """Run a button's action; anything else gets a real click."""
     action = n.get_action_iface()
-    if n.get_role_name() == "push button" and action is not None and action.get_n_actions() > 0:
+    if n.get_role_name() in BUTTON_ROLES and action is not None and action.get_n_actions() > 0:
         action.do_action(0)
         time.sleep(0.4)
     else:
@@ -241,7 +244,7 @@ def press(n):
 
 
 def button(root, name, wait=20.0):
-    return need(root, f"button {name!r}", name=name, role="push button", showing=True, wait=wait)
+    return need(root, f"button {name!r}", name=name, roles=BUTTON_ROLES, showing=True, wait=wait)
 
 
 # Controls a row shows as: a switch row, a combo row, a check row.
@@ -249,29 +252,57 @@ SWITCH_ROLES = ("switch", "toggle button", "check box")
 COMBO_ROLES = ("combo box",)
 
 
+def has_action(n):
+    action = n.get_action_iface()
+    return action is not None and action.get_n_actions() > 0
+
+
+def labelled(root, label, acting, wait=20.0):
+    """The showing node named `label` that has (or lacks) an action: a row and its toggle share
+    the name, and their roles differ between AT-SPI versions."""
+    end = time.time() + wait
+    while True:
+        for n in nodes(root):
+            try:
+                if n.get_name() == label and is_showing(n) and has_action(n) == acting:
+                    return n
+            except Exception:
+                continue
+        if time.time() >= end:
+            raise Fail(f"not found: {label!r} ({'toggle' if acting else 'row'})")
+        time.sleep(0.5)
+
+
 def option(root, label):
-    """An option's toggle: the switch inside its row, named after the row."""
-    return need(root, f"option {label!r}", name=label, roles=SWITCH_ROLES, showing=True)
+    """An option's toggle."""
+    return labelled(root, label, True)
 
 
 def option_row(root, label):
     """An option's row, which carries the greyed-out state."""
-    return need(root, f"row {label!r}", name=label, role="list item", showing=True)
+    return labelled(root, label, False)
+
+
+def option_on(root, label):
+    return is_on(option(root, label)) or is_on(option_row(root, label))
 
 
 def set_option(root, label, on):
-    n = option(root, label)
-    if is_on(n) != on:
-        action = n.get_action_iface()
-        if action is not None and action.get_n_actions() > 0:
-            action.do_action(0)
-        else:
-            click(n)
-        end = time.time() + 5
-        while is_on(option(root, label)) != on:
-            if time.time() > end:
-                raise Fail(f"{label!r} did not turn {'on' if on else 'off'}")
+    """Toggle by action, or click the row when the action does not take."""
+    if option_on(root, label) == on:
+        return
+    option(root, label).get_action_iface().do_action(0)
+    for attempt in ("action", "click"):
+        end = time.time() + 3
+        while time.time() < end:
+            if option_on(root, label) == on:
+                return
             time.sleep(0.3)
+        if attempt == "action":
+            log(f"  the toggle action did not take on {label!r}; clicking the row")
+            click(option_row(root, label))
+    raise Fail(f"{label!r} did not turn {'on' if on else 'off'}: "
+               f"{describe(option(root, label))} / {describe(option_row(root, label))}")
 
 
 def combo_choice(root, label, choices, want):
@@ -412,6 +443,8 @@ def case_cd_options(app):
 
     press(button(app, "Choose Folder..."))
     need_text(app, "cdsrc")
+    # A new disc starts as Classic Mac HFS, which cannot flatten.
+    combo_choice(app, "Layout", LAYOUTS, LAYOUTS[0])
     if is_sensitive(option_row(app, OPTIONS[1])):
         raise Fail("flatten can be changed with Unpack archives off")
     set_option(app, "Unpack archives", True)
