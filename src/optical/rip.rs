@@ -222,10 +222,10 @@ fn open_local_source(path: &str) -> Result<Box<dyn OpticalSource>> {
             return Ok(Box::new(reader));
         }
         Ok(_) => {
-            log::info!("{path}: no CD table of contents — treating as DVD/Blu-ray media");
+            log::info!("{path}: no CD table of contents - treating as DVD/Blu-ray media");
         }
         Err(e) => {
-            log::info!("{path}: CD reader unavailable ({e:#}) — trying DVD/Blu-ray media");
+            log::info!("{path}: CD reader unavailable ({e:#}) - trying DVD/Blu-ray media");
         }
     }
 

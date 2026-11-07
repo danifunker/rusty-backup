@@ -460,7 +460,7 @@ pub fn chd_to_bincue_multi(
 
     if tracks.len() != parsed.tracks.len() {
         bail!(
-            "track count mismatch between CHD ({}) and cue ({}) — multi-bin split aborted",
+            "track count mismatch between CHD ({}) and cue ({}) - multi-bin split aborted",
             tracks.len(),
             parsed.tracks.len(),
         );
@@ -714,7 +714,7 @@ pub fn chd_to_iso(
     libchdman_rs::cd::extract_to_iso(chd_path, iso_path, &mut on_progress).map_err(
         |e| match e {
             libchdman_rs::ChdError::UnsupportedFormat => {
-                anyhow::anyhow!("CHD is multi-track or not MODE1 — extract to BIN/CUE instead")
+                anyhow::anyhow!("CHD is multi-track or not MODE1 - extract to BIN/CUE instead")
             }
             other => anyhow::anyhow!("CD CHD extract to ISO failed: {:?}", other),
         },
