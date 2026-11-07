@@ -4,6 +4,7 @@
 //! engine or the model; `scripts/check-boundaries.sh` enforces that.
 
 mod app;
+mod archives;
 mod backup;
 mod browser;
 mod build_disk;
@@ -13,6 +14,7 @@ mod effects;
 mod form;
 mod inspect;
 mod keys;
+mod optical;
 mod progress;
 mod restore;
 mod size_row;

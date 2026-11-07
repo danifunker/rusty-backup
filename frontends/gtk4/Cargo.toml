@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 rusty-backup = { path = "../..", default-features = false, features = [
     "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
-    "remote", "tui-update", "crypto", "yaml",
+    "remote", "tui-update", "crypto", "yaml", "audio",
 ] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }

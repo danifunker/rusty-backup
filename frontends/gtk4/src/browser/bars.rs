@@ -12,7 +12,7 @@ use rusty_backup::controller::commander::{
 };
 
 use super::SendFn;
-use crate::widgets::{flow, flow_show, set_text};
+use crate::widgets::{flow, flow_show, plain, set_text};
 
 /// Opens the file picker and hands the chosen paths to the callback.
 pub type AddFiles = Rc<dyn Fn(Rc<dyn Fn(Vec<PathBuf>)>)>;
@@ -290,6 +290,118 @@ impl Header {
         self.check.set_visible(s.caps.check && s.tool_free);
         self.journal.set_visible(s.caps.journal);
         self.chd.set_visible(s.chd);
+        *self.shown.borrow_mut() = Some(s);
+    }
+}
+
+/// What the disc browser's header shows.
+#[derive(Clone, PartialEq)]
+pub struct DiscShown {
+    labels: Vec<String>,
+    selected: u32,
+    game: Option<String>,
+    loaded: bool,
+}
+
+/// The disc browser's header: the filesystem picker (hybrid sides, boot areas), the game, Tree.
+pub struct DiscHeader {
+    root: gtk::Box,
+    pick_title: gtk::Label,
+    picker: gtk::DropDown,
+    only: gtk::Label,
+    game: gtk::Label,
+    tree: gtk::Button,
+    view: gtk::MenuButton,
+    shown: RefCell<Option<DiscShown>>,
+}
+
+impl DiscHeader {
+    pub fn build(send: &SendFn, items: Rc<dyn Fn() -> Vec<ViewMenuItem>>) -> DiscHeader {
+        let title = gtk::Label::new(Some("Disc Browser"));
+        title.add_css_class("heading");
+        let pick_title = gtk::Label::new(Some("Filesystem:"));
+        let picker = gtk::DropDown::from_strings(&[]);
+        picker.set_widget_name(ids::DISC_FS);
+        let s = send.clone();
+        picker.connect_selected_notify(move |d| {
+            s(pane(P::SelectPartition(d.selected() as usize)));
+        });
+        let only = gtk::Label::new(None);
+        let game = gtk::Label::new(None);
+        let tree = button("Tree", ids::TREE, send, pane(P::ListTree { ids: false }));
+        let view = gtk::MenuButton::builder().label("View").build();
+        view.set_widget_name(ids::VIEW_MENU);
+        let popup_send = send.clone();
+        view.set_create_popup_func(move |b| {
+            b.set_popover(Some(&view_popover(&items(), &popup_send)));
+        });
+        let close = button("Close", ids::CLOSE, send, A::Mode(ModeAction::RequestClose));
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        root.set_margin_top(6);
+        root.set_margin_start(8);
+        root.set_margin_end(8);
+        for widget in [
+            title.upcast_ref::<gtk::Widget>(),
+            pick_title.upcast_ref(),
+            picker.upcast_ref(),
+            only.upcast_ref(),
+            game.upcast_ref(),
+            tree.upcast_ref(),
+            view.upcast_ref(),
+            close.upcast_ref(),
+        ] {
+            root.append(widget);
+        }
+        DiscHeader {
+            root,
+            pick_title,
+            picker,
+            only,
+            game,
+            tree,
+            view,
+            shown: RefCell::default(),
+        }
+    }
+
+    pub fn root(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    pub fn read(ctl: &CommanderController) -> DiscShown {
+        let pane = ctl.pane(Side::Left);
+        DiscShown {
+            labels: pane
+                .partition_label_parts()
+                .iter()
+                .map(|p| p.joined())
+                .collect(),
+            selected: pane.selected_partition().unwrap_or(0) as u32,
+            game: pane.disc_game().map(|g| format!("Game: {g}")),
+            loaded: pane.listing.is_loaded(),
+        }
+    }
+
+    pub fn show(&self, s: DiscShown, menu_up: bool) {
+        if menu_up && !self.view.is_active() {
+            self.view.popup();
+        }
+        if self.shown.borrow().as_ref() == Some(&s) {
+            return;
+        }
+        let several = s.labels.len() > 1;
+        self.pick_title.set_visible(several);
+        self.picker.set_visible(several);
+        let plain: Vec<String> = s.labels.iter().map(|l| plain(l).into_owned()).collect();
+        let refs: Vec<&str> = plain.iter().map(String::as_str).collect();
+        self.picker.set_model(Some(&gtk::StringList::new(&refs)));
+        self.picker.set_selected(s.selected);
+        self.only.set_visible(s.labels.len() == 1);
+        let only = s.labels.first().map(|l| format!("[{l}]"));
+        set_text(&self.only, only.as_deref().unwrap_or(""));
+        self.game.set_visible(s.game.is_some());
+        set_text(&self.game, s.game.as_deref().unwrap_or(""));
+        self.tree.set_visible(s.loaded);
         *self.shown.borrow_mut() = Some(s);
     }
 }

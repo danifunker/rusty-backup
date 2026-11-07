@@ -1910,7 +1910,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev
+          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

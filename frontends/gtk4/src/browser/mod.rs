@@ -27,6 +27,7 @@ use rusty_backup::controller::commander::{
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::optical::{disc_browser, DiscSource};
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
@@ -35,7 +36,7 @@ use crate::sync::SyncGuard;
 use crate::widgets::{keep_focus, plain, set_text, typing};
 
 pub use bars::view_popover;
-use bars::{EditBar, EditShown, Header, HeaderShown, MarkBar, MarkShown};
+use bars::{DiscHeader, DiscShown, EditBar, EditShown, Header, HeaderShown, MarkBar, MarkShown};
 use detail::{Detail, DetailShown};
 use dialogs::{present_editor, present_journal, Dialogs, DialogsShown, KeyFn};
 pub use info::{FileInfo, InfoShown};
@@ -44,14 +45,18 @@ use pane::{PaneHost, PaneShown, PaneView};
 /// Sends an action to the screen's controller; a change a sync made is dropped here.
 pub type SendFn = Rc<dyn Fn(A)>;
 
-fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
+/// The controller of the Inspect browse view, or of the Optical tab's disc browser (`disc`).
+fn new_controller(notify: &Arc<dyn Notify>, disc: bool) -> CommanderController {
     let services = PaneServices {
         jobs: JobRegistry::new(),
         notify: Arc::clone(notify),
         recent: Box::new(CommanderRecent(UserConfig)),
     };
     let (keymap, problems) = KeyMap::load(KeyMap::user_file().as_deref());
-    let mut ctl = CommanderController::single(services, keymap, PaneProfile::inspect());
+    let mut ctl = match disc {
+        true => disc_browser(services, keymap),
+        false => CommanderController::single(services, keymap, PaneProfile::inspect()),
+    };
     ctl.report_keymap_problems(problems);
     ctl
 }
@@ -64,8 +69,11 @@ pub struct BrowseView {
     sync: SyncGuard,
     me: Weak<BrowseView>,
     active: Cell<bool>,
+    /// The Optical tab's disc browser: its own header, and only Extract beside the listing.
+    disc: bool,
     root: gtk::Box,
     header: Header,
+    disc_header: DiscHeader,
     edit: EditBar,
     marks: MarkBar,
     banner: adw::Banner,
@@ -86,6 +94,7 @@ pub struct BrowseView {
 /// Everything a refresh shows, read while the controller is borrowed and shown after it is not.
 struct Shown {
     header: HeaderShown,
+    disc_header: Option<DiscShown>,
     edit: EditShown,
     marks: MarkShown,
     jobs: Vec<(Snapshot, bool)>,
@@ -138,6 +147,15 @@ impl PaneHost for Host {
 
 impl BrowseView {
     pub fn build(notify: Arc<dyn Notify>, host: EffectHost) -> Rc<BrowseView> {
+        Self::make(notify, host, false)
+    }
+
+    /// The Optical tab's disc browser: the same view over `PaneProfile::optical`.
+    pub fn disc(notify: Arc<dyn Notify>, host: EffectHost) -> Rc<BrowseView> {
+        Self::make(notify, host, true)
+    }
+
+    fn make(notify: Arc<dyn Notify>, host: EffectHost, disc: bool) -> Rc<BrowseView> {
         Rc::new_cyclic(|me: &Weak<BrowseView>| {
             let target = me.clone();
             let send: SendFn = Rc::new(move |action| {
@@ -157,7 +175,10 @@ impl BrowseView {
                     view.extract("/".to_string());
                 }
             });
-            let header = Header::build(&send, items, extract_all);
+            let header = Header::build(&send, items.clone(), extract_all);
+            let disc_header = DiscHeader::build(&send, items);
+            header.root().set_visible(!disc);
+            disc_header.root().set_visible(disc);
             let target = me.clone();
             let add_files = Rc::new(move |done: Rc<dyn Fn(Vec<PathBuf>)>| {
                 if let Some(view) = target.upgrade() {
@@ -193,6 +214,7 @@ impl BrowseView {
 
             let pane = PaneView::build(Side::Left, Rc::new(Host(me.clone())));
             let detail = Detail::build(&send);
+            detail.set_plain(disc);
             let split = gtk::Paned::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .start_child(pane.root())
@@ -212,6 +234,7 @@ impl BrowseView {
 
             let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
             root.append(header.root());
+            root.append(disc_header.root());
             root.append(&banner);
             root.append(jobs.root());
             root.append(edit.root());
@@ -232,15 +255,18 @@ impl BrowseView {
                 view.is_some_and(|v| v.key(key, mods))
             });
             let dialogs = Dialogs::new(host.clone(), send, &[Side::Left], keys);
+            dialogs.set_plain_tree(disc);
             BrowseView {
-                ctrl: RefCell::new(new_controller(&notify)),
+                ctrl: RefCell::new(new_controller(&notify, disc)),
                 notify,
                 host,
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 active: Cell::new(false),
+                disc,
                 root,
                 header,
+                disc_header,
                 edit,
                 marks,
                 banner,
@@ -324,6 +350,16 @@ impl BrowseView {
         self.pane.focus();
     }
 
+    /// Browse a disc image or the disc in a drive.
+    pub fn open_disc(&self, src: DiscSource) {
+        self.close();
+        let fx = self.ctrl.borrow_mut().open_disc(src);
+        self.active.set(true);
+        self.after(fx);
+        self.changed();
+        self.pane.focus();
+    }
+
     /// The streamed backup's seekable cache is ready; the listing stays where it is.
     pub fn upgrade_seekable(&self, path: PathBuf) {
         if self.active.get() {
@@ -335,7 +371,7 @@ impl BrowseView {
         if !self.active.replace(false) {
             return;
         }
-        let fresh = new_controller(&self.notify);
+        let fresh = new_controller(&self.notify, self.disc);
         // The old pane's readers go before its CHD diff or archive temp is removed.
         self.ctrl.replace(fresh).close_inspect();
         self.label_prefix.borrow_mut().clear();
@@ -553,6 +589,7 @@ impl BrowseView {
         let caps = ctl.browse_caps();
         Shown {
             header: Header::read(&ctl, &prefix),
+            disc_header: self.disc.then(|| DiscHeader::read(&ctl)),
             edit: EditBar::read(&ctl),
             marks: MarkBar::read(&ctl),
             jobs,
@@ -578,6 +615,9 @@ impl BrowseView {
 
     /// Ask whether the file under the cursor is a Mac archive, once.
     fn sniff(&self) {
+        if self.disc {
+            return;
+        }
         let path = {
             let ctl = self.ctrl.borrow();
             let d = ctl.side_detail(Side::Left);
@@ -609,7 +649,10 @@ impl BrowseView {
     }
 
     fn show(&self, s: Shown) {
-        self.header.show(s.header, s.menu_up);
+        self.header.show(s.header, s.menu_up && !self.disc);
+        if let Some(disc) = s.disc_header {
+            self.disc_header.show(disc, s.menu_up);
+        }
         self.edit.show(s.edit);
         self.marks.show(s.marks);
         self.jobs.show(&s.jobs);

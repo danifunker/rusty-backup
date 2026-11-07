@@ -95,6 +95,9 @@ widgets with:
 - A size entry keeps the user's words: while its text parses to the controller's value it is left alone, so `4K` does not turn into `4096` mid-typing, and an unparsable text stays while it has the focus.
 - A partition row is two lines of the grid, fields over content and moves, so a GPT GUID fits at the form's width. The cells are rebuilt only when `Shape` changes: the table, its columns, or which rows can copy.
 - A "Pick..." that only stamps a value is a `MenuButton` with a list, not a `DropDown`: there is nothing to show as selected, and a `DropDown` takes the width of its longest item.
+- A readout that moves with time while no job wakes the shell (a playing CD-DA track) re-arms a one-shot `timeout_add_local_once` from its refresh only while it moves, as `FOLLOW_DELAY` does; it is not a polling timer.
+- A screen whose refresh is skipped off screen connects its root's `map` to `refresh`: a tab selected from code is mapped after the tick that would have drawn it.
+- A list whose rows carry a tick box binds the box's state inside the screen's `SyncGuard`, so a recycled cell taking its new row's value sends nothing back.
 - `TextView::scroll_mark_onscreen` is queued until the lines are measured, so a mark deleted straight after never scrolls. Keep the mark.
 
 ## Slices
@@ -107,7 +110,7 @@ widgets with:
 | 3 | Commander: two panes, key map, drag and drop, staged edits | done; `commander/` takes the window over, every source opens (remote included: `Connect` is the controller's own prompt), File Info is `browser/info.rs` with the controller's field prompts, and Browse opens it from the row menu; the graphical metadata editors stay slice 7; a drop from the file manager is slice 8, a drag out to it is not built |
 | 4 | Backup and Restore | done; `backup/` and `restore/` are the tabs, `form.rs` the adw rows and `chd.rs` / `size_row.rs` the controls later slices reuse; Write Image File picks its source but its Physical Disk Export window is slice 7, greyed out; the top bar's Close Backup and the Inspect share live in `app.rs` |
 | 5 | Build Disk wizard | done; `build_disk/` is the tab, every step egui has: Kind, Output (image and container, or a device), Disk (table, donor, volume, preset, size), Partitions (`rows.rs`), Options, Review, Build; the option rules, hints and `DiskKind::hint` moved into the controller; "Open in Inspect" is `app::open_in_inspect` |
-| 6 | Optical and Archives | |
+| 6 | Optical and Archives | done; `optical/` is the tab (source, disc line, output form with the CD CHD control, the CHD Info, Add remote daemon and CD-DA player windows) and `archives/` the other (entry list with tick boxes, fork format, Extract All / Selected, Mount in Inspect); the disc browser is `BrowseView::disc`, with its own header and only Extract beside the listing; Inspect hands an optical image or a Mac archive over through `app::open_in_optical` / `open_in_archives`; Start asks before it replaces an output file, and the output follows the format's extension; a drive is unit-tested only |
 | 7 | Dialogs: resize, expand HFS, Alto resize, partition editor, metadata editor, export, Expand Image, Check results, CHD Info, bulk and floppy convert, remote (with Inspect's Pick Another Image, Back Up Image, Close Remote), settings, update banner | |
 | 8 | Drop routing, file open, cross-tab handoffs, about, `.desktop` and icon, elevated relaunch | |
 | 9 | Tier B smoke over AT-SPI; deb, rpm and Arch packaging beside egui | |
@@ -124,6 +127,8 @@ connects late shows the frame from when it connected until the next redraw. A cl
 swallows clicks until its animation ends, which a browser tab paints slowly: wait before the next
 click. Typed text arrives only as key events, so drive a text field one key at a time. The window
 follows the browser's size, so a wider browser means a wider window, not a layout bug.
+
+A CD-DA track played under the harness goes to the speakers unless the scratch HOME holds an `.asoundrc` with `pcm.!default { type null }`.
 
 To drive it from a script, read the page's own globals. `sendInput(BROADWAY_EVENT_KEY_PRESS, [keysym,
 state])` reaches GTK where a synthesized `KeyboardEvent` does not, with state 4 for Ctrl. A

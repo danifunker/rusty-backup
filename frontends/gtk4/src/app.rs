@@ -11,13 +11,16 @@ use rusty_backup::controller::app::{
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_confirm,
     elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, ShareStep,
 };
+use rusty_backup::controller::inspect::{InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
 // Through `super`: scripts/check-boundaries.sh takes a crate path to these names for the engine's.
+use super::archives::ArchivesScreen;
 use super::backup::BackupScreen;
 use super::build_disk::BuildDiskScreen;
+use super::optical::OpticalScreen;
 use super::restore::RestoreScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
@@ -68,6 +71,8 @@ pub struct App {
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
     build: Rc<BuildDiskScreen>,
+    optical: Rc<OpticalScreen>,
+    archives: Rc<ArchivesScreen>,
     close_backup: gtk::Button,
     /// The tabs, or Commander Mode, which takes the whole window while open.
     screens: gtk::Stack,
@@ -129,6 +134,30 @@ pub fn open_in_inspect(path: PathBuf) {
     if let Some(app) = APP.with(|a| a.borrow().clone()) {
         app.apply(AppAction::SelectTab(AppTab::Inspect));
         app.inspect.open_file(path);
+    }
+}
+
+/// Archives' Mount: a decoded payload, which its guard keeps alive, in Inspect.
+pub fn load_in_inspect(source: InspectSource) {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.apply(AppAction::SelectTab(AppTab::Inspect));
+        app.inspect.apply(InspectAction::Load(source));
+    }
+}
+
+/// An optical disc Inspect opened goes to the Optical tab.
+pub fn open_in_optical(path: PathBuf) {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.apply(AppAction::SelectTab(AppTab::Optical));
+        app.optical.open_image(path);
+    }
+}
+
+/// A Mac archive Inspect opened goes to the Archives tab.
+pub fn open_in_archives(path: PathBuf) {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.apply(AppAction::SelectTab(AppTab::Archives));
+        app.archives.open_path(path);
     }
 }
 
@@ -255,6 +284,8 @@ impl App {
         let backup = BackupScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let restore = RestoreScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let build = BuildDiskScreen::build(ctrl.notify(), host.clone());
+        let optical = OpticalScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        let archives = ArchivesScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         for (tab, name, title, icon) in TABS {
             match tab {
                 AppTab::Inspect => {
@@ -269,9 +300,11 @@ impl App {
                 AppTab::Build => {
                     stack.add_titled_with_icon(build.root(), Some(name), title, icon);
                 }
-                AppTab::Optical | AppTab::Archives => {
-                    let page = adw::StatusPage::builder().title(title).build();
-                    stack.add_titled_with_icon(&page, Some(name), title, icon);
+                AppTab::Optical => {
+                    stack.add_titled_with_icon(optical.root(), Some(name), title, icon);
+                }
+                AppTab::Archives => {
+                    stack.add_titled_with_icon(archives.root(), Some(name), title, icon);
                 }
             }
         }
@@ -283,6 +316,8 @@ impl App {
             backup,
             restore,
             build,
+            optical,
+            archives,
             close_backup: close_backup.clone(),
             screens,
             commander: RefCell::default(),
@@ -292,6 +327,8 @@ impl App {
             auto_scroll: auto_scroll.clone(),
             sync: SyncGuard::default(),
         });
+
+        app.optical.find_drives();
 
         let send = |action: fn() -> AppAction| {
             let app = app.clone();
@@ -354,7 +391,12 @@ impl App {
         match commander {
             Some(screen) => screen.key(key, mods),
             None => {
-                self.ctrl.borrow().active_tab() == AppTab::Inspect && self.inspect.key(key, mods)
+                let tab = self.ctrl.borrow().active_tab();
+                match tab {
+                    AppTab::Inspect => self.inspect.key(key, mods),
+                    AppTab::Optical => self.optical.key(key, mods),
+                    AppTab::Backup | AppTab::Restore | AppTab::Build | AppTab::Archives => false,
+                }
             }
         }
     }
@@ -408,6 +450,8 @@ impl App {
         self.backup.tick();
         self.restore.tick();
         self.build.tick();
+        self.optical.tick();
+        self.archives.tick();
         self.share_backup();
         self.lock_tabs();
         let commander = self.commander.borrow().clone();
@@ -456,6 +500,7 @@ impl App {
             (AppTab::Backup, on(self.backup.is_running(), "Backup")),
             (AppTab::Restore, on(self.restore.is_running(), "Restore")),
             (AppTab::Build, on(self.build.is_running(), "Build Disk")),
+            (AppTab::Optical, on(self.optical.is_running(), "Optical")),
             (AppTab::Inspect, self.inspect.running_job()),
         ];
         self.backup
@@ -464,6 +509,8 @@ impl App {
             .set_busy(busy_elsewhere(AppTab::Restore, &running, false));
         self.build
             .set_busy(busy_elsewhere(AppTab::Build, &running, false));
+        self.optical
+            .set_busy(busy_elsewhere(AppTab::Optical, &running, false));
     }
 
     /// Read the controller first and release it: setting a widget can fire its change signal.

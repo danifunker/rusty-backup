@@ -111,14 +111,14 @@ fn carry_out(screen: &InspectScreen, request: HostRequest) -> Option<String> {
             None
         }
         HostRequest::ExpandHfs(_) => Some("The Expand HFS dialog is coming soon.".to_string()),
-        HostRequest::OpenOptical(path) => Some(format!(
-            "{} is an optical disc; the Optical tab is coming soon.",
-            path.display()
-        )),
-        HostRequest::OpenArchive(path) => Some(format!(
-            "{} is an archive; the Archives tab is coming soon.",
-            path.display()
-        )),
+        HostRequest::OpenOptical(path) => {
+            crate::app::open_in_optical(path);
+            None
+        }
+        HostRequest::OpenArchive(path) => {
+            crate::app::open_in_archives(path);
+            None
+        }
     }
 }
 

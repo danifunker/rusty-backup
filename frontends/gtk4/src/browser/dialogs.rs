@@ -143,7 +143,7 @@ pub fn buttons(send: &SendFn, list: &[(&str, A)]) -> gtk::Box {
 }
 
 /// Read-only monospace text with scroll bars.
-fn text_view(text: &str) -> gtk::ScrolledWindow {
+pub fn text_view(text: &str) -> gtk::ScrolledWindow {
     let view = gtk::TextView::builder()
         .editable(false)
         .monospace(true)
@@ -236,6 +236,7 @@ pub struct Dialogs {
     tree_large: Slot,
     tree_text: Rc<RefCell<Option<TreeText>>>,
     tree_force: Rc<Cell<bool>>,
+    plain_tree: Cell<bool>,
     budget: Slot,
     budget_live: RefCell<Option<(gtk::Label, gtk::Label, gtk::Button)>>,
     chd: Slot,
@@ -495,6 +496,7 @@ impl Dialogs {
             tree_large: slot_dropping_tree(),
             tree_text: tree_text.clone(),
             tree_force: Rc::default(),
+            plain_tree: Cell::default(),
             budget: Slot::default(),
             budget_live: RefCell::default(),
             chd: Slot::default(),
@@ -545,6 +547,11 @@ impl Dialogs {
                 .map(|d| (d.serial, format!("File Info: {}", d.entry.name))),
             info: ctl.detail().map(|d| FileInfo::read(ctl, d, known)),
         }
+    }
+
+    /// The tree window leaves out Show IDs.
+    pub fn set_plain_tree(&self, on: bool) {
+        self.plain_tree.set(on);
     }
 
     /// Keep a tree listing the pane handed over until its window closes.
@@ -1417,6 +1424,8 @@ fn tree_dialog(tree: &TreeText, this: &Rc<Dialogs>) -> adw::Dialog {
     save.connect_clicked(move |_| send(pane(Side::Left, P::SaveTree)));
     let ids = gtk::CheckButton::with_label("Show IDs");
     ids.set_active(tree.ids);
+    // A disc's tree has no filesystem ids.
+    ids.set_visible(!this.plain_tree.get());
     let send = this.send.clone();
     ids.connect_toggled(move |b| {
         send(pane(Side::Left, P::ListTree { ids: b.is_active() }));

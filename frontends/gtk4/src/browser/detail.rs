@@ -56,6 +56,7 @@ struct Actions {
     path: Option<String>,
     folder: bool,
     extractable: bool,
+    export: bool,
     copying: bool,
     file: bool,
     nested: bool,
@@ -96,6 +97,8 @@ pub struct Detail {
     empty: gtk::Label,
     key: Cell<Option<(u64, bool)>>,
     is_text: Cell<bool>,
+    /// Only Extract is offered.
+    plain: Cell<bool>,
     shown: Rc<RefCell<Actions>>,
 }
 
@@ -267,6 +270,7 @@ impl Detail {
             empty,
             key: Cell::new(None),
             is_text: Cell::new(false),
+            plain: Cell::new(false),
             shown,
         });
         detail.connect(send, &stuffit, &sit_hqx, &mar);
@@ -349,6 +353,11 @@ impl Detail {
             .unwrap_or(ResourceForkMode::AppleDouble)
     }
 
+    /// Offer only Extract, as the disc browser does.
+    pub fn set_plain(&self, on: bool) {
+        self.plain.set(on);
+    }
+
     /// What the panel's option controls say, for an extract from a key press as well.
     pub fn extract_options(&self) -> ExtractOptions {
         let mode = ProdosExportMode::ALL.get(self.prodos.selected() as usize);
@@ -379,22 +388,24 @@ impl Detail {
             None => self.is_text.get(),
         };
         let applies = extract_applies(&d.fs_type);
+        let extras = !self.plain.get();
         let actions = Actions {
             path: (!in_wrapper).then(|| entry.path.clone()),
             folder: entry.is_directory(),
             extractable: !in_wrapper
                 && (entry.is_file() || entry.is_directory() || entry.is_symlink()),
+            export: extras,
             copying: ctl.copy_job().is_some(),
             file: entry.is_file(),
-            nested: entry.is_file() && entry.size >= MIN_NESTED_IMAGE_BYTES,
-            archive: caps.mac && sniffed,
-            mac: caps.mac,
+            nested: extras && entry.is_file() && entry.size >= MIN_NESTED_IMAGE_BYTES,
+            archive: extras && caps.mac && sniffed,
+            mac: extras && caps.mac,
             forks: applies.forks,
             prodos: applies.prodos_suffix,
             qnx: applies.rs_to_lf,
-            text,
+            text: extras && text,
             edit_mode: ctl.edit_mode(),
-            metadata: d.editable,
+            metadata: extras && d.editable,
         };
         DetailShown {
             key,
@@ -444,6 +455,7 @@ impl Detail {
         };
         self.extract.set_label(extract);
         self.export.set_label(export);
+        flow_show(&self.export, a.export);
         self.export.set_sensitive(!a.copying);
         self.extract.set_sensitive(!a.copying);
         flow_show(&self.nested, a.nested);
