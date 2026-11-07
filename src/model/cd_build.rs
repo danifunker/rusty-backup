@@ -87,6 +87,11 @@ impl CdLayout {
         matches!(self, CdLayout::SgiEfs | CdLayout::NextUfs)
     }
 
+    /// Files carry a resource fork, so a `._` sidecar can be taken into its file.
+    pub fn keeps_forks(self) -> bool {
+        matches!(self, CdLayout::MacHfs | CdLayout::MacHfsPlus)
+    }
+
     /// Archives may be unpacked into one shared root, the shape IRIX `inst` wants.
     pub fn can_flatten(self) -> bool {
         matches!(self, CdLayout::SgiEfs | CdLayout::NextUfs)

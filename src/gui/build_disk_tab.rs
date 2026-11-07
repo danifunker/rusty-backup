@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
-    BuildDiskAction, BuildDiskController, CdLayout, DiskKind, FormatOptions, FormatTarget, FsKind,
-    FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step, AFFS_VARIANTS, CD_AUTO_SIZE,
-    SECTOR_SIZES,
+    BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
+    FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
+    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -342,20 +342,40 @@ impl BuildDiskTab {
         for row in self.ctl.cd_options() {
             let mut on = row.on;
             let enabled = row.unavailable.is_none();
-            let resp = ui
-                .add_enabled(enabled, egui::Checkbox::new(&mut on, row.option.label()))
-                .on_hover_text(row.option.hint());
+            let resp = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, row.option.label()));
             if let Some(why) = row.unavailable {
                 resp.on_disabled_hover_text(why);
             } else if on != row.on {
                 toggled.push((row.option, on));
             }
+            help(ui, row.option.hint());
         }
+        let sidecars = self.ctl.cd_sidecars();
+        let mut picked = sidecars;
+        ui.horizontal(|ui| {
+            ui.label("macOS ._ files:");
+            ui.add_enabled_ui(self.ctl.cd_sidecars_unavailable().is_none(), |ui| {
+                egui::ComboBox::from_id_salt(ids::CD_SIDECARS)
+                    .selected_text(sidecars.label())
+                    .show_ui(ui, |ui| {
+                        for &c in CdSidecars::choices(cd.layout) {
+                            ui.selectable_value(&mut picked, c, c.label())
+                                .on_hover_text(c.hint());
+                        }
+                    })
+            })
+            .response
+            .on_disabled_hover_text(self.ctl.cd_sidecars_unavailable().unwrap_or_default());
+        });
+        help(ui, &format!("{} {}", hints::CD_SIDECARS, sidecars.hint()));
         if cd != before {
             self.act(BuildDiskAction::SetCd(cd));
         }
         for (option, on) in toggled {
             self.act(BuildDiskAction::SetCdOption(option, on));
+        }
+        if picked != sidecars {
+            self.act(BuildDiskAction::SetCdSidecars(picked));
         }
     }
 
@@ -1051,6 +1071,13 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
         }
     });
     (o != t.opts).then_some(o)
+}
+
+/// An option's plain-language help, indented under it.
+fn help(ui: &mut egui::Ui, text: &str) {
+    ui.indent(text, |ui| {
+        ui.label(egui::RichText::new(text).small().weak());
+    });
 }
 
 #[cfg(test)]

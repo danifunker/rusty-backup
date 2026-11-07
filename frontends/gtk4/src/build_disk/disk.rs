@@ -7,7 +7,7 @@ use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::build_disk::{
     format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdOptionRow,
-    CdView, DiskKind, FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
+    CdSidecars, CdView, DiskKind, FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
 };
 use rusty_backup::controller::partition_edit::{BuildAction, BuildView};
 
@@ -27,6 +27,8 @@ pub struct DiskShown {
     cd: CdView,
     cd_auto: bool,
     cd_options: Vec<CdOptionRow>,
+    cd_sidecars: CdSidecars,
+    cd_sidecars_unavailable: Option<&'static str>,
     volume_fs: FsKind,
     range: Option<String>,
     view: BuildView,
@@ -46,6 +48,8 @@ impl DiskShown {
             cd: ctrl.cd().clone(),
             cd_auto: ctrl.cd_auto_size(),
             cd_options: ctrl.cd_options(),
+            cd_sidecars: ctrl.cd_sidecars(),
+            cd_sidecars_unavailable: ctrl.cd_sidecars_unavailable(),
             volume_fs: ctrl.volume_fs(),
             range: ctrl.volume_size_range(),
             view: ctrl.table_view(),
@@ -176,6 +180,11 @@ struct CdRows {
     clear: gtk::Button,
     /// One switch per `CdOption::ALL`, in that order.
     options: Vec<adw::SwitchRow>,
+    sidecars: adw::ComboRow,
+    /// The sidecar choice's help, under the list: a long subtitle would squeeze the value out.
+    sidecars_help: gtk::Label,
+    /// What `sidecars` lists now, which follows the layout.
+    choices: Rc<Cell<&'static [CdSidecars]>>,
 }
 
 impl CdRows {
@@ -247,6 +256,21 @@ impl CdRows {
                 row
             })
             .collect();
+
+        let sidecars = combo("macOS ._ files", ids::CD_SIDECARS, &[]);
+        let choices: Rc<Cell<&'static [CdSidecars]>> = Rc::new(Cell::new(&[]));
+        let (s, list) = (send.clone(), choices.clone());
+        sidecars.connect_selected_notify(move |r| {
+            if let Some(c) = list.get().get(r.selected() as usize) {
+                s(BuildDiskAction::SetCdSidecars(*c));
+            }
+        });
+        root.add(&sidecars);
+        let sidecars_help = line();
+        sidecars_help.add_css_class("dim-label");
+        sidecars_help.add_css_class("caption");
+        sidecars_help.set_margin_top(6);
+        root.add(&sidecars_help);
         CdRows {
             root,
             held,
@@ -256,10 +280,14 @@ impl CdRows {
             folder,
             clear,
             options,
+            sidecars,
+            sidecars_help,
+            choices,
         }
     }
 
-    fn show(&self, c: CdView, auto: bool, options: &[CdOptionRow]) {
+    fn show(&self, s: &DiskShown) {
+        let (c, auto, options) = (s.cd.clone(), s.cd_auto, &s.cd_options);
         let at = CdLayout::ALL.iter().position(|l| *l == c.layout);
         set_combo(&self.layout, at.unwrap_or(0) as u32);
         self.layout.set_subtitle(c.layout.hint());
@@ -272,12 +300,42 @@ impl CdRows {
         for (switch, row) in self.options.iter().zip(options) {
             set_switch(switch, row.on);
             switch.set_sensitive(row.unavailable.is_none());
-            let tip = row.unavailable.unwrap_or(row.option.hint());
-            if switch.tooltip_text().as_deref() != Some(tip) {
-                switch.set_tooltip_text(Some(tip));
-            }
+            set_help(switch, row.option.hint(), row.unavailable);
+        }
+        let choices = CdSidecars::choices(c.layout);
+        let labels: Vec<String> = choices.iter().map(|c| c.label().to_string()).collect();
+        set_labels(&self.sidecars, &labels);
+        self.choices.set(choices);
+        let at = choices.iter().position(|x| *x == s.cd_sidecars);
+        set_combo(&self.sidecars, at.unwrap_or(0) as u32);
+        self.sidecars
+            .set_sensitive(s.cd_sidecars_unavailable.is_none());
+        let help = format!("{} {}", hints::CD_SIDECARS, s.cd_sidecars.hint());
+        let help = match s.cd_sidecars_unavailable {
+            Some(why) => format!("macOS ._ files: not available: {why}\n{help}"),
+            None => help,
+        };
+        set_line(&self.sidecars_help, Some(&help));
+        let tip = s.cd_sidecars_unavailable;
+        if self.sidecars.tooltip_text().as_deref() != tip {
+            self.sidecars.set_tooltip_text(tip);
         }
         *self.held.borrow_mut() = Some(c);
+    }
+}
+
+/// An option's help as its subtitle, led by why it cannot be changed now.
+fn set_help(row: &impl IsA<adw::ActionRow>, help: &str, unavailable: Option<&str>) {
+    let row = row.as_ref();
+    if row.subtitle_lines() != 0 {
+        row.set_subtitle_lines(0);
+    }
+    match unavailable {
+        Some(why) => set_subtitle(row, &format!("Not available: {why}\n{help}")),
+        None => set_subtitle(row, help),
+    }
+    if row.tooltip_text().as_deref() != unavailable {
+        row.set_tooltip_text(unavailable);
     }
 }
 
@@ -512,7 +570,7 @@ impl DiskStep {
         let fixed = s.range.is_none();
         set_line(&self.fixed, fixed.then_some(hints::FIXED_SIZE));
         self.show_size(&s);
+        self.cd.show(&s);
         self.preset.show(s.preset);
-        self.cd.show(s.cd, s.cd_auto, &s.cd_options);
     }
 }

@@ -1924,11 +1924,11 @@ jobs:
       - name: Build
         run: cargo build --locked --release
       # The packages sit beside egui's: rusty-backup-gtk, its own desktop file and icon name.
-      # Tier B smoke: the shell over AT-SPI under Xvfb, on a FAT fixture (scripts/gtk4-smoke.py).
-      - name: Smoke test over AT-SPI
+      # The GUI regression suite: the shell over AT-SPI under Xvfb (scripts/gtk4-gui-suite.py).
+      - name: GUI regression suite over AT-SPI
         run: |
           sudo apt-get install -y xvfb at-spi2-core python3-gi gir1.2-atspi-2.0 dosfstools mtools
-          dbus-run-session -- xvfb-run -a ../../scripts/gtk4-smoke.sh "$PWD/target/release/rusty-backup-gtk"
+          dbus-run-session -- xvfb-run -a ../../scripts/gtk4-gui-suite.sh "$PWD/target/release/rusty-backup-gtk"
       - name: Install packaging tools
         run: |
           for crate in cargo-deb cargo-generate-rpm; do

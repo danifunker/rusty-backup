@@ -456,7 +456,7 @@ fn a_donors_boot_flag_comes_with_its_layout() {
 /// Every CD option is listed; one that does not apply says why and ignores a toggle.
 #[test]
 fn cd_options_are_all_listed_and_refuse_with_a_reason() {
-    use super::{CdLayout, CdOption};
+    use super::{CdLayout, CdOption, CdSidecars};
     let dir = tempfile::tempdir().unwrap();
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Cd));
@@ -504,13 +504,23 @@ fn cd_options_are_all_listed_and_refuse_with_a_reason() {
         BuildDiskAction::SetCdOption(CdOption::ExpandArchives, true),
     );
     assert!(why(&c, CdOption::FlattenFolders).is_none());
+    assert_eq!(c.cd_sidecars(), CdSidecars::Exclude, "EFS has no forks");
     act(
         &mut c,
-        BuildDiskAction::SetCdOption(CdOption::ExcludeAppleDouble, true),
+        BuildDiskAction::SetCdSidecars(CdSidecars::ResourceFork),
     );
-    assert!(
-        why(&c, CdOption::IncludeAppleDouble).is_some(),
-        "leave out and copy in clash"
+    assert_eq!(c.cd_sidecars(), CdSidecars::Exclude, "not offered on EFS");
+    act(&mut c, BuildDiskAction::SetCdSidecars(CdSidecars::Keep));
+    assert!(c.cd().import.include_appledouble);
+    let mut cd = c.cd().clone();
+    cd.layout = CdLayout::MacHfs;
+    act(&mut c, BuildDiskAction::SetCd(cd));
+    assert_eq!(CdSidecars::choices(CdLayout::MacHfs).len(), 3);
+    act(&mut c, BuildDiskAction::SetCdSidecars(CdSidecars::Exclude));
+    assert!(c.cd().import.ignore_appledouble && !c.cd().import.include_appledouble);
+    act(
+        &mut c,
+        BuildDiskAction::SetCdSidecars(CdSidecars::ResourceFork),
     );
-    assert!(c.cd().import.ignore_appledouble);
+    assert_eq!(c.cd_sidecars(), CdSidecars::ResourceFork);
 }

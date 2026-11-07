@@ -16,10 +16,10 @@ use ratatui::Frame;
 use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
-    BuildDiskController, CdLayout, CdOption, DiskKind, FormatOptions, FsKind, FsOption, MacDriver,
-    NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, CD_AUTO_SIZE,
-    SECTOR_SIZES,
+    containers, cpm_presets, format_size, geometries, hints, parse_size_field, purpose,
+    BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdSidecars, DiskKind, FormatOptions,
+    FsKind, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
+    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -62,6 +62,7 @@ pub(super) enum Row {
     CdAutoSize,
     CdFolder,
     CdOpt(CdOption),
+    CdSidecars,
     PSize(usize),
     PType(usize),
     PName(usize),
@@ -211,6 +212,7 @@ impl BuildDiskState {
                         }
                         r.push(Row::CdFolder);
                         r.extend(CdOption::ALL.iter().map(|o| Row::CdOpt(*o)));
+                        r.push(Row::CdSidecars);
                     }
                     DiskKind::Preset => {
                         r.push(Row::Preset);
@@ -477,6 +479,14 @@ impl BuildDiskState {
                     None => {}
                 }
             }
+            Row::CdSidecars => match c.cd_sidecars_unavailable() {
+                None => {
+                    let all = CdSidecars::choices(c.cd().layout);
+                    let next = cycle(all, c.cd_sidecars(), forward);
+                    self.act(BuildDiskAction::SetCdSidecars(next));
+                }
+                why => self.status = why.map(str::to_string),
+            },
             Row::MacDriver => {
                 let next = match c.mac_driver() {
                     MacDriver::Bundled => MacDriver::Off,
@@ -952,6 +962,13 @@ impl App {
                         None => (label, value),
                     }
                 }
+                Row::CdSidecars => (
+                    "macOS ._ files".into(),
+                    match c.cd_sidecars_unavailable() {
+                        Some(why) => format!("< {} >  (n/a: {why})", c.cd_sidecars().label()),
+                        None => format!("< {} >", c.cd_sidecars().label()),
+                    },
+                ),
                 Row::PSize(p) => (
                     "  Size".into(),
                     v.rows
@@ -1081,6 +1098,11 @@ impl App {
                 ratatui::style::Style::default()
             };
             lines.push(Line::styled(format!("{marker}{label:<16} {value}"), style));
+            if sel {
+                if let Some(help) = row_help(c, row) {
+                    lines.push(Line::styled(format!("    {help}"), pal.dim()));
+                }
+            }
         }
         if c.step() == Step::Options {
             for t in &targets {
@@ -1118,6 +1140,15 @@ impl App {
         if s.device_pick {
             self.draw_device_pick(frame, area, s.device_sel, "Pick the device to build on");
         }
+    }
+}
+
+/// The plain-language help shown under a selected CD option.
+fn row_help(c: &BuildDiskController, row: &Row) -> Option<String> {
+    match row {
+        Row::CdOpt(o) => Some(o.hint().to_string()),
+        Row::CdSidecars => Some(format!("{} {}", hints::CD_SIDECARS, c.cd_sidecars().hint())),
+        _ => None,
     }
 }
 

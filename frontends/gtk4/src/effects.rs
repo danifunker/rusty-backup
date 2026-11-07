@@ -36,6 +36,18 @@ pub enum Reply {
 
 pub type ReplyFn = Rc<dyn Fn(Reply)>;
 
+/// The GUI suite's answer to a picker, from `RUSTY_BACKUP_TEST_PICKS` (`purpose<TAB>path` lines).
+/// Read on every pick so the suite can change it between steps; an unlisted purpose cancels.
+fn scripted_pick(purpose: &str) -> Option<Option<PathBuf>> {
+    let file = std::env::var_os("RUSTY_BACKUP_TEST_PICKS")?;
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let found = text.lines().find_map(|l| {
+        let (p, path) = l.split_once('\t')?;
+        (p == purpose).then(|| PathBuf::from(path))
+    });
+    Some(found)
+}
+
 #[derive(Clone)]
 pub struct EffectHost {
     window: adw::ApplicationWindow,
@@ -104,6 +116,16 @@ impl EffectHost {
     }
 
     fn pick(&self, spec: PickSpec, folder: bool, reply: ReplyFn) {
+        if let Some(answer) = scripted_pick(spec.purpose) {
+            let purpose = spec.purpose;
+            glib::idle_add_local_once(move || {
+                reply(Reply::Picked {
+                    purpose,
+                    path: answer,
+                })
+            });
+            return;
+        }
         let dialog = gtk::FileDialog::builder()
             .title(plain(&spec.title).as_ref())
             .modal(true)

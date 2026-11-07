@@ -185,8 +185,7 @@ pub mod ids {
     pub const CD_FLATTEN: &str = "build_disk.cd_flatten";
     pub const CD_NO_PERMISSIONS: &str = "build_disk.cd_no_permissions";
     pub const CD_FORCE: &str = "build_disk.cd_force";
-    pub const CD_APPLEDOUBLE: &str = "build_disk.cd_appledouble";
-    pub const CD_NO_APPLEDOUBLE: &str = "build_disk.cd_no_appledouble";
+    pub const CD_SIDECARS: &str = "build_disk.cd_sidecars";
     pub const OPTION: &str = "build_disk.option";
 }
 
@@ -204,21 +203,39 @@ pub mod hints {
         "Size the disc to the folder plus filesystem overhead, for an image to mount rather than burn.";
     pub const CD_FOLDER: &str = "The folder's contents land at the disc's root; leave it blank \
          to fill the disc later in Inspect or Commander.";
-    pub const CD_EXPAND_ARCHIVES: &str = "Unpack tar and classic Mac archives (.sit, .cpt, \
-         .hqx, ...) into a folder named after each, instead of copying them in as files.";
-    pub const CD_EXPAND_GUNZIP: &str = "Strip the gzip layer off .gz files (a .tgz lands as .tar).";
-    pub const CD_EXPAND_IMAGES: &str = "Copy the files out of disk images (.dsk, .img, DiskCopy, \
-         .dmg, .hfv, ...) into a folder named after each.";
-    pub const CD_FLATTEN: &str = "Unpack every archive into the disc's root rather than a folder \
-         each: the shape IRIX inst wants for a set of .tardist files.";
-    pub const CD_NO_PERMISSIONS: &str = "Ignore the host's Unix mode and ownership.";
-    pub const CD_FORCE: &str = "When two entries land on the same name, keep the later one \
-         instead of stopping the build.";
-    pub const CD_APPLEDOUBLE: &str = "Copy macOS ._ sidecar files in as files too. With neither \
-         sidecar option on, a Mac disc takes their resource fork into the file itself and the \
-         other discs leave them out.";
-    pub const CD_NO_APPLEDOUBLE: &str = "Leave macOS ._ sidecar files out entirely, taking no \
-         resource fork from them either: for a folder that only has them because it came off a \
+    pub const CD_EXPAND_ARCHIVES: &str = "Archives in the folder (.tar, .tardist, .zip, and \
+         classic Mac .sit, .cpt, .hqx) are opened and their contents put on the disc, in a folder \
+         named after each archive. Leave it off to put the archive files on the disc unopened.";
+    pub const CD_EXPAND_GUNZIP: &str = "Files compressed with gzip go on the disc uncompressed: \
+         readme.gz lands as readme, and a .tgz or .tar.gz as a plain .tar. Handy for an old \
+         system with no gunzip. With Unpack archives on too, a .tar.gz is unpacked all the way.";
+    pub const CD_EXPAND_IMAGES: &str = "Disk images in the folder (.dsk, .img, .hfv, .dmg, \
+         DiskCopy) are opened and the files inside them put on the disc, in a folder named after \
+         each image, Mac resource forks included. Leave it off to put the image files themselves \
+         on the disc.";
+    pub const CD_FLATTEN: &str = "Instead of a folder per archive, every archive's contents go \
+         straight into the top of the disc, merged together. This is the layout an IRIX \
+         software CD needs, where inst is pointed at one folder holding every .tardist's \
+         contents. A file found in more than one archive is kept once.";
+    pub const CD_NO_PERMISSIONS: &str = "Normally each file keeps the owner and the read, write \
+         and run permissions it has on this computer. Turn this on to give every file the \
+         disc's standard owner and permissions instead, so the disc does not carry this \
+         computer's user ids.";
+    pub const CD_FORCE: &str = "When two things land at the same place on the disc (two \
+         archives holding the same file, say), the later one replaces the earlier one. With \
+         this off the build stops with an error instead, except when unpacking into the root, \
+         where the first copy is kept.";
+    pub const CD_SIDECARS: &str = "A modern Mac copying files to a disk that is not Mac \
+         formatted stores each file's Mac data (its resource fork, type and creator) in a \
+         hidden ._ file beside it.";
+    pub const CD_SIDECARS_FORK: &str = "Each ._ file is put back into the file it belongs to, \
+         as its resource fork, type and creator, the way a classic Mac kept it. The ._ files \
+         themselves do not appear on the disc.";
+    pub const CD_SIDECARS_KEEP: &str = "The ._ files go on the disc as ordinary files, just as \
+         they are in the folder. On a Mac disc the file they belong to still gets its resource \
+         fork as well.";
+    pub const CD_SIDECARS_EXCLUDE: &str = "The ._ files are left off the disc and nothing is \
+         taken from them. Pick this when they are only there because the folder was on a \
          modern Mac.";
     pub const FIXED_SIZE: &str = "This filesystem has a fixed size; no size to choose.";
     pub const DONOR: &str = "Take the table, its special partitions and their contents from \
@@ -380,32 +397,26 @@ pub enum CdOption {
     ExpandImages,
     Force,
     NoPermissions,
-    ExcludeAppleDouble,
-    IncludeAppleDouble,
 }
 
 impl CdOption {
-    pub const ALL: [CdOption; 8] = [
+    pub const ALL: [CdOption; 6] = [
         CdOption::ExpandArchives,
         CdOption::FlattenFolders,
         CdOption::ExpandGunzip,
         CdOption::ExpandImages,
         CdOption::Force,
         CdOption::NoPermissions,
-        CdOption::ExcludeAppleDouble,
-        CdOption::IncludeAppleDouble,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             CdOption::ExpandArchives => "Unpack archives",
-            CdOption::FlattenFolders => "Unpack into the root",
+            CdOption::FlattenFolders => "Unpack every archive into the root",
             CdOption::ExpandGunzip => "Decompress .gz files",
-            CdOption::ExpandImages => "Open disk images",
-            CdOption::Force => "Overwrite entries with the same name",
-            CdOption::NoPermissions => "Ignore host permissions",
-            CdOption::ExcludeAppleDouble => "Leave out macOS ._ sidecar files",
-            CdOption::IncludeAppleDouble => "Copy macOS ._ sidecar files in as files",
+            CdOption::ExpandImages => "Copy files out of disk images",
+            CdOption::Force => "Replace files with the same name",
+            CdOption::NoPermissions => "Ignore this computer's permissions",
         }
     }
 
@@ -417,8 +428,6 @@ impl CdOption {
             CdOption::ExpandImages => hints::CD_EXPAND_IMAGES,
             CdOption::Force => hints::CD_FORCE,
             CdOption::NoPermissions => hints::CD_NO_PERMISSIONS,
-            CdOption::ExcludeAppleDouble => hints::CD_NO_APPLEDOUBLE,
-            CdOption::IncludeAppleDouble => hints::CD_APPLEDOUBLE,
         }
     }
 
@@ -430,8 +439,6 @@ impl CdOption {
             CdOption::ExpandImages => ids::CD_EXPAND_IMAGES,
             CdOption::Force => ids::CD_FORCE,
             CdOption::NoPermissions => ids::CD_NO_PERMISSIONS,
-            CdOption::ExcludeAppleDouble => ids::CD_NO_APPLEDOUBLE,
-            CdOption::IncludeAppleDouble => ids::CD_APPLEDOUBLE,
         }
     }
 
@@ -443,9 +450,62 @@ impl CdOption {
             CdOption::ExpandImages => &mut i.expand_images,
             CdOption::Force => &mut i.force,
             CdOption::NoPermissions => &mut i.no_permissions,
-            CdOption::ExcludeAppleDouble => &mut i.ignore_appledouble,
-            CdOption::IncludeAppleDouble => &mut i.include_appledouble,
         }
+    }
+}
+
+/// What becomes of the macOS `._` files in the folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdSidecars {
+    /// Taken into their file as its resource fork (Mac discs only).
+    ResourceFork,
+    Keep,
+    Exclude,
+}
+
+impl CdSidecars {
+    pub fn label(self) -> &'static str {
+        match self {
+            CdSidecars::ResourceFork => "Use as resource forks",
+            CdSidecars::Keep => "Leave as-is",
+            CdSidecars::Exclude => "Exclude",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            CdSidecars::ResourceFork => hints::CD_SIDECARS_FORK,
+            CdSidecars::Keep => hints::CD_SIDECARS_KEEP,
+            CdSidecars::Exclude => hints::CD_SIDECARS_EXCLUDE,
+        }
+    }
+
+    /// The choices `layout` offers, its default first.
+    pub fn choices(layout: CdLayout) -> &'static [CdSidecars] {
+        if layout.keeps_forks() {
+            &[
+                CdSidecars::ResourceFork,
+                CdSidecars::Keep,
+                CdSidecars::Exclude,
+            ]
+        } else {
+            &[CdSidecars::Exclude, CdSidecars::Keep]
+        }
+    }
+
+    fn of(layout: CdLayout, i: &CdImport) -> CdSidecars {
+        match (i.include_appledouble, i.ignore_appledouble) {
+            (true, _) => CdSidecars::Keep,
+            (_, true) => CdSidecars::Exclude,
+            // Without a fork to take them into, a disc leaves them out.
+            _ if layout.keeps_forks() => CdSidecars::ResourceFork,
+            _ => CdSidecars::Exclude,
+        }
+    }
+
+    fn apply(self, i: &mut CdImport) {
+        i.include_appledouble = self == CdSidecars::Keep;
+        i.ignore_appledouble = self == CdSidecars::Exclude;
     }
 }
 
@@ -518,6 +578,8 @@ pub enum BuildDiskAction {
     PickCdFolder,
     /// One of the folder-copy switches; ignored while it does not apply.
     SetCdOption(CdOption, bool),
+    /// Ignored when the layout does not offer it.
+    SetCdSidecars(CdSidecars),
     /// "Start from an existing disk...": pick a donor image to lay the table out from.
     PickDonor,
     /// Start from a blank table again.
@@ -821,12 +883,6 @@ impl BuildDiskController {
                         CdOption::NoPermissions if !cd.layout.keeps_permissions() => {
                             Some("HFS keeps no Unix permissions.")
                         }
-                        CdOption::ExcludeAppleDouble if cd.import.include_appledouble => {
-                            Some("Copy macOS ._ sidecar files in as files is on.")
-                        }
-                        CdOption::IncludeAppleDouble if cd.import.ignore_appledouble => {
-                            Some("Leave out macOS ._ sidecar files is on.")
-                        }
                         _ => None,
                     }
                 };
@@ -837,6 +893,19 @@ impl BuildDiskController {
                 }
             })
             .collect()
+    }
+
+    /// What becomes of the folder's macOS `._` files, as the layout reads the settings.
+    pub fn cd_sidecars(&self) -> CdSidecars {
+        CdSidecars::of(self.cd.layout, &self.cd.import)
+    }
+
+    /// Why the `._` choice cannot be changed now.
+    pub fn cd_sidecars_unavailable(&self) -> Option<&'static str> {
+        self.cd
+            .from_dir
+            .is_none()
+            .then_some("Choose a folder to fill the disc from first.")
     }
 
     /// The CD is sized to its folder rather than to the size text.
@@ -1844,6 +1913,12 @@ impl Controller for BuildDiskController {
                     .any(|r| r.option == option && r.unavailable.is_none());
                 if applies {
                     *option.flag(&mut self.cd.import) = on;
+                }
+            }
+            BuildDiskAction::SetCdSidecars(choice) => {
+                let offered = CdSidecars::choices(self.cd.layout).contains(&choice);
+                if offered && self.cd_sidecars_unavailable().is_none() {
+                    choice.apply(&mut self.cd.import);
                 }
             }
             BuildDiskAction::PickCdFolder => {
