@@ -177,6 +177,7 @@ notes = "The FPGA cores. Reached via the HPS. Authoritative for Amiga, X68000 an
 # with exit 77, never fail. See emulator/README.md for what each one is.
 
 # [emulators]
+# linux_kernel = "/path/to/vmlinuz-<version>"   # same version as /lib/modules/<version>
 # freebsd15 = "/path/to/freebsd15"                 # holds fbsd.qcow2
 # icon_cli  = "/path/to/icon-emu/target/release/icon-cli"
 # icon_rom  = "/path/to/icon1_rom_combined.bin"
