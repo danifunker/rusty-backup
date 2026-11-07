@@ -1321,7 +1321,12 @@ impl Target for DiskWriteTarget {
             }
             "Confirm" => DiskWriteAction::Confirmed {
                 purpose: purpose::OVERWRITE_FILE,
-                yes: true,
+                yes: arg.and_then(Value::as_bool).unwrap_or(true),
+            },
+            "PickTargetImage" => DiskWriteAction::PickTargetImage,
+            "Picked" => DiskWriteAction::Picked {
+                purpose: purpose::TARGET_IMAGE,
+                path: Some(self.dir.path().join(arg_str(arg)?)),
             },
             "Close" => DiskWriteAction::Close,
             other => return Err(format!("DiskWriteController has no action {other:?}")),
@@ -1345,6 +1350,16 @@ impl Target for DiskWriteTarget {
                 None => String::new(),
             }),
             "written" => Value::Boolean(self.written()),
+            "writing" => Value::Boolean(self.ctl.is_writing()),
+            "target" => Value::String(
+                self.ctl
+                    .write_target_name()
+                    .map(|t| {
+                        let dir = self.dir.path().display().to_string();
+                        t.replace(dir.as_str(), "$dir")
+                    })
+                    .unwrap_or_default(),
+            ),
             "log" => Value::String(self.log.join("\n")),
             other => return Err(format!("DiskWriteController has no probe {other:?}")),
         })
@@ -2062,6 +2077,10 @@ impl Target for ResizeTarget {
             },
             "Preview" => ResizeAction::Preview,
             "Apply" => ResizeAction::Apply,
+            "Confirm" => ResizeAction::Confirmed {
+                purpose: rusty_backup::controller::resize::purpose::APPLY,
+                yes: arg.and_then(Value::as_bool).ok_or("Confirm needs a bool")?,
+            },
             "Close" => ResizeAction::Close,
             other => return Err(format!("ResizeController has no action {other:?}")),
         };
@@ -2085,6 +2104,8 @@ impl Target for ResizeTarget {
                     .join("; "),
             ),
             "can_apply" => Value::Boolean(self.ctl.can_apply()),
+            "running" => Value::Boolean(self.ctl.is_running()),
+            "target" => Value::String(self.ctl.write_target().unwrap_or_default()),
             "changed" => Value::Boolean(self.changed),
             "log" => Value::String(self.log.join("\n")),
             "file_mib" => Value::Integer(

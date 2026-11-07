@@ -35,6 +35,7 @@ use crate::model::job::{Job, Notify, Snapshot};
 use crate::partition::{PartitionAlignment, PartitionInfo, PartitionTable};
 use dsk_clonezilla::metadata::ClonezillaImage;
 
+pub use crate::controller::browser::{CheckSummary, RepairSummary};
 pub use export::{
     per_partition_refusal, ExportFormatChoice, ExportNotes, ExportSettings, LayoutBar, CHD_REFUSAL,
     EXPORT_FORMATS,
@@ -44,7 +45,7 @@ pub use layout::{
     segment_at, segment_widths, LayoutSegment, PartitionRow, SegmentKind, BAR_HEIGHT,
     LABEL_THRESHOLD_PX, MIN_SEGMENT_PX,
 };
-pub use tools::{FsckView, ResizePlan};
+pub use tools::{CheckReport, FsckView, ResizePlan};
 
 // Plain data the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::model::browse_session::BrowseSession;
@@ -73,6 +74,8 @@ pub mod purpose {
     pub const DISCARD_EDITS: &str = "inspect.discard_edits";
     pub const REPAIR: &str = "inspect.repair";
     pub const DEFRAGMENT: &str = "inspect.defragment";
+    /// Apply Changes in the partition-table editor.
+    pub const APPLY_TABLE: &str = "inspect.apply_table";
     pub const BOOT_DONOR: &str = "inspect.boot_donor";
     pub const SWAB_DEST: &str = "inspect.swab_dest";
     pub const EXPORT_DISK: &str = "inspect.export_disk";
@@ -205,7 +208,7 @@ pub enum InspectAction {
     CloseEditor,
     /// An edit in the partition-table window.
     Table(crate::controller::partition_edit::TableEditAction),
-    /// Apply Changes: validates first, then writes the edits.
+    /// Apply Changes: validates, asks, then writes the edits.
     ApplyTableEdits,
     /// Open the Export Disk Image window.
     OpenExport,
@@ -1197,10 +1200,7 @@ impl Controller for InspectController {
                 self.table_edit(edit);
                 Vec::new()
             }
-            InspectAction::ApplyTableEdits => {
-                self.apply_table_edits();
-                Vec::new()
-            }
+            InspectAction::ApplyTableEdits => self.ask_apply_table(),
             InspectAction::OpenExport => {
                 self.open_export();
                 Vec::new()
@@ -1320,6 +1320,7 @@ impl InspectController {
             }
             purpose::REPAIR if yes => self.repair(),
             purpose::DEFRAGMENT => self.defragment_answered(yes),
+            purpose::APPLY_TABLE => self.apply_table_answered(yes),
             _ => {}
         }
         Vec::new()

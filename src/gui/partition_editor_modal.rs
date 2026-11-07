@@ -24,7 +24,11 @@ pub enum Action {
 }
 
 /// The Inspect tab's table editor. `Apply` comes only while the view says it can.
-pub fn show_table(ui: &mut egui::Ui, view: &TableEditView) -> (Vec<TableEditAction>, Action) {
+pub fn show_table(
+    ui: &mut egui::Ui,
+    view: &TableEditView,
+    target: Option<&str>,
+) -> (Vec<TableEditAction>, Action) {
     let mut open = true;
     let mut action = Action::Stay;
     let mut edits = Vec::new();
@@ -253,6 +257,9 @@ pub fn show_table(ui: &mut egui::Ui, view: &TableEditView) -> (Vec<TableEditActi
                 ui.colored_label(super::theme::success(ui.visuals()), status);
             }
             ui.add_space(4.0);
+            if let Some(target) = target {
+                ui.label(egui::RichText::new(format!("Writes to: {target}")).strong());
+            }
             ui.horizontal(|ui| {
                 if ui.button("Validate").clicked() {
                     edits.push(TableEditAction::Validate);
@@ -415,7 +422,7 @@ mod tests {
                 can_apply: false,
             };
             egui::__run_test_ui(|ui| {
-                let (edits, action) = show_table(ui, &view);
+                let (edits, action) = show_table(ui, &view, Some("disk.img"));
                 assert!(edits.is_empty());
                 assert_eq!(action, Action::Stay);
             });

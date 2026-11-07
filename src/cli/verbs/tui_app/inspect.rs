@@ -491,8 +491,9 @@ impl InspectState {
             Pick::Of(Who::Floppy, purpose) => {
                 self.fact(FloppyConvertAction::Picked { purpose, path })
             }
-            // The writer, the remote picker and Resize ask for no file.
-            Pick::Of(Who::Writer, _) | Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
+            Pick::Of(Who::Writer, purpose) => self.wact(DiskWriteAction::Picked { purpose, path }),
+            // The remote picker and Resize ask for no file.
+            Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
             Pick::WriterImage => {
                 if let Some(path) = path {
                     self.win.image = path.display().to_string();
@@ -535,10 +536,13 @@ impl InspectState {
                 purpose: spec.purpose,
                 text,
             }),
+            Ask::Confirm(Who::Resize, spec) => self.zact(ResizeAction::Confirmed {
+                purpose: spec.purpose,
+                yes,
+            }),
             // The Inspect controller asks no text; the others ask no y / n.
             Ask::Text { .. }
             | Ask::Confirm(Who::Remote, _)
-            | Ask::Confirm(Who::Resize, _)
             | Ask::Confirm(Who::Alto, _)
             | Ask::Confirm(Who::Hfs, _)
             | Ask::Confirm(Who::Floppy, _) => {}
@@ -1383,6 +1387,7 @@ impl App {
         s.ctl.set_browse_dirty(dirty);
         s.ctl.reconcile_devices(devices.as_slice());
         s.writer.reconcile_devices(devices.as_slice());
+        s.resize.reconcile_devices(devices.as_slice());
         let fx = s.ctl.tick();
         s.absorb(Who::Inspect, fx);
         let fx = s.writer.tick();
@@ -1573,7 +1578,8 @@ impl App {
             );
         }
         if let Some(view) = s.ctl.table_editor() {
-            self.draw_table_editor(frame, area, &view, &s.twin);
+            let target = s.ctl.table_write_target();
+            self.draw_table_editor(frame, area, &view, &s.twin, target.as_deref());
         }
         if s.resize.is_open() {
             self.draw_resize(frame, area, &s.resize, &s.rwin);

@@ -204,7 +204,7 @@ pub struct CheckSummary {
 }
 
 impl CheckSummary {
-    pub(super) fn of(r: &FsckResult) -> Self {
+    pub(crate) fn of(r: &FsckResult) -> Self {
         let mut stats_line = format!(
             "Files: {}  Directories: {}",
             r.stats.files_checked, r.stats.directories_checked
@@ -251,7 +251,7 @@ pub struct RepairSummary {
 }
 
 impl RepairSummary {
-    pub(super) fn of(r: &RepairReport) -> Self {
+    pub(crate) fn of(r: &RepairReport) -> Self {
         RepairSummary {
             applied: r.fixes_applied.clone(),
             failed: r.fixes_failed.clone(),

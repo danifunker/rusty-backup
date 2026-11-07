@@ -44,6 +44,8 @@ pub(super) struct ToolState {
     table_apply: Option<Job<TableApply>>,
     editor: PartitionEditor,
     editor_open: bool,
+    /// Apply Changes' question on screen: a yes only counts for exactly what it named.
+    table_asked: Option<String>,
     expand: Option<Job<u64>>,
     expand_chd: bool,
     repack: Option<Job<()>>,
@@ -63,6 +65,7 @@ impl ToolState {
         self.repair_target = None;
         self.pending_repack = None;
         self.boot_pending = None;
+        self.table_asked = None;
     }
 
     pub fn repacking(&self) -> bool {
@@ -95,6 +98,7 @@ impl ToolState {
 
     pub fn close_editor(&mut self) {
         self.editor_open = false;
+        self.table_asked = None;
     }
 }
 
@@ -102,6 +106,14 @@ impl ToolState {
 pub struct FsckView<'a> {
     pub result: &'a FsckResult,
     pub repair: Option<&'a RepairReport>,
+    pub show_debug: bool,
+}
+
+/// The Check results window as plain data, for a view that names no engine type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckReport {
+    pub check: crate::controller::browser::CheckSummary,
+    pub repair: Option<crate::controller::browser::RepairSummary>,
     pub show_debug: bool,
 }
 
@@ -114,6 +126,8 @@ pub struct ResizePlan {
     /// The container's real capacity, never less than the table describes.
     pub size_bytes: u64,
     pub is_device: bool,
+    /// The device the plan was read from, so a refreshed list can tell it left.
+    pub device: Option<crate::device::DeviceIdentity>,
     /// A plain image file can be grown; a device or CHD cannot.
     pub can_grow: bool,
     pub path: PathBuf,
@@ -242,6 +256,18 @@ impl InspectController {
             result: self.tools.fsck_result.as_ref()?,
             repair: self.tools.repair_report.as_ref(),
             show_debug: self.tools.show_debug,
+        })
+    }
+
+    /// The Check results window's content, while it is open.
+    pub fn check_report(&self) -> Option<CheckReport> {
+        let view = self.fsck_view()?;
+        Some(CheckReport {
+            check: crate::controller::browser::CheckSummary::of(view.result),
+            repair: view
+                .repair
+                .map(crate::controller::browser::RepairSummary::of),
+            show_debug: view.show_debug,
         })
     }
 
@@ -546,7 +572,77 @@ impl InspectController {
         ed.add_bootable = false;
     }
 
-    pub(super) fn apply_table_edits(&mut self) {
+    /// The disk or image Apply Changes writes, as its question names it.
+    pub fn table_write_target(&self) -> Option<String> {
+        if let Some(Source::Device { identity, .. }) = &self.source {
+            return Some(format!(
+                "{} ({}, {})",
+                identity.path.display(),
+                identity.media_name,
+                format_size(identity.size_bytes)
+            ));
+        }
+        self.disk_path().map(|p| p.display().to_string())
+    }
+
+    /// Validate the editor; the question Apply Changes asks, when there is something to write.
+    fn table_question(&mut self) -> Option<String> {
+        let table = self.found.table.clone()?;
+        let target = self.table_write_target()?;
+        self.tools.editor.build_and_validate(&table);
+        let editor = &self.tools.editor;
+        if !editor.errors.is_empty() || editor.edits.is_empty() {
+            return None;
+        }
+        let mut msg = format!(
+            "Write {} partition table edit(s) to {target}?\n",
+            editor.edits.len()
+        );
+        for edit in &editor.edits {
+            msg.push_str(&format!("\n  {}", describe_edit(edit)));
+        }
+        msg.push_str("\n\nOnly the table changes: no data is moved or formatted.");
+        Some(msg)
+    }
+
+    /// Apply Changes: validate, then ask before the table is written.
+    pub(super) fn ask_apply_table(&mut self) -> Vec<Effect> {
+        if self.found.table.is_none() {
+            self.error("No partition table loaded");
+            return Vec::new();
+        }
+        if self.tools.table_apply.is_some() || self.backup_folder().is_some() {
+            return Vec::new();
+        }
+        let Some(message) = self.table_question() else {
+            return Vec::new();
+        };
+        self.tools.table_asked = Some(message.clone());
+        vec![Effect::Confirm(ConfirmSpec {
+            purpose: purpose::APPLY_TABLE,
+            title: "Apply Partition Table Changes".into(),
+            message,
+            confirm_label: "Write Table".into(),
+            destructive: true,
+        })]
+    }
+
+    /// The answer to Apply Changes; a yes for a question no longer on screen writes nothing.
+    pub(super) fn apply_table_answered(&mut self, yes: bool) {
+        let Some(asked) = self.tools.table_asked.take() else {
+            return;
+        };
+        if !yes {
+            return;
+        }
+        if self.table_question().as_deref() != Some(asked.as_str()) {
+            self.warn("The table edits changed while the question was open; nothing was written.");
+            return;
+        }
+        self.apply_table_edits();
+    }
+
+    fn apply_table_edits(&mut self) {
         let Some(table) = self.found.table.clone() else {
             self.error("No partition table loaded");
             return;
@@ -642,6 +738,10 @@ impl InspectController {
                 .unwrap_or(0),
             size_bytes: size,
             is_device,
+            device: match &self.source {
+                Some(Source::Device { identity, .. }) => Some(identity.clone()),
+                _ => None,
+            },
             can_grow: !is_device && self.found.chd_path.is_none(),
             path,
         })
@@ -921,6 +1021,51 @@ impl InspectController {
             }
         }
         fx
+    }
+}
+
+/// One edit as Apply Changes' question lists it.
+fn describe_edit(edit: &crate::partition::editor::PartitionTableEdit) -> String {
+    use crate::partition::editor::PartitionTableEdit as E;
+    match edit {
+        E::ResizeEntry {
+            index,
+            new_size_bytes,
+        } => format!("Partition {index}: size {}", format_size(*new_size_bytes)),
+        E::MoveEntry {
+            index,
+            new_start_lba,
+        } => format!("Partition {index}: start at LBA {new_start_lba}"),
+        E::ChangeType {
+            index,
+            new_type_byte,
+            new_type_string,
+        } => match new_type_string {
+            Some(t) => format!("Partition {index}: type {t}"),
+            None => format!("Partition {index}: type 0x{new_type_byte:02X}"),
+        },
+        E::DeleteEntry { index } => format!("Partition {index}: delete"),
+        E::AddEntry {
+            start_lba,
+            size_bytes,
+            partition_type,
+            type_string,
+            bootable,
+        } => {
+            let kind = match type_string {
+                Some(t) => t.clone(),
+                None => format!("0x{partition_type:02X}"),
+            };
+            let boot = if *bootable { ", bootable" } else { "" };
+            format!(
+                "Add: {} at LBA {start_lba}, type {kind}{boot}",
+                format_size(*size_bytes)
+            )
+        }
+        E::SetBootable { index, bootable } => {
+            let on = if *bootable { "boot" } else { "no boot" };
+            format!("Partition {index}: {on}")
+        }
     }
 }
 

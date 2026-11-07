@@ -1,7 +1,7 @@
 # The Inspect table editor's rules every shell (egui, TUI) relies on: Add Partition needs a gap of
 # at least 1 MiB and pre-fills the editor, a row offers Minimum once its minimum is known, a
-# primary row can be deleted and undone, and Apply writes the new entry so the re-read table
-# lists it.
+# primary row can be deleted and undone, and Apply asks, then writes the new entry so the
+# re-read table lists it.
 name = "Inspect: add a partition through the table editor"
 vm = "inspect"
 
@@ -35,6 +35,12 @@ expect = { table_errors = "", table_can_apply = true }
 
 [[step]]
 action = "ApplyTable"
+effects = ["Confirm"]
+expect = { partitions = 1 }
+
+[[step]]
+action = "Confirm"
+arg = true
 settle = true
 expect = { partitions = 2, log = "~Partition table updated successfully." }
 

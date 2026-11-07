@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::controller::log::LogLevel;
 use crate::controller::partition_edit::{BarSegment, LayoutBar};
-use crate::controller::{job_outcome, Controller, Effect};
+use crate::controller::{job_outcome, ConfirmSpec, Controller, Effect};
 use crate::model::job::{Job, Notify, Snapshot};
 use crate::model::partition_resize::{self, parsed_new_size, stamp_mib};
 use crate::model::status::ResizeStatus;
@@ -22,6 +22,12 @@ use crate::partition::{PartitionInfo, PartitionTable};
 pub use crate::controller::inspect::ResizePlan;
 pub use crate::model::size_mode::SizeMode;
 pub use disk_core::display::format_size;
+
+/// The `purpose` of each confirmation this controller asks for.
+pub mod purpose {
+    /// Apply: the partitions are rewritten in place.
+    pub const APPLY: &str = "resize.apply";
+}
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
@@ -50,8 +56,13 @@ pub enum ResizeAction {
     /// "I understand the risks" for a physical device.
     AcceptDeviceRisk(bool),
     Preview,
+    /// Asks first; the write starts on the answer.
     Apply,
     Cancel,
+    Confirmed {
+        purpose: &'static str,
+        yes: bool,
+    },
 }
 
 /// One row of the size grid.
@@ -101,6 +112,8 @@ pub struct ResizeController {
     preview: Option<Vec<PreviewRow>>,
     plan_error: Option<String>,
     device_risk_accepted: bool,
+    /// The question on screen: a yes only counts for exactly what it named.
+    asked: Option<String>,
     job: Option<Job<Result<(), String>>>,
     /// The engine's lines, shared with the running write.
     lines: Arc<Mutex<Vec<String>>>,
@@ -117,6 +130,7 @@ impl ResizeController {
             preview: None,
             plan_error: None,
             device_risk_accepted: false,
+            asked: None,
             job: None,
             lines: Arc::new(Mutex::new(Vec::new())),
             disk_changed: false,
@@ -151,6 +165,51 @@ impl ResizeController {
 
     pub fn device_risk_accepted(&self) -> bool {
         self.device_risk_accepted
+    }
+
+    /// The disk or image the write changes, as the question names it.
+    pub fn write_target(&self) -> Option<String> {
+        let plan = self.plan.as_ref()?;
+        Some(match &plan.device {
+            Some(d) => format!(
+                "{} ({}, {})",
+                d.path.display(),
+                d.media_name,
+                disk_core::display::format_size(d.size_bytes)
+            ),
+            None => plan.path.display().to_string(),
+        })
+    }
+
+    /// What Apply asks: the target and the previewed layout.
+    fn question(&self) -> Option<String> {
+        let target = self.write_target()?;
+        let preview = self.preview.as_ref()?;
+        let mut msg = format!("Resize the partitions of {target}?\n");
+        for r in preview.iter().filter(|r| r.action != "No change") {
+            msg.push_str(&format!(
+                "\n  Partition {}: {} at {} -> {} at {} ({})",
+                r.index, r.old_size, r.old_start, r.new_size, r.new_start, r.action
+            ));
+        }
+        msg.push_str("\n\nThe partitions are rewritten in place. Back up the disk first.");
+        Some(msg)
+    }
+
+    /// A refreshed device list: a device target that left it closes the window unwritten.
+    pub fn reconcile_devices(&mut self, devices: &[crate::device::DiskDevice]) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(want) = self.plan.as_ref().and_then(|p| p.device.clone()) else {
+            return;
+        };
+        if devices.iter().any(|d| d.identity() == want) {
+            return;
+        }
+        self.error("The device being resized is no longer listed; nothing was written.");
+        self.plan = None;
+        self.asked = None;
     }
 
     /// The container's capacity, the bound the new layout must fit.
@@ -281,12 +340,21 @@ impl ResizeController {
             _ => {}
         }
         row.mode = mode;
+        self.stale();
+    }
+
+    /// A size changed: the preview no longer shows what Apply would write.
+    fn stale(&mut self) {
+        self.preview = None;
+        self.plan_error = None;
+        self.asked = None;
     }
 
     fn set_text(&mut self, index: usize, text: String) {
         if let Some(row) = self.row_mut(index) {
-            if row.mode == SizeMode::Custom {
+            if row.mode == SizeMode::Custom && row.text != text {
                 row.text = text;
+                self.stale();
             }
         }
     }
@@ -362,6 +430,39 @@ impl ResizeController {
 
     fn error(&mut self, msg: impl Into<String>) {
         self.log.push((LogLevel::Error, msg.into()));
+    }
+
+    /// Apply: ask before the partitions are rewritten.
+    fn ask(&mut self) -> Vec<Effect> {
+        if !self.can_apply() {
+            return Vec::new();
+        }
+        let Some(message) = self.question() else {
+            return Vec::new();
+        };
+        self.asked = Some(message.clone());
+        vec![Effect::Confirm(ConfirmSpec {
+            purpose: purpose::APPLY,
+            title: "Resize Partitions".to_string(),
+            message,
+            confirm_label: "Resize".to_string(),
+            destructive: true,
+        })]
+    }
+
+    /// The answer to Apply's question; a yes for a question no longer on screen writes nothing.
+    fn answered(&mut self, yes: bool) {
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
+        if !yes {
+            return;
+        }
+        if self.question().as_deref() != Some(asked.as_str()) {
+            self.error("The resize changed while the question was open; nothing was written.");
+            return;
+        }
+        self.start();
     }
 
     /// Re-plan from the fields (the same parser as the preview) and start the write.
@@ -504,7 +605,10 @@ impl Controller for ResizeController {
     fn apply(&mut self, action: ResizeAction) -> Vec<Effect> {
         let edits = !matches!(
             action,
-            ResizeAction::Open(_) | ResizeAction::Close | ResizeAction::Cancel
+            ResizeAction::Open(_)
+                | ResizeAction::Close
+                | ResizeAction::Cancel
+                | ResizeAction::Confirmed { .. }
         );
         if edits && self.job.is_some() {
             return Vec::new();
@@ -514,14 +618,26 @@ impl Controller for ResizeController {
             ResizeAction::Close => {
                 if self.job.is_none() {
                     self.plan = None;
+                    self.asked = None;
                 }
             }
             ResizeAction::SetMode { index, mode } => self.set_mode(index, mode),
             ResizeAction::SetSizeText { index, text } => self.set_text(index, text),
-            ResizeAction::AcceptDeviceRisk(on) => self.device_risk_accepted = on,
-            ResizeAction::Preview => self.compute_preview(),
-            ResizeAction::Apply => self.start(),
+            ResizeAction::AcceptDeviceRisk(on) => {
+                self.device_risk_accepted = on;
+                self.asked = None;
+            }
+            ResizeAction::Preview => {
+                self.asked = None;
+                self.compute_preview();
+            }
+            ResizeAction::Apply => return self.ask(),
             ResizeAction::Cancel => self.cancel(),
+            ResizeAction::Confirmed { purpose, yes } => {
+                if purpose == purpose::APPLY {
+                    self.answered(yes);
+                }
+            }
         }
         Vec::new()
     }
@@ -535,6 +651,94 @@ impl Controller for ResizeController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::job::NoNotify;
+
+    /// The resize plan of a 16 MiB MBR image, as Inspect builds it.
+    fn plan(dir: &std::path::Path) -> ResizePlan {
+        use crate::controller::inspect::{
+            InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
+        };
+        let path = crate::controller::test_fixtures::mbr_with_gap(dir);
+        let mut inspect = InspectController::new(InspectServices {
+            jobs: JobRegistry::new(),
+            notify: Arc::new(NoNotify),
+        });
+        inspect.apply(InspectAction::Open(InspectSource::Image {
+            path,
+            temp: None,
+        }));
+        while inspect.loading().is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            inspect.tick();
+        }
+        inspect.resize_plan().expect("a table")
+    }
+
+    #[test]
+    fn a_device_that_leaves_the_list_closes_the_window_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = plan(dir.path());
+        let device = crate::device::DiskDevice {
+            name: "fake".into(),
+            path: plan.path.clone(),
+            size_bytes: plan.size_bytes,
+            is_removable: true,
+            is_read_only: false,
+            is_system: false,
+            bus_protocol: "USB".into(),
+            media_name: "Fake".into(),
+            partitions: Vec::new(),
+        };
+        plan.is_device = true;
+        plan.device = Some(device.identity());
+        let mut ctl = ResizeController::new(Arc::new(NoNotify));
+        ctl.apply(ResizeAction::Open(Box::new(plan)));
+        assert!(ctl.write_target().unwrap().contains("Fake"));
+        ctl.reconcile_devices(std::slice::from_ref(&device));
+        assert!(ctl.is_open(), "still listed");
+        let mut other = device.clone();
+        other.media_name = "Other".into();
+        ctl.reconcile_devices(&[other]);
+        assert!(!ctl.is_open());
+        assert!(ctl.take_log()[0].1.contains("no longer listed"));
+    }
+
+    #[test]
+    fn apply_asks_and_names_the_previewed_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctl = ResizeController::new(Arc::new(NoNotify));
+        ctl.apply(ResizeAction::Open(Box::new(plan(dir.path()))));
+        let index = ctl.rows()[0].index;
+        ctl.apply(ResizeAction::SetMode {
+            index,
+            mode: SizeMode::Custom,
+        });
+        ctl.apply(ResizeAction::SetSizeText {
+            index,
+            text: "8".into(),
+        });
+        assert!(ctl.apply(ResizeAction::Apply).is_empty(), "no preview yet");
+        ctl.apply(ResizeAction::Preview);
+        let fx = ctl.apply(ResizeAction::Apply);
+        let Some(Effect::Confirm(spec)) = fx.first() else {
+            panic!("{fx:?}");
+        };
+        assert!(spec.message.contains(&ctl.write_target().unwrap()));
+        assert!(spec.message.contains("8.0 MiB"));
+        // The first yes answers the question; a second one has none left.
+        ctl.apply(ResizeAction::Confirmed {
+            purpose: purpose::APPLY,
+            yes: true,
+        });
+        assert!(ctl.is_running());
+        ctl.wait_idle();
+        assert!(ctl.take_disk_changed());
+        ctl.apply(ResizeAction::Confirmed {
+            purpose: purpose::APPLY,
+            yes: true,
+        });
+        assert!(!ctl.is_running(), "the question was answered once");
+    }
 
     #[test]
     fn a_size_row_offers_minimum_only_below_its_size() {

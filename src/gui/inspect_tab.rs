@@ -450,6 +450,7 @@ impl InspectTab {
 
         let mut resize_finished = false;
         if let Some(popup) = self.resize_popup.as_mut() {
+            popup.reconcile_devices(ctx.devices);
             resize_finished = popup.poll(ctx.log);
             if !popup.show(ui, ctx.log) {
                 self.resize_popup = None;
@@ -693,7 +694,9 @@ impl InspectTab {
         let Some(view) = self.ctl.table_editor() else {
             return;
         };
-        let (edits, action) = super::partition_editor_modal::show_table(ui, &view);
+        let target = self.ctl.table_write_target();
+        let (edits, action) =
+            super::partition_editor_modal::show_table(ui, &view, target.as_deref());
         for edit in edits {
             self.act(InspectAction::Table(edit));
         }

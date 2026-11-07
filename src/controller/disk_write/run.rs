@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{finished, purpose, push_log, DiskWriteController};
 use crate::controller::log::LogLevel;
-use crate::controller::{ConfirmSpec, Effect, TextSpec};
+use crate::controller::{ConfirmSpec, Effect, PickSpec, TextSpec};
 use crate::model::job::{Job, Snapshot};
 use crate::model::physical_write_runner::{self, PhysicalWriteStatus};
 
@@ -17,6 +17,8 @@ pub(super) struct RunState {
     /// The finished write's last snapshot, for its bar.
     done: Option<Snapshot>,
     pub last: Option<Outcome>,
+    /// The question on screen: a yes only counts for exactly what it named.
+    pub asked: Option<String>,
 }
 
 impl RunState {
@@ -72,6 +74,32 @@ impl DiskWriteController {
             && !self.run.running()
     }
 
+    /// The target as the questions and the window name it.
+    pub fn write_target_name(&self) -> Option<String> {
+        if let Some(d) = self.target_device() {
+            return Some(d.display_name());
+        }
+        self.target_image().map(|p| p.display().to_string())
+    }
+
+    /// What Write asks now: the target, what part of it, and what goes there.
+    fn question(&self) -> Option<String> {
+        let target = self.write_target_name()?;
+        let source = self.source_label();
+        let what = match self.chosen_partition() {
+            Some(p) => format!(
+                "Writing replaces the contents of partition {} ({}) on {target}.",
+                p.index + 1,
+                p.type_name
+            ),
+            None if self.target_device().is_some() => {
+                format!("Writing erases all data on {target}.")
+            }
+            None => format!("Write the image to {target}? Its contents are replaced."),
+        };
+        Some(format!("{what}\nSource: {source}"))
+    }
+
     /// Check the form, then ask: a device wants its name typed, an image file a yes.
     pub(super) fn write(&mut self) -> Vec<Effect> {
         if !self.can_write() {
@@ -82,16 +110,17 @@ impl DiskWriteController {
             return Vec::new();
         }
         self.error = None;
+        let Some(message) = self.question() else {
+            return Vec::new();
+        };
+        self.run.asked = Some(message.clone());
         if let Some(name) = self.device_name() {
-            let what = if self.target.partition.is_some() {
-                "Writing replaces the contents of the selected partition."
-            } else {
-                "Writing erases all data on the selected device."
-            };
             return vec![Effect::AskText(TextSpec {
                 purpose: purpose::DEVICE_NAME,
                 title: "Confirm Write".to_string(),
-                prompt: format!("{what}\nConfirm: type the device name `{name}` to enable Write"),
+                prompt: format!(
+                    "{message}\nConfirm: type the device name `{name}` to enable Write"
+                ),
                 initial: String::new(),
                 ok_label: "Write to disk".to_string(),
                 unchanged: String::new(),
@@ -102,23 +131,51 @@ impl DiskWriteController {
                 validator: device_name_typed,
             })];
         }
-        let file = self
-            .target_image()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::OVERWRITE_FILE,
             title: "Confirm Write".to_string(),
-            message: format!("Write the image to {file}? Its contents are replaced."),
+            message,
             confirm_label: "Write".to_string(),
             destructive: true,
         })]
     }
 
-    /// The typed device name came back: check it again, then write.
-    pub(super) fn device_name_answered(&mut self, text: &str) {
+    /// The asked question, if it still names what a write would do now.
+    fn still_asked(&mut self) -> bool {
+        let Some(asked) = self.run.asked.take() else {
+            return false;
+        };
+        if self.question().as_deref() == Some(asked.as_str()) {
+            return true;
+        }
+        push_log(
+            &self.log,
+            LogLevel::Warning,
+            "The write target changed while the question was open; nothing was written.",
+        );
+        false
+    }
+
+    /// The image-file question's answer.
+    pub(super) fn file_answered(&mut self, yes: bool) {
+        if !yes {
+            self.run.asked = None;
+            return;
+        }
+        if self.target_device().is_none() && self.still_asked() {
+            self.start_write();
+        }
+    }
+
+    /// The typed device name came back: check it and the question again, then write.
+    pub(super) fn device_name_answered(&mut self, text: Option<String>) {
+        let Some(text) = text else {
+            self.run.asked = None;
+            return;
+        };
         let name = self.device_name().unwrap_or_default();
-        if name.is_empty() || text != name.as_str() {
+        if name.is_empty() || text != name {
+            self.run.asked = None;
             push_log(
                 &self.log,
                 LogLevel::Warning,
@@ -126,7 +183,26 @@ impl DiskWriteController {
             );
             return;
         }
-        self.start_write();
+        if self.still_asked() {
+            self.start_write();
+        }
+    }
+
+    /// Ask where to write the image file.
+    pub(super) fn pick_target_image(&self) -> Vec<Effect> {
+        let name = self
+            .source
+            .as_ref()
+            .and_then(|s| s.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        vec![Effect::PickFile(PickSpec {
+            purpose: purpose::TARGET_IMAGE,
+            title: "Write to an image file".to_string(),
+            filters: Vec::new(),
+            save: true,
+            file_name: name,
+        })]
     }
 
     fn request(&self) -> Result<physical_write_runner::PhysicalWriteRequest, String> {
