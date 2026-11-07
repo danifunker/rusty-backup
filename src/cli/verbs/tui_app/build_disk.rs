@@ -17,8 +17,8 @@ use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, MacDriver, NoNotify,
-    OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, SECTOR_SIZES,
+    BuildDiskController, CdLayout, DiskKind, FormatOptions, FsKind, FsOption, MacDriver, NoNotify,
+    OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -56,6 +56,15 @@ pub(super) enum Row {
     X68kParts,
     SystemDisk,
     SgiLabel,
+    CdLayout,
+    CdName,
+    CdAutoSize,
+    CdFolder,
+    CdExpandArchives,
+    CdExpandGunzip,
+    CdExpandImages,
+    CdFlatten,
+    CdNoPermissions,
     PSize(usize),
     PType(usize),
     PName(usize),
@@ -151,8 +160,10 @@ impl BuildDiskState {
                     self.picker = Some((spec.purpose, FilePicker::new(kind, spec.title)));
                 }
                 Effect::Message(m) => self.status = Some(m),
-                Effect::PickFolder(_)
-                | Effect::Confirm(_)
+                Effect::PickFolder(spec) => {
+                    self.picker = Some((spec.purpose, FilePicker::new(PickKind::Dir, spec.title)));
+                }
+                Effect::Confirm(_)
                 | Effect::AskPassword(_)
                 | Effect::AskText(_)
                 | Effect::Choose(_)
@@ -196,6 +207,27 @@ impl BuildDiskState {
             Step::Disk => {
                 let mut r = Vec::new();
                 match c.kind() {
+                    DiskKind::Cd => {
+                        let cd = c.cd();
+                        r.extend([Row::CdLayout, Row::CdName, Row::CdAutoSize]);
+                        if !c.cd_auto_size() {
+                            r.push(Row::Size);
+                        }
+                        r.push(Row::CdFolder);
+                        if cd.from_dir.is_some() {
+                            r.extend([
+                                Row::CdExpandArchives,
+                                Row::CdExpandGunzip,
+                                Row::CdExpandImages,
+                            ]);
+                            if cd.layout.can_flatten() && cd.import.expand_archives {
+                                r.push(Row::CdFlatten);
+                            }
+                            if cd.layout.keeps_permissions() {
+                                r.push(Row::CdNoPermissions);
+                            }
+                        }
+                    }
                     DiskKind::Preset => {
                         r.push(Row::Preset);
                         match c.preset().kind {
@@ -320,6 +352,7 @@ impl BuildDiskState {
             Row::Confirm => c.confirm_text().to_string(),
             Row::X68kParts => c.preset().x68k_partitions.to_string(),
             Row::SgiLabel => c.preset().sgi_label.clone(),
+            Row::CdName => c.cd().name.clone(),
             _ => return None,
         })
     }
@@ -393,6 +426,11 @@ impl BuildDiskState {
                 p.sgi_label = text;
                 self.act(BuildDiskAction::SetPreset(p));
             }
+            Row::CdName => {
+                let mut cd = self.ctl.cd().clone();
+                cd.name = text;
+                self.act(BuildDiskAction::SetCd(cd));
+            }
             _ => {}
         }
     }
@@ -431,6 +469,36 @@ impl BuildDiskState {
                 let mut p = c.preset().clone();
                 p.x68k_scsi = !p.x68k_scsi;
                 self.act(BuildDiskAction::SetPreset(p));
+            }
+            Row::CdLayout => {
+                let mut cd = c.cd().clone();
+                cd.layout = cycle(&CdLayout::ALL, cd.layout, forward);
+                self.act(BuildDiskAction::SetCd(cd));
+            }
+            Row::CdAutoSize => {
+                let text = if c.cd_auto_size() {
+                    "600M"
+                } else {
+                    CD_AUTO_SIZE
+                };
+                self.act(BuildDiskAction::SetSize(text.to_string()));
+            }
+            Row::CdExpandArchives
+            | Row::CdExpandGunzip
+            | Row::CdExpandImages
+            | Row::CdFlatten
+            | Row::CdNoPermissions => {
+                let mut cd = c.cd().clone();
+                let i = &mut cd.import;
+                let flag = match row {
+                    Row::CdExpandArchives => &mut i.expand_archives,
+                    Row::CdExpandGunzip => &mut i.expand_gunzip,
+                    Row::CdExpandImages => &mut i.expand_images,
+                    Row::CdFlatten => &mut i.flatten_folders,
+                    _ => &mut i.no_permissions,
+                };
+                *flag = !*flag;
+                self.act(BuildDiskAction::SetCd(cd));
             }
             Row::MacDriver => {
                 let next = match c.mac_driver() {
@@ -652,6 +720,7 @@ impl App {
                 Some(Row::OutputImage) => s.act(BuildDiskAction::PickOutputImage),
                 Some(Row::AddPartition) => s.act(BuildDiskAction::Table(BuildAction::AddRow)),
                 Some(Row::SystemDisk) => s.act(BuildDiskAction::PickSystemDisk),
+                Some(Row::CdFolder) => s.act(BuildDiskAction::PickCdFolder),
                 Some(Row::Handler(i)) => s.act(BuildDiskAction::RemoveHandler(i)),
                 Some(Row::AddHandler(i)) => {
                     if let Some(t) = s.ctl.handlers_missing().get(i).cloned() {
@@ -879,6 +948,31 @@ impl App {
                         .unwrap_or_else(|| "(none: seed files; Enter to choose)".into()),
                 ),
                 Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
+                Row::CdLayout => ("Layout".into(), format!("< {} >", c.cd().layout.label())),
+                Row::CdName => ("Volume name".into(), c.cd().name.clone()),
+                Row::CdAutoSize => (
+                    "Size".into(),
+                    if c.cd_auto_size() {
+                        "< sized to the folder >".into()
+                    } else {
+                        "< fixed size >".into()
+                    },
+                ),
+                Row::CdFolder => (
+                    "Fill from".into(),
+                    c.cd()
+                        .from_dir
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(blank disc; Enter to choose a folder)".into()),
+                ),
+                Row::CdExpandArchives => tick("Unpack archives", c.cd().import.expand_archives),
+                Row::CdExpandGunzip => tick("Decompress .gz files", c.cd().import.expand_gunzip),
+                Row::CdExpandImages => tick("Open disk images", c.cd().import.expand_images),
+                Row::CdFlatten => tick("Unpack into the root", c.cd().import.flatten_folders),
+                Row::CdNoPermissions => {
+                    tick("Ignore host permissions", c.cd().import.no_permissions)
+                }
                 Row::PSize(p) => (
                     "  Size".into(),
                     v.rows
@@ -1046,6 +1140,14 @@ impl App {
             self.draw_device_pick(frame, area, s.device_sel, "Pick the device to build on");
         }
     }
+}
+
+/// A check row's label and its `[x]` / `[ ]` value.
+fn tick(label: &str, on: bool) -> (String, String) {
+    (
+        label.to_string(),
+        if on { "[x]".into() } else { "[ ]".into() },
+    )
 }
 
 #[cfg(test)]

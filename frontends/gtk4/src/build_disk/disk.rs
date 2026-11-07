@@ -1,4 +1,4 @@
-//! The Disk step: a table and its donor, a volume's filesystem, or a preset; then the size.
+//! The Disk step: a table and its donor, a volume's filesystem, a preset or a CD-ROM; then the size.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -6,15 +6,15 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::build_disk::{
-    format_size, hints, ids, BuildDiskAction, BuildDiskController, DiskKind, FsKind, PresetKind,
-    PresetView, TableKind,
+    format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdView, DiskKind,
+    FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
 };
 use rusty_backup::controller::partition_edit::{BuildAction, BuildView};
 
 use super::ActionFn;
 use crate::form::{
     button, combo, group, line, path_row, set_combo, set_entry, set_labels, set_line, set_spin,
-    set_subtitle, spin,
+    set_subtitle, set_switch, spin, switch,
 };
 use crate::widgets::{plain, set_text};
 
@@ -24,6 +24,8 @@ const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sect
 pub struct DiskShown {
     kind: DiskKind,
     preset: PresetView,
+    cd: CdView,
+    cd_auto: bool,
     volume_fs: FsKind,
     range: Option<String>,
     view: BuildView,
@@ -40,6 +42,8 @@ impl DiskShown {
         DiskShown {
             kind: ctrl.kind(),
             preset: ctrl.preset().clone(),
+            cd: ctrl.cd().clone(),
+            cd_auto: ctrl.cd_auto_size(),
             volume_fs: ctrl.volume_fs(),
             range: ctrl.volume_size_range(),
             view: ctrl.table_view(),
@@ -159,6 +163,160 @@ impl PresetRows {
     }
 }
 
+/// A CD-ROM's layout, name, size and folder, sent whole as the controller takes them.
+struct CdRows {
+    root: adw::PreferencesGroup,
+    held: Rc<RefCell<Option<CdView>>>,
+    layout: adw::ComboRow,
+    name: adw::EntryRow,
+    auto: adw::SwitchRow,
+    folder: adw::ActionRow,
+    clear: gtk::Button,
+    archives: adw::SwitchRow,
+    flatten: adw::SwitchRow,
+    gunzip: adw::SwitchRow,
+    images: adw::SwitchRow,
+    no_permissions: adw::SwitchRow,
+}
+
+impl CdRows {
+    fn build(send: &ActionFn) -> CdRows {
+        let root = group("CD-ROM");
+        let held: Rc<RefCell<Option<CdView>>> = Rc::default();
+        let edit = |change: Rc<dyn Fn(&mut CdView)>| {
+            let held = held.clone();
+            let send = send.clone();
+            move || {
+                let mut cd = held.borrow().clone();
+                if let Some(c) = cd.as_mut() {
+                    change(c);
+                }
+                if let Some(c) = cd {
+                    send(BuildDiskAction::SetCd(c));
+                }
+            }
+        };
+
+        let labels: Vec<&str> = CdLayout::ALL.iter().map(|l| l.label()).collect();
+        let layout = combo("Layout", ids::CD_LAYOUT, &labels);
+        let picked = layout.clone();
+        let apply = edit(Rc::new(move |c| {
+            if let Some(l) = CdLayout::ALL.get(picked.selected() as usize) {
+                c.layout = *l;
+            }
+        }));
+        layout.connect_selected_notify(move |_| apply());
+        root.add(&layout);
+
+        let name = adw::EntryRow::builder().title("Volume name").build();
+        name.set_widget_name(ids::CD_NAME);
+        let picked = name.clone();
+        let apply = edit(Rc::new(move |c| c.name = picked.text().to_string()));
+        name.connect_changed(move |_| apply());
+        root.add(&name);
+
+        let auto = switch("Size to the folder", ids::CD_AUTO_SIZE);
+        auto.set_tooltip_text(Some(hints::CD_AUTO_SIZE));
+        let s = send.clone();
+        auto.connect_active_notify(move |r| {
+            let text = if r.is_active() { CD_AUTO_SIZE } else { "600M" };
+            s(BuildDiskAction::SetSize(text.to_string()));
+        });
+        root.add(&auto);
+
+        let choose = button("Choose Folder...", ids::CD_FOLDER);
+        choose.set_tooltip_text(Some(hints::CD_FOLDER));
+        let s = send.clone();
+        choose.connect_clicked(move |_| s(BuildDiskAction::PickCdFolder));
+        let folder = path_row("Fill from", &choose);
+        let clear = button("Clear", ids::CD_FOLDER_CLEAR);
+        clear.set_valign(gtk::Align::Center);
+        let apply = edit(Rc::new(|c| c.from_dir = None));
+        clear.connect_clicked(move |_| apply());
+        folder.add_suffix(&clear);
+        root.add(&folder);
+
+        let flag = |title: &str, id: &str, hint: &str, set: fn(&mut CdView, bool)| {
+            let row = switch(title, id);
+            row.set_tooltip_text(Some(hint));
+            let picked = row.clone();
+            let apply = edit(Rc::new(move |c| set(c, picked.is_active())));
+            row.connect_active_notify(move |_| apply());
+            root.add(&row);
+            row
+        };
+        let archives = flag(
+            "Unpack archives",
+            ids::CD_EXPAND_ARCHIVES,
+            hints::CD_EXPAND_ARCHIVES,
+            |c, on| c.import.expand_archives = on,
+        );
+        let flatten = flag(
+            "Unpack into the root",
+            ids::CD_FLATTEN,
+            hints::CD_FLATTEN,
+            |c, on| c.import.flatten_folders = on,
+        );
+        let gunzip = flag(
+            "Decompress .gz files",
+            ids::CD_EXPAND_GUNZIP,
+            hints::CD_EXPAND_GUNZIP,
+            |c, on| c.import.expand_gunzip = on,
+        );
+        let images = flag(
+            "Open disk images",
+            ids::CD_EXPAND_IMAGES,
+            hints::CD_EXPAND_IMAGES,
+            |c, on| c.import.expand_images = on,
+        );
+        let no_permissions = flag(
+            "Ignore host permissions",
+            ids::CD_NO_PERMISSIONS,
+            hints::CD_NO_PERMISSIONS,
+            |c, on| c.import.no_permissions = on,
+        );
+        CdRows {
+            root,
+            held,
+            layout,
+            name,
+            auto,
+            folder,
+            clear,
+            archives,
+            flatten,
+            gunzip,
+            images,
+            no_permissions,
+        }
+    }
+
+    fn show(&self, c: CdView, auto: bool) {
+        let at = CdLayout::ALL.iter().position(|l| *l == c.layout);
+        set_combo(&self.layout, at.unwrap_or(0) as u32);
+        self.layout.set_subtitle(c.layout.hint());
+        set_entry(&self.name, &c.name);
+        set_switch(&self.auto, auto);
+        let dir = c.from_dir.as_ref().map(|d| d.display().to_string());
+        set_subtitle(&self.folder, dir.as_deref().unwrap_or("(a blank disc)"));
+        self.clear.set_visible(dir.is_some());
+        let filled = dir.is_some();
+        for row in [&self.archives, &self.gunzip, &self.images] {
+            row.set_visible(filled);
+        }
+        self.flatten
+            .set_visible(filled && c.layout.can_flatten() && c.import.expand_archives);
+        self.no_permissions
+            .set_visible(filled && c.layout.keeps_permissions());
+        set_switch(&self.archives, c.import.expand_archives);
+        set_switch(&self.flatten, c.import.flatten_folders);
+        set_switch(&self.gunzip, c.import.expand_gunzip);
+        set_switch(&self.images, c.import.expand_images);
+        set_switch(&self.no_permissions, c.import.no_permissions);
+        *self.held.borrow_mut() = Some(c);
+    }
+}
+
 pub struct DiskStep {
     root: gtk::Box,
     table_group: adw::PreferencesGroup,
@@ -169,6 +327,7 @@ pub struct DiskStep {
     table: adw::ComboRow,
     kinds: Rc<Cell<&'static [TableKind]>>,
     preset: PresetRows,
+    cd: CdRows,
     volume_group: adw::PreferencesGroup,
     volume: adw::ComboRow,
     fixed: gtk::Label,
@@ -220,6 +379,7 @@ impl DiskStep {
         table_group.add(&donor_error);
 
         let preset = PresetRows::build(send);
+        let cd = CdRows::build(send);
 
         let volume_group = group("Volume");
         let labels: Vec<&str> = FsKind::ALL.iter().map(|k| k.display_name()).collect();
@@ -282,6 +442,7 @@ impl DiskStep {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
         root.append(&table_group);
         root.append(&preset.root);
+        root.append(&cd.root);
         root.append(&volume_group);
         root.append(&size_group);
         root.append(&layout_group);
@@ -295,6 +456,7 @@ impl DiskStep {
             table,
             kinds,
             preset,
+            cd,
             volume_group,
             volume,
             fixed,
@@ -347,7 +509,9 @@ impl DiskStep {
 
     fn show_size(&self, s: &DiskShown) {
         let fixed = s.kind == DiskKind::Volume && s.range.is_none();
-        self.size_group.set_visible(!fixed || s.is_device);
+        let cd_auto = s.kind == DiskKind::Cd && s.cd_auto;
+        self.size_group
+            .set_visible((!fixed || s.is_device) && !cd_auto);
         self.size.set_visible(!s.is_device);
         self.device_size.set_visible(s.is_device);
         set_entry(&self.size, &s.size_text);
@@ -357,6 +521,7 @@ impl DiskStep {
         };
         set_subtitle(&self.device_size, &text);
         let range = s.range.as_deref().filter(|_| s.kind == DiskKind::Volume);
+        let range = range.or((s.kind == DiskKind::Cd).then_some(hints::CD_SIZE));
         let note = match (&s.size, range) {
             (Ok(n), Some(r)) => format!("{}, {r}", format_size(*n)),
             (Ok(n), None) => format_size(*n),
@@ -374,6 +539,7 @@ impl DiskStep {
         self.layout_group
             .set_visible(s.kind == DiskKind::Partitioned);
         self.preset.root.set_visible(s.kind == DiskKind::Preset);
+        self.cd.root.set_visible(s.kind == DiskKind::Cd);
         self.volume_group.set_visible(s.kind == DiskKind::Volume);
 
         self.show_table(&s);
@@ -383,5 +549,6 @@ impl DiskStep {
         set_line(&self.fixed, fixed.then_some(hints::FIXED_SIZE));
         self.show_size(&s);
         self.preset.show(s.preset);
+        self.cd.show(s.cd, s.cd_auto);
     }
 }

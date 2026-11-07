@@ -12,6 +12,7 @@ pub mod backup_plan;
 pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
+pub mod cd_build;
 pub mod cache_runner;
 #[cfg(feature = "audio")]
 pub mod cd_audio_player;

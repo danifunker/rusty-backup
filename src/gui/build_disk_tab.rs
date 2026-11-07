@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
-    BuildDiskAction, BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption,
-    MacDriver, OptionEdit, PresetKind, RowContent, Step, AFFS_VARIANTS, SECTOR_SIZES,
+    BuildDiskAction, BuildDiskController, CdLayout, DiskKind, FormatOptions, FormatTarget, FsKind,
+    FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step, AFFS_VARIANTS, CD_AUTO_SIZE,
+    SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -205,14 +206,17 @@ impl BuildDiskTab {
 
     fn output_step(&mut self, ui: &mut egui::Ui, ctx: &TabContext) {
         let is_device = self.ctl.output_is_device();
+        let cd = self.ctl.kind() == DiskKind::Cd;
         ui.horizontal(|ui| {
             if ui.radio(!is_device, "Image file").clicked() {
                 self.act(BuildDiskAction::SetOutputIsDevice(false));
             }
-            if ui
-                .radio(is_device, "Physical disk")
-                .on_hover_text(hints::DEVICE)
-                .clicked()
+            // A CD-ROM image is burned from the file, never written to a disk.
+            if !cd
+                && ui
+                    .radio(is_device, "Physical disk")
+                    .on_hover_text(hints::DEVICE)
+                    .clicked()
             {
                 self.act(BuildDiskAction::SetOutputIsDevice(true));
             }
@@ -229,6 +233,9 @@ impl BuildDiskTab {
                     self.act(BuildDiskAction::PickOutputImage);
                 }
             });
+            if cd {
+                return;
+            }
             let cur = self.ctl.container();
             let mut picked = None;
             ui.horizontal(|ui| {
@@ -289,6 +296,70 @@ impl BuildDiskTab {
         );
     }
 
+    /// The CD-ROM's layout, name, size and the folder it is filled from.
+    fn cd_step(&mut self, ui: &mut egui::Ui) {
+        let mut cd = self.ctl.cd().clone();
+        let before = cd.clone();
+        for l in CdLayout::ALL {
+            ui.radio_value(&mut cd.layout, l, l.label())
+                .on_hover_text(l.hint());
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Volume name:");
+            ui.add(egui::TextEdit::singleline(&mut cd.name).desired_width(200.0));
+        });
+        let mut auto = self.ctl.cd_auto_size();
+        if ui
+            .checkbox(&mut auto, "Size to the folder")
+            .on_hover_text(hints::CD_AUTO_SIZE)
+            .changed()
+        {
+            let text = if auto { CD_AUTO_SIZE } else { "600M" };
+            self.act(BuildDiskAction::SetSize(text.to_string()));
+        }
+        if !auto {
+            self.size_row(ui, Some(hints::CD_SIZE.to_string()));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Fill from:");
+            match &cd.from_dir {
+                Some(d) => ui.label(d.display().to_string()),
+                None => ui.label(egui::RichText::new("(a blank disc)").weak()),
+            };
+            if ui
+                .button("Choose Folder...")
+                .on_hover_text(hints::CD_FOLDER)
+                .clicked()
+            {
+                self.act(BuildDiskAction::PickCdFolder);
+            }
+            if cd.from_dir.is_some() && ui.small_button("Clear").clicked() {
+                cd.from_dir = None;
+            }
+        });
+        if cd.from_dir.is_some() {
+            let i = &mut cd.import;
+            ui.checkbox(&mut i.expand_archives, "Unpack archives")
+                .on_hover_text(hints::CD_EXPAND_ARCHIVES);
+            if cd.layout.can_flatten() && i.expand_archives {
+                ui.checkbox(&mut i.flatten_folders, "Unpack into the root")
+                    .on_hover_text(hints::CD_FLATTEN);
+            }
+            ui.checkbox(&mut i.expand_gunzip, "Decompress .gz files")
+                .on_hover_text(hints::CD_EXPAND_GUNZIP);
+            ui.checkbox(&mut i.expand_images, "Open disk images")
+                .on_hover_text(hints::CD_EXPAND_IMAGES);
+            if cd.layout.keeps_permissions() {
+                ui.checkbox(&mut i.no_permissions, "Ignore host permissions")
+                    .on_hover_text(hints::CD_NO_PERMISSIONS);
+            }
+        }
+        if cd != before {
+            self.act(BuildDiskAction::SetCd(cd));
+        }
+    }
+
     fn size_row(&mut self, ui: &mut egui::Ui, hint: Option<String>) {
         if self.ctl.output_is_device() {
             ui.horizontal(|ui| {
@@ -330,6 +401,7 @@ impl BuildDiskTab {
 
     fn disk_step(&mut self, ui: &mut egui::Ui) {
         match self.ctl.kind() {
+            DiskKind::Cd => self.cd_step(ui),
             DiskKind::Preset => {
                 let mut p = self.ctl.preset().clone();
                 let before = p.clone();

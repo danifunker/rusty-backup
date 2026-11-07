@@ -1043,6 +1043,7 @@ impl Target for BuildDiskTarget {
             "SetKind" => A::SetKind(match arg_str(arg)? {
                 "partitioned" => DiskKind::Partitioned,
                 "volume" => DiskKind::Volume,
+                "cd" => DiskKind::Cd,
                 other => return Err(format!("unknown kind {other:?}")),
             }),
             "OutputImage" => {
@@ -1122,6 +1123,31 @@ impl Target for BuildDiskTarget {
                 match t.row {
                     Some(row) => A::SetRowOptions { row, opts },
                     None => A::SetVolumeOptions(opts),
+                }
+            }
+            "CdLayout" => {
+                use rusty_backup::controller::build_disk::CdLayout;
+                let want = arg_str(arg)?;
+                let layout = match want {
+                    "sgi-efs" => CdLayout::SgiEfs,
+                    "mac-hfs" => CdLayout::MacHfs,
+                    "mac-hfsplus" => CdLayout::MacHfsPlus,
+                    "next-ufs" => CdLayout::NextUfs,
+                    other => return Err(format!("no CD layout {other:?}")),
+                };
+                let mut cd = self.ctl.cd().clone();
+                cd.layout = layout;
+                A::SetCd(cd)
+            }
+            // A folder with README and sub/data to fill the disc from.
+            "CdFill" => {
+                let src = self.dir.path().join("cd-src");
+                std::fs::create_dir_all(src.join("sub")).map_err(|e| e.to_string())?;
+                std::fs::write(src.join("README"), b"hello disc\n").map_err(|e| e.to_string())?;
+                std::fs::write(src.join("sub/data"), vec![7u8; 5000]).map_err(|e| e.to_string())?;
+                A::Picked {
+                    purpose: purpose::CD_FOLDER,
+                    path: Some(src),
                 }
             }
             "TypeDevicePath" => A::SetConfirmText(self.ctl.confirm_expected().unwrap_or_default()),

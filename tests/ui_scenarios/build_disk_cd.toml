@@ -1,0 +1,48 @@
+# Build Disk's CD-ROM kind: no device output, an automatic size needs a folder, then a classic
+# Mac disc sized to and filled from a folder; its HFS volume opens.
+name = "Build Disk: a CD-ROM image filled from a folder"
+vm = "build_disk"
+
+[[step]]
+action = "SetKind"
+arg = "cd"
+expect = { steps = "Kind,Output,Disk,Review,Build" }
+
+[[step]]
+action = "Next"
+expect = { step = "Output" }
+
+[[step]]
+action = "OutputDevice"
+arg = "8M"
+expect = { blocked = "~saved as a file" }
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk", blocked = "" }
+
+[[step]]
+action = "CdLayout"
+arg = "mac-hfs"
+
+[[step]]
+action = "SetSize"
+arg = "auto"
+expect = { blocked = "~needs a folder" }
+
+[[step]]
+action = "CdFill"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", blocked = "" }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { step = "Build", result = "ok", opens = 1 }

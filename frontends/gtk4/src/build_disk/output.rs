@@ -20,6 +20,8 @@ const KINDS: [&str; 2] = ["Image file", "Physical disk"];
 /// What the step shows.
 pub struct OutputShown {
     is_device: bool,
+    /// A CD-ROM is a raw file: no device, no container.
+    cd: bool,
     image: Option<String>,
     container: ExportFormat,
     devices: Vec<DiskDevice>,
@@ -30,6 +32,7 @@ impl OutputShown {
     pub fn read(ctrl: &BuildDiskController, devices: &[DiskDevice]) -> OutputShown {
         OutputShown {
             is_device: ctrl.output_is_device(),
+            cd: ctrl.kind() == rusty_backup::controller::build_disk::DiskKind::Cd,
             image: ctrl.image().map(|p| p.display().to_string()),
             container: ctrl.container(),
             devices: devices.to_vec(),
@@ -118,8 +121,10 @@ impl OutputStep {
 
     pub fn show(&self, s: OutputShown) {
         set_combo(&self.kind, u32::from(s.is_device));
+        // A CD-ROM image is burned from the file, so it never offers a device or a container.
+        self.kind.set_visible(!s.cd || s.is_device);
         self.image.set_visible(!s.is_device);
-        self.container.set_visible(!s.is_device);
+        self.container.set_visible(!s.is_device && !s.cd);
         self.device.set_visible(s.is_device);
         set_subtitle(&self.image, s.image.as_deref().unwrap_or("(not chosen)"));
         let at = self.formats.iter().position(|c| *c == s.container);

@@ -392,7 +392,11 @@ The app has five tabs:
   equivalent is `rb-cli build`, for example
   `rb-cli build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`,
   or `rb-cli build /dev/sdX --table rdb --partition 500M --partition rest --format 1=pfs3:Work --format 2=sfs --yes`
-  for an SD card.
+  for an SD card. Build Disk also makes CD-ROM images (`.iso`) in a
+  platform's own layout: an IRIX EFS disc, a classic Mac HFS or HFS+ disc,
+  or a NeXTSTEP UFS disc, blank or filled from a folder (archives and disk
+  images optionally unpacked on the way), sized by hand or to the folder.
+  There is no ISO 9660 side; the CLI equivalent is `rb-cli optical new`.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox

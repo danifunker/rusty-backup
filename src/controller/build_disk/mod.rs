@@ -124,6 +124,7 @@ pub mod purpose {
     pub const MAC_DRIVER: &str = "build_disk.mac_driver";
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const DONOR: &str = "build_disk.donor";
+    pub const CD_FOLDER: &str = "build_disk.cd_folder";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -173,6 +174,16 @@ pub mod ids {
     pub const REMOVE_HANDLER: &str = "build_disk.remove_handler";
     pub const MAC_DRIVER: &str = "build_disk.mac_driver";
     pub const MAC_DRIVER_DISK: &str = "build_disk.mac_driver_disk";
+    pub const CD_LAYOUT: &str = "build_disk.cd_layout";
+    pub const CD_NAME: &str = "build_disk.cd_name";
+    pub const CD_AUTO_SIZE: &str = "build_disk.cd_auto_size";
+    pub const CD_FOLDER: &str = "build_disk.cd_folder";
+    pub const CD_FOLDER_CLEAR: &str = "build_disk.cd_folder_clear";
+    pub const CD_EXPAND_ARCHIVES: &str = "build_disk.cd_expand_archives";
+    pub const CD_EXPAND_GUNZIP: &str = "build_disk.cd_expand_gunzip";
+    pub const CD_EXPAND_IMAGES: &str = "build_disk.cd_expand_images";
+    pub const CD_FLATTEN: &str = "build_disk.cd_flatten";
+    pub const CD_NO_PERMISSIONS: &str = "build_disk.cd_no_permissions";
     pub const OPTION: &str = "build_disk.option";
 }
 
@@ -184,6 +195,20 @@ pub mod hints {
     pub const DEVICE_WARNING: &str =
         "Building erases everything on the device. The disk is built at the device's own size.";
     pub const SIZE: &str = "Accepts K / M / G suffixes, e.g. 512M or 2G.";
+    pub const CD_SIZE: &str = "A CD-R holds about 650-700 MiB; a larger image still works in an \
+         emulator.";
+    pub const CD_AUTO_SIZE: &str =
+        "Size the disc to the folder plus filesystem overhead, for an image to mount rather than burn.";
+    pub const CD_FOLDER: &str = "The folder's contents land at the disc's root; leave it blank \
+         to fill the disc later in Inspect or Commander.";
+    pub const CD_EXPAND_ARCHIVES: &str = "Unpack tar and classic Mac archives (.sit, .cpt, \
+         .hqx, ...) into a folder named after each, instead of copying them in as files.";
+    pub const CD_EXPAND_GUNZIP: &str = "Strip the gzip layer off .gz files (a .tgz lands as .tar).";
+    pub const CD_EXPAND_IMAGES: &str = "Copy the files out of disk images (.dsk, .img, DiskCopy, \
+         .dmg, .hfv, ...) into a folder named after each.";
+    pub const CD_FLATTEN: &str = "Unpack every archive into the disc's root rather than a folder \
+         each: the shape IRIX inst wants for a set of .tardist files.";
+    pub const CD_NO_PERMISSIONS: &str = "Ignore the host's Unix mode and ownership.";
     pub const FIXED_SIZE: &str = "This filesystem has a fixed size; no size to choose.";
     pub const DONOR: &str = "Take the table, its special partitions and their contents from \
          another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
@@ -248,16 +273,24 @@ pub enum DiskKind {
     Volume,
     /// A fixed-shape bootable disk (X68000, SGI IRIX).
     Preset,
+    /// A CD-ROM image in one of the native layouts `model::cd_build` masters.
+    Cd,
 }
 
 impl DiskKind {
-    pub const ALL: [DiskKind; 3] = [DiskKind::Partitioned, DiskKind::Volume, DiskKind::Preset];
+    pub const ALL: [DiskKind; 4] = [
+        DiskKind::Partitioned,
+        DiskKind::Volume,
+        DiskKind::Preset,
+        DiskKind::Cd,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             DiskKind::Partitioned => "Partitioned disk",
             DiskKind::Volume => "Single volume (no partition table)",
             DiskKind::Preset => "Bootable preset (X68000, SGI IRIX)",
+            DiskKind::Cd => "CD-ROM image (IRIX EFS, Mac HFS / HFS+, NeXTSTEP UFS)",
         }
     }
 
@@ -274,6 +307,10 @@ impl DiskKind {
             DiskKind::Preset => {
                 "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or an SGI \
                  IRIX disk with its volume header and an EFS root."
+            }
+            DiskKind::Cd => {
+                "A CD-ROM image (.iso) in a platform's own layout, blank or filled from a folder. \
+                 There is no ISO 9660 side: each disc is read by the system it is made for."
             }
         }
     }
@@ -310,6 +347,21 @@ pub struct PresetView {
     /// SGI: the EFS volume label (6 bytes).
     pub sgi_label: String,
 }
+
+pub use crate::model::cd_build::{CdImport, CdLayout};
+
+/// A CD-ROM's fields, for the Disk step; its size is the shared size text, or `auto`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdView {
+    pub layout: CdLayout,
+    pub name: String,
+    /// The folder the disc is filled from; `None` leaves it blank.
+    pub from_dir: Option<PathBuf>,
+    pub import: CdImport,
+}
+
+/// The size text that sizes a CD to its folder.
+pub const CD_AUTO_SIZE: &str = "auto";
 
 /// What a row holds after the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +413,10 @@ pub enum BuildDiskAction {
     SetPreset(PresetView),
     /// "Choose..." for the X68000 preset's system floppy.
     PickSystemDisk,
+    /// The CD-ROM and its fields, edited as one.
+    SetCd(CdView),
+    /// "Choose..." for the folder a CD is filled from.
+    PickCdFolder,
     /// "Start from an existing disk...": pick a donor image to lay the table out from.
     PickDonor,
     /// Start from a blank table again.
@@ -405,6 +461,7 @@ pub struct BuildDiskController {
     builder: DiskBuilder,
     volume: RowFormat,
     preset: PresetView,
+    cd: CdView,
     size_text: String,
     output_is_device: bool,
     device: Option<(usize, DiskDevice)>,
@@ -439,6 +496,12 @@ impl BuildDiskController {
                 x68k_partitions: 1,
                 x68k_system_disk: None,
                 sgi_label: "irix".to_string(),
+            },
+            cd: CdView {
+                layout: CdLayout::MacHfs,
+                name: CdLayout::MacHfs.default_name().to_string(),
+                from_dir: None,
+                import: CdImport::default(),
             },
             size_text: "512M".to_string(),
             output_is_device: false,
@@ -492,7 +555,7 @@ impl BuildDiskController {
                 }
             }
             DiskKind::Volume => v.push(Step::Options),
-            DiskKind::Preset => {}
+            DiskKind::Preset | DiskKind::Cd => {}
         }
         v.push(Step::Review);
         v.push(Step::Build);
@@ -566,6 +629,9 @@ impl BuildDiskController {
         if self.kind == DiskKind::Volume && self.volume.kind.caps().fixed_size {
             return self.fixed_volume_size();
         }
+        if self.kind == DiskKind::Cd && self.cd_auto_size() {
+            return Err("Sized to the folder when it is built.".to_string());
+        }
         match crate::partition::parse_size(self.size_text.as_str()) {
             Ok(0) => Err("The size must be more than zero.".to_string()),
             Ok(n) => Ok(n),
@@ -629,6 +695,15 @@ impl BuildDiskController {
         &self.preset
     }
 
+    pub fn cd(&self) -> &CdView {
+        &self.cd
+    }
+
+    /// The CD is sized to its folder rather than to the size text.
+    pub fn cd_auto_size(&self) -> bool {
+        self.size_text.trim().eq_ignore_ascii_case(CD_AUTO_SIZE)
+    }
+
     /// The donor the layout started from: its path and table name.
     pub fn donor(&self) -> Option<(&Path, &str)> {
         self.builder
@@ -680,7 +755,7 @@ impl BuildDiskController {
                 format!("Volume ({})", self.volume.kind.display_name()),
                 &self.volume,
             )],
-            DiskKind::Preset => Vec::new(),
+            DiskKind::Preset | DiskKind::Cd => Vec::new(),
             DiskKind::Partitioned => self
                 .builder
                 .rows
@@ -798,6 +873,9 @@ impl BuildDiskController {
     }
 
     fn output_blocked(&self) -> Option<String> {
+        if self.kind == DiskKind::Cd && self.output_is_device {
+            return Some("A CD-ROM image is saved as a file; choose Image file.".to_string());
+        }
         if !self.output_is_device {
             return match self.image {
                 Some(_) => None,
@@ -818,6 +896,9 @@ impl BuildDiskController {
     }
 
     fn disk_blocked(&self) -> Option<String> {
+        if self.kind == DiskKind::Cd {
+            return self.cd_blocked();
+        }
         let size = match self.disk_size() {
             Ok(s) => s,
             Err(e) => return Some(e),
@@ -826,7 +907,35 @@ impl BuildDiskController {
             DiskKind::Partitioned => None,
             DiskKind::Volume => self.volume.fits(size).err(),
             DiskKind::Preset => self.preset_blocked(size),
+            DiskKind::Cd => self.cd_blocked(),
         }
+    }
+
+    /// What the CD's fields lack: a size or a folder to measure, a folder that exists.
+    fn cd_blocked(&self) -> Option<String> {
+        if let Some(dir) = &self.cd.from_dir {
+            if !dir.is_dir() {
+                return Some(format!("{} is not a folder.", dir.display()));
+            }
+        }
+        if self.cd_auto_size() {
+            return self
+                .cd
+                .from_dir
+                .is_none()
+                .then(|| "An automatic size needs a folder to fill the disc from.".to_string());
+        }
+        let size = match self.disk_size() {
+            Ok(s) => s,
+            Err(e) => return Some(e),
+        };
+        if self.cd.layout == CdLayout::NextUfs {
+            let opts = crate::partition::next_cd_builder::NextCdOptions::new(size, "");
+            return crate::partition::next_cd_builder::plan_next_ufs_cd(&opts)
+                .err()
+                .map(|e| format!("{e:#}"));
+        }
+        None
     }
 
     /// The size the preset is built at: a device's size rounded down to what the preset takes.
@@ -880,7 +989,7 @@ impl BuildDiskController {
                 return Some(format!("{}: {e}", step.label()));
             }
         }
-        if !self.output_is_device {
+        if !self.output_is_device && self.kind != DiskKind::Cd {
             if let Some(why) = self
                 .disk_size()
                 .ok()
@@ -900,12 +1009,18 @@ impl BuildDiskController {
     /// The Review step's summary lines.
     pub fn review_lines(&self) -> Vec<String> {
         let mut v = Vec::new();
-        let size = self.disk_size().map(format_size).unwrap_or_default();
+        let size = match self.disk_size() {
+            Ok(s) => format_size(s),
+            Err(_) if self.kind == DiskKind::Cd => "sized to the folder".to_string(),
+            Err(_) => String::new(),
+        };
         v.push(match (&self.device, self.output_is_device, &self.image) {
             (Some((_, d)), true, _) => {
                 format!("Write to {} ({size}), erasing it", d.display_name())
             }
-            (_, false, Some(p)) if self.container == ExportFormat::Raw => {
+            (_, false, Some(p))
+                if self.container == ExportFormat::Raw || self.kind == DiskKind::Cd =>
+            {
                 format!("Save as {} ({size})", p.display())
             }
             (_, false, Some(p)) => format!(
@@ -932,6 +1047,35 @@ impl BuildDiskController {
                         }
                     }
                     PresetKind::SgiEfs => v.push(format!("EFS label {:?}", p.sgi_label)),
+                }
+            }
+            DiskKind::Cd => {
+                let c = &self.cd;
+                v.push(format!("{}, volume name {:?}", c.layout.label(), c.name));
+                v.push(match &c.from_dir {
+                    Some(d) => format!("Filled from {}", d.display()),
+                    None => "Left blank".to_string(),
+                });
+                let i = &c.import;
+                let mut how = Vec::new();
+                if i.expand_archives {
+                    how.push(if i.flatten_folders && c.layout.can_flatten() {
+                        "archives unpacked into the root"
+                    } else {
+                        "archives unpacked"
+                    });
+                }
+                if i.expand_gunzip {
+                    how.push(".gz files decompressed");
+                }
+                if i.expand_images {
+                    how.push("disk images opened up");
+                }
+                if i.no_permissions && c.layout.keeps_permissions() {
+                    how.push("host permissions ignored");
+                }
+                if c.from_dir.is_some() && !how.is_empty() {
+                    v.push(format!("While copying: {}", how.join(", ")));
                 }
             }
             DiskKind::Partitioned => {
@@ -1007,6 +1151,23 @@ impl BuildDiskController {
     /// Warnings shown on Review that do not block the build.
     pub fn warnings(&self) -> Vec<String> {
         let mut v = Vec::new();
+        if self.kind == DiskKind::Cd {
+            let limit = self.cd.layout.name_limit();
+            if self.cd.name.len() > limit {
+                v.push(format!(
+                    "Warning: this disc keeps the first {limit} bytes of the volume name"
+                ));
+            }
+            if self
+                .disk_size()
+                .is_ok_and(|s| s > crate::model::cd_build::CD_R_BYTES)
+            {
+                v.push(
+                    "Info: larger than a 700 MB CD-R - fine for an emulator, too big to burn"
+                        .to_string(),
+                );
+            }
+        }
         if self.kind == DiskKind::Partitioned {
             let mut b = self.builder.clone();
             b.validate();
@@ -1069,12 +1230,19 @@ impl BuildDiskController {
                 PresetKind::X68k => "x68000.hds".to_string(),
                 PresetKind::SgiEfs => "irix.img".to_string(),
             },
+            DiskKind::Cd => "disc.iso".to_string(),
+        };
+        let (kind_name, ext) = match self.kind {
+            DiskKind::Cd => ("CD-ROM images", "iso"),
+            DiskKind::Partitioned | DiskKind::Volume | DiskKind::Preset => {
+                ("Raw disk images", "img")
+            }
         };
         vec![Effect::PickFile(PickSpec {
             purpose: purpose::OUTPUT_IMAGE,
             title: "Save the new disk image as".to_string(),
             filters: vec![
-                ("Raw disk images".to_string(), vec!["img".to_string()]),
+                (kind_name.to_string(), vec![ext.to_string()]),
                 ("All Files".to_string(), vec!["*".to_string()]),
             ],
             save: true,
@@ -1138,6 +1306,7 @@ impl BuildDiskController {
                 self.image = Some(path);
             }
             purpose::SYSTEM_DISK => self.preset.x68k_system_disk = Some(path),
+            purpose::CD_FOLDER => self.cd.from_dir = Some(path),
             purpose::DONOR => {
                 self.donor_error = None;
                 self.donor_job = Some(Job::spawn(
@@ -1237,10 +1406,34 @@ impl BuildDiskController {
             (false, _, Some(p)) => p.clone(),
             _ => return,
         };
-        let Ok(size) = self.disk_size() else {
+        let size = self.disk_size();
+        if self.kind == DiskKind::Cd {
+            let c = &self.cd;
+            let request = crate::model::provision_runner::BuildRequest::Cd {
+                target_path: target.clone(),
+                request: crate::model::cd_build::CdRequest {
+                    layout: c.layout,
+                    size: size.as_ref().ok().copied(),
+                    name: c.name.clone(),
+                    from_dir: c.from_dir.clone(),
+                    import: c.import.clone(),
+                    mac_block_size: None,
+                    bytes_per_inode: None,
+                },
+            };
+            self.push(
+                LogLevel::Info,
+                format!("Building a CD-ROM image at {}", target.display()),
+            );
+            self.start_job(request, None);
+            return;
+        }
+        let Ok(size) = size else {
             return;
         };
         let request = match self.kind {
+            // Started above, before the size was required.
+            DiskKind::Cd => return,
             DiskKind::Preset => {
                 let p = &self.preset;
                 crate::model::provision_runner::BuildRequest::Preset {
@@ -1302,6 +1495,15 @@ impl BuildDiskController {
             format!("Building on {} ({})", target.display(), format_size(size)),
         );
         let container = (!self.output_is_device).then_some(self.container);
+        self.start_job(request, container);
+    }
+
+    /// Run `request` as the build job, its log lines landing in the panel.
+    fn start_job(
+        &mut self,
+        request: crate::model::provision_runner::BuildRequest,
+        container: Option<ExportFormat>,
+    ) {
         let sink = Arc::clone(&self.log);
         self.outcome = None;
         self.finished = None;
@@ -1434,7 +1636,15 @@ impl Controller for BuildDiskController {
                 }
             }
             _ if !editable => {}
-            BuildDiskAction::SetKind(k) => self.kind = k,
+            BuildDiskAction::SetKind(k) => {
+                // A CD is a file, raw, with a CD's size.
+                if k == DiskKind::Cd && self.kind != DiskKind::Cd {
+                    self.output_is_device = false;
+                    self.container = ExportFormat::Raw;
+                    self.size_text = "600M".to_string();
+                }
+                self.kind = k;
+            }
             BuildDiskAction::SetOutputIsDevice(on) => self.output_is_device = on,
             BuildDiskAction::SetContainer(c) => self.container = c,
             BuildDiskAction::SelectDevice { row, device } => {
@@ -1468,6 +1678,26 @@ impl Controller for BuildDiskController {
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
             BuildDiskAction::SetPreset(p) => self.preset = p,
+            BuildDiskAction::SetCd(c) => {
+                // A layout change takes that layout's default name, unless one was typed.
+                if c.layout != self.cd.layout && self.cd.name == self.cd.layout.default_name() {
+                    self.cd = CdView {
+                        name: c.layout.default_name().to_string(),
+                        ..c
+                    };
+                } else {
+                    self.cd = c;
+                }
+            }
+            BuildDiskAction::PickCdFolder => {
+                return vec![Effect::PickFolder(PickSpec {
+                    purpose: purpose::CD_FOLDER,
+                    title: "Fill the disc from this folder".to_string(),
+                    filters: Vec::new(),
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
             BuildDiskAction::PickDonor => {
                 return vec![Effect::PickFile(PickSpec {
                     purpose: purpose::DONOR,
