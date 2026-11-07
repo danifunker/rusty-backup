@@ -30,6 +30,20 @@ pub mod ids {
     pub const CLOSE: &str = "floppy_convert.close";
 }
 
+/// Inspect's button hover.
+pub const BUTTON_HINT: &str = "Convert between XDF, HDM, DIM, and D88 floppy container formats \
+    (X68000 / PC-98 / FM-7).";
+pub const BULK_NOTE: &str = "Converting a folder of floppies? Use the main Bulk Convert dialog \
+    (XDF / HDM / DIM / D88 are listed there as output formats).";
+pub const SAME_FORMAT_NOTE: &str =
+    "Source and target match - the output will be a byte-identical copy.";
+
+/// A path row's text.
+pub fn path_label(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(not chosen)".to_string())
+}
+
 /// User intents.
 pub enum FloppyConvertAction {
     /// Open the dialog, with a source to sniff or empty.
@@ -135,6 +149,15 @@ impl FloppyConvertController {
     /// The form is editable: nothing has run on this source yet.
     pub fn editable(&self) -> bool {
         self.job.is_none() && self.outcome.is_none()
+    }
+
+    /// The dismiss button: Close once a run ended, Cancel before.
+    pub fn close_label(&self) -> &'static str {
+        if self.outcome.is_some() {
+            "Close"
+        } else {
+            "Cancel"
+        }
     }
 
     pub fn can_start(&self) -> bool {

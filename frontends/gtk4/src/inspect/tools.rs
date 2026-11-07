@@ -6,11 +6,12 @@ use adw::prelude::*;
 use rusty_backup::controller::inspect::{hints, ids, InspectAction};
 
 use super::ActionFn;
-use crate::widgets::{coming, flow, flow_show};
+use crate::widgets::{flow, flow_show};
 
 /// What the buttons show, read from the controller.
 pub struct ToolState {
     pub can_reinspect: bool,
+    pub can_export: bool,
     pub can_edit_table: bool,
     pub can_add_partition: bool,
     pub add_hint: String,
@@ -27,6 +28,7 @@ pub struct ToolState {
 pub struct ToolBar {
     root: gtk::FlowBox,
     reinspect: gtk::Button,
+    export: gtk::Button,
     edit: gtk::Button,
     add: gtk::Button,
     expand: gtk::Button,
@@ -43,12 +45,6 @@ fn button(label: &str, id: &str) -> gtk::Button {
     button
 }
 
-fn stub(label: &str, id: &str, what: &str) -> gtk::Button {
-    let b = button(label, id);
-    coming(&b, what);
-    b
-}
-
 fn live(label: &str, id: &str, send: &ActionFn, action: fn() -> InspectAction) -> gtk::Button {
     let b = button(label, id);
     let send = send.clone();
@@ -63,21 +59,21 @@ fn view(label: &str, id: &str, run: Rc<dyn Fn()>) -> gtk::Button {
 }
 
 impl ToolBar {
-    /// `expand_image` and `resize` open the view's own windows.
-    pub fn build(send: &ActionFn, expand_image: Rc<dyn Fn()>, resize: Rc<dyn Fn()>) -> ToolBar {
+    /// `expand_image`, `resize` and `floppy` open the view's own windows.
+    pub fn build(
+        send: &ActionFn,
+        expand_image: Rc<dyn Fn()>,
+        resize: Rc<dyn Fn()>,
+        floppy: Rc<dyn Fn()>,
+    ) -> ToolBar {
         let reinspect = live("Re-inspect", ids::REINSPECT, send, || {
             InspectAction::Reinspect
         });
-        let export = stub(
-            "Export Disk Image...",
-            ids::EXPORT,
-            "the Export Disk Image dialog",
-        );
-        let floppy = stub(
-            "Convert Floppy Container...",
-            ids::CONVERT_FLOPPY,
-            "the floppy convert dialog",
-        );
+        let export = live("Export Disk Image...", ids::EXPORT, send, || {
+            InspectAction::OpenExport
+        });
+        let floppy = view("Convert Floppy Container...", ids::CONVERT_FLOPPY, floppy);
+        floppy.set_tooltip_text(Some(rusty_backup::controller::floppy_convert::BUTTON_HINT));
         let edit = live("Edit Partition Table...", ids::EDIT_TABLE, send, || {
             InspectAction::EditTable
         });
@@ -102,6 +98,7 @@ impl ToolBar {
         ToolBar {
             root,
             reinspect,
+            export,
             edit,
             add,
             expand,
@@ -119,6 +116,7 @@ impl ToolBar {
 
     pub fn show(&self, state: &ToolState) {
         self.reinspect.set_sensitive(state.can_reinspect);
+        self.export.set_sensitive(state.can_export);
         self.edit.set_sensitive(state.can_edit_table);
         self.add.set_sensitive(state.can_add_partition);
         self.add.set_tooltip_text(Some(&state.add_hint));

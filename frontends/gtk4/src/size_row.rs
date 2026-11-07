@@ -90,6 +90,12 @@ impl SizeCell {
         grid.attach(&size, column + 1, row, 1, 1);
     }
 
+    /// A hover on the size, such as the largest size a capped volume can take.
+    pub fn set_tooltip(&self, text: Option<&str>) {
+        self.spin.set_tooltip_text(text);
+        self.mode.set_tooltip_text(text);
+    }
+
     /// Run inside the screen's `SyncGuard`.
     pub fn show(&self, s: SizeShown) {
         // First: replacing the list fires selected-notify, which reads the choices.

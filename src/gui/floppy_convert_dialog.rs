@@ -6,7 +6,8 @@
 //! lives in the Bulk Convert dialog and `rb-cli floppy convert <dir> <dir> --to <fmt>`.
 
 use rusty_backup::controller::floppy_convert::{
-    FloppyConvertAction, FloppyConvertController, FloppyTarget,
+    path_label, FloppyConvertAction, FloppyConvertController, FloppyTarget, BULK_NOTE,
+    SAME_FORMAT_NOTE,
 };
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller, Effect};
@@ -62,12 +63,7 @@ impl FloppyConvertDialog {
         window.resizable(true).default_width(520.0).show(ctx, |ui| {
             ui.label(egui::RichText::new("Source").strong());
             ui.horizontal(|ui| {
-                let label = self
-                    .ctl
-                    .source()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(not chosen)".to_string());
-                ui.label(label);
+                ui.label(path_label(self.ctl.source()));
                 if ui
                     .add_enabled(!busy, egui::Button::new("Choose File..."))
                     .clicked()
@@ -84,14 +80,7 @@ impl FloppyConvertDialog {
             if let Some(err) = self.ctl.source_error() {
                 ui.colored_label(super::theme::danger(ui.visuals()), err);
             }
-            ui.label(
-                egui::RichText::new(
-                    "Converting a folder of floppies? Use the main Bulk Convert dialog \
-                     (XDF / HDM / DIM / D88 are listed there as output formats).",
-                )
-                .small()
-                .italics(),
-            );
+            ui.label(egui::RichText::new(BULK_NOTE).small().italics());
 
             ui.separator();
             ui.label(egui::RichText::new("Target").strong());
@@ -115,25 +104,14 @@ impl FloppyConvertDialog {
 
                 ui.horizontal(|ui| {
                     ui.label("Output file:");
-                    let path_text = self
-                        .ctl
-                        .output()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(not chosen)".to_string());
-                    ui.label(path_text);
+                    ui.label(path_label(self.ctl.output()));
                     if ui.button("Save As...").clicked() {
                         actions.push(FloppyConvertAction::PickOutput);
                     }
                 });
 
                 if self.ctl.same_format() {
-                    ui.label(
-                        egui::RichText::new(
-                            "Source and target match - the output will be a byte-identical copy.",
-                        )
-                        .small()
-                        .italics(),
-                    );
+                    ui.label(egui::RichText::new(SAME_FORMAT_NOTE).small().italics());
                 }
             });
 
@@ -169,13 +147,8 @@ impl FloppyConvertDialog {
                 {
                     actions.push(FloppyConvertAction::Start);
                 }
-                let close_label = if self.ctl.outcome().is_some() {
-                    "Close"
-                } else {
-                    "Cancel"
-                };
                 if ui
-                    .add_enabled(!busy, egui::Button::new(close_label))
+                    .add_enabled(!busy, egui::Button::new(self.ctl.close_label()))
                     .clicked()
                 {
                     actions.push(FloppyConvertAction::Close);

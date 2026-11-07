@@ -8,6 +8,7 @@
 pub mod bar;
 mod details;
 mod editor;
+mod export;
 mod table;
 mod tools;
 mod windows;
@@ -36,7 +37,9 @@ use crate::progress::JobList;
 use crate::source::{Pick, PickerSpec, SourcePicker};
 use crate::sync::SyncGuard;
 use crate::volume::alto::AltoDialog;
+use crate::volume::disk_write::DiskWriteDialog;
 use crate::volume::expand_hfs::ExpandHfsDialog;
+use crate::volume::floppy::FloppyDialog;
 use crate::volume::resize::ResizeDialog;
 use crate::widgets::set_text;
 
@@ -79,6 +82,9 @@ pub struct InspectScreen {
     resize: RefCell<Option<Rc<ResizeDialog>>>,
     hfs: RefCell<Option<Rc<ExpandHfsDialog>>>,
     alto: RefCell<Option<Rc<AltoDialog>>>,
+    floppy: RefCell<Option<Rc<FloppyDialog>>>,
+    /// Physical Disk Export, kept once opened so a write is seen after its window hides.
+    writer: RefCell<Option<Rc<DiskWriteDialog>>>,
 }
 
 /// Everything a refresh shows, read while the controller is borrowed and shown after it is not.
@@ -205,7 +211,13 @@ impl InspectScreen {
                     s.open_resize();
                 }
             });
-            let tools = ToolBar::build(&send, expand_image, resize);
+            let screen = me.clone();
+            let floppy: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.open_floppy();
+                }
+            });
+            let tools = ToolBar::build(&send, expand_image, resize, floppy);
             let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
             error.add_css_class("error");
             let details = Details::build(&send);
@@ -238,7 +250,13 @@ impl InspectScreen {
                     s.refresh();
                 }
             });
-            let windows = Windows::new(host.clone(), send.clone(), dismiss, on_mib);
+            let screen = me.clone();
+            let physical: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.open_physical();
+                }
+            });
+            let windows = Windows::new(host.clone(), send.clone(), dismiss, on_mib, physical);
             let no_partitions = gtk::Label::builder()
                 .label("No partitions found.")
                 .xalign(0.0)
@@ -317,6 +335,8 @@ impl InspectScreen {
                 resize: RefCell::default(),
                 hfs: RefCell::default(),
                 alto: RefCell::default(),
+                writer: RefCell::default(),
+                floppy: RefCell::default(),
             }
         })
     }
@@ -373,6 +393,17 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let writer = self.writer.borrow().clone();
+        if let Some(w) = writer {
+            w.tick();
+        }
+        let floppy = self.floppy.borrow().clone();
+        if let Some(d) = floppy {
+            d.tick();
+            if !d.is_open() {
+                self.floppy.replace(None);
+            }
+        }
         let alto = self.alto.borrow().clone();
         if let Some(d) = alto {
             d.tick();
@@ -403,6 +434,31 @@ impl InspectScreen {
         }
     }
 
+    fn open_floppy(&self) {
+        let open = self.floppy.borrow().as_ref().is_some_and(|d| d.is_open());
+        let source = self.ctrl.borrow().floppy_convert_source();
+        if let (false, Some(path)) = (open, source) {
+            let d = FloppyDialog::open(self.notify.clone(), self.host.clone(), Some(path));
+            *self.floppy.borrow_mut() = Some(d);
+        }
+    }
+
+    /// Export's Physical Disk Export: the image goes to the disk writer's window.
+    fn open_physical(&self) {
+        let Some(open) = self.ctrl.borrow().physical_source() else {
+            return;
+        };
+        self.apply(InspectAction::CloseExport);
+        let writer = self.writer.borrow().clone();
+        let writer = writer.unwrap_or_else(|| {
+            let w = DiskWriteDialog::new(self.notify.clone(), self.host.clone());
+            w.set_devices(&self.devices.borrow());
+            *self.writer.borrow_mut() = Some(w.clone());
+            w
+        });
+        writer.open(open);
+    }
+
     fn open_expand_image(&self) {
         if self.ctrl.borrow().can_expand_image() {
             self.windows.expand_mib.set(0);
@@ -417,6 +473,7 @@ impl InspectScreen {
             Dismiss::Check => InspectAction::CloseCheck,
             Dismiss::Chd => InspectAction::CloseChdInfo,
             Dismiss::Editor => InspectAction::CloseEditor,
+            Dismiss::Export => InspectAction::CloseExport,
             Dismiss::Expand => {
                 self.windows.expand_open.set(false);
                 self.refresh();
@@ -438,6 +495,10 @@ impl InspectScreen {
         let resize = self.resize.borrow().clone();
         if let Some(d) = resize {
             d.set_devices(&devices);
+        }
+        let writer = self.writer.borrow().clone();
+        if let Some(w) = writer {
+            w.set_devices(&devices);
         }
         *self.devices.borrow_mut() = devices;
     }
@@ -484,6 +545,20 @@ impl InspectScreen {
             Some("Inspect: Resize")
         } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
             Some("Inspect: Expand HFS")
+        } else if self
+            .writer
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.is_writing())
+        {
+            Some("Inspect: Physical Disk Export")
+        } else if self
+            .floppy
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_running())
+        {
+            Some("Inspect: Floppy Convert")
         } else {
             None
         }
@@ -585,6 +660,7 @@ impl InspectScreen {
             jobs,
             tools: ToolState {
                 can_reinspect: ctrl.can_reinspect(),
+                can_export: ctrl.can_export(),
                 can_edit_table: ctrl.can_edit_table(),
                 can_add_partition: ctrl.can_add_partition(),
                 add_hint: ctrl.add_partition_hint(),
@@ -626,6 +702,7 @@ impl InspectScreen {
                     .expand_open
                     .get()
                     .then(|| ctrl.expand_image_preview(self.windows.expand_mib.get())),
+                export: export::ExportShown::read(&mut ctrl),
             },
         }
     }

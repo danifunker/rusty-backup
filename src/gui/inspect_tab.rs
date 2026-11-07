@@ -11,10 +11,12 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::inspect::{
-    expand_image_bytes, format_size, format_size_exact, hints, per_partition_refusal, purpose,
-    BackupSummary, ChdProfile, ClonezillaSummary, ExportFormat, ExportFormatChoice, HostRequest,
-    InspectAction, InspectController, InspectServices, InspectSource, LayoutBar, MinCell,
-    CHD_REFUSAL, EXPAND_IMAGE_MIB_MAX,
+    after_caption, chd_estimate_line, expand_image_bytes, format_size, format_size_exact, hints,
+    max_size_hint, per_partition_refusal, pfs3_affected, purpose, BackupSummary, ChdProfile,
+    ClonezillaSummary, ExportFormat, ExportFormatChoice, HostRequest, InspectAction,
+    InspectController, InspectServices, InspectSource, LayoutBar, MinCell, CHD_REFUSAL,
+    EXPAND_IMAGE_MIB_MAX, EXPORT_INTRO, HFV_WHOLE_REFUSAL, PFS3_SHRINK_LINES, PFS3_SHRINK_TITLE,
+    PHYSICAL_REFUSAL, SECTOR_BY_SECTOR_WARNING, SIZES_HINT,
 };
 use rusty_backup::controller::{Controller as _, Effect};
 
@@ -526,10 +528,7 @@ impl InspectTab {
             if let Some(src) = self.ctl.floppy_convert_source() {
                 if ui
                     .button("Convert Floppy Container...")
-                    .on_hover_text(
-                        "Convert between XDF, HDM, DIM, and D88 floppy container \
-                         formats (X68000 / PC-98 / FM-7).",
-                    )
+                    .on_hover_text(rusty_backup::controller::floppy_convert::BUTTON_HINT)
                     .clicked()
                 {
                     self.floppy_convert_dialog = Some(FloppyConvertDialog::with_source(src));
@@ -728,7 +727,7 @@ impl InspectTab {
             .resizable(true)
             .default_width(500.0)
             .show(ui.ctx(), |ui| {
-                ui.label("Export partitions as disk image files.");
+                ui.label(EXPORT_INTRO);
                 ui.add_space(4.0);
                 // Current vs After at one byte-per-pixel scale, so shrinks and grows show.
                 show_export_disk_layout_bars(ui, &layout);
@@ -742,10 +741,7 @@ impl InspectTab {
                     s.whole_disk = true;
                 }
                 if is_hfv {
-                    whole.on_hover_text(
-                        "HFV is a single classic-HFS volume with no partition table, so it is \
-                         exported per-partition (one .hfv per HFS partition).",
-                    );
+                    whole.on_hover_text(HFV_WHOLE_REFUSAL);
                 }
                 let per_part = ui.add_enabled(
                     !whole_disk_only,
@@ -775,12 +771,7 @@ impl InspectTab {
                 ui.add_space(8.0);
                 if !s.configs.is_empty() {
                     ui.label(egui::RichText::new("Partition Sizes:").strong())
-                        .on_hover_text(
-                            "Minimum is the trim point: the imaged size of a compacted backup \
-                             partition, or the last used byte of a live volume. The exported \
-                             volume is resized in place to match. Anything smaller needs a \
-                             Backup with shrink-to-minimum, which clones the volume.",
-                        );
+                        .on_hover_text(SIZES_HINT);
                     egui::Grid::new("export_partition_sizes")
                         .striped(true)
                         .min_col_width(50.0)
@@ -793,14 +784,7 @@ impl InspectTab {
                             for cfg in &mut s.configs {
                                 ui.label(format!("{}", cfg.index));
                                 ui.label(&cfg.type_name);
-                                let max_size_hover = cfg.max_size.map(|b| {
-                                    let max_mib = (b / (1024 * 1024)).max(1) as u32;
-                                    format!(
-                                        "HFS volumes are capped at 65535 allocation blocks. \
-                                         For this volume's block size, the maximum is {max_mib} MiB. \
-                                         Growing further requires reformatting.",
-                                    )
-                                });
+                                let max_size_hover = cfg.max_size.map(max_size_hint);
                                 super::size_mode_row::size_mode_row(
                                     ui,
                                     &mut cfg.choice,
@@ -826,27 +810,14 @@ impl InspectTab {
 
                 if let Some(workflow) = notes.chd_workflow {
                     ui.label(egui::RichText::new(workflow).small().italics());
-                    if let Some((total, scratch, output)) = notes.chd_estimate {
-                        ui.label(format!(
-                            "Estimated peak new disk usage: {} MiB \
-                             (scratch {} MiB + output {} MiB). \
-                             Available space is checked when you pick a destination.",
-                            total / (1024 * 1024),
-                            scratch / (1024 * 1024),
-                            output / (1024 * 1024),
-                        ));
+                    if let Some(estimate) = notes.chd_estimate {
+                        ui.label(chd_estimate_line(estimate));
                     }
                     if notes.sector_by_sector_warning {
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(
-                                "Warning: the source is a sector-by-sector backup. \
-                                 Re-exporting with new partition sizes drops the \
-                                 byte-for-byte preservation of free space and \
-                                 unrecognized filesystem regions - only smart-compact \
-                                 areas of recognized partitions carry over.",
-                            )
-                            .color(super::theme::warning(ui.visuals())),
+                            egui::RichText::new(SECTOR_BY_SECTOR_WARNING)
+                                .color(super::theme::warning(ui.visuals())),
                         );
                     }
                     ui.add_space(8.0);
@@ -856,16 +827,10 @@ impl InspectTab {
                     if ui.button("Export...").clicked() {
                         start = true;
                     }
-                    let pde = ui.add_enabled(
-                        can_physical,
-                        egui::Button::new("Physical Disk Export..."),
-                    );
+                    let pde =
+                        ui.add_enabled(can_physical, egui::Button::new("Physical Disk Export..."));
                     if !can_physical {
-                        pde.clone().on_hover_text(
-                            "Physical Disk Export currently supports raw image file \
-                             sources only. Backup folders, devices, and Clonezilla \
-                             images aren't wired in yet.",
-                        );
+                        pde.clone().on_hover_text(PHYSICAL_REFUSAL);
                     }
                     if pde.clicked() {
                         physical = true;
@@ -1299,29 +1264,12 @@ fn show_pfs3_banner(ui: &mut egui::Ui, names: &[String]) {
     egui::Frame::group(ui.style())
         .fill(ui.visuals().widgets.noninteractive.bg_fill)
         .show(ui, |ui| {
-            ui.label(egui::RichText::new("PFS3 shrink: volume will be rebuilt").strong());
-            ui.label(format!("Affected partitions: {}", names.join(", ")));
-            ui.label(
-                "PFS3's allocator scatters blocks throughout the volume, so \
-                 in-place trim can't free up space. The export pipeline will \
-                 instead walk the source and rebuild a packed copy at the new \
-                 size - limitations to be aware of:",
-            );
-            ui.label("  - PFS3 trashcan (deldir) contents are NOT preserved.");
-            ui.label(
-                "  - File data, directory tree, protection bits, comments, \
-                 dates, softlinks, and hardlinks (both directions) ARE preserved.",
-            );
-            ui.label(
-                "  - Operation is slower than a verbatim copy: every file is \
-                 read from the source and re-written to the destination.",
-            );
-            ui.label(
-                "  - Uses a tempfile for the rebuilt image; ensure your \
-                 temp directory has enough free space for the target partition size.",
-            );
+            ui.label(egui::RichText::new(PFS3_SHRINK_TITLE).strong());
+            ui.label(pfs3_affected(names));
+            for line in PFS3_SHRINK_LINES {
+                ui.label(*line);
+            }
         });
-    ui.add_space(4.0);
 }
 
 fn show_clonezilla_metadata(ui: &mut egui::Ui, cz: &ClonezillaSummary) {
@@ -1402,11 +1350,7 @@ fn show_export_disk_layout_bars(ui: &mut egui::Ui, layout: &LayoutBar) {
     });
 
     ui.add_space(4.0);
-    ui.label(format!(
-        "After  ({} -> {}):",
-        format_size(current_total),
-        format_size(after_total),
-    ));
+    ui.label(after_caption(layout));
     let after_w = available_width * (after_total as f64 / max_total as f64) as f32;
     ui.scope(|ui| {
         ui.set_width(after_w.max(60.0));

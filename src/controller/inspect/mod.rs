@@ -37,8 +37,10 @@ use dsk_clonezilla::metadata::ClonezillaImage;
 
 pub use crate::controller::browser::{CheckSummary, RepairSummary};
 pub use export::{
-    per_partition_refusal, ExportFormatChoice, ExportNotes, ExportSettings, LayoutBar, CHD_REFUSAL,
-    EXPORT_FORMATS,
+    after_caption, chd_estimate_line, max_size_hint, per_partition_refusal, pfs3_affected,
+    ExportFormatChoice, ExportNotes, ExportSettings, LayoutBar, CHD_REFUSAL, EXPORT_FORMATS,
+    EXPORT_INTRO, HFV_WHOLE_REFUSAL, PFS3_SHRINK_LINES, PFS3_SHRINK_TITLE, PHYSICAL_REFUSAL,
+    SECTOR_BY_SECTOR_WARNING, SIZES_HINT,
 };
 pub use layout::{
     format_block_size, format_bytes_grouped, format_size_decimal, format_size_exact, hints,
@@ -109,6 +111,17 @@ pub mod ids {
     pub const CONNECT_REMOTE: &str = "inspect.source.connect_remote";
     pub const CONVERT_FLOPPY: &str = "inspect.convert_floppy";
     pub const CANCEL_EXPORT: &str = "inspect.cancel_export";
+    pub const EXPORT_WHOLE: &str = "inspect.export.whole_disk";
+    pub const EXPORT_PER_PARTITION: &str = "inspect.export.per_partition";
+    pub const EXPORT_FORMAT: &str = "inspect.export.format";
+    pub const EXPORT_SIZE_MODE: &str = "inspect.export.size_mode";
+    pub const EXPORT_SIZE_MIB: &str = "inspect.export.size_mib";
+    pub const EXPORT_CHD_MODE: &str = "inspect.export.chd_mode";
+    pub const EXPORT_CHD_HUNK: &str = "inspect.export.chd_hunk";
+    pub const EXPORT_CHD_CODEC: &str = "inspect.export.chd_codec";
+    pub const EXPORT_START: &str = "inspect.export.start";
+    pub const EXPORT_PHYSICAL: &str = "inspect.export.physical";
+    pub const EXPORT_CLOSE: &str = "inspect.export.close";
     pub const SWAP_WORD_ORDER: &str = "inspect.swap_word_order";
     pub const PARTITION_BAR: &str = "inspect.partition_bar";
     pub const PARTITION_TABLE: &str = "inspect.partition_table";
@@ -217,6 +230,15 @@ pub enum InspectAction {
     /// Open the Export Disk Image window.
     OpenExport,
     CloseExport,
+    /// Whole disk (true) or one file per partition; a format that allows only one keeps it.
+    SetExportWholeDisk(bool),
+    SetExportFormat(ExportFormat),
+    /// A partition row's size mode and Custom size.
+    SetExportSize {
+        index: usize,
+        mode: crate::model::size_mode::SizeMode,
+        custom_mib: u32,
+    },
     /// The window's Export button, with the CHD options its control holds.
     StartExport(crate::rbformats::chd_options::ChdOptions),
     CancelExport,
@@ -1211,6 +1233,23 @@ impl Controller for InspectController {
             }
             InspectAction::CloseExport => {
                 self.export.close();
+                Vec::new()
+            }
+            InspectAction::SetExportWholeDisk(on) => {
+                self.export_settings_mut().set_whole_disk(on);
+                Vec::new()
+            }
+            InspectAction::SetExportFormat(format) => {
+                self.export_settings_mut().format = format;
+                self.export_settings_mut();
+                Vec::new()
+            }
+            InspectAction::SetExportSize {
+                index,
+                mode,
+                custom_mib,
+            } => {
+                self.set_export_size(index, mode, custom_mib);
                 Vec::new()
             }
             InspectAction::StartExport(chd) => self.start_export(chd),

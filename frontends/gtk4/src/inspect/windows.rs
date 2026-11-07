@@ -1,5 +1,5 @@
 //! Inspect's own windows, each up while the controller (or, for Expand Image, the view) says so:
-//! Check results, CHD Info, Expand Image and Edit Partition Table.
+//! Check results, CHD Info, Expand Image, Edit Partition Table and Export Disk Image.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -11,6 +11,7 @@ use rusty_backup::controller::inspect::{
 use rusty_backup::controller::partition_edit::{TableEditView, TableKind};
 
 use super::editor::EditorParts;
+use super::export::{ExportParts, ExportShown};
 use super::ActionFn;
 use crate::browser::dialogs::{page, text_view, window, wrapped, Slot};
 use crate::effects::EffectHost;
@@ -24,6 +25,7 @@ pub enum Dismiss {
     Chd,
     Editor,
     Expand,
+    Export,
 }
 
 /// What the windows show, read while the controller is borrowed.
@@ -33,6 +35,7 @@ pub struct WindowsShown {
     pub editor: Option<(TableEditView, Option<String>)>,
     /// Expand Image's current and new size, while its window is open.
     pub expand: Option<(u64, u64)>,
+    pub export: Option<ExportShown>,
 }
 
 struct ExpandParts {
@@ -51,6 +54,10 @@ pub struct Windows {
     editor_parts: RefCell<Option<EditorParts>>,
     expand: Slot,
     expand_parts: RefCell<Option<ExpandParts>>,
+    export: Slot,
+    export_parts: RefCell<Option<ExportParts>>,
+    /// Hands the image to Physical Disk Export.
+    physical: Rc<dyn Fn()>,
     /// Expand Image is the view's own window: open, and the MiB typed so far.
     pub expand_open: Cell<bool>,
     pub expand_mib: Rc<Cell<u32>>,
@@ -70,6 +77,7 @@ impl Windows {
         send: ActionFn,
         dismiss: Rc<dyn Fn(Dismiss)>,
         on_mib: Rc<dyn Fn()>,
+        physical: Rc<dyn Fn()>,
     ) -> Windows {
         Windows {
             host,
@@ -81,6 +89,9 @@ impl Windows {
             editor_parts: RefCell::default(),
             expand: Slot::default(),
             expand_parts: RefCell::default(),
+            export: Slot::default(),
+            export_parts: RefCell::default(),
+            physical,
             expand_open: Cell::new(false),
             expand_mib: Rc::new(Cell::new(0)),
             on_mib,
@@ -99,6 +110,37 @@ impl Windows {
         });
         self.show_editor(s.editor);
         self.show_expand(s.expand);
+        self.show_export(s.export);
+    }
+
+    fn show_export(&self, export: Option<ExportShown>) {
+        let key = export.as_ref().map(|_| "export".to_string());
+        let built = RefCell::new(None);
+        let (send, physical) = (self.send.clone(), self.physical.clone());
+        self.export.sync(
+            &self.host,
+            &self.dismiss,
+            key,
+            Some(Dismiss::Export),
+            || {
+                let (dialog, parts) = ExportParts::build(&send, physical);
+                *built.borrow_mut() = Some(parts);
+                dialog
+            },
+        );
+        if let Some(parts) = built.into_inner() {
+            *self.export_parts.borrow_mut() = Some(parts);
+        }
+        match export {
+            Some(shown) => {
+                if let Some(parts) = &*self.export_parts.borrow() {
+                    parts.show(shown);
+                }
+            }
+            None => {
+                self.export_parts.borrow_mut().take();
+            }
+        }
     }
 
     fn show_check(&self, report: Option<CheckReport>) {
