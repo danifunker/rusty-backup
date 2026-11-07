@@ -23,6 +23,9 @@ pub use crate::controller::inspect::ResizePlan;
 pub use crate::model::size_mode::SizeMode;
 pub use disk_core::display::format_size;
 
+/// Why Preview refuses once a write ended.
+const STALE: &str = "The disk changed: close this window and open Resize Partitions again.";
+
 /// The `purpose` of each confirmation this controller asks for.
 pub mod purpose {
     /// Apply: the partitions are rewritten in place.
@@ -118,6 +121,8 @@ pub struct ResizeController {
     /// The engine's lines, shared with the running write.
     lines: Arc<Mutex<Vec<String>>>,
     disk_changed: bool,
+    /// A write ended: the plan describes the old table, so nothing more is planned from it.
+    written: bool,
 }
 
 impl ResizeController {
@@ -134,6 +139,7 @@ impl ResizeController {
             job: None,
             lines: Arc::new(Mutex::new(Vec::new())),
             disk_changed: false,
+            written: false,
         }
     }
 
@@ -236,6 +242,7 @@ impl ResizeController {
 
     pub fn can_apply(&self) -> bool {
         self.job.is_none()
+            && !self.written
             && self.preview.is_some()
             && self.plan_error.is_none()
             && (!self.is_device() || self.device_risk_accepted)
@@ -368,6 +375,10 @@ impl ResizeController {
     fn compute_preview(&mut self) {
         self.preview = None;
         self.plan_error = None;
+        if self.written {
+            self.plan_error = Some(STALE.to_string());
+            return;
+        }
         let mut desired = Vec::new();
         for row in self.rows.iter().filter(|r| !r.extended) {
             let Some(new_bytes) = parsed_new_size(row.text.as_str(), row.original_size) else {
@@ -579,6 +590,9 @@ impl ResizeController {
         };
         self.job = None;
         self.drain_lines();
+        self.written = true;
+        self.preview = None;
+        self.asked = None;
         match done.and_then(|r| r) {
             Ok(()) => self.log.push((
                 LogLevel::Info,
@@ -733,6 +747,12 @@ mod tests {
         assert!(ctl.is_running());
         ctl.wait_idle();
         assert!(ctl.take_disk_changed());
+        assert!(
+            !ctl.can_apply() && ctl.preview().is_none(),
+            "the old plan is spent"
+        );
+        ctl.apply(ResizeAction::Preview);
+        assert_eq!(ctl.plan_error(), Some(STALE));
         ctl.apply(ResizeAction::Confirmed {
             purpose: purpose::APPLY,
             yes: true,

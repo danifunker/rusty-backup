@@ -29,6 +29,17 @@ pub mod ids {
     pub const TABLE_ADD: &str = "partition_edit.add";
     pub const TABLE_VALIDATE: &str = "partition_edit.validate";
     pub const TABLE_APPLY: &str = "partition_edit.apply";
+    pub const TABLE_ROW_TYPE: &str = "partition_edit.row_type";
+    pub const TABLE_ROW_MODE: &str = "partition_edit.row_mode";
+    pub const TABLE_ROW_SIZE: &str = "partition_edit.row_size";
+    pub const TABLE_ROW_BOOT: &str = "partition_edit.row_boot";
+    pub const TABLE_ROW_DELETE: &str = "partition_edit.row_delete";
+    pub const TABLE_ROW_UNDO: &str = "partition_edit.row_undo";
+    pub const TABLE_FREE_GAP: &str = "partition_edit.free_gap";
+    pub const TABLE_ADD_START: &str = "partition_edit.add_start";
+    pub const TABLE_ADD_SIZE: &str = "partition_edit.add_size";
+    pub const TABLE_ADD_TYPE: &str = "partition_edit.add_type";
+    pub const TABLE_ADD_BOOT: &str = "partition_edit.add_boot";
     pub const BUILD_KIND: &str = "partition_edit.build_kind";
     pub const BUILD_ADD_ROW: &str = "partition_edit.build_add_row";
     pub const BUILD_VALIDATE: &str = "partition_edit.build_validate";

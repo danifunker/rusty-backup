@@ -93,6 +93,10 @@ pub mod ids {
     pub const EDIT_TABLE: &str = "inspect.edit_table";
     pub const ADD_PARTITION: &str = "inspect.add_partition";
     pub const EXPAND_IMAGE: &str = "inspect.expand_image";
+    pub const EXPAND_IMAGE_ADD: &str = "inspect.expand_image.add_mib";
+    pub const EXPAND_IMAGE_START: &str = "inspect.expand_image.start";
+    pub const CHECK_REPAIR: &str = "inspect.check.repair";
+    pub const CHECK_DEBUG: &str = "inspect.check.debug";
     pub const MAKE_BOOTABLE: &str = "inspect.make_bootable";
     pub const RESIZE: &str = "inspect.resize";
     pub const CHD_INFO: &str = "inspect.chd_info";
