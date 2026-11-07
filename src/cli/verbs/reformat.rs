@@ -15,7 +15,13 @@ use std::io::{Seek, SeekFrom, Write};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use crate::cli::verbs::new::FsKind;
+
+/// The filesystems `reformat` can write in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReformatFs {
+    /// Classic HFS (Mac OS Standard).
+    Hfs,
+}
 
 #[derive(Debug, Args)]
 pub struct ReformatArgs {
@@ -25,7 +31,7 @@ pub struct ReformatArgs {
     /// Filesystem to format the partition with. Only `hfs` is supported
     /// today.
     #[arg(long, value_enum)]
-    pub fs: FsKind,
+    pub fs: ReformatFs,
 
     /// New volume name. HFS: up to 27 Mac Roman bytes.
     #[arg(long, default_value = "rusty-backup")]
@@ -48,9 +54,7 @@ pub struct ReformatArgs {
 }
 
 pub fn run(args: ReformatArgs) -> Result<()> {
-    if args.fs != FsKind::Hfs {
-        bail!("reformat: only --fs hfs is supported today");
-    }
+    let ReformatFs::Hfs = args.fs;
 
     // Open the image read-write (decoding a CHD / container as needed) and
     // resolve which partition we're targeting (offset + size). We don't open a
@@ -92,43 +96,45 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         .map(|v| v.min(u32::MAX as u64) as u32)
         .unwrap_or(default_ext);
 
-    let volume = fs_mac::hfs::create_blank_hfs_sized(
+    // A dry run first, so a bad name fails before anything on the partition is zeroed.
+    let len = fs_mac::hfs::write_blank_hfs_sized_into(
+        &mut NullTarget(0),
+        0,
         ctx.size,
         block_size,
-        &args.name,
+        args.name.as_str(),
         extents_bytes,
         catalog_bytes,
     )
     .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
-
-    if volume.len() as u64 > ctx.size {
-        // create_blank_hfs_sized must never exceed the requested size; this
-        // is a defensive guard so we never clobber neighbouring partitions.
+    if len > ctx.size {
         bail!(
-            "internal error: formatted volume ({} bytes) exceeds partition ({} bytes)",
-            volume.len(),
+            "internal error: formatted volume ({len} bytes) exceeds partition ({} bytes)",
             ctx.size
         );
     }
 
+    // Zero the whole partition so no stale bytes survive, then stream the metadata over it.
     file.seek(SeekFrom::Start(ctx.offset))
         .context("seeking to partition offset")?;
-    file.write_all(&volume)
-        .context("writing fresh HFS volume")?;
-
-    // Zero any trailing slack between the volume's end and the partition's
-    // end so no stale template/catalog bytes survive in the partition.
-    let slack = ctx.size - volume.len() as u64;
-    if slack > 0 {
-        let zeros = vec![0u8; 64 * 1024];
-        let mut remaining = slack;
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..n])
-                .context("zero-filling partition slack")?;
-            remaining -= n as u64;
-        }
+    let zeros = vec![0u8; 1 << 20];
+    let mut remaining = ctx.size;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..n])
+            .context("zeroing the partition")?;
+        remaining -= n as u64;
     }
+    fs_mac::hfs::write_blank_hfs_sized_into(
+        &mut file,
+        ctx.offset,
+        ctx.size,
+        block_size,
+        args.name.as_str(),
+        extents_bytes,
+        catalog_bytes,
+    )
+    .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
     file.flush().ok();
 
     // Persist: flatten/re-encode if the image was a CHD / container; no-op for
@@ -141,4 +147,26 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         ctx.offset, ctx.size, args.name, block_size
     ));
     Ok(())
+}
+
+/// A target that discards what is written, for a dry run of a streaming formatter.
+struct NullTarget(u64);
+
+impl Write for NullTarget {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for NullTarget {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        if let SeekFrom::Start(n) = to {
+            self.0 = n;
+        }
+        Ok(self.0)
+    }
 }

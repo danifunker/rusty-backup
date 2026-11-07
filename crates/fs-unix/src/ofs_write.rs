@@ -560,6 +560,22 @@ pub fn location_parts(loc: u64) -> (u64, usize) {
 /// first block immediately after it. `size_bytes` rounds down to a whole
 /// sector. Returns the image bytes.
 pub fn create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_ofs_into(&mut cur, 0, size_bytes, name)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_ofs`]: writes the table of contents and the bitmap's
+/// used prefix at `at_offset`, and returns the volume's length.
+pub fn write_blank_ofs_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    name: &str,
+) -> Result<u64, FilesystemError> {
     let total = size_bytes / SECTOR;
     if name.len() > 31 {
         return Err(FilesystemError::InvalidData(
@@ -584,7 +600,8 @@ pub fn create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesyst
         ));
     }
 
-    let mut img = vec![0u8; (total * SECTOR) as usize];
+    // The TOC and the bitmap bytes that cover the used sectors; the rest stays zero.
+    let mut img = vec![0u8; (SECTOR + used.div_ceil(8)) as usize];
     put_be32(&mut img, 0, 0x0001_0000);
     put_be32(&mut img, 4, disk_core::times::now() as u32);
     put_be32(&mut img, 8, 1);
@@ -600,11 +617,74 @@ pub fn create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesyst
         let byte = SECTOR as usize + (s / 8) as usize;
         img[byte] |= 1 << (s % 8);
     }
-    Ok(img)
+    w.seek(SeekFrom::Start(at_offset))?;
+    w.write_all(&img)?;
+    Ok(total * SECTOR)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_ofs(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+        let total = size_bytes / SECTOR;
+        if name.len() > 31 {
+            return Err(FilesystemError::InvalidData(
+                "ofs: volume name is capped at 31 bytes".into(),
+            ));
+        }
+        // Version 1 directory blocks are 8 sectors; the bitmap has to cover the
+        // whole volume, and the root block has to fit after it.
+        let bitmap_sectors = total.div_ceil(8).div_ceil(SECTOR).max(1);
+        let first_dir = 1 + bitmap_sectors;
+        let used = first_dir + 8;
+        if total < used + 8 {
+            return Err(FilesystemError::InvalidData(format!(
+                "ofs: {size_bytes} bytes is too small for a table of contents, a bitmap, and a \
+                 root directory (needs at least {} bytes)",
+                (used + 8) * SECTOR
+            )));
+        }
+        if total > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(
+                "ofs: sector numbers are a 32-bit field; 2 TiB is the ceiling".into(),
+            ));
+        }
+
+        let mut img = vec![0u8; (total * SECTOR) as usize];
+        put_be32(&mut img, 0, 0x0001_0000);
+        put_be32(&mut img, 4, disk_core::times::now() as u32);
+        put_be32(&mut img, 8, 1);
+        put_be32(&mut img, 12, bitmap_sectors as u32);
+        put_be32(&mut img, 16, first_dir as u32);
+        put_be32(&mut img, 20, total as u32);
+        put_be32(&mut img, 24, SECTOR as u32);
+        put_be32(&mut img, 36, used as u32);
+        img[44..44 + name.len()].copy_from_slice(name.as_bytes());
+
+        // Mark the TOC, the bitmap, and the root directory block as allocated.
+        for s in 0..used {
+            let byte = SECTOR as usize + (s / 8) as usize;
+            img[byte] |= 1 << (s % 8);
+        }
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for kib in [64u64, 1440, 10_240, 65_536] {
+            // The TOC stamps the clock, so a pair built across a second boundary is redone.
+            let (old, new) = loop {
+                let t = disk_core::times::now();
+                let old = old_create_blank_ofs(kib * 1024, "BeBox").unwrap();
+                let new = create_blank_ofs(kib * 1024, "BeBox").unwrap();
+                if disk_core::times::now() == t {
+                    break (old, new);
+                }
+            };
+            assert!(old == new, "{kib} KiB differs");
+        }
+    }
     use super::*;
     use std::io::Cursor;
 

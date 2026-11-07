@@ -111,7 +111,7 @@ fn plan_volume(opts: &MacCdOptions) -> Result<(u32, u64)> {
     let block_size = match opts.block_size {
         Some(bs) => bs,
         None => match opts.fs {
-            MacCdFs::Hfs => fs_mac::hfs::pick_block_size(avail_bytes),
+            MacCdFs::Hfs => fs_mac::hfs::pick_cd_block_size(avail_bytes),
             // Apple's default, and the largest our HFS+ formatter supports.
             MacCdFs::HfsPlus => 4096,
         },
@@ -335,17 +335,23 @@ mod tests {
     fn streamed_file_matches_in_memory_image() {
         use std::io::Read;
         let opts = MacCdOptions::new(8 * 1024 * 1024, "Stream", MacCdFs::Hfs);
+        let started = fs_mac::hfs_common::hfs_now();
         let (mem, layout) = build_mac_hfs_cd(&opts).unwrap();
 
         let mut file = tempfile::tempfile().expect("tempfile");
         let streamed = write_mac_hfs_cd(&mut file, &opts).expect("stream");
         file.set_len(streamed.disk_bytes).unwrap();
+        let ticked = fs_mac::hfs_common::hfs_now() != started;
         assert_eq!(streamed, layout);
 
         let mut on_disk = Vec::new();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_to_end(&mut on_disk).unwrap();
-        assert_eq!(on_disk, mem, "streamed bytes match the in-memory image");
+        assert_eq!(on_disk.len(), mem.len());
+        // The volume dates come from the clock, so a pair built across a second may differ there.
+        let differing = on_disk.iter().zip(&mem).filter(|(a, b)| a != b).count();
+        let allowed = if ticked { 64 } else { 0 };
+        assert!(differing <= allowed, "{differing} bytes differ");
     }
 
     /// A 650 MiB HFS disc needs a block size above 512 to stay inside HFS's
@@ -363,7 +369,8 @@ mod tests {
             write_mac_hfs_cd(&mut file, &MacCdOptions::new(big, "Big", MacCdFs::Hfs)).unwrap();
         // No `set_len`: only the metadata regions matter here, and reserving
         // 650 MB of runner disk for a layout assertion is its own hazard.
-        assert!(layout.block_size >= 16384, "auto block size scales up");
+        assert!(layout.block_size >= 10240, "auto block size scales up");
+        assert_eq!(layout.block_size % 2048, 0, "whole CD sectors");
         assert!(layout.hfs_bytes() / layout.block_size as u64 <= 65535);
 
         let mut too_small = MacCdOptions::new(big, "Big", MacCdFs::Hfs);

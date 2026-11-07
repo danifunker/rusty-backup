@@ -43,12 +43,22 @@ pub struct NewMacCdromArgs {
 
     /// With `--from-dir`: unpack archives found in the tree into a directory
     /// named after each, instead of copying them in verbatim. Classic Mac
-    /// archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks
+    /// archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`, Mac `.zip`) land with both forks
     /// and their Finder type/creator intact — a disc the target Mac can run
     /// straight off, rather than one it has to unstuff first. Tar archives are
     /// unpacked too. `--size auto` measures what they unpack to.
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
+
+    /// With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`).
+    /// With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files.
+    #[arg(long = "expand-gunzip", requires = "from_dir")]
+    pub expand_gunzip: bool,
+
+    /// With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+    /// `.hfv`, ...) into a folder named after each, forks included, instead of the image.
+    #[arg(long = "expand-images", requires = "from_dir")]
+    pub expand_images: bool,
 
     /// With `--from-dir`: overwrite entries that already exist rather than
     /// failing on the collision.
@@ -127,7 +137,7 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     let Some(dir) = &args.from_dir else {
         anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
     };
-    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir(dir, args.expand_archives, false)
+    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir_for(dir, &import_options(args))
         .with_context(|| format!("measuring {}", dir.display()))?;
     // Project twice: HFS's allocation block scales with the volume, and on a
     // disc-sized volume it is what drives per-file slack, so a 512-byte first
@@ -135,7 +145,7 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     let block = match fs {
         MacCdFs::Hfs => {
             let rough = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
-            fs_mac::hfs::pick_block_size(rough) as u64
+            fs_mac::hfs::pick_cd_block_size(rough) as u64
         }
         MacCdFs::HfsPlus => 4096,
     };
@@ -143,8 +153,8 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     log_stderr(format!(
         "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disc",
         bytes / (1024 * 1024),
-        if args.expand_archives {
-            " (archives measured expanded)"
+        if args.expand_archives || args.expand_gunzip || args.expand_images {
+            " (measured as it will land)"
         } else {
             ""
         },
@@ -153,10 +163,28 @@ fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     Ok(projected)
 }
 
+/// The import settings, shared by `--size auto` and the import so the disc fits what lands.
+fn import_options(args: &NewMacCdromArgs) -> crate::fs::dir_import::DirImportOptions {
+    crate::fs::dir_import::DirImportOptions {
+        // HFS and HFS+ have no Unix permissions, which is why there is no flag for them.
+        shared: super::import::shared_options(
+            args.force,
+            false,
+            true,
+            args.include_appledouble,
+            false,
+        ),
+        expand_archives: args.expand_archives,
+        flatten_archives: false,
+        expand_gunzip: args.expand_gunzip,
+        expand_disk_images: args.expand_images,
+    }
+}
+
 /// Import `dir` into the freshly-formatted disc's Mac volume.
 fn populate(args: &NewMacCdromArgs, dir: &std::path::Path) -> Result<()> {
     use crate::cli::resolve::resolve_partition_rw_forced;
-    use crate::fs::dir_import::{import_dir, DirImportOptions};
+    use crate::fs::dir_import::import_dir;
 
     if !dir.is_dir() {
         anyhow::bail!("--from-dir: not a directory: {}", dir.display());
@@ -170,20 +198,7 @@ fn populate(args: &NewMacCdromArgs, dir: &std::path::Path) -> Result<()> {
     let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
         .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
 
-    let opts = DirImportOptions {
-        // Host Unix modes are never applied: HFS and HFS+ have no Unix
-        // permissions to receive them, which is why there is no flag for it.
-        shared: super::import::shared_options(
-            args.force,
-            false,
-            true,
-            args.include_appledouble,
-            false,
-        ),
-        expand_archives: args.expand_archives,
-        flatten_archives: false,
-        expand_gunzip: false,
-    };
+    let opts = import_options(args);
     let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
         .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
     fs.sync_metadata()

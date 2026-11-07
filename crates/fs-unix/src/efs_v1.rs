@@ -2145,6 +2145,22 @@ const EFS_V1_INODE_DIVISOR: u32 = 40;
 /// Format a blank EFS v1 volume, in **native** byte order (a fresh image has
 /// not been through a word-swapping controller). See docs/SGI_EFS_v1.md.
 pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_efs_v1_into(&mut cur, 0, size_bytes, name)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_efs_v1`]: writes the root directory, root inode, bitmap
+/// and superblock at `at_offset`, and returns the volume's length.
+pub fn write_blank_efs_v1_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    name: &str,
+) -> anyhow::Result<u64> {
     let total_blocks = (size_bytes / EFS_V1_BLOCKSIZE) as u32;
     if total_blocks < EFS_V1_MIN_BLOCKS {
         anyhow::bail!(
@@ -2205,7 +2221,6 @@ pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
     sb.validate()
         .map_err(|e| anyhow::anyhow!("EFS v1 mkfs produced invalid geometry: {e}"))?;
 
-    let mut img = vec![0u8; (total_blocks as u64 * EFS_V1_BLOCKSIZE) as usize];
     let regions = EfsV1DataRegions::from_sb(&sb);
 
     // Bitmap starts all-in-use, then each group's data area is released —
@@ -2230,8 +2245,11 @@ pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
     );
     root_dir[EFS_V1_DIRENTSIZE + 2] = b'.';
     root_dir[EFS_V1_DIRENTSIZE + 3] = b'.';
-    let root_off = root_block as usize * EFS_V1_BLOCKSIZE as usize;
-    img[root_off..root_off + root_dir.len()].copy_from_slice(&root_dir);
+    let mut put = |at: u64, bytes: &[u8]| -> std::io::Result<()> {
+        w.seek(SeekFrom::Start(at_offset + at))?;
+        w.write_all(bytes)
+    };
+    put(u64::from(root_block) * EFS_V1_BLOCKSIZE, &root_dir)?;
 
     let now = sb.fs_time;
     let mut root = EfsV1Inode::empty(EFS_V1_ROOT_INODE);
@@ -2261,18 +2279,15 @@ pub fn create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8
         .ok_or_else(|| anyhow::anyhow!("EFS v1 mkfs: root inode has no home in the inode table"))?;
     let mut slot = [0u8; EFS_V1_INODESIZE as usize];
     root.write_into(&mut slot);
-    let ipos = iblock as usize * EFS_V1_BLOCKSIZE as usize + ioff;
-    img[ipos..ipos + slot.len()].copy_from_slice(&slot);
+    put(u64::from(iblock) * EFS_V1_BLOCKSIZE + ioff as u64, &slot)?;
+    put(u64::from(EFS_V1_BITMAPBB) * EFS_V1_BLOCKSIZE, &bm)?;
 
-    let bmpos = EFS_V1_BITMAPBB as usize * EFS_V1_BLOCKSIZE as usize;
-    img[bmpos..bmpos + bm.len()].copy_from_slice(&bm);
+    let mut sector = vec![0u8; EFS_V1_BLOCKSIZE as usize];
+    sb.write_into(&mut sector);
+    sb.recompute_checksum(&mut sector);
+    put(EFS_V1_SUPERBB * EFS_V1_BLOCKSIZE, &sector)?;
 
-    let sbpos = EFS_V1_SUPERBB as usize * EFS_V1_BLOCKSIZE as usize;
-    let sector = &mut img[sbpos..sbpos + EFS_V1_BLOCKSIZE as usize];
-    sb.write_into(sector);
-    sb.recompute_checksum(sector);
-
-    Ok(img)
+    Ok(u64::from(total_blocks) * EFS_V1_BLOCKSIZE)
 }
 
 /// Pack a volume label into one of the superblock's 6-byte name fields.
@@ -2301,6 +2316,156 @@ fn count_free_bits(bm: &[u8], regions: &EfsV1DataRegions) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_efs_v1(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+        let total_blocks = (size_bytes / EFS_V1_BLOCKSIZE) as u32;
+        if total_blocks < EFS_V1_MIN_BLOCKS {
+            anyhow::bail!(
+                "EFS v1 needs at least {} bytes; asked for {size_bytes}",
+                EFS_V1_MIN_BLOCKS as u64 * EFS_V1_BLOCKSIZE
+            );
+        }
+
+        // Geometry closes on `fs_size == firstcg + ncg * cgfsize` while `firstcg`
+        // must clear the bitmap sized from it, so iterate until the two agree.
+        let mut ncg = (total_blocks / EFS_V1_TARGET_CGFSIZE).max(1);
+        while ncg > 1 && total_blocks / ncg < EFS_V1_MIN_BLOCKS {
+            ncg -= 1;
+        }
+        let mut firstcg = EFS_V1_BITMAPBB + 2;
+        let (fs_size, cgfsize, bmsize) = loop {
+            let avail = total_blocks.saturating_sub(firstcg);
+            let cgfsize = avail / ncg;
+            if cgfsize < 8 {
+                anyhow::bail!(
+                    "EFS v1: {size_bytes} bytes is too small to lay out a cylinder group"
+                );
+            }
+            let fs_size = firstcg + ncg * cgfsize;
+            let bmsize = fs_size.div_ceil(8);
+            // Reserve for a grown volume, but declare only what is in use.
+            let reserve = fs_size
+                .saturating_mul(EFS_V1_GROWTH_HEADROOM)
+                .div_ceil(8)
+                .div_ceil(EFS_V1_BLOCKSIZE as u32);
+            // Keep `firstcg` even, the way the period mkfs laid it out.
+            let need = EFS_V1_BITMAPBB + reserve;
+            let need = need + (need & 1);
+            if firstcg >= need {
+                break (fs_size, cgfsize, bmsize);
+            }
+            firstcg = need;
+        };
+        let cgisize = (cgfsize / EFS_V1_INODE_DIVISOR).max(1).min(cgfsize - 1);
+
+        let mut sb = EfsV1Superblock {
+            fs_size,
+            firstcg,
+            cgfsize,
+            cgisize: cgisize as u16,
+            sectors: 17,
+            heads: 7,
+            ncg: ncg as u16,
+            dirty: 0,
+            fs_time: now_u32(),
+            fname: pack_label(name),
+            fpack: pack_label("sgi"),
+            magic: EFS_V1_MAGIC,
+            prealloc: 16,
+            bmsize,
+            tfree: 0,
+            tinode: 0,
+            checksum: 0,
+        };
+        sb.validate()
+            .map_err(|e| anyhow::anyhow!("EFS v1 mkfs produced invalid geometry: {e}"))?;
+
+        let mut img = vec![0u8; (total_blocks as u64 * EFS_V1_BLOCKSIZE) as usize];
+        let regions = EfsV1DataRegions::from_sb(&sb);
+
+        // Bitmap starts all-in-use, then each group's data area is released —
+        // inode tables stay in use, as on a real EFS v1 volume.
+        let mut bm = vec![0u8; bmsize as usize];
+        for (lo, hi) in regions.ranges() {
+            for b in lo..hi {
+                bm[(b / 8) as usize] |= 1u8 << (b % 8);
+            }
+        }
+
+        // The root directory gets the first data block of cylinder group 0.
+        let root_block = firstcg + cgisize;
+        bm[(root_block / 8) as usize] &= !(1u8 << (root_block % 8));
+
+        let mut root_dir = vec![0u8; EFS_V1_DIRENTSIZE * 2];
+        BigEndian::write_u16(&mut root_dir[0..2], EFS_V1_ROOT_INODE as u16);
+        root_dir[2] = b'.';
+        BigEndian::write_u16(
+            &mut root_dir[EFS_V1_DIRENTSIZE..EFS_V1_DIRENTSIZE + 2],
+            EFS_V1_ROOT_INODE as u16,
+        );
+        root_dir[EFS_V1_DIRENTSIZE + 2] = b'.';
+        root_dir[EFS_V1_DIRENTSIZE + 3] = b'.';
+        let root_off = root_block as usize * EFS_V1_BLOCKSIZE as usize;
+        img[root_off..root_off + root_dir.len()].copy_from_slice(&root_dir);
+
+        let now = sb.fs_time;
+        let mut root = EfsV1Inode::empty(EFS_V1_ROOT_INODE);
+        // 0777 is what the era's mkfs stamped on both volumes of the real disk.
+        root.mode = 0o040777;
+        // `.` and the `..` of the root itself.
+        root.nlink = 2;
+        root.size = root_dir.len() as u32;
+        root.atime = now;
+        root.mtime = now;
+        root.ctime = now;
+        root.numextents = 1;
+        root.extents[0] = EfsV1Extent {
+            magic: 0,
+            bn: root_block,
+            length: 1,
+            offset: 0,
+        };
+
+        // `fs_tinode` counts free inodes but leaves one out, verified against both
+        // volumes of the IRIS 3130 disk.
+        sb.tfree = count_free_bits(&bm, &regions);
+        sb.tinode = sb.total_inodes().saturating_sub(2);
+
+        let (iblock, ioff) = sb.inode_location(EFS_V1_ROOT_INODE).ok_or_else(|| {
+            anyhow::anyhow!("EFS v1 mkfs: root inode has no home in the inode table")
+        })?;
+        let mut slot = [0u8; EFS_V1_INODESIZE as usize];
+        root.write_into(&mut slot);
+        let ipos = iblock as usize * EFS_V1_BLOCKSIZE as usize + ioff;
+        img[ipos..ipos + slot.len()].copy_from_slice(&slot);
+
+        let bmpos = EFS_V1_BITMAPBB as usize * EFS_V1_BLOCKSIZE as usize;
+        img[bmpos..bmpos + bm.len()].copy_from_slice(&bm);
+
+        let sbpos = EFS_V1_SUPERBB as usize * EFS_V1_BLOCKSIZE as usize;
+        let sector = &mut img[sbpos..sbpos + EFS_V1_BLOCKSIZE as usize];
+        sb.write_into(sector);
+        sb.recompute_checksum(sector);
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for mib in [1u64, 8, 40] {
+            // The superblock stamps the clock, so a pair built across a second is redone.
+            let (old, new) = loop {
+                let t = now_u32();
+                let old = old_create_blank_efs_v1(mib << 20, "root").unwrap();
+                let new = create_blank_efs_v1(mib << 20, "root").unwrap();
+                if now_u32() == t {
+                    break (old, new);
+                }
+            };
+            assert!(old == new, "{mib} MiB differs");
+        }
+    }
     use super::*;
     use std::io::Cursor;
 

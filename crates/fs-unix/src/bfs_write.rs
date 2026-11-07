@@ -1169,6 +1169,162 @@ struct NodeView {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_bfs(
+        size_bytes: u64,
+        block_size: u32,
+        name: &str,
+        endian: BfsEndian,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        if !block_size.is_power_of_two() || !(1024..=8192).contains(&block_size) {
+            return Err(FilesystemError::InvalidData(format!(
+                "bfs: block size {block_size} must be a power of two in 1024..=8192"
+            )));
+        }
+        let bs = block_size as u64;
+        let block_shift = block_size.trailing_zeros();
+        // One bitmap block covers `block_size * 8` blocks, and BFS sizes an
+        // allocation group to exactly that so `blocks_per_ag` stays 1.
+        let ag_shift = block_shift + 3;
+        let ag_blocks = 1u64 << ag_shift;
+
+        let num_blocks = size_bytes / bs;
+        let num_ags = num_blocks.div_ceil(ag_blocks);
+        // Root lives in AG 8, so the volume has to reach that far.
+        let min_ags = 9u64;
+        if num_ags < min_ags {
+            return Err(FilesystemError::InvalidData(format!(
+                "bfs: {size_bytes} bytes is too small — a {block_size}-byte-block volume needs at \
+                 least {} bytes ({min_ags} allocation groups)",
+                min_ags * ag_blocks * bs
+            )));
+        }
+        if name.len() > 31 {
+            return Err(FilesystemError::InvalidData(
+                "bfs: volume name is capped at 31 bytes".into(),
+            ));
+        }
+
+        let bitmap_blocks = num_ags;
+        let log_start_block = 1 + bitmap_blocks;
+        let log_blocks = 2048u64.min(ag_blocks - 1);
+        let indices_block = log_start_block + log_blocks;
+        let root_block = 8 * ag_blocks;
+        // The directory tree is a header block plus one leaf node.
+        let root_tree_block = root_block + 1;
+        let root_tree_blocks = 2u64;
+        let indices_tree_block = indices_block + 1;
+
+        let mut img = vec![0u8; (num_blocks * bs) as usize];
+        let ag_mask = ag_blocks - 1;
+        let run = |block: u64, len: u16| BlockRun {
+            allocation_group: (block >> ag_shift) as u32,
+            start: (block & ag_mask) as u16,
+            len,
+        };
+
+        // ---- superblock ----
+        let sb_at = 512usize;
+        let sb = &mut img[sb_at..sb_at + 164];
+        sb[..name.len()].copy_from_slice(name.as_bytes());
+        endian.put_u32(sb, 32, crate::bfs::BFS_MAGIC1);
+        endian.put_u32(sb, 36, crate::bfs::BFS_BYTE_ORDER);
+        endian.put_u32(sb, 40, block_size);
+        endian.put_u32(sb, 44, block_shift);
+        endian.put_i64(sb, 48, num_blocks as i64);
+        endian.put_u32(sb, 64, block_size);
+        endian.put_u32(sb, 68, crate::bfs::BFS_MAGIC2);
+        endian.put_u32(sb, 72, 1);
+        endian.put_u32(sb, 76, ag_shift);
+        endian.put_u32(sb, 80, num_ags as u32);
+        endian.put_u32(sb, 84, BFS_CLEAN);
+        run(log_start_block, log_blocks as u16).write(endian, sb, 88);
+        endian.put_i64(sb, 96, indices_block as i64);
+        endian.put_i64(sb, 104, indices_block as i64);
+        endian.put_u32(sb, 112, crate::bfs::BFS_MAGIC3);
+        run(root_block, 1).write(endian, sb, 116);
+        run(indices_block, 1).write(endian, sb, 124);
+
+        // ---- allocation bitmap: everything laid out above ----
+        let mut used = 0u64;
+        let mut mark = |img: &mut [u8], start: u64, count: u64| {
+            for b in start..start + count {
+                // The bitmap starts at block 1, so its byte 0 is at `bs`.
+                let at = bs as usize + (b / 32) as usize * 4;
+                let mut word = endian.read_u32(img, at);
+                word |= 1 << (b % 32);
+                endian.put_u32(img, at, word);
+            }
+            used += count;
+        };
+        mark(&mut img, 0, 1 + bitmap_blocks);
+        mark(&mut img, log_start_block, log_blocks);
+        mark(&mut img, indices_block, 1 + root_tree_blocks);
+        mark(&mut img, root_block, 1 + root_tree_blocks);
+        endian.put_i64(&mut img[sb_at..sb_at + 164], 56, used as i64);
+
+        // ---- the two directories ----
+        let write_dir =
+            |img: &mut [u8], inode_block: u64, tree_block: u64, parent: u64, dir_name: &str| {
+                let tree = {
+                    let node_size = block_size as usize;
+                    let mut t = BTree::blank(endian, node_size);
+                    t.leaf_insert_raw(node_size as i64, ".", inode_block as i64);
+                    t.leaf_insert_raw(node_size as i64, "..", parent as i64);
+                    t
+                };
+                let at = (tree_block * bs) as usize;
+                img[at..at + tree.data.len()].copy_from_slice(&tree.data);
+
+                let mut inode = vec![0u8; block_size as usize];
+                endian.put_u32(&mut inode, 0, BFS_INODE_MAGIC);
+                run(inode_block, 1).write(endian, &mut inode, 4);
+                endian.put_u32(&mut inode, 0x14, S_IFDIR | 0o755);
+                endian.put_u32(&mut inode, 0x18, INODE_FLAGS_DEFAULT);
+                run(parent, 1).write(endian, &mut inode, 0x2C);
+                endian.put_u32(&mut inode, 0x40, block_size);
+                let mut ds = DataStream {
+                    size: (root_tree_blocks * bs) as i64,
+                    ..Default::default()
+                };
+                ds.direct[0] = run(tree_block, root_tree_blocks as u16);
+                ds.max_direct_range = ds.size;
+                ds.max_indirect_range = ds.size;
+                ds.max_double_indirect_range = ds.size;
+                ds.write(endian, &mut inode, INODE_OFF_DATA);
+                let off = INODE_OFF_SMALL_DATA;
+                endian.put_u32(&mut inode, off, FILE_NAME_TYPE);
+                endian.put_u16(&mut inode, off + 4, 1);
+                endian.put_u16(&mut inode, off + 6, dir_name.len() as u16);
+                inode[off + 8] = FILE_NAME_NAME;
+                let name_at = off + 8 + 1 + 3;
+                inode[name_at..name_at + dir_name.len()].copy_from_slice(dir_name.as_bytes());
+                let iat = (inode_block * bs) as usize;
+                img[iat..iat + inode.len()].copy_from_slice(&inode);
+            };
+        write_dir(&mut img, root_block, root_tree_block, root_block, name);
+        write_dir(
+            &mut img,
+            indices_block,
+            indices_tree_block,
+            root_block,
+            "indices",
+        );
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for (mib, bs) in [(72u64, 1024u32), (100, 1024), (290, 2048)] {
+            for endian in [BfsEndian::Little, BfsEndian::Big] {
+                let old = old_create_blank_bfs(mib << 20, bs, "Haiku", endian).unwrap();
+                let new = create_blank_bfs(mib << 20, bs, "Haiku", endian).unwrap();
+                assert!(old == new, "{mib} MiB bs {bs} differs");
+            }
+        }
+    }
     use super::*;
 
     fn tree() -> BTree {
@@ -1295,6 +1451,24 @@ pub fn create_blank_bfs(
     name: &str,
     endian: BfsEndian,
 ) -> Result<Vec<u8>, FilesystemError> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_bfs_into(&mut cur, 0, size_bytes, block_size, name, endian)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_bfs`]: writes the superblock, the bitmap's used prefix
+/// and the two directories at `at_offset`, and returns the volume's length.
+pub fn write_blank_bfs_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    endian: BfsEndian,
+) -> Result<u64, FilesystemError> {
     if !block_size.is_power_of_two() || !(1024..=8192).contains(&block_size) {
         return Err(FilesystemError::InvalidData(format!(
             "bfs: block size {block_size} must be a power of two in 1024..=8192"
@@ -1334,7 +1508,13 @@ pub fn create_blank_bfs(
     let root_tree_blocks = 2u64;
     let indices_tree_block = indices_block + 1;
 
-    let mut img = vec![0u8; (num_blocks * bs) as usize];
+    // The superblock and the bitmap's used prefix are built here; every bit past the last
+    // block marked below is zero, so the rest of the bitmap stays unwritten.
+    let last_marked = (1 + bitmap_blocks)
+        .max(log_start_block + log_blocks)
+        .max(indices_block + 1 + root_tree_blocks)
+        .max(root_block + 1 + root_tree_blocks);
+    let mut img = vec![0u8; (bs + last_marked.div_ceil(32) * 4) as usize];
     let ag_mask = ag_blocks - 1;
     let run = |block: u64, len: u16| BlockRun {
         allocation_group: (block >> ag_shift) as u32,
@@ -1383,54 +1563,54 @@ pub fn create_blank_bfs(
     endian.put_i64(&mut img[sb_at..sb_at + 164], 56, used as i64);
 
     // ---- the two directories ----
-    let write_dir =
-        |img: &mut [u8], inode_block: u64, tree_block: u64, parent: u64, dir_name: &str| {
-            let tree = {
-                let node_size = block_size as usize;
-                let mut t = BTree::blank(endian, node_size);
-                t.leaf_insert_raw(node_size as i64, ".", inode_block as i64);
-                t.leaf_insert_raw(node_size as i64, "..", parent as i64);
-                t
-            };
-            let at = (tree_block * bs) as usize;
-            img[at..at + tree.data.len()].copy_from_slice(&tree.data);
-
-            let mut inode = vec![0u8; block_size as usize];
-            endian.put_u32(&mut inode, 0, BFS_INODE_MAGIC);
-            run(inode_block, 1).write(endian, &mut inode, 4);
-            endian.put_u32(&mut inode, 0x14, S_IFDIR | 0o755);
-            endian.put_u32(&mut inode, 0x18, INODE_FLAGS_DEFAULT);
-            run(parent, 1).write(endian, &mut inode, 0x2C);
-            endian.put_u32(&mut inode, 0x40, block_size);
-            let mut ds = DataStream {
-                size: (root_tree_blocks * bs) as i64,
-                ..Default::default()
-            };
-            ds.direct[0] = run(tree_block, root_tree_blocks as u16);
-            ds.max_direct_range = ds.size;
-            ds.max_indirect_range = ds.size;
-            ds.max_double_indirect_range = ds.size;
-            ds.write(endian, &mut inode, INODE_OFF_DATA);
-            let off = INODE_OFF_SMALL_DATA;
-            endian.put_u32(&mut inode, off, FILE_NAME_TYPE);
-            endian.put_u16(&mut inode, off + 4, 1);
-            endian.put_u16(&mut inode, off + 6, dir_name.len() as u16);
-            inode[off + 8] = FILE_NAME_NAME;
-            let name_at = off + 8 + 1 + 3;
-            inode[name_at..name_at + dir_name.len()].copy_from_slice(dir_name.as_bytes());
-            let iat = (inode_block * bs) as usize;
-            img[iat..iat + inode.len()].copy_from_slice(&inode);
+    w.seek(SeekFrom::Start(at_offset))?;
+    w.write_all(&img)?;
+    let write_dir = |w: &mut W,
+                     inode_block: u64,
+                     tree_block: u64,
+                     parent: u64,
+                     dir_name: &str|
+     -> std::io::Result<()> {
+        let tree = {
+            let node_size = block_size as usize;
+            let mut t = BTree::blank(endian, node_size);
+            t.leaf_insert_raw(node_size as i64, ".", inode_block as i64);
+            t.leaf_insert_raw(node_size as i64, "..", parent as i64);
+            t
         };
-    write_dir(&mut img, root_block, root_tree_block, root_block, name);
-    write_dir(
-        &mut img,
-        indices_block,
-        indices_tree_block,
-        root_block,
-        "indices",
-    );
+        w.seek(SeekFrom::Start(at_offset + tree_block * bs))?;
+        w.write_all(&tree.data)?;
 
-    Ok(img)
+        let mut inode = vec![0u8; block_size as usize];
+        endian.put_u32(&mut inode, 0, BFS_INODE_MAGIC);
+        run(inode_block, 1).write(endian, &mut inode, 4);
+        endian.put_u32(&mut inode, 0x14, S_IFDIR | 0o755);
+        endian.put_u32(&mut inode, 0x18, INODE_FLAGS_DEFAULT);
+        run(parent, 1).write(endian, &mut inode, 0x2C);
+        endian.put_u32(&mut inode, 0x40, block_size);
+        let mut ds = DataStream {
+            size: (root_tree_blocks * bs) as i64,
+            ..Default::default()
+        };
+        ds.direct[0] = run(tree_block, root_tree_blocks as u16);
+        ds.max_direct_range = ds.size;
+        ds.max_indirect_range = ds.size;
+        ds.max_double_indirect_range = ds.size;
+        ds.write(endian, &mut inode, INODE_OFF_DATA);
+        let off = INODE_OFF_SMALL_DATA;
+        endian.put_u32(&mut inode, off, FILE_NAME_TYPE);
+        endian.put_u16(&mut inode, off + 4, 1);
+        endian.put_u16(&mut inode, off + 6, dir_name.len() as u16);
+        inode[off + 8] = FILE_NAME_NAME;
+        let name_at = off + 8 + 1 + 3;
+        inode[name_at..name_at + dir_name.len()].copy_from_slice(dir_name.as_bytes());
+        w.seek(SeekFrom::Start(at_offset + inode_block * bs))?;
+        w.write_all(&inode)
+    };
+    write_dir(w, root_block, root_tree_block, root_block, name)?;
+    write_dir(w, indices_block, indices_tree_block, root_block, "indices")?;
+
+    Ok(num_blocks * bs)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Build Disk: build any disk we support
 
-Feature plan, not yet started. Read
+Feature plan; work is on branch `add-build-disk` (cut from `main` 2026-11-05). Read
 [CONTRIBUTING.md § Architecture policy (MVC)](../CONTRIBUTING.md#architecture-policy-mvc--read-before-adding-any-code)
 first; it is binding. The user asked for full TUI parity including Build Disk,
 and for the feature to be planned before it is built.
@@ -165,7 +165,9 @@ All of these belong in the model or a crate, never in a shell.
 |---|---|---|:-:|
 | G1 | **Format dispatch in the model.** Move `FsKind`, its option bag (`NewArgs`) and `format_image` out of `src/cli/verbs/new.rs` into `src/model/format.rs` (`FsKind` as a plain enum, no clap derive; the CLI keeps a `ValueEnum` mirror). Add per-fs capabilities: min / max size, fixed geometry, label rules, options, stream or `Vec`. | `src/model` | M |
 | G2 | **Format into an extent.** `format_into(&mut W, offset, len, FsKind, opts)` so the builder can format partition N on an image or a device. Stream formatters write straight through. `Vec` formatters write the buffer at the offset, with a size cap (refuse above, for example, 2 GiB rather than eat RAM). | `src/model`, plus `write_*_into` variants in crates | M |
-| G3 | **Streaming writers** for the large `Vec`-only filesystems: HPFS, PFS3, SFS, AFFS, BFS, OFS (the floppy-sized ones can stay `Vec`). | `fs-hpfs`, `fs-amiga`, `fs-unix` (publish + bump) | M each |
+| G3 | **Streaming writers** for the large `Vec`-only filesystems: HPFS, PFS3, SFS, AFFS, BFS, OFS (the floppy-sized ones can stay `Vec`). Each writes only metadata through `Write + Seek` with memory bounded by one bitmap band / block, never the volume. The old `create_blank_*` becomes a wrapper that streams into a `Cursor`, and a test proves the bytes match the old output before the old code goes. | `fs-hpfs`, `fs-amiga`, `fs-unix` (publish + bump) | M each |
+| G13 | **Layout donor**: read an existing disk's table into rows plus its verbatim head region; the label schemes resize through `restore_patch`. | `src/model`, `src/partition` | M |
+| G14 | **More disc expansion**: ZIP (and Mac zips), MacBinary / AppleSingle single files, disk-image contents; `--expand-gunzip` on every CD format. **Done 2026-11-05** (`fs-tar` 0.1.2 `zip_import`, `fs-mac` 0.1.4 `parse_applesingle`, `fs::image_import`, `--expand-images`). | `src/fs/dir_import.rs` | S-M |
 | G4 | **Wire the U rows**: exFAT, CBM, DFS, RS-DOS, DragonDOS, Human68k, Alto BFS (and Pilot if wanted) into G1's dispatch with their geometry options. | `src/model` | S each |
 | G5 | **Container output as a build step**: build to a temp raw or straight to the sink, then encode through `ExportFormat` (CHD behind `chd`), the floppy encoders and fixed VHD. Lift the VHD footer out of `new_partitioned_hd.rs`. | `src/model` | M |
 | G6 | **Bootable flag and boot code** per scheme: MBR active byte and an optional boot-code donor, RDB boot priority, the SGI dvh / Sun / NeXT boot slices that already exist, APM driver partition (reuse the `make-bootable` pieces). | `partition::provision`, `part-tables` | M |
@@ -174,6 +176,17 @@ All of these belong in the model or a crate, never in a shell.
 | G9 | **Fixed builders as presets**: express x68k, sgi-efs and the four CD targets as builder presets (scheme + rows + boot pieces) where the shape fits, and keep the special code (IPL, volume header files) as preset hooks. | `src/partition`, `src/model` | M |
 | G10 | Missing table writers: MBR extended / logical, AHDI XGM, BSD disklabel, APM-TS, DSD. | `part-tables`, `provision` | S-M each |
 | G11 | Missing filesystem creators: QNX 2, HP LIF, QXL.WIN, SquashFS (empty), ADFS D / F, Atari ED first. APFS / btrfs / JFS / ReiserFS / VxFS / QNX 4/6 / Lisa are L and read-mostly today. Each needs its own oracle. | the fs crate | S-L |
+
+### Found in phase 1
+
+- **Streaming writers assume a zeroed target.** Every formatter writes only its metadata and
+  leaves the rest to read as zero, which a fresh or sparse file does. A physical disk or a
+  reused image does not: old inode-table or directory bytes would surface as garbage. Phase 4
+  (formatting rows on a device) has to zero what each formatter skips that its fs reads (the
+  inode tables, directory areas and bitmaps), not the whole partition. `FsCaps` grows a
+  "regions that must read zero" answer per fs, or the writers take a `zero_fill` flag.
+- **UFS writes its inode tables** (as `newfs` does), so a 1 TiB UFS1 writes tens of GB. That is
+  correct, but Build Disk shows progress for it.
 
 ## 3. Proposed design
 
@@ -264,15 +277,17 @@ Each phase ships on its own: tests green, `scripts/check-boundaries.sh`, GUI bui
 
 | # | Phase | Tests |
 |---|---|---|
-| 1 | G1: format dispatch in `model::format`. `rb-cli new floppy / volume` call it; byte-identical output. | existing `new-volume*.toml` tier-1 cases, plus a model test that hashes every `FsKind`'s blank volume before and after |
-| 2 | `controller::build_disk` over `DiskBuilder`; Restore's Build Disk forwards to it; GUI unchanged on screen. | `tests/ui_scenarios/restore_build_disk.toml` still passes; new `build_disk_basic.toml` |
-| 3 | TUI Build Disk screen on the controller: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list and its `NewCommand` building. | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
-| 4 | G2 + per-row **Format** content: format each row during the build, GUI and TUI. `new hd --partition SIZE:TYPE:NAME --format N=FS[:LABEL]` on the CLI. Start with the stream-capable filesystems. | tier-1 cases per scheme: build, then `fsck` and `ls` each partition; emulator scenarios: `fat.win7-blank`-style for MBR+FAT / NTFS, `ufs1-be.solaris-blank` on a Sun label, `ufs43.nextstep-blank` on a NeXT label, FS-UAE for RDB+PFS3 / SFS |
-| 5 | Bare-volume builds in the same controller (scheme = None), a GUI New Disk dialog, every `FsKind` in the TUI (CP/M preset picker, Oric, HPFS, PFS3, SFS, EFS v1, XFS, BFS, OFS, UFS x3). | ui_scenario per class; existing `new-volume` CLI cases |
-| 6 | G5: container output in the build (CHD, VHD, QCOW2, VMDK, 2MG, WOZ, DC42, ATR, D88 ...). | tier-4 `convert.toml`-style cases; `chdman info` and MAME for CHD; `qemu-img check` |
-| 7 | G4: the U-row filesystems (exFAT, CBM, DFS, RS-DOS, DragonDOS, Human68k, Alto). | fs fsck round-trip per fs; VICE for CBM, the MiSTer cores where there is no emulator |
-| 8 | G6 + G7: bootable flags, boot-code donors, RDB handlers in GUI / TUI. | QEMU MBR boot (the GRUB MBR-gap recipe); FS-UAE boots an RDB with an embedded handler |
-| 9 | G8 + G9: fill from host folder; the fixed builders as presets. `new hd x68k` / `sgi-efs` / `optical new` become presets with byte-identical output. | existing x68k / sgi-efs / CD cases unchanged; Iris (IRIX 6.5) mounts a preset sgi-efs disk |
+| 1 | G1: format dispatch in `model::format`. `rb-cli new floppy / volume` call it; byte-identical output. **Done 2026-11-05**: `model::format::{FsKind, FsCaps, FormatOptions, format_into, format_to_file, Window}`; FAT, HFS, HFS+ and HFV now stream (`fs-mac` 0.1.5 adds the sized HFS / HFS+ writers); `new volume ufs --bytes-per-inode` works (it was refused). | existing `new-volume*.toml` tier-1 cases, plus a model test that formats every `FsKind` at its minimum, a middle size and its largest buildable size (capped at 4 GiB) and opens and fscks it; images compared byte for byte with the old CLI (only clock / UUID bytes differ) |
+| 2 | `controller::build_disk` over `DiskBuilder` with the wizard's step machine (§ 7), and the GUI's top-level **Build Disk** tab drawing it. It covers today's capability (partitioned disk, empty or image rows, image or device target); Restore's Build Disk mode moves here and leaves the Restore tab. | `tests/ui_scenarios/restore_build_disk.toml` moves to `build_disk_basic.toml`; wizard step tests (Next blocked with a reason, Back keeps entries) |
+| 3 | TUI Build Disk screen on the same steps: scheme, geometry, rows (size / type / name / source), image or device target, device confirmation. Retire the TUI's one-partition HD list, its `NewWizard` and its `NewCommand` building. **Done 2026-11-05** (`tui_app/build_disk.rs`, a Build Disk tab); the TUI New Disk tab keeps only the two bootable presets (X68000, SGI EFS, until phase 9) and the CD-ROM targets (until the CD plan). | ui_scenario for multi-row MBR and RDB; TUI key-map entries |
+| 3b | G3: streaming writers for HPFS, AFFS, PFS3, SFS, BFS, OFS, each byte-identical to today's blank volume, each published. **Done 2026-11-05**: `write_blank_{hpfs,affs,pfs3,sfs,bfs,ofs}_into` (fs-hpfs 0.1.1, fs-amiga 0.1.1, fs-unix 0.2.2); each `create_blank_*` now wraps its stream, and the old in-memory code stays in the tests as the byte-for-byte reference. Memory is bounded: HPFS and AFFS hold one bitmap band / page, SFS one bitmap block, PFS3 its used reserved blocks (a few MiB), BFS and OFS the bitmap prefix the metadata marks. A 64 GiB HPFS formats into a sparse file. | per fs: old-vs-new hash test; its existing fsck oracle on a 4 GiB blank volume built with a small memory limit (`ulimit -v`) |
+| 4 | G2 + per-row **Format** content: format each row during the build, GUI and TUI. `new hd --partition SIZE:TYPE:NAME --format N=FS[:LABEL]` on the CLI. Start with the stream-capable filesystems. **Done 2026-11-05**: the GUI and TUI got formatted rows in phase 2; the CLI is `rb-cli build TARGET --table KIND --partition SPEC... --format N=FS[:LABEL]... --fill N=PATH...` (or `--fs FS --label L` for a bare volume), which drives the same controller, so its refusals are the wizard's. Per-filesystem options (FAT32, block size, ...) are GUI / TUI only for now. | tier-1 cases per scheme: build, then `fsck` and `ls` each partition; emulator scenarios: `fat.win7-blank`-style for MBR+FAT / NTFS, `ufs1-be.solaris-blank` on a Sun label, `ufs43.nextstep-blank` on a NeXT label, FS-UAE for RDB+PFS3 / SFS |
+| 4b | G13: start from a donor disk's layout (copy / format blank / empty per row, verbatim head region, new disk size). **Done 2026-11-05** for image donors: the Disk step's "Start from: an existing disk's layout" (`model::disk_builder::Donor`, `DiskBuilder::from_donor`) takes the table and one row per partition, each copied by default and switchable to Format or Empty; a label donor (SGI, Sun, NeXT, RDB, AHDI, X68000, SGI disk label) keeps its head verbatim and its slots fixed, laid out and rewritten by `restore_patch`, which now also regenerates the whole-disk entries (SGI VOLUME and cylinder count, Sun backup slice and ncyl / pcyl) so a bigger disk is described whole (restores to a bigger disk gain this too). MBR / GPT / APM donors are rewritten by the provision writers with their rows free. `rb-cli build --from DONOR [--partition SIZE]... [--format N=FS] [--empty N]`. A copied filesystem grows to a bigger row through `fs::resize_filesystem_for` ("Copy and resize"; one that cannot resize keeps its size, and the build log says so), and its start LBA is restamped. exFAT stops where its FAT is full (and warns). HFS past what its block size and bitmap reach is rebuilt into the row at a bigger block size, up to the 4063 MB classic HFS holds; a bigger row is refused with the reason. AFFS grows without a size limit from us: the resizer writes bitmap extension chains. Not yet: physical-disk and backup-folder donors, and MBR logicals. | SGI vh donor -> larger disk, IRIX mounts it (Iris); RDB donor with handlers -> FS-UAE; MBR / APM donors; Review lists copied vs regenerated |
+| 5 | Bare-volume builds in the same controller (scheme = None), a GUI New Disk dialog, every `FsKind` in the TUI (CP/M preset picker, Oric, HPFS, PFS3, SFS, EFS v1, XFS, BFS, OFS, UFS x3). **Done 2026-11-05** with phase 2: the Kind step's single volume is every `FsKind` in the GUI and the TUI (CP/M preset picker included), and the TUI New Disk tab keeps only the presets and CDs. | ui_scenario per class; existing `new-volume` CLI cases |
+| 6 | G5: container output in the build (CHD, VHD, QCOW2, VMDK, 2MG, WOZ, DC42, ATR, D88 ...). **Done 2026-11-05**: an image output picks a container (raw, fixed / dynamic VHD, QCOW2, VMDK, CHD, 2MG, DiskCopy 4.2, WOZ, MOOF; the save name's extension picks one); the disk is built raw beside the target and encoded through `bulk_convert_runner::convert_image`, the Bulk Convert step. WOZ / MOOF / DiskCopy 4.2 refuse a size that is not one of their floppies. The X68000 floppy containers and ATR are not offered yet. | tier-4 `convert.toml`-style cases; `chdman info` and MAME for CHD; `qemu-img check` |
+| 7 | G4: the U-row filesystems (exFAT, CBM, DFS, RS-DOS, DragonDOS, Human68k, Alto). **Done 2026-11-05** for exFAT (streams, Windows cluster sizes), CBM (D64 / D64-40 / D71 / D81 / D80 / D82), Acorn DFS (40 / 80 tracks), RS-DOS (35 / 40 / 80) and DragonDOS (40 / 80, one or two sides), with a geometry option; each geometry formats, opens and fscks in a test. That test found blank D71s leaving track 53 free, which the 1571 reserves whole (fs-8bit 0.1.1). Deferred: Human68k (its creator takes a donor template; the X68000 preset covers it) and Alto / Pilot (packs are PDI files, not raw volumes). | fs fsck round-trip per fs; VICE for CBM, the MiSTer cores where there is no emulator |
+| 8 | G6 + G7: bootable flags, boot-code donors, RDB handlers in GUI / TUI. **Done 2026-11-05** for the flags and handlers: a Boot column (MBR active flag, one partition; RDB bootable flag, several) and the RDB handler list (`Add PFS\3 handler...` for each DosType the rows use that the ROM lacks, with a Review warning when none is added) in the GUI and TUI; `rb-cli build --bootable N --filesystem DOSTYPE=PATH`. Handler loading and its HUNK_HEADER check moved from `new hd` into `provision_runner::load_rdb_handlers`. Boot-code donors stay on `docs/bootable_disks_backlog.md` (decision 3). | QEMU MBR boot (the GRUB MBR-gap recipe); FS-UAE boots an RDB with an embedded handler |
+| 9 | G8 + G9: fill from host folder; the fixed builders as presets. `new hd x68k` / `sgi-efs` / `optical new` become presets with byte-identical output. **Done 2026-11-05** for the hard-disk presets: the Kind step's Bootable preset offers the X68000 (SASI / SCSI, 1-8 Human68k partitions, an optional system floppy cloned in) and SGI IRIX (EFS label) disks, built by the same `build_x68k_hdd` / `write_sgi_efs_hdd` calls `new hd` makes (a test compares them), to a file, a device or a container; `rb-cli build --preset x68k|sgi-efs`. Fill from a host folder (G8) and the CD presets stay with docs/cdrom_building_plan.md; the TUI New Disk tab still offers the presets as shortcuts beside its CD targets. | existing x68k / sgi-efs / CD cases unchanged; Iris (IRIX 6.5) mounts a preset sgi-efs disk |
 | 10+ | G10 / G11 one writer or creator at a time, each with its real-OS oracle (`regression-tests/ORACLE-HOSTS.md`, `EMULATORS.md`). | per item |
 
 Phases 1-3 give the TUI parity the user asked for. 4-6 give one-step "build any
@@ -321,10 +336,88 @@ mention creation), `docs/cli-reference.md`, `docs/platform_matrix.md`, and
 6. **Filesystems:** Build Disk can create every filesystem we support writing. The E rows
    with no creator stay on the filesystem backlog until a writer exists; each writer that
    lands joins Build Disk.
-7. **Size limits:** AFFS, PFS3 (plus its multi-MI formatting for large disks), SFS, HPFS and
-   BFS get streaming writers (G3). Until each lands, the builder shows its current cap
-   (2 GiB) in the size field and refuses above it with the reason. The small in-RAM
+7. **Streaming (revised 2026-11-05):** every filesystem streams, except a true floppy format of
+   3 MB or less; see CONTRIBUTING.md § Streaming rule. It replaces the 64 MB cap below.
+   **Earlier size limits:** AFFS, PFS3 (plus its multi-MI formatting for large disks), SFS, HPFS and
+   BFS get streaming writers (G3). **Revised 2026-11-05:** all five, plus BeOS OFS, go
+   streaming *before* Build Disk offers them (G3 moves ahead of phase 4's formatted rows),
+   because rb-cli also runs on vintage machines (the Rust 1.73 / PowerPC / Solaris builds)
+   where even a few hundred MB in RAM is out of reach; formatting an HPFS partition on a
+   real disk from OS/2-era hardware has to work. No in-RAM cap is shown for them. The small in-RAM
    filesystems (ProDOS, MFS, Minix V1, the floppy formats, BeOS OFS, EFS v1) keep a 64 MB
    cap. Real-world maxima were given from memory; confirm each when its writer is done.
 8. **Targets:** an image file (in any container) or a physical disk, as today's Build Disk
    does; a physical disk needs its device name typed to confirm.
+
+## 7. The wizard (asked 2026-11-05)
+
+The user asked for Build Disk to be a wizard in the GUI. The steps are controller state
+(`BuildDiskController::step()`, `steps()`, `next_blocked() -> Option<String>`), so the TUI walks the
+same steps and a scenario test drives both. The CLI's `rb-cli build` skips the steps and fills
+the same `BuildRequest`; the same validators run.
+
+| # | Step | Shown for | What it asks | Next is blocked when |
+|---|---|---|---|---|
+| 1 | **Kind** | always | Floppy, single volume (no table), partitioned disk, or a preset (an optical-disc kind comes with the CD plan) (X68000, SGI EFS hard disk, ...) | never |
+| 2 | **Disk** | floppy: format + geometry; volume: filesystem + size; partitioned: scheme + size + alignment / heads / sectors; preset: its few fields | the base shape | size outside the fs / scheme limits (the reason is shown) |
+| 3 | **Partitions** | partitioned, presets with rows | rows: size, type, name, content (empty, format with a filesystem, source image; host folder from phase 9), with the layout bar | the layout does not place, or a row's fs does not fit its size |
+| 4 | **Filesystem options** | any row or volume that formats | label and per-fs options (FAT type, cluster size, HFS+ case, ext journal, CP/M DPB, ...) per formatted row | a label breaks its fs's rules |
+| 5 | **Output** | always | image file (path + container: raw, CHD, VHD, ...) or a physical disk: an SD / CF card in a reader, a USB stick, any disk the device list shows (the Restore tab's list, with its identity check). A device fixes the disk size to its capacity, so step 2's size follows the card and `rest` fills it | no path or device; a container that cannot hold this content |
+| 6 | **Review** | always | a summary of every choice, the warnings (fs vs scheme pairings, a missing Amiga handler), and for a device the typed device-name confirmation | the device name does not match |
+| 7 | **Build** | always | progress and log of the one build job; on success "Open in Inspect" and "Build another" | (running) |
+
+### Starting from an existing disk's layout (asked 2026-11-05)
+
+Step 2 for a partitioned disk asks **Start from: a blank table, or an existing disk's layout**.
+The donor is an image, a backup or a physical disk. Example: build a bigger SGI disk from a
+small working one, keeping its volume header (sash, ide and the other volume-header files),
+its swap and its slot layout, with a new disk size.
+
+- The donor's table is read with the existing parsers, and its **head region rides
+  verbatim** (SGI volume header and its files, RDB and its filesystem handlers, the X68000
+  IPL, NeXT boot blocks, Sun boot slices). The resize uses `partition::restore_patch`, the
+  same code that resizes these labels on restore today. MBR / GPT / APM tables are rewritten
+  by the `provision` writers; APM driver partitions (`Apple_Driver43`, `Apple_Patches`, ...)
+  are copied as rows.
+- Each donor partition becomes a row, with its **content** picked per row:
+  - **Copy**: the donor's bytes. This is the default for special partitions such as the
+    volume header, drivers, boot slices and RDB handlers. A filesystem that can resize grows
+    or shrinks to the row's size; one that can't keeps its size, and the rest of the row is
+    padded.
+  - **Format blank**: same filesystem and label as the donor. This is the default for data
+    partitions.
+  - **Empty**.
+- Whole-disk entries (SGI slot 10 `volume`, Sun slice 2 `backup`) are not rows: they are
+  regenerated to the new disk size.
+- The rows stay editable, so sizes can change and rows can be added where the scheme has
+  free slots. `rest` goes on the last data row by default.
+- Review lists what came from the donor and what was regenerated.
+
+This adds **G13: layout donor** (`model::disk_builder::DiskBuilder::from_donor`, reading a
+table into rows plus the verbatim head region; the build runs `restore_patch` for the label
+schemes) as phase 4b.
+
+### Checking that each filesystem supports what is asked
+
+The wizard only offers what the model says works, and tests check that the model is right:
+
+- **Capabilities in the model (G1):** per `FsKind`, the minimum and maximum size, block /
+  cluster choices, label rules, the schemes it pairs with, and whether it can format,
+  resize, and be populated (has an editor). The size field, the filesystem list per scheme,
+  the "Copy and resize" choice and the label field all read these.
+- **A capability test** builds every `FsKind` at its minimum, a middle size and its maximum
+  (streamed and sparse), then runs our fsck and the fs's oracle where one exists. A claimed
+  limit that fails is a test failure, not a user bug report.
+- **A pairing test** builds each natural pairing in § 1d (scheme x fs), then `fsck` + `ls` +
+  a `put` / `get` round trip on every partition. The real-OS emulator scenarios
+  (`regression-tests/emulator/`) cover the pairings that have an emulator.
+- A capability that is not proven is not offered. For a donor row, the wizard checks
+  `can_resize` before it offers "Copy and resize".
+
+### Optical discs
+
+Moved to [cdrom_building_plan.md](cdrom_building_plan.md) (2026-11-05): mastering discs
+from content, the ISO 9660 writer and CD audio are a later plan. Build Disk keeps the
+existing CD builders (`optical new`) as they are; only their archive expansion (G14) is
+being done now, ahead of the phases.
+

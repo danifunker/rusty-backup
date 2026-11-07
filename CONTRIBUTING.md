@@ -274,6 +274,22 @@ never copy it sideways.
 
 ---
 
+### Streaming rule
+
+**Every filesystem streams.** Code that creates, formats, clones, repacks or builds a volume
+writes through `Write + Seek` and never holds the volume in RAM. Memory is bounded by metadata
+(one bitmap band, one block, a directory), never by the size of the volume. Rusty Backup runs
+on vintage machines, and a volume-sized buffer has already taken down a 14 GB desktop.
+
+- The one exception is a true floppy format of **3 MB or less**, whose whole image may be built
+  in memory (`model::format::IN_RAM_LIMIT`). A format that can exceed that streams, even when
+  its common sizes are small.
+- No lower size limit stands in for a streaming writer.
+- Don't zero-fill a volume-sized buffer. A `create_blank_*` that returns a `Vec` is a wrapper
+  over the stream for tests and small callers; real code calls the `write_blank_*_into` form.
+- Prove memory with a test that formats a large volume onto a sparse target. Windows files are
+  not sparse by default, so size such a test down there.
+
 ## Patterns to follow (the established conventions)
 
 These are the patterns the refactor settled on. Use them as templates.

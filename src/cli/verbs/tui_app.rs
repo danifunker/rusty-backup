@@ -45,13 +45,14 @@ use ratatui::{DefaultTerminal, Frame};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
+use crate::cli::verbs::new::{HdCommand, NewCommand};
 use crate::controller::app::{format_size, RateTracker};
 use crate::controller::app::{DiskDevice, RecentMode};
 
 mod archives;
 mod ask;
 mod backup;
+mod build_disk;
 mod bulk;
 mod commander;
 mod dialogs;
@@ -68,6 +69,7 @@ mod writer;
 
 use archives::ArchiveState;
 use backup::BackupState;
+use build_disk::BuildDiskState;
 use bulk::{BulkState, BulkStep};
 use inspect::InspectState;
 #[cfg(feature = "optical")]
@@ -764,6 +766,7 @@ impl Palette {
 enum TabId {
     Backup,
     Restore,
+    Build,
     Inspect,
     NewDisk,
     Optical,
@@ -777,6 +780,7 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Backup, "Backup"),
     (TabId::Restore, "Restore"),
     (TabId::Inspect, "Inspect"),
+    (TabId::Build, "Build Disk"),
     (TabId::NewDisk, "New Disk"),
     (TabId::Optical, "Optical"),
     (TabId::Archives, "Archives"),
@@ -911,8 +915,6 @@ enum WizStep {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiskClass {
-    Floppy,
-    Volume,
     Hd,
     Cdrom,
 }
@@ -923,19 +925,9 @@ enum DiskClass {
 /// `--partitions`, EFS inode density — remain CLI-only.
 const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     (
-        "Floppy",
-        DiskClass::Floppy,
-        "Bare floppy-geometry volume: FAT / HFS and the fixed-geometry retro filesystems.",
-    ),
-    (
-        "Volume",
-        DiskClass::Volume,
-        "Bare single volume of any size (a superfloppy): NTFS, ext, HFS+, EFS, ...",
-    ),
-    (
-        "Hard disk",
+        "Bootable hard disk",
         DiskClass::Hd,
-        "Partition-table-wrapped, self-bootable HDD image (Sharp X68000, SGI IRIX).",
+        "A ready-to-boot preset: Sharp X68000 (Human68k) or SGI IRIX (EFS). Any other disk: Build Disk.",
     ),
     (
         "CD-ROM",
@@ -968,78 +960,11 @@ const CD_TARGETS: &[(&str, CdTarget)] = &[
 enum HdPlatform {
     X68k,
     SgiEfs,
-    /// Generic tables. The wizard builds one partition filling the disk;
-    /// multi-partition layouts stay on the CLI, which takes `--partition`.
-    Mbr,
-    Gpt,
-    Apm,
-    /// Partition table only — no EFS format, no IPL stub, unlike the two above.
-    SgiTable,
-    X68kTable,
-    Rdb,
-    Sun,
-    Atari,
-}
-
-/// Wrap the shared args with the default cylinder geometry, for the two
-/// tables whose partitions land on cylinder boundaries.
-fn cylinder_args(
-    common: crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs,
-) -> crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
-    crate::cli::verbs::new_partitioned_hd::CylinderHdArgs {
-        common,
-        heads: crate::controller::new_disk::DEFAULT_HEADS,
-        sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
-    }
 }
 
 const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
     ("Sharp X68000 (Human68k)", HdPlatform::X68k),
     ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
-    ("MBR (DOS / PC), one partition", HdPlatform::Mbr),
-    ("GPT (UEFI), one partition", HdPlatform::Gpt),
-    ("APM (Apple / PowerPC), one partition", HdPlatform::Apm),
-    (
-        "SGI volume header (IRIX), one partition",
-        HdPlatform::SgiTable,
-    ),
-    ("X68000 table only, one partition", HdPlatform::X68kTable),
-    ("Amiga RDB, one partition", HdPlatform::Rdb),
-    ("Sun disk label (SPARC), one slice", HdPlatform::Sun),
-    ("Atari ST AHDI, one partition", HdPlatform::Atari),
-];
-
-/// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
-/// because it requires a `--cpm-preset` (use the CLI: `rb-cli new floppy cpm`).
-const FLOPPY_FS: &[(&str, FloppyFs)] = &[
-    ("FAT12 / FAT16", FloppyFs::Fat),
-    ("HFS (Mac OS Standard)", FloppyFs::Hfs),
-    ("Atari DOS 2.0S", FloppyFs::Atari),
-    ("Apple DOS 3.3", FloppyFs::AppleDos),
-    ("OS-9 / NitrOS-9", FloppyFs::Os9),
-    ("UCSD p-System", FloppyFs::Ucsd),
-    ("TR-DOS (ZX Spectrum)", FloppyFs::Trdos),
-    ("TI-99/4A", FloppyFs::Ti99),
-    ("MFS (Mac, pre-HFS)", FloppyFs::Mfs),
-    ("Acorn ADFS (E-format)", FloppyFs::Adfs),
-    ("Minix V1", FloppyFs::Minix),
-];
-
-/// Filesystems offered under `new volume` in the wizard.
-const VOLUME_FS: &[(&str, VolumeFs)] = &[
-    ("HFS (Mac OS Standard)", VolumeFs::Hfs),
-    ("HFS+ / HFSX", VolumeFs::Hfsplus),
-    ("HFV (BasiliskII, <= 2047 MB)", VolumeFs::Hfv),
-    ("FAT12 / 16 / 32", VolumeFs::Fat),
-    ("NTFS", VolumeFs::Ntfs),
-    ("ext2", VolumeFs::Ext),
-    ("ext3", VolumeFs::Ext3),
-    ("ext4", VolumeFs::Ext4),
-    ("Amiga FFS / OFS", VolumeFs::Affs),
-    ("ProDOS (<= ~32 MiB)", VolumeFs::Prodos),
-    ("IRIX EFS", VolumeFs::Efs),
-    ("Minix V2", VolumeFs::Minix2),
-    ("Minix V3", VolumeFs::Minix3),
 ];
 
 /// The details form's text fields: path, size, name — plus, for a CD-ROM, an
@@ -1051,8 +976,19 @@ const WIZ_FIELDS: usize = 3;
 /// non-text row, so the key handler special-cases it.
 const WIZ_FIELD_EXPAND: usize = 4;
 
-/// Index of the expand-gunzip toggle, a row only the NeXT target has (`--expand-gunzip`).
+/// Index of the expand-gunzip toggle (`--expand-gunzip`).
 const WIZ_FIELD_GUNZIP: usize = 5;
+
+/// Index of the expand-images toggle (`--expand-images`), the last CD-ROM row.
+const WIZ_FIELD_IMAGES: usize = 6;
+
+/// The CD-ROM expansion toggles, as the builders' `--expand-*` flags take them.
+#[derive(Clone, Copy)]
+struct Expand {
+    archives: bool,
+    gunzip: bool,
+    images: bool,
+}
 
 struct NewWizard {
     step: WizStep,
@@ -1071,8 +1007,10 @@ struct NewWizard {
     /// copying them in packed; `--expand-archives` on either CD verb. Also
     /// changes what `--size auto` measures (what the archives unpack to).
     expand_archives: bool,
-    /// Strip only the gzip layer of `.gz` files in [`Self::from_dir`]; `--expand-gunzip` (NeXT only).
+    /// Strip only the gzip layer of `.gz` files in [`Self::from_dir`]; `--expand-gunzip`.
     expand_gunzip: bool,
+    /// Copy the files out of disk images in [`Self::from_dir`]; `--expand-images`.
+    expand_images: bool,
     /// Tab-to-browse picker for the path field.
     picker: Option<FilePicker>,
     /// Result of the last create attempt (success or error text).
@@ -1088,11 +1026,12 @@ impl Default for NewWizard {
             fs_sel: 0,
             field: 0,
             path: String::new(),
-            size: "800K".to_string(),
+            size: "32M".to_string(),
             name: "rusty-backup".to_string(),
             from_dir: String::new(),
             expand_archives: false,
             expand_gunzip: false,
+            expand_images: false,
             picker: None,
             status: None,
             is_error: false,
@@ -1111,17 +1050,15 @@ impl NewWizard {
     /// but only while it still holds another class's default — so a size the
     /// user typed is never clobbered by arrowing through the class list.
     fn seed_size_for_class(&mut self) {
-        const DEFAULTS: [&str; 4] = ["800K", "64M", "32M", "600M"];
+        const DEFAULTS: [&str; 2] = ["32M", "600M"];
         let cur = self.size.trim();
         // `auto` is a size the CD class can produce for itself, so treat it as
         // a default too — otherwise arrowing off CD-ROM and back would leave a
         // stale `auto` on a class that can't use it.
         if cur.is_empty() || cur.eq_ignore_ascii_case("auto") || DEFAULTS.contains(&cur) {
             self.size = match self.class() {
-                DiskClass::Floppy => DEFAULTS[0],
-                DiskClass::Volume => DEFAULTS[1],
-                DiskClass::Hd => DEFAULTS[2],
-                DiskClass::Cdrom => DEFAULTS[3],
+                DiskClass::Hd => DEFAULTS[0],
+                DiskClass::Cdrom => DEFAULTS[1],
             }
             .to_string();
         }
@@ -1132,8 +1069,7 @@ impl NewWizard {
     /// stops at name.
     fn field_count(&self) -> usize {
         match self.class() {
-            DiskClass::Cdrom if self.cd_target() == CdTarget::NextUfs => WIZ_FIELD_GUNZIP + 1,
-            DiskClass::Cdrom => WIZ_FIELD_EXPAND + 1,
+            DiskClass::Cdrom => WIZ_FIELD_IMAGES + 1,
             _ => WIZ_FIELDS,
         }
     }
@@ -1144,8 +1080,6 @@ impl NewWizard {
 
     fn fs_count(&self) -> usize {
         match self.class() {
-            DiskClass::Floppy => FLOPPY_FS.len(),
-            DiskClass::Volume => VOLUME_FS.len(),
             // The "filesystem" step picks the target platform / disc layout for
             // a hard disk or a CD.
             DiskClass::Hd => HD_PLATFORMS.len(),
@@ -1154,8 +1088,6 @@ impl NewWizard {
     }
     fn fs_label(&self, i: usize) -> &'static str {
         match self.class() {
-            DiskClass::Floppy => FLOPPY_FS[i.min(FLOPPY_FS.len() - 1)].0,
-            DiskClass::Volume => VOLUME_FS[i.min(VOLUME_FS.len() - 1)].0,
             DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
             DiskClass::Cdrom => CD_TARGETS[i.min(CD_TARGETS.len() - 1)].0,
         }
@@ -1200,6 +1132,8 @@ struct App {
     backup: Option<BackupState>,
     /// The Restore screen state (lazily created on first visit).
     restore: Option<RestoreState>,
+    /// The Build Disk screen state (lazily created on first visit).
+    build_disk: Option<BuildDiskState>,
     /// The Bulk convert screen state (lazily created on first visit).
     bulk: Option<BulkState>,
     /// The Optical screen state (lazily created on first visit).
@@ -1266,6 +1200,7 @@ impl App {
             newdisk: None,
             backup: None,
             restore: None,
+            build_disk: None,
             bulk: None,
             #[cfg(feature = "optical")]
             optical: None,
@@ -1511,6 +1446,11 @@ impl App {
 
         // The Restore screen owns most keys on its tab.
         if self.current() == TabId::Restore && self.handle_restore_key(key.code) {
+            return;
+        }
+
+        // The Build Disk screen owns most keys on its tab.
+        if self.current() == TabId::Build && self.handle_build_disk_key(key.code) {
             return;
         }
 
@@ -1801,6 +1741,12 @@ impl App {
         if self.current() == TabId::Restore && self.restore.is_none() {
             self.restore = Some(RestoreState::new(self.shell.recent_handle()));
         }
+        if self.current() == TabId::Build {
+            if self.build_disk.is_none() {
+                self.build_disk = Some(BuildDiskState::default());
+            }
+            self.load_devices_once();
+        }
         if self.current() == TabId::Bulk && self.bulk.is_none() {
             self.bulk = Some(BulkState::default());
         }
@@ -1951,7 +1897,7 @@ impl App {
                         1 => w.size.pop(),
                         2 => w.name.pop(),
                         // The toggle rows hold no text to erase.
-                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => None,
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP | WIZ_FIELD_IMAGES => None,
                         _ => w.from_dir.pop(),
                     };
                     true
@@ -1969,13 +1915,18 @@ impl App {
                     w.expand_gunzip = !w.expand_gunzip;
                     true
                 }
+                KeyCode::Char(' ') if w.field == WIZ_FIELD_IMAGES => {
+                    w.status = None;
+                    w.expand_images = !w.expand_images;
+                    true
+                }
                 KeyCode::Char(c) if !c.is_control() => {
                     w.status = None;
                     match w.field {
                         0 => w.path.push(c),
                         1 => w.size.push(c),
                         2 => w.name.push(c),
-                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP => {}
+                        WIZ_FIELD_EXPAND | WIZ_FIELD_GUNZIP | WIZ_FIELD_IMAGES => {}
                         _ => w.from_dir.push(c),
                     }
                     true
@@ -2007,119 +1958,54 @@ impl App {
         // `NewCommand`.
         if w.class() == DiskClass::Cdrom {
             let target = w.cd_target();
-            let expand = w.expand_archives;
-            let gunzip = w.expand_gunzip && target == CdTarget::NextUfs;
-            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand, gunzip);
+            let expand = Expand {
+                archives: w.expand_archives,
+                gunzip: w.expand_gunzip,
+                images: w.expand_images,
+            };
+            self.newdisk_create_cdrom(target, path, size, name, from_dir, expand);
             return;
         }
-        let cmd = match w.class() {
-            DiskClass::Floppy => NewCommand::Floppy(FloppyArgs {
-                fs: FLOPPY_FS[w.fs_sel.min(FLOPPY_FS.len() - 1)].1,
-                image: path.clone(),
-                size,
-                name,
-                block_size: None,
-                catalog_size: None,
-                extents_size: None,
-                cpm_preset: None,
-                // The TUI wizard has no FAT32 toggle yet; size-based selection
-                // is the existing behaviour. `rb-cli new ... --fat32` forces it.
-                fat32: false,
-            }),
-            DiskClass::Volume => NewCommand::Volume(VolumeArgs {
-                fs: VOLUME_FS[w.fs_sel.min(VOLUME_FS.len() - 1)].1,
-                image: path.clone(),
-                size,
-                name,
-                block_size: None,
-                big_endian: false,
-                catalog_size: None,
-                extents_size: None,
-                case_sensitive: false,
-                min_catalog: None,
-                affs_variant: 1,
-                fat32: false,
-                inodes: None,
-                bytes_per_inode: None,
-                cluster_size: None,
-                sector_size: None,
-            }),
-            // Handled above — a disc goes through `optical new`, not `new`.
-            DiskClass::Cdrom => unreachable!("CD-ROM dispatched before this match"),
-            // Hard disks build with their defaults; the donor-clone and custom
-            // partition-layout options stay on the CLI (`rb-cli new hd ...`).
-            DiskClass::Hd => {
-                let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
-                NewCommand::Hd {
-                    cmd: match platform {
-                        // Same defaults the CLI's clap definitions carry:
-                        // SASI variant, the printing IPL stub, one partition.
-                        HdPlatform::X68k => {
-                            HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
-                                image: path.clone(),
-                                size,
-                                variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
-                                stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
-                                partitions: 1,
-                                system_disk: None,
-                                boot_sector_donor: None,
-                                builtin_boot_sector: false,
-                            })
-                        }
-                        HdPlatform::SgiEfs => {
-                            HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
-                                image: path.clone(),
-                                size,
-                                name,
-                                fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
-                                heads: crate::controller::new_disk::DEFAULT_HEADS,
-                                sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
-                                inodes: None,
-                                bytes_per_inode: None,
-                                // The TUI's "new disk" flow formats only; it
-                                // has no folder picker, so populating stays a
-                                // separate `import` step.
-                                from_dir: None,
-                                expand_archives: false,
-                                flatten_folders: false,
-                                force: false,
-                                no_permissions: false,
-                                include_appledouble: false,
-                            })
-                        }
-                        HdPlatform::Mbr
-                        | HdPlatform::Gpt
-                        | HdPlatform::Apm
-                        | HdPlatform::SgiTable
-                        | HdPlatform::X68kTable
-                        | HdPlatform::Rdb
-                        | HdPlatform::Sun
-                        | HdPlatform::Atari => {
-                            // One partition over the whole disk, at the CLI's
-                            // default type and alignment.
-                            let args = crate::cli::verbs::new_partitioned_hd::PartitionedHdArgs {
-                                image: path.clone(),
-                                size: size.clone(),
-                                partitions: vec!["rest".to_string()],
-                                fills: Vec::new(),
-                                filesystems: Vec::new(),
-                                align: "1M".to_string(),
-                                force: false,
-                            };
-                            match platform {
-                                HdPlatform::Mbr => HdCommand::Mbr(args),
-                                HdPlatform::Gpt => HdCommand::Gpt(args),
-                                HdPlatform::X68kTable => HdCommand::X68kTable(args),
-                                HdPlatform::Atari => HdCommand::Atari(args),
-                                HdPlatform::SgiTable => HdCommand::Sgi(cylinder_args(args)),
-                                HdPlatform::Rdb => HdCommand::Rdb(cylinder_args(args)),
-                                HdPlatform::Sun => HdCommand::Sun(cylinder_args(args)),
-                                _ => HdCommand::Apm(args),
-                            }
-                        }
-                    },
+        // Only the bootable presets are here; any other disk is built in the Build Disk tab.
+        let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
+        let cmd = NewCommand::Hd {
+            cmd: match platform {
+                HdPlatform::X68k => {
+                    HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
+                        image: path.clone(),
+                        size,
+                        variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
+                        stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
+                        partitions: 1,
+                        system_disk: None,
+                        boot_sector_donor: None,
+                        builtin_boot_sector: false,
+                    })
                 }
-            }
+                HdPlatform::SgiEfs => {
+                    HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
+                        image: path.clone(),
+                        size,
+                        name,
+                        fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
+                        heads: crate::controller::new_disk::DEFAULT_HEADS,
+                        sectors: crate::controller::new_disk::DEFAULT_SECTORS_PER_TRACK,
+                        inodes: None,
+                        bytes_per_inode: None,
+                        // The TUI's "new disk" flow formats only; it
+                        // has no folder picker, so populating stays a
+                        // separate `import` step.
+                        from_dir: None,
+                        expand_archives: false,
+                        expand_gunzip: false,
+                        expand_images: false,
+                        flatten_folders: false,
+                        force: false,
+                        no_permissions: false,
+                        include_appledouble: false,
+                    })
+                }
+            },
         };
         // A task: building (and filling) a big image takes a while. `new::run` logs
         // advisories to stderr, which the task silences so they don't land on the alt-screen.
@@ -2155,7 +2041,6 @@ impl App {
     /// meaningful for an IRIX `inst` distribution and near-meaningless
     /// elsewhere, so it would be a fourth row that misleads on two of the
     /// three targets.
-    #[allow(clippy::too_many_arguments)]
     fn newdisk_create_cdrom(
         &mut self,
         target: CdTarget,
@@ -2163,9 +2048,13 @@ impl App {
         size: String,
         name: String,
         from_dir: String,
-        expand_archives: bool,
-        expand_gunzip: bool,
+        expand: Expand,
     ) {
+        let Expand {
+            archives: expand_archives,
+            gunzip: expand_gunzip,
+            images: expand_images,
+        } = expand;
         let from = (!from_dir.is_empty()).then(|| expand_tilde(&from_dir));
         if let Some(d) = &from {
             if !d.is_dir() {
@@ -2194,6 +2083,8 @@ impl App {
                         bytes_per_inode: None,
                         from_dir: from,
                         expand_archives,
+                        expand_gunzip,
+                        expand_images,
                         flatten_folders: false,
                         force: false,
                         no_permissions: false,
@@ -2214,6 +2105,8 @@ impl App {
                             name,
                             from_dir: from,
                             expand_archives,
+                            expand_gunzip,
+                            expand_images,
                             force: false,
                             include_appledouble: false,
                             block_size: None,
@@ -2228,6 +2121,7 @@ impl App {
                         from_dir: from,
                         expand_archives,
                         expand_gunzip,
+                        expand_images,
                         flatten_folders: false,
                         force: false,
                         no_permissions: false,
@@ -2281,6 +2175,7 @@ impl App {
         self.share_backup_tick();
         self.backup_tick();
         self.restore_tick();
+        self.build_disk_tick();
         self.inspect_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
         self.archive_tick();
@@ -2594,6 +2489,12 @@ impl App {
                 return;
             }
         }
+        if self.current() == TabId::Build {
+            if let Some(b) = &self.build_disk {
+                self.draw_build_disk(frame, area, b);
+                return;
+            }
+        }
         if self.current() == TabId::Bulk {
             if let Some(b) = &self.bulk {
                 self.draw_bulk(frame, area, b);
@@ -2768,11 +2669,9 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disks build with their defaults - the table-only entries get \
-                     one partition over the whole disk, empty. Donor-cloning and \
-                     multi-partition layouts need the CLI \
-                     (`rb-cli new hd <table> --partition ...`). \
-                     CD-ROM images: the Optical tab.",
+                    "The presets build with their defaults; donor-cloning needs the CLI \
+                     (`rb-cli new hd x68k --system-disk ...`). Floppies, bare volumes \
+                     and partitioned disks of any kind: the Build Disk tab.",
                     self.palette.dim(),
                 ));
                 lines.push(Line::raw(""));
@@ -2894,16 +2793,20 @@ impl App {
                         WIZ_FIELD_EXPAND,
                         "Expand:",
                         w.expand_archives,
-                        "unpack .tar / .sit / .cpt / .hqx into the disc",
+                        "unpack .tar / .zip / .sit / .cpt / .hqx into the disc",
                     ));
-                    if w.cd_target() == CdTarget::NextUfs {
-                        lines.push(toggle(
-                            WIZ_FIELD_GUNZIP,
-                            "Gunzip:",
-                            w.expand_gunzip,
-                            "strip the gzip layer only (.tar.gz -> .tar)",
-                        ));
-                    }
+                    lines.push(toggle(
+                        WIZ_FIELD_GUNZIP,
+                        "Gunzip:",
+                        w.expand_gunzip,
+                        "strip the gzip layer only (.tar.gz -> .tar)",
+                    ));
+                    lines.push(toggle(
+                        WIZ_FIELD_IMAGES,
+                        "Images:",
+                        w.expand_images,
+                        "copy the files out of .dsk / .img / .dmg / .hfv",
+                    ));
                 }
                 lines.push(Line::raw(""));
                 if let Some(s) = &w.status {
@@ -3080,6 +2983,8 @@ impl App {
             self.backup_footer_keys()
         } else if self.current() == TabId::Restore {
             self.restore_footer_keys()
+        } else if self.current() == TabId::Build {
+            self.build_disk_footer_keys()
         } else if self.current() == TabId::Bulk {
             let step = self.bulk.as_ref().map(|b| b.step);
             match step {
@@ -3236,6 +3141,9 @@ impl App {
         if self.current() == TabId::Restore {
             return self.restore_key_context();
         }
+        if self.current() == TabId::Build {
+            return ("Build Disk", build_disk::HINTS_BUILD_DISK);
+        }
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical {
             return self.optical_key_context();
@@ -3378,13 +3286,22 @@ impl App {
                 "M8 - reuses bulk_convert_runner.",
             ),
             TabId::NewDisk => self.newdisk_content(),
+            TabId::Build => self.stub(
+                "Build a disk: partitioned or one volume, to an image file or a device.",
+                &[
+                    "Choose a partitioned disk or a bare volume.",
+                    "Save as an image file, or pick a device (SD / CF card, USB stick).",
+                    "Lay out partitions; format each, fill it from an image, or leave it empty.",
+                ],
+                "docs/build_disk_plan.md",
+            ),
             TabId::Settings => self.settings_content(),
         };
         // Tabs whose real operations touch a physical disk carry an elevation
         // caution when we're not running elevated.
         if matches!(
             self.current(),
-            TabId::Backup | TabId::Restore | TabId::Inspect
+            TabId::Backup | TabId::Restore | TabId::Build | TabId::Inspect
         ) {
             if let Some(note) = self.device_note() {
                 text.lines.push(Line::raw(""));
@@ -3396,14 +3313,12 @@ impl App {
 
     fn newdisk_content(&self) -> Text<'static> {
         self.stub(
-            "Create a blank disk image - the home for all `new` operations.",
+            "Bootable presets and CD-ROM images; any other disk is the Build Disk tab.",
             &[
-                "Floppy   - FAT/HFS + the retro filesystems at floppy geometry.",
-                "Volume   - a bare superfloppy (NTFS, ext4, HFS+, ...) any size.",
-                "Hard disk- a partition-table-wrapped bootable image (x68k, SGI).",
-                "CD-ROM   - an optical image (via the Optical tab).",
+                "Bootable hard disk - Sharp X68000 (Human68k) or SGI IRIX (EFS).",
+                "CD-ROM   - an SGI / Mac / NeXT disc, optionally filled from a folder.",
             ],
-            "M-create - drives `new floppy/volume/hd` + `optical new`.",
+            "Drives `new hd x68k / sgi-efs` and `optical new`.",
         )
     }
 
@@ -5454,11 +5369,9 @@ mod tests {
     fn cdrom_class_exposes_the_source_folder_field() {
         assert_eq!(
             wizard_on(DiskClass::Cdrom).field_count(),
-            WIZ_FIELD_EXPAND + 1
+            WIZ_FIELD_IMAGES + 1
         );
-        for other in [DiskClass::Floppy, DiskClass::Volume, DiskClass::Hd] {
-            assert_eq!(wizard_on(other).field_count(), WIZ_FIELDS);
-        }
+        assert_eq!(wizard_on(DiskClass::Hd).field_count(), WIZ_FIELDS);
     }
 
     /// Space flips the expand-archives toggle on its own row, and stays an
@@ -5506,13 +5419,13 @@ mod tests {
         w
     }
 
-    /// Only the NeXT target has the gunzip row; Space flips it and it holds no text.
+    /// Every CD target has the gunzip and images rows; Space flips each and they hold no text.
     #[test]
-    fn next_cd_target_adds_a_gunzip_toggle_row() {
-        assert_eq!(wizard_on_next_cd().field_count(), WIZ_FIELD_GUNZIP + 1);
+    fn cd_targets_have_gunzip_and_images_toggle_rows() {
+        assert_eq!(wizard_on_next_cd().field_count(), WIZ_FIELD_IMAGES + 1);
         assert_eq!(
             wizard_on(DiskClass::Cdrom).field_count(),
-            WIZ_FIELD_EXPAND + 1
+            WIZ_FIELD_IMAGES + 1
         );
 
         let mut app = App::new_on(DEFAULT_TAB);
@@ -5528,6 +5441,13 @@ mod tests {
         assert!(
             w.expand_gunzip && !w.expand_archives,
             "only the gunzip row flipped"
+        );
+        app.newdisk.as_mut().unwrap().field = WIZ_FIELD_IMAGES;
+        app.handle_newdisk_key(KeyCode::Char(' '));
+        let w = app.newdisk.as_ref().unwrap();
+        assert!(
+            w.expand_images && !w.expand_archives,
+            "the images row flipped"
         );
         app.handle_newdisk_key(KeyCode::Char('x'));
         app.handle_newdisk_key(KeyCode::Backspace);
@@ -5560,8 +5480,6 @@ mod tests {
     /// would choke on it.
     #[test]
     fn size_default_follows_the_selected_class() {
-        assert_eq!(wizard_on(DiskClass::Floppy).size, "800K");
-        assert_eq!(wizard_on(DiskClass::Volume).size, "64M");
         assert_eq!(wizard_on(DiskClass::Hd).size, "32M");
         assert_eq!(wizard_on(DiskClass::Cdrom).size, "600M");
 
@@ -5570,13 +5488,13 @@ mod tests {
         w.size = "auto".to_string();
         w.class_sel = NEW_CLASSES
             .iter()
-            .position(|c| c.1 == DiskClass::Volume)
+            .position(|c| c.1 == DiskClass::Hd)
             .unwrap();
         w.seed_size_for_class();
-        assert_eq!(w.size, "64M", "'auto' must not leak onto a non-CD class");
+        assert_eq!(w.size, "32M", "'auto' must not leak onto a non-CD class");
 
         // A size the user typed is still never clobbered.
-        let mut w = wizard_on(DiskClass::Floppy);
+        let mut w = wizard_on(DiskClass::Hd);
         w.size = "1440K".to_string();
         w.class_sel = NEW_CLASSES
             .iter()

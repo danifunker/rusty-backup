@@ -42,7 +42,7 @@ pub struct ImportArgs {
     pub dest: String,
 
     /// Unpack archives found in the tree into a directory named after each,
-    /// instead of copying them in verbatim. Two families: tar (detected by the
+    /// instead of copying them in verbatim. Three families: ZIP (macOS `__MACOSX` forks joined), tar (detected by the
     /// `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and
     /// a gzipped disk image is not mistaken for one) and classic Mac
     /// (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks
@@ -54,6 +54,11 @@ pub struct ImportArgs {
     /// With `--expand-archives` too, tarballs are unpacked fully and only other `.gz` files decompressed.
     #[arg(long = "expand-gunzip")]
     pub expand_gunzip: bool,
+
+    /// Copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+    /// `.hfv`, ...) into a folder named after each, forks included, instead of the image.
+    #[arg(long = "expand-images")]
+    pub expand_images: bool,
 
     /// With `--expand-archives`: unpack each archive into the directory that
     /// held it rather than into a subdirectory named after it, so every
@@ -169,6 +174,7 @@ pub fn run(args: ImportArgs) -> Result<()> {
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
         expand_gunzip: args.expand_gunzip,
+        expand_disk_images: args.expand_images,
     };
 
     let stats = import_dir(&mut *fs, &dest, &args.dir, &opts, &progress_cb)

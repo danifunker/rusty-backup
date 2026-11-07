@@ -1643,7 +1643,7 @@ mod tests {
         );
         assert_eq!(
             BigEndian::read_u16(&data[n2 + node_size - 4..n2 + node_size - 2]),
-            (node_size - 4) as u16
+            (node_size - 6) as u16
         );
         assert_eq!(report.fixes_applied.len(), 1);
 

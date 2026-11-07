@@ -901,20 +901,17 @@ pub(super) fn repair_map_nodes(
             fixed = true;
         }
 
-        // Set correct offset table: record 0 at 14, free space at node_size - 2
-        // The map record spans from offset 14 to (node_size - 4): the last 4 bytes
-        // are the offset table itself (2 entries × 2 bytes).
+        // Record 0 at 14; Apple's record ends at node_size - 6, an old image of ours at - 4.
         let rec0_pos = off + node_size - 2;
         let rec0_off = BigEndian::read_u16(&catalog_data[rec0_pos..rec0_pos + 2]) as usize;
         if rec0_off != 14 {
             BigEndian::write_u16(&mut catalog_data[rec0_pos..rec0_pos + 2], 14);
             fixed = true;
         }
-        // Free space offset: end of map data = node_size - 4
         let free_pos = off + node_size - 4;
         let free_off = BigEndian::read_u16(&catalog_data[free_pos..free_pos + 2]) as usize;
-        let expected_free = node_size - 4;
-        if free_off != expected_free {
+        let expected_free = node_size - 6;
+        if free_off != expected_free && free_off != node_size - 4 {
             BigEndian::write_u16(
                 &mut catalog_data[free_pos..free_pos + 2],
                 expected_free as u16,

@@ -41,7 +41,7 @@ use disk_core::rust173::IntIsMultipleOf as _;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
-use crate::human68k::{create_blank_human68k, Human68kFilesystem};
+use crate::human68k::{write_blank_human68k_into, Human68kFilesystem};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
@@ -233,18 +233,14 @@ where
         "Human68k clone: formatting blank {} MiB target volume",
         target_size / (1024 * 1024)
     ));
-    let blank = create_blank_human68k(&template, target_size)?;
-    debug_assert_eq!(blank.len() as u64, target_size);
-
-    // Tempfile keeps peak memory bounded by one source-file buffer plus
-    // the I/O ring instead of the whole target image.
+    // The blank target is formatted straight into a tempfile, drained into `dst` at the end.
     let mut tmp = tempfile::tempfile().map_err(|e| {
         FilesystemError::Io(disk_core::io_other(format!(
             "create tempfile for Human68k clone: {e}"
         )))
     })?;
-    tmp.write_all(&blank)?;
-    drop(blank);
+    tmp.set_len(target_size)?;
+    write_blank_human68k_into(&mut tmp, &template, target_size)?;
     tmp.seek(SeekFrom::Start(0))?;
 
     let mut target = Human68kFilesystem::open(tmp, 0)?;
@@ -269,6 +265,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::human68k::create_blank_human68k;
     use byteorder::{BigEndian, ByteOrder};
 
     /// Build a blank, valid SHARP/KG big-endian FAT16 Human68k image with

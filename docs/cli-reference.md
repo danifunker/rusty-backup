@@ -431,6 +431,44 @@ Usage: show <IMAGE>
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
 
+### `build`
+
+Build a disk in one step: a partition table with each partition formatted, filled from an image or left empty, or one bare volume; to an image file or a device (`--yes`). The command-line form of the Build Disk tab: `build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`
+
+```
+Usage: build [OPTIONS] <TARGET>
+```
+
+**Arguments**
+
+- `<TARGET>` — The image file to create, or a device path (`/dev/sdX`, `/dev/diskN`, `\\.\PhysicalDriveN`) to build on. A device needs `--yes` and is built at its own size
+
+**Options**
+
+- `--size` — Disk (or volume) size for an image target, e.g. `64M`, `2G`. Ignored for a device and for a fixed-geometry volume
+- `--table` — Partition table to write. Leave it out for one bare volume (give `--fs`)
+- `--partition` — A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition
+- `--format` — Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one
+- `--fill` — Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works
+- `--bootable` — Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB
+- `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided
+- `--mac-driver` — The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it
+- `--align` — Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default
+- `--heads` — Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)
+- `--sectors` — Sectors per track for the cylinder-aligned tables
+- `--fs` — With no `--table`: the filesystem of the one bare volume
+- `--from` — Start from this disk image's layout: its table, special partitions and their contents, at the new `--size`. Each partition is copied unless `--format N=FS` or `--empty N` says otherwise; `--partition SIZE` sets the sizes in order. A copied filesystem that can resize grows to its partition; one that can't keeps its size. A label (SGI, Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized for the new disk
+- `--empty` — With `--from`: leave partition N empty instead of copying it
+- `--preset` — Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make
+- `--scsi` — `--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI
+- `--x68k-partitions` — `--preset x68k`: how many Human68k partitions, 1 to 8
+- `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
+- `--label` — With no `--table`: the volume label
+- `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
+- `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw
+- `--force` — Overwrite an existing image file
+- `--yes` — Required to build on a device; everything on it is erased
+
 ### `cbk`
 
 Pack a backup folder into a single `.cbk` container, or unpack one (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly
@@ -681,9 +719,9 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 **Options**
 
 - `--size` — Target volume size in bytes. Accepts suffixes (`K`, `M`, `G`)
-- `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
+- `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65024. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
 - `--output` — Destination path for the new image. Created (or truncated)
-- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 2047 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
+- `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 4063 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
 
 ### `floppy`
 
@@ -825,8 +863,9 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 
 **Options**
 
-- `--expand-archives` — Unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Two families: tar (detected by the `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one) and classic Mac (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks and their Finder type/creator intact)
+- `--expand-archives` — Unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Three families: ZIP (macOS `__MACOSX` forks joined), tar (detected by the `ustar` magic, so IRIX `.tardist` and oddly-named archives are found and a gzipped disk image is not mistaken for one) and classic Mac (`.sit` / `.sea` / `.cpt` / `.hqx` / `.mar`, which land with both forks and their Finder type/creator intact)
 - `--expand-gunzip` — Strip one gzip layer and keep the result: `x.tar.gz` / `x.tgz` land as `x.tar`, `f.gz` as `f`. With `--expand-archives` too, tarballs are unpacked fully and only other `.gz` files decompressed
+- `--expand-images` — Copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the directory that held it rather than into a subdirectory named after it, so every archive shares one root
 - `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
@@ -1232,7 +1271,9 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 - `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole cylinder. Defaults to 50M
 - `--from-dir` — Populate the root filesystem from this host directory after formatting. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack tar archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--expand-archives` — With `--from-dir`: unpack tar and ZIP archives found in the tree into a directory named after each, instead of copying them in verbatim. Detected by content, so IRIX `.tardist` files count
+- `--expand-gunzip` — With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root — the shape IRIX `inst` wants. Overlapping entries are then expected, so this skips entries that already exist unless `--force`
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
@@ -1548,7 +1589,9 @@ Usage: mac-hfs [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`, Mac `.zip`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--expand-gunzip` — With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
 - `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
@@ -1570,7 +1613,9 @@ Usage: mac-hfsplus [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`, Mac `.zip`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to
+- `--expand-gunzip` — With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
 - `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
@@ -1592,8 +1637,9 @@ Usage: next-ufs [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (`600M`, `650M`, ...) or `auto` to fit `--from-dir`; rounded up to a 2048-byte sector. Past ~700M suits an emulator, not a burner
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, pre-POSIX tars included) into a directory named after each, instead of copying them
+- `--expand-archives` — With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, pre-POSIX tars included), ZIP and classic Mac archives into a directory named after each
 - `--expand-gunzip` — With `--from-dir`: strip one gzip layer only (`x.tar.gz` -> `x.tar`, `f.gz` -> `f`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--flatten-folders` — With `--expand-archives`: unpack every archive into the volume root, not one folder each. Entries that already exist are skipped unless `--force` is given
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
@@ -1617,7 +1663,9 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 
 - `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`), or `auto` to size it to `--from-dir` plus filesystem overhead and headroom. Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R); keep an explicit size at or below your target media (~650-700 MiB for a CD), and use `auto` for an image you intend to mount rather than burn
 - `--from-dir` — Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root
-- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Tar is detected by content, so IRIX `.tardist` files count; classic Mac archives (`.sit`, `.cpt`, `.hqx`, …) are unpacked too
+- `--expand-archives` — With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Tar is detected by content, so IRIX `.tardist` files count; classic Mac archives (`.sit`, `.cpt`, `.hqx`, …) and ZIP are unpacked too
+- `--expand-gunzip` — With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files
+- `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--flatten-folders` — With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
@@ -1921,12 +1969,13 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 **Options**
 
 - `--target-size` — Target size in bytes (defaults to the original disk size from the backup metadata)
-- `--size` — Per-partition size policy. Defaults to `original`, or `[restore] size` from the config file when set
+- `--size` — Per-partition size policy: `original`, `minimum` or `fill`. Defaults to `original`, or `[restore] size` from the config file when set
 - `--alignment` — Partition alignment policy. Defaults to `original`, or `[restore] alignment` from the config file when set
 - `--device` — Treat `TARGET` as a block device (enables sector-aligned writes and the full device-write safety preflight in [`crate::cli::device_safety`])
 - `--yes` — Confirm the destructive write: required for a device target and to replace an existing remote image file; a no-op for a local file
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
+- `--no-mac-driver` — Leave out the bundled Mac driver a backup that lost its own would otherwise get
 
 ### `rm`
 

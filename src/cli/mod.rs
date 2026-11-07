@@ -60,6 +60,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Build a disk in one step: a partition table with each partition
+    /// formatted, filled from an image or left empty, or one bare volume;
+    /// to an image file or a device (`--yes`). The command-line form of
+    /// the Build Disk tab: `build disk.img --size 2G --table mbr
+    /// --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`.
+    Build(verbs::build::BuildArgs),
+
     /// Create a blank image, grouped by media class: `new floppy <fs>`,
     /// `new volume <fs>` (bare superfloppy), or `new hd {x68k|sgi-efs}`
     /// (partition-table-wrapped, bootable). CD-ROM images are under
@@ -477,6 +484,7 @@ fn prompt_and_launch_tui() -> Result<()> {
 pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New { cmd } => verbs::new::run(cmd),
+        Command::Build(args) => verbs::build::run(args),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),

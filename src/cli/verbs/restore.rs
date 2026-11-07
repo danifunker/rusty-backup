@@ -18,6 +18,8 @@ pub enum SizeMode {
     Original,
     /// Use the imaged minimum size from the backup metadata.
     Minimum,
+    /// Grow the last partition to the end of the target; the others keep their original size.
+    Fill,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -41,7 +43,7 @@ pub struct RestoreArgs {
     #[arg(long = "target-size")]
     pub target_size: Option<u64>,
 
-    /// Per-partition size policy. Defaults to `original`, or
+    /// Per-partition size policy: `original`, `minimum` or `fill`. Defaults to `original`, or
     /// `[restore] size` from the config file when set.
     #[arg(long, value_enum)]
     pub size: Option<SizeMode>,
@@ -70,6 +72,10 @@ pub struct RestoreArgs {
     /// Write zeros to unused filesystem space.
     #[arg(long = "write-zeros-to-unused")]
     pub write_zeros_to_unused: bool,
+
+    /// Leave out the bundled Mac driver a backup that lost its own would otherwise get.
+    #[arg(long = "no-mac-driver")]
+    pub no_mac_driver: bool,
 }
 
 pub fn run(args: RestoreArgs) -> Result<()> {
@@ -148,6 +154,13 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
     };
     let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
+    report_caveats(
+        &args.backup_dir,
+        &alignment,
+        &partition_sizes,
+        target_size,
+        !args.no_mac_driver,
+    )?;
 
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
@@ -159,10 +172,11 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         // choice per partition; `--size` is uniform across all of them.
         partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
+        install_mac_driver: !args.no_mac_driver,
     };
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
-    spawn_progress_pump(progress.clone());
+    let pump = spawn_progress_pump(progress.clone());
     let _status = crate::cli::status::watch({
         let p = Arc::clone(&progress);
         move || {
@@ -182,7 +196,9 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         config.target_path.display()
     ));
 
-    run_restore(config, progress).context("restore failed")
+    let result = run_restore(config, progress);
+    pump.finish();
+    result.context("restore failed")
 }
 
 /// Restore a backup folder to a remote target (device or image file) over the
@@ -218,6 +234,13 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
     };
 
     let partition_sizes = resolve_partition_sizes(args.size, &args.backup_dir)?;
+    report_caveats(
+        &args.backup_dir,
+        &alignment,
+        &partition_sizes,
+        target_size,
+        !args.no_mac_driver,
+    )?;
 
     let config = RestoreConfig {
         backup_folder: args.backup_dir,
@@ -229,10 +252,11 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         alignment,
         partition_sizes,
         write_zeros_to_unused: args.write_zeros_to_unused,
+        install_mac_driver: !args.no_mac_driver,
     };
 
     let progress = Arc::new(Mutex::new(RestoreProgress::default()));
-    spawn_progress_pump(progress.clone());
+    let pump = spawn_progress_pump(progress.clone());
     let _status = crate::cli::status::watch({
         let p = Arc::clone(&progress);
         move || {
@@ -256,7 +280,7 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
 
     let conn = RemoteConnection::connect_shared(&remote.addr())
         .with_context(|| format!("connecting to {}", remote.addr()))?;
-    restore_to_remote(
+    let result = restore_to_remote(
         config,
         conn,
         &remote.path,
@@ -264,8 +288,9 @@ fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()>
         progress,
         None,
         args.yes,
-    )
-    .context("remote restore failed")
+    );
+    pump.finish();
+    result.context("remote restore failed")
 }
 
 /// Expand the uniform `--size` policy across every partition in the backup.
@@ -303,7 +328,43 @@ fn resolve_partition_sizes(
                 size_choice: RestoreSizeChoice::Minimum,
             })
             .collect(),
+        SizeMode::Fill => read_metadata(backup_dir)?
+            .partitions
+            .iter()
+            .max_by_key(|pm| pm.start_lba)
+            .map(|pm| crate::restore::RestorePartitionSize {
+                index: pm.index,
+                size_choice: RestoreSizeChoice::FillRemaining,
+            })
+            .into_iter()
+            .collect(),
     })
+}
+
+/// Print what each volume asks of the machine reading it, and refuse what cannot be built.
+fn report_caveats(
+    backup_dir: &std::path::Path,
+    alignment: &RestoreAlignment,
+    sizes: &[crate::restore::RestorePartitionSize],
+    target_size: u64,
+    install_mac_driver: bool,
+) -> Result<()> {
+    use crate::model::fs_limits::CaveatLevel;
+    use crate::model::restore_plan::{load_backup, plan_caveats};
+    let Ok(loaded) = load_backup(backup_dir) else {
+        return Ok(());
+    };
+    let caveats = plan_caveats(&loaded, alignment, sizes, target_size, install_mac_driver);
+    for c in &caveats {
+        log_stderr(format!("rb-cli restore: {}", c.line()));
+    }
+    match caveats
+        .iter()
+        .find(|c| c.caveat.level == CaveatLevel::Blocked)
+    {
+        Some(c) => bail!("{}", c.caveat.text),
+        None => Ok(()),
+    }
 }
 
 fn read_metadata(backup_dir: &std::path::Path) -> Result<crate::backup::metadata::BackupMetadata> {
@@ -322,13 +383,13 @@ fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {
     Ok(read_metadata(backup_dir)?.source_size_bytes)
 }
 
-fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) {
+fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) -> crate::cli::status::LogPump {
     use std::time::Duration;
-    std::thread::spawn(move || {
+    crate::cli::status::LogPump::spawn(move |stop| {
         let mut last_op = String::new();
         let mut last_pct: i32 = -1;
         loop {
-            std::thread::sleep(Duration::from_millis(200));
+            let stopping = stop.wait(Duration::from_millis(200));
             let snapshot = match progress.lock() {
                 Ok(mut p) => {
                     let drained: Vec<crate::restore::LogMessage> =
@@ -366,19 +427,18 @@ fn spawn_progress_pump(progress: Arc<Mutex<RestoreProgress>>) {
                     last_pct = pct;
                 }
             }
-            if finished {
+            if finished || stopping {
                 return;
             }
         }
-    });
-    // Silence unused-import / unused-result warnings in stripped builds.
-    let _ = anyhow::Ok::<()>(());
+    })
 }
 
 fn parse_size_mode(s: &str) -> Option<SizeMode> {
     match s.to_ascii_lowercase().as_str() {
         "original" => Some(SizeMode::Original),
         "minimum" => Some(SizeMode::Minimum),
+        "fill" => Some(SizeMode::Fill),
         _ => None,
     }
 }

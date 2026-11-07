@@ -92,7 +92,7 @@ impl ExpandHfsDialog {
                         egui::RichText::new(
                             "Bare classic-HFS volume with no partition table - mountable in \
                                  BasiliskII / SheepShaver as `.hfv`, or usable as a raw single- \
-                                 partition image. Capped at 2047 MB (classic HFS limit).",
+                                 partition image. Capped at 4063 MB (classic HFS limit).",
                         )
                         .small()
                         .italics(),

@@ -43,6 +43,8 @@ pub struct Placed {
     pub size_bytes: u64,
     pub type_text: String,
     pub name: String,
+    /// Boot from this partition: the MBR active flag, the RDB bootable flag.
+    pub bootable: bool,
 }
 
 impl Placed {
@@ -265,6 +267,16 @@ pub fn records_geometry(kind: TableKind) -> bool {
 
 /// True for the tables whose entries carry a name the user can set — GPT and
 /// APM labels, X68000's 8-byte name, and RDB's AmigaDOS device name.
+/// Whether `kind` can mark a partition bootable: `Some(true)` when only one may be (MBR's
+/// active flag), `Some(false)` when several may (RDB), `None` when the table has no flag.
+pub fn bootable_rule(kind: TableKind) -> Option<bool> {
+    match kind {
+        TableKind::Mbr => Some(true),
+        TableKind::Rdb => Some(false),
+        _ => None,
+    }
+}
+
 pub fn carries_entry_name(kind: TableKind) -> bool {
     matches!(
         kind,
@@ -409,6 +421,7 @@ pub fn place(
                 .clone()
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| default_name(kind, i)),
+            bootable: false,
         });
         cursor = end;
     }
@@ -463,7 +476,7 @@ fn write_mbr<W: Write + Seek>(out: &mut W, placed: &[Placed]) -> Result<()> {
             byte,
             p.start_lba as u32,
             (p.size_bytes / SECTOR) as u32,
-            false,
+            p.bootable,
         ));
     }
     let bytes = mbr::build_minimal_mbr(0x5253_5459, &entries, 255, 63);
@@ -740,6 +753,14 @@ fn write_rdb<W: Write + Seek>(
             (41, low_cyl as u32),
             (42, high_cyl as u32),
             (48, dos_type),
+            (
+                5,
+                if p.bootable {
+                    part_tables::rdb::PART_FLAG_BOOTABLE
+                } else {
+                    0
+                },
+            ),
         ] {
             put_long(&mut part, long as usize, value);
         }

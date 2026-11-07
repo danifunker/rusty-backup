@@ -492,6 +492,15 @@ pub fn run_single_partition_restore(
         }
     }
 
+    // A fresh APM disk has no driver at all, and a Mac won't mount it without one.
+    if let Some(nd) = config
+        .new_disk
+        .as_ref()
+        .filter(|nd| matches!(nd.table_type, NewTableType::Apm))
+    {
+        super::install_bundled_mac_driver(&mut target, nd.disk_size_bytes, &progress);
+    }
+
     target.flush()?;
     target.sync_all()?;
 
@@ -537,6 +546,16 @@ pub fn run_single_partition_restore(
     let alt_header_fixup = !verbatim && !needs_resize && write_size != source_data_size;
     if needs_resize || alt_header_fixup {
         set_operation(&progress, "Resizing filesystem...");
+        if needs_resize {
+            super::rebuild_outgrown_hfs(
+                &mut target,
+                config.target_offset_bytes,
+                write_size,
+                &config.target_path,
+                config.target_is_device,
+                &progress,
+            )?;
+        }
         let inner_file = target
             .inner_mut()
             .context("failed to access device for resize")?;

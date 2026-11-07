@@ -19,6 +19,13 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-088](#r-088)~~ | ~~**Medium**~~ **FIXED** | `src/cli/verbs/{restore,backup}.rs` | ~~`rb-cli restore` and `backup` could exit with log lines unprinted, final warnings included~~ — the verb waits for its log thread, 2026-11-06 |
+| ~~[R-087](#r-087)~~ | ~~**Medium**~~ **FIXED** | `src/fs/make_bootable.rs` | ~~`make-bootable` called a disk bootable when its DDR named a driver with no code behind it~~ — it looks for the code and installs the driver when there is none, 2026-11-06 |
+| ~~[R-086](#r-086)~~ | ~~**High**~~ **FIXED** | `src/backup` (`apm_extras`), `src/restore` | ~~A Mac disk restored from a zstd or raw backup, or from a CHD at a new size, came back with its driver partition zeroed, so it could not start up~~ — the driver is kept in `apm-extras.bin`, CHD restores copy it, and a backup that lost it gets the bundled driver, 2026-11-06 |
+| ~~[R-085](#r-085)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-mac` (`hfs_outgrows_in_place`) | ~~A partition under one block past a volume's limit counted as outgrowing it, which would rebuild a volume on a same-size restore~~ — less than a block past the limit is a remainder, 2026-11-06 |
+| ~~[R-084](#r-084)~~ | ~~**High**~~ **FIXED** | `crates/fs-mac` (`pick_block_size`) | ~~A classic HFS volume with 65536-byte allocation blocks bombs System 7.5 at the desktop: every auto-sized volume past 2 GB, and Expand HFS's largest block choice~~ — blocks are the smallest multiple of 512 that fits, capped at 65024, 2026-11-06 |
+| ~~[R-083](#r-083)~~ | ~~**High**~~ **FIXED** | `crates/fs-amiga` (AFFS fsck) | ~~fsck reports a bitmap extension block as allocated but unreachable, and repair frees it, on any AFFS volume past about 49 MiB~~ — the blocks of the `bm_ext` chain count as metadata, 2026-11-06 |
+| ~~[R-082](#r-082)~~ | ~~Medium~~ **FIXED** | `crates/fs-mac` (`hfs_common`, HFS fsck) | ~~B-tree map nodes hold a 494-byte record where Apple's hold 492, so hfsutils refuses any volume with one ("malformed b*-tree map node"), and repair rewrites a real Mac's map node into that form~~ — written the way ExtendBTree writes them, 2026-11-06 |
 | ~~[R-081](#r-081)~~ | ~~Medium~~ **FIXED** | `libchdman-rs` 0.289.x (vendored MAME `chd.cpp`) | ~~A CHD of a source of 8 KiB or less aborts the process: `compress_v5_map`'s buffer leaves no room for the Huffman tree with one or two hunks~~ — libchdman-rs 0.289.4 allows 160 bits for the tree, 2026-11-04 |
 | ~~[R-080](#r-080)~~ | ~~Medium~~ **FIXED** | `src/restore/superfloppy_wrap.rs`, `src/model/{backup_loader,text_edit}.rs` | ~~A bare SquashFS image opened in Inspect fails to Browse ("bad MDB signature"): "squashfs" contains "hfs", so its row got MBR type 0xAF and opened as HFS; the same match chose the Apple HFS GPT type and Mac Roman text~~ — SquashFS is matched first (0x83, Linux filesystem GUID, UTF-8), 2026-11-04 |
 | ~~[R-079](#r-079)~~ | ~~**High**~~ **FIXED** | `crates/fs-pc` (NTFS directory listing) | ~~An NT4 NTFS volume hides every file in MFT records 16-23: NT4 Terminal Server's `WTSRV` (record 17) and its 3,600 files were missing from browse, backup sizing and extract~~ — only the fixed metafiles 0-15 are hidden, 2026-11-04 |
@@ -105,6 +112,66 @@ finding depends on a fixture, the fixture is named.
 ---
 
 ## Found during Phase 2 slice 29, 2026-11-04
+
+### R-088 — the CLI could exit before printing its log {#r-088}
+
+The log thread woke every 200 ms and nothing waited for it, so whatever came in the last wake was
+lost. A fast machine finished a small restore inside one wake and printed none of it. Found by the
+macOS CI runner failing `a_zstd_backup_grows_past_the_block_limit`.
+
+### R-087 — make-bootable trusted the DDR over the disk {#r-087}
+
+`assess_bootability` only read `driver_count`, so a disk restored with a zeroed driver (R-086) was
+reported as "already bootable" and left alone. Test: `a_registered_driver_with_no_code_is_installed`.
+
+### R-086 — a restored Mac disk lost its driver {#r-086}
+
+The map and driver entries are not data partitions, so they never reached `metadata.partitions`,
+and only the 2 KB map was saved. The map came back still pointing at a driver, over zeros: the Quadra
+showed the blinking disk. Only a CHD restored at its own size worked, since that copies the whole
+disk. The old comment in the CHD resize path said driver bodies came through the partition loop;
+they never did. Tests: `tests/cli_suite/cli_restore_apm_driver.rs`.
+
+### R-085 — a remainder under one block looked like outgrowing the volume {#r-085}
+
+`hfs_outgrows_in_place` compared the new size with the exact limit, but the in-place resize rounds
+down to whole blocks and handles a remainder fine. Apple's formatters leave one on most volumes
+near the block limit. Build Disk only rebuilt needlessly; Restore now asks on every HFS partition,
+so a same-size restore would have rewritten the volume. Test:
+`a_remainder_under_one_block_is_not_outgrowing`.
+
+### R-084 — a 64 KiB allocation block bombs System 7.5 {#r-084}
+
+`pick_block_size` only doubled, so anything past 2 GB got 65536-byte blocks. On a
+Quadra 800 under QEMU, System 7.5.5 draws a system-error bomb as the Finder comes
+up: 1900 MB at 32 KiB mounts, 2200 MB at 64 KiB bombs, and 2200 MB at 34.5 KiB
+mounts. Mac OS 9 takes 65536 without complaint, so testing only there hides it.
+65024 is the largest multiple of 512 below 65536, and 65535 of those is the
+"4,063 MB" period sources give for System 7.5. A 4063 MB volume from Build Disk
+mounts there with the bundled driver, the Finder writes to it, and Disk First Aid
+calls it OK (`docs/evidence/dfa-system755-quadra-hfs-4gb.png`). The same disk passes
+on Mac OS 8.1 on the Quadra, booted from a Build Disk output with the bundled driver
+(`dfa-macos81-quadra-hfs-4gb.png`), and on Mac OS 9.2.2 on QEMU `mac99` behind OS 9's
+own ATA drivers (`dfa-macos9-mac99-hfs-4gb.png`).
+
+### R-083 — AFFS fsck frees a live bitmap extension block {#r-083}
+
+`bitmap_page_owns_block` knew the bitmap pages but not the `bm_ext` blocks that
+list them, so on a volume with more than 25 pages fsck called each extension
+block unreachable and `repair` marked it free, ready for a new file to overwrite.
+Found when the in-place resizer learned to write extension chains
+(`resize_crosses_the_bitmap_extension_boundary`). `fsck_counts_bitmap_extension_blocks`
+pins it.
+
+### R-082 — HFS map nodes are two bytes too long {#r-082}
+
+Apple's `ExtendBTree` sizes a map record as `nodeSize - sizeof(BTNodeDescriptor) - 6`
+and puts the free-space offset at `nodeSize - 6`; `hfsutils` checks for exactly
+`0x1fa`. We used `- 4`, so every volume whose catalog needs a map node (one over
+1 MiB, so roughly 200 MB and up at the default sizing) failed `hmount`. Mac OS 9
+mounts the old form, so volumes already written stay usable, and our reader follows
+each node's own offsets, so both forms open. `repair_map_nodes` leaves the old form
+alone rather than shifting its bits, and no longer rewrites Apple's.
 
 ### R-081 — a CHD of an image of 8 KiB or less aborts the process {#r-081}
 

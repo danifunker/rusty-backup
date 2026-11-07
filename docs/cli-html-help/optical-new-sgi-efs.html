@@ -22,7 +22,11 @@
 <dt><code>--from-dir</code></dt>
 <dd>Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root</dd>
 <dt><code>--expand-archives</code></dt>
-<dd>With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Tar is detected by content, so IRIX `.tardist` files count; classic Mac archives (`.sit`, `.cpt`, `.hqx`, …) are unpacked too</dd>
+<dd>With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Tar is detected by content, so IRIX `.tardist` files count; classic Mac archives (`.sit`, `.cpt`, `.hqx`, …) and ZIP are unpacked too</dd>
+<dt><code>--expand-gunzip</code></dt>
+<dd>With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files</dd>
+<dt><code>--expand-images</code></dt>
+<dd>With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image</dd>
 <dt><code>--flatten-folders</code></dt>
 <dd>With `--expand-archives`: unpack each archive into the volume root rather than a subdirectory named after it, so every archive shares one root. This is the shape IRIX `inst` wants — point it at one directory holding every `.tardist`'s product images instead of re-pointing it per archive. Overlapping entries are then expected (SGI freeware tardists all ship the same `fw_common*` product), so this skips entries that already exist unless `--force` is given</dd>
 <dt><code>--force</code></dt>

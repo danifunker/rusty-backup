@@ -290,6 +290,8 @@ pub struct AffsFilesystem<R: Read + Seek> {
     /// Bitmap block numbers in order — index `i` of `bitmap_pages` holds
     /// the 127 u32 map words covering bits `[i*4064 .. (i+1)*4064)`.
     bitmap_pages: Vec<u32>,
+    /// Extension blocks listing the pages past the 25 in the root block.
+    bitmap_exts: Vec<u32>,
     /// Total blocks tracked by the bitmap.
     total_blocks: u32,
 
@@ -388,6 +390,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             &root,
             total_blocks,
         )?;
+        let (_, bitmap_exts) = bitmap_chain(&mut reader, partition_offset, block_size, &root)?;
 
         Ok(AffsFilesystem {
             reader,
@@ -401,6 +404,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
             root,
             bitmap,
             bitmap_pages,
+            bitmap_exts,
             total_blocks,
             dirty: HashMap::new(),
         })
@@ -940,11 +944,11 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         self.total_blocks
     }
 
-    /// True if `block` is a bitmap page (root inline or extension).
+    /// True if `block` is a bitmap page (root inline or extension) or an extension block.
     /// Used by the fsck rebuild to ensure bitmap blocks remain marked
     /// allocated even though they're never reached via directory walks.
     pub fn bitmap_page_owns_block(&self, block: u32) -> bool {
-        self.bitmap_pages.contains(&block)
+        self.bitmap_pages.contains(&block) || self.bitmap_exts.contains(&block)
     }
 
     /// Public accessor — same semantics as the private `block_is_allocated`.
@@ -1051,28 +1055,27 @@ fn write_bstr(
     Ok(())
 }
 
-fn read_bitmap<R: Read + Seek>(
+/// The volume's bitmap pages in order, and the extension blocks that list those past the root's 25.
+fn bitmap_chain<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
     block_size: u64,
     root: &AffsRootBlock,
-    total_blocks: u32,
-) -> Result<(Vec<u8>, Vec<u32>), FilesystemError> {
-    // Each bitmap block holds 127 u32 map entries = 127*32 = 4064 bits.
-    // We concatenate map[1..128] from each bitmap block into a flat byte
-    // array. The bitmap covers blocks [2 .. total_blocks).
+) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
     let mut pages: Vec<u32> = root
         .bm_pages
         .iter()
         .copied()
         .take_while(|&p| p != 0)
         .collect();
+    let mut exts = Vec::new();
     let mut bm_ext = root.bm_ext;
     let mut ext_seen = std::collections::HashSet::new();
     while bm_ext != 0 {
         if !ext_seen.insert(bm_ext) {
             return Err(parse_err("bitmap extension list contains a cycle"));
         }
+        exts.push(bm_ext);
         let offset = partition_offset + bm_ext as u64 * block_size;
         reader.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; BSIZE];
@@ -1087,6 +1090,20 @@ fn read_bitmap<R: Read + Seek>(
         }
         bm_ext = read_u32(&buf, 127 * 4);
     }
+    Ok((pages, exts))
+}
+
+fn read_bitmap<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    root: &AffsRootBlock,
+    total_blocks: u32,
+) -> Result<(Vec<u8>, Vec<u32>), FilesystemError> {
+    // Each bitmap block holds 127 u32 map entries = 127*32 = 4064 bits.
+    // We concatenate map[1..128] from each bitmap block into a flat byte
+    // array. The bitmap covers blocks [2 .. total_blocks).
+    let (pages, _) = bitmap_chain(reader, partition_offset, block_size, root)?;
 
     let bits_per_page = 127 * 32; // 4064
     let required_bits = total_blocks.saturating_sub(2) as usize;
@@ -1841,20 +1858,17 @@ impl<R: Read + Seek> Read for CompactAffsReader<R> {
 // be rebuilt to reflect the new layout.
 //
 // Scope of this implementation:
-// - Volumes whose bitmap fits in `root.bm_pages[..]` (up to 25 pages =
-//   ~50 MB at 512-byte blocks). Volumes that use the `root.bm_ext`
-//   chain are refused with a clear error so we don't silently corrupt
-//   anything.
+// - Any bitmap size: pages past the 25 in `root.bm_pages[..]` go on a
+//   `root.bm_ext` chain, read and rewritten like the pages themselves.
+//   New pages take free blocks after the root, so they skip user data.
 // - Both shrink and grow paths, both with the same set of safety
 //   guards: every currently-allocated user-data block must still fit
-//   in the new volume AND must not collide with any of the new
-//   metadata positions.
+//   in the new volume AND must not sit on the new root block.
 //
 // The function is a silent no-op on non-AFFS volumes, matching every
 // other `resize_*_in_place` in `resize_filesystem_for`.
 
 const AFFS_BITS_PER_BM_PAGE: u32 = 127 * 32; // 4064
-const AFFS_BM_PAGES_ROOT: u32 = 25;
 
 /// Resize an AFFS volume at `partition_offset` to `new_size_bytes`. See
 /// the module-level resize comment for the scope and safety contract.
@@ -1955,34 +1969,12 @@ pub fn resize_affs_in_place(
     let old_root_parsed = AffsRootBlock::parse(&old_root_buf, old_root)
         .map_err(|e| anyhow::anyhow!("AFFS resize: root parse failed: {e}"))?;
 
-    // We don't support bm_ext chains here (see module comment).
-    if old_root_parsed.bm_ext != 0 {
-        anyhow::bail!(
-            "AFFS resize: volume uses a bitmap-extension chain (bm_ext = {}), \
-             which is not yet supported by the in-place resize.",
-            old_root_parsed.bm_ext,
-        );
-    }
-
-    let old_pages: Vec<u32> = old_root_parsed
-        .bm_pages
-        .iter()
-        .copied()
-        .take_while(|&p| p != 0)
-        .collect();
+    let (old_pages, old_exts) = bitmap_chain(device, partition_offset, BSIZE_U64, &old_root_parsed)
+        .map_err(|e| anyhow::anyhow!("AFFS resize: reading the bitmap chain failed: {e}"))?;
     let new_pages_needed = affs_bm_pages_needed(new_total);
-    if new_pages_needed > AFFS_BM_PAGES_ROOT as usize {
-        anyhow::bail!(
-            "AFFS resize: target {} sectors needs {} bitmap pages, but only {} \
-             fit in the root block (bm_ext chain growth not yet implemented).",
-            new_total,
-            new_pages_needed,
-            AFFS_BM_PAGES_ROOT,
-        );
-    }
-    let new_pages: Vec<u32> = (0..new_pages_needed as u32)
-        .map(|i| new_root + 1 + i)
-        .collect();
+    let new_exts_needed = new_pages_needed
+        .saturating_sub(BM_PAGES_ROOT)
+        .div_ceil(BM_EXT_PAGES);
 
     // --- 4. Reconstruct the old logical bitmap (set bit = free). ---
     let (bitmap, _) = read_bitmap(
@@ -2017,28 +2009,18 @@ pub fn resize_affs_in_place(
         !bit_set(bm, blk)
     };
 
-    // --- 5. Walk every old-bitmap entry, accumulate user-data blocks
-    //        (every allocated block that isn't old_root or an old bm_page),
-    //        check the safety contract. ---
+    // --- 5. Walk every old-bitmap entry and check the safety contract:
+    //        user data (every allocated block that isn't old metadata) must
+    //        fit the new volume and stay off the new root block. ---
     let old_metadata: std::collections::HashSet<u32> = std::iter::once(old_root)
         .chain(old_pages.iter().copied())
+        .chain(old_exts.iter().copied())
         .collect();
-    let new_metadata: std::collections::HashSet<u32> = std::iter::once(new_root)
-        .chain(new_pages.iter().copied())
-        .collect();
+    let is_user = |blk: u32| -> bool {
+        blk >= 2 && blk < old_total && is_allocated(&bitmap, blk) && !old_metadata.contains(&blk)
+    };
 
-    let mut user_blocks: Vec<u32> = Vec::new();
-    for blk in 2..old_total {
-        if !is_allocated(&bitmap, blk) {
-            continue;
-        }
-        if old_metadata.contains(&blk) {
-            continue;
-        }
-        user_blocks.push(blk);
-    }
-
-    for &blk in &user_blocks {
+    for blk in (2..old_total).filter(|&b| is_user(b)) {
         if blk >= new_total {
             anyhow::bail!(
                 "AFFS resize: allocated block {} lies past the target tail \
@@ -2049,15 +2031,38 @@ pub fn resize_affs_in_place(
                 blk + 1,
             );
         }
-        if new_metadata.contains(&blk) {
+        if blk == new_root {
             anyhow::bail!(
-                "AFFS resize: allocated user block {} collides with the new \
-                 root/bitmap position. Move or delete the file occupying \
-                 that block, or pick a different target size.",
+                "AFFS resize: allocated user block {} collides with the new root \
+                 block. Move or delete the file occupying that block, or pick \
+                 a different target size.",
                 blk,
             );
         }
     }
+
+    // Free blocks after the root first, as a formatter lays them out; the old set stays intact.
+    let mut placed: Vec<u32> = Vec::with_capacity(new_pages_needed + new_exts_needed);
+    for blk in (new_root + 1..new_total).chain(2..new_root) {
+        if placed.len() == new_pages_needed + new_exts_needed {
+            break;
+        }
+        if !old_metadata.contains(&blk) && !is_user(blk) {
+            placed.push(blk);
+        }
+    }
+    if placed.len() < new_pages_needed + new_exts_needed {
+        anyhow::bail!(
+            "AFFS resize: only {} free block(s) for {} bitmap page(s) and {} extension block(s)",
+            placed.len(),
+            new_pages_needed,
+            new_exts_needed,
+        );
+    }
+    let (new_pages, new_exts) = placed.split_at(new_pages_needed);
+    let new_metadata: std::collections::HashSet<u32> = std::iter::once(new_root)
+        .chain(placed.iter().copied())
+        .collect();
 
     // --- 6. Build the new flat bitmap. Bits cover [2..new_total). Start
     //        with everything free, then mark user blocks + new metadata as
@@ -2083,27 +2088,26 @@ pub fn resize_affs_in_place(
         }
         bm[bit / 8] &= !(1u8 << (bit % 8));
     };
-    for &blk in &user_blocks {
+    for blk in (2..old_total.min(new_total)).filter(|&b| is_user(b)) {
         clear_bit(&mut new_bm, blk);
     }
-    clear_bit(&mut new_bm, new_root);
-    for &p in &new_pages {
-        clear_bit(&mut new_bm, p);
+    for &blk in &new_metadata {
+        clear_bit(&mut new_bm, blk);
     }
 
     // --- 7. Build the new root block buffer. Start from the old root,
     //        update bm_pages[] + headerKey, rewrite checksum. ---
     let mut new_root_buf = old_root_buf;
     // headerKey at long 1 (offset 4..8).
-    BigEndian::write_u32(&mut new_root_buf[4..8], new_root);
+    BigEndian::write_u32(&mut new_root_buf[4..8], 0);
     // bm_pages[0..25] at 0x13C onward, zero-fill unused slots.
-    for i in 0..AFFS_BM_PAGES_ROOT as usize {
+    for i in 0..BM_PAGES_ROOT {
         let off = 0x13C + i * 4;
         let val = new_pages.get(i).copied().unwrap_or(0);
         BigEndian::write_u32(&mut new_root_buf[off..off + 4], val);
     }
-    // bm_ext stays zero (we refused bm_ext volumes earlier).
-    BigEndian::write_u32(&mut new_root_buf[0x1A0..0x1A4], 0);
+    let first_ext = new_exts.first().copied().unwrap_or(0);
+    BigEndian::write_u32(&mut new_root_buf[0x1A0..0x1A4], first_ext);
     // bm_flag at 0x138 stays -1 (valid).
     BigEndian::write_i32(&mut new_root_buf[0x138..0x13C], -1);
     // Re-stamp the normal checksum (word 5).
@@ -2158,6 +2162,21 @@ pub fn resize_affs_in_place(
         ))?;
         device.write_all(&new_bm_page_bufs[page_idx])?;
     }
+    for (e, &ext_blk) in new_exts.iter().enumerate() {
+        let mut ext = [0u8; BSIZE];
+        let listed = new_pages.iter().skip(BM_PAGES_ROOT + e * BM_EXT_PAGES);
+        for (slot, &page) in listed.take(BM_EXT_PAGES).enumerate() {
+            BigEndian::write_u32(&mut ext[slot * 4..slot * 4 + 4], page);
+        }
+        // Last long of an extension block points at the next one, or 0.
+        let next = new_exts.get(e + 1).copied().unwrap_or(0);
+        let nx = BM_EXT_PAGES * 4;
+        BigEndian::write_u32(&mut ext[nx..nx + 4], next);
+        device.seek(SeekFrom::Start(
+            partition_offset + ext_blk as u64 * BSIZE_U64,
+        ))?;
+        device.write_all(&ext)?;
+    }
     device.seek(SeekFrom::Start(
         partition_offset + new_root as u64 * BSIZE_U64,
     ))?;
@@ -2183,7 +2202,7 @@ pub fn resize_affs_in_place(
 
     log(&format!(
         "AFFS resize: {} -> {} sectors ({} -> {} bytes), root {} -> {}, \
-         {} bitmap page(s)",
+         {} bitmap page(s), {} extension block(s)",
         old_total,
         new_total,
         old_total as u64 * BSIZE_U64,
@@ -2191,11 +2210,12 @@ pub fn resize_affs_in_place(
         old_root,
         new_root,
         new_pages.len(),
+        new_exts.len(),
     ));
     Ok(())
 }
 
-/// Scan for an ST_ROOT block whose header-key matches its own block
+/// Scan for an ST_ROOT block whose header-key is 0 or its own block
 /// number. Tries `(2 + upper_total - 1) / 2` first (cheap path for
 /// volumes that haven't been resized yet), then walks the plausible
 /// range upward looking for the marker. Returns the block number, or
@@ -2214,10 +2234,9 @@ fn find_affs_root_block(
         if read_i32(&buf, 0) != T_HEADER {
             return Ok(false);
         }
-        if read_u32(&buf, 4) != blk {
-            return Ok(false);
-        }
-        Ok(true)
+        // A real root's header_key is 0 (R-020); an older image of ours holds its own block.
+        let key = read_u32(&buf, 4);
+        Ok((key == 0 || key == blk) && read_u32(&buf, 12) == HT_SIZE as u32)
     };
 
     // Adapter: Read+Seek -> AffsRootProbe trait so we can reuse one helper.
@@ -2279,8 +2298,23 @@ pub fn create_blank_affs(
     variant: u8,
     volume_name: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    use byteorder::{BigEndian, ByteOrder};
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_affs_into(&mut cur, 0, size_bytes, variant, volume_name)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
 
+/// The streaming form of [`create_blank_affs`]: writes the boot, root, bitmap and extension
+/// blocks at `at_offset`, one bitmap page in memory at a time, and returns the volume's length.
+pub fn write_blank_affs_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    variant: u8,
+    volume_name: &str,
+) -> anyhow::Result<u64> {
     if size_bytes < 32 * 1024 {
         return Err(anyhow::anyhow!(
             "AFFS volume must be at least 32 KiB, got {size_bytes}"
@@ -2299,19 +2333,13 @@ pub fn create_blank_affs(
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // Root block lives at the middle of the data region (classic AFFS
-    // layout). The Amiga formatter picks `(2 + total_blocks - 1) / 2`.
+    // Root block lives at the middle of the data region; the Amiga formatter picks this.
     let root_block: u32 = (2 + total_blocks - 1) / 2;
 
-    // One bitmap block covers BITMAP_BITS_PER_BLOCK blocks, so a volume larger
-    // than that needs several. Writing exactly one regardless is what made a
-    // 4 MB volume panic indexing past the end of its single page (R-008b), and
-    // what left every volume above 4066 blocks with an uncovered tail
-    // (R-008a). The bitmap starts at block 2 (blocks 0/1 are the boot block).
+    // One bitmap page per BITMAP_BITS_PER_BLOCK blocks, starting at block 2 (R-008a / R-008b).
     let bitmap_bits_needed = total_blocks.saturating_sub(2) as usize;
     let bitmap_pages = bitmap_bits_needed.div_ceil(BITMAP_BITS_PER_BLOCK).max(1);
-    // Pages past the 25 that fit in the root block live on a chain of bitmap
-    // extension blocks, each holding 127 more page pointers plus a `next`.
+    // Pages past the 25 the root block holds live on a chain of extension blocks.
     let ext_blocks = bitmap_pages
         .saturating_sub(BM_PAGES_ROOT)
         .div_ceil(BM_EXT_PAGES);
@@ -2323,23 +2351,18 @@ pub fn create_blank_affs(
             "AFFS volume too small to fit root + {bitmap_pages} bitmap block(s)"
         ));
     }
-
-    let mut img = vec![0u8; total_blocks as usize * BSIZE];
+    let put = |w: &mut W, block: u64, bytes: &[u8]| -> std::io::Result<()> {
+        w.seek(SeekFrom::Start(at_offset + block * BSIZE_U64))?;
+        w.write_all(bytes)
+    };
 
     // Boot block: "DOS\x" magic.
-    img[0] = b'D';
-    img[1] = b'O';
-    img[2] = b'S';
-    img[3] = variant;
+    put(w, 0, &[b'D', b'O', b'S', variant])?;
 
     // Root block.
-    let root_off = root_block as usize * BSIZE;
-    let root = &mut img[root_off..root_off + BSIZE];
+    let mut root = [0u8; BSIZE];
     BigEndian::write_i32(&mut root[0..4], T_HEADER);
-    // header_key is 0 on a root block, not the block's own number. Verified
-    // against a real Workbench 1.3 disk (fs.affs.workbench13.hd.hdf), whose
-    // root reads header_key=0 where ours wrote 4096 — the hypothesis R-020
-    // recorded, now with a disk behind it.
+    // header_key is 0 on a root block, as a real Workbench 1.3 disk has it (R-020).
     BigEndian::write_u32(&mut root[4..8], 0);
     BigEndian::write_u32(&mut root[12..16], HT_SIZE as u32);
     BigEndian::write_i32(&mut root[0x138..0x13C], -1); // bm_flag = valid
@@ -2359,73 +2382,45 @@ pub fn create_blank_affs(
     BigEndian::write_i32(&mut root[0x1D8..0x1DC], 1); // last-access stamp
     BigEndian::write_i32(&mut root[0x1E4..0x1E8], 1); // creation stamp
     BigEndian::write_i32(&mut root[0x1FC..0x200], ST_ROOT);
-    let sum = normal_checksum(root, 5);
+    let sum = normal_checksum(&root, 5);
     BigEndian::write_u32(&mut root[0x14..0x18], sum);
+    put(w, u64::from(root_block), &root)?;
 
-    // Bitmap pages: set bit = free (the Amiga convention, opposite of most
-    // filesystems). Start all-free, then clear the blocks the metadata itself
-    // occupies and every bit past the end of the volume, so the allocator can
-    // never hand out a block that does not exist.
+    // Bitmap pages, set bit = free: bit `i` covers block `i + 2`. The metadata run
+    // (root, pages, extension blocks) and every bit past the volume's end start used.
+    let meta = (root_block as usize - 2)..(last_meta_block as usize - 1);
+    let past_end = bitmap_bits_needed..bitmap_pages * BITMAP_BITS_PER_BLOCK;
     for page in 0..bitmap_pages {
-        let bm_off = (bitmap_block as usize + page) * BSIZE;
-        let bm = &mut img[bm_off..bm_off + BSIZE];
+        let mut bm = [0u8; BSIZE];
         for i in 1..BITMAP_WORDS_PER_BLOCK + 1 {
             BigEndian::write_u32(&mut bm[i * 4..i * 4 + 4], 0xFFFFFFFF);
         }
-    }
-
-    // Bit `i` of the whole bitmap covers block `i + 2`; page `p` holds bits
-    // `p * BITMAP_BITS_PER_BLOCK ..`. `clear` maps a block number to its page
-    // and word, so a metadata block on any page is marked correctly.
-    let clear_block = |img: &mut [u8], blk: u32| {
-        if blk < 2 {
-            return;
+        let lo = page * BITMAP_BITS_PER_BLOCK;
+        let hi = lo + BITMAP_BITS_PER_BLOCK;
+        for range in [&meta, &past_end] {
+            for bit in range.start.max(lo)..range.end.min(hi) {
+                let bit_in_page = bit - lo;
+                let off = (bit_in_page / 32 + 1) * 4; // word 0 is the checksum
+                let word = BigEndian::read_u32(&bm[off..off + 4]) & !(1u32 << (bit_in_page % 32));
+                BigEndian::write_u32(&mut bm[off..off + 4], word);
+            }
         }
-        let bit = (blk - 2) as usize;
-        let page = bit / BITMAP_BITS_PER_BLOCK;
-        if page >= bitmap_pages {
-            return;
-        }
-        let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
-        let word_idx = bit_in_page / 32 + 1; // word 0 is the checksum
-        let bit_in_word = bit_in_page % 32;
-        let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
-        let mut w = BigEndian::read_u32(&img[off..off + 4]);
-        w &= !(1u32 << bit_in_word);
-        BigEndian::write_u32(&mut img[off..off + 4], w);
-    };
-
-    clear_block(&mut img, root_block);
-    for p in 0..bitmap_pages {
-        clear_block(&mut img, bitmap_block + p as u32);
-    }
-    for e in 0..ext_blocks {
-        clear_block(&mut img, bitmap_block + bitmap_pages as u32 + e as u32);
-    }
-    // Bits past the end of the volume, in the final page.
-    for bit in bitmap_bits_needed..bitmap_pages * BITMAP_BITS_PER_BLOCK {
-        let page = bit / BITMAP_BITS_PER_BLOCK;
-        let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
-        let word_idx = bit_in_page / 32 + 1;
-        let bit_in_word = bit_in_page % 32;
-        let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
-        let mut w = BigEndian::read_u32(&img[off..off + 4]);
-        w &= !(1u32 << bit_in_word);
-        BigEndian::write_u32(&mut img[off..off + 4], w);
+        let sum = bitmap_checksum(&bm);
+        BigEndian::write_u32(&mut bm[0..4], sum);
+        put(w, u64::from(bitmap_block) + page as u64, &bm)?;
     }
 
     // Bitmap extension chain for pages beyond the 25 the root block holds.
     for e in 0..ext_blocks {
         let ext_blk = bitmap_block as usize + bitmap_pages + e;
-        let ext_off = ext_blk * BSIZE;
+        let mut ext = [0u8; BSIZE];
         let first_page = BM_PAGES_ROOT + e * BM_EXT_PAGES;
         for slot in 0..BM_EXT_PAGES {
             let page = first_page + slot;
             if page >= bitmap_pages {
                 break;
             }
-            let off = ext_off + slot * 4;
-            BigEndian::write_u32(&mut img[off..off + 4], bitmap_block + page as u32);
+            BigEndian::write_u32(&mut ext[slot * 4..slot * 4 + 4], bitmap_block + page as u32);
         }
         // Last long of an extension block points at the next one, or 0.
         let next = if e + 1 < ext_blocks {
@@ -2433,23 +2428,202 @@ pub fn create_blank_affs(
         } else {
             0
         };
-        let nx = ext_off + BM_EXT_PAGES * 4;
-        BigEndian::write_u32(&mut img[nx..nx + 4], next);
+        let nx = BM_EXT_PAGES * 4;
+        BigEndian::write_u32(&mut ext[nx..nx + 4], next);
+        put(w, ext_blk as u64, &ext)?;
     }
 
-    // Checksums last, over the finished pages.
-    for page in 0..bitmap_pages {
-        let bm_off = (bitmap_block as usize + page) * BSIZE;
-        let bm = &mut img[bm_off..bm_off + BSIZE];
-        let sum = bitmap_checksum(bm);
-        BigEndian::write_u32(&mut bm[0..4], sum);
-    }
-
-    Ok(img)
+    Ok(total_blocks_u64 * BSIZE_U64)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_affs(
+        size_bytes: u64,
+        variant: u8,
+        volume_name: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        use byteorder::{BigEndian, ByteOrder};
+
+        if size_bytes < 32 * 1024 {
+            return Err(anyhow::anyhow!(
+                "AFFS volume must be at least 32 KiB, got {size_bytes}"
+            ));
+        }
+        if !size_bytes.is_multiple_of(BSIZE_U64) {
+            return Err(anyhow::anyhow!(
+                "AFFS volume size must be a multiple of 512, got {size_bytes}"
+            ));
+        }
+        let total_blocks_u64 = size_bytes / BSIZE_U64;
+        if total_blocks_u64 > u32::MAX as u64 {
+            return Err(anyhow::anyhow!(
+                "AFFS volume size {size_bytes} exceeds u32 block range"
+            ));
+        }
+        let total_blocks = total_blocks_u64 as u32;
+
+        // Root block lives at the middle of the data region (classic AFFS
+        // layout). The Amiga formatter picks `(2 + total_blocks - 1) / 2`.
+        let root_block: u32 = (2 + total_blocks - 1) / 2;
+
+        // One bitmap block covers BITMAP_BITS_PER_BLOCK blocks, so a volume larger
+        // than that needs several. Writing exactly one regardless is what made a
+        // 4 MB volume panic indexing past the end of its single page (R-008b), and
+        // what left every volume above 4066 blocks with an uncovered tail
+        // (R-008a). The bitmap starts at block 2 (blocks 0/1 are the boot block).
+        let bitmap_bits_needed = total_blocks.saturating_sub(2) as usize;
+        let bitmap_pages = bitmap_bits_needed.div_ceil(BITMAP_BITS_PER_BLOCK).max(1);
+        // Pages past the 25 that fit in the root block live on a chain of bitmap
+        // extension blocks, each holding 127 more page pointers plus a `next`.
+        let ext_blocks = bitmap_pages
+            .saturating_sub(BM_PAGES_ROOT)
+            .div_ceil(BM_EXT_PAGES);
+
+        let bitmap_block: u32 = root_block + 1;
+        let last_meta_block = bitmap_block as u64 + bitmap_pages as u64 + ext_blocks as u64 - 1;
+        if last_meta_block >= total_blocks as u64 {
+            return Err(anyhow::anyhow!(
+                "AFFS volume too small to fit root + {bitmap_pages} bitmap block(s)"
+            ));
+        }
+
+        let mut img = vec![0u8; total_blocks as usize * BSIZE];
+
+        // Boot block: "DOS\x" magic.
+        img[0] = b'D';
+        img[1] = b'O';
+        img[2] = b'S';
+        img[3] = variant;
+
+        // Root block.
+        let root_off = root_block as usize * BSIZE;
+        let root = &mut img[root_off..root_off + BSIZE];
+        BigEndian::write_i32(&mut root[0..4], T_HEADER);
+        // header_key is 0 on a root block, not the block's own number. Verified
+        // against a real Workbench 1.3 disk (fs.affs.workbench13.hd.hdf), whose
+        // root reads header_key=0 where ours wrote 4096 — the hypothesis R-020
+        // recorded, now with a disk behind it.
+        BigEndian::write_u32(&mut root[4..8], 0);
+        BigEndian::write_u32(&mut root[12..16], HT_SIZE as u32);
+        BigEndian::write_i32(&mut root[0x138..0x13C], -1); // bm_flag = valid
+        for i in 0..bitmap_pages.min(BM_PAGES_ROOT) {
+            let off = 0x13C + i * 4;
+            BigEndian::write_u32(&mut root[off..off + 4], bitmap_block + i as u32);
+        }
+        if ext_blocks > 0 {
+            // First extension block sits immediately after the bitmap pages.
+            let first_ext = bitmap_block + bitmap_pages as u32;
+            BigEndian::write_u32(&mut root[0x1A0..0x1A4], first_ext);
+        }
+        let name_bytes = volume_name.as_bytes();
+        let n = name_bytes.len().min(MAX_NAME_LEN);
+        root[0x1B0] = n as u8;
+        root[0x1B1..0x1B1 + n].copy_from_slice(&name_bytes[..n]);
+        BigEndian::write_i32(&mut root[0x1D8..0x1DC], 1); // last-access stamp
+        BigEndian::write_i32(&mut root[0x1E4..0x1E8], 1); // creation stamp
+        BigEndian::write_i32(&mut root[0x1FC..0x200], ST_ROOT);
+        let sum = normal_checksum(root, 5);
+        BigEndian::write_u32(&mut root[0x14..0x18], sum);
+
+        // Bitmap pages: set bit = free (the Amiga convention, opposite of most
+        // filesystems). Start all-free, then clear the blocks the metadata itself
+        // occupies and every bit past the end of the volume, so the allocator can
+        // never hand out a block that does not exist.
+        for page in 0..bitmap_pages {
+            let bm_off = (bitmap_block as usize + page) * BSIZE;
+            let bm = &mut img[bm_off..bm_off + BSIZE];
+            for i in 1..BITMAP_WORDS_PER_BLOCK + 1 {
+                BigEndian::write_u32(&mut bm[i * 4..i * 4 + 4], 0xFFFFFFFF);
+            }
+        }
+
+        // Bit `i` of the whole bitmap covers block `i + 2`; page `p` holds bits
+        // `p * BITMAP_BITS_PER_BLOCK ..`. `clear` maps a block number to its page
+        // and word, so a metadata block on any page is marked correctly.
+        let clear_block = |img: &mut [u8], blk: u32| {
+            if blk < 2 {
+                return;
+            }
+            let bit = (blk - 2) as usize;
+            let page = bit / BITMAP_BITS_PER_BLOCK;
+            if page >= bitmap_pages {
+                return;
+            }
+            let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
+            let word_idx = bit_in_page / 32 + 1; // word 0 is the checksum
+            let bit_in_word = bit_in_page % 32;
+            let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
+            let mut w = BigEndian::read_u32(&img[off..off + 4]);
+            w &= !(1u32 << bit_in_word);
+            BigEndian::write_u32(&mut img[off..off + 4], w);
+        };
+
+        clear_block(&mut img, root_block);
+        for p in 0..bitmap_pages {
+            clear_block(&mut img, bitmap_block + p as u32);
+        }
+        for e in 0..ext_blocks {
+            clear_block(&mut img, bitmap_block + bitmap_pages as u32 + e as u32);
+        }
+        // Bits past the end of the volume, in the final page.
+        for bit in bitmap_bits_needed..bitmap_pages * BITMAP_BITS_PER_BLOCK {
+            let page = bit / BITMAP_BITS_PER_BLOCK;
+            let bit_in_page = bit % BITMAP_BITS_PER_BLOCK;
+            let word_idx = bit_in_page / 32 + 1;
+            let bit_in_word = bit_in_page % 32;
+            let off = (bitmap_block as usize + page) * BSIZE + word_idx * 4;
+            let mut w = BigEndian::read_u32(&img[off..off + 4]);
+            w &= !(1u32 << bit_in_word);
+            BigEndian::write_u32(&mut img[off..off + 4], w);
+        }
+
+        // Bitmap extension chain for pages beyond the 25 the root block holds.
+        for e in 0..ext_blocks {
+            let ext_blk = bitmap_block as usize + bitmap_pages + e;
+            let ext_off = ext_blk * BSIZE;
+            let first_page = BM_PAGES_ROOT + e * BM_EXT_PAGES;
+            for slot in 0..BM_EXT_PAGES {
+                let page = first_page + slot;
+                if page >= bitmap_pages {
+                    break;
+                }
+                let off = ext_off + slot * 4;
+                BigEndian::write_u32(&mut img[off..off + 4], bitmap_block + page as u32);
+            }
+            // Last long of an extension block points at the next one, or 0.
+            let next = if e + 1 < ext_blocks {
+                (ext_blk + 1) as u32
+            } else {
+                0
+            };
+            let nx = ext_off + BM_EXT_PAGES * 4;
+            BigEndian::write_u32(&mut img[nx..nx + 4], next);
+        }
+
+        // Checksums last, over the finished pages.
+        for page in 0..bitmap_pages {
+            let bm_off = (bitmap_block as usize + page) * BSIZE;
+            let bm = &mut img[bm_off..bm_off + BSIZE];
+            let sum = bitmap_checksum(bm);
+            BigEndian::write_u32(&mut bm[0..4], sum);
+        }
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for kib in [32u64, 800, 2048, 4096, 8192, 65536] {
+            for variant in [0u8, 3, 7] {
+                let old = old_create_blank_affs(kib * 1024, variant, "Vol").unwrap();
+                let new = create_blank_affs(kib * 1024, variant, "Vol").unwrap();
+                assert!(old == new, "{kib} KiB DOS{variant} differs");
+            }
+        }
+    }
     use super::*;
     use byteorder::{BigEndian, ByteOrder};
     use std::io::Cursor;
@@ -2993,6 +3167,88 @@ mod tests {
         // 880/881 were inside the volume but get marked free in the new
         // bitmap.)
         assert_eq!(alloc, 4, "expected 4 alloc, got {alloc}");
+    }
+
+    /// A formatted volume's root has header_key 0, like a real disk's, and still resizes.
+    #[test]
+    fn resize_grows_a_formatted_volume() {
+        let mut img = create_blank_affs(1024 * 1024, 1, "Real").expect("format");
+        let new_size = 4 * 1024 * 1024usize;
+        img.resize(new_size, 0);
+        let mut cur = Cursor::new(img);
+        resize_affs_in_place(&mut cur, 0, new_size as u64, &mut |_| {}).expect("grow");
+        let fs = AffsFilesystem::open(&mut cur, 0).expect("reopen after grow");
+        assert_eq!(fs.total_blocks(), (new_size / BSIZE) as u32);
+    }
+
+    fn add_file(cur: &mut Cursor<Vec<u8>>, name: &str, payload: &[u8]) {
+        use disk_core::filesystem::CreateFileOptions;
+        let mut fs = AffsFilesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let mut src = Cursor::new(payload.to_vec());
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, name, &mut src, payload.len() as u64, &opts)
+            .expect("create");
+        fs.sync_metadata().expect("sync");
+    }
+
+    fn assert_clean_with_file(cur: &mut Cursor<Vec<u8>>, name: &str, payload: &[u8]) {
+        let mut fs = AffsFilesystem::open(cur, 0).expect("reopen");
+        let result = fs.fsck().expect("fsck supported").expect("fsck runs");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let entry = entries.iter().find(|e| e.name == name).expect("file kept");
+        let bytes = fs.read_file(entry, payload.len() + 1).expect("read");
+        assert_eq!(bytes, payload);
+    }
+
+    /// Past 25 bitmap pages the resizer builds an extension chain, and walks one on the next resize.
+    #[test]
+    fn resize_crosses_the_bitmap_extension_boundary() {
+        let payload = vec![0x5Au8; 200 * 1024];
+        let img = create_blank_affs(4 * 1024 * 1024, 1, "Chain").expect("format");
+        let mut cur = Cursor::new(img);
+        add_file(&mut cur, "keep", &payload);
+
+        for mib in [64usize, 150, 30] {
+            let size = mib * 1024 * 1024;
+            let padded = cur.get_ref().len().max(size);
+            cur.get_mut().resize(padded, 0);
+            resize_affs_in_place(&mut cur, 0, size as u64, &mut |_| {}).expect("resize");
+            cur.get_mut().truncate(size);
+            assert_clean_with_file(&mut cur, "keep", &payload);
+            let name = format!("after{mib}");
+            add_file(&mut cur, &name, &payload);
+            assert_clean_with_file(&mut cur, &name, &payload);
+        }
+    }
+
+    /// Extension blocks are reachable: fsck stays clean and repair keeps them allocated.
+    #[test]
+    fn fsck_counts_bitmap_extension_blocks() {
+        let img = create_blank_affs(64 * 1024 * 1024, 1, "Big").expect("format");
+        let mut cur = Cursor::new(img);
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+        let ext = fs.root.bm_ext;
+        assert_ne!(ext, 0, "64 MiB needs an extension block");
+        assert!(fs.bitmap_page_owns_block(ext));
+        let result = fs.fsck().expect("fsck supported").expect("fsck runs");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    /// New bitmap pages step around user data instead of refusing the grow.
+    #[test]
+    fn resize_places_bitmap_pages_around_user_data() {
+        let payload = vec![0xC3u8; 600 * 1024];
+        let img = create_blank_affs(1024 * 1024, 1, "Around").expect("format");
+        let mut cur = Cursor::new(img);
+        add_file(&mut cur, "big", &payload);
+        // Two more blocks put the new root on the old bitmap page, with data right after it.
+        let size = 1024 * 1024 + 1024;
+        cur.get_mut().resize(size, 0);
+        resize_affs_in_place(&mut cur, 0, size as u64, &mut |_| {}).expect("grow");
+        assert_clean_with_file(&mut cur, "big", &payload);
     }
 
     /// Refuse to shrink past a file's data block. The AFFS allocator

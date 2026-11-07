@@ -398,6 +398,61 @@ verifies = [
 ]
 
 [[oracle]]
+id = "nextstep-disk"
+tool = "NeXTSTEP 3.3 disk(8)"
+kind = "emulator"
+program = "python3"
+notes = """NeXTSTEP's own `disk` tool, run under the Previous fork (github.com/danifunker/previous-fork)
+through its serial FIFOs, reads the label and prints it. The script compares the partition
+NeXTSTEP reports with rb-cli's reading, so a unit mistake fails even though the label parses.
+RB_EMU_CONTROL=1 damages the label copies and must fail. `program` is python3 on the amitools
+pattern; the script exits 77 when local.toml has no `previous` or `nextstep_boot`."""
+verifies = [
+  { format = "part.next", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-06: NeXTSTEP 3.3 prints the label with partition a at byte 1048576, 15728640 bytes; the damaged control answers no label on disk", check = ["{oracles}/nextstep_disk_label.py", "{artifact}"], expect_stdout = "PASS: NeXTSTEP" },
+]
+availability = [
+  { platform = "linux", status = "expected" },
+]
+
+[[oracle]]
+id = "linux-guest"
+tool = "Linux kernel (befs, Solaris x86 partition parser)"
+kind = "emulator"
+program = "python3"
+notes = """A stock Ubuntu kernel in a small QEMU VM with a busybox initramfs, so no root and no mount on
+the host. The kernel unpacks from a linux-image .deb (`apt-get download`, `dpkg-deb -x`) and
+local.toml's `[emulators] linux_kernel` points at it. befs is read-only, so a pass proves the volume
+mounts and reads back, not that it is free of damage; Haiku's checkfs would be the stronger judge.
+The Solaris parser reads the VTOC only: real Solaris 2.6 under QEMU stalls after its kernel banner.
+RB_EMU_CONTROL=1 damages the structure and must fail."""
+verifies = [
+  { format = "fs.bfs", direction = "write", strength = "structural", status = "proven", evidence = "2026-11-06: Linux 7.0 befs mounts the volume and every file rb-cli wrote matches by md5; a damaged superblock is refused", check = ["{oracles}/linux_guest.py", "bfs", "{artifact}"], expect_stdout = "PASS: Linux befs" },
+  { format = "part.solaris-x86", direction = "write", strength = "structural", status = "proven", evidence = "2026-11-06: the kernel's parser finds all four slices at rb-cli's exact sectors; a damaged VTOC loses them", check = ["{oracles}/linux_guest.py", "solaris-x86", "{artifact}"], expect_stdout = "PASS: the Linux parser" },
+]
+availability = [
+  { platform = "linux", status = "expected" },
+]
+
+[[oracle]]
+id = "ofs-extractor-port"
+tool = "ofs-extractor (Python port)"
+kind = "package"
+program = "python3"
+notes = """A line-for-line port of Steve White's ofs-extractor, the only other reader of this format.
+Not authoritative: no running system reads OFS, so a pass says two implementations agree. It is
+kept honest by the real disk: on fs.ofs.hobbit-1993 it and rb-cli agree on all 556 files byte for
+byte, 38 of them extent-list files. The port rather than the C because the original is untrusted
+code from 2004 that also assumes a 32-bit `long`."""
+verifies = [
+  { format = "fs.ofs", direction = "write", strength = "structural", status = "proven", evidence = "2026-11-06: reads back contiguous and extent-list files rb-cli wrote; a damaged root directory fails", check = ["{oracles}/ofs_white_reader.py", "{artifact}"], expect_stdout = "PASS: the ofs-extractor port" },
+]
+availability = [
+  { platform = "linux",   status = "expected" },
+  { platform = "macos",   status = "expected" },
+  { platform = "windows", status = "expected" },
+]
+
+[[oracle]]
 id = "copperline"
 tool = "Copperline"
 kind = "emulator"

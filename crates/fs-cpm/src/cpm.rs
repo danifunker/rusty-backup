@@ -1053,13 +1053,45 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
 /// `0xE5` in the status byte marks every directory slot empty. The result
 /// round-trips through [`CpmFilesystem::open_with_dpb`] with an empty catalog.
 pub fn create_blank(dpb: Dpb) -> Vec<u8> {
-    let reserved = dpb.off as usize * dpb.spt as usize * 128;
-    let size = reserved + dpb.data_bytes() as usize;
-    vec![0xE5u8; size]
+    vec![0xE5u8; blank_size(&dpb) as usize]
+}
+
+/// The length of a blank disk: its reserved tracks and data area.
+fn blank_size(dpb: &Dpb) -> u64 {
+    dpb.off as u64 * dpb.spt as u64 * 128 + dpb.data_bytes()
+}
+
+/// The streaming form of [`create_blank`]: fills the disk with 0xE5 at `at_offset`, 64 KiB at a
+/// time, and returns its length.
+pub fn write_blank_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    dpb: Dpb,
+) -> std::io::Result<u64> {
+    let size = blank_size(&dpb);
+    let chunk = [0xE5u8; 64 * 1024];
+    w.seek(SeekFrom::Start(at_offset))?;
+    let mut left = size;
+    while left > 0 {
+        let n = left.min(chunk.len() as u64) as usize;
+        w.write_all(&chunk[..n])?;
+        left -= n as u64;
+    }
+    Ok(size)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn streaming_a_blank_disk_matches_the_in_memory_one() {
+        for dpb in crate::cpm_diskdefs::ALL_PRESETS {
+            let mut cur = std::io::Cursor::new(Vec::new());
+            let len = write_blank_into(&mut cur, 0, *dpb).unwrap();
+            assert_eq!(len as usize, cur.get_ref().len(), "{}", dpb.name);
+            assert!(*cur.get_ref() == create_blank(*dpb), "{}", dpb.name);
+        }
+    }
     use super::super::cpm_diskdefs::AMSTRAD_DATA;
     use super::*;
     use std::io::Cursor;

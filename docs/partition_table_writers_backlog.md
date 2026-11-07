@@ -1,6 +1,6 @@
 # Partition-table writers: what's done, what's left
 
-`rb-cli new hd <table>` and the GUI Restore tab's **Build Disk** mode both
+`rb-cli new hd <table>` and the GUI's **Build Disk** tab both
 provision a blank disk with a real partition table and partitions you size and
 type yourself. The layout maths and every table writer live in
 `src/partition/provision.rs`; `src/cli/verbs/new_partitioned_hd.rs` is only the

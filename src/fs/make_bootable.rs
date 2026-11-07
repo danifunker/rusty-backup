@@ -21,7 +21,7 @@
 //! a deliberate, separate operation (the Expand/Export "APM disk" path), not
 //! something this applies behind your back.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::fs::hfs_boot;
@@ -29,6 +29,7 @@ use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver};
 use crate::partition::PartitionTable;
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{Filesystem, FilesystemError};
+use part_tables::apm::Apm;
 
 /// Conventional name of the bootable folder on a classic-Mac volume.
 const SYSTEM_FOLDER_NAME: &str = "System Folder";
@@ -126,6 +127,18 @@ pub struct MakeBootableReport {
     pub now_bootable: bool,
 }
 
+/// True if a driver the DDR registers has code behind it; a restore could leave a slot of zeros.
+fn driver_code_present(disk: &mut (impl Read + Seek), apm: &Apm) -> bool {
+    let block_size = apm.ddr.block_size.max(512) as u64;
+    apm.ddr.driver_info.iter().any(|d| {
+        let mut code = vec![0u8; d.size.max(1) as usize * 512];
+        disk.seek(SeekFrom::Start(d.block as u64 * block_size))
+            .is_ok()
+            && disk.read_exact(&mut code).is_ok()
+            && code.iter().any(|&b| b != 0)
+    })
+}
+
 /// Classify `path` and report which bootability components are present.
 pub fn assess_bootability(path: &Path) -> Result<Assessment, FilesystemError> {
     let mut file = std::fs::File::open(path).map_err(FilesystemError::Io)?;
@@ -148,11 +161,8 @@ pub fn assess_bootability(path: &Path) -> Result<Assessment, FilesystemError> {
                 })?;
             let block_size = apm.ddr.block_size.max(512) as u64;
             let offset = hfs.start_block as u64 * block_size;
-            (
-                BootDiskKind::ApmHfs,
-                offset,
-                Some(apm.ddr.driver_count >= 1),
-            )
+            let has_driver = apm.ddr.driver_count >= 1 && driver_code_present(&mut file, apm);
+            (BootDiskKind::ApmHfs, offset, Some(has_driver))
         }
         _ => {
             return Err(FilesystemError::Unsupported(
@@ -394,6 +404,46 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, &img).unwrap();
         path
+    }
+
+    /// A driver slot of zeros: the map and DDR claim a driver, as a restore used to leave them.
+    #[test]
+    fn a_registered_driver_with_no_code_is_installed() {
+        use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver};
+        use part_tables::apm::build_minimal_apm;
+        let blocks = (16 * MIB / 512) as u32;
+        let apm = build_minimal_apm(
+            &[
+                ("Apple_Driver43".to_string(), 64, 32),
+                ("Apple_HFS".to_string(), 96, blocks - 96),
+            ],
+            512,
+            blocks,
+        );
+        let mut raw = vec![0u8; (16 * MIB) as usize];
+        let head = apm.build_apm_blocks(Some(blocks));
+        raw[..head.len()].copy_from_slice(&head);
+        let vol = flat_hfs_with_system_folder("rb_mb_zero_vol.hfv");
+        let vol = std::fs::read(vol).unwrap();
+        raw[96 * 512..96 * 512 + vol.len()].copy_from_slice(&vol);
+        let mut disk = std::io::Cursor::new(raw);
+        let driver = MacScsiDriver::builtin();
+        bless_apm_disk(&mut disk, 16 * MIB, &driver, &BlessOptions::default()).unwrap();
+        let path = std::env::temp_dir().join("rb_mb_zero_driver.hda");
+        std::fs::write(&path, disk.get_ref()).unwrap();
+        assert_eq!(assess_bootability(&path).unwrap().has_driver, Some(true));
+
+        let mut raw = disk.into_inner();
+        raw[64 * 512..96 * 512].fill(0);
+        std::fs::write(&path, &raw).unwrap();
+        assert_eq!(assess_bootability(&path).unwrap().has_driver, Some(false));
+
+        let report = make_bootable(&path, &MakeBootableOptions::default()).unwrap();
+        assert!(
+            report.applied.iter().any(|a| a.contains("SCSI driver")),
+            "{report:?}"
+        );
+        assert_eq!(assess_bootability(&path).unwrap().has_driver, Some(true));
     }
 
     #[test]

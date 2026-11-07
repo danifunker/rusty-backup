@@ -1,0 +1,30 @@
+# An APM disk offers a Mac driver, on by default, and the choice sticks; another table has none.
+name = "Build Disk: the Mac driver on an APM disk"
+vm = "build_disk"
+
+[[step]]
+action = "Next"
+expect = { step = "Output" }
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "SetTable"
+arg = "APM"
+expect = { mac_driver = "Apple SCSI driver 7.3.5 (bundled)" }
+
+[[step]]
+action = "SetMacDriver"
+arg = "none"
+expect = { mac_driver = "None" }
+
+[[step]]
+action = "SetTable"
+arg = "MBR"
+expect = { mac_driver = "" }

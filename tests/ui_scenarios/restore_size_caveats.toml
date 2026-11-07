@@ -1,0 +1,20 @@
+# The Restore form says what a volume asks of the machine reading it, from the shared limits
+# table: a small FAT16 has nothing to say at its own size, and warns where it stops growing.
+# The first SetCustomSize only switches the row into Custom.
+name = "Restore: caveats follow the chosen size"
+vm = "restore"
+
+[[step]]
+action = "OpenBackup"
+arg = "$mbr_backup"
+settle = true
+expect = { backup = true, partitions = 1, caveats = "" }
+
+[[step]]
+action = "SetCustomSize"
+arg = 4096
+
+[[step]]
+action = "SetCustomSize"
+arg = 4096
+expect = { caveats = "~stops at" }

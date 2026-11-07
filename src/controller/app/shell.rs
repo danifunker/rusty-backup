@@ -15,6 +15,8 @@ pub use crate::device::DiskDevice;
 pub enum AppTab {
     Backup,
     Restore,
+    /// Build Disk: a new partitioned disk or volume.
+    Build,
     Inspect,
     Optical,
     Archives,
@@ -310,6 +312,8 @@ impl AppController {
             AppTab::Optical => DropRoute::Optical(path),
             AppTab::Archives => DropRoute::Archives(path),
             AppTab::Restore => DropRoute::Restore(path),
+            // Build Disk starts from nothing; a drop has no meaning there.
+            AppTab::Build => DropRoute::Ignore,
             AppTab::Backup => DropRoute::Backup(path),
         }
     }

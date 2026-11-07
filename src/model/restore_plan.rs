@@ -12,7 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backup::metadata::BackupMetadata;
+use crate::backup::metadata::{BackupLayout, BackupMetadata, PartitionMetadata};
+use crate::model::fs_limits::{caveats, Caveat, CaveatLevel, VolumeFacts, HEAD_BYTES};
 use crate::model::size_mode::{SizeMode, CUSTOM_MIB_MAX};
 use crate::restore::single::{
     NewDiskConfig, NewTableType, SinglePartitionRestoreConfig, SinglePartitionSource,
@@ -47,6 +48,8 @@ pub struct SizeRow {
     pub minimum_size: u64,
     pub mode: SizeMode,
     pub custom_mib: u32,
+    /// What the partition's own first bytes say it holds; `None` if unread or not in the table.
+    pub facts: Option<VolumeFacts>,
 }
 
 impl SizeRow {
@@ -59,6 +62,7 @@ impl SizeRow {
             minimum_size: minimum,
             mode: SizeMode::Original,
             custom_mib: (original / MIB) as u32,
+            facts: None,
         }
     }
 
@@ -119,6 +123,8 @@ pub struct LoadedBackup {
     pub loaded_line: String,
     /// Keeps a `.cbk`'s unpacked folder alive.
     pub guard: Option<tempfile::TempDir>,
+    /// The disk had a Mac driver and this backup did not keep it.
+    pub mac_driver_missing: bool,
 }
 
 impl LoadedBackup {
@@ -173,15 +179,20 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
                 } else {
                     pm.original_size_bytes
                 });
-            SizeRow::new(
+            let mut row = SizeRow::new(
                 pm.index,
                 pm.type_name.clone(),
                 pm.start_lba,
                 pm.original_size_bytes,
                 minimum,
-            )
+            );
+            row.facts = partition_head(folder, &metadata, pm).and_then(|head| {
+                VolumeFacts::from_head(&head, pm.partition_type_string.as_deref())
+            });
+            row
         })
         .collect();
+    let mac_driver_missing = mac_driver_missing(folder, &metadata);
     let loaded_line = format!(
         "Loaded backup: {} partition(s) from {}",
         metadata.partitions.len(),
@@ -194,7 +205,142 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
         rows,
         loaded_line,
         guard: None,
+        mac_driver_missing,
     })
+}
+
+/// A whole-disk CHD holds the driver itself; a per-partition backup needs the sidecar.
+fn mac_driver_missing(folder: &Path, metadata: &BackupMetadata) -> bool {
+    if metadata.partition_table_type != "APM" || metadata.layout == BackupLayout::SingleFileChd {
+        return false;
+    }
+    std::fs::File::open(folder.join("apm.json"))
+        .ok()
+        .and_then(|f| serde_json::from_reader(f).ok())
+        .is_some_and(|apm| crate::backup::apm_extras::driver_missing(folder, &apm))
+}
+
+/// The first [`HEAD_BYTES`] of a backed-up partition; `None` when they cannot be read.
+fn partition_head(
+    folder: &Path,
+    metadata: &BackupMetadata,
+    pm: &PartitionMetadata,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    if metadata.layout == BackupLayout::SingleFileChd {
+        let chd = folder.join(metadata.container.as_deref()?);
+        let mut reader = crate::rbformats::chd::ChdReader::open(&chd).ok()?;
+        reader.seek(SeekFrom::Start(pm.byte_offset())).ok()?;
+        reader.take(HEAD_BYTES as u64).read_to_end(&mut head).ok()?;
+    } else {
+        let members: Vec<PathBuf> = pm.compressed_files.iter().map(|f| folder.join(f)).collect();
+        crate::rbformats::decompress_members_to_writer(
+            &members,
+            &metadata.compression_type,
+            &mut head,
+            Some(HEAD_BYTES as u64),
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .ok()?;
+    }
+    Some(head)
+}
+
+/// One caveat, and the partition it concerns (1-based, as `inspect` numbers them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowCaveat {
+    pub position: Option<usize>,
+    pub caveat: Caveat,
+}
+
+impl RowCaveat {
+    /// "Partition 2: ..." for a view or the log.
+    pub fn line(&self) -> String {
+        let text = crate::model::fs_limits::line(&self.caveat);
+        match self.position {
+            Some(n) => format!("Partition {n}: {text}"),
+            None => text,
+        }
+    }
+}
+
+/// What a whole-disk restore of `loaded` at these sizes means for each volume.
+pub fn plan_caveats(
+    loaded: &LoadedBackup,
+    alignment: &RestoreAlignment,
+    sizes: &[RestorePartitionSize],
+    target_size: u64,
+    install_mac_driver: bool,
+) -> Vec<RowCaveat> {
+    // The layout is what knows how big Fill makes a row.
+    let layout = loaded
+        .metadata
+        .as_ref()
+        .filter(|_| target_size > 0)
+        .and_then(|m| {
+            crate::restore::calculate_restore_layout(m, alignment, sizes, target_size).ok()
+        });
+    let mut out = Vec::new();
+    if loaded.mac_driver_missing {
+        let text = if install_mac_driver {
+            format!(
+                "This backup did not keep the disk's Mac driver, so the bundled {} goes in its \
+                 place; it covers SCSI disks, and an IDE Mac needs its own",
+                crate::fs::mac_scsi_bless::BUILTIN_DRIVER_NAME
+            )
+        } else {
+            "This backup did not keep the disk's Mac driver and none will be added, so a Mac \
+             cannot start up from this disk"
+                .to_string()
+        };
+        out.push(RowCaveat {
+            position: None,
+            caveat: Caveat {
+                level: CaveatLevel::Warning,
+                text,
+            },
+        });
+    }
+    for (pos, row) in loaded.rows.iter().enumerate() {
+        let Some(facts) = row.facts else { continue };
+        let size = layout
+            .as_ref()
+            .and_then(|l| l.iter().find(|o| o.index == row.index))
+            .map_or_else(|| row.effective_size(), |o| o.export_size);
+        out.extend(caveats(&facts, size).into_iter().map(|caveat| RowCaveat {
+            position: Some(pos + 1),
+            caveat,
+        }));
+    }
+    out
+}
+
+/// What one volume means at `size`, for a single-partition or new-disk restore.
+pub fn volume_caveats(facts: Option<VolumeFacts>, size: u64) -> Vec<RowCaveat> {
+    facts
+        .map(|f| caveats(&f, size))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|caveat| RowCaveat {
+            position: None,
+            caveat,
+        })
+        .collect()
+}
+
+/// The facts of an image file used as a partition source.
+pub fn image_facts(path: &Path) -> Option<VolumeFacts> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    std::fs::File::open(path)
+        .ok()?
+        .take(HEAD_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    VolumeFacts::from_head(&head, None)
 }
 
 fn load_clonezilla(folder: &Path, cz_folder: &Path) -> Result<LoadedBackup, String> {
@@ -230,6 +376,7 @@ fn load_clonezilla(folder: &Path, cz_folder: &Path) -> Result<LoadedBackup, Stri
         rows,
         loaded_line,
         guard: None,
+        mac_driver_missing: false,
     })
 }
 

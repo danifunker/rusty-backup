@@ -57,7 +57,7 @@ rb-cli du  disk.dsk "/System Folder" --json   # recursive both-fork (data+resour
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
 rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
-rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs + .sit/.cpt/.hqx it finds
+rb-cli import disk.hda ./stuff /     # copy a whole host folder in; --expand-archives unpacks tarballs, .zip and .sit/.cpt/.hqx it finds
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli convert disk.scp ./out --format raw   # flux capture (.scp / .hfe / KryoFlux / .emu) -> decoded sector image
@@ -80,7 +80,9 @@ rb-cli optical new sgi-efs irix.iso --size auto --from-dir ./sgi-stuff \
 rb-cli optical new mac-hfs mac.iso --size 600M --name "My CD"     # classic Mac CD-ROM (APM + HFS)
 rb-cli optical new mac-hfsplus mac.iso --size auto --from-dir ./mac-stuff  # HFS+ (Mac OS 8.1+), filled
 rb-cli optical new mac-hfs mac.iso --size auto --from-dir ./mac-stuff \
-       --expand-archives     # unstuff every .sit/.cpt/.hqx onto the disc, forks intact
+       --expand-archives     # unstuff every .sit/.cpt/.hqx/.zip onto the disc, forks intact
+rb-cli optical new mac-hfs mac.iso --size auto --from-dir ./floppies \
+       --expand-images       # copy the files out of every .dsk/.img/.dmg/.hfv onto the disc
 rb-cli optical new next-ufs next.iso --size auto --from-dir ./next-stuff  # NeXTSTEP CD (NeXT label + 4.3BSD UFS)
 rb-cli optical new next-ufs next.iso --size auto --from-dir ./next-stuff \
        --expand-gunzip       # .tar.gz -> .tar, .gz -> plain file; tars and .pkg left intact
@@ -352,7 +354,13 @@ The app has five tabs:
 - **Restore** — pick a backup folder and a target device or image file.
   Partition sizes can be left at original, shrunk to the filesystem minimum,
   or set to a custom value; the filesystem is expanded in place when the
-  restored partition is larger than the minimum. Alignment (DOS/cylinder,
+  restored partition is larger than the minimum. A classic HFS volume too big
+  for its block size is rebuilt with bigger blocks, up to 4063 MB. The form
+  lists what each volume asks of the machine reading it, such as "FAT32 needs
+  Windows 95 OSR2 or later" and where a volume stops growing
+  ([docs/fs_limits.md](docs/fs_limits.md)). A Mac disk keeps its driver
+  partition; a backup from an older version that lost it gets the bundled
+  Apple SCSI driver 7.3.5 (`--no-mac-driver` leaves it out). Alignment (DOS/cylinder,
   1 MB, or custom) is preserved from the source by default. A top-level
   "Add free space for in-OS expansion" toggle pads the target image so
   the guest OS can extend partitions there after boot — see the *Disk
@@ -362,14 +370,29 @@ The app has five tabs:
   Rusty Backup can read works (raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and
   gzip- or zip-wrapped images are decoded on the way to the disk). The
   CLI equivalent is `rb-cli write IMAGE DEVICE [--partition N] --yes`.
-  A **Build Disk** mode goes the other way: pick a blank device or name a
-  new image file, choose a table type (MBR / GPT / APM / SGI volume header
-  / SGI disk label / X68000), lay out the partitions in the shared
-  partition editor, and
-  optionally assign a source image to each one. Applying writes the table
-  and pours every assigned image into its partition in a single pass. The
-  CLI equivalent is
-  `rb-cli new hd {mbr|gpt|apm|sgi|sgi-dklabel|x68k} IMG --size 2G --partition 512M:0C:DOS --partition rest --fill 1=dos.img`.
+- **Build Disk** — a wizard that makes a new disk from nothing: a partitioned
+  disk (MBR / GPT / APM / RDB / SGI volume header / SGI disk label / Sun /
+  NeXT / Solaris x86 / X68000 / Atari AHDI), one bare volume, or a bootable
+  preset (a Sharp X68000 Human68k disk, an SGI IRIX EFS disk), saved as an
+  image file or written straight to a physical disk such as an SD or CF card.
+  Each partition is formatted blank with any of the 39 filesystems Rusty
+  Backup can create, filled from a source image, or left empty; its type
+  follows the filesystem. A build can also start from an existing disk image's
+  layout at a new size, for example a bigger SGI disk from a small one: its
+  table, volume header or boot blocks and partitions come along (each copied,
+  formatted afresh or left empty), and the label is rewritten for the new
+  size. A partition can be marked bootable (MBR active,
+  RDB bootable). An Amiga RDB disk can carry its filesystem handlers (`L:PFS3`,
+  `L:SmartFilesystem`) so the ROM mounts PFS3 / SFS unaided. The wizard checks each filesystem's size limits and
+  label rules before it lets you go on, and a device build asks you to type
+  the device path first. An image file can be saved raw or encoded into VHD,
+  QCOW2, VMDK, CHD, 2MG, DiskCopy 4.2, WOZ or MOOF; the file name's extension
+  picks one. On a device every byte of a formatted partition is
+  written, so old data on a used card cannot show through. The CLI
+  equivalent is `rb-cli build`, for example
+  `rb-cli build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`,
+  or `rb-cli build /dev/sdX --table rdb --partition 500M --partition rest --format 1=pfs3:Work --format 2=sfs --yes`
+  for an SD card.
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox
@@ -508,8 +531,13 @@ The app has five tabs:
   scriptable counterpart. The same decoders back `--expand-archives` on
   `rb-cli import` and `optical new`, which unstuffs a folder's archives
   straight into the image — forks and Finder type/creator intact — instead
-  of copying them in packed. `--expand-gunzip` is the lighter option: it
-  strips only a gzip layer (`x.tar.gz` lands as `x.tar`).
+  of copying them in packed; a macOS-made `.zip` lands with the forks its
+  `__MACOSX` sidecars carry. `--expand-gunzip` is the lighter option: it
+  strips only a gzip layer (`x.tar.gz` lands as `x.tar`). `--expand-images`
+  copies the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+  `.hfv`, ...) instead of the image, one folder per image (a subfolder per
+  partition). MacBinary and AppleSingle files always land as real forked
+  files on an HFS / HFS+ target.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
 restore-tab partition list) use a shared **Size Mode** radio set
@@ -595,7 +623,7 @@ readable.
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically. An NTFS-compressed image's MFT is parsed as it streams in, not gathered into memory |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
-| BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
+| BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 4063 MB; past 2 GB needs System 7.5 or later) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images. Apple Twiggy / FileWare 871 KB prototype images (the recovered MacPaint 0.5 / early Finder disks, disk-format byte `0x54`) are auto-detected and de-interleaved into their MFS/HFS volume — the two sides are stored sequentially, so the volume is recovered by rotating the sector array onto its Master Directory Block. |
@@ -691,7 +719,7 @@ inspect-tab Edit Mode.
 | Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | Yes | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. fsck reconciles the FAT against the directory tree (the CBM VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy from the primary, and surfaces cross-linked clusters and broken chains read-only. |
 | CP/M (2.2 / 3 / Plus) | Yes | Yes | — | Yes | Amstrad CPC / PCW, Tatung Einstein, Spectravideo SV-328, MITS Altair, Grant Searle MultiComp, ZX Spectrum +3. Nine built-in disk-parameter blocks (DPBs); CP/M has no on-disk signature, so the format is chosen explicitly (`--fs-type cpm:<preset>`, or `rb-cli new floppy cpm --cpm-preset <name>` to format a blank disk). fsck is a directory self-consistency check (CP/M keeps no on-disk free map): it flags cross-linked blocks, out-of-range block pointers, and invalid directory entries (CP/M 3 disk-label / timestamp entries are recognized as valid); repair reclaims invalid entries — cross-links have no redundant metadata to recover from, so they are surfaced read-only. |
 | QDOS (QXL.WIN) | Yes | Yes | Yes (in-place resize) | — | Sinclair QL hard-disk container. Read + write + resize; the per-file 64-byte QDOS header is preserved. Microdrive `.mdv` is detect-only. |
-| AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. Volumes we write mount **Read/Write under a real Kickstart 3.1** (FS-UAE, `oracles/fsuae/affs_mount.py`) and are accepted by amitools' `xdftool`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
+| AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. Volumes we write mount **Read/Write under a real Kickstart 3.1** (FS-UAE, `oracles/fsuae/affs_mount.py`) and are accepted by amitools' `xdftool`. In-place resize relocates root + bitmap pages and writes `bm_ext` chains, so it has no size limit of its own; it refuses only when the new root block is in use. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | Yes (validate + repair) | Amiga PFS3 family. Create blank volumes with `rb-cli new volume pfs3`; a bare (RDB-less) PFS3 image is detected at sector 0 by its boot magic and routed to the driver by DosType. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. fsck walks the directory tree + anode chains and reconciles both the data and reserved allocation bitmaps (plus the free-block counters) against the walk, rebuilding them when the structure is intact — the classic "validation needed" after an unclean unmount. PFS3 has no block checksums, so structural damage is surfaced read-only rather than silently rewritten. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | Yes (validate + repair) | Amiga `SFS\0` / `SFS\2`. Create blank volumes with `rb-cli new volume sfs`. fsck validates every metadata-block checksum, walks the AdminSpaceContainer chain + object tree, and reconciles the single block bitmap against the walk, rebuilding it when the structure is intact. Repair touches only bitmap blocks, so it is safe regardless of btree depth. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Volumes we write pass **IRIX 6.5's own `fsck`** on all five phases, and IRIX mounts them and writes into them (R-039). Symbolic links are read **and written**, so `untar` restores an archive's links instead of dropping them. Aggressive shrink renumbers inodes into low CGs. Resizes move in whole cylinder groups (`fs_size == firstcg + ncg * cgfsize`, as `mkfs_efs` lays it out), so a target size rounds down to a group boundary. Files are read **and written** through indirect extents, up to EFS's 2 GiB per-file limit. |
@@ -786,8 +814,10 @@ On restore the EBR chain for logical partitions is rebuilt, like Clonezilla's ow
 - **HFS classic block-size expansion** ("Expand HFS Volume…") clones a
   source volume into a freshly formatted target with a larger allocation
   block size and a verified-bootable APM layout (DDR + APM map + driver
-  partitions + alt MDB). Useful when an old 2 GB classic-HFS volume runs
-  out of 16-bit block addresses.
+  partitions + alt MDB). Useful when a classic-HFS volume runs out of
+  16-bit block addresses. Classic HFS reaches 4063 MB here; past 2 GB it needs
+  System 7.5 or later. A full-size volume passes Disk First Aid on System 7.5.5
+  and Mac OS 8.1 on a Quadra 800 and on Mac OS 9.2.2, all under QEMU.
 - **SGI EFS / XFS**: EFS is fully read/write/resize. XFS gained a full
   edit + repair surface (R1-R8 repair pipeline; oracle-validated against
   `xfs_repair`) on the v4 format. Open XFS holes (multi-block leaf/node

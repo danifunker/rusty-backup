@@ -2633,7 +2633,7 @@ fn pick_btree_node_size(_target_bytes: u64) -> u16 {
 
 /// Largest B-tree file size the blank-volume builder will produce. With
 /// node_size=512, the header bitmap covers 2048 nodes (= 1 MiB) on its own;
-/// each appended map node extends this by 3952 nodes. We cap at 16 MiB —
+/// each appended map node extends this by 3936 nodes. We cap at 16 MiB —
 /// 32768 nodes — which is plenty for any real-world HFS catalog while
 /// staying well under HFS's 32-bit node-index space.
 pub const HFS_MAX_BTREE_FILE_SIZE: u32 = 16 * 1024 * 1024;
@@ -2964,17 +2964,56 @@ pub fn clone_target_btree_sizes(
     (catalog, extents)
 }
 
-/// Pick the smallest 512-byte-multiple allocation block size that keeps a
-/// volume of `volume_bytes` within HFS's 65535-block (`drNmAlBlks`) ceiling.
-pub fn pick_block_size(volume_bytes: u64) -> u32 {
-    let mut bs: u32 = 512;
-    while volume_bytes / bs as u64 > 65535 {
-        bs = bs.saturating_mul(2);
-        if bs == 0 {
-            return 1 << 16;
-        }
+/// Largest allocation block: System 7.5 bombs on 65536, the first size past 16 bits.
+pub const HFS_MAX_BLOCK_SIZE: u32 = 65024;
+
+/// The largest classic HFS volume we write: 65535 blocks of [`HFS_MAX_BLOCK_SIZE`], about 4 GB.
+pub const HFS_MAX_VOLUME_BYTES: u64 = 4063 * 1024 * 1024;
+
+/// What a volume of this size asks of Mac OS, for sizes past System 7's limit.
+pub fn mac_os_size_note(volume_bytes: u64) -> Option<&'static str> {
+    (volume_bytes >= 2 << 30).then_some(
+        "An HFS volume of 2 GB or more needs System 7.5 or later; System 7.1 won't mount it",
+    )
+}
+
+/// True if `new_size` is past what this classic HFS volume reaches in place, so only a rebuild gets there.
+pub fn hfs_outgrows_in_place(
+    device: &mut (impl Read + Seek),
+    partition_offset: u64,
+    new_size: u64,
+) -> bool {
+    let mut sector = [0u8; 512];
+    let read = device
+        .seek(SeekFrom::Start(partition_offset + 1024))
+        .and_then(|_| device.read_exact(&mut sector));
+    // A wrapper's real volume is the embedded HFS+ one, which a classic clone would lose.
+    if read.is_err() || BigEndian::read_u16(&sector[0x7C..0x7E]) == 0x482B {
+        return false;
     }
-    bs
+    // Less than a block past the limit is a remainder the resize rounds off, not growth.
+    let block_size = BigEndian::read_u32(&sector[20..24]) as u64;
+    hfs_max_growable_size(device, partition_offset).is_some_and(|max| new_size >= max + block_size)
+}
+
+/// Pick the smallest 512-byte-multiple allocation block size that keeps a volume
+/// of `volume_bytes` within HFS's 65535-block (`drNmAlBlks`) ceiling, as Apple's
+/// formatters do. Capped at [`HFS_MAX_BLOCK_SIZE`].
+pub fn pick_block_size(volume_bytes: u64) -> u32 {
+    // Boot blocks, MDB, a full bitmap, the alternate MDB and the last sector.
+    let allocatable = volume_bytes.saturating_sub((3 + 16) * 512 + 1024);
+    let sectors = allocatable.div_ceil(65535).div_ceil(512).max(1);
+    (sectors * 512).min(HFS_MAX_BLOCK_SIZE as u64) as u32
+}
+
+/// [`pick_block_size`] for a CD: a block divides or fills whole 2048-byte sectors, under the limit.
+pub fn pick_cd_block_size(volume_bytes: u64) -> u32 {
+    let bs = pick_block_size(volume_bytes);
+    if bs <= 2048 {
+        return bs.next_power_of_two();
+    }
+    bs.next_multiple_of(2048)
+        .min(HFS_MAX_BLOCK_SIZE / 2048 * 2048)
 }
 
 /// Variant of [`create_blank_hfs`] that lets the caller request minimum
@@ -3049,6 +3088,32 @@ pub fn write_blank_hfs_into<W: Write + Seek>(
     )
 }
 
+/// [`write_blank_hfs_into`] with B-tree size floors, the streaming twin of [`create_blank_hfs_sized`].
+pub fn write_blank_hfs_sized_into<W: Write + Seek>(
+    target: &mut W,
+    at_offset: u64,
+    target_size_bytes: u64,
+    block_size: u32,
+    volume_name: &str,
+    min_extents_bytes: u32,
+    min_catalog_bytes: u32,
+) -> Result<u64, FilesystemError> {
+    let (front, mdb, image_size) = build_blank_hfs_front(
+        target_size_bytes,
+        block_size,
+        volume_name,
+        min_extents_bytes,
+        min_catalog_bytes,
+        hfs_common::hfs_now(),
+    )?;
+    target.seek(SeekFrom::Start(at_offset))?;
+    target.write_all(&front)?;
+    target.seek(SeekFrom::Start(at_offset + image_size - 1024))?;
+    target.write_all(&mdb)?;
+    target.write_all(&[0u8; 512])?;
+    Ok(image_size)
+}
+
 /// [`write_blank_hfs_into`] with the volume dates fixed at `now`.
 pub(crate) fn write_blank_hfs_into_at<W: Write + Seek>(
     target: &mut W,
@@ -3112,17 +3177,17 @@ fn build_blank_hfs_front(
                 "HFS volume too small for block_size {block_size}"
             )));
         }
-        if tb > 65535 {
-            return Err(FilesystemError::InvalidData(format!(
-                "HFS would have {tb} allocation blocks at block_size {block_size}, exceeding u16 ceiling 65535"
-            )));
-        }
-        let tb = tb as u32;
-        let bitmap_bytes = (tb as u64).div_ceil(8);
+        // The count only settles once the bitmap has its full size, so judge it then.
+        let bitmap_bytes = tb.min(65535).div_ceil(8);
         let bitmap_sectors = bitmap_bytes.div_ceil(512) as u16;
         let needed = 3u16 + bitmap_sectors;
         if needed <= first_alloc_block {
-            total_blocks = tb;
+            if tb > 65535 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "HFS would have {tb} allocation blocks at block_size {block_size}, exceeding u16 ceiling 65535"
+                )));
+            }
+            total_blocks = tb as u32;
             break;
         }
         first_alloc_block = needed;
@@ -4625,8 +4690,9 @@ pub fn fit_hfs_volume_to_partition(
     if block_size == 0 || volume_len >= partition_len {
         return Ok(false);
     }
+    // A remainder shorter than a block is fine, as long as the alternate MDB follows it.
     let growable = hfs_max_growable_size(device, partition_offset).unwrap_or(0);
-    if growable < partition_len {
+    if growable + block_size <= partition_len {
         log(&format!(
             "Warning: the HFS volume ({volume_len} bytes) does not fill its {partition_len}-byte \
              partition and its volume bitmap cannot address more blocks; Disk First Aid will \
@@ -4841,6 +4907,34 @@ mod tests {
     /// The streaming and in-memory blank formatters must agree byte for byte —
     /// the streaming one only skips writing the free middle, which reads back
     /// as zeros from a `set_len`'d file.
+    /// Blocks are any multiple of 512, and never 65536, which bombs System 7.5.
+    #[test]
+    fn pick_block_size_stays_under_the_system_75_limit() {
+        assert_eq!(pick_block_size(10 * 1024 * 1024), 512);
+        assert_eq!(pick_block_size(2200 * 1024 * 1024), 35328);
+        assert_eq!(pick_block_size(HFS_MAX_VOLUME_BYTES), HFS_MAX_BLOCK_SIZE);
+        assert_eq!(pick_cd_block_size(650 * 1024 * 1024), 12288);
+        assert_eq!(pick_cd_block_size(HFS_MAX_VOLUME_BYTES), 63488);
+        let front = (3 + 16) * 512 + 1024;
+        assert!((HFS_MAX_VOLUME_BYTES - front) / HFS_MAX_BLOCK_SIZE as u64 <= 65535);
+    }
+
+    /// A volume at 65535 blocks still fits a partition that ends less than a block past it.
+    #[test]
+    fn fit_moves_the_alternate_mdb_past_a_short_remainder() {
+        let bs = 8192u32;
+        let size = 65535u64 * bs as u64 + 19 * 512 + 1024;
+        let mut file = tempfile::tempfile().unwrap();
+        let len = write_blank_hfs_into(&mut file, 0, size, bs, "Full").unwrap();
+        let part = len + 4096;
+        file.set_len(part).unwrap();
+        assert!(fit_hfs_volume_to_partition(&mut file, 0, part, &mut |_| {}).unwrap());
+        file.seek(SeekFrom::Start(part - 1024)).unwrap();
+        let mut sig = [0u8; 2];
+        file.read_exact(&mut sig).unwrap();
+        assert_eq!(BigEndian::read_u16(&sig), HFS_SIGNATURE);
+    }
+
     #[test]
     fn write_blank_hfs_into_matches_create_blank_hfs() {
         let (size, bs) = (8 * 1024 * 1024u64, 4096u32);
@@ -5130,6 +5224,18 @@ mod tests {
         img[byte] &= !(0x80 >> (tail % 8));
         resize_hfs_in_place(&mut Cursor::new(&mut img), 0, SIZE / 2, &mut |_| {})
             .expect("with the tail free the shrink goes through");
+    }
+
+    /// R-085: a partition under one block past the volume's limit needs no rebuild.
+    #[test]
+    fn a_remainder_under_one_block_is_not_outgrowing() {
+        const SIZE: u64 = 8 * 1024 * 1024;
+        let img = create_blank_hfs(SIZE, 1024, "T").unwrap();
+        let mut disk = Cursor::new(img);
+        let max = hfs_max_growable_size(&mut disk, 0).unwrap();
+        assert!(!hfs_outgrows_in_place(&mut disk, 0, max));
+        assert!(!hfs_outgrows_in_place(&mut disk, 0, max + 1023));
+        assert!(hfs_outgrows_in_place(&mut disk, 0, max + 1024));
     }
 
     /// R-078: the minimum size left no room for the alternate MDB, so a shrink to it cut the last block.
@@ -7377,7 +7483,7 @@ mod tests {
     #[test]
     fn test_create_blank_hfs_with_map_nodes() {
         // Request a 2 MiB catalog (4096 nodes at node_size=512). This needs
-        // ceil((4096-2048)/3952) = 1 map node.
+        // ceil((4096-2048)/3936) = 1 map node.
         let img =
             create_blank_hfs_sized(64 * 1024 * 1024, 32 * 1024, "MapNodes", 0, 2 * 1024 * 1024)
                 .expect("create_blank_hfs_sized 2 MiB cat");
@@ -7405,7 +7511,7 @@ mod tests {
         assert_eq!(header.free_nodes, 4093);
 
         // Walk the segment iterator — should yield 2 segments covering
-        // 256 + 494 = 750 bytes = 6000 bits ≥ 4096 nodes.
+        // 256 + 492 = 748 bytes = 5984 bits ≥ 4096 nodes.
         let segs = hfs_common::btree_bitmap_segments(&cat, 512);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].base_bit, 0);
@@ -7882,5 +7988,25 @@ mod tests {
             "fsck errors: {:?}",
             result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn sized_streaming_matches_in_memory() {
+        // The dates come from the clock, so a pair built across a second boundary is redone.
+        for _ in 0..5 {
+            let t0 = hfs_common::hfs_now();
+            let mem = create_blank_hfs_sized(20 << 20, 1024, "Vol", 64 << 10, 128 << 10).unwrap();
+            let mut cur = std::io::Cursor::new(vec![0u8; 20 << 20]);
+            let len =
+                write_blank_hfs_sized_into(&mut cur, 0, 20 << 20, 1024, "Vol", 64 << 10, 128 << 10)
+                    .unwrap();
+            if hfs_common::hfs_now() != t0 {
+                continue;
+            }
+            assert_eq!(len as usize, mem.len());
+            assert!(cur.get_ref()[..mem.len()] == mem[..]);
+            return;
+        }
+        panic!("the clock ticked during every attempt");
     }
 }

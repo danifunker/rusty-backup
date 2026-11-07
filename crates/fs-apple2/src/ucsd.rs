@@ -365,6 +365,21 @@ fn sanitize_volume_name(name: &str) -> String {
 /// Apple II / PC convention): zeroed boot + a volume label at block 2 with an
 /// empty directory. Returns the raw image.
 pub fn create_blank_ucsd(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let mut img = vec![0u8; size_bytes.min(u16::MAX as u64 * BLOCK) as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_ucsd_into(&mut cur, 0, size_bytes, name)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_ucsd`]: writes the directory at `at_offset`, and
+/// returns the volume's length.
+pub fn write_blank_ucsd_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    name: &str,
+) -> Result<u64, FilesystemError> {
     let blocks = size_bytes / BLOCK;
     if blocks <= DIR_END as u64 {
         return Err(FilesystemError::Unsupported(
@@ -377,9 +392,8 @@ pub fn create_blank_ucsd(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesys
         ));
     }
     let vname = sanitize_volume_name(name);
-    let mut img = vec![0u8; (blocks * BLOCK) as usize];
-    let base = (DIR_BLOCK * BLOCK) as usize;
-    let d = &mut img[base..base + (DIR_BLOCKS * BLOCK) as usize];
+    let mut dir = vec![0u8; (DIR_BLOCKS * BLOCK) as usize];
+    let d = dir.as_mut_slice();
     write_u16(d, 0, 0, true); // FIRSTBLK
     write_u16(d, 2, DIR_END, true); // DLASTBLK = 6
     write_u16(d, 4, 0, true); // kind = untyped
@@ -387,7 +401,9 @@ pub fn create_blank_ucsd(size_bytes: u64, name: &str) -> Result<Vec<u8>, Filesys
     write_u16(d, 14, blocks as u16, true); // DEOVBLK
     write_u16(d, 16, 0, true); // DNUMFILES
     write_u16(d, 20, 0, true); // DLASTBOOT date
-    Ok(img)
+    w.seek(SeekFrom::Start(at_offset + DIR_BLOCK * BLOCK))?;
+    w.write_all(&dir)?;
+    Ok(blocks * BLOCK)
 }
 
 fn write_u16(buf: &mut [u8], off: usize, val: u16, little: bool) {
@@ -846,6 +862,44 @@ pub fn repair_ucsd<R: Read + Write + Seek>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    fn old_create_blank_ucsd(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+        let blocks = size_bytes / BLOCK;
+        if blocks <= DIR_END as u64 {
+            return Err(FilesystemError::Unsupported(
+                "UCSD volume too small (needs more than 6 blocks)".into(),
+            ));
+        }
+        if blocks > u16::MAX as u64 {
+            return Err(FilesystemError::Unsupported(
+                "UCSD volume too large (max 65535 blocks / 32 MiB)".into(),
+            ));
+        }
+        let vname = sanitize_volume_name(name);
+        let mut img = vec![0u8; (blocks * BLOCK) as usize];
+        let base = (DIR_BLOCK * BLOCK) as usize;
+        let d = &mut img[base..base + (DIR_BLOCKS * BLOCK) as usize];
+        write_u16(d, 0, 0, true); // FIRSTBLK
+        write_u16(d, 2, DIR_END, true); // DLASTBLK = 6
+        write_u16(d, 4, 0, true); // kind = untyped
+        write_name(d, 6, &vname, 7);
+        write_u16(d, 14, blocks as u16, true); // DEOVBLK
+        write_u16(d, 16, 0, true); // DNUMFILES
+        write_u16(d, 20, 0, true); // DLASTBOOT date
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for kib in [4u64, 140, 800, 32_000] {
+            let old = old_create_blank_ucsd(kib * 1024, "PAS").unwrap();
+            assert!(
+                old == create_blank_ucsd(kib * 1024, "PAS").unwrap(),
+                "{kib} KiB"
+            );
+        }
+    }
     use super::*;
     use std::io::Cursor;
     use std::path::PathBuf;

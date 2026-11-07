@@ -1,4 +1,4 @@
-//! Starting and running: the confirmations, the restore jobs of each mode, and the disk build.
+//! Starting and running: the confirmations and the restore jobs of each mode.
 
 use std::sync::{Arc, Mutex};
 
@@ -7,12 +7,12 @@ use super::{
     path_label, purpose, push_log, RestoreBar, RestoreController, RestoreMode, SizeMode, TargetSlot,
 };
 use crate::controller::log::LogLevel;
-use crate::controller::{ConfirmSpec, Effect, TextSpec};
-use crate::model::job::{Job, Snapshot};
+use crate::controller::{ConfirmSpec, Effect};
+use crate::model::job::Job;
 use crate::restore::RestoreProgress;
 use disk_core::display::format_size;
 
-/// What a finished restore or build returns: `Err` carries the engine's message.
+/// What a finished restore returns: `Err` carries the engine's message.
 type RunOutcome = Result<(), String>;
 
 /// The engine call a restore job makes with its shared progress.
@@ -22,19 +22,11 @@ type RestoreBody = Box<dyn FnOnce(Arc<Mutex<RestoreProgress>>) -> anyhow::Result
 pub(super) struct RunState {
     running: Option<(Job<RunOutcome>, Arc<Mutex<RestoreProgress>>)>,
     pub last: Option<RunOutcome>,
-    build: Option<Job<RunOutcome>>,
-    /// The finished build's last snapshot, for its bar.
-    build_done: Option<Snapshot>,
-    pub build_last: Option<RunOutcome>,
 }
 
 impl RunState {
     pub fn running(&self) -> bool {
         self.running.is_some()
-    }
-
-    pub fn building(&self) -> bool {
-        self.build.is_some()
     }
 
     pub fn bar(&self) -> Option<RestoreBar> {
@@ -45,28 +37,6 @@ impl RunState {
             current_bytes: p.current_bytes,
             total_bytes: p.total_bytes,
         })
-    }
-
-    pub fn build_snapshot(&self) -> Option<Snapshot> {
-        match &self.build {
-            Some(job) => Some(job.snapshot()),
-            None => self.build_done.clone(),
-        }
-    }
-
-    pub fn cancel_build(&self) {
-        if let Some(job) = &self.build {
-            job.cancel();
-        }
-    }
-}
-
-/// The Build Disk confirmation's rule: the answer must be the device's name.
-fn device_name_typed(spec: &TextSpec, text: &str) -> Result<(), String> {
-    if spec.taken.first().map(|s| s.as_str()) == Some(text) {
-        Ok(())
-    } else {
-        Err(String::new())
     }
 }
 
@@ -86,7 +56,7 @@ impl RestoreController {
             RestoreMode::FullDisk => (self.full_disk_question(), "Confirm Restore"),
             RestoreMode::SinglePartition => (self.single_question(), "Confirm Restore"),
             RestoreMode::NewDisk => (self.new_disk_question(), "Confirm Restore"),
-            RestoreMode::WriteImage | RestoreMode::BuildDisk => return Vec::new(),
+            RestoreMode::WriteImage => return Vec::new(),
         };
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::RESTORE,
@@ -186,7 +156,7 @@ impl RestoreController {
             RestoreMode::FullDisk => self.start_full_disk(),
             RestoreMode::SinglePartition => self.start_single(),
             RestoreMode::NewDisk => self.start_new_disk(),
-            RestoreMode::WriteImage | RestoreMode::BuildDisk => {}
+            RestoreMode::WriteImage => {}
         }
     }
 
@@ -222,6 +192,7 @@ impl RestoreController {
             alignment: self.resolved_alignment(),
             partition_sizes: self.partition_sizes(target_is_device),
             write_zeros_to_unused: false,
+            install_mac_driver: self.targets.install_mac_driver,
         };
         self.info(format!("Starting restore to {}", target_path.display()));
         self.spawn_restore(
@@ -253,6 +224,7 @@ impl RestoreController {
             alignment: self.resolved_alignment(),
             partition_sizes: self.partition_sizes(is_device),
             write_zeros_to_unused: false,
+            install_mac_driver: self.targets.install_mac_driver,
         };
         self.info(format!("Starting restore to {display}"));
         self.spawn_restore(
@@ -404,7 +376,6 @@ impl RestoreController {
     }
 
     pub(super) fn poll_run(&mut self) {
-        self.poll_build();
         let Some(done) = self.run.running.as_ref().and_then(|(j, _)| finished(j)) else {
             return;
         };
@@ -423,138 +394,5 @@ impl RestoreController {
         if self.src.load_deferred {
             self.start_load();
         }
-    }
-
-    // --- Build Disk ---------------------------------------------------------------------
-
-    /// The plan's Apply: an image target builds now; erasing a device asks for its name first.
-    pub(super) fn build_apply(&mut self) -> Vec<Effect> {
-        if self.run.building() {
-            return Vec::new();
-        }
-        // Create Disk validates first; the window shows why it refused.
-        let valid = self
-            .targets
-            .builder
-            .as_mut()
-            .is_some_and(|b| b.validate().is_some());
-        if !valid {
-            return Vec::new();
-        }
-        if !self.targets.build.is_device {
-            self.start_build();
-            return Vec::new();
-        }
-        let Some(device) = self.device(TargetSlot::BuildDisk) else {
-            self.error("No target selected");
-            return Vec::new();
-        };
-        let name = device.display_name();
-        let table = self
-            .targets
-            .builder
-            .as_ref()
-            .map(|b| b.kind.label())
-            .unwrap_or("?");
-        vec![Effect::AskText(TextSpec {
-            purpose: purpose::BUILD,
-            title: "Confirm Build".to_string(),
-            prompt: format!(
-                "A new {table} partition table will be written to {name}, destroying \
-                 everything on it!\nConfirm: type the device name `{name}` to enable the build"
-            ),
-            initial: String::new(),
-            ok_label: "I understand, proceed".to_string(),
-            unchanged: String::new(),
-            taken: vec![name],
-            fold_case: false,
-            forbidden: String::new(),
-            error: None,
-            validator: device_name_typed,
-        })]
-    }
-
-    /// The typed device name came back: check it again, then build.
-    pub(super) fn build_answered(&mut self, text: &str) -> Vec<Effect> {
-        let name = self
-            .device(TargetSlot::BuildDisk)
-            .map(|d| d.display_name())
-            .unwrap_or_default();
-        if name.is_empty() || text != name.as_str() {
-            self.warn("The typed name does not match the device; nothing was written.");
-            return Vec::new();
-        }
-        self.start_build();
-        Vec::new()
-    }
-
-    fn start_build(&mut self) {
-        let Some((target_path, target_size)) = self.build_target() else {
-            self.error("No target selected");
-            return;
-        };
-        let Some(builder) = self.targets.builder.as_mut() else {
-            return;
-        };
-        let Some(placed) = builder.validate() else {
-            self.error("Partition layout is not valid; fix the errors and try again");
-            return;
-        };
-        let req = crate::model::provision_runner::ProvisionRequest {
-            target_path: target_path.clone(),
-            target_size_bytes: target_size,
-            kind: builder.kind,
-            geometry: builder.geometry,
-            partitions: placed,
-            sources: builder.sources(),
-        };
-        let kind = builder.kind;
-        self.info(format!(
-            "Building a {} disk on {} ({})",
-            kind.label(),
-            target_path.display(),
-            format_size(target_size),
-        ));
-        self.targets.builder = None;
-        let sink = Arc::clone(&self.log);
-        self.run.build_done = None;
-        self.run.build_last = None;
-        self.run.build = Some(self.spawn("Building disk", move |ctx| {
-            ctx.set_phase("Writing the partition table...");
-            let status = crate::model::provision_runner::start_provision(req);
-            let mut logged = 0;
-            crate::model::worker::wait_spawned(ctx, &status, |s, ctx| {
-                for msg in s.log_messages.iter().skip(logged) {
-                    push_log(&sink, LogLevel::Info, msg.as_str());
-                }
-                logged = s.log_messages.len();
-                if s.total_bytes > 0 {
-                    ctx.set_phase("Building disk");
-                    ctx.set_bytes(s.current_bytes, s.total_bytes);
-                }
-                if ctx.is_cancelled() {
-                    s.cancel_requested = true;
-                }
-                s.finished
-            });
-            let err = crate::model::worker::lock_status(&*status).error.clone();
-            Ok(match err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            })
-        }));
-    }
-
-    fn poll_build(&mut self) {
-        let Some(done) = self.run.build.as_ref().and_then(finished) else {
-            return;
-        };
-        self.run.build_done = self.run.build.take().map(|j| j.snapshot());
-        let outcome = done.and_then(|inner| inner);
-        match &outcome {
-            Ok(()) => self.info("Disk build complete"),
-            Err(e) => self.error(format!("Disk build failed: {e}")),
-        }
-        self.run.build_last = Some(outcome);
     }
 }

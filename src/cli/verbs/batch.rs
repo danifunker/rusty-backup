@@ -19,12 +19,14 @@ use crate::fs::entry::FileEntryTypeDisplay as _;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::cli::img_at::{ImageRef, PartSelector};
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::resolve_partition_rw;
+use crate::model::format::{FormatOptions, FsKind, Window};
 use disk_core::filesystem::{CreateDirectoryOptions, CreateFileOptions};
 
 #[derive(Debug, Args)]
@@ -563,63 +565,110 @@ fn apply_format_op(path: &std::path::Path, op: &FormatOp) -> Result<()> {
     if pt_kind != "none" && pt_kind != "mbr" {
         bail!("unsupported partition_table {pt_kind:?}; only 'none' or 'mbr' for now");
     }
-    let mut fs_bytes = build_blank_fs(&op.fs, size, name, op.block_size, op.affs_variant)?;
-    if pt_kind == "mbr" {
-        if op.fs != "fat" {
-            bail!("partition_table = 'mbr' currently requires fs = 'fat'");
-        }
-        let (mbr, total) = single_partition_mbr(&mut fs_bytes, fat_type_byte_for(size))?;
-        let at = u64::from(MBR_ALIGN_SECTORS) * 512;
-        crate::compat::write_sparse_parts(path, &[(0, &mbr), (at, &fs_bytes)], total)
-    } else {
-        crate::compat::write_sparse(path, &fs_bytes)
+    let (kind, opts) = format_request(op.fs.as_str(), name, op.block_size, op.affs_variant)?;
+    if pt_kind != "mbr" {
+        crate::model::format::format_to_file(path, size, kind, &opts)?;
+        return Ok(());
     }
-    .with_context(|| format!("writing {}", path.display()))
+    if op.fs != "fat" {
+        bail!("partition_table = 'mbr' currently requires fs = 'fat'");
+    }
+    write_new_image(path, |file| {
+        let len = format_at(file, MBR_ALIGN_SECTORS, size, kind, &opts)?;
+        let (mbr, total) = single_partition_mbr(len, fat_type_byte_for(size))?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&mbr)?;
+        file.set_len(total)?;
+        Ok(())
+    })
 }
 
-/// Dispatch to the right per-FS `create_blank_*` based on the JSON `fs` string.
-fn build_blank_fs(
-    fs: &str,
+/// Build a new image at `path` with `body`, leaving no partial file behind on failure.
+fn write_new_image(
+    path: &std::path::Path,
+    body: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    let result = body(&mut file).and_then(|()| file.sync_all().map_err(Into::into));
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result.with_context(|| format!("writing {}", path.display()))
+}
+
+/// Format a volume at `lba` in `file`, streaming, and point a FAT boot sector's hidden-sector
+/// field at it. Returns the volume's length.
+fn format_at(
+    file: &mut std::fs::File,
+    lba: u32,
     size: u64,
+    kind: FsKind,
+    opts: &FormatOptions,
+) -> Result<u64> {
+    let at = u64::from(lba) * 512;
+    let done = {
+        let mut w = Window::new(file, at, size);
+        crate::model::format::format_into(&mut w, size, kind, opts)?
+    };
+    if kind == FsKind::Fat {
+        let mut jump = [0u8; 1];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut jump)?;
+        if jump[0] == 0xEB || jump[0] == 0xE9 {
+            file.seek(SeekFrom::Start(at + 28))?;
+            file.write_all(&lba.to_le_bytes())?;
+        }
+    }
+    Ok(done.len)
+}
+
+/// The filesystem and options the JSON `fs` string names.
+fn format_request(
+    fs: &str,
     name: &str,
     block_size: Option<u32>,
     affs_variant: Option<u8>,
-) -> Result<Vec<u8>> {
-    match fs {
-        "fat" => fs_pc::fat::create_blank_fat(size, Some(name)),
-        "efs" => fs_unix::efs::create_blank_efs(size, name),
-        "xfs" => fs_xfs::xfs::format::create_blank_xfs(size, name)
-            .map_err(|e| anyhow!("create_blank_xfs: {e}")),
-        "affs" => fs_amiga::affs::create_blank_affs(size, affs_variant.unwrap_or(1), name),
+) -> Result<(FsKind, FormatOptions)> {
+    let mut opts = FormatOptions {
+        label: name.to_string(),
+        ..FormatOptions::default()
+    };
+    let kind = match fs {
+        "fat" => FsKind::Fat,
+        "efs" => FsKind::Efs,
+        "xfs" => FsKind::Xfs,
+        "affs" => {
+            opts.affs_variant = affs_variant.unwrap_or(1);
+            FsKind::Affs
+        }
         "hfs" => {
-            let bs = block_size.unwrap_or_else(|| crate::cli::parse::pick_block_size(size));
-            fs_mac::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
-                .map_err(|e| anyhow!("create_blank_hfs_sized: {e}"))
+            opts.block_size = block_size;
+            // The B-trees take the formatter's floor here, not the volume-scaled default.
+            opts.catalog_bytes = Some(0);
+            opts.extents_bytes = Some(0);
+            FsKind::Hfs
         }
-        "ext" | "ext2" => fs_unix::ext_format::create_blank_ext2(size, name)
-            .map_err(|e| anyhow!("create_blank_ext2: {e}")),
-        "ext3" => fs_unix::ext_format::create_blank_ext3(size, name)
-            .map_err(|e| anyhow!("create_blank_ext3: {e}")),
-        "ext4" => fs_unix::ext_format::create_blank_ext4(size, name)
-            .map_err(|e| anyhow!("create_blank_ext4: {e}")),
-        "minix" | "minix1" => {
-            fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V1)
-                .map_err(|e| anyhow!("create_blank_minix: {e}"))
-        }
-        "minix2" => fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V2)
-            .map_err(|e| anyhow!("create_blank_minix: {e}")),
-        "minix3" => fs_unix::minix::create_blank_minix(size, fs_unix::minix::MinixVersion::V3)
-            .map_err(|e| anyhow!("create_blank_minix: {e}")),
-        "ucsd" | "pascal" => fs_apple2::ucsd::create_blank_ucsd(size, name)
-            .map_err(|e| anyhow!("create_blank_ucsd: {e}")),
-        "trdos" | "beta" => fs_8bit::trdos::create_blank_trdos(size, name)
-            .map_err(|e| anyhow!("create_blank_trdos: {e}")),
-        "ti99" => fs_8bit::ti99::create_blank_ti99(size, name)
-            .map_err(|e| anyhow!("create_blank_ti99: {e}")),
+        "ext" | "ext2" => FsKind::Ext,
+        "ext3" => FsKind::Ext3,
+        "ext4" => FsKind::Ext4,
+        "minix" | "minix1" => FsKind::Minix,
+        "minix2" => FsKind::Minix2,
+        "minix3" => FsKind::Minix3,
+        "ucsd" | "pascal" => FsKind::Ucsd,
+        "trdos" | "beta" => FsKind::Trdos,
+        "ti99" => FsKind::Ti99,
         other => {
             bail!("unsupported fs {other:?}; expected one of fat, efs, xfs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
         }
-    }
+    };
+    Ok((kind, opts))
 }
 
 /// MBR partition type byte for the FAT `create_blank_fat` actually produces at
@@ -646,13 +695,10 @@ const MBR_ALIGN_SECTORS: u32 = 2048; // 1 MiB at 512-byte sectors
 
 /// The MBR sector for one FAT partition at 1 MiB, and the whole disk's length; patches `fs`'s
 /// hidden-sectors field in place so the volume is never copied.
-fn single_partition_mbr(fs: &mut [u8], type_byte: u8) -> Result<([u8; 512], u64)> {
-    let fs_sectors = fs.len().div_ceil(512);
-    if fs_sectors as u64 > u32::MAX as u64 - MBR_ALIGN_SECTORS as u64 {
+fn single_partition_mbr(fs_len: u64, type_byte: u8) -> Result<([u8; 512], u64)> {
+    let fs_sectors = fs_len.div_ceil(512);
+    if fs_sectors > u32::MAX as u64 - MBR_ALIGN_SECTORS as u64 {
         bail!("filesystem too large for an MBR wrapper");
-    }
-    if fs.len() >= 32 && (fs[0] == 0xEB || fs[0] == 0xE9) {
-        fs[28..32].copy_from_slice(&MBR_ALIGN_SECTORS.to_le_bytes());
     }
     let mbr = part_tables::mbr::build_minimal_mbr(
         0xDEADBEEF,
@@ -660,7 +706,7 @@ fn single_partition_mbr(fs: &mut [u8], type_byte: u8) -> Result<([u8; 512], u64)
         16,
         63,
     );
-    let total = (u64::from(MBR_ALIGN_SECTORS) + fs_sectors as u64) * 512;
+    let total = (u64::from(MBR_ALIGN_SECTORS) + fs_sectors) * 512;
     Ok((mbr, total))
 }
 
@@ -685,51 +731,42 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
     }
 
     const ALIGN_SECTORS: u32 = 2048;
-    let mut entries: Vec<(u8, u32, u32, bool)> = Vec::new();
-    let mut sections: Vec<(u32, Vec<u8>)> = Vec::new();
-    let mut cursor_lba: u32 = ALIGN_SECTORS;
-    for p in &disk.partitions {
-        let size = crate::cli::parse::parse_size(&p.size)
-            .with_context(|| format!("parsing disk.partitions[].size {:?}", p.size))?;
-        let name = p.name.as_deref().unwrap_or("rusty-backup");
-        let fs_bytes = build_blank_fs(&p.fs, size, name, p.block_size, p.affs_variant)?;
-        let fs_sectors_u64 = (fs_bytes.len() as u64).div_ceil(512);
-        if fs_sectors_u64 > u32::MAX as u64 {
-            bail!("partition too large for 32-bit LBA");
+    write_new_image(path, |file| {
+        let mut entries: Vec<(u8, u32, u32, bool)> = Vec::new();
+        let mut cursor_lba: u32 = ALIGN_SECTORS;
+        for p in &disk.partitions {
+            let size = crate::cli::parse::parse_size(&p.size)
+                .with_context(|| format!("parsing disk.partitions[].size {:?}", p.size))?;
+            let name = p.name.as_deref().unwrap_or("rusty-backup");
+            let (kind, opts) = format_request(p.fs.as_str(), name, p.block_size, p.affs_variant)?;
+            let type_byte = match p.fs.as_str() {
+                "fat" => fat_type_byte_for(size),
+                "efs" => 0x83, // Linux native; close enough — IRIX uses its own SGI table normally
+                "xfs" => 0x83, // what Linux itself uses for XFS on an MBR disk
+                "affs" => 0x83,
+                "hfs" => 0xAF,                                    // Apple HFS
+                "minix" | "minix1" | "minix2" | "minix3" => 0x81, // Minix
+                other => bail!("unsupported fs in disk.partitions: {other:?}"),
+            };
+            let len = format_at(file, cursor_lba, size, kind, &opts)?;
+            let fs_sectors_u64 = len.div_ceil(512);
+            if fs_sectors_u64 > u32::MAX as u64 {
+                bail!("partition too large for 32-bit LBA");
+            }
+            let fs_sectors = fs_sectors_u64 as u32;
+            entries.push((type_byte, cursor_lba, fs_sectors, p.bootable));
+            cursor_lba = cursor_lba
+                .checked_add(fs_sectors)
+                .ok_or_else(|| anyhow!("partition layout overflowed u32 LBA"))?;
+            // 1-MiB alignment between partitions.
+            cursor_lba = cursor_lba.div_ceil(ALIGN_SECTORS) * ALIGN_SECTORS;
         }
-        let fs_sectors = fs_sectors_u64 as u32;
-        let mut patched = fs_bytes;
-        if p.fs == "fat" && patched.len() >= 32 && (patched[0] == 0xEB || patched[0] == 0xE9) {
-            patched[28..32].copy_from_slice(&cursor_lba.to_le_bytes());
-        }
-        let type_byte = match p.fs.as_str() {
-            "fat" => fat_type_byte_for(size),
-            "efs" => 0x83, // Linux native; close enough — IRIX uses its own SGI table normally
-            "xfs" => 0x83, // what Linux itself uses for XFS on an MBR disk
-            "affs" => 0x83,
-            "hfs" => 0xAF,                                    // Apple HFS
-            "minix" | "minix1" | "minix2" | "minix3" => 0x81, // Minix
-            other => bail!("unsupported fs in disk.partitions: {other:?}"),
-        };
-        entries.push((type_byte, cursor_lba, fs_sectors, p.bootable));
-        sections.push((cursor_lba, patched));
-        cursor_lba = cursor_lba
-            .checked_add(fs_sectors)
-            .ok_or_else(|| anyhow!("partition layout overflowed u32 LBA"))?;
-        // 1-MiB alignment between partitions.
-        cursor_lba = cursor_lba.div_ceil(ALIGN_SECTORS) * ALIGN_SECTORS;
-    }
-
-    let mbr = part_tables::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
-    // Pieces go straight to their offsets; assembling a whole-disk buffer touched every page.
-    let mut parts: Vec<(u64, &[u8])> = vec![(0, &mbr)];
-    parts.extend(
-        sections
-            .iter()
-            .map(|(lba, b)| (u64::from(*lba) * 512, b.as_slice())),
-    );
-    crate::compat::write_sparse_parts(path, &parts, u64::from(cursor_lba) * 512)
-        .with_context(|| format!("writing {}", path.display()))
+        let mbr = part_tables::mbr::build_minimal_mbr(0xDEADBEEF, &entries, 16, 63);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&mbr)?;
+        file.set_len(u64::from(cursor_lba) * 512)?;
+        Ok(())
+    })
 }
 
 fn apply_op(

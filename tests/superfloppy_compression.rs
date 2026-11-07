@@ -91,6 +91,7 @@ fn round_trip(
             alignment: RestoreAlignment::Original,
             partition_sizes: Vec::new(),
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         },
         Arc::new(Mutex::new(RestoreProgress::default())),
     )
@@ -222,6 +223,7 @@ fn superfloppy_chd_is_one_whole_disk_container() {
             alignment: RestoreAlignment::Original,
             partition_sizes: Vec::new(),
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         },
         Arc::new(Mutex::new(RestoreProgress::default())),
     )

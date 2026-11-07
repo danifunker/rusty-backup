@@ -304,6 +304,41 @@ pub struct CloneReport {
     pub errors: Vec<(String, String)>,
 }
 
+/// Format a blank `target_size` HFS volume at `at_offset` in `target` and replay `source` onto it.
+/// Returns the volume's length. The B-trees take the blank default as a floor, so a dense catalog fits.
+pub fn clone_hfs_at<RS, T>(
+    source: &mut HfsFilesystem<RS>,
+    target: &mut T,
+    at_offset: u64,
+    target_size: u64,
+    block_size: u32,
+    volume_name: &str,
+) -> Result<(u64, CloneReport), FilesystemError>
+where
+    RS: Read + Seek + Send,
+    T: Read + Write + Seek + Send,
+{
+    let summary = source.volume_summary();
+    let (catalog_min, extents_min) = crate::hfs::clone_target_btree_sizes(
+        target_size,
+        block_size,
+        summary.catalog_file_size,
+        summary.extents_file_size,
+    );
+    let len = crate::hfs::write_blank_hfs_sized_into(
+        target,
+        at_offset,
+        target_size,
+        block_size,
+        volume_name,
+        extents_min,
+        catalog_min,
+    )?;
+    let mut target_fs = HfsFilesystem::open(&mut *target, at_offset)?;
+    let report = clone_hfs_volume(source, &mut target_fs)?;
+    Ok((len, report))
+}
+
 /// Walk every directory and file in `source` and replicate them onto `target`,
 /// preserving Finder metadata, dates, locked state, resource forks, and the
 /// blessed-system-folder pointer.

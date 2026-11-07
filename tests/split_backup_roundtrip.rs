@@ -136,6 +136,7 @@ fn split_round_trip(
             alignment: RestoreAlignment::Original,
             partition_sizes: Vec::new(),
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         },
         Arc::new(Mutex::new(RestoreProgress::default())),
     )
@@ -274,6 +275,7 @@ fn chd_rejects_split_size_up_front() {
             alignment: RestoreAlignment::Original,
             partition_sizes: Vec::new(),
             write_zeros_to_unused: false,
+            install_mac_driver: true,
         },
         Arc::new(Mutex::new(RestoreProgress::default())),
     )

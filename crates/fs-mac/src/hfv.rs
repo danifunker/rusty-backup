@@ -18,30 +18,26 @@
 //! * **Classic HFS only — never HFS+.** A flat HFV is mounted by the 68k ROM's
 //!   classic HFS driver. HFS+ in a flat image needs Mac OS 8.1+ plus a driver
 //!   shim and is out of scope.
-//! * **Total size ≤ 2047 MB.** Classic HFS uses a 16-bit allocation-block count
-//!   (`drNmAlBlks`, max 65,535) and classic Mac OS does signed 32-bit byte
-//!   arithmetic on volume sizes; a volume ≥ 2 GiB (2^31 bytes) wraps negative
-//!   and won't mount / corrupts. The safe ceiling is [`HFV_MAX_BYTES`].
+//! * **Total size ≤ 4063 MB.** Classic HFS uses a 16-bit allocation-block count
+//!   (`drNmAlBlks`, max 65,535), and System 7.5 bombs on a block of 65536 bytes,
+//!   so [`crate::hfs::HFS_MAX_BLOCK_SIZE`] sets the ceiling. System 6 and 7 stop
+//!   at 2 GB (see [`crate::hfs::mac_os_size_note`]).
 //! * The allocation-block-size floor follows from the size: [`suggest_block_size`]
 //!   picks the smallest standard block size keeping `drNmAlBlks ≤ 65,535`.
 
-use std::io::{Cursor, Read, Seek};
+use std::io::{Read, Seek, Write};
 
 use crate::hfs::{create_blank_hfs_sized, HfsFilesystem};
-use crate::hfs_clone::{clone_hfs_volume, CloneReport};
+use crate::hfs_clone::{clone_hfs_at, CloneReport};
 use disk_core::filesystem::{Filesystem, FilesystemError};
 
-/// Maximum byte size of an HFV (classic-HFS) volume: **2047 MB**.
-///
-/// Just under the 2 GiB (2^31-byte) boundary at which classic Mac OS's signed
-/// 32-bit volume arithmetic wraps. Anything at or above this is refused rather
-/// than handed to an emulator that would corrupt it.
-pub const HFV_MAX_BYTES: u64 = 2047 * 1024 * 1024;
+/// Maximum byte size of an HFV (classic-HFS) volume: **4063 MB**.
+pub const HFV_MAX_BYTES: u64 = crate::hfs::HFS_MAX_VOLUME_BYTES;
 
 /// Allocation block sizes an HFV may use. Each maps to a 2 GB-class ceiling
 /// defined by HFS's 65,535-block `u16`. Canonical list — the HFS expand
 /// runner re-exports these so there is a single source of truth.
-pub const BLOCK_SIZE_CHOICES: &[u32] = &[4096, 8192, 16384, 32768, 65536];
+pub const BLOCK_SIZE_CHOICES: &[u32] = &[4096, 8192, 16384, 32768, crate::hfs::HFS_MAX_BLOCK_SIZE];
 
 /// Maximum HFS volume size addressable with a given allocation block size
 /// (`65,535 × block_size`).
@@ -96,7 +92,7 @@ pub fn validate_hfv_target(size_bytes: u64, kind: HfvVolumeKind) -> Result<(), F
     }
     if size_bytes > HFV_MAX_BYTES {
         return Err(FilesystemError::InvalidData(format!(
-            "HFV volume size {} bytes exceeds the classic-HFS limit of {} bytes (2047 MB)",
+            "HFV volume size {} bytes exceeds the classic-HFS limit of {} bytes (4063 MB)",
             size_bytes, HFV_MAX_BYTES
         )));
     }
@@ -122,7 +118,7 @@ pub fn build_blank_hfv(
 }
 
 /// Clone an open classic-HFS `source` into a freshly-built, defragmented flat
-/// HFV image of `target_size` bytes, returning the image bytes.
+/// HFV image of `target_size` bytes, written to `target`; returns its length.
 ///
 /// This is the engine primitive behind "export to HFV" and "expand HFV": it
 /// builds a blank target sized to comfortably hold the source's catalog and
@@ -134,14 +130,16 @@ pub fn build_blank_hfv(
 ///
 /// `target_size` must satisfy [`validate_hfv_target`]; the source must be
 /// classic HFS (HFS+ sources are refused).
-pub fn clone_into_hfv<RS>(
+pub fn clone_into_hfv<RS, T>(
     source: &mut HfsFilesystem<RS>,
+    target: &mut T,
     target_size: u64,
     block_size: u32,
     volume_name: &str,
-) -> Result<(Vec<u8>, CloneReport), FilesystemError>
+) -> Result<(u64, CloneReport), FilesystemError>
 where
     RS: Read + Seek + Send,
+    T: Read + Write + Seek + Send,
 {
     if source.fs_type() != "HFS" {
         return Err(FilesystemError::InvalidData(format!(
@@ -150,39 +148,14 @@ where
         )));
     }
     validate_hfv_target(target_size, HfvVolumeKind::Hfs)?;
-
-    let summary = source.volume_summary();
-    // Size the target B-trees with the blank-format default as a floor (not
-    // just 1.5x the source), so a densely-packed source catalog can't undersize
-    // the target and exhaust it mid-clone. See clone_target_btree_sizes.
-    let (catalog_min, extents_min) = crate::hfs::clone_target_btree_sizes(
-        target_size,
-        block_size,
-        summary.catalog_file_size,
-        summary.extents_file_size,
-    );
-
-    let mut target_buf = create_blank_hfs_sized(
-        target_size,
-        block_size,
-        volume_name,
-        extents_min,
-        catalog_min,
-    )?;
-
-    let report = {
-        let target_cursor = Cursor::new(&mut target_buf);
-        let mut target_fs = HfsFilesystem::open(target_cursor, 0)?;
-        clone_hfs_volume(source, &mut target_fs)?
-    };
-
-    Ok((target_buf, report))
+    clone_hfs_at(source, target, 0, target_size, block_size, volume_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hfs::create_blank_hfs;
+    use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -197,16 +170,16 @@ mod tests {
         // Exactly the cap is allowed; one byte over is not.
         assert!(validate_hfv_target(HFV_MAX_BYTES, HfvVolumeKind::Hfs).is_ok());
         let err = validate_hfv_target(HFV_MAX_BYTES + 1, HfvVolumeKind::Hfs).unwrap_err();
-        assert!(err.to_string().contains("2047 MB"));
+        assert!(err.to_string().contains("4063 MB"));
     }
 
     #[test]
     fn suggest_block_size_covers_full_range() {
         assert_eq!(suggest_block_size(10 * MIB), 4096);
-        // 2047 MB must be coverable by a single choice keeping blocks <= 65535.
+        // 4063 MB must be coverable by a single choice keeping blocks <= 65535.
         let bs = suggest_block_size(HFV_MAX_BYTES);
         assert!(max_volume_for_block_size(bs) >= HFV_MAX_BYTES);
-        assert_eq!(bs, 32768);
+        assert_eq!(bs, crate::hfs::HFS_MAX_BLOCK_SIZE);
     }
 
     #[test]
@@ -227,7 +200,7 @@ mod tests {
     #[test]
     fn build_blank_hfv_refuses_hfs_plus_and_oversize() {
         // Oversize is refused before create_blank touches it.
-        assert!(build_blank_hfv(HFV_MAX_BYTES + MIB, 32768, "X").is_err());
+        assert!(build_blank_hfv(HFV_MAX_BYTES + MIB, 65024, "X").is_err());
     }
 
     #[test]
@@ -254,11 +227,14 @@ mod tests {
 
         // Clone it into a larger flat HFV.
         let mut source_fs = HfsFilesystem::open(Cursor::new(src_img), 0).unwrap();
-        let (hfv, report) = clone_into_hfv(&mut source_fs, 16 * MIB, 4096, "Cloned").unwrap();
+        let mut hfv = Cursor::new(Vec::new());
+        let (len, report) =
+            clone_into_hfv(&mut source_fs, &mut hfv, 16 * MIB, 4096, "Cloned").unwrap();
         assert_eq!(report.files_copied, 1);
+        assert_eq!(len, hfv.get_ref().len() as u64);
 
         // The clone is a valid HFV with the file present.
-        let mut out = HfsFilesystem::open(Cursor::new(hfv), 0).unwrap();
+        let mut out = HfsFilesystem::open(hfv, 0).unwrap();
         assert_eq!(out.volume_summary().volume_name, "Cloned");
         let root = out.root().unwrap();
         let kids = out.list_directory(&root).unwrap();

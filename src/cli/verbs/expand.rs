@@ -3,7 +3,7 @@
 //! blank volume of a chosen size and allocation block size, then either
 //! wrap the result in a new APM disk image (default) or, with `--to-hfv`,
 //! write it as a flat BasiliskII HFV (bare volume, no partition table,
-//! capped at 2047 MB).
+//! capped at 4063 MB).
 //!
 //! Thin CLI over [`crate::model::hfs_expand_runner`], the same worker
 //! the GUI's "Expand HFS Volume…" dialog uses. The source disk is
@@ -42,7 +42,7 @@ pub struct ExpandArgs {
     pub size: String,
 
     /// Allocation block size in bytes. One of: 4096, 8192, 16384, 32768,
-    /// 65536. If omitted, picks the smallest block size whose 65535-block
+    /// 65024. If omitted, picks the smallest block size whose 65535-block
     /// ceiling can hold `--size`.
     #[arg(long = "block-size")]
     pub block_size: Option<u32>,
@@ -52,7 +52,7 @@ pub struct ExpandArgs {
     pub output: PathBuf,
 
     /// Write a flat BasiliskII HFV (bare classic-HFS volume, no partition
-    /// table) instead of an APM disk image. Capped at 2047 MB. Use this to
+    /// table) instead of an APM disk image. Capped at 4063 MB. Use this to
     /// produce a `.hfv` for BasiliskII / SheepShaver.
     #[arg(long = "to-hfv")]
     pub to_hfv: bool,
@@ -101,7 +101,7 @@ pub fn run(args: ExpandArgs) -> Result<()> {
     }
     if args.to_hfv && target_size > fs_mac::hfv::HFV_MAX_BYTES {
         bail!(
-            "--size {} exceeds the BasiliskII HFV limit of {} (2047 MB); HFV volumes must be classic-HFS-mountable",
+            "--size {} exceeds the BasiliskII HFV limit of {} (4063 MB); HFV volumes must be classic-HFS-mountable",
             format_size(target_size),
             format_size(fs_mac::hfv::HFV_MAX_BYTES)
         );

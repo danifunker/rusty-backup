@@ -289,40 +289,6 @@ fn fake_device(path: &Path) -> DiskDevice {
 }
 
 #[test]
-fn building_on_a_device_asks_for_its_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let dev = fake_device(dir.path().join("dev").as_path());
-    let mut ctl = controller();
-    ctl.apply(RestoreAction::SetMode(RestoreMode::BuildDisk));
-    ctl.apply(RestoreAction::BuildDefine);
-    assert!(!ctl.builder_open(), "no target yet");
-    ctl.apply(RestoreAction::SetTargetIsDevice(
-        TargetSlot::BuildDisk,
-        true,
-    ));
-    ctl.apply(RestoreAction::SelectDevice {
-        slot: TargetSlot::BuildDisk,
-        row: 0,
-        device: dev.clone(),
-    });
-    ctl.apply(RestoreAction::BuildDefine);
-    assert!(ctl.builder_open());
-    let fx = ctl.apply(RestoreAction::BuildApply);
-    let spec = match &fx[..] {
-        [Effect::AskText(spec)] => spec.clone(),
-        other => panic!("expected the typed confirmation, got {other:?}"),
-    };
-    assert!(spec.validate("nope").is_err());
-    assert!(spec.validate(dev.display_name().as_str()).is_ok());
-    ctl.apply(RestoreAction::Answered {
-        purpose: purpose::BUILD,
-        text: Some("nope".into()),
-    });
-    assert!(!ctl.is_running());
-    assert!(ctl.builder_open());
-}
-
-#[test]
 fn a_refreshed_list_drops_the_old_disks_scan() {
     let dir = tempfile::tempdir().unwrap();
     let a = fake_device(dir.path().join("a").as_path());
@@ -343,4 +309,216 @@ fn a_refreshed_list_drops_the_old_disks_scan() {
     );
     ctl.reconcile_devices(&[]);
     assert!(ctl.device(TargetSlot::SinglePartition).is_none());
+}
+
+/// A 16 MiB HFS volume at 512-byte blocks on an MBR disk, backed up through the Backup controller.
+fn hfs_backup(dir: &Path) -> PathBuf {
+    use crate::controller::backup::{BackupAction, BackupController, BackupServices};
+    const MIB: u64 = 1024 * 1024;
+    let img = dir.join("hfs.img");
+    let mut disk = std::io::Cursor::new(vec![0u8; (17 * MIB) as usize]);
+    {
+        let mut part = crate::model::format::Window::new(&mut disk, MIB, 16 * MIB);
+        fs_mac::hfs::write_blank_hfs_into(&mut part, 0, 16 * MIB, 512, "Mac").unwrap();
+    }
+    let mut raw = disk.into_inner();
+    raw[446 + 4] = 0xAF;
+    raw[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    raw[446 + 12..446 + 16].copy_from_slice(&((16 * MIB / 512) as u32).to_le_bytes());
+    raw[510] = 0x55;
+    raw[511] = 0xAA;
+    std::fs::write(&img, raw).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut b = BackupController::new(BackupServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(NoNotify),
+    });
+    b.apply(BackupAction::OpenImage {
+        path: img,
+        rename: false,
+    });
+    b.wait_idle();
+    b.apply(BackupAction::SetDestination(Some(out.clone())));
+    b.apply(BackupAction::SetName("b".into()));
+    b.apply(BackupAction::SetResize(false));
+    b.apply(BackupAction::Start(None));
+    b.wait_finished();
+    assert_eq!(b.last_result(), Some(&Ok(())));
+    out.join("b")
+}
+
+/// The first switch into Custom only seeds the original size, so the size goes in second.
+fn custom_size(ctl: &mut RestoreController, mib: u32) {
+    let index = ctl.size_rows()[0].index;
+    for _ in 0..2 {
+        ctl.apply(RestoreAction::SetPartitionSize {
+            index,
+            mode: SizeMode::Custom,
+            custom_mib: mib,
+        });
+    }
+}
+
+#[test]
+fn caveats_follow_the_size_and_a_volume_past_its_limit_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = hfs_backup(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    let target = dir.path().join("r.img");
+    ctl.apply(RestoreAction::SetTargetIsDevice(
+        TargetSlot::FullDisk,
+        false,
+    ));
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(target),
+    ));
+    assert!(ctl.size_caveats().is_empty(), "nothing to say at 16 MiB");
+    assert!(ctl.validate().is_ok());
+
+    custom_size(&mut ctl, 3 * 1024);
+    let lines: Vec<String> = ctl.size_caveats().iter().map(|c| c.line()).collect();
+    assert!(lines.iter().any(|l| l.contains("rebuilt")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("System 7.5")), "{lines:?}");
+    assert!(lines[0].starts_with("Partition 1: "), "{lines:?}");
+    assert!(ctl.validate().is_ok());
+
+    custom_size(&mut ctl, 5 * 1024);
+    assert_eq!(ctl.size_caveats()[0].caveat.level, CaveatLevel::Blocked);
+    assert!(ctl.validate().unwrap_err().contains("Classic HFS stops"));
+    assert!(!ctl.can_start());
+}
+
+#[test]
+fn a_single_partition_restore_rebuilds_an_outgrown_hfs() {
+    use crate::model::restore_plan::{single_partition_config, PartitionSource};
+    use crate::restore::RestoreProgress;
+    use disk_core::filesystem::Filesystem as _;
+    const MIB: u64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hfs.img");
+    let mut file = std::fs::File::create(&source).unwrap();
+    fs_mac::hfs::write_blank_hfs_into(&mut file, 0, 16 * MIB, 512, "Mac").unwrap();
+    file.set_len(16 * MIB).unwrap();
+    let target = dir.path().join("disk.img");
+    std::fs::File::create(&target)
+        .unwrap()
+        .set_len(64 * MIB)
+        .unwrap();
+
+    let mut config =
+        single_partition_config(&PartitionSource::Image(&source), &target, 2048, 48 * MIB);
+    config.target_is_device = false;
+    let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+    crate::restore::single::run_single_partition_restore(config, progress).unwrap();
+
+    let mut disk = std::fs::File::open(&target).unwrap();
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(&mut disk, MIB).unwrap();
+    assert_eq!(fs.volume_summary().volume_name, "Mac");
+    assert!(fs.fsck().unwrap().errors.is_empty());
+    assert!(fs.total_size() > 40 * MIB, "{}", fs.total_size());
+}
+
+#[test]
+fn a_new_apm_disk_gets_a_mac_driver() {
+    use crate::model::restore_plan::{new_disk_config, PartitionSource};
+    use crate::restore::RestoreProgress;
+    const MIB: u64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hfs.img");
+    let mut file = std::fs::File::create(&source).unwrap();
+    fs_mac::hfs::write_blank_hfs_into(&mut file, 0, 16 * MIB, 4096, "Mac").unwrap();
+    file.set_len(16 * MIB).unwrap();
+    let target = dir.path().join("disk.img");
+    let choice = NewDiskChoice {
+        table: NewTableType::Apm,
+        alignment: AlignmentChoice::Modern1MB,
+        custom_alignment: 2048,
+        bootable: true,
+    };
+    let config = new_disk_config(
+        &PartitionSource::Image(&source),
+        &target,
+        false,
+        None,
+        &choice,
+    );
+    let progress = Arc::new(Mutex::new(RestoreProgress::new()));
+    crate::restore::single::run_single_partition_restore(config, progress).unwrap();
+
+    let mut disk = std::fs::File::open(&target).unwrap();
+    let apm = part_tables::apm::Apm::parse(&mut disk).unwrap();
+    assert_eq!(apm.ddr.driver_count, 1);
+    assert!(apm
+        .entries
+        .iter()
+        .any(|e| e.partition_type == "Apple_Driver43"));
+}
+
+#[test]
+fn a_backup_that_lost_its_mac_driver_offers_the_bundled_one() {
+    use crate::controller::backup::{BackupAction, BackupController, BackupServices};
+    use part_tables::apm::{build_minimal_apm, DriverInfo};
+    const MIB: u64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let mut apm = build_minimal_apm(
+        &[
+            ("Apple_Driver43".to_string(), 64, 32),
+            ("Apple_HFS".to_string(), 96, 32768),
+        ],
+        512,
+        32864,
+    );
+    apm.ddr.driver_count = 1;
+    apm.ddr.driver_info = vec![DriverInfo {
+        block: 64,
+        size: 19,
+        kind: 1,
+    }];
+    let mut disk = std::io::Cursor::new(vec![0u8; 32864 * 512]);
+    {
+        let mut part = crate::model::format::Window::new(&mut disk, 96 * 512, 16 * MIB);
+        fs_mac::hfs::write_blank_hfs_into(&mut part, 0, 16 * MIB, 512, "Mac").unwrap();
+    }
+    let mut raw = disk.into_inner();
+    let head = apm.build_apm_blocks(Some(32864));
+    raw[..head.len()].copy_from_slice(&head);
+    let img = dir.path().join("mac.img");
+    std::fs::write(&img, raw).unwrap();
+
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut b = BackupController::new(BackupServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(NoNotify),
+    });
+    b.apply(BackupAction::OpenImage {
+        path: img,
+        rename: false,
+    });
+    b.wait_idle();
+    b.apply(BackupAction::SetDestination(Some(out.clone())));
+    b.apply(BackupAction::SetName("b".into()));
+    b.apply(BackupAction::SetResize(false));
+    b.apply(BackupAction::Start(None));
+    b.wait_finished();
+    assert_eq!(b.last_result(), Some(&Ok(())));
+    let folder = out.join("b");
+
+    let mut ctl = controller();
+    open(&mut ctl, folder.clone());
+    assert!(!ctl.mac_driver_missing(), "a new backup keeps it");
+
+    std::fs::remove_file(folder.join("apm-extras.bin")).unwrap();
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    assert!(ctl.mac_driver_missing());
+    let says = |ctl: &RestoreController, what: &str| {
+        ctl.size_caveats().iter().any(|c| c.line().contains(what))
+    };
+    assert!(says(&ctl, "bundled Apple SCSI driver"));
+    ctl.apply(RestoreAction::SetInstallMacDriver(false));
+    assert!(says(&ctl, "cannot start up"));
 }

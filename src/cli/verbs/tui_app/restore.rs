@@ -5,8 +5,8 @@
 //! space; alignment; per-partition sizes with the layout-fit check), Single Partition (target
 //! scan and partition pick), New Disk (table, alignment, bootable) and Write Image File, whose
 //! image goes to a headless `DiskWriteController` drawn as the GUI's Physical Disk Export window
-//! (target, region, synthesized table, the typed device name). Build Disk is planned separately
-//! (docs/build_disk_plan.md). See docs/phase2_commander_plan.md § "Slice 25".
+//! (target, region, synthesized table, the typed device name). Building a fresh disk is the Build
+//! Disk screen's. See docs/phase2_commander_plan.md § "Slice 25".
 
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +25,9 @@ use super::{
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::restore::{
-    format_size, purpose, AlignmentChoice, HostRequest, JobRegistry, LayoutFit, NewTableType,
-    NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
+    format_size, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry, LayoutFit,
+    NewTableType, NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices,
+    SizeMode, TargetSlot,
 };
 use crate::controller::{Controller as _, Effect, PickSpec};
 
@@ -36,7 +37,7 @@ pub(super) enum RestoreStep {
     Run,
 }
 
-/// The modes the screen offers, in order (Build Disk has its own plan).
+/// The modes the screen offers, in order.
 const MODES: &[(RestoreMode, &str)] = &[
     (RestoreMode::FullDisk, "Full Disk Restore"),
     (RestoreMode::SinglePartition, "Restore Single Partition"),
@@ -64,6 +65,7 @@ pub(super) enum Field {
     Expand,
     ExpandMib,
     ExtendLast,
+    MacDriver,
     Alignment,
     AlignCustom,
     /// A partition's size row, by its index.
@@ -311,7 +313,6 @@ impl RestoreState {
         match self.ctl.mode() {
             RestoreMode::SinglePartition => TargetSlot::SinglePartition,
             RestoreMode::NewDisk => TargetSlot::NewDisk,
-            RestoreMode::BuildDisk => TargetSlot::BuildDisk,
             RestoreMode::FullDisk | RestoreMode::WriteImage => TargetSlot::FullDisk,
         }
     }
@@ -377,6 +378,9 @@ impl RestoreState {
                     }
                 }
                 f.extend(c.size_rows().iter().map(|r| Field::Size(r.index)));
+                if c.mac_driver_missing() {
+                    f.push(Field::MacDriver);
+                }
                 f.push(Field::Start);
             }
             RestoreMode::SinglePartition | RestoreMode::NewDisk => {
@@ -418,7 +422,6 @@ impl RestoreState {
                     f.push(Field::WriteTarget);
                 }
             }
-            RestoreMode::BuildDisk => {}
         }
         f
     }
@@ -472,6 +475,10 @@ impl RestoreState {
             Field::ExtendLast => {
                 let on = !self.ctl.expand().extend_last;
                 self.act(RestoreAction::SetExtendLast(on));
+            }
+            Field::MacDriver => {
+                let on = !self.ctl.install_mac_driver();
+                self.act(RestoreAction::SetInstallMacDriver(on));
             }
             Field::Alignment => {
                 let all = [
@@ -1077,10 +1084,7 @@ impl App {
             };
             let (label, value): (String, String) = match f {
                 Field::Mode => {
-                    let name = MODES
-                        .iter()
-                        .find(|m| m.0 == c.mode())
-                        .map_or("Build Disk", |m| m.1);
+                    let name = MODES.iter().find(|m| m.0 == c.mode()).map_or("?", |m| m.1);
                     ("Mode:".into(), format!("< {name} >"))
                 }
                 Field::Backup => (
@@ -1224,6 +1228,17 @@ impl App {
                         ),
                     )
                 }
+                Field::MacDriver => (
+                    "Mac driver:".into(),
+                    format!(
+                        "< {} >",
+                        if c.install_mac_driver() {
+                            "Install the bundled driver"
+                        } else {
+                            "None"
+                        }
+                    ),
+                ),
                 Field::ExtendLast => (
                     "  Use:".into(),
                     format!(
@@ -1392,10 +1407,6 @@ impl App {
             ]));
             // What each row found, under it.
             match f {
-                Field::Mode if c.mode() == RestoreMode::BuildDisk => dim(
-                    lines,
-                    "Build Disk is planned for the TUI (docs/build_disk_plan.md).".into(),
-                ),
                 Field::Backup => {
                     if let Some(snap) = c.loading() {
                         dim(lines, format!("{}...", snap.label));
@@ -1479,6 +1490,13 @@ impl App {
             }
         }
         lines.push(Line::raw(""));
+        for c in r.ctl.size_caveats() {
+            let style = match c.caveat.level {
+                CaveatLevel::Info => pal.dim(),
+                CaveatLevel::Warning | CaveatLevel::Blocked => pal.warn(),
+            };
+            lines.push(Line::styled(format!("  {}", c.line()), style));
+        }
         if let Some(last) = r.log.last() {
             lines.push(Line::styled(format!("  {last}"), pal.dim()));
         }

@@ -26,6 +26,11 @@ pub enum BuildAction {
         row: usize,
         text: String,
     },
+    /// The MBR active flag or the RDB bootable flag.
+    SetRowBootable {
+        row: usize,
+        on: bool,
+    },
     /// "Choose..." for a row's source image: a picker, then its decoded size in a job.
     PickRowSource(usize),
     ClearRowSource(usize),
@@ -48,6 +53,7 @@ pub struct BuildRowView {
     pub planned_size: Option<u64>,
     pub source: Option<PathBuf>,
     pub source_size: u64,
+    pub bootable: bool,
 }
 
 /// Everything the Build Disk window draws.
@@ -64,6 +70,8 @@ pub struct BuildView {
     pub geometry: Option<(u16, u16)>,
     /// The Name column is shown.
     pub names: bool,
+    /// The Boot column is shown: `Some(true)` when only one row may be bootable.
+    pub boot: Option<bool>,
     pub rows: Vec<BuildRowView>,
     pub can_add_row: bool,
     /// "N of M slots used", for tables with a fixed slot count.
@@ -74,10 +82,29 @@ pub struct BuildView {
     pub status: Option<String>,
     /// Create Disk is enabled (the layout places).
     pub can_create: bool,
+    /// The layout comes from a donor's label: the table, slots, types and names are fixed.
+    pub fixed: bool,
 }
 
 /// Carry out one intent on the plan; `PickRowSource` is the host's (it needs a picker and a job).
 pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
+    // A label donor keeps its table and slots; only sizes, bootable flags and content change.
+    if builder.fixed_slots()
+        && matches!(
+            action,
+            BuildAction::SetKind(_)
+                | BuildAction::SetRowType { .. }
+                | BuildAction::SetRowName { .. }
+                | BuildAction::MoveRow { .. }
+                | BuildAction::RemoveRow(_)
+                | BuildAction::AddRow
+                | BuildAction::SetAlign(_)
+                | BuildAction::SetHeads(_)
+                | BuildAction::SetSectorsPerTrack(_)
+        )
+    {
+        return;
+    }
     match action {
         BuildAction::SetKind(kind) => builder.set_kind(kind),
         BuildAction::SetAlign(t) => builder.align_text = t,
@@ -96,6 +123,15 @@ pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
         BuildAction::SetRowName { row, text } => {
             if let Some(r) = builder.rows.get_mut(row) {
                 r.name = text;
+            }
+        }
+        BuildAction::SetRowBootable { row, on } => {
+            // MBR has one active flag: setting one clears the others.
+            if on && provision::bootable_rule(builder.kind) == Some(true) {
+                builder.rows.iter_mut().for_each(|r| r.bootable = false);
+            }
+            if let Some(r) = builder.rows.get_mut(row) {
+                r.bootable = on;
             }
         }
         BuildAction::PickRowSource(_) => {}
@@ -148,6 +184,7 @@ pub(crate) fn build_view(builder: &DiskBuilder) -> BuildView {
                 planned_size: p.map(|p| p.size_bytes),
                 source: r.source.clone(),
                 source_size: r.source_size,
+                bootable: r.bootable,
             }
         })
         .collect::<Vec<_>>();
@@ -190,8 +227,10 @@ pub(crate) fn build_view(builder: &DiskBuilder) -> BuildView {
         geometry: provision::records_geometry(builder.kind)
             .then_some((builder.geometry.heads, builder.geometry.sectors_per_track)),
         names: provision::carries_entry_name(builder.kind),
+        boot: provision::bootable_rule(builder.kind),
         rows,
-        can_add_row: builder.can_add_row(),
+        can_add_row: builder.can_add_row() && !builder.fixed_slots(),
+        fixed: builder.fixed_slots(),
         slots: builder.remaining_slots().map(|left| (n, n + left)),
         can_create: planned.is_ok(),
         layout,

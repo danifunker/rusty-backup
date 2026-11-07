@@ -650,6 +650,7 @@ fn put_u32(buf: &mut [u8], off: usize, v: u32) {
 }
 
 #[inline]
+#[cfg(test)]
 fn sector_mut(img: &mut [u8], s: u32) -> &mut [u8] {
     let o = s as usize * SECTOR as usize;
     &mut img[o..o + SECTOR as usize]
@@ -709,6 +710,22 @@ fn is_name_long(name: &[u8]) -> bool {
 /// bytes. Layout is byte-identical to `scripts/hpfs-oracle.py mkfs` so the two
 /// implementations cross-validate.
 pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
+    // `vec!` leaves untouched pages unmapped; filling a grown Vec would make them all resident.
+    let mut img = vec![0u8; size_bytes as usize];
+    let mut cur = std::io::Cursor::new(img.as_mut_slice());
+    let len = write_blank_hpfs_into(&mut cur, 0, size_bytes, label)?;
+    img.truncate(len as usize);
+    Ok(img)
+}
+
+/// The streaming form of [`create_blank_hpfs`]: writes only the metadata sectors at `at_offset`
+/// and returns the volume's length. The rest must already read as zero (a fresh or sparse file).
+pub fn write_blank_hpfs_into<W: Write + Seek>(
+    w: &mut W,
+    at_offset: u64,
+    size_bytes: u64,
+    label: &str,
+) -> Result<u64, FilesystemError> {
     let ts = (size_bytes / SECTOR) as u32;
     if (ts as u64) < 2048 {
         return Err(FilesystemError::InvalidData(
@@ -723,11 +740,8 @@ pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesy
     // One u32 per band, in whole 4-sector blocks (128 bands each); one block capped volumes at 1 GiB.
     let bitmap_dir_sectors = ((n_bands * 4).div_ceil(4 * SECTOR as usize) * 4) as u32;
     cur += bitmap_dir_sectors;
-    let mut band_bmp = Vec::with_capacity(n_bands);
-    for _ in 0..n_bands {
-        band_bmp.push(cur);
-        cur += 4;
-    }
+    let band_bmp0 = cur;
+    cur += 4 * n_bands as u32;
     let dmap = cur;
     cur += 4;
     let user_id = cur;
@@ -749,179 +763,148 @@ pub fn create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, Filesy
         ));
     }
     let root_dno = dirband_start;
-
-    let mut img = vec![0u8; ts as usize * SECTOR as usize];
-
-    // ---- band bitmaps (bit set = free): start all-free, then mark used ----
-    let mut bands: Vec<Vec<u8>> = (0..n_bands)
-        .map(|_| vec![0xffu8; 4 * SECTOR as usize])
-        .collect();
-    let set_used = |bands: &mut Vec<Vec<u8>>, s: u32| {
-        let band = (s >> 14) as usize;
-        let idx = ((s & 0x3fff) >> 5) as usize;
-        let bit = s & 0x1f;
-        let base = idx * 4;
-        let mut w = u32::from_le_bytes([
-            bands[band][base],
-            bands[band][base + 1],
-            bands[band][base + 2],
-            bands[band][base + 3],
-        ]);
-        w &= !(1u32 << bit);
-        bands[band][base..base + 4].copy_from_slice(&w.to_le_bytes());
+    let put = |w: &mut W, sector: u32, bytes: &[u8]| -> Result<(), FilesystemError> {
+        w.seek(SeekFrom::Start(at_offset + u64::from(sector) * SECTOR))?;
+        w.write_all(bytes)?;
+        Ok(())
     };
-    for s in ts..(n_bands as u32 * BAND_SECTORS) {
-        set_used(&mut bands, s);
-    }
-    for s in 0..0x14u32 {
-        set_used(&mut bands, s);
-    }
-    for s in bitmap_dir..bitmap_dir + bitmap_dir_sectors {
-        set_used(&mut bands, s);
-    }
-    for &base in &band_bmp {
-        for s in base..base + 4 {
-            set_used(&mut bands, s);
+
+    // Band bitmaps (bit set = free), built and written one band at a time.
+    let used: [(u32, u32); 9] = [
+        (0, 0x14),
+        (bitmap_dir, bitmap_dir + bitmap_dir_sectors),
+        (band_bmp0, band_bmp0 + 4 * n_bands as u32),
+        (dmap, dmap + 4),
+        (user_id, user_id + 8),
+        (hotfix, hotfix + 4),
+        (root_fnode, root_fnode + 1),
+        (dirband_start, dirband_start + dirband_size),
+        (ts, n_bands as u32 * BAND_SECTORS),
+    ];
+    let mut band = vec![0u8; 4 * SECTOR as usize];
+    for i in 0..n_bands as u32 {
+        band.iter_mut().for_each(|b| *b = 0xff);
+        let (lo, hi) = (i * BAND_SECTORS, (i + 1) * BAND_SECTORS);
+        for &(start, end) in &used {
+            for s in start.max(lo)..end.min(hi) {
+                let s = s - lo;
+                let base = ((s >> 5) * 4) as usize;
+                let mut word = u32::from_le_bytes([
+                    band[base],
+                    band[base + 1],
+                    band[base + 2],
+                    band[base + 3],
+                ]);
+                word &= !(1u32 << (s & 0x1f));
+                band[base..base + 4].copy_from_slice(&word.to_le_bytes());
+            }
         }
-    }
-    for s in dmap..dmap + 4 {
-        set_used(&mut bands, s);
-    }
-    for s in user_id..user_id + 8 {
-        set_used(&mut bands, s);
-    }
-    for s in hotfix..hotfix + 4 {
-        set_used(&mut bands, s);
-    }
-    set_used(&mut bands, root_fnode);
-    for s in dirband_start..dirband_start + dirband_size {
-        set_used(&mut bands, s);
+        put(w, band_bmp0 + 4 * i, &band)?;
     }
 
     // ---- dnode bitmap (bit set = free), 1 bit / dnode ----
     let mut dmap_buf = vec![0u8; 4 * SECTOR as usize];
     for d in 0..dnodes {
         let idx = (d >> 5) as usize;
-        let mut w = u32::from_le_bytes([
+        let mut word = u32::from_le_bytes([
             dmap_buf[idx * 4],
             dmap_buf[idx * 4 + 1],
             dmap_buf[idx * 4 + 2],
             dmap_buf[idx * 4 + 3],
         ]);
-        w |= 1u32 << (d & 0x1f);
-        dmap_buf[idx * 4..idx * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        word |= 1u32 << (d & 0x1f);
+        dmap_buf[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
     // root dnode (index 0) is used.
     dmap_buf[0] &= !1u8;
+    put(w, dmap, &dmap_buf)?;
 
     // ---- boot block ----
-    {
-        let b = sector_mut(&mut img, 0);
-        b[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
-        b[3..11].copy_from_slice(b"IBM 4.50");
-        put_u16(b, 11, SECTOR as u16);
-        b[13] = 1;
-        put_u16(b, 19, if ts < 0x10000 { ts as u16 } else { 0 });
-        b[21] = 0xf8;
-        put_u16(b, 24, 63);
-        put_u16(b, 26, 16);
-        put_u32(b, 32, if ts >= 0x10000 { ts } else { 0 });
-        b[36] = 0x80;
-        b[38] = 0x28; // sig_28h (HPFS marker)
-        put_u32(b, 39, 0x1234_5678);
-        let mut lbl = [b' '; 11];
-        let lb = label.as_bytes();
-        let n = lb.len().min(11);
-        lbl[..n].copy_from_slice(&lb[..n]);
-        b[43..54].copy_from_slice(&lbl);
-        b[54..62].copy_from_slice(b"HPFS    ");
-        put_u16(b, 510, 0xaa55);
-    }
+    let mut b = [0u8; SECTOR as usize];
+    b[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+    b[3..11].copy_from_slice(b"IBM 4.50");
+    put_u16(&mut b, 11, SECTOR as u16);
+    b[13] = 1;
+    put_u16(&mut b, 19, if ts < 0x10000 { ts as u16 } else { 0 });
+    b[21] = 0xf8;
+    put_u16(&mut b, 24, 63);
+    put_u16(&mut b, 26, 16);
+    put_u32(&mut b, 32, if ts >= 0x10000 { ts } else { 0 });
+    b[36] = 0x80;
+    b[38] = 0x28; // sig_28h (HPFS marker)
+    put_u32(&mut b, 39, 0x1234_5678);
+    let mut lbl = [b' '; 11];
+    let lb = label.as_bytes();
+    let n = lb.len().min(11);
+    lbl[..n].copy_from_slice(&lb[..n]);
+    b[43..54].copy_from_slice(&lbl);
+    b[54..62].copy_from_slice(b"HPFS    ");
+    put_u16(&mut b, 510, 0xaa55);
+    put(w, 0, &b)?;
 
     // ---- super block ----
-    {
-        let b = sector_mut(&mut img, 16);
-        put_u32(b, 0, SB_MAGIC);
-        put_u32(b, 4, 0xFA53_E9C5);
-        b[8] = 2; // version
-        b[9] = 2; // funcversion
-        put_u32(b, 12, root_fnode);
-        put_u32(b, 16, ts);
-        put_u32(b, 24, bitmap_dir);
-        put_u32(b, 48, dirband_size);
-        put_u32(b, 52, dirband_start);
-        put_u32(b, 56, dirband_end);
-        put_u32(b, 60, dmap);
-        put_u32(b, 96, user_id);
-    }
+    let mut b = [0u8; SECTOR as usize];
+    put_u32(&mut b, 0, SB_MAGIC);
+    put_u32(&mut b, 4, 0xFA53_E9C5);
+    b[8] = 2; // version
+    b[9] = 2; // funcversion
+    put_u32(&mut b, 12, root_fnode);
+    put_u32(&mut b, 16, ts);
+    put_u32(&mut b, 24, bitmap_dir);
+    put_u32(&mut b, 48, dirband_size);
+    put_u32(&mut b, 52, dirband_start);
+    put_u32(&mut b, 56, dirband_end);
+    put_u32(&mut b, 60, dmap);
+    put_u32(&mut b, 96, user_id);
+    put(w, 16, &b)?;
 
-    // ---- spare block ----
-    {
-        let b = sector_mut(&mut img, 17);
-        put_u32(b, 0, SP_MAGIC);
-        put_u32(b, 4, 0xFA52_29C5);
-        put_u32(b, 12, hotfix);
-        // all counts zero (clean, no hotfixes/spares/codepages)
-    }
+    // ---- spare block: all counts zero (clean, no hotfixes / spares / codepages) ----
+    let mut b = [0u8; SECTOR as usize];
+    put_u32(&mut b, 0, SP_MAGIC);
+    put_u32(&mut b, 4, 0xFA52_29C5);
+    put_u32(&mut b, 12, hotfix);
+    put(w, 17, &b)?;
 
     // ---- bitmap directory ----
-    {
-        let at = bitmap_dir as usize * SECTOR as usize;
-        let b = &mut img[at..at + bitmap_dir_sectors as usize * SECTOR as usize];
-        for (i, &bm) in band_bmp.iter().enumerate() {
-            put_u32(b, i * 4, bm);
-        }
+    let mut dir = vec![0u8; bitmap_dir_sectors as usize * SECTOR as usize];
+    for i in 0..n_bands {
+        put_u32(&mut dir, i * 4, band_bmp0 + 4 * i as u32);
     }
-
-    // ---- flush band bitmaps + dnode bitmap ----
-    for (i, &base) in band_bmp.iter().enumerate() {
-        let o = base as usize * SECTOR as usize;
-        img[o..o + 4 * SECTOR as usize].copy_from_slice(&bands[i]);
-    }
-    {
-        let o = dmap as usize * SECTOR as usize;
-        img[o..o + 4 * SECTOR as usize].copy_from_slice(&dmap_buf);
-    }
+    put(w, bitmap_dir, &dir)?;
 
     // ---- root fnode (directory) ----
-    {
-        let b = sector_mut(&mut img, root_fnode);
-        put_u32(b, 0, FNODE_MAGIC);
-        put_u32(b, 28, root_fnode); // up = self
-        put_u16(b, 54, FNODE_FLAG_DIR);
-        b[60] = 7; // n_free_nodes
-        b[61] = 1; // n_used_nodes
-        put_u16(b, 62, 0x14); // first_free
-        put_u32(b, 64, 0xFFFF_FFFF); // external[0].file_secno = -1
-        put_u32(b, 72, root_dno); // external[0].disk_secno
-        put_u16(b, 184, 0xC4); // ea_offs
-    }
+    let mut b = [0u8; SECTOR as usize];
+    put_u32(&mut b, 0, FNODE_MAGIC);
+    put_u32(&mut b, 28, root_fnode); // up = self
+    put_u16(&mut b, 54, FNODE_FLAG_DIR);
+    b[60] = 7; // n_free_nodes
+    b[61] = 1; // n_used_nodes
+    put_u16(&mut b, 62, 0x14); // first_free
+    put_u32(&mut b, 64, 0xFFFF_FFFF); // external[0].file_secno = -1
+    put_u32(&mut b, 72, root_dno); // external[0].disk_secno
+    put_u16(&mut b, 184, 0xC4); // ea_offs
+    put(w, root_fnode, &b)?;
 
     // ---- root dnode: \001\001 (first) + \377 (last) ----
-    {
-        let de1 = {
-            let mut de = make_dirent(b"\x01\x01", root_fnode, 0, AT_DIRECTORY);
-            de[2] = DE_FIRST; // flags: first
-            de
-        };
-        let mut off = 20usize;
-        let b = sector_mut(&mut img, root_dno);
-        put_u32(b, 0, DNODE_MAGIC);
-        b[8] = 0x01; // root_dnode
-        put_u32(b, 12, root_fnode); // up
-        put_u32(b, 16, root_dno); // self
-        b[off..off + de1.len()].copy_from_slice(&de1);
-        off += de1.len();
-        // \377 last entry
-        put_u16(b, off, 32);
-        b[off + 2] = DE_LAST;
-        b[off + 30] = 1;
-        b[off + 31] = 0xff;
-        off += 32;
-        put_u32(b, 4, off as u32); // first_free
-    }
+    let mut de1 = make_dirent(b"\x01\x01", root_fnode, 0, AT_DIRECTORY);
+    de1[2] = DE_FIRST;
+    let mut b = vec![0u8; 4 * SECTOR as usize];
+    let mut off = 20usize;
+    put_u32(&mut b, 0, DNODE_MAGIC);
+    b[8] = 0x01; // root_dnode
+    put_u32(&mut b, 12, root_fnode); // up
+    put_u32(&mut b, 16, root_dno); // self
+    b[off..off + de1.len()].copy_from_slice(&de1);
+    off += de1.len();
+    put_u16(&mut b, off, 32);
+    b[off + 2] = DE_LAST;
+    b[off + 30] = 1;
+    b[off + 31] = 0xff;
+    off += 32;
+    put_u32(&mut b, 4, off as u32); // first_free
+    put(w, root_dno, &b[..SECTOR as usize])?;
 
-    Ok(img)
+    Ok(u64::from(ts) * SECTOR)
 }
 
 // =============================== fsck ===============================
@@ -2327,6 +2310,253 @@ pub fn validate_hpfs_name(name: &str) -> Result<(), FilesystemError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-memory formatter the streaming one replaced, kept to prove the bytes match.
+    #[allow(clippy::needless_range_loop)]
+    fn old_create_blank_hpfs(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
+        let ts = (size_bytes / SECTOR) as u32;
+        if (ts as u64) < 2048 {
+            return Err(FilesystemError::InvalidData(
+                "HPFS volume must be at least 1 MiB".into(),
+            ));
+        }
+        let n_bands = ts.div_ceil(BAND_SECTORS) as usize;
+
+        // Bump-allocate metadata sectors from 0x14.
+        let mut cur = 0x14u32;
+        let bitmap_dir = cur;
+        // One u32 per band, in whole 4-sector blocks (128 bands each); one block capped volumes at 1 GiB.
+        let bitmap_dir_sectors = ((n_bands * 4).div_ceil(4 * SECTOR as usize) * 4) as u32;
+        cur += bitmap_dir_sectors;
+        let mut band_bmp = Vec::with_capacity(n_bands);
+        for _ in 0..n_bands {
+            band_bmp.push(cur);
+            cur += 4;
+        }
+        let dmap = cur;
+        cur += 4;
+        let user_id = cur;
+        cur += 8;
+        let hotfix = cur;
+        cur += 4;
+        let root_fnode = cur;
+        cur += 1;
+
+        let dnodes = (ts / 32 / 4).clamp(8, 0x1000);
+        let dirband_size = dnodes * 4;
+        cur = (cur + 3) & !3;
+        let dirband_start = cur;
+        let dirband_end = dirband_start + dirband_size - 1;
+        cur += dirband_size;
+        if cur > ts {
+            return Err(FilesystemError::InvalidData(
+                "HPFS volume too small for metadata".into(),
+            ));
+        }
+        let root_dno = dirband_start;
+
+        let mut img = vec![0u8; ts as usize * SECTOR as usize];
+
+        // ---- band bitmaps (bit set = free): start all-free, then mark used ----
+        let mut bands: Vec<Vec<u8>> = (0..n_bands)
+            .map(|_| vec![0xffu8; 4 * SECTOR as usize])
+            .collect();
+        let set_used = |bands: &mut Vec<Vec<u8>>, s: u32| {
+            let band = (s >> 14) as usize;
+            let idx = ((s & 0x3fff) >> 5) as usize;
+            let bit = s & 0x1f;
+            let base = idx * 4;
+            let mut w = u32::from_le_bytes([
+                bands[band][base],
+                bands[band][base + 1],
+                bands[band][base + 2],
+                bands[band][base + 3],
+            ]);
+            w &= !(1u32 << bit);
+            bands[band][base..base + 4].copy_from_slice(&w.to_le_bytes());
+        };
+        for s in ts..(n_bands as u32 * BAND_SECTORS) {
+            set_used(&mut bands, s);
+        }
+        for s in 0..0x14u32 {
+            set_used(&mut bands, s);
+        }
+        for s in bitmap_dir..bitmap_dir + bitmap_dir_sectors {
+            set_used(&mut bands, s);
+        }
+        for &base in &band_bmp {
+            for s in base..base + 4 {
+                set_used(&mut bands, s);
+            }
+        }
+        for s in dmap..dmap + 4 {
+            set_used(&mut bands, s);
+        }
+        for s in user_id..user_id + 8 {
+            set_used(&mut bands, s);
+        }
+        for s in hotfix..hotfix + 4 {
+            set_used(&mut bands, s);
+        }
+        set_used(&mut bands, root_fnode);
+        for s in dirband_start..dirband_start + dirband_size {
+            set_used(&mut bands, s);
+        }
+
+        // ---- dnode bitmap (bit set = free), 1 bit / dnode ----
+        let mut dmap_buf = vec![0u8; 4 * SECTOR as usize];
+        for d in 0..dnodes {
+            let idx = (d >> 5) as usize;
+            let mut w = u32::from_le_bytes([
+                dmap_buf[idx * 4],
+                dmap_buf[idx * 4 + 1],
+                dmap_buf[idx * 4 + 2],
+                dmap_buf[idx * 4 + 3],
+            ]);
+            w |= 1u32 << (d & 0x1f);
+            dmap_buf[idx * 4..idx * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        // root dnode (index 0) is used.
+        dmap_buf[0] &= !1u8;
+
+        // ---- boot block ----
+        {
+            let b = sector_mut(&mut img, 0);
+            b[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+            b[3..11].copy_from_slice(b"IBM 4.50");
+            put_u16(b, 11, SECTOR as u16);
+            b[13] = 1;
+            put_u16(b, 19, if ts < 0x10000 { ts as u16 } else { 0 });
+            b[21] = 0xf8;
+            put_u16(b, 24, 63);
+            put_u16(b, 26, 16);
+            put_u32(b, 32, if ts >= 0x10000 { ts } else { 0 });
+            b[36] = 0x80;
+            b[38] = 0x28; // sig_28h (HPFS marker)
+            put_u32(b, 39, 0x1234_5678);
+            let mut lbl = [b' '; 11];
+            let lb = label.as_bytes();
+            let n = lb.len().min(11);
+            lbl[..n].copy_from_slice(&lb[..n]);
+            b[43..54].copy_from_slice(&lbl);
+            b[54..62].copy_from_slice(b"HPFS    ");
+            put_u16(b, 510, 0xaa55);
+        }
+
+        // ---- super block ----
+        {
+            let b = sector_mut(&mut img, 16);
+            put_u32(b, 0, SB_MAGIC);
+            put_u32(b, 4, 0xFA53_E9C5);
+            b[8] = 2; // version
+            b[9] = 2; // funcversion
+            put_u32(b, 12, root_fnode);
+            put_u32(b, 16, ts);
+            put_u32(b, 24, bitmap_dir);
+            put_u32(b, 48, dirband_size);
+            put_u32(b, 52, dirband_start);
+            put_u32(b, 56, dirband_end);
+            put_u32(b, 60, dmap);
+            put_u32(b, 96, user_id);
+        }
+
+        // ---- spare block ----
+        {
+            let b = sector_mut(&mut img, 17);
+            put_u32(b, 0, SP_MAGIC);
+            put_u32(b, 4, 0xFA52_29C5);
+            put_u32(b, 12, hotfix);
+            // all counts zero (clean, no hotfixes/spares/codepages)
+        }
+
+        // ---- bitmap directory ----
+        {
+            let at = bitmap_dir as usize * SECTOR as usize;
+            let b = &mut img[at..at + bitmap_dir_sectors as usize * SECTOR as usize];
+            for (i, &bm) in band_bmp.iter().enumerate() {
+                put_u32(b, i * 4, bm);
+            }
+        }
+
+        // ---- flush band bitmaps + dnode bitmap ----
+        for (i, &base) in band_bmp.iter().enumerate() {
+            let o = base as usize * SECTOR as usize;
+            img[o..o + 4 * SECTOR as usize].copy_from_slice(&bands[i]);
+        }
+        {
+            let o = dmap as usize * SECTOR as usize;
+            img[o..o + 4 * SECTOR as usize].copy_from_slice(&dmap_buf);
+        }
+
+        // ---- root fnode (directory) ----
+        {
+            let b = sector_mut(&mut img, root_fnode);
+            put_u32(b, 0, FNODE_MAGIC);
+            put_u32(b, 28, root_fnode); // up = self
+            put_u16(b, 54, FNODE_FLAG_DIR);
+            b[60] = 7; // n_free_nodes
+            b[61] = 1; // n_used_nodes
+            put_u16(b, 62, 0x14); // first_free
+            put_u32(b, 64, 0xFFFF_FFFF); // external[0].file_secno = -1
+            put_u32(b, 72, root_dno); // external[0].disk_secno
+            put_u16(b, 184, 0xC4); // ea_offs
+        }
+
+        // ---- root dnode: \001\001 (first) + \377 (last) ----
+        {
+            let de1 = {
+                let mut de = make_dirent(b"\x01\x01", root_fnode, 0, AT_DIRECTORY);
+                de[2] = DE_FIRST; // flags: first
+                de
+            };
+            let mut off = 20usize;
+            let b = sector_mut(&mut img, root_dno);
+            put_u32(b, 0, DNODE_MAGIC);
+            b[8] = 0x01; // root_dnode
+            put_u32(b, 12, root_fnode); // up
+            put_u32(b, 16, root_dno); // self
+            b[off..off + de1.len()].copy_from_slice(&de1);
+            off += de1.len();
+            // \377 last entry
+            put_u16(b, off, 32);
+            b[off + 2] = DE_LAST;
+            b[off + 30] = 1;
+            b[off + 31] = 0xff;
+            off += 32;
+            put_u32(b, 4, off as u32); // first_free
+        }
+
+        Ok(img)
+    }
+
+    #[test]
+    fn streaming_format_matches_the_old_in_memory_one() {
+        for mb in [1u64, 4, 9, 64, 200] {
+            for label in ["", "VOL", "A LONG LABEL"] {
+                let old = old_create_blank_hpfs(mb << 20, label).unwrap();
+                let new = create_blank_hpfs(mb << 20, label).unwrap();
+                assert!(old == new, "{mb} MiB {label:?} differs");
+            }
+        }
+    }
+
+    /// A 64 GiB volume streams into a sparse file without building it in memory.
+    #[test]
+    fn a_large_volume_streams_into_a_sparse_file() {
+        // Windows files are not sparse by default, so a CI runner would reserve all of it.
+        let size: u64 = if cfg!(windows) { 2 << 30 } else { 64 << 30 };
+        let path = std::env::temp_dir().join(format!("hpfs-big-{}.img", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let len = write_blank_hpfs_into(&mut f, 0, size, "BIG").unwrap();
+        f.set_len(len).unwrap();
+        drop(f);
+        let f = std::fs::File::open(&path).unwrap();
+        let mut fs = HpfsFilesystem::open(f, 0).unwrap();
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(listed.is_empty(), "{listed:?}");
+    }
     use super::*;
     use std::io::Cursor;
     use std::path::PathBuf;

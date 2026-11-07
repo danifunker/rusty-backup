@@ -3,7 +3,7 @@
 //!
 //! Pre-conditions:
 //! - `source` is a read-only `Pfs3Filesystem`.
-//! - `target` is freshly built via `create_blank_pfs3` and opened for
+//! - `target` is freshly built via `write_blank_pfs3_into` and opened for
 //!   read+write; its root is empty.
 //! - The target volume is large enough to hold every file's data plus
 //!   the new reserved-area / metadata overhead. The caller is
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
-use crate::pfs3::{create_blank_pfs3, Pfs3Filesystem};
+use crate::pfs3::{write_blank_pfs3_into, Pfs3Filesystem};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
@@ -358,19 +358,14 @@ where
         target_size / (1024 * 1024),
         name
     ));
-    let blank = create_blank_pfs3(total_sectors, &name)?;
-    debug_assert_eq!(blank.len() as u64, target_size);
-
-    // Tempfile keeps peak memory bounded by one source-file buffer plus
-    // I/O ring instead of the whole target image. The tempfile is
-    // unlinked when dropped — drained into `dst` first.
+    // The blank target is formatted straight into a tempfile, drained into `dst` at the end.
     let mut tmp = tempfile::tempfile().map_err(|e| {
         FilesystemError::Io(disk_core::io_other(format!(
             "create tempfile for PFS3 clone: {e}"
         )))
     })?;
-    tmp.write_all(&blank)?;
-    drop(blank); // free the 9 GB blank-buffer for big partitions
+    let len = write_blank_pfs3_into(&mut tmp, 0, total_sectors, name.as_str())?;
+    tmp.set_len(len)?;
     tmp.seek(SeekFrom::Start(0))?;
 
     let mut target = Pfs3Filesystem::open(tmp, 0)?;

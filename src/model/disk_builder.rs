@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::model::format::{self, FormatOptions, FsKind};
 use crate::partition::parse_size;
 use crate::partition::provision::{self, Geometry, PartSpec, Placed};
 use crate::partition::type_catalog::{self, TableKind};
@@ -37,6 +38,236 @@ pub struct BuilderRow {
     /// Decoded size of `source`, cached by the caller so validation can flag
     /// an image too big for the partition without re-opening it every frame.
     pub source_size: u64,
+    /// Format this partition blank; ignored when `source` is set.
+    pub format: Option<RowFormat>,
+    /// Boot from this partition, where the table has a flag for it.
+    pub bootable: bool,
+    /// Copy the donor's partition at this position into the row (its bytes, verbatim).
+    pub copy_from: Option<usize>,
+    /// The donor partition this row was laid out from, kept when its content changes.
+    pub donor_part: Option<usize>,
+}
+
+/// A disk whose layout a build starts from: its table and partitions, and for the label
+/// schemes the head region that rides verbatim (resized by `partition::restore_patch`).
+#[derive(Debug, Clone)]
+pub struct Donor {
+    pub path: PathBuf,
+    /// The table type as `PartitionTable::type_name` spells it.
+    pub table_type: String,
+    pub kind: TableKind,
+    pub disk_size: u64,
+    /// The bytes before the first partition; written back patched for a label scheme.
+    pub head: Vec<u8>,
+    pub parts: Vec<DonorPart>,
+}
+
+/// One partition of a donor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DonorPart {
+    /// `PartitionInfo::index`, which the label patchers key on.
+    pub index: usize,
+    pub start_byte: u64,
+    pub size: u64,
+    /// The type in the table's own vocabulary, and its display name.
+    pub type_text: String,
+    pub type_name: String,
+}
+
+impl Donor {
+    /// Read `path`'s table (any container the engine opens).
+    pub fn read(path: &std::path::Path) -> Result<Donor> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut r = crate::model::source_reader::open_read(path)?;
+        let table = crate::partition::PartitionTable::detect(&mut r)
+            .map_err(|e| anyhow::anyhow!("no partition table found: {e}"))?;
+        let kind = type_catalog::kind_of(&table);
+        if !provision::WRITABLE_TABLES.contains(&kind) {
+            anyhow::bail!("a {} table cannot be built from yet", table.type_name());
+        }
+        let infos: Vec<_> = table
+            .partitions()
+            .into_iter()
+            .filter(|p| !p.is_extended_container && p.size_bytes > 0)
+            .collect();
+        if infos.is_empty() {
+            anyhow::bail!("the donor has no partitions");
+        }
+        if crate::partition::partitions_overlap(infos.as_slice()) {
+            anyhow::bail!("the donor's partitions overlap; it describes several layouts at once");
+        }
+        if kind == TableKind::Mbr && infos.iter().any(|p| p.is_logical) {
+            anyhow::bail!("the donor has logical partitions, which Build Disk cannot write yet");
+        }
+        let disk_size = r.seek(SeekFrom::End(0))?;
+        let head_len = infos
+            .iter()
+            .map(|p| p.byte_offset())
+            .min()
+            .unwrap_or(512)
+            .max(512);
+        let mut head = vec![0u8; head_len as usize];
+        r.seek(SeekFrom::Start(0))?;
+        r.read_exact(&mut head)?;
+        let parts = infos
+            .iter()
+            .map(|p| DonorPart {
+                index: p.index,
+                start_byte: p.byte_offset(),
+                size: p.size_bytes,
+                type_text: match kind {
+                    TableKind::Mbr => format!("{:02X}", p.partition_type_byte),
+                    _ => p
+                        .partition_type_string
+                        .clone()
+                        .unwrap_or_else(|| p.type_name.clone()),
+                },
+                type_name: p.type_name.clone(),
+            })
+            .collect();
+        Ok(Donor {
+            path: path.to_path_buf(),
+            table_type: table.type_name().to_string(),
+            kind,
+            disk_size,
+            head,
+            parts,
+        })
+    }
+
+    /// The table is a label the patchers rewrite in the verbatim head (SGI, Sun, NeXT, RDB, ...).
+    pub fn keeps_head(&self) -> bool {
+        crate::partition::restore_patch::can_patch(self.table_type.as_str())
+    }
+}
+
+/// A filesystem to format and its options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFormat {
+    pub kind: FsKind,
+    pub opts: FormatOptions,
+}
+
+impl RowFormat {
+    /// `kind` with its default options (CP/M gets its first preset).
+    pub fn new(kind: FsKind) -> Self {
+        // The CLI's default name is longer than some labels allow; those start as UNTITLED.
+        let max = kind.caps().label_max;
+        let label = match kind.default_label() {
+            l if max == 0 || l.len() <= max => l.to_string(),
+            _ => "UNTITLED".chars().take(max).collect(),
+        };
+        let mut opts = FormatOptions {
+            label,
+            ..FormatOptions::default()
+        };
+        if kind == FsKind::Cpm {
+            opts.cpm_preset = fs_cpm::cpm_diskdefs::ALL_PRESETS
+                .first()
+                .map(|d| d.name.to_string());
+        }
+        RowFormat { kind, opts }
+    }
+
+    /// The filesystem and, when it has one, its label: `FAT12 / FAT16 / FAT32 "DOS"`.
+    pub fn describe(&self) -> String {
+        if self.kind.caps().label_max == 0 {
+            self.kind.display_name().to_string()
+        } else {
+            format!("{} {:?}", self.kind.display_name(), self.opts.label)
+        }
+    }
+
+    /// The options and label are ones this filesystem takes.
+    pub fn check(&self) -> Result<(), String> {
+        format::check_options(self.kind, &self.opts).map_err(|e| format!("{e:#}"))?;
+        let max = self.kind.caps().label_max;
+        if max > 0 && self.opts.label.len() > max {
+            return Err(format!(
+                "the {} label is at most {max} bytes",
+                self.kind.display_name()
+            ));
+        }
+        if self.opts.affs_variant > 7 {
+            return Err("the AFFS variant is 0 to 7".to_string());
+        }
+        Ok(())
+    }
+
+    /// A volume of `size` bytes is one this filesystem can be formatted at.
+    pub fn fits(&self, size: u64) -> Result<(), String> {
+        let caps = self.kind.caps();
+        let name = self.kind.display_name();
+        if caps.fixed_size {
+            return if caps.min_size > size {
+                Err(format!(
+                    "{name} needs {}, more than {}",
+                    format_size(caps.min_size),
+                    format_size(size)
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if size < caps.min_size {
+            return Err(format!(
+                "{name} needs at least {}, not {}",
+                format_size(caps.min_size),
+                format_size(size)
+            ));
+        }
+        if size > caps.max_buildable() {
+            return Err(format!(
+                "{name} can be at most {}, not {}",
+                format_size(caps.max_buildable()),
+                format_size(size)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The partition type a row formatted with `fs` should carry on a `kind` table, when the table
+/// has one for it. `size` picks FAT's type byte.
+pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64) -> Option<String> {
+    use FsKind as F;
+    let t = match (kind, fs) {
+        (TableKind::Mbr, F::Fat) => {
+            let fat = fs_pc::fat::compute_fat_blank_layout(size.max(64 * 1024)).ok()?;
+            match fat.fat_type {
+                fs_pc::fat::FatType::Fat12 => "01",
+                fs_pc::fat::FatType::Fat16 if size < 32 * 1024 * 1024 => "04",
+                fs_pc::fat::FatType::Fat16 => "06",
+                fs_pc::fat::FatType::Fat32 => "0C",
+            }
+        }
+        (TableKind::Mbr, F::Ntfs | F::Hpfs | F::Exfat) => "07",
+        (TableKind::Mbr, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => "83",
+        (TableKind::Mbr, F::Hfs | F::Hfsplus | F::Hfv) => "AF",
+        (TableKind::Mbr, F::Bfs) => "EB",
+        (TableKind::Mbr, F::Ufs) => "A5",
+        (TableKind::Gpt, F::Fat | F::Ntfs | F::Exfat) => "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
+        (TableKind::Gpt, F::Ext | F::Ext3 | F::Ext4 | F::Xfs) => {
+            "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+        }
+        (TableKind::Gpt, F::Hfs | F::Hfsplus | F::Hfv) => "48465300-0000-11AA-AA11-00306543ECAC",
+        (TableKind::Gpt, F::Ufs) => "516E7CB4-6ECF-11D6-8FF8-00022D09712B",
+        (TableKind::Apm, F::Hfs | F::Hfsplus | F::Hfv) => "Apple_HFS",
+        (TableKind::Apm, F::Prodos) => "Apple_ProDOS",
+        (TableKind::Apm, F::Mfs) => "Apple_MFS",
+        (TableKind::Apm, F::Ufs) => "Apple_UFS",
+        (TableKind::Apm, F::Bfs) => "Be_BFS",
+        (TableKind::Sgi, F::Xfs) => "XFS",
+        (TableKind::Sgi, F::Efs) => "EFS",
+        (TableKind::Rdb, F::Pfs3) => "PFS\\3",
+        (TableKind::Rdb, F::Sfs) => "SFS\\0",
+        (TableKind::Rdb, F::Affs) => "DOS\\3",
+        (TableKind::Next, F::Ufs43) => "4.3BSD",
+        (TableKind::Atari, F::Fat) if size > 16 * 1024 * 1024 => "BGM",
+        (TableKind::Atari, F::Fat) => "GEM",
+        _ => return None,
+    };
+    Some(t.to_string())
 }
 
 impl BuilderRow {
@@ -58,6 +289,8 @@ impl BuilderRow {
 #[derive(Debug, Clone)]
 pub struct DiskBuilder {
     pub kind: TableKind,
+    /// The disk this layout started from, when it did.
+    pub donor: Option<Donor>,
     /// Size of the disk being built, in bytes.
     pub disk_size: u64,
     /// Alignment for partition starts; the same grammar as `--align`
@@ -74,6 +307,7 @@ impl Default for DiskBuilder {
     fn default() -> Self {
         Self {
             kind: TableKind::Mbr,
+            donor: None,
             disk_size: 0,
             // Blank means "the table's own default" — 1 MiB, or a cylinder on SGI.
             align_text: String::new(),
@@ -94,6 +328,109 @@ impl DiskBuilder {
             rows: vec![BuilderRow::new(kind, "rest")],
             ..Default::default()
         }
+    }
+
+    /// A builder laid out like `donor`: one row per donor partition at its own size, each
+    /// copying the donor's bytes.
+    pub fn from_donor(donor: Donor, disk_size: u64) -> Self {
+        let rows = donor
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| BuilderRow {
+                size_text: p.size.to_string(),
+                type_text: p.type_text.clone(),
+                copy_from: Some(i),
+                donor_part: Some(i),
+                ..Default::default()
+            })
+            .collect();
+        Self {
+            kind: donor.kind,
+            disk_size,
+            rows,
+            donor: Some(donor),
+            ..Default::default()
+        }
+    }
+
+    /// The donor keeps its head and its slots: rows cannot be added, removed or moved.
+    pub fn fixed_slots(&self) -> bool {
+        self.donor.as_ref().is_some_and(|d| d.keeps_head())
+    }
+
+    /// The donor's head patched for this layout, and where each row lands, for a label donor.
+    pub fn patched_head(&self) -> Result<Option<(Vec<u8>, Vec<Placed>)>> {
+        let Some(d) = self.donor.as_ref().filter(|d| d.keeps_head()) else {
+            return Ok(None);
+        };
+        if self.rows.len() != d.parts.len() {
+            anyhow::bail!("the donor's layout has {} slots", d.parts.len());
+        }
+        let (unit, tail) =
+            crate::partition::restore_patch::layout_limits(d.table_type.as_str(), &d.head);
+        let fixed: u64 = self
+            .rows
+            .iter()
+            .filter(|r| !r.is_rest())
+            .map(|r| parse_size(&r.size_text).unwrap_or(0).div_ceil(unit) * unit)
+            .sum();
+        let floor = d.parts.iter().map(|p| p.start_byte).min().unwrap_or(0);
+        let rest = self.disk_size.saturating_sub(fixed + floor + tail) / unit * unit;
+        let mut overrides = Vec::new();
+        for (i, (row, part)) in self.rows.iter().zip(d.parts.iter()).enumerate() {
+            let size = if row.is_rest() {
+                rest
+            } else {
+                parse_size(&row.size_text)
+                    .map_err(|e| anyhow::anyhow!("partition {}: {e:#}", i + 1))?
+            };
+            overrides.push(part_tables::PartitionSizeOverride::size_only(
+                part.index,
+                part.start_byte / 512,
+                part.size,
+                size,
+            ));
+        }
+        let patched = crate::partition::restore_patch::patch_head_for_restore(
+            d.table_type.as_str(),
+            d.head.as_slice(),
+            overrides.as_slice(),
+            self.disk_size,
+            &mut |_| {},
+        )?;
+        let placed = patched
+            .overrides
+            .iter()
+            .zip(d.parts.iter())
+            .zip(self.rows.iter())
+            .map(|((ov, part), row)| Placed {
+                start_lba: ov.effective_start_lba(),
+                size_bytes: ov.export_size,
+                type_text: part.type_text.clone(),
+                name: String::new(),
+                bootable: row.bootable,
+            })
+            .collect();
+        Ok(Some((patched.head, placed)))
+    }
+
+    /// The donor bytes each row copies: `(row, donor start byte, length)`, the length capped at
+    /// the row's planned size.
+    pub fn copies(&self, placed: &[Placed]) -> Vec<(usize, u64, u64)> {
+        let Some(d) = self.donor.as_ref() else {
+            return Vec::new();
+        };
+        self.rows
+            .iter()
+            .zip(placed.iter())
+            .enumerate()
+            .filter(|(_, (r, _))| r.source.is_none() && r.format.is_none())
+            .filter_map(|(i, (r, p))| {
+                let part = d.parts.get(r.copy_from?)?;
+                Some((i, part.start_byte, part.size.min(p.size_bytes)))
+            })
+            .collect()
     }
 
     /// Switch table type, re-stamping the default partition type on any row
@@ -198,24 +535,47 @@ impl DiskBuilder {
         if self.disk_size == 0 {
             anyhow::bail!("target size is unknown");
         }
+        if let Some((_, placed)) = self.patched_head()? {
+            return Ok(placed);
+        }
         if let Err(e) = provision::parse_align(&self.align_text) {
             if !self.align_text.trim().is_empty() {
                 return Err(e);
             }
         }
-        provision::place(
+        let mut placed = provision::place(
             &self.specs()?,
             self.kind,
             self.disk_size,
             self.align_bytes(),
             self.geometry,
-        )
+        )?;
+        if provision::bootable_rule(self.kind).is_some() {
+            for (p, row) in placed.iter_mut().zip(self.rows.iter()) {
+                p.bootable = row.bootable;
+            }
+        }
+        Ok(placed)
     }
 
     /// Source image per row, in the shape
     /// [`crate::model::provision_runner::ProvisionRequest`] wants.
     pub fn sources(&self) -> Vec<Option<PathBuf>> {
         self.rows.iter().map(|r| r.source.clone()).collect()
+    }
+
+    /// The filesystem to format per row, in the shape the build request wants.
+    pub fn formats(&self) -> Vec<Option<RowFormat>> {
+        self.rows
+            .iter()
+            .map(|r| {
+                if r.source.is_some() {
+                    None
+                } else {
+                    r.format.clone()
+                }
+            })
+            .collect()
     }
 
     /// Plan the layout and check every assigned source fits. Populates
@@ -232,6 +592,13 @@ impl DiskBuilder {
             }
         };
 
+        let boots = placed.iter().filter(|p| p.bootable).count();
+        if provision::bootable_rule(self.kind) == Some(true) && boots > 1 {
+            self.errors.push(format!(
+                "Only one {} partition can be marked bootable; {boots} are",
+                self.kind.label()
+            ));
+        }
         for (i, (row, p)) in self.rows.iter().zip(placed.iter()).enumerate() {
             if row.source.is_some() && row.source_size > p.size_bytes {
                 self.errors.push(format!(
@@ -240,6 +607,25 @@ impl DiskBuilder {
                     format_size(row.source_size),
                     format_size(p.size_bytes),
                 ));
+            }
+            let donor_part = row
+                .copy_from
+                .and_then(|k| self.donor.as_ref().and_then(|d| d.parts.get(k)));
+            if let (None, None, Some(part)) = (&row.source, &row.format, donor_part) {
+                if part.size > p.size_bytes {
+                    self.errors.push(format!(
+                        "Partition {}: the donor's {} is {}, more than the {} it would copy into",
+                        i + 1,
+                        part.type_name,
+                        format_size(part.size),
+                        format_size(p.size_bytes),
+                    ));
+                }
+            }
+            if let (None, Some(f)) = (&row.source, &row.format) {
+                if let Err(e) = f.fits(p.size_bytes).and_then(|()| f.check()) {
+                    self.errors.push(format!("Partition {}: {e}", i + 1));
+                }
             }
             if !row.type_text.trim().is_empty()
                 && !type_catalog::choices(self.kind).is_empty()
@@ -256,10 +642,12 @@ impl DiskBuilder {
 
         if self.errors.iter().all(|e| e.starts_with("Warning:")) {
             let filled = self.rows.iter().filter(|r| r.source.is_some()).count();
+            let formatted = self.formats().iter().filter(|f| f.is_some()).count();
             self.status = Some(format!(
-                "Ready: {} partition(s), {} with a source image.",
+                "Ready: {} partition(s), {} with a source image, {} formatted.",
                 placed.len(),
                 filled,
+                formatted,
             ));
             Some(placed)
         } else {

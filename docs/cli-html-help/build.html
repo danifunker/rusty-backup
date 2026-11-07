@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli build</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>build</span></nav>
+<h1><code>rb-cli build</code></h1>
+<p>Build a disk in one step: a partition table with each partition formatted, filled from an image or left empty, or one bare volume; to an image file or a device (`--yes`). The command-line form of the Build Disk tab: `build disk.img --size 2G --table mbr --partition 512M --partition rest --format 1=fat:DOS --format 2=ext4`</p>
+<h2>Usage</h2>
+<pre><code>Usage: build [OPTIONS] &lt;TARGET&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;TARGET&gt;</code></dt>
+<dd>The image file to create, or a device path (`/dev/sdX`, `/dev/diskN`, `\\.\PhysicalDriveN`) to build on. A device needs `--yes` and is built at its own size</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disk (or volume) size for an image target, e.g. `64M`, `2G`. Ignored for a device and for a fixed-geometry volume</dd>
+<dt><code>--table</code></dt>
+<dd>Partition table to write. Leave it out for one bare volume (give `--fs`)</dd>
+<dt><code>--partition</code></dt>
+<dd>A partition, in disk order: `SIZE[:TYPE[:NAME]]`, where SIZE is `20M` / `1G` / bytes or `rest`, and TYPE is the table's own type value (MBR byte, GPT GUID, `Apple_HFS`, `DOS\3`, ...). Repeat for each partition; the default is one `rest` partition</dd>
+<dt><code>--format</code></dt>
+<dd>Format partition N blank: `N=FS[:LABEL]`, where FS is a `new volume` / `new floppy` filesystem name (`fat`, `hfs`, `pfs3`, `ufs-solaris`, ...). The partition's type follows the filesystem unless the `--partition` spec gave one</dd>
+<dt><code>--fill</code></dt>
+<dd>Pour an image into partition N after the table is written: `N=PATH`. Any image Rusty Backup can read works</dd>
+<dt><code>--bootable</code></dt>
+<dd>Mark partition N bootable: the MBR active flag (one partition) or the RDB bootable flag. Repeatable on RDB</dd>
+<dt><code>--filesystem</code></dt>
+<dd>Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH` (repeatable). PATH is the handler's AmigaDOS load file (`L:PFS3`, `L:SmartFilesystem`); without one, a DosType the ROM lacks cannot mount unaided</dd>
+<dt><code>--mac-driver</code></dt>
+<dd>The Mac driver on an APM disk: `bundled` (the default: a donor's own driver if it has one, otherwise Apple SCSI 7.3.5), `none`, or the path of an Apple-formatted disk to take the driver from. The driver serves SCSI; a Mac with the disk on IDE won't mount it</dd>
+<dt><code>--align</code></dt>
+<dd>Partition-start alignment, e.g. `1M` or `63s`; blank uses the table's default</dd>
+<dt><code>--heads</code></dt>
+<dd>Heads for the cylinder-aligned tables (SGI, RDB, Sun, NeXT, Solaris x86)</dd>
+<dt><code>--sectors</code></dt>
+<dd>Sectors per track for the cylinder-aligned tables</dd>
+<dt><code>--fs</code></dt>
+<dd>With no `--table`: the filesystem of the one bare volume</dd>
+<dt><code>--from</code></dt>
+<dd>Start from this disk image's layout: its table, special partitions and their contents, at the new `--size`. Each partition is copied unless `--format N=FS` or `--empty N` says otherwise; `--partition SIZE` sets the sizes in order. A copied filesystem that can resize grows to its partition; one that can't keeps its size. A label (SGI, Sun, NeXT, RDB, AHDI, X68000) keeps its head region verbatim, resized for the new disk</dd>
+<dt><code>--empty</code></dt>
+<dd>With `--from`: leave partition N empty instead of copying it</dd>
+<dt><code>--preset</code></dt>
+<dd>Build a fixed bootable preset instead of a table or a volume: `x68k` (IPL, X68000 table, Human68k) or `sgi-efs` (volume header, EFS root). The same disks `new hd x68k` / `new hd sgi-efs` make</dd>
+<dt><code>--scsi</code></dt>
+<dd>`--preset x68k`: write the SCSI form (1024-byte sectors) rather than SASI</dd>
+<dt><code>--x68k-partitions</code></dt>
+<dd>`--preset x68k`: how many Human68k partitions, 1 to 8</dd>
+<dt><code>--system-disk</code></dt>
+<dd>`--preset x68k`: a Human68k system floppy cloned into partition 1</dd>
+<dt><code>--label</code></dt>
+<dd>With no `--table`: the volume label</dd>
+<dt><code>--geometry</code></dt>
+<dd>With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first</dd>
+<dt><code>--container</code></dt>
+<dd>Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing image file</dd>
+<dt><code>--yes</code></dt>
+<dd>Required to build on a device; everything on it is erased</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

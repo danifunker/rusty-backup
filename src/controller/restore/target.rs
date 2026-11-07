@@ -1,14 +1,13 @@
 //! The targets: each mode's device or image, the full-disk sizing form, the single-partition
-//! target scan, the new-disk table choice and Build Disk's target and plan.
+//! target scan and the new-disk table choice.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::source::finished;
 use super::{
-    purpose, AlignmentChoice, DiskBuilder, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType,
-    Picked, PlanSegment, RestoreController, SizeRow, Target, TargetPartition, TargetSlot,
+    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType, Picked, PlanSegment,
+    RestoreController, RestoreMode, RowCaveat, SizeRow, Target, TargetPartition, TargetSlot,
 };
-use crate::controller::{Effect, PickSpec};
 use crate::device::{DeviceIdentity, DiskDevice};
 use crate::model::job::{Job, Snapshot};
 use crate::model::source_scan::ScanFailure;
@@ -21,7 +20,6 @@ pub(super) struct TargetState {
     pub full: Target,
     pub single: Target,
     pub new_disk: Target,
-    pub build: Target,
     pub alignment: AlignmentChoice,
     pub custom_alignment: u32,
     pub expand: ExpandPlan,
@@ -32,13 +30,8 @@ pub(super) struct TargetState {
     pub sp_scan: Option<(DeviceIdentity, Job<TargetScan>)>,
     pub sp_scan_error: Option<String>,
     pub new_disk_choice: NewDiskChoice,
-    /// An image target's size, in the `rb-cli new hd --size` grammar.
-    pub build_size_text: String,
-    /// The partition plan, while Build Disk's editor is open.
-    pub builder: Option<DiskBuilder>,
-    /// The plan row a picked source image goes to, then its decoded-size probe.
-    pub build_source_row: Option<usize>,
-    pub build_source: Option<(usize, Job<(PathBuf, u64)>)>,
+    /// Put the bundled Mac driver on a disk whose backup lost its own.
+    pub install_mac_driver: bool,
 }
 
 impl Default for TargetState {
@@ -47,7 +40,6 @@ impl Default for TargetState {
             full: Target::new(true),
             single: Target::new(true),
             new_disk: Target::new(true),
-            build: Target::new(false),
             alignment: AlignmentChoice::Original,
             custom_alignment: 2048,
             expand: ExpandPlan::default(),
@@ -56,16 +48,13 @@ impl Default for TargetState {
             sp_part: None,
             sp_scan: None,
             sp_scan_error: None,
+            install_mac_driver: true,
             new_disk_choice: NewDiskChoice {
                 table: NewTableType::Mbr,
                 alignment: AlignmentChoice::Modern1MB,
                 custom_alignment: 2048,
                 bootable: false,
             },
-            build_size_text: "512M".to_string(),
-            builder: None,
-            build_source_row: None,
-            build_source: None,
         }
     }
 }
@@ -76,7 +65,6 @@ impl TargetState {
             TargetSlot::FullDisk => &self.full,
             TargetSlot::SinglePartition => &self.single,
             TargetSlot::NewDisk => &self.new_disk,
-            TargetSlot::BuildDisk => &self.build,
         }
     }
 
@@ -85,7 +73,6 @@ impl TargetState {
             TargetSlot::FullDisk => &mut self.full,
             TargetSlot::SinglePartition => &mut self.single,
             TargetSlot::NewDisk => &mut self.new_disk,
-            TargetSlot::BuildDisk => &mut self.build,
         }
     }
 
@@ -131,7 +118,6 @@ impl RestoreController {
             TargetSlot::FullDisk,
             TargetSlot::SinglePartition,
             TargetSlot::NewDisk,
-            TargetSlot::BuildDisk,
         ] {
             let t = self.targets.target_mut(slot);
             let Some(picked) = &t.device else {
@@ -250,6 +236,77 @@ impl RestoreController {
             self.partition_sizes(is_device).as_slice(),
             target,
         ))
+    }
+
+    /// The backup lost its Mac driver, so the form offers the bundled one.
+    pub fn mac_driver_missing(&self) -> bool {
+        self.mode == RestoreMode::FullDisk && self.loaded().is_some_and(|l| l.mac_driver_missing)
+    }
+
+    pub fn install_mac_driver(&self) -> bool {
+        self.targets.install_mac_driver
+    }
+
+    /// What each volume asks of the machine reading it, at the sizes chosen; worst first per row.
+    pub fn size_caveats(&self) -> Vec<RowCaveat> {
+        use crate::model::restore_plan::{plan_caveats, volume_caveats};
+        match self.mode {
+            RestoreMode::FullDisk => self.loaded().map_or_else(Vec::new, |loaded| {
+                let is_device = self.targets.full.is_device;
+                plan_caveats(
+                    loaded,
+                    &self.resolved_alignment(),
+                    self.partition_sizes(is_device).as_slice(),
+                    self.target_size(),
+                    self.targets.install_mac_driver,
+                )
+            }),
+            RestoreMode::SinglePartition | RestoreMode::NewDisk => {
+                let facts = if self.src.has_image() {
+                    self.src.image_facts
+                } else {
+                    let index = self.src.source_partition;
+                    self.size_rows()
+                        .iter()
+                        .find(|r| Some(r.index) == index)
+                        .and_then(|r| r.facts)
+                };
+                match self.partition_target_size() {
+                    Some(size) => volume_caveats(facts, size),
+                    None => Vec::new(),
+                }
+            }
+            RestoreMode::WriteImage => Vec::new(),
+        }
+    }
+
+    /// The partition a single-partition or new-disk restore fills, once its target is known.
+    fn partition_target_size(&self) -> Option<u64> {
+        if self.mode == RestoreMode::SinglePartition {
+            let index = self.targets.sp_part?;
+            let parts = &self.targets.sp_parts;
+            return parts
+                .iter()
+                .find(|p| p.index == index)
+                .map(|p| p.size_bytes);
+        }
+        let source = self.partition_source()?;
+        let t = &self.targets.new_disk;
+        let device_size = t.device.as_ref().map(|p| p.device.size_bytes);
+        let path = t
+            .device
+            .as_ref()
+            .map(|p| p.device.path.clone())
+            .or(t.image.clone())?;
+        let config = crate::model::restore_plan::new_disk_config(
+            &source,
+            path.as_path(),
+            t.is_device,
+            device_size.filter(|_| t.is_device),
+            &self.targets.new_disk_choice,
+        );
+        let disk = config.new_disk.as_ref().map(|d| d.disk_size_bytes)?;
+        Some(disk.saturating_sub(config.target_offset_bytes))
     }
 
     pub(super) fn resolved_alignment(&self) -> crate::restore::RestoreAlignment {
@@ -401,123 +458,5 @@ impl RestoreController {
             c.table,
             crate::model::restore_plan::new_disk_alignment_sectors(c.alignment, c.custom_alignment),
         )
-    }
-
-    // --- build disk ---------------------------------------------------------------------
-
-    pub fn build_size_text(&self) -> &str {
-        self.targets.build_size_text.as_str()
-    }
-
-    /// The typed image size, or why it does not parse.
-    pub fn build_size(&self) -> Result<u64, String> {
-        crate::partition::parse_size(self.targets.build_size_text.as_str())
-            .map_err(|e| format!("{e:#}"))
-    }
-
-    /// Build Disk's target as `(path, size)`, once complete.
-    pub fn build_target(&self) -> Option<(PathBuf, u64)> {
-        let t = &self.targets.build;
-        if t.is_device {
-            let p = t.device.as_ref()?;
-            Some((p.device.path.clone(), p.device.size_bytes))
-        } else {
-            let path = t.image.clone()?;
-            let size = self.build_size().ok()?;
-            (size > 0).then_some((path, size))
-        }
-    }
-
-    /// Build Disk's partition window content, while it is open.
-    pub fn build_view(&self) -> Option<crate::controller::partition_edit::BuildView> {
-        self.targets
-            .builder
-            .as_ref()
-            .map(crate::controller::partition_edit::build_view)
-    }
-
-    /// A row's source image is being measured.
-    pub fn build_source_probing(&self) -> Option<Snapshot> {
-        self.targets
-            .build_source
-            .as_ref()
-            .map(|(_, j)| j.snapshot())
-    }
-
-    /// An edit in Build Disk's partition window; a source pick asks for the file first.
-    pub(super) fn build_edit(
-        &mut self,
-        action: crate::controller::partition_edit::BuildAction,
-    ) -> Vec<Effect> {
-        use crate::controller::partition_edit::BuildAction;
-        let Some(builder) = self.targets.builder.as_mut() else {
-            return Vec::new();
-        };
-        if let BuildAction::PickRowSource(row) = action {
-            if row >= builder.rows.len() {
-                return Vec::new();
-            }
-            self.targets.build_source_row = Some(row);
-            let mut filters = vec![(
-                "Disk images".to_string(),
-                Self::ext(crate::model::file_types::DISK_IMAGE_EXTS),
-            )];
-            filters.push(("All Files".to_string(), vec!["*".to_string()]));
-            return vec![Effect::PickFile(PickSpec {
-                purpose: purpose::BUILD_SOURCE,
-                title: format!("Source image for partition {}", row + 1),
-                filters,
-                save: false,
-                file_name: String::new(),
-            })];
-        }
-        crate::controller::partition_edit::apply_build(builder, action);
-        Vec::new()
-    }
-
-    /// A row's source image was picked: measure its decoded size off the UI thread.
-    pub(super) fn build_source_picked(&mut self, path: PathBuf) {
-        let Some(row) = self.targets.build_source_row.take() else {
-            return;
-        };
-        let job = self.spawn("Measuring the source image...", move |_| {
-            let size = crate::model::source_reader::decoded_image_size(path.as_path()).unwrap_or(0);
-            Ok((path, size))
-        });
-        self.targets.build_source = Some((row, job));
-    }
-
-    pub(super) fn poll_build_source(&mut self) {
-        let Some(done) = self
-            .targets
-            .build_source
-            .as_ref()
-            .and_then(|(_, j)| finished(j))
-        else {
-            return;
-        };
-        let Some((row, _)) = self.targets.build_source.take() else {
-            return;
-        };
-        if let (Ok((path, size)), Some(builder)) = (done, self.targets.builder.as_mut()) {
-            crate::controller::partition_edit::set_row_source(builder, row, path, size);
-        }
-    }
-
-    pub fn builder_open(&self) -> bool {
-        self.targets.builder.is_some()
-    }
-
-    pub(super) fn build_define(&mut self) {
-        let Some((_, size)) = self.build_target() else {
-            return;
-        };
-        let kind = self
-            .targets
-            .builder
-            .as_ref()
-            .map(|b| b.kind)
-            .unwrap_or(crate::partition::type_catalog::TableKind::Mbr);
-        self.targets.builder = Some(DiskBuilder::new(kind, size));
     }
 }

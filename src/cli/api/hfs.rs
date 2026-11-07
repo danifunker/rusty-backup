@@ -13,9 +13,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::cli::io::{open_image_ro, open_image_rw};
-use crate::cli::parse::{parse_size, pick_block_size, split_mac_path, ZeroReader};
+use crate::cli::parse::{parse_size, split_mac_path, ZeroReader};
 use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
-use fs_mac::hfs::{create_blank_hfs_sized, validate_hfs_integrity, HfsFilesystem};
+use fs_mac::hfs::{validate_hfs_integrity, HfsFilesystem};
 use part_tables::apm::Apm;
 
 #[derive(Subcommand, Debug)]
@@ -270,111 +270,23 @@ pub(crate) fn cmd_new(
     name: &str,
     block_size: Option<u32>,
 ) -> Result<()> {
-    cmd_new_sized(image, size_arg, name, block_size, None, None)
-}
-
-/// Variant of [`cmd_new`] that exposes B-tree sizing overrides. When
-/// `catalog_bytes` / `extents_bytes` are `None`, falls back to
-/// [`fs_mac::hfs::default_btree_sizes`] (~0.5 % of volume, clump-
-/// aligned, 24-block floor) so steady-state file activity doesn't
-/// trigger B-tree extensions.
-pub(crate) fn cmd_new_sized(
-    image: PathBuf,
-    size_arg: &str,
-    name: &str,
-    block_size: Option<u32>,
-    catalog_bytes: Option<u32>,
-    extents_bytes: Option<u32>,
-) -> Result<()> {
     let size = parse_size(size_arg)?;
-    if size < 1024 {
-        bail!("size {size} is too small for an HFS volume");
-    }
-    let block_size = match block_size {
-        Some(bs) => {
-            if bs == 0 || bs % 512 != 0 {
-                bail!("block-size must be a non-zero multiple of 512 (got {bs})");
-            }
-            bs
-        }
-        None => pick_block_size(size),
+    let opts = crate::model::format::FormatOptions {
+        label: name.to_string(),
+        block_size,
+        ..Default::default()
     };
-
-    let (default_cat, default_ext) = fs_mac::hfs::default_btree_sizes(size, block_size);
-    let catalog_bytes = catalog_bytes.unwrap_or(default_cat);
-    let extents_bytes = extents_bytes.unwrap_or(default_ext);
-
-    let bytes = create_blank_hfs_sized(size, block_size, name, extents_bytes, catalog_bytes)
-        .map_err(|e| anyhow!("failed to format HFS volume: {e}"))?;
-
-    crate::compat::write_sparse(&image, &bytes)
-        .with_context(|| format!("writing {}", image.display()))?;
-
-    println!(
-        "Created HFS volume {} ({} bytes, block_size={})",
-        image.display(),
-        bytes.len(),
-        block_size
-    );
-    Ok(())
-}
-
-/// Create a fresh blank **HFS+ / HFSX** volume (a bare single volume, no
-/// partition map) at `image`. `case_sensitive` selects HFSX; `min_catalog`
-/// is a *floor* on the catalog B-tree size in bytes — set it small to make
-/// the catalog easy to outgrow (exercises the §4b fork-grow path with a few
-/// thousand `put`s instead of hundreds of thousands).
-pub(crate) fn cmd_new_hfsplus_sized(
-    image: PathBuf,
-    size_arg: &str,
-    name: &str,
-    block_size: Option<u32>,
-    case_sensitive: bool,
-    min_catalog: Option<u32>,
-) -> Result<()> {
-    let size = parse_size(size_arg)?;
-    // HFS+ pins its node size at 4096, so the allocation block size must be a
-    // power of two in [512, 4096]. Default to 4096 (Apple's default for any
-    // non-trivial volume); the volume must hold at least 64 blocks.
-    let block_size = match block_size {
-        Some(bs) => {
-            if !bs.is_power_of_two() || !(512..=4096).contains(&bs) {
-                bail!("HFS+ block-size must be a power of two in [512, 4096] (got {bs})");
-            }
-            bs
-        }
-        None => 4096,
-    };
-    if size < block_size as u64 * 64 {
-        bail!(
-            "size {size} is too small for an HFS+ volume (need at least {} bytes \
-             for 64 allocation blocks of {block_size})",
-            block_size as u64 * 64
-        );
-    }
-
-    let bytes = fs_mac::hfsplus::create_blank_hfsplus_sized(
+    let done = crate::model::format::format_to_file(
+        image.as_path(),
         size,
-        block_size,
-        name,
-        case_sensitive,
-        min_catalog.unwrap_or(0),
-        0,
-    );
-
-    crate::compat::write_sparse(&image, &bytes)
-        .with_context(|| format!("writing {}", image.display()))?;
-
+        crate::model::format::FsKind::Hfs,
+        &opts,
+    )?;
     println!(
-        "Created {} volume {} ({} bytes, block_size={}{})",
-        if case_sensitive { "HFSX" } else { "HFS+" },
+        "Created HFS volume {} ({} bytes, {})",
         image.display(),
-        bytes.len(),
-        block_size,
-        match min_catalog {
-            Some(c) => format!(", min-catalog={c}"),
-            None => String::new(),
-        }
+        done.len,
+        done.summary
     );
     Ok(())
 }

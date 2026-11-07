@@ -43,7 +43,7 @@ pub struct NewNextCdromArgs {
     pub from_dir: Option<PathBuf>,
 
     /// With `--from-dir`: unpack tarballs (`.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, pre-POSIX
-    /// tars included) into a directory named after each, instead of copying them.
+    /// tars included), ZIP and classic Mac archives into a directory named after each.
     #[arg(long = "expand-archives", requires = "from_dir")]
     pub expand_archives: bool,
 
@@ -51,6 +51,11 @@ pub struct NewNextCdromArgs {
     /// With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files.
     #[arg(long = "expand-gunzip", requires = "from_dir")]
     pub expand_gunzip: bool,
+
+    /// With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`,
+    /// `.hfv`, ...) into a folder named after each, forks included, instead of the image.
+    #[arg(long = "expand-images", requires = "from_dir")]
+    pub expand_images: bool,
 
     /// With `--expand-archives`: unpack every archive into the volume root, not one folder each.
     /// Entries that already exist are skipped unless `--force` is given.
@@ -149,6 +154,7 @@ fn import_options(args: &NewNextCdromArgs) -> crate::fs::dir_import::DirImportOp
         expand_archives: args.expand_archives,
         flatten_archives: args.flatten_folders,
         expand_gunzip: args.expand_gunzip,
+        expand_disk_images: args.expand_images,
     }
 }
 
@@ -181,7 +187,7 @@ fn resolve_disc_size(args: &NewNextCdromArgs) -> Result<u64> {
     log_stderr(format!(
         "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disc",
         bytes / (1024 * 1024),
-        if args.expand_archives || args.expand_gunzip {
+        if args.expand_archives || args.expand_gunzip || args.expand_images {
             " (measured as it will land)"
         } else {
             ""

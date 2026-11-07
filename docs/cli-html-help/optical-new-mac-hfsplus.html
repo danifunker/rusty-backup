@@ -22,7 +22,11 @@
 <dt><code>--from-dir</code></dt>
 <dd>Populate the disc from this host directory after formatting it. The directory's *contents* land at the volume root</dd>
 <dt><code>--expand-archives</code></dt>
-<dd>With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to</dd>
+<dd>With `--from-dir`: unpack archives found in the tree into a directory named after each, instead of copying them in verbatim. Classic Mac archives (`.sit`, `.sea`, `.cpt`, `.hqx`, `.mar`, Mac `.zip`) land with both forks and their Finder type/creator intact — a disc the target Mac can run straight off, rather than one it has to unstuff first. Tar archives are unpacked too. `--size auto` measures what they unpack to</dd>
+<dt><code>--expand-gunzip</code></dt>
+<dd>With `--from-dir`: strip the gzip layer off `.gz` files (a `.tgz` lands as `.tar`). With `--expand-archives` too, tarballs unpack fully and this takes the other `.gz` files</dd>
+<dt><code>--expand-images</code></dt>
+<dd>With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image</dd>
 <dt><code>--force</code></dt>
 <dd>With `--from-dir`: overwrite entries that already exist rather than failing on the collision</dd>
 <dt><code>--include-appledouble</code></dt>
