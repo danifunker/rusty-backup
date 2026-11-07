@@ -296,6 +296,7 @@ impl BackupController {
         self.found.table_desc = Some(scan.table_desc);
         for probe in scan.probes {
             let idx = probe.index;
+            let no = idx + 1;
             let type_str = probe.type_string.as_deref();
             match probe.result {
                 crate::fs::MinimumResult::Computed {
@@ -316,7 +317,7 @@ impl BackupController {
                     if let Some(min) = mins.effective(idx, probe.type_byte, type_str) {
                         let suffix = mins.result_suffix(idx, fragmentation_percent);
                         self.info(format!(
-                            "Partition {idx}: minimum size {} (original {}){suffix}",
+                            "Partition {no}: minimum size {} (original {}){suffix}",
                             format_size(min),
                             format_size(probe.size_bytes),
                         ));
@@ -324,7 +325,7 @@ impl BackupController {
                 }
                 crate::fs::MinimumResult::Deferred { fs_name } => {
                     self.info(format!(
-                        "Partition {idx}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
+                        "Partition {no}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
                     ));
                     self.found.deferred.insert(idx, fs_name);
                 }
@@ -383,7 +384,8 @@ impl BackupController {
                     use_sector_aligned: path.as_deref().map(is_device_path).unwrap_or(false),
                 }),
                 None => Err(format!(
-                    "Cannot calculate minimum size for partition {index}: no open source handle",
+                    "Cannot calculate minimum size for partition {}: no open source handle",
+                    index + 1
                 )),
             },
         }
@@ -405,7 +407,8 @@ impl BackupController {
         let remote = self.remote_active();
         if remote && !self.remote_connected() {
             self.error(format!(
-                "Cannot calculate minimum size for partition {index}: remote source not connected",
+                "Cannot calculate minimum size for partition {}: remote source not connected",
+                index + 1
             ));
             return;
         }
@@ -425,13 +428,15 @@ impl BackupController {
                 )
             });
             self.info(format!(
-                "Calculating minimum size for partition {index} ({fs_name}) over the wire...",
+                "Calculating minimum size for partition {} ({fs_name}) over the wire...",
+                index + 1
             ));
             part.byte_offset()
         } else {
             let fs_name = deferred.unwrap_or("unknown");
             self.info(format!(
-                "Calculating minimum size for partition {index} ({fs_name})...",
+                "Calculating minimum size for partition {} ({fs_name})...",
+                index + 1
             ));
             part.start_lba * 512
         };
@@ -490,7 +495,8 @@ impl BackupController {
                     self.min_found(idx, in_place, defrag, frag, phase)
                 }
                 Some(Err(err)) => self.error(format!(
-                    "Minimum size calculation failed for partition {idx}: {err}",
+                    "Minimum size calculation failed for partition {}: {err}",
+                    idx + 1
                 )),
                 None => {}
             }
@@ -522,13 +528,15 @@ impl BackupController {
             Some(min) => {
                 let suffix = mins.result_suffix(idx, frag);
                 self.info(format!(
-                    "Partition {idx}: minimum size {} (computed){suffix}",
+                    "Partition {}: minimum size {} (computed){suffix}",
+                    idx + 1,
                     format_size(min),
                 ));
                 self.run.min_found(idx, min);
             }
             None => self.info(format!(
-                "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {phase})",
+                "Partition {}: filesystem could not be opened for minimum-size calculation (last phase: {phase})",
+                idx + 1,
             )),
         }
     }
@@ -561,7 +569,11 @@ fn min_size_in_job(
         // Each phase is logged so a long HFS+ catalog walk does not look like a hang.
         for phase in s.phase_log.drain(..) {
             if !phase.is_empty() {
-                push_log(sink, LogLevel::Info, format!("Partition {index}: {phase}"));
+                push_log(
+                    sink,
+                    LogLevel::Info,
+                    format!("Partition {}: {phase}", index + 1),
+                );
             }
         }
         ctx.set_phase(s.phase.as_str());

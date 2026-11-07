@@ -323,11 +323,13 @@ impl InspectController {
                     use_sector_aligned: false,
                 }),
                 Err(e) => Err(format!(
-                    "Cannot calculate minimum size for partition {index}: {e}"
+                    "Cannot calculate minimum size for partition {}: {e}",
+                    index + 1
                 )),
             },
             None => Err(format!(
-                "Cannot calculate minimum size for partition {index}: no open source handle"
+                "Cannot calculate minimum size for partition {}: no open source handle",
+                index + 1
             )),
         }
     }
@@ -359,7 +361,8 @@ impl InspectController {
             .copied()
             .unwrap_or("unknown");
         self.info(format!(
-            "Calculating minimum size for partition {index} ({fs_name})..."
+            "Calculating minimum size for partition {} ({fs_name})...",
+            index + 1
         ));
         let req = MinSizeRequest {
             source,
@@ -389,13 +392,14 @@ impl InspectController {
                 continue;
             };
             self.found.deferred.remove(&idx);
+            let no = idx + 1;
             match finished(&job) {
                 Some(Ok((Some(min), defrag, _))) => self.min_found(idx, min, defrag),
                 Some(Ok((None, _, phase))) => self.info(format!(
-                    "Partition {idx}: filesystem could not be opened for minimum-size calculation (last phase: {phase})",
+                    "Partition {no}: filesystem could not be opened for minimum-size calculation (last phase: {phase})",
                 )),
                 Some(Err(err)) => self.error(format!(
-                    "Minimum size calculation failed for partition {idx}: {err}",
+                    "Minimum size calculation failed for partition {no}: {err}",
                 )),
                 None => {}
             }
@@ -403,6 +407,7 @@ impl InspectController {
     }
 
     fn min_found(&mut self, idx: usize, min: u64, defrag: Option<u64>) {
+        let no = idx + 1;
         let part_size = self
             .found
             .partitions
@@ -416,13 +421,13 @@ impl InspectController {
             Some(d) => {
                 self.found.defrag_min_sizes.insert(idx, d);
                 self.info(format!(
-                    "Partition {idx}: minimum size {} (computed); defragmented {}",
+                    "Partition {no}: minimum size {} (computed); defragmented {}",
                     format_size(clamped),
                     format_size(d),
                 ));
             }
             None => self.info(format!(
-                "Partition {idx}: minimum size {} (computed)",
+                "Partition {no}: minimum size {} (computed)",
                 format_size(clamped),
             )),
         }
@@ -513,12 +518,13 @@ impl InspectController {
                             part.type_name = new_name;
                             self.layout_generation += 1;
                         }
-                        self.info(format!("Partition {idx} label: {label}"));
+                        self.info(format!("Partition {} label: {label}", idx + 1));
                     }
                 }
                 Some(Ok(None)) | None => {}
                 Some(Err(err)) => self.warn(format!(
-                    "Volume label probe failed for partition {idx}: {err}",
+                    "Volume label probe failed for partition {}: {err}",
+                    idx + 1
                 )),
             }
         }
@@ -541,7 +547,11 @@ fn min_size_in_job(
     crate::model::worker::wait_spawned(job, &status, |s, ctx| {
         for phase in s.phase_log.drain(..) {
             if !phase.is_empty() {
-                push_log(sink, LogLevel::Info, format!("Partition {index}: {phase}"));
+                push_log(
+                    sink,
+                    LogLevel::Info,
+                    format!("Partition {}: {phase}", index + 1),
+                );
             }
         }
         ctx.set_phase(s.phase.as_str());
