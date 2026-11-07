@@ -8,8 +8,11 @@
 //! `model::format`, and the build is one job over `model::provision_runner`. The CLI's `rb-cli
 //! build` fills the same request without the steps. See docs/build_disk_plan.md § 7.
 
+mod options;
 #[cfg(test)]
 mod tests;
+
+pub use options::{OptionEdit, AFFS_VARIANTS, SECTOR_SIZES};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -127,6 +130,7 @@ pub mod purpose {
 pub mod ids {
     pub const STEP: &str = "build_disk.step";
     pub const KIND: &str = "build_disk.kind";
+    pub const OUTPUT_KIND: &str = "build_disk.output_kind";
     pub const OUTPUT_DEVICE: &str = "build_disk.output_device";
     pub const OUTPUT_IMAGE: &str = "build_disk.output_image";
     pub const SIZE: &str = "build_disk.size";
@@ -140,6 +144,66 @@ pub mod ids {
     pub const CREATE: &str = "build_disk.create";
     pub const CANCEL: &str = "build_disk.cancel";
     pub const BUILD_ANOTHER: &str = "build_disk.build_another";
+    pub const OPEN_INSPECT: &str = "build_disk.open_inspect";
+    pub const CONTAINER: &str = "build_disk.container";
+    pub const PICK_IMAGE: &str = "build_disk.pick_image";
+    pub const DONOR: &str = "build_disk.donor";
+    pub const DONOR_BLANK: &str = "build_disk.donor_blank";
+    pub const ALIGN: &str = "build_disk.align";
+    pub const HEADS: &str = "build_disk.heads";
+    pub const SECTORS: &str = "build_disk.sectors";
+    pub const PRESET: &str = "build_disk.preset";
+    pub const X68K_SCSI: &str = "build_disk.x68k_scsi";
+    pub const X68K_PARTS: &str = "build_disk.x68k_parts";
+    pub const SYSTEM_DISK: &str = "build_disk.system_disk";
+    pub const SYSTEM_DISK_CLEAR: &str = "build_disk.system_disk_clear";
+    pub const SGI_LABEL: &str = "build_disk.sgi_label";
+    pub const ROW_SIZE: &str = "build_disk.row_size";
+    pub const ROW_TYPE: &str = "build_disk.row_type";
+    pub const ROW_PICK_TYPE: &str = "build_disk.row_pick_type";
+    pub const ROW_NAME: &str = "build_disk.row_name";
+    pub const ROW_BOOT: &str = "build_disk.row_boot";
+    pub const ROW_IMAGE: &str = "build_disk.row_image";
+    pub const ROW_CLEAR: &str = "build_disk.row_clear";
+    pub const ROW_UP: &str = "build_disk.row_up";
+    pub const ROW_DOWN: &str = "build_disk.row_down";
+    pub const ROW_REMOVE: &str = "build_disk.row_remove";
+    pub const ADD_ROW: &str = "build_disk.add_row";
+    pub const ADD_HANDLER: &str = "build_disk.add_handler";
+    pub const REMOVE_HANDLER: &str = "build_disk.remove_handler";
+    pub const MAC_DRIVER: &str = "build_disk.mac_driver";
+    pub const MAC_DRIVER_DISK: &str = "build_disk.mac_driver_disk";
+    pub const OPTION: &str = "build_disk.option";
+}
+
+/// The text every view shows beside a control.
+pub mod hints {
+    pub const CONTAINER: &str = "The disk is built raw, then encoded into this container. The \
+         file name's extension picks one when you save.";
+    pub const DEVICE: &str = "An SD or CF card in a reader, a USB stick, or another disk";
+    pub const DEVICE_WARNING: &str =
+        "Building erases everything on the device. The disk is built at the device's own size.";
+    pub const SIZE: &str = "Accepts K / M / G suffixes, e.g. 512M or 2G.";
+    pub const FIXED_SIZE: &str = "This filesystem has a fixed size; no size to choose.";
+    pub const DONOR: &str = "Take the table, its special partitions and their contents from \
+         another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
+         volume header or boot blocks verbatim.";
+    pub const ALIGN: &str = "Partition starts are rounded up to this. Blank uses the table \
+         default. Accepts 1M / 63s (sectors).";
+    pub const SYSTEM_DISK: &str = "A Human68k system floppy cloned into partition 1";
+    pub const NO_SYSTEM_DISK: &str = "(none: seed files)";
+    pub const ROW_SIZE: &str = "20M / 1G / bytes, or `rest` for whatever is left";
+    pub const ROW_FIXED_TYPE: &str = "From the donor's label; the label keeps it";
+    pub const ROW_PICK_TYPE: &str = "Choose a well-known partition type";
+    pub const ROW_COPY: &str = "The donor partition's bytes, verbatim";
+    pub const ROW_IMAGE: &str = "Pour an image into this partition after the table is written";
+    pub const BOOT_MBR: &str = "The MBR active flag: the BIOS boots this partition";
+    pub const BOOT_RDB: &str = "The RDB bootable flag: Kickstart may boot this partition";
+    pub const HANDLER: &str = "The AmigaDOS load file, e.g. L:PFS3 or L:SmartFilesystem; the \
+         strap loads it from the RDB";
+    pub const MAC_DRIVER: &str = "A Mac mounts an APM disk only through a driver on the disk. \
+         Bundled uses a donor's own driver when it has one";
+    pub const FAT32: &str = "An EFI System Partition is FAT32";
 }
 
 /// The wizard's steps, in the order they are walked.
@@ -194,6 +258,23 @@ impl DiskKind {
             DiskKind::Partitioned => "Partitioned disk",
             DiskKind::Volume => "Single volume (no partition table)",
             DiskKind::Preset => "Bootable preset (X68000, SGI IRIX)",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            DiskKind::Partitioned => {
+                "A partition table (MBR, GPT, APM, RDB, SGI, Sun, NeXT, ...) with partitions you \
+                 size, each formatted, filled from an image, or left empty."
+            }
+            DiskKind::Volume => {
+                "One filesystem across the whole disk with no partition table: a floppy, a \
+                 superfloppy, or a bare volume for an emulator."
+            }
+            DiskKind::Preset => {
+                "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or an SGI \
+                 IRIX disk with its volume header and an EFS root."
+            }
         }
     }
 }
@@ -299,7 +380,7 @@ pub enum BuildDiskAction {
     },
     Create,
     Cancel,
-    /// Back to the start, keeping the choices.
+    /// Back to the start, keeping the choices but the output file, which the last build wrote.
     BuildAnother,
 }
 
@@ -434,6 +515,33 @@ impl BuildDiskController {
         self.device.as_ref().map(|(r, _)| *r)
     }
 
+    /// "Refresh Devices" replaced the list: the target follows its own disk, and never another one.
+    pub fn reconcile_devices(&mut self, devices: &[DiskDevice]) {
+        if self.is_running() {
+            return;
+        }
+        let Some((row, device)) = &self.device else {
+            return;
+        };
+        let identity = device.identity();
+        if devices.get(*row).map(DiskDevice::identity) == Some(identity.clone()) {
+            return;
+        }
+        match devices.iter().position(|d| d.identity() == identity) {
+            Some(moved) => self.device = Some((moved, devices[moved].clone())),
+            None => {
+                let gone = device.display_name();
+                self.device = None;
+                self.confirm_text.clear();
+                self.push(
+                    LogLevel::Warning,
+                    format!("{gone} is no longer listed, so it is no longer the build target."),
+                );
+            }
+        }
+        self.sync_size();
+    }
+
     pub fn image(&self) -> Option<&Path> {
         self.image.as_deref()
     }
@@ -475,6 +583,18 @@ impl BuildDiskController {
         crate::model::format::format_into(&mut cur, 0, self.volume.kind, &self.volume.opts)
             .map(|d| d.len)
             .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The sizes a volume's filesystem takes, for the Disk step; a fixed size has none.
+    pub fn volume_size_range(&self) -> Option<String> {
+        let caps = self.volume.kind.caps();
+        (!caps.fixed_size).then(|| {
+            format!(
+                "{} to {}",
+                format_size(caps.min_size),
+                format_size(caps.max_buildable())
+            )
+        })
     }
 
     /// The table and rows, as the partition editor draws them.
@@ -985,7 +1105,20 @@ impl BuildDiskController {
             })];
         }
         if let BuildAction::SetKind(kind) = action {
+            let auto: Vec<bool> = (0..self.builder.rows.len())
+                .map(|i| self.row_type_is_suggested(i))
+                .collect();
+            let sizes = self.planned_sizes();
             self.builder.set_kind(kind);
+            for (i, r) in self.builder.rows.iter_mut().enumerate() {
+                if let (true, Some(f)) = (auto[i], r.format.as_ref()) {
+                    let size = sizes.get(i).copied().unwrap_or(0);
+                    r.type_text = crate::model::disk_builder::suggested_type(kind, f.kind, size)
+                        .unwrap_or_else(|| {
+                            crate::partition::provision::default_type(kind).to_string()
+                        });
+                }
+            }
             return Vec::new();
         }
         partition_edit::apply_build(&mut self.builder, action);
@@ -1042,14 +1175,27 @@ impl BuildDiskController {
         }
     }
 
+    fn planned_sizes(&self) -> Vec<u64> {
+        let placed = self.builder.plan().unwrap_or_default();
+        placed.iter().map(|p| p.size_bytes).collect()
+    }
+
+    /// The row's type is the one its filesystem proposed, so it is ours to change, not the user's.
+    fn row_type_is_suggested(&self, row: usize) -> bool {
+        let size = self.planned_sizes().get(row).copied().unwrap_or(0);
+        let Some(r) = self.builder.rows.get(row) else {
+            return false;
+        };
+        let fs = r.format.as_ref().map(|f| f.kind);
+        let kind = self.builder.kind;
+        fs.and_then(|fs| crate::model::disk_builder::suggested_type(kind, fs, size))
+            .is_some_and(|t| t == r.type_text.trim())
+    }
+
     fn set_row_fs(&mut self, row: usize, fs: Option<FsKind>) {
         let kind = self.builder.kind;
-        let size = self
-            .builder
-            .plan()
-            .ok()
-            .and_then(|p| p.get(row).map(|p| p.size_bytes))
-            .unwrap_or(0);
+        let size = self.planned_sizes().get(row).copied().unwrap_or(0);
+        let suggested = self.row_type_is_suggested(row);
         let Some(r) = self.builder.rows.get_mut(row) else {
             return;
         };
@@ -1063,10 +1209,11 @@ impl BuildDiskController {
                 if let Some(label) = r.format.as_ref().and_then(|old| typed_label(old, fs)) {
                     f.opts.label = label;
                 }
-                // A default or donor type follows the filesystem; one the user typed stays.
+                // A default, donor or proposed type follows the filesystem; one the user typed stays.
                 if r.type_text.trim().is_empty()
                     || r.type_text.trim() == crate::partition::provision::default_type(kind)
                     || r.donor_part.is_some()
+                    || suggested
                 {
                     if let Some(t) = crate::model::disk_builder::suggested_type(kind, fs, size) {
                         r.type_text = t;
@@ -1275,6 +1422,8 @@ impl Controller for BuildDiskController {
                     self.outcome = None;
                     self.finished = None;
                     self.confirm_text.clear();
+                    // Asked for again: the save picker is what warns before an overwrite.
+                    self.image = None;
                     self.step = Step::Kind;
                 }
             }

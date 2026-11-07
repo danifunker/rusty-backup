@@ -18,7 +18,7 @@ use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
     BuildDiskController, DiskKind, FormatOptions, FsKind, FsOption, MacDriver, NoNotify,
-    PresetKind, RowContent, Step, TableKind,
+    OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -259,11 +259,7 @@ impl BuildDiskState {
                     if t.caps.label_max > 0 {
                         r.push(Row::Label(t.row));
                     }
-                    for o in t.caps.options {
-                        if !matches!(o, FsOption::BtreeSizes | FsOption::MinCatalog) {
-                            r.push(Row::Opt(t.row, *o));
-                        }
-                    }
+                    r.extend(t.fields().into_iter().map(|o| Row::Opt(t.row, o)));
                 }
                 r
             }
@@ -330,7 +326,6 @@ impl BuildDiskState {
 
     /// A finished text edit lands on its row.
     fn commit(&mut self, row: Row, text: String) {
-        let clamp32 = |v: Option<u64>| v.map(|v| v.min(u64::from(u32::MAX)) as u32);
         match row {
             Row::OutputImage => {
                 let path = (!text.trim().is_empty()).then(|| std::path::PathBuf::from(text.trim()));
@@ -375,23 +370,14 @@ impl BuildDiskState {
                     return;
                 };
                 let Some(mut o) = self.opts_of(r) else { return };
-                match opt {
-                    FsOption::BlockSize => o.block_size = clamp32(v),
-                    FsOption::Inodes => {
-                        o.inodes = v;
-                        if v.is_some() {
-                            o.bytes_per_inode = None;
-                        }
-                    }
-                    FsOption::BytesPerInode => {
-                        o.bytes_per_inode = v;
-                        if v.is_some() {
-                            o.inodes = None;
-                        }
-                    }
-                    FsOption::ClusterSize => o.cluster_bytes = clamp32(v),
+                let edit = match opt {
+                    FsOption::BlockSize => OptionEdit::BlockSize(v),
+                    FsOption::Inodes => OptionEdit::Inodes(v),
+                    FsOption::BytesPerInode => OptionEdit::BytesPerInode(v),
+                    FsOption::ClusterSize => OptionEdit::ClusterSize(v),
                     _ => return,
-                }
+                };
+                edit.apply(&mut o);
                 self.set_opts(r, o);
             }
             Row::Confirm => self.act(BuildDiskAction::SetConfirmText(text)),
@@ -495,7 +481,8 @@ impl BuildDiskState {
                     FsOption::Fat32 => o.fat32 = !o.fat32,
                     FsOption::CaseSensitive => o.case_sensitive = !o.case_sensitive,
                     FsOption::AffsVariant => {
-                        o.affs_variant = cycle(&[0u8, 1, 2, 3, 4, 5, 6, 7], o.affs_variant, forward)
+                        let all = AFFS_VARIANTS.map(|v| v.0);
+                        o.affs_variant = cycle(&all, o.affs_variant, forward)
                     }
                     FsOption::CpmPreset => {
                         let all = cpm_presets();
@@ -517,12 +504,8 @@ impl BuildDiskState {
                         o.geometry = Some(cycle(all.as_slice(), cur, forward).to_string());
                     }
                     FsOption::SectorSize => {
-                        let s = cycle(
-                            &[512u32, 1024, 2048, 4096],
-                            o.sector_size.unwrap_or(512),
-                            forward,
-                        );
-                        o.sector_size = (s != 512).then_some(s);
+                        let s = cycle(&SECTOR_SIZES, o.sector_size.unwrap_or(512), forward);
+                        OptionEdit::SectorSize(s).apply(&mut o);
                     }
                     _ => return false,
                 }
@@ -691,6 +674,7 @@ impl App {
 
     pub(super) fn build_disk_tick(&mut self) {
         if let Some(s) = self.build_disk.as_mut() {
+            s.ctl.reconcile_devices(self.shell.devices());
             s.tick();
         }
     }
@@ -868,16 +852,9 @@ impl App {
                     v.geometry.map(|g| g.1).unwrap_or(0).to_string(),
                 ),
                 Row::VolumeFs => {
-                    let caps = c.volume_fs().caps();
-                    let range = if caps.fixed_size {
-                        "fixed size".to_string()
-                    } else {
-                        format!(
-                            "{} to {}",
-                            format_size(caps.min_size),
-                            format_size(caps.max_buildable())
-                        )
-                    };
+                    let range = c
+                        .volume_size_range()
+                        .unwrap_or_else(|| "fixed size".to_string());
                     (
                         "Filesystem".into(),
                         format!("< {} >  {range}", c.volume_fs().display_name()),

@@ -1098,6 +1098,7 @@ impl Target for BuildDiskTarget {
                 A::Table(BuildAction::SetRowSize { row, text })
             }
             "AddRow" => A::Table(BuildAction::AddRow),
+            "BuildAnother" => A::BuildAnother,
             "RowFs" => {
                 let (row, id) = row_arg(arg)?;
                 let fs = match id.as_str() {
