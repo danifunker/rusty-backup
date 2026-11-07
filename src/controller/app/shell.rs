@@ -359,6 +359,11 @@ impl AppController {
 }
 
 /// The one-line notice a tab shows while another tab's job locks its controls.
+/// This build's version, as the shells show it.
+pub fn app_version() -> &'static str {
+    env!("APP_VERSION")
+}
+
 pub fn busy_elsewhere_notice(tab: &str) -> String {
     format!("A disk job is running ({tab}); start controls unlock when it finishes.")
 }

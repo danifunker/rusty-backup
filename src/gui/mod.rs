@@ -45,7 +45,7 @@ use restore_tab::RestoreTab;
 use rusty_backup::controller::app::{
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate, AppAction,
     AppController, AppTab, DropRoute, DropTargets, ElevationGate, InstallState, RecentHandle,
-    RecentMode, ShareStep, UpdateInfo,
+    RecentMode, ShareStep,
 };
 use rusty_backup::controller::{Controller, Effect};
 use settings_dialog::SettingsDialog;
@@ -276,7 +276,7 @@ impl RustyBackupApp {
     /// release asset this offers in-app "Download & Install Update" (download
     /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
     /// or a missing asset) it opens the releases page in a browser.
-    fn show_update_actions(&mut self, ui: &mut egui::Ui, info: &UpdateInfo) {
+    fn show_update_actions(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
         let mut view_release = false;
         if self.app.can_install_update() {
@@ -324,7 +324,7 @@ impl RustyBackupApp {
             view_release = ui.button("View Release").clicked();
         }
         if view_release {
-            let _ = webbrowser::open(&info.releases_url);
+            actions.push(AppAction::ViewRelease);
         }
         for a in actions {
             let fx = self.app.apply(a);
@@ -560,7 +560,7 @@ impl eframe::App for RustyBackupApp {
         }
 
         // Update notification banner (if update available and not dismissed).
-        if let Some(info) = self.app.update_banner().cloned() {
+        if self.app.update_banner().is_some() {
             egui::Panel::top("update_banner").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -568,11 +568,8 @@ impl eframe::App for RustyBackupApp {
                             .color(theme::warning(ui.visuals()))
                             .strong(),
                     );
-                    ui.label(format!(
-                        "available: v{} -> v{}",
-                        info.current_version, info.latest_version
-                    ));
-                    self.show_update_actions(ui, &info);
+                    ui.label(self.app.update_banner_text().unwrap_or_default());
+                    self.show_update_actions(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Dismiss update notification").clicked() {
                             self.app.apply(AppAction::DismissUpdate);

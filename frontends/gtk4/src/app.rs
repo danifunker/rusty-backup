@@ -8,7 +8,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::app::{
-    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_confirm,
+    app_version, busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_confirm,
     elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, ShareStep,
 };
 use rusty_backup::controller::inspect::{InspectAction, InspectSource};
@@ -26,6 +26,7 @@ use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::keys::{key_of, mods_of};
+use crate::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
 use crate::widgets::plain;
@@ -74,6 +75,9 @@ pub struct App {
     optical: Rc<OpticalScreen>,
     archives: Rc<ArchivesScreen>,
     close_backup: gtk::Button,
+    settings: RefCell<Option<Rc<SettingsWindow>>>,
+    banner: gtk::Revealer,
+    banner_text: gtk::Label,
     /// The tabs, or Commander Mode, which takes the whole window while open.
     screens: gtk::Stack,
     commander: RefCell<Option<Rc<CommanderScreen>>>,
@@ -92,6 +96,13 @@ thread_local! {
 pub fn tick() {
     if let Some(app) = APP.with(|a| a.borrow().clone()) {
         app.tick();
+    }
+}
+
+/// Settings cleared the recent files: every tab's picker forgets its copy.
+fn forget_recents() {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.forget_recents();
     }
 }
 
@@ -225,6 +236,55 @@ impl App {
         close_backup.set_visible(false);
         header.pack_end(&close_backup);
 
+        let settings = gtk::Button::with_label("Settings...");
+        settings.set_widget_name(ids::SETTINGS);
+        let bulk = gtk::Button::with_label("Bulk Convert...");
+        bulk.set_widget_name(ids::BULK_CONVERT);
+        bulk.set_tooltip_text(Some(
+            "Convert every disk image in a folder to one chosen format, \
+             using the same parameters for every file.",
+        ));
+        crate::widgets::coming(&bulk, "Bulk Convert");
+        let version = gtk::Label::new(Some(&format!("Version {}", app_version())));
+        version.add_css_class("dim-label");
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        for b in [&settings, &bulk] {
+            b.add_css_class("flat");
+            if let Some(label) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                label.set_xalign(0.0);
+            }
+            menu_box.append(b);
+        }
+        menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        menu_box.append(&version);
+        let popover = gtk::Popover::builder().child(&menu_box).build();
+        let menu = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .popover(&popover)
+            .tooltip_text("Menu")
+            .build();
+        menu.set_widget_name(ids::MENU);
+        header.pack_end(&menu);
+
+        let banner_text = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+        let banner_title = gtk::Label::new(Some("Update"));
+        banner_title.add_css_class("warning");
+        banner_title.add_css_class("heading");
+        let view_release = gtk::Button::with_label("View Release");
+        view_release.set_widget_name(ids::UPDATE_VIEW);
+        let dismiss = gtk::Button::with_label("Dismiss update notification");
+        dismiss.set_widget_name(ids::UPDATE_DISMISS);
+        let banner_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        banner_box.set_margin_start(8);
+        banner_box.set_margin_end(8);
+        banner_box.set_margin_top(4);
+        banner_box.set_margin_bottom(4);
+        banner_box.append(&banner_title);
+        banner_box.append(&banner_text);
+        banner_box.append(&view_release);
+        banner_box.append(&dismiss);
+        let banner = gtk::Revealer::builder().child(&banner_box).build();
+
         let log_view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -264,6 +324,7 @@ impl App {
 
         let view = adw::ToolbarView::new();
         view.add_top_bar(&header);
+        view.add_top_bar(&banner);
         view.set_content(Some(&split));
         let screens = gtk::Stack::new();
         screens.add_named(&view, Some("tabs"));
@@ -319,6 +380,9 @@ impl App {
             optical,
             archives,
             close_backup: close_backup.clone(),
+            settings: RefCell::default(),
+            banner,
+            banner_text,
             screens,
             commander: RefCell::default(),
             stack: stack.clone(),
@@ -329,6 +393,7 @@ impl App {
         });
 
         app.optical.find_drives();
+        app.ctrl.borrow_mut().start_update_check();
 
         let send = |action: fn() -> AppAction| {
             let app = app.clone();
@@ -341,6 +406,14 @@ impl App {
         refresh.connect_clicked(send(|| AppAction::RefreshDevices));
         elevate.connect_clicked(send(|| AppAction::RequestElevation));
         copy.connect_clicked(send(|| AppAction::CopyLog));
+        view_release.connect_clicked(send(|| AppAction::ViewRelease));
+        dismiss.connect_clicked(send(|| AppAction::DismissUpdate));
+        let a = app.clone();
+        let p = popover.clone();
+        settings.connect_clicked(move |_| {
+            p.popdown();
+            a.open_settings();
+        });
         clear.connect_clicked(send(|| AppAction::ClearLog));
         let a = app.clone();
         auto_scroll.connect_toggled(move |b| {
@@ -485,6 +558,25 @@ impl App {
     }
 
     /// The top bar's Close Backup: it closes on both tabs.
+    fn open_settings(&self) {
+        let open = self.settings.borrow().as_ref().is_some_and(|w| w.is_open());
+        if open {
+            return;
+        }
+        let recent = self.ctrl.borrow().recent_handle();
+        let window = SettingsWindow::open(recent, Box::new(forget_recents));
+        self.host.present(window.dialog());
+        *self.settings.borrow_mut() = Some(window);
+    }
+
+    fn forget_recents(&self) {
+        self.inspect.forget_recents();
+        self.backup.forget_recents();
+        self.restore.forget_recents();
+        self.optical.forget_recents();
+        self.archives.forget_recents();
+    }
+
     fn close_backup(&self) {
         self.ctrl.borrow_mut().close_shared_backup();
         self.restore.clear_backup();
@@ -518,6 +610,11 @@ impl App {
         let tab = self.ctrl.borrow().active_tab();
         let shared = self.ctrl.borrow().shared_backup().is_some();
         self.close_backup.set_visible(shared);
+        let banner = self.ctrl.borrow().update_banner_text();
+        self.banner.set_reveal_child(banner.is_some());
+        if let Some(text) = banner {
+            crate::widgets::set_text(&self.banner_text, &text);
+        }
         self.sync.run(|| {
             if let Some((_, name, ..)) = TABS.iter().find(|t| t.0 == tab) {
                 if self.stack.visible_child_name().as_deref() != Some(*name) {

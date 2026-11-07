@@ -17,6 +17,7 @@ mod keys;
 mod optical;
 mod progress;
 mod restore;
+mod settings;
 mod size_row;
 mod source;
 mod sync;

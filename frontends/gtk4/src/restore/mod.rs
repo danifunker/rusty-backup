@@ -383,6 +383,12 @@ impl RestoreScreen {
         }
     }
 
+    /// Settings cleared the recent files: the picker forgets its copy too.
+    pub fn forget_recents(&self) {
+        self.recent_files.borrow_mut().clear();
+        self.refresh();
+    }
+
     fn remember(&self, path: &Path) {
         let list = self
             .recent
