@@ -11,7 +11,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::app::Snapshot;
+use rusty_backup::controller::browser::metadata::known_type_creators;
 use rusty_backup::controller::browser::{ids, TextDoc};
+use rusty_backup::controller::browser::{MetadataFields, MetadataForm};
 use rusty_backup::controller::commander::{
     format_size, journal_status, journal_summary, journal_txn_blocks, journal_txn_rows,
     ApplyPreflight, ApplyReport, ArchiveSave, ArchiveViewer, BrowserPaneAction as P, BudgetAction,
@@ -180,6 +182,7 @@ pub struct PaneDialogsShown {
     errors: Vec<(String, String)>,
     fs_type: String,
     tool: Option<(ToolReport, bool, bool)>,
+    metadata: Option<MetadataForm>,
 }
 
 /// What the windows show this refresh, read while the controller is borrowed.
@@ -224,6 +227,8 @@ struct PaneDialogs {
     errors: Slot,
     tool: Slot,
     show_debug: Rc<Cell<bool>>,
+    metadata: Slot,
+    metadata_error: RefCell<Option<gtk::Label>>,
 }
 
 pub struct Dialogs {
@@ -270,6 +275,8 @@ impl PaneDialogs {
             errors: Slot::default(),
             tool: Slot::default(),
             show_debug: Rc::default(),
+            metadata: Slot::default(),
+            metadata_error: RefCell::default(),
         })
     }
 
@@ -295,11 +302,35 @@ impl PaneDialogs {
                 let repairable = !ctl.has_archive_flow();
                 (r, repairable, ctl.edit_mode())
             }),
+            metadata: pane.metadata_form().cloned(),
         }
     }
 
     fn show(self: &Rc<Self>, s: PaneDialogsShown) {
         let (side, host, send) = (self.side, &self.host, &self.send);
+
+        let want = s.metadata.as_ref().map(|f| f.entry.path.clone());
+        let built = RefCell::new(None);
+        self.metadata.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::CancelMetadata)),
+            || {
+                let form = s.metadata.clone().expect("a form to show");
+                let (dialog, error) = metadata_dialog(self, &form);
+                *built.borrow_mut() = Some(error);
+                dialog
+            },
+        );
+        if let Some(error) = built.into_inner() {
+            *self.metadata_error.borrow_mut() = Some(error);
+        }
+        if let Some(label) = &*self.metadata_error.borrow() {
+            let error = s.metadata.as_ref().and_then(|f| f.error.as_deref());
+            label.set_visible(error.is_some());
+            label.set_text(&plain(error.unwrap_or("")));
+        }
 
         let want = s.review.as_ref().map(|_| "review".to_string());
         self.review
@@ -1713,4 +1744,110 @@ pub fn present_editor(doc: TextDoc, host: &EffectHost, save: SaveText) {
         }
     });
     host.present(&dialog);
+}
+
+/// Edit Metadata over the pane's form: only the fields this entry carries are offered.
+fn metadata_dialog(d: &PaneDialogs, form: &MetadataForm) -> (adw::Dialog, gtk::Label) {
+    let e = &form.entry;
+    let init = &form.initial;
+    let body = page();
+    body.append(&wrapped(&format!("Metadata for {}", e.name)));
+    let grid = gtk::Grid::builder()
+        .row_spacing(6)
+        .column_spacing(8)
+        .build();
+    let mut line = 0;
+    let mut field = |label: &str, value: &str, hint: &str| {
+        let entry = gtk::Entry::builder()
+            .text(plain(value).as_ref())
+            .hexpand(true)
+            .build();
+        entry.set_placeholder_text(Some(hint));
+        let name = gtk::Label::builder().label(label).xalign(0.0).build();
+        grid.attach(&name, 0, line, 1, 1);
+        grid.attach(&entry, 1, line, 1, 1);
+        line += 1;
+        entry
+    };
+    let mac = e.is_file() && e.type_code.is_some();
+    let type_code = field("Type:", &init.type_code, "4 characters");
+    let creator = field("Creator:", &init.creator, "4 characters");
+    let dated = e.mac_dates.is_some();
+    let modified = field("Modified:", &init.modified, "YYYY-MM-DD HH:MM:SS (UTC)");
+    let created = field("Created:", &init.created, "YYYY-MM-DD HH:MM:SS (UTC)");
+    let posix = e.mode.is_some();
+    let mode = field("Permissions:", &init.mode, "octal, e.g. 644");
+    let owner = field("Owner:", &init.owner, "uid:gid");
+    for (w, on) in [
+        (&type_code, mac),
+        (&creator, mac),
+        (&modified, dated),
+        (&created, dated),
+        (&mode, posix),
+        (&owner, posix),
+    ] {
+        w.set_visible(on);
+        if let Some(label) = w.prev_sibling() {
+            label.set_visible(on);
+        }
+    }
+    body.append(&grid);
+    if mac {
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let pop = gtk::Popover::builder()
+            .child(
+                &gtk::ScrolledWindow::builder()
+                    .child(&list)
+                    .min_content_height(320)
+                    .min_content_width(380)
+                    .build(),
+            )
+            .build();
+        for (label, t, c) in known_type_creators() {
+            let b = gtk::Button::with_label(&label);
+            b.add_css_class("flat");
+            let (ty, cr, p) = (type_code.clone(), creator.clone(), pop.clone());
+            let code = |b: [u8; 4]| b.iter().map(|&c| c as char).collect::<String>();
+            let (tt, ct) = (code(t), code(c));
+            b.connect_clicked(move |_| {
+                ty.set_text(&plain(&tt));
+                cr.set_text(&plain(&ct));
+                p.popdown();
+            });
+            list.append(&b);
+        }
+        let pick = gtk::MenuButton::builder()
+            .label("Pick a known type...")
+            .popover(&pop)
+            .build();
+        pick.set_halign(gtk::Align::Start);
+        body.append(&pick);
+    }
+    let error = toned("", "error");
+    error.set_visible(false);
+    body.append(&error);
+    let save = gtk::Button::with_label("Stage");
+    save.add_css_class("suggested-action");
+    let cancel = gtk::Button::with_label("Cancel");
+    let (side, send) = (d.side, d.send.clone());
+    let read = move || MetadataFields {
+        type_code: type_code.text().to_string(),
+        creator: creator.text().to_string(),
+        modified: modified.text().to_string(),
+        created: created.text().to_string(),
+        mode: mode.text().to_string(),
+        owner: owner.text().to_string(),
+    };
+    let s = send.clone();
+    save.connect_clicked(move |_| s(pane(side, P::SubmitMetadata(Box::new(read())))));
+    cancel.connect_clicked(move |_| send(pane(side, P::CancelMetadata)));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::End);
+    row.append(&cancel);
+    row.append(&save);
+    body.append(&row);
+    (
+        window(&format!("Edit Metadata{}", d.tag), 460, -1, &body),
+        error,
+    )
 }

@@ -2,7 +2,7 @@
 //!
 //! `src/gui/browse_view.rs` is the reference for [`BrowseView`]. The pane, the detail panel and
 //! the dialogs read a controller and send actions, so they know nothing of Inspect; Commander
-//! reuses them. The metadata editors are slice 7 and stay greyed out.
+//! reuses them. Edit Metadata is the pane's own form, in `dialogs.rs`.
 
 mod bars;
 mod detail;

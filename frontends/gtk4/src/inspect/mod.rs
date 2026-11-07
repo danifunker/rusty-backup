@@ -1,9 +1,9 @@
 //! The Inspect tab: a retained view over `controller::inspect::InspectController`.
 //!
 //! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference. Its
-//! own windows are `windows.rs` and `editor.rs`; Resize, Expand HFS and Alto resize have
-//! controllers of their own (`crate::volume`). Export and floppy convert stay greyed out until
-//! slice 7b. The browse view takes the whole tab while it is open.
+//! own windows are `windows.rs`, `editor.rs` and `export.rs`, and `remote.rs` the daemon picker;
+//! Resize, Expand HFS, Alto resize, the disk writer and floppy convert have controllers of their
+//! own (`crate::volume`). The browse view takes the whole tab while it is open.
 
 pub mod bar;
 mod details;

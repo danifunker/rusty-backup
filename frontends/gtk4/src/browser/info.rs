@@ -1,7 +1,7 @@
 //! File Info: the entry's facts, prompts for its fields, and a preview, in a window or a quick view.
 //!
 //! The field prompts are the controller's own (`EditDetail`), so a value is validated and staged
-//! as every other view does it. The graphical metadata editors are slice 7.
+//! as every other view does it.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

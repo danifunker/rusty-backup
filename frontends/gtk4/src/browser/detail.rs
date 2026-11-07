@@ -16,7 +16,7 @@ use rusty_backup::controller::commander::{
 };
 
 use super::SendFn;
-use crate::widgets::{coming, flow, flow_show, plain, set_text};
+use crate::widgets::{flow, flow_show, plain, set_text};
 
 /// The panel's state; `body` is left out while the entry on screen has not changed.
 pub struct DetailShown {
@@ -170,7 +170,6 @@ impl Detail {
         let browse_archive = action_button("Browse archive...", ids::BROWSE_ARCHIVE);
         let edit_text = action_button("Edit as text...", ids::EDIT_TEXT);
         let metadata = action_button("Edit Metadata...", ids::EDIT_METADATA);
-        coming(&metadata, "the metadata editor");
 
         let row = flow();
         for b in [
@@ -338,6 +337,10 @@ impl Detail {
         on_path(
             &self.edit_text,
             Box::new(|_, _| vec![A::Pane(Side::Left, P::EditText)]),
+        );
+        on_path(
+            &self.metadata,
+            Box::new(|_, _| vec![A::Pane(Side::Left, P::EditMetadata)]),
         );
     }
 
