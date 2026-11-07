@@ -10,10 +10,11 @@ use rusty_backup::controller::app::{
     elevation_button_hover, elevation_button_label, elevation_confirm, elevation_gate, ids,
     AppAction, AppController, AppTab, ElevationGate,
 };
-use rusty_backup::controller::log::capture;
+use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
+use crate::inspect::InspectScreen;
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
 
@@ -54,6 +55,7 @@ const TABS: [(AppTab, &str, &str, &str); 6] = [
 pub struct App {
     ctrl: RefCell<AppController>,
     host: EffectHost,
+    inspect: Rc<InspectScreen>,
     stack: adw::ViewStack,
     log_view: gtk::TextView,
     log_shown: Cell<usize>,
@@ -72,16 +74,31 @@ pub fn tick() {
     }
 }
 
-/// Show the window, creating it on first use.
-pub fn present(application: &adw::Application, _image: Option<PathBuf>) {
-    if let Some(app) = APP.with(|a| a.borrow().clone()) {
-        app.host_window().present();
+/// Add a controller's drained log lines to the log panel.
+pub fn append_log(lines: Vec<(LogLevel, String)>) {
+    if lines.is_empty() {
         return;
     }
-    let app = App::build(application);
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.ctrl.borrow_mut().log.extend_lines(lines);
+        app.sync_log(&app.ctrl.borrow());
+    }
+}
+
+/// Show the window, creating it on first use, and open `image` in Inspect if one was named.
+pub fn present(application: &adw::Application, image: Option<PathBuf>) {
+    let existing = APP.with(|a| a.borrow().clone());
+    let app = existing.unwrap_or_else(|| {
+        let app = App::build(application);
+        APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+        app
+    });
     app.host_window().present();
-    APP.with(|a| *a.borrow_mut() = Some(app));
     tick();
+    if let Some(path) = image {
+        app.apply(AppAction::SelectTab(AppTab::Inspect));
+        app.inspect.open_file(path);
+    }
 }
 
 /// Answers to the app controller's own questions.
@@ -115,10 +132,6 @@ impl App {
         ctrl.load_devices();
 
         let stack = adw::ViewStack::new();
-        for (_, name, title, icon) in TABS {
-            let page = adw::StatusPage::builder().title(title).build();
-            stack.add_titled_with_icon(&page, Some(name), title, icon);
-        }
 
         let switcher = adw::ViewSwitcher::builder()
             .stack(&stack)
@@ -194,9 +207,21 @@ impl App {
             .build();
         window.set_size_request(700, 460);
 
+        let host = EffectHost::new(window, toasts);
+        let inspect = InspectScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        for (tab, name, title, icon) in TABS {
+            if tab == AppTab::Inspect {
+                stack.add_titled_with_icon(inspect.root(), Some(name), title, icon);
+            } else {
+                let page = adw::StatusPage::builder().title(title).build();
+                stack.add_titled_with_icon(&page, Some(name), title, icon);
+            }
+        }
+
         let app = Rc::new(App {
             ctrl: RefCell::new(ctrl),
-            host: EffectHost::new(window, toasts),
+            host,
+            inspect,
             stack: stack.clone(),
             log_view,
             log_shown: Cell::new(0),
@@ -248,6 +273,9 @@ impl App {
             self.host
                 .run(vec![Effect::Confirm(elevation_confirm())], &reply());
         }
+        let devices = self.ctrl.borrow().devices().to_vec();
+        self.inspect.set_devices(devices);
+        self.inspect.tick();
         self.refresh();
     }
 

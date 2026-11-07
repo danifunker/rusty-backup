@@ -5,8 +5,12 @@
 
 mod app;
 mod effects;
+mod inspect;
+mod progress;
 mod sync;
+mod theme;
 mod wake;
+mod widgets;
 
 use adw::prelude::*;
 use gtk::{gio, glib};

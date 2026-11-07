@@ -12,7 +12,6 @@ use rusty_backup::controller::app::picker_start_folder;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec};
 
 /// An answer to an effect, for the view to turn into its controller's action.
-#[allow(dead_code)] // Until the screens answer their own effects.
 pub enum Reply {
     Picked {
         purpose: &'static str,
@@ -22,10 +21,12 @@ pub enum Reply {
         purpose: &'static str,
         yes: bool,
     },
+    #[allow(dead_code)] // Until a screen asks for text (Inspect does not).
     Answered {
         purpose: &'static str,
         text: Option<String>,
     },
+    #[allow(dead_code)] // Until a screen asks for a choice (Inspect does not).
     Chose {
         purpose: &'static str,
         choice: usize,
@@ -88,7 +89,10 @@ impl EffectHost {
                 let filter = gtk::FileFilter::new();
                 filter.set_name(Some(name));
                 for ext in exts {
-                    filter.add_suffix(ext);
+                    match ext.as_str() {
+                        "*" => filter.add_pattern("*"),
+                        _ => filter.add_suffix(ext),
+                    }
                 }
                 filters.append(&filter);
             }

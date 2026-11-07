@@ -19,6 +19,7 @@ rusty-backup = { path = "../..", default-features = false, features = [
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 log = "0.4"
+pangocairo = "0.22"
 
 [workspace]
 
