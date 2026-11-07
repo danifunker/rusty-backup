@@ -398,6 +398,23 @@ verifies = [
 ]
 
 [[oracle]]
+id = "nextstep-disk"
+tool = "NeXTSTEP 3.3 disk(8)"
+kind = "emulator"
+program = "python3"
+notes = """NeXTSTEP's own `disk` tool, run under the Previous fork (github.com/danifunker/previous-fork)
+through its serial FIFOs, reads the label and prints it. The script compares the partition
+NeXTSTEP reports with rb-cli's reading, so a unit mistake fails even though the label parses.
+RB_EMU_CONTROL=1 damages the label copies and must fail. `program` is python3 on the amitools
+pattern; the script exits 77 when local.toml has no `previous` or `nextstep_boot`."""
+verifies = [
+  { format = "part.next", direction = "write", strength = "authoritative", status = "proven", evidence = "2026-11-06: NeXTSTEP 3.3 prints the label with partition a at byte 1048576, 15728640 bytes; the damaged control answers no label on disk", check = ["{oracles}/nextstep_disk_label.py", "{artifact}"], expect_stdout = "PASS: NeXTSTEP" },
+]
+availability = [
+  { platform = "linux", status = "expected" },
+]
+
+[[oracle]]
 id = "copperline"
 tool = "Copperline"
 kind = "emulator"
