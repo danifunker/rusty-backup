@@ -31,7 +31,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use rusty_backup::controller::log::capture;
 
-const APP_ID: &str = "io.github.danifunker.RustyBackup";
+pub const APP_ID: &str = "io.github.danifunker.RustyBackup";
 
 fn main() -> glib::ExitCode {
     capture::init();
@@ -39,6 +39,8 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_OPEN | gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    // The installed icon carries the app id's name, as the .desktop file says; GTK is up by now.
+    application.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
     application.connect_activate(|a| app::present(a, None));
     application.connect_open(|a, files, _hint| {
         app::present(a, files.first().and_then(|f| f.path()));

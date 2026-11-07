@@ -359,6 +359,15 @@ impl AppController {
 }
 
 /// The one-line notice a tab shows while another tab's job locks its controls.
+/// What an About window says.
+pub mod about {
+    pub const NAME: &str = "Rusty Backup";
+    pub const SUMMARY: &str = "Back up, restore and inspect vintage computer disk images";
+    pub const WEBSITE: &str = "https://github.com/danifunker/rusty-backup";
+    pub const ISSUES: &str = "https://github.com/danifunker/rusty-backup/issues";
+    pub const DEVELOPER: &str = "Dani Sarfati";
+}
+
 /// This build's version, as the shells show it.
 pub fn app_version() -> &'static str {
     env!("APP_VERSION")

@@ -6,14 +6,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 use rusty_backup::controller::app::{
-    app_version, busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_confirm,
-    elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, ShareStep,
+    about, app_version, busy_elsewhere, elevation_button_hover, elevation_button_label,
+    elevation_confirm, elevation_gate, ids, AppAction, AppController, AppTab, DropRoute,
+    DropTargets, ElevationGate, ShareStep,
 };
+use rusty_backup::controller::backup::BackupAction;
 use rusty_backup::controller::inspect::{InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::{capture, LogLevel};
+use rusty_backup::controller::restore::RestoreAction;
 use rusty_backup::controller::{Controller, Effect};
 
 // Through `super`: scripts/check-boundaries.sh takes a crate path to these names for the engine's.
@@ -245,10 +248,12 @@ impl App {
         let bulk = gtk::Button::with_label("Bulk Convert...");
         bulk.set_widget_name(ids::BULK_CONVERT);
         bulk.set_tooltip_text(Some(MENU_HINT));
+        let about_button = gtk::Button::with_label("About Rusty Backup");
+        about_button.set_widget_name(ids::ABOUT);
         let version = gtk::Label::new(Some(&format!("Version {}", app_version())));
         version.add_css_class("dim-label");
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        for b in [&settings, &bulk] {
+        for b in [&settings, &bulk, &about_button] {
             b.add_css_class("flat");
             if let Some(label) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                 label.set_xalign(0.0);
@@ -414,6 +419,12 @@ impl App {
         dismiss.connect_clicked(send(|| AppAction::DismissUpdate));
         let a = app.clone();
         let p = popover.clone();
+        about_button.connect_clicked(move |_| {
+            p.popdown();
+            a.host.present(&about_dialog());
+        });
+        let a = app.clone();
+        let p = popover.clone();
         bulk.connect_clicked(move |_| {
             p.popdown();
             a.bulk.open();
@@ -454,6 +465,17 @@ impl App {
             }
         });
         app.host_window().add_controller(keys);
+        // Files from the file manager: the screen on top decides, through the app controller.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let a = app.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            let Ok(list) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            let paths: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).collect();
+            a.dropped(paths)
+        });
+        app.screens.add_controller(drop);
         let a = app.clone();
         app.host_window().connect_close_request(move |_| {
             let screen = a.commander.borrow().clone();
@@ -569,6 +591,57 @@ impl App {
     }
 
     /// The top bar's Close Backup: it closes on both tabs.
+    /// Files dropped on the window; true when a screen took them.
+    fn dropped(&self, paths: Vec<PathBuf>) -> bool {
+        let Some(first) = paths.first().cloned() else {
+            return false;
+        };
+        let commander = self.commander.borrow().clone();
+        if let Some(screen) = commander {
+            screen.drop_path(first);
+            return true;
+        }
+        let tab = self.ctrl.borrow().active_tab();
+        if tab == AppTab::Inspect && self.inspect.drop_into_volume(paths) {
+            return true;
+        }
+        let (inspect_remote, inspect_loaded) = self.inspect.drop_state();
+        let targets = DropTargets {
+            inspect_remote,
+            inspect_loaded,
+            optical_browsing: self.optical.is_browsing(),
+        };
+        let route = self.ctrl.borrow_mut().route_drop(first, targets);
+        let taken = match route {
+            DropRoute::Inspect(path) => {
+                self.inspect.open_file(path);
+                true
+            }
+            DropRoute::Optical(path) => {
+                self.optical.open_image(path);
+                true
+            }
+            DropRoute::Archives(path) => {
+                self.archives.open_path(path);
+                true
+            }
+            DropRoute::Restore(path) => {
+                self.restore.apply(RestoreAction::OpenDropped(path));
+                true
+            }
+            DropRoute::Backup(path) => {
+                self.backup.apply(BackupAction::OpenImage {
+                    path,
+                    rename: false,
+                });
+                true
+            }
+            DropRoute::Ignore => false,
+        };
+        self.refresh();
+        taken
+    }
+
     fn open_settings(&self) {
         let open = self.settings.borrow().as_ref().is_some_and(|w| w.is_open());
         if open {
@@ -663,4 +736,19 @@ impl App {
             self.log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
         }
     }
+}
+
+/// The About window, from the app controller's text.
+fn about_dialog() -> adw::Dialog {
+    let d = adw::AboutDialog::builder()
+        .application_name(about::NAME)
+        .application_icon(crate::APP_ID)
+        .version(app_version())
+        .developer_name(about::DEVELOPER)
+        .comments(about::SUMMARY)
+        .website(about::WEBSITE)
+        .issue_url(about::ISSUES)
+        .license_type(gtk::License::Agpl30)
+        .build();
+    d.upcast()
 }

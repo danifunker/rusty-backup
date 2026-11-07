@@ -233,6 +233,10 @@ impl OpticalScreen {
     }
 
     /// Open `path` as the image-file source (Inspect's hand-off).
+    pub fn is_browsing(&self) -> bool {
+        self.ctrl.borrow().is_browsing()
+    }
+
     pub fn open_image(&self, path: PathBuf) {
         self.apply(OpticalAction::OpenImage(path));
     }

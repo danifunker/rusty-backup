@@ -294,6 +294,15 @@ impl BrowseView {
     }
 
     /// Closing or switching the source would lose work.
+    /// Files dropped from the file manager: staged into the open volume while editing.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>) -> bool {
+        if !self.ctrl.borrow().edit_mode() {
+            return false;
+        }
+        self.apply(A::Pane(Side::Left, P::AddPicked(paths)));
+        true
+    }
+
     pub fn has_unsaved_edits(&self) -> bool {
         self.active.get() && self.ctrl.borrow().has_unsaved_edits()
     }

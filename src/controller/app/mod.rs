@@ -12,7 +12,7 @@ mod shell;
 mod update;
 
 pub use shell::{
-    app_version, busy_elsewhere, busy_elsewhere_notice, elevation_button_hover,
+    about, app_version, busy_elsewhere, busy_elsewhere_notice, elevation_button_hover,
     elevation_button_label, elevation_confirm, elevation_gate, host_known_older_than,
     no_devices_hint, physical_devices_available, picker_start_folder, progress_text,
     running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
@@ -51,6 +51,7 @@ pub mod ids {
     pub const MENU: &str = "app.menu";
     pub const SETTINGS: &str = "app.settings";
     pub const BULK_CONVERT: &str = "app.bulk_convert";
+    pub const ABOUT: &str = "app.about";
     pub const UPDATE_VIEW: &str = "app.update.view";
     pub const UPDATE_DISMISS: &str = "app.update.dismiss";
 }

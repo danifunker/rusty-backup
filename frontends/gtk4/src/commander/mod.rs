@@ -10,6 +10,7 @@ mod pane;
 mod windows;
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
@@ -295,6 +296,11 @@ impl CommanderScreen {
     }
 
     /// The window is closing: `true` holds it while the controller asks about staged edits.
+    /// A path dropped from the file manager opens in the active pane.
+    pub fn drop_path(&self, path: PathBuf) {
+        self.send(A::OpenDropped(path));
+    }
+
     pub fn hold_quit(&self) -> bool {
         if !self.ctrl.borrow().has_staged_edits() {
             return false;

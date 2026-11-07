@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rusty Backup
+Comment=Back up, restore and inspect vintage computer disk images
+Exec=rusty-backup-gtk %F
+Icon=io.github.danifunker.RustyBackup
+Categories=Utility;Archiving;
+Terminal=false
+StartupNotify=true
+Keywords=backup;restore;disk;image;vintage;retro;

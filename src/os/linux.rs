@@ -718,6 +718,8 @@ pub fn relaunch_with_elevation() -> Result<()> {
         // A renderer override has to survive elevation, or the relaunch lands back on a crashing default.
         "RUSTY_BACKUP_RENDERER",
         "WGPU_BACKEND",
+        // The GTK shell's display backend, so the elevated copy opens where this one did.
+        "GDK_BACKEND",
     ];
     let mut env_args: Vec<String> = Vec::new();
     for var in &passthrough_vars {

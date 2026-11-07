@@ -526,6 +526,17 @@ impl InspectScreen {
         self.apply(action);
     }
 
+    /// What decides where a dropped file goes: a remote session, a loaded source, an edit.
+    pub fn drop_state(&self) -> (bool, bool) {
+        let ctrl = self.ctrl.borrow();
+        (ctrl.is_remote(), ctrl.has_local_source())
+    }
+
+    /// Files dropped while a volume is open in edit mode are added to it.
+    pub fn drop_into_volume(&self, paths: Vec<PathBuf>) -> bool {
+        self.browse.is_active() && self.browse.drop_paths(paths)
+    }
+
     /// Open an image named outside the picker (the command line); a wrapper is decoded first.
     pub fn open_file(&self, path: PathBuf) {
         self.remember(&path);
