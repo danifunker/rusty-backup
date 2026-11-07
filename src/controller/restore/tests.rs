@@ -299,16 +299,15 @@ fn a_refreshed_list_drops_the_old_disks_scan() {
         row: 0,
         device: a.clone(),
     });
-    ctl.reconcile_devices(&[a]);
+    ctl.reconcile_devices(std::slice::from_ref(&a));
     assert_eq!(ctl.device_row(TargetSlot::SinglePartition), Some(0));
+    ctl.reconcile_devices(&[b.clone(), a.clone()]);
+    assert_eq!(ctl.device_row(TargetSlot::SinglePartition), Some(1));
     ctl.reconcile_devices(std::slice::from_ref(&b));
-    assert_eq!(
-        ctl.device(TargetSlot::SinglePartition)
-            .map(|d| d.path.clone()),
-        Some(b.path)
+    assert!(
+        ctl.device(TargetSlot::SinglePartition).is_none(),
+        "a write target never becomes the disk that took its row"
     );
-    ctl.reconcile_devices(&[]);
-    assert!(ctl.device(TargetSlot::SinglePartition).is_none());
 }
 
 /// A 16 MiB HFS volume at 512-byte blocks on an MBR disk, backed up through the Backup controller.
@@ -599,7 +598,7 @@ fn a_refresh_moving_the_device_voids_the_question() {
     });
     ctl.apply(RestoreAction::Start);
     ctl.reconcile_devices(std::slice::from_ref(&b));
-    assert_eq!(ctl.write_target(), Some(b.display_name()));
+    assert_eq!(ctl.write_target(), None);
     answer(&mut ctl, true);
     assert!(!ctl.is_running());
 }

@@ -111,7 +111,7 @@ impl RestoreController {
         self.targets.target(slot).image.as_deref()
     }
 
-    /// "Refresh Devices" replaced the list: another disk (or none) may now sit at a target's row.
+    /// "Refresh Devices" replaced the list: a target follows its own disk, and never another one.
     pub fn reconcile_devices(&mut self, devices: &[DiskDevice]) {
         if self.is_running() {
             return;
@@ -125,19 +125,19 @@ impl RestoreController {
             let Some(picked) = &t.device else {
                 continue;
             };
-            let now = devices.get(picked.row);
-            if now.map(DiskDevice::identity) == Some(picked.device.identity()) {
+            if devices.get(picked.row).map(DiskDevice::identity) == Some(picked.device.identity()) {
                 continue;
             }
-            let row = picked.row;
-            t.device = now.map(|d| Picked {
+            let identity = picked.device.identity();
+            let moved = devices.iter().position(|d| d.identity() == identity);
+            let gone = picked.device.display_name();
+            t.device = moved.map(|row| Picked {
                 row,
-                device: d.clone(),
+                device: devices[row].clone(),
             });
-            let moved = t.device.as_ref().map(|p| p.device.display_name());
-            if let Some(name) = moved {
+            if moved.is_none() {
                 self.warn(format!(
-                    "The restore target is now {name}: the list changed."
+                    "{gone} is no longer listed, so it is no longer the restore target."
                 ));
             }
         }

@@ -841,7 +841,7 @@ in the TUI Restore screen is gone.
    - `Open(WriteOpen)` (a job; a new source drops the target), `Close`, `is_open`, `opening()`.
    - The target: `SelectDevice { row, device }` (the partitions are read in a job; the same disk
      is not re-read), `SetTargetImage` (the TUI's image-file target), `reconcile_devices` (the
-     target follows its row, as the window's index did), `SetTargetPartition`,
+     target follows its own disk, or clears if it is gone), `SetTargetPartition`,
      `CycleTargetPartition` (whole disk, each partition, whole disk), `target_partitions()`
      (`TargetPartition` with position and label), `partition_warning()`.
    - The form: `SetSynthesize`, `SetTableKind`, `SetAlignment`, `SetCustomAlignment`,

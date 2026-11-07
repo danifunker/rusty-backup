@@ -197,9 +197,9 @@ fn a_refreshed_device_list_moves_the_target_with_its_row() {
         row: 0,
         device: fake_device(&a),
     });
+    c.reconcile_devices(&[fake_device(&b), fake_device(&a)]);
+    assert_eq!(c.target_device().map(|d| d.path.clone()), Some(a));
     c.reconcile_devices(&[fake_device(&b)]);
-    assert_eq!(c.target_device().map(|d| d.path.clone()), Some(b));
-    c.reconcile_devices(&[]);
     assert!(c.target_device().is_none());
     c.wait_idle();
     c.apply(DiskWriteAction::Close);
