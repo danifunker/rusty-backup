@@ -179,6 +179,8 @@ fn load_native(folder: &Path, metadata_path: &Path) -> Result<LoadedBackup, Stri
                 } else {
                     pm.original_size_bytes
                 });
+            // The engine refuses less than its floor, so a row never offers it.
+            let minimum = minimum.max(crate::restore::restore_size_floor(&metadata, pm));
             let mut row = SizeRow::new(
                 pm.index,
                 pm.type_name.clone(),

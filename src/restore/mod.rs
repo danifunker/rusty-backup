@@ -210,7 +210,7 @@ fn set_progress_bytes(progress: &Arc<Mutex<RestoreProgress>>, current: u64, tota
 /// trimming to it never needs data relocation, which is exactly what the copy
 /// loop (`to_copy = chd_size.min(export_size)`) and the follow-up
 /// `resize_filesystem_for` can deliver.
-fn restore_size_floor(
+pub(crate) fn restore_size_floor(
     metadata: &BackupMetadata,
     pm: &crate::backup::metadata::PartitionMetadata,
 ) -> u64 {
@@ -884,7 +884,9 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             .partition_sizes
             .iter()
             .any(|p| !matches!(p.size_choice, RestoreSizeChoice::Original));
-        return if any_non_original {
+        // A backup-time resize moved the partitions, so their original sizes need the layout rebuilt.
+        let any_resized = metadata.partitions.iter().any(|p| p.resized);
+        return if any_non_original || any_resized {
             run_single_file_chd_restore_resize(&config, progress, &metadata)
         } else {
             run_single_file_chd_restore_as_is(&config, progress, &metadata)
@@ -1613,8 +1615,9 @@ fn run_single_file_chd_restore_resize(
     // Treat the CHD's current layout (imaged_size_bytes) as the baseline
     // for "Original". `calculate_restore_layout` keys off
     // `original_size_bytes`, so swap them in a clone before calling.
+    // A partition the backup shrank keeps its real original: that is the size "Original" offers.
     let mut adjusted = metadata.clone();
-    for pm in &mut adjusted.partitions {
+    for pm in adjusted.partitions.iter_mut().filter(|pm| !pm.resized) {
         pm.original_size_bytes = pm.imaged_size_bytes;
     }
 
