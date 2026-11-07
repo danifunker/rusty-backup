@@ -14,7 +14,7 @@ use crate::browser::pane::{PaneHost, PaneShown, PaneView};
 use crate::browser::SendFn;
 use crate::progress::JobList;
 use crate::source::{Pick, PickerSpec, SourcePicker};
-use crate::widgets::{flow, flow_show, plain, set_text};
+use crate::widgets::{plain, set_text};
 
 /// The bars around the listing, read while the controller is borrowed.
 #[derive(Clone, PartialEq)]
@@ -52,13 +52,14 @@ pub struct CommanderPane {
     side: Side,
     send: SendFn,
     root: gtk::Box,
+    /// The source and volume rows, for the screen's size groups.
+    rows: [gtk::ScrolledWindow; 2],
     source: Rc<SourcePicker>,
     close_image: gtk::Button,
     close: gtk::Button,
     apply: gtk::Button,
     discard: gtk::Button,
     edits: gtk::Button,
-    volume_bar: gtk::FlowBox,
     part: gtk::DropDown,
     part_labels: gtk::StringList,
     new_folder: gtk::Button,
@@ -170,7 +171,7 @@ impl CommanderPane {
             let open = b.has_css_class("rb-open");
             to_pane(A::Pane(side, P::ShowEdits(!open)));
         });
-        let source_bar = flow();
+        let source_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         source_bar.append(source.root());
         for b in [&close_image, &close, &apply, &discard, &edits] {
             source_bar.append(b);
@@ -196,7 +197,12 @@ impl CommanderPane {
             P::RequestNewFolder,
         );
         new_folder.set_tooltip_text(Some("Create a folder in the current directory"));
-        let title = gtk::Label::new(None);
+        // On a narrow pane the volume name gives way, not the partition picker.
+        part.set_size_request(150, -1);
+        let title = gtk::Label::builder()
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(18)
+            .build();
         title.add_css_class("heading");
         let free = gtk::Label::new(None);
         let read_only = gtk::Label::new(Some("Read-only"));
@@ -205,7 +211,7 @@ impl CommanderPane {
             "This source can be browsed and copied out of, but not written to - copies into \
              this pane are disabled.",
         ));
-        let volume_bar = flow();
+        let volume_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         volume_bar.append(&part);
         volume_bar.append(&new_folder);
         volume_bar.append(&title);
@@ -271,11 +277,16 @@ impl CommanderPane {
         view.set_list_id(names.list);
         view.root().set_vexpand(true);
 
+        // The bars above the listing; the screen keeps both sides' the same height.
+        // Fixed rows, clipped rather than wrapped, so a row is as tall on both sides.
+        let rows = [clip(&source_bar), clip(&volume_bar)];
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        header.append(&rows[0]);
+        header.append(&rows[1]);
+        header.append(&path);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         root.add_css_class("rb-pane");
-        root.append(&source_bar);
-        root.append(&volume_bar);
-        root.append(&path);
+        root.append(&header);
         root.append(jobs.root());
         root.append(&unlock);
         root.append(view.root());
@@ -283,13 +294,13 @@ impl CommanderPane {
             side,
             send: send.clone(),
             root,
+            rows,
             source,
             close_image,
             close,
             apply,
             discard,
             edits,
-            volume_bar,
             part,
             part_labels,
             new_folder,
@@ -310,6 +321,11 @@ impl CommanderPane {
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// The source and volume rows; the screen keeps each one height on both sides.
+    pub fn rows(&self) -> &[gtk::ScrolledWindow; 2] {
+        &self.rows
     }
 
     pub fn view(&self) -> &PaneView {
@@ -384,28 +400,31 @@ impl CommanderPane {
         }
         let b = s.bars;
         self.source.show(&b.source, &b.recent, &[]);
-        flow_show(&self.close_image, b.close_image.is_some());
+        shown(&self.close_image, b.close_image.is_some());
         self.close_image
             .set_sensitive(b.close_image.unwrap_or(false));
-        flow_show(&self.close, b.can_close);
+        shown(&self.close, b.can_close);
         for w in [&self.apply, &self.discard] {
-            flow_show(w, b.stages);
+            shown(w, b.stages);
             w.set_sensitive(b.staged > 0 && !b.busy);
         }
-        flow_show(&self.edits, b.stages && b.staged > 0);
+        shown(&self.edits, b.stages && b.staged > 0);
         self.apply.set_label(&format!("Apply ({})", b.staged));
         self.edits.set_label(&format!("Edits ({})", b.staged));
         match b.edits_open {
             true => self.edits.add_css_class("rb-open"),
             false => self.edits.remove_css_class("rb-open"),
         }
-        self.volume_bar.set_visible(b.loaded);
+        // The row stays, empty, so the listing starts where the other side's does.
+        for w in [&self.title, &self.free] {
+            w.set_visible(b.loaded);
+        }
         self.show_parts(&b);
-        flow_show(&self.new_folder, b.new_folder);
+        shown(&self.new_folder, b.new_folder);
         set_text(&self.title, &b.title);
         set_text(&self.free, b.free.as_deref().unwrap_or(""));
-        flow_show(&self.free, b.free.is_some());
-        flow_show(&self.read_only, b.read_only);
+        shown(&self.free, b.loaded && b.free.is_some());
+        shown(&self.read_only, b.read_only);
         set_text(&self.prefix, &b.prefix);
         self.show_crumbs(&b);
         self.show_lock(b.locked);
@@ -437,7 +456,7 @@ impl CommanderPane {
         if self.part.selected() != at {
             self.part.set_selected(at);
         }
-        flow_show(&self.part, !b.host);
+        shown(&self.part, b.loaded && !b.host);
     }
 
     fn show_crumbs(&self, b: &Bars) {
@@ -492,4 +511,18 @@ impl CommanderPane {
         set_text(&self.unlock_note, note);
         set_text(&self.password_label, label);
     }
+}
+
+fn shown(widget: &impl IsA<gtk::Widget>, on: bool) {
+    widget.set_visible(on);
+}
+
+/// A row that clips instead of widening the pane.
+fn clip(row: &gtk::Box) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder()
+        .child(row)
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .build()
 }

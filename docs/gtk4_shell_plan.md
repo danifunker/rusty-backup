@@ -104,6 +104,7 @@ widgets with:
 - A window only the view holds open (Expand Image) still sits on a `Slot`; when the screen's `Action` is not `Clone`, the slot sends a small `Dismiss` enum and the screen maps it.
 - A `ColumnView` row changed in place with its own object keeps its cell, even after `items_changed`: replace the row with a new `BoxedAnyObject` (`splice(i, 1, ..)`) so its tick box rebinds.
 - A window the app opens from the header menu (`settings.rs`, `bulk.rs`) is a struct with its own controller; Bulk Convert's controller outlives its window, so the app keeps it and ticks it.
+- Commander's two panes start their listings level: each header row is a plain `Box` clipped by a `ScrolledWindow` (never a wrapping `FlowBox`), and one vertical `SizeGroup` per row spans both sides. A `SizeGroup` ignores height-for-width widgets like `FlowBox`, and a widget holds no reference to its group, so the screen keeps the groups.
 - A destructive dialog shows "Writes to:" with the controller's own name (`ResizeController::write_target`, `table_write_target`, `write_target_name`), the name its question uses.
 
 ## Slices

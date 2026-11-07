@@ -61,6 +61,8 @@ pub struct CommanderScreen {
     log: gtk::Button,
     copying: JobList,
     panes: [Rc<CommanderPane>; 2],
+    /// Keeps both headers one height; a widget holds no reference to its group.
+    _level: [gtk::SizeGroup; 2],
     sides: [gtk::Stack; 2],
     quick: [Rc<FileInfo>; 2],
     quick_hint: [gtk::Label; 2],
@@ -199,6 +201,14 @@ impl CommanderScreen {
                 CommanderPane::build(side, &send, host)
             };
             let panes = [pane_for(Side::Left), pane_for(Side::Right)];
+            // Each header row takes the taller side's height, so the two listings start level.
+            let level = [0, 1].map(|row| {
+                let group = gtk::SizeGroup::new(gtk::SizeGroupMode::Vertical);
+                for pane in &panes {
+                    group.add_widget(&pane.rows()[row]);
+                }
+                group
+            });
             let quick = [FileInfo::build(&send), FileInfo::build(&send)];
             let hint = || gtk::Label::builder().xalign(0.0).margin_start(8).build();
             let quick_hint = [hint(), hint()];
@@ -271,6 +281,7 @@ impl CommanderScreen {
                 log,
                 copying,
                 panes,
+                _level: level,
                 sides,
                 quick,
                 quick_hint,
