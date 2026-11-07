@@ -83,7 +83,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -105,6 +105,7 @@ jobs:
       windows-vintage: ${{ steps.p.outputs.windows-vintage }}
       musl: ${{ steps.p.outputs.musl }}
       crates-msrv: ${{ steps.p.outputs.crates-msrv }}
+      gtk4: ${{ steps.p.outputs.gtk4 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -120,7 +121,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -1893,6 +1894,29 @@ jobs:
           path: |
             crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
             crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
+
+  # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
+  # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.
+  build-gtk4:
+    name: Build GTK4 shell
+    needs: plan
+    if: needs.plan.outputs.gtk4 == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontends/gtk4
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   # Every crate under crates/ runs its own tests on the Rust 1.73 floor. The app's
   # vintage builds only compile the crates, so this is the one place their tests

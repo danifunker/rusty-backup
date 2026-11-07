@@ -1,0 +1,26 @@
+# The GTK4 + libadwaita Linux shell (docs/native_frontends_plan.md Phase 4, §9).
+# Its own workspace root and lockfile: gtk4-rs needs a recent rustc, which must not move the engine's 1.73 floor.
+[package]
+name = "rusty-backup-gtk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+[[bin]]
+name = "rusty-backup-gtk"
+path = "src/main.rs"
+
+[dependencies]
+rusty-backup = { path = "../..", default-features = false, features = [
+    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "remote", "tui-update", "crypto", "yaml",
+] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+log = "0.4"
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"

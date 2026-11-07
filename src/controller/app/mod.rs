@@ -12,6 +12,7 @@ mod shell;
 mod update;
 
 pub use shell::{
+    elevation_confirm,
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate,
     host_known_older_than, no_devices_hint, physical_devices_available, picker_start_folder,
     running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
@@ -43,6 +44,8 @@ pub mod ids {
     pub const LOG_CLEAR: &str = "log.clear";
     pub const LOG_AUTO_SCROLL: &str = "log.auto_scroll";
     pub const LOG_LIST: &str = "log.list";
+    pub const REFRESH_DEVICES: &str = "app.refresh_devices";
+    pub const ELEVATE: &str = "app.elevate";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

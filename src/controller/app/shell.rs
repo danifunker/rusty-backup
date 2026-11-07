@@ -137,6 +137,20 @@ pub fn elevation_button_hover() -> &'static str {
 }
 
 /// The note beside a physical-device picker while unprivileged, naming the remedy.
+/// The Linux "restart as root?" question; answer with `AppAction::ConfirmElevation`.
+pub fn elevation_confirm() -> crate::controller::ConfirmSpec {
+    crate::controller::ConfirmSpec {
+        purpose: "elevate",
+        title: "Unlock Physical Devices".to_string(),
+        message: "Physical disk devices can only be opened by root. Rusty Backup will restart \
+                  with root privileges via pkexec, and you will be prompted for your password. \
+                  Disk image files do not need this. Any unsaved changes will be lost on restart."
+            .to_string(),
+        confirm_label: "Restart as Root".to_string(),
+        destructive: false,
+    }
+}
+
 pub fn unelevated_device_note() -> &'static str {
     if cfg!(windows) {
         "Note: physical devices need administrator privileges. Without it they may \

@@ -27,6 +27,7 @@ seekable-zstd, remote, tui, crypto, yaml` (root `Cargo.toml`).
 | macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default | |
 | Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default | |
 | Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default | |
+| Linux GTK4 shell (compile check) | gtk4 | modern | nothing yet: `frontends/gtk4/`, screens in progress | GTK4 (Phase 4) | stable (gtk4-rs needs >= 1.92) | shell features | Not shipped until it reaches parity; needs GTK >= 4.14 and libadwaita >= 1.5 |
 | Linux riscv64 GUI | riscv64 | modern | egui GUI + rb-cli, deb + rpm | GTK4 (Phase 4) | stable | default | |
 | Linux static musl x64, arm64, i586, i686, ppc64, ppc32 | musl | modern | rb-cli + TUI | TUI | stable; i586 pinned 1.98.1; ppc32 nightly + build-std; ppc via cargo-zigbuild | pure-zstd, remote, tui | no GUI, no CHD, no optical, no crypto |
 | Linux glibc ppc64, ppc, riscv64 (extra-arch) | extra-arch | modern | rb-cli + TUI | TUI | stable | pure-zstd, remote, tui | no GUI, no CHD, no optical, no crypto |
@@ -48,7 +49,8 @@ for wasm32) is a CI target too; the check script knows it.
 |---|---|---|
 | egui | `src/gui/` | the modern GUI rows, until Phase 7 retires it |
 | TUI | `src/cli/verbs/tui*` (ratatui) | every rb-cli row |
-| AppKit, GTK4, Win32 | `frontends/{appkit,gtk4,win32}/` (not yet) | Phases 3-5 |
+| GTK4 + libadwaita | `frontends/gtk4/` (in progress, not shipped; CI target `gtk4` compiles it) | Linux modern, Phase 4 |
+| AppKit, Win32 | `frontends/{appkit,win32}/` (not yet) | Phases 3, 5 |
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 
 Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`).
