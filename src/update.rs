@@ -353,8 +353,9 @@ pub fn release_is_newer(latest: &str, current: &str) -> bool {
     if current.ends_with("-dev") {
         return false;
     }
+    // Date tags come as `YYYYMMDDHHMM` or `YYYY-MM-DD-HH-MM`; dotted versions split on dots.
     let numeric = |s: &str| -> Option<Vec<u64>> {
-        s.split('.')
+        s.split(['.', '-'])
             .map(|part| part.parse::<u64>().ok())
             .collect::<Option<Vec<u64>>>()
     };
@@ -785,6 +786,9 @@ mod tests {
         // A -dev build is never "outdated" (the old check offered a downgrade).
         assert!(!release_is_newer("202609011200", "0.1.0-dev"));
         assert!(!release_is_newer("202609011200", "202609020000-dev"));
+        // Dashed date tags order numerically too: an older release is not an update.
+        assert!(!release_is_newer("v2026-11-07-03-46", "2026-11-07-13-44"));
+        assert!(release_is_newer("v2026-11-08-00-01", "2026-11-07-13-44"));
     }
 
     #[test]
