@@ -1356,7 +1356,8 @@ impl Target for DiskWriteTarget {
                     .write_target_name()
                     .map(|t| {
                         let dir = self.dir.path().display().to_string();
-                        t.replace(dir.as_str(), "$dir")
+                        // Forward slashes, so one expectation holds on Windows too.
+                        t.replace(dir.as_str(), "$dir").replace('\\', "/")
                     })
                     .unwrap_or_default(),
             ),
