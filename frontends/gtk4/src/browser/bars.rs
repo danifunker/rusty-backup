@@ -295,7 +295,7 @@ impl Header {
 }
 
 /// The View menu, one control per entry; the controller says what each does.
-fn view_popover(items: &[ViewMenuItem], send: &SendFn) -> gtk::Popover {
+pub fn view_popover(items: &[ViewMenuItem], send: &SendFn) -> gtk::Popover {
     let popover = gtk::Popover::new();
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let mut group: Option<gtk::CheckButton> = None;

@@ -38,6 +38,12 @@ pub fn fact(name: &str, value: &str) -> String {
     )
 }
 
+/// Text boxes and open menus keep their keys, wherever the window's shortcuts are read.
+pub fn typing(widget: &impl IsA<gtk::Widget>) -> bool {
+    let focus = widget.root().and_then(|r| r.focus());
+    focus.is_some_and(|f| f.is::<gtk::Text>() || f.ancestor(gtk::Popover::static_type()).is_some())
+}
+
 /// Keep a button for a dialog that is not built yet: greyed out, with a tooltip saying so.
 pub fn coming(button: &gtk::Button, what: &str) {
     button.set_sensitive(false);

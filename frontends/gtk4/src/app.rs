@@ -6,15 +6,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
+use gtk::glib;
 use rusty_backup::controller::app::{
     elevation_button_hover, elevation_button_label, elevation_confirm, elevation_gate, ids,
     AppAction, AppController, AppTab, ElevationGate,
 };
+use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
+use crate::keys::{key_of, mods_of};
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
 use crate::widgets::plain;
@@ -57,6 +61,9 @@ pub struct App {
     ctrl: RefCell<AppController>,
     host: EffectHost,
     inspect: Rc<InspectScreen>,
+    /// The tabs, or Commander Mode, which takes the whole window while open.
+    screens: gtk::Stack,
+    commander: RefCell<Option<Rc<CommanderScreen>>>,
     stack: adw::ViewStack,
     log_view: gtk::TextView,
     log_shown: Cell<usize>,
@@ -72,6 +79,13 @@ thread_local! {
 pub fn tick() {
     if let Some(app) = APP.with(|a| a.borrow().clone()) {
         app.tick();
+    }
+}
+
+/// Leave Commander Mode for the tabs, once its controller has said so.
+fn close_commander() {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
+        app.close_commander();
     }
 }
 
@@ -157,6 +171,10 @@ impl App {
         elevate.set_visible(gate == ElevationGate::NeedsElevation);
         header.pack_end(&elevate);
 
+        let commander = gtk::Button::with_label("Commander Mode");
+        commander.set_widget_name(ids::COMMANDER);
+        header.pack_start(&commander);
+
         let log_view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -194,18 +212,20 @@ impl App {
             .position(600)
             .build();
 
-        let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&split));
         let view = adw::ToolbarView::new();
         view.add_top_bar(&header);
-        view.set_content(Some(&toasts));
+        view.set_content(Some(&split));
+        let screens = gtk::Stack::new();
+        screens.add_named(&view, Some("tabs"));
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&screens));
 
         let window = adw::ApplicationWindow::builder()
             .application(application)
             .title("Rusty Backup")
             .default_width(1200)
             .default_height(800)
-            .content(&view)
+            .content(&toasts)
             .build();
         window.set_size_request(700, 460);
 
@@ -224,6 +244,8 @@ impl App {
             ctrl: RefCell::new(ctrl),
             host,
             inspect,
+            screens,
+            commander: RefCell::default(),
             stack: stack.clone(),
             log_view,
             log_shown: Cell::new(0),
@@ -235,6 +257,8 @@ impl App {
             let app = app.clone();
             move |_: &gtk::Button| app.apply(action())
         };
+        let a = app.clone();
+        commander.connect_clicked(move |_| a.open_commander());
         refresh.connect_clicked(send(|| AppAction::RefreshDevices));
         elevate.connect_clicked(send(|| AppAction::RequestElevation));
         copy.connect_clicked(send(|| AppAction::CopyLog));
@@ -256,7 +280,64 @@ impl App {
                 a.apply(AppAction::SelectTab(t.0));
             }
         });
+        // On the window: a closing dialog leaves nothing focused, and keys must still work then.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let a = app.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let used = key_of(key).is_some_and(|k| a.key(k, mods_of(state)));
+            match used {
+                true => glib::Propagation::Stop,
+                false => glib::Propagation::Proceed,
+            }
+        });
+        app.host_window().add_controller(keys);
+        let a = app.clone();
+        app.host_window().connect_close_request(move |_| {
+            let screen = a.commander.borrow().clone();
+            match screen.is_some_and(|s| s.hold_quit()) {
+                true => glib::Propagation::Stop,
+                false => glib::Propagation::Proceed,
+            }
+        });
         app
+    }
+
+    /// A shortcut goes to the screen on top; a dialog over the window keeps its keys.
+    fn key(&self, key: Key, mods: Mods) -> bool {
+        if self.host.dialog_open() {
+            return false;
+        }
+        let commander = self.commander.borrow().clone();
+        match commander {
+            Some(screen) => screen.key(key, mods),
+            None => {
+                self.ctrl.borrow().active_tab() == AppTab::Inspect && self.inspect.key(key, mods)
+            }
+        }
+    }
+
+    fn open_commander(&self) {
+        if self.commander.borrow().is_some() {
+            return;
+        }
+        let ctrl = self.ctrl.borrow();
+        let on_close: Rc<dyn Fn()> = Rc::new(close_commander);
+        let screen =
+            CommanderScreen::build(ctrl.jobs(), &ctrl.notify(), self.host.clone(), on_close);
+        drop(ctrl);
+        self.screens.add_named(screen.root(), Some("commander"));
+        self.screens.set_visible_child_name("commander");
+        screen.opened();
+        *self.commander.borrow_mut() = Some(screen);
+    }
+
+    fn close_commander(&self) {
+        let Some(screen) = self.commander.borrow_mut().take() else {
+            return;
+        };
+        self.screens.set_visible_child_name("tabs");
+        self.screens.remove(screen.root());
     }
 
     fn apply(&self, action: AppAction) {
@@ -278,6 +359,10 @@ impl App {
         let devices = self.ctrl.borrow().devices().to_vec();
         self.inspect.set_devices(devices);
         self.inspect.tick();
+        let commander = self.commander.borrow().clone();
+        if let Some(screen) = commander {
+            screen.tick();
+        }
         self.refresh();
     }
 

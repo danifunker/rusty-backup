@@ -26,6 +26,15 @@ pub struct DetailShown {
     actions: Actions,
 }
 
+impl Preview {
+    pub fn text(&self) -> &str {
+        match self {
+            Preview::None => "",
+            Preview::Text(t) | Preview::Hex(t) | Preview::Note(t) => t,
+        }
+    }
+}
+
 struct Body {
     name: String,
     facts: Vec<String>,
@@ -34,7 +43,7 @@ struct Body {
     preview: Preview,
 }
 
-enum Preview {
+pub enum Preview {
     None,
     Text(String),
     Hex(String),
@@ -405,13 +414,7 @@ impl Detail {
             self.note.set_visible(b.note.is_some());
             set_text(&self.budget, &b.budget.join("\n"));
             self.budget.set_visible(!b.budget.is_empty());
-            let buffer = self.preview.buffer();
-            match b.preview {
-                Preview::None => buffer.set_text(""),
-                Preview::Text(t) | Preview::Hex(t) | Preview::Note(t) => {
-                    buffer.set_text(&plain(&t))
-                }
-            }
+            self.preview.buffer().set_text(&plain(b.preview.text()));
         }
         let has_row = s.key.is_some();
         self.empty.set_visible(!has_row);
@@ -473,7 +476,19 @@ fn body_of(d: &FileDetail, caps: BrowseCaps) -> Body {
                  #{t:02X}{aux:04X} filename suffix."
             )
         });
-    let preview = if entry.is_directory() {
+    Body {
+        name: entry.name.clone(),
+        facts,
+        budget: d.size_budget_lines(),
+        note,
+        preview: preview_of(d),
+    }
+}
+
+/// What File Info shows of the entry's contents, for the side panel and the window alike.
+pub fn preview_of(d: &FileDetail) -> Preview {
+    let entry = &d.entry;
+    if entry.is_directory() {
         Preview::None
     } else if entry.is_symlink() {
         let target = entry
@@ -500,12 +515,5 @@ fn body_of(d: &FileDetail, caps: BrowseCaps) -> Body {
                 }
             }
         }
-    };
-    Body {
-        name: entry.name.clone(),
-        facts,
-        budget: d.size_budget_lines(),
-        note,
-        preview,
     }
 }

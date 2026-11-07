@@ -20,7 +20,12 @@ struct JobRow {
 
 impl JobRow {
     fn new(cancel_id: &str, on_cancel: Rc<dyn Fn()>) -> JobRow {
-        let phase = gtk::Label::builder().xalign(0.0).build();
+        // Fixed width: a phase naming each file must not walk Cancel away from the pointer.
+        let phase = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
         let spinner = gtk::Spinner::new();
         let cancel = gtk::Button::with_label("Cancel");
         cancel.add_css_class("flat");

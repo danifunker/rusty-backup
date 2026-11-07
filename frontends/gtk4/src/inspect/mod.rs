@@ -6,7 +6,6 @@
 
 mod bar;
 mod details;
-mod source;
 mod table;
 mod tools;
 
@@ -24,18 +23,19 @@ use rusty_backup::controller::inspect::{
     InspectController, InspectServices, InspectSource, JobRegistry, LayoutSegment, PartitionRow,
     TableSummary,
 };
+use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::browser::BrowseView;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::progress::JobList;
+use crate::source::{Pick, PickerSpec, SourcePicker};
 use crate::sync::SyncGuard;
 use crate::widgets::set_text;
 
 use bar::PartitionBar;
 use details::{show_note, Details};
-use source::{Pick, SourcePicker};
 use table::PartitionTable;
 use tools::{ToolBar, ToolState};
 
@@ -134,7 +134,18 @@ impl InspectScreen {
                 }
             });
 
-            let source = SourcePicker::build();
+            let source = SourcePicker::build(PickerSpec {
+                source: ids::SOURCE,
+                recent: ids::SOURCE_RECENT,
+                device: ids::SOURCE_DEVICE,
+                open_file: ids::OPEN_FILE,
+                open_folder: None,
+                open_backup: ids::OPEN_BACKUP,
+                connect: ids::CONNECT_REMOTE,
+                connect_live: false,
+                width_chars: 44,
+                caption: Some("Source:"),
+            });
             let target = me.clone();
             source.connect_pick(move |pick| {
                 if let Some(screen) = target.upgrade() {
@@ -207,7 +218,13 @@ impl InspectScreen {
             }));
             let root = gtk::Stack::new();
             root.add_named(&scroll, Some("inspect"));
-            root.add_named(browse.root(), Some("browse"));
+            // Clipped: the edit bar's extra buttons wrap rather than widen the window.
+            let clip = gtk::ScrolledWindow::builder()
+                .child(browse.root())
+                .hscrollbar_policy(gtk::PolicyType::External)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .build();
+            root.add_named(&clip, Some("browse"));
 
             let recent_files = recent.list(RecentMode::Inspect);
             InspectScreen {
@@ -256,6 +273,11 @@ impl InspectScreen {
         }
     }
 
+    /// A window-wide key: the browse view's, while it is open.
+    pub fn key(&self, key: Key, mods: Mods) -> bool {
+        self.browse.key(key, mods)
+    }
+
     pub fn apply(&self, action: InspectAction) {
         let effects = self.ctrl.borrow_mut().apply(action);
         self.after(effects);
@@ -301,6 +323,8 @@ impl InspectScreen {
             }
             Pick::OpenFile => InspectAction::ChooseImage,
             Pick::OpenBackup => InspectAction::ChooseBackupFolder,
+            // Inspect's picker offers neither: no folder source, and remote is slice 7.
+            Pick::OpenFolder | Pick::Connect => return,
         };
         self.apply(action);
     }

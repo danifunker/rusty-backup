@@ -5,10 +5,12 @@
 
 mod app;
 mod browser;
+mod commander;
 mod effects;
 mod inspect;
 mod keys;
 mod progress;
+mod source;
 mod sync;
 mod theme;
 mod wake;

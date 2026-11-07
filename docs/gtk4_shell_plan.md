@@ -65,6 +65,25 @@ widgets with:
   timeout while `follow_pending()` says one is due. It is a deadline, not a polling timer.
 - Nothing that appears on selection may sit above the listing: the row moves under the pointer and
   the second click of a double click misses. The marked-rows bar lives in the fixed footer.
+- Shortcuts are read by one capture-phase key controller on the window, which hands them to the screen
+  on top while no dialog is up (`EffectHost::dialog_open`). A closing `adw::Dialog` leaves nothing
+  focused, and a controller lower down then never sees a key. `widgets::typing` keeps text entries
+  and open menus out of it.
+- A window a pane opens lives in `dialogs::PaneDialogs`, one set per side. A two-pane screen tags the
+  titles, `(L)` and `(R)`; everything else in `Dialogs` is the screen's. Windows only Commander opens
+  are in `commander/windows.rs`, on the same `Slot`.
+- A drag between panes is the view's own: `PaneView::watch_drags` reads raw events through an
+  `EventControllerLegacy` on the screen root, in capture. The row's claimed click denies any gesture,
+  and the pointer's grab does not survive the row being selected, so a controller lower down stops
+  seeing motion. Broadway delivers no GDK drag, and this works on every backend. `gtk::DragSource`
+  belongs to a drag out to the file manager, which nothing does yet.
+- A press on one of several selected rows selects only on release, so a drag carries them all.
+- Keep live parts out of a window's key, and let the window update them: the checksum window holds a
+  `JobList`, File Info a `FileInfo` the refresh feeds.
+- A label that names a running file must not move what follows it: the job row's phase has a fixed
+  width and ellipsizes, or Cancel walks away from the pointer as the copy goes.
+- `CenterBox` sides take their natural width, so a pane with one more button pushes the column. The
+  sides are clipped by a `ScrolledWindow` with an `External` policy to stay equal.
 
 ## Slices
 
@@ -73,7 +92,7 @@ widgets with:
 | 0 | Skeleton: window, tabs, log, effect host, `Notify`, elevation, CI target | done |
 | 1 | Inspect: source picker, partition bar (`DrawingArea`), partition table, tools | done; Browse, Check, CHD Info, Export, Expand Image and remote wait on slices 2 and 7, greyed out |
 | 2 | Browse view on `BrowserPaneController` (`ColumnView`, `TreeListModel`), file detail, journal | done; `browser/` is the reusable pane, detail panel and windows; the metadata editors wait on slice 7, greyed out; the Optical disc browser header and host drag and drop wait on slices 6 and 8 |
-| 3 | Commander: two panes, key map, drag and drop, staged edits | |
+| 3 | Commander: two panes, key map, drag and drop, staged edits | done; `commander/` takes the window over, every source opens (remote included: `Connect` is the controller's own prompt), File Info is `browser/info.rs` with the controller's field prompts, and Browse opens it from the row menu; the graphical metadata editors stay slice 7; a drop from the file manager is slice 8, a drag out to it is not built |
 | 4 | Backup and Restore | |
 | 5 | Build Disk wizard | |
 | 6 | Optical and Archives | |
@@ -93,3 +112,9 @@ connects late shows the frame from when it connected until the next redraw. A cl
 swallows clicks until its animation ends, which a browser tab paints slowly: wait before the next
 click. Typed text arrives only as key events, so drive a text field one key at a time. The window
 follows the browser's size, so a wider browser means a wider window, not a layout bug.
+
+To drive it from a script, read the page's own globals. `sendInput(BROADWAY_EVENT_KEY_PRESS, [keysym,
+state])` reaches GTK where a synthesized `KeyboardEvent` does not, with state 4 for Ctrl. A
+`MouseEvent` dispatched on `document.elementFromPoint` works for clicks and drags once one real click
+has landed after the page loaded. Motion is compressed, so a slow drag may arrive as a single event.
+Broadway has no GDK drag: a `gtk::DragSource` starts and nothing ever receives it.

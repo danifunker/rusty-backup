@@ -9,30 +9,39 @@ use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use rusty_backup::controller::browser::TextDoc;
+use gtk::glib;
+use rusty_backup::controller::app::Snapshot;
+use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
     format_size, journal_status, journal_summary, journal_txn_blocks, journal_txn_rows,
     ApplyPreflight, ApplyReport, ArchiveSave, ArchiveViewer, BrowserPaneAction as P, BudgetAction,
-    BudgetForm, BudgetMode, CommanderAction as A, CommanderController, ForkFormat, HashAlgo,
-    ImportChoice, JournalDetail, JournalTone, LineEnding, MacArchiveKind, ModeAction, OnConflict,
-    Side, SkippedReport, TarChoice, TarPreview, TextShape, ToolReport, TreeText, UnsavedChoice,
-    MAX_CONSECUTIVE_FAILURES,
+    BudgetForm, BudgetMode, ChecksumRow, CommanderAction as A, CommanderController, ForkFormat,
+    HashAlgo, ImportChoice, JournalDetail, JournalTone, LineEnding, MacArchiveKind, ModeAction,
+    OnConflict, Side, SkippedReport, TarChoice, TarPreview, TextShape, ToolReport, TreeText,
+    UnsavedChoice, MAX_CONSECUTIVE_FAILURES,
 };
+use rusty_backup::controller::keys::{Key, Mods};
 
+use super::info::{FileInfo, InfoShown};
 use super::SendFn;
 use crate::effects::EffectHost;
+use crate::keys::{key_of, mods_of};
+use crate::progress::JobList;
 use crate::widgets::plain;
+
+/// Runs a key through the screen's key map; true when it meant something.
+pub type KeyFn = Rc<dyn Fn(Key, Mods) -> bool>;
 
 /// Past this a tree listing offers Save before it fills a text view.
 const TREE_INLINE_LIMIT: usize = 1024 * 1024;
 
-fn pane(action: P) -> A {
-    A::Pane(Side::Left, action)
+fn pane(side: Side, action: P) -> A {
+    A::Pane(side, action)
 }
 
 /// A dialog the controller holds open.
 #[derive(Default)]
-struct Slot {
+pub struct Slot {
     shown: Rc<RefCell<Option<(String, adw::Dialog)>>>,
     /// Runs when the user closes it, for what the view itself holds.
     on_close: RefCell<Option<Rc<dyn Fn()>>>,
@@ -40,7 +49,7 @@ struct Slot {
 
 impl Slot {
     /// Show what `want` keys, built by `build` when it changed; `None` closes it.
-    fn sync(
+    pub fn sync(
         &self,
         host: &EffectHost,
         send: &SendFn,
@@ -84,7 +93,7 @@ impl Slot {
 }
 
 /// A dialog with a title bar around `body`.
-fn window(title: &str, width: i32, height: i32, body: &impl IsA<gtk::Widget>) -> adw::Dialog {
+pub fn window(title: &str, width: i32, height: i32, body: &impl IsA<gtk::Widget>) -> adw::Dialog {
     let bar = adw::HeaderBar::new();
     let view = adw::ToolbarView::new();
     view.add_top_bar(&bar);
@@ -97,7 +106,7 @@ fn window(title: &str, width: i32, height: i32, body: &impl IsA<gtk::Widget>) ->
         .build()
 }
 
-fn page() -> gtk::Box {
+pub fn page() -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
     b.set_margin_start(12);
     b.set_margin_end(12);
@@ -106,7 +115,7 @@ fn page() -> gtk::Box {
     b
 }
 
-fn wrapped(text: &str) -> gtk::Label {
+pub fn wrapped(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(plain(text).as_ref())
         .xalign(0.0)
@@ -121,7 +130,7 @@ fn toned(text: &str, class: &str) -> gtk::Label {
     l
 }
 
-fn buttons(send: &SendFn, list: &[(&str, A)]) -> gtk::Box {
+pub fn buttons(send: &SendFn, list: &[(&str, A)]) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.set_halign(gtk::Align::End);
     for (label, action) in list {
@@ -150,7 +159,7 @@ fn text_view(text: &str) -> gtk::ScrolledWindow {
 }
 
 /// A list of paths, or anything else that can run long, in a short scroller.
-fn listing(lines: &[String]) -> gtk::ScrolledWindow {
+pub fn listing(lines: &[String]) -> gtk::ScrolledWindow {
     let scroll = text_view(&lines.join("\n"));
     scroll.set_max_content_height(200);
     scroll.set_propagate_natural_height(true);
@@ -158,9 +167,8 @@ fn listing(lines: &[String]) -> gtk::ScrolledWindow {
     scroll
 }
 
-/// What the windows show this refresh, read while the controller is borrowed.
-pub struct DialogsShown {
-    unsaved: Option<(usize, Vec<String>)>,
+/// One pane's windows, read while the controller is borrowed.
+pub struct PaneDialogsShown {
     review: Option<ApplyPreflight>,
     report: Option<(ApplyReport, usize)>,
     edits: Option<(Vec<String>, bool)>,
@@ -172,26 +180,38 @@ pub struct DialogsShown {
     errors: Vec<(String, String)>,
     fs_type: String,
     tool: Option<(ToolReport, bool, bool)>,
+}
+
+/// What the windows show this refresh, read while the controller is borrowed.
+pub struct DialogsShown {
+    panes: Vec<PaneDialogsShown>,
+    unsaved: Option<(usize, Vec<String>)>,
     budget: Option<BudgetForm>,
     chd: Option<String>,
     log: Option<Vec<String>>,
     help: Option<(Vec<(&'static str, String)>, String)>,
-    checksums: Option<Checksums>,
+    checksums: Option<ChecksumsShown>,
     conflict: Option<Vec<String>>,
     skipped: Option<SkippedReport>,
     password: Option<bool>,
+    detail: Option<(u64, String)>,
+    info: Option<InfoShown>,
 }
 
-struct Checksums {
+struct ChecksumsShown {
     title: String,
-    text: String,
-    running: Option<String>,
+    error: Option<String>,
+    rows: Vec<ChecksumRow>,
+    running: Option<Snapshot>,
 }
 
-pub struct Dialogs {
+/// The windows a pane opens; a two-pane screen has one set per side.
+struct PaneDialogs {
+    side: Side,
+    /// Names the pane in a two-pane screen's titles.
+    tag: String,
     host: EffectHost,
     send: SendFn,
-    unsaved: Slot,
     review: Slot,
     report: Slot,
     edits: Slot,
@@ -204,6 +224,14 @@ pub struct Dialogs {
     errors: Slot,
     tool: Slot,
     show_debug: Rc<Cell<bool>>,
+}
+
+pub struct Dialogs {
+    host: EffectHost,
+    send: SendFn,
+    panes: Vec<Rc<PaneDialogs>>,
+    key: KeyFn,
+    unsaved: Slot,
     tree: Slot,
     tree_large: Slot,
     tree_text: Rc<RefCell<Option<TreeText>>>,
@@ -214,27 +242,21 @@ pub struct Dialogs {
     log: Slot,
     help: Slot,
     checksums: Slot,
+    checksum_jobs: RefCell<Option<JobList>>,
     conflict: Slot,
     skipped: Slot,
     password: Slot,
+    detail: Slot,
+    info: RefCell<Option<Rc<FileInfo>>>,
 }
 
-impl Dialogs {
-    pub fn new(host: EffectHost, send: SendFn) -> Rc<Dialogs> {
-        let tree_text: Rc<RefCell<Option<TreeText>>> = Rc::default();
-        let drop_tree = |held: &Rc<RefCell<Option<TreeText>>>| {
-            let held = held.clone();
-            let f: Rc<dyn Fn()> = Rc::new(move || *held.borrow_mut() = None);
-            RefCell::new(Some(f))
-        };
-        let slot_dropping_tree = || Slot {
-            on_close: drop_tree(&tree_text),
-            ..Slot::default()
-        };
-        Rc::new(Dialogs {
-            host,
-            send,
-            unsaved: Slot::default(),
+impl PaneDialogs {
+    fn new(side: Side, tag: String, host: &EffectHost, send: &SendFn) -> Rc<PaneDialogs> {
+        Rc::new(PaneDialogs {
+            side,
+            tag,
+            host: host.clone(),
+            send: send.clone(),
             review: Slot::default(),
             report: Slot::default(),
             edits: Slot::default(),
@@ -247,50 +269,12 @@ impl Dialogs {
             errors: Slot::default(),
             tool: Slot::default(),
             show_debug: Rc::default(),
-            tree: slot_dropping_tree(),
-            tree_large: slot_dropping_tree(),
-            tree_text: tree_text.clone(),
-            tree_force: Rc::default(),
-            budget: Slot::default(),
-            budget_live: RefCell::default(),
-            chd: Slot::default(),
-            log: Slot::default(),
-            help: Slot::default(),
-            checksums: Slot::default(),
-            conflict: Slot::default(),
-            skipped: Slot::default(),
-            password: Slot::default(),
         })
     }
 
-    pub fn read(ctl: &CommanderController) -> DialogsShown {
-        let pane = ctl.pane(Side::Left);
-        let checksums = ctl.checksums().map(|c| {
-            let mut text = String::new();
-            for row in &c.rows {
-                text.push_str(&format!("{}  ({})\n", row.name, format_size(row.size)));
-                if let Some(err) = &row.error {
-                    text.push_str(&format!("  failed: {err}\n"));
-                }
-                if let Some(values) = &row.values {
-                    for (algo, value) in HashAlgo::ALL.iter().zip(values) {
-                        text.push_str(&format!("  {:7} {value}\n", algo.label()));
-                    }
-                }
-            }
-            if let Some(err) = &c.error {
-                text = err.clone();
-            }
-            Checksums {
-                title: c.title.clone(),
-                text,
-                running: c.running().map(|s| s.phase),
-            }
-        });
-        DialogsShown {
-            unsaved: ctl
-                .unsaved_shown()
-                .then(|| (pane.queue.len(), pane.staged_summary())),
+    fn read(ctl: &CommanderController, side: Side) -> PaneDialogsShown {
+        let pane = ctl.pane(side);
+        PaneDialogsShown {
             review: pane.apply_review().cloned(),
             report: pane.apply_report().cloned().map(|r| (r, pane.queue.len())),
             edits: pane
@@ -310,6 +294,240 @@ impl Dialogs {
                 let repairable = !ctl.has_archive_flow();
                 (r, repairable, ctl.edit_mode())
             }),
+        }
+    }
+
+    fn show(self: &Rc<Self>, s: PaneDialogsShown) {
+        let (side, host, send) = (self.side, &self.host, &self.send);
+
+        let want = s.review.as_ref().map(|_| "review".to_string());
+        self.review
+            .sync(host, send, want, Some(pane(side, P::DismissReview)), || {
+                let p = s.review.clone().expect("a review to show");
+                review_dialog(self, &p)
+            });
+
+        let want = s
+            .report
+            .as_ref()
+            .map(|(r, n)| format!("{}/{}/{n}/{}", r.applied, r.total, r.failed.len()));
+        self.report
+            .sync(host, send, want, Some(pane(side, P::DismissReport)), || {
+                let (r, still) = s.report.clone().expect("a report to show");
+                report_dialog(self, &r, still)
+            });
+
+        let want = s.edits.as_ref().map(|(l, busy)| format!("{l:?}{busy}"));
+        self.edits.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::ShowEdits(false))),
+            || {
+                let (lines, busy) = s.edits.clone().unwrap_or_default();
+                edits_dialog(self, &lines, busy)
+            },
+        );
+
+        self.tar.sync(
+            host,
+            send,
+            s.tar.clone(),
+            Some(pane(side, P::ChooseTar(TarChoice::Cancel))),
+            || {
+                let name = s.tar.clone().unwrap_or_default();
+                let body = page();
+                body.append(&wrapped(&format!("\"{name}\" is a tar archive.")));
+                body.append(&wrapped(
+                    "Import its contents into the current folder, or add the archive itself as \
+                     a file?",
+                ));
+                let choose = |c| pane(side, P::ChooseTar(c));
+                body.append(&buttons(
+                    send,
+                    &[
+                        ("Import contents", choose(TarChoice::Import)),
+                        ("Add as file", choose(TarChoice::AsFile)),
+                        ("Cancel", choose(TarChoice::Cancel)),
+                    ],
+                ));
+                window("Tar archive", 460, -1, &body)
+            },
+        );
+
+        let want = s.tar_preview.as_ref().map(|_| "preview".to_string());
+        self.tar_preview.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::ConfirmTarImport(false))),
+            || {
+                let (p, fs) = s.tar_preview.clone().expect("a preview to show");
+                let body = page();
+                body.append(&toned(
+                    &format!("This [{fs}] volume can't store everything in the archive:"),
+                    "warning",
+                ));
+                for w in &p.warnings {
+                    body.append(&wrapped(&format!("- {w}")));
+                }
+                if p.sidecars > 0 {
+                    let line = format!("- {} macOS ._ sidecar(s) will be skipped.", p.sidecars);
+                    body.append(&wrapped(&line));
+                }
+                body.append(&wrapped(&format!(
+                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
+                    p.files, p.dirs
+                )));
+                body.append(&buttons(
+                    send,
+                    &[
+                        ("Continue", pane(side, P::ConfirmTarImport(true))),
+                        ("Cancel", pane(side, P::ConfirmTarImport(false))),
+                    ],
+                ));
+                window(
+                    "Import archive - some content can't be kept",
+                    520,
+                    -1,
+                    &body,
+                )
+            },
+        );
+
+        let want = s.import.as_ref().map(|(n, k)| format!("{n}{}", k.label()));
+        self.import.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::ChooseImport(ImportChoice::Cancel))),
+            || {
+                let (name, kind) = s.import.clone().expect("an import to show");
+                import_dialog(self, &name, kind)
+            },
+        );
+
+        let want = s.save.as_ref().map(|p| p.entry_name.clone());
+        self.save.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::CancelSaveArchive)),
+            || {
+                let p = s.save.clone().expect("an archive to save");
+                archive_save_dialog(self, &p)
+            },
+        );
+
+        let want = s.viewer.as_ref().map(|w| w.entry_name.clone());
+        let mut extract = None;
+        self.viewer
+            .sync(host, send, want, Some(pane(side, P::CloseArchive)), || {
+                let w = s.viewer.clone().expect("an archive to view");
+                let (dialog, button) = archive_viewer_dialog(self, &w);
+                extract = Some(button);
+                dialog
+            });
+        if let Some(button) = extract {
+            *self.viewer_extract.borrow_mut() = Some(button);
+        }
+        if let (Some(w), Some(button)) = (&s.viewer, &*self.viewer_extract.borrow()) {
+            let n = w.marked_files();
+            button.set_label(&format!("Extract Selected... ({n})"));
+            button.set_sensitive(n > 0);
+        }
+
+        let want = (!s.errors.is_empty()).then(|| format!("{:?}", s.errors));
+        self.errors.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::DismissStagingErrors)),
+            || errors_dialog(self, &s.errors, &s.fs_type),
+        );
+
+        let debug = self.show_debug.clone();
+        let want = s
+            .tool
+            .as_ref()
+            .map(|(r, repairable, edit)| format!("{r:?}{repairable}{edit}{}", debug.get()));
+        self.tool.sync(
+            host,
+            send,
+            want,
+            Some(pane(side, P::DismissToolReport)),
+            || {
+                let (r, repairable, edit) = s.tool.clone().expect("a report to show");
+                tool_dialog(&r, repairable, edit, self)
+            },
+        );
+    }
+}
+
+impl Dialogs {
+    /// One set of pane windows per side in `sides`; `key` runs a key press through the key map.
+    pub fn new(host: EffectHost, send: SendFn, sides: &[Side], key: KeyFn) -> Rc<Dialogs> {
+        let tree_text: Rc<RefCell<Option<TreeText>>> = Rc::default();
+        let drop_tree = |held: &Rc<RefCell<Option<TreeText>>>| {
+            let held = held.clone();
+            let f: Rc<dyn Fn()> = Rc::new(move || *held.borrow_mut() = None);
+            RefCell::new(Some(f))
+        };
+        let slot_dropping_tree = || Slot {
+            on_close: drop_tree(&tree_text),
+            ..Slot::default()
+        };
+        let tag = |s: &Side| match sides.len() {
+            1 => String::new(),
+            _ => format!(" ({})", s.label()),
+        };
+        let panes = sides
+            .iter()
+            .map(|s| PaneDialogs::new(*s, tag(s), &host, &send))
+            .collect();
+        Rc::new(Dialogs {
+            host,
+            send,
+            panes,
+            key,
+            unsaved: Slot::default(),
+            tree: slot_dropping_tree(),
+            tree_large: slot_dropping_tree(),
+            tree_text: tree_text.clone(),
+            tree_force: Rc::default(),
+            budget: Slot::default(),
+            budget_live: RefCell::default(),
+            chd: Slot::default(),
+            log: Slot::default(),
+            help: Slot::default(),
+            checksums: Slot::default(),
+            checksum_jobs: RefCell::default(),
+            conflict: Slot::default(),
+            skipped: Slot::default(),
+            password: Slot::default(),
+            detail: Slot::default(),
+            info: RefCell::default(),
+        })
+    }
+
+    pub fn read(&self, ctl: &CommanderController) -> DialogsShown {
+        let pane = ctl.pane(Side::Left);
+        let checksums = ctl.checksums().map(|c| ChecksumsShown {
+            title: c.title.clone(),
+            error: c.error.clone(),
+            rows: c.rows.clone(),
+            running: c.running(),
+        });
+        let known = self.info.borrow().as_ref().and_then(|live| live.key());
+        DialogsShown {
+            panes: self
+                .panes
+                .iter()
+                .map(|p| PaneDialogs::read(ctl, p.side))
+                .collect(),
+            unsaved: ctl
+                .unsaved_shown()
+                .then(|| (pane.queue.len(), pane.staged_summary())),
             budget: ctl.size_budget().copied(),
             chd: ctl.chd_info().map(str::to_string),
             log: ctl.log_shown().then(|| ctl.log().to_vec()),
@@ -319,9 +537,13 @@ impl Dialogs {
             checksums,
             conflict: ctl.host_conflict().map(<[String]>::to_vec),
             skipped: ctl.skipped_report().cloned(),
-            password: pane
-                .needs_password()
+            // A two-pane screen asks inside the pane, beside the other pane's work.
+            password: (pane.needs_password() && ctl.is_single())
                 .then(|| pane.volume().fs_type == "APFS"),
+            detail: ctl
+                .detail()
+                .map(|d| (d.serial, format!("File Info: {}", d.entry.name))),
+            info: ctl.detail().map(|d| FileInfo::read(ctl, d, known)),
         }
     }
 
@@ -337,7 +559,9 @@ impl Dialogs {
 
     pub fn show(self: &Rc<Self>, s: DialogsShown) {
         let (host, send) = (&self.host, &self.send);
-        let key = |k: Option<String>| k;
+        for (pane, shown) in self.panes.iter().zip(s.panes) {
+            pane.show(shown);
+        }
 
         let want = s.unsaved.as_ref().map(|(n, l)| format!("{n}{l:?}"));
         self.unsaved.sync(
@@ -365,154 +589,6 @@ impl Dialogs {
             },
         );
 
-        let want = s.review.as_ref().map(|_| "review".to_string());
-        self.review
-            .sync(host, send, want, Some(pane(P::DismissReview)), || {
-                let p = s.review.clone().expect("a review to show");
-                review_dialog(&p, send)
-            });
-
-        let want = s
-            .report
-            .as_ref()
-            .map(|(r, n)| format!("{}/{}/{n}/{}", r.applied, r.total, r.failed.len()));
-        self.report
-            .sync(host, send, want, Some(pane(P::DismissReport)), || {
-                let (r, still) = s.report.clone().expect("a report to show");
-                report_dialog(&r, still, send)
-            });
-
-        let want = s.edits.as_ref().map(|(l, busy)| format!("{l:?}{busy}"));
-        self.edits
-            .sync(host, send, want, Some(pane(P::ShowEdits(false))), || {
-                let (lines, busy) = s.edits.clone().unwrap_or_default();
-                edits_dialog(&lines, busy, send)
-            });
-
-        self.tar.sync(
-            host,
-            send,
-            key(s.tar.clone()),
-            Some(pane(P::ChooseTar(TarChoice::Cancel))),
-            || {
-                let name = s.tar.clone().unwrap_or_default();
-                let body = page();
-                body.append(&wrapped(&format!("\"{name}\" is a tar archive.")));
-                body.append(&wrapped(
-                    "Import its contents into the current folder, or add the archive itself as \
-                     a file?",
-                ));
-                let choose = |c| pane(P::ChooseTar(c));
-                body.append(&buttons(
-                    send,
-                    &[
-                        ("Import contents", choose(TarChoice::Import)),
-                        ("Add as file", choose(TarChoice::AsFile)),
-                        ("Cancel", choose(TarChoice::Cancel)),
-                    ],
-                ));
-                window("Tar archive", 460, -1, &body)
-            },
-        );
-
-        let want = s.tar_preview.as_ref().map(|_| "preview".to_string());
-        self.tar_preview.sync(
-            host,
-            send,
-            want,
-            Some(pane(P::ConfirmTarImport(false))),
-            || {
-                let (p, fs) = s.tar_preview.clone().expect("a preview to show");
-                let body = page();
-                body.append(&toned(
-                    &format!("This [{fs}] volume can't store everything in the archive:"),
-                    "warning",
-                ));
-                for w in &p.warnings {
-                    body.append(&wrapped(&format!("- {w}")));
-                }
-                if p.sidecars > 0 {
-                    let line = format!("- {} macOS ._ sidecar(s) will be skipped.", p.sidecars);
-                    body.append(&wrapped(&line));
-                }
-                body.append(&wrapped(&format!(
-                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
-                    p.files, p.dirs
-                )));
-                body.append(&buttons(
-                    send,
-                    &[
-                        ("Continue", pane(P::ConfirmTarImport(true))),
-                        ("Cancel", pane(P::ConfirmTarImport(false))),
-                    ],
-                ));
-                window(
-                    "Import archive - some content can't be kept",
-                    520,
-                    -1,
-                    &body,
-                )
-            },
-        );
-
-        let want = s.import.as_ref().map(|(n, k)| format!("{n}{}", k.label()));
-        self.import.sync(
-            host,
-            send,
-            want,
-            Some(pane(P::ChooseImport(ImportChoice::Cancel))),
-            || {
-                let (name, kind) = s.import.clone().expect("an import to show");
-                import_dialog(&name, kind, send)
-            },
-        );
-
-        let want = s.save.as_ref().map(|p| p.entry_name.clone());
-        self.save
-            .sync(host, send, want, Some(pane(P::CancelSaveArchive)), || {
-                let p = s.save.clone().expect("an archive to save");
-                archive_save_dialog(&p, send)
-            });
-
-        let want = s.viewer.as_ref().map(|w| w.entry_name.clone());
-        let mut extract = None;
-        self.viewer
-            .sync(host, send, want, Some(pane(P::CloseArchive)), || {
-                let w = s.viewer.clone().expect("an archive to view");
-                let (dialog, button) = archive_viewer_dialog(&w, send);
-                extract = Some(button);
-                dialog
-            });
-        if let Some(button) = extract {
-            *self.viewer_extract.borrow_mut() = Some(button);
-        }
-        if let (Some(w), Some(button)) = (&s.viewer, &*self.viewer_extract.borrow()) {
-            let n = w.marked_files();
-            button.set_label(&format!("Extract Selected... ({n})"));
-            button.set_sensitive(n > 0);
-        }
-
-        let want = (!s.errors.is_empty()).then(|| format!("{:?}", s.errors));
-        self.errors.sync(
-            host,
-            send,
-            want,
-            Some(pane(P::DismissStagingErrors)),
-            || errors_dialog(&s.errors, &s.fs_type, send),
-        );
-
-        let debug = self.show_debug.clone();
-        let want = s
-            .tool
-            .as_ref()
-            .map(|(r, repairable, edit)| format!("{r:?}{repairable}{edit}{}", debug.get()));
-        let this = self.clone();
-        self.tool
-            .sync(host, send, want, Some(pane(P::DismissToolReport)), || {
-                let (r, repairable, edit) = s.tool.clone().expect("a report to show");
-                tool_dialog(&r, repairable, edit, &this)
-            });
-
         self.show_tree();
 
         self.show_budget(s.budget.as_ref());
@@ -520,7 +596,7 @@ impl Dialogs {
         self.chd.sync(
             host,
             send,
-            key(s.chd.clone()),
+            s.chd.clone(),
             Some(A::Mode(ModeAction::CloseChdInfo)),
             || {
                 let body = page();
@@ -532,18 +608,7 @@ impl Dialogs {
         let want = s.log.as_ref().map(|l| format!("{l:?}"));
         self.log
             .sync(host, send, want, Some(A::ShowLog(false)), || {
-                let lines = s.log.clone().unwrap_or_default();
-                let body = page();
-                body.append(&wrapped(&format!(
-                    "{} operation(s) this session.",
-                    lines.len()
-                )));
-                body.append(&text_view(&lines.join("\n")));
-                body.append(&buttons(
-                    send,
-                    &[("Copy all", A::CopyLog), ("Clear", A::ClearLog)],
-                ));
-                window("Session log", 560, 360, &body)
+                log_dialog(s.log.as_deref().unwrap_or(&[]), send)
             });
 
         let want = s.help.as_ref().map(|_| "help".to_string());
@@ -568,24 +633,12 @@ impl Dialogs {
                     .build();
                 body.append(&scroll);
                 body.append(&wrapped(&footer));
-                window("Keyboard shortcuts", 420, 480, &body)
+                let dialog = window("Keyboard shortcuts", 420, 480, &body);
+                dialog.add_controller(forward_keys(&self.key));
+                dialog
             });
 
-        let want = s
-            .checksums
-            .as_ref()
-            .map(|c| format!("{}{}{:?}", c.title, c.text, c.running));
-        self.checksums
-            .sync(host, send, want, Some(A::CloseChecksums), || {
-                let c = s.checksums.as_ref().expect("checksums to show");
-                let body = page();
-                if let Some(phase) = &c.running {
-                    body.append(&wrapped(phase));
-                }
-                body.append(&text_view(&c.text));
-                body.append(&buttons(send, &[("Copy all", A::CopyChecksums)]));
-                window(&c.title, 560, 360, &body)
-            });
+        self.show_checksums(s.checksums.as_ref());
 
         let want = s.conflict.as_ref().map(|n| format!("{n:?}"));
         self.conflict
@@ -626,6 +679,70 @@ impl Dialogs {
         self.password.sync(host, send, want, None, || {
             password_dialog(s.password.unwrap_or(false), send)
         });
+
+        self.show_detail(s.detail, s.info);
+    }
+
+    /// File Info: the key is the entry; what a job reads later lands in the open window.
+    fn show_detail(&self, detail: Option<(u64, String)>, info: Option<InfoShown>) {
+        let (host, send) = (&self.host, &self.send);
+        let title = detail.as_ref().map(|d| d.1.clone()).unwrap_or_default();
+        let want = detail.map(|d| d.0.to_string());
+        if want.is_none() {
+            *self.info.borrow_mut() = None;
+        }
+        let mut fresh = None;
+        self.detail
+            .sync(host, send, want, Some(A::CloseDetail), || {
+                let live = FileInfo::build(send);
+                let dialog = window(&title, 620, 560, live.root());
+                fresh = Some(live);
+                dialog
+            });
+        if let Some(live) = fresh {
+            *self.info.borrow_mut() = Some(live);
+        }
+        if let (Some(live), Some(info)) = (&*self.info.borrow(), info) {
+            live.show(info);
+        }
+    }
+
+    fn show_checksums(&self, c: Option<&ChecksumsShown>) {
+        let (host, send) = (&self.host, &self.send);
+        // The running job's numbers stay out of the key, or every wake would rebuild the window.
+        let want = c.map(|c| {
+            format!(
+                "{}{:?}{}{}",
+                c.title,
+                c.error,
+                c.rows.len(),
+                c.running.is_some()
+            )
+        });
+        let mut jobs = None;
+        self.checksums
+            .sync(host, send, want, Some(A::CloseChecksums), || {
+                let c = c.expect("checksums to show");
+                let body = page();
+                if let Some(err) = &c.error {
+                    body.append(&toned(err, "error"));
+                } else if c.running.is_some() {
+                    let list = JobList::new(ids::CANCEL_JOB, Rc::new(|| {}));
+                    body.append(list.root());
+                    jobs = Some(list);
+                } else {
+                    body.append(&buttons(send, &[("Copy all", A::CopyChecksums)]));
+                    body.append(&checksum_rows(&c.rows, send));
+                }
+                window(&c.title, 600, 420, &body)
+            });
+        if jobs.is_some() {
+            *self.checksum_jobs.borrow_mut() = jobs;
+        }
+        let held = self.checksum_jobs.borrow();
+        if let (Some(list), Some(snap)) = (&*held, c.and_then(|c| c.running.clone())) {
+            list.show(&[(snap, false)]);
+        }
     }
 
     fn show_tree(self: &Rc<Self>) {
@@ -650,7 +767,7 @@ impl Dialogs {
             body.append(&wrapped("Save it to a file, or show it here (slow)."));
             let save = gtk::Button::with_label("Save to File...");
             let send = this.send.clone();
-            save.connect_clicked(move |_| send(pane(P::SaveTree)));
+            save.connect_clicked(move |_| send(pane(Side::Left, P::SaveTree)));
             let anyway = gtk::Button::with_label("Show in app anyway (slow)");
             let again = this.clone();
             anyway.connect_clicked(move |_| {
@@ -710,7 +827,103 @@ impl Dialogs {
     }
 }
 
-fn review_dialog(p: &ApplyPreflight, send: &SendFn) -> adw::Dialog {
+/// A window's keys go through the screen's key map, so its toggle key closes it too.
+fn forward_keys(key: &KeyFn) -> gtk::EventControllerKey {
+    let keys = gtk::EventControllerKey::new();
+    let key = key.clone();
+    keys.connect_key_pressed(move |_, pressed, _, state| {
+        let used = key_of(pressed).is_some_and(|k| key(k, mods_of(state)));
+        match used {
+            true => glib::Propagation::Stop,
+            false => glib::Propagation::Proceed,
+        }
+    });
+    keys
+}
+
+fn log_dialog(lines: &[String], send: &SendFn) -> adw::Dialog {
+    let body = page();
+    body.append(&wrapped(&format!(
+        "{} operation(s) this session.",
+        lines.len()
+    )));
+    if lines.is_empty() {
+        let hint = wrapped(
+            "No operations yet. Applied edits, host copies / exports, and immediate host \
+             deletes / renames / new folders are recorded here.",
+        );
+        hint.add_css_class("dim-label");
+        hint.set_vexpand(true);
+        hint.set_valign(gtk::Align::Start);
+        body.append(&hint);
+    } else {
+        let scroll = text_view(&lines.join("\n"));
+        if let Some(view) = scroll.child().and_downcast::<gtk::TextView>() {
+            let buffer = view.buffer();
+            let end = buffer.create_mark(None, &buffer.end_iter(), false);
+            glib::idle_add_local_once(move || view.scroll_mark_onscreen(&end));
+        }
+        body.append(&scroll);
+    }
+    let row = buttons(send, &[("Copy all", A::CopyLog), ("Clear", A::ClearLog)]);
+    if let Some(copy) = row.first_child() {
+        copy.set_sensitive(!lines.is_empty());
+    }
+    body.append(&row);
+    window("Session log", 560, 360, &body)
+}
+
+/// One block per file: its name, then each value with a Copy button.
+fn checksum_rows(rows: &[ChecksumRow], send: &SendFn) -> gtk::ScrolledWindow {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    for (file, row) in rows.iter().enumerate() {
+        let name = wrapped(&format!("{}  ({})", row.name, format_size(row.size)));
+        name.add_css_class("heading");
+        list.append(&name);
+        if let Some(err) = &row.error {
+            list.append(&toned(&format!("failed: {err}"), "error"));
+        }
+        let Some(values) = &row.values else {
+            continue;
+        };
+        let grid = gtk::Grid::builder()
+            .row_spacing(2)
+            .column_spacing(12)
+            .build();
+        for (i, (algo, value)) in HashAlgo::ALL.iter().zip(values).enumerate() {
+            let shown = gtk::Label::builder()
+                .label(value.as_str())
+                .xalign(0.0)
+                .selectable(true)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::Char)
+                .hexpand(true)
+                .build();
+            shown.add_css_class("monospace");
+            let copy = gtk::Button::with_label("Copy");
+            copy.add_css_class("flat");
+            let (send, algo) = (send.clone(), *algo);
+            copy.connect_clicked(move |_| send(A::CopyChecksum { file, algo }));
+            let label = gtk::Label::builder()
+                .label(algo.label())
+                .xalign(0.0)
+                .build();
+            grid.attach(&label, 0, i as i32, 1, 1);
+            grid.attach(&shown, 1, i as i32, 1, 1);
+            grid.attach(&copy, 2, i as i32, 1, 1);
+        }
+        list.append(&grid);
+    }
+    gtk::ScrolledWindow::builder()
+        .child(&list)
+        .vexpand(true)
+        .min_content_height(160)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build()
+}
+
+fn review_dialog(on: &PaneDialogs, p: &ApplyPreflight) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     if p.shortfall() > 0 {
         body.append(&toned(
@@ -773,19 +986,20 @@ fn review_dialog(p: &ApplyPreflight, send: &SendFn) -> adw::Dialog {
     };
     let go = gtk::Button::with_label(label);
     let (to_pane, held) = (send.clone(), choice);
-    go.connect_clicked(move |_| to_pane(pane(P::ApplyReviewed(held.get()))));
+    go.connect_clicked(move |_| to_pane(pane(side, P::ApplyReviewed(held.get()))));
     let cancel = gtk::Button::with_label("Cancel");
     let to_pane = send.clone();
-    cancel.connect_clicked(move |_| to_pane(pane(P::DismissReview)));
+    cancel.connect_clicked(move |_| to_pane(pane(side, P::DismissReview)));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.set_halign(gtk::Align::End);
     row.append(&go);
     row.append(&cancel);
     body.append(&row);
-    window("Before applying", 480, -1, &body)
+    window(&format!("Before applying{}", on.tag), 480, -1, &body)
 }
 
-fn report_dialog(r: &ApplyReport, still: usize, send: &SendFn) -> adw::Dialog {
+fn report_dialog(on: &PaneDialogs, r: &ApplyReport, still: usize) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     if let Some(fatal) = &r.fatal {
         body.append(&toned(fatal, "error"));
@@ -811,11 +1025,14 @@ fn report_dialog(r: &ApplyReport, still: usize, send: &SendFn) -> adw::Dialog {
     }
     let mut list: Vec<(&str, Vec<A>)> = Vec::new();
     if still > 0 {
-        list.push(("Retry", vec![pane(P::DismissReport), pane(P::Apply)]));
-        let discard = vec![pane(P::DismissReport), pane(P::Discard)];
+        list.push((
+            "Retry",
+            vec![pane(side, P::DismissReport), pane(side, P::Apply)],
+        ));
+        let discard = vec![pane(side, P::DismissReport), pane(side, P::Discard)];
         list.push(("Discard remaining", discard));
     }
-    list.push(("Close", vec![pane(P::DismissReport)]));
+    list.push(("Close", vec![pane(side, P::DismissReport)]));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.set_halign(gtk::Align::End);
     for (label, actions) in list {
@@ -829,10 +1046,11 @@ fn report_dialog(r: &ApplyReport, still: usize, send: &SendFn) -> adw::Dialog {
         row.append(&b);
     }
     body.append(&row);
-    window("Apply report", 560, -1, &body)
+    window(&format!("Apply report{}", on.tag), 560, -1, &body)
 }
 
-fn edits_dialog(lines: &[String], busy: bool, send: &SendFn) -> adw::Dialog {
+fn edits_dialog(on: &PaneDialogs, lines: &[String], busy: bool) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     body.append(&wrapped(
         "Staged for this pane (applied in order on Apply):",
@@ -846,7 +1064,7 @@ fn edits_dialog(lines: &[String], busy: bool, send: &SendFn) -> adw::Dialog {
         remove.set_tooltip_text(Some("Remove this edit from the queue"));
         remove.set_sensitive(!busy);
         let to_pane = send.clone();
-        remove.connect_clicked(move |_| to_pane(pane(P::Unstage(i))));
+        remove.connect_clicked(move |_| to_pane(pane(side, P::Unstage(i))));
         row.append(&remove);
         row.append(&wrapped(&format!("{}. {line}", i + 1)));
         list.append(&row);
@@ -857,10 +1075,11 @@ fn edits_dialog(lines: &[String], busy: bool, send: &SendFn) -> adw::Dialog {
         .min_content_height(160)
         .build();
     body.append(&scroll);
-    window("Pending edits", 460, 360, &body)
+    window(&format!("Pending edits{}", on.tag), 460, 360, &body)
 }
 
-fn import_dialog(name: &str, kind: MacArchiveKind, send: &SendFn) -> adw::Dialog {
+fn import_dialog(on: &PaneDialogs, name: &str, kind: MacArchiveKind) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     // A single BinHex converts; an archive expands; BinHex over an archive does either.
     let (title, text, expand) = match kind {
         MacArchiveKind::BinHexSingleFile => (
@@ -903,7 +1122,7 @@ fn import_dialog(name: &str, kind: MacArchiveKind, send: &SendFn) -> adw::Dialog
     let body = page();
     body.append(&wrapped(&format!("{name} is a {} archive.", kind.label())));
     body.append(&wrapped(&text));
-    let choose = |c| pane(P::ChooseImport(c));
+    let choose = |c| pane(side, P::ChooseImport(c));
     let mut list = vec![(expand, choose(ImportChoice::Expand))];
     list.extend(convert_only.map(|l| (l, choose(ImportChoice::ConvertOnly))));
     list.push(("Add as-is", choose(ImportChoice::AsIs)));
@@ -912,7 +1131,8 @@ fn import_dialog(name: &str, kind: MacArchiveKind, send: &SendFn) -> adw::Dialog
     window(title, 520, -1, &body)
 }
 
-fn fork_dropdown(current: ForkFormat, send: &SendFn, viewer: bool) -> gtk::DropDown {
+fn fork_dropdown(on: &PaneDialogs, current: ForkFormat, viewer: bool) -> gtk::DropDown {
+    let (side, send) = (on.side, &on.send);
     let labels: Vec<&str> = ForkFormat::ALL.iter().map(|f| f.label()).collect();
     let drop = gtk::DropDown::from_strings(&labels);
     let at = ForkFormat::ALL.iter().position(|f| *f == current);
@@ -920,13 +1140,14 @@ fn fork_dropdown(current: ForkFormat, send: &SendFn, viewer: bool) -> gtk::DropD
     let send = send.clone();
     drop.connect_selected_notify(move |d| {
         if let Some(format) = ForkFormat::ALL.get(d.selected() as usize).copied() {
-            send(pane(P::ArchiveFormat { viewer, format }));
+            send(pane(side, P::ArchiveFormat { viewer, format }));
         }
     });
     drop
 }
 
-fn archive_save_dialog(p: &ArchiveSave, send: &SendFn) -> adw::Dialog {
+fn archive_save_dialog(on: &PaneDialogs, p: &ArchiveSave) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     body.append(&wrapped(&format!(
         "{} is a {} archive.",
@@ -936,17 +1157,17 @@ fn archive_save_dialog(p: &ArchiveSave, send: &SendFn) -> adw::Dialog {
     body.append(&wrapped("How would you like to save it?"));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.append(&gtk::Label::new(Some("Decoded fork container:")));
-    row.append(&fork_dropdown(p.format, send, false));
+    row.append(&fork_dropdown(on, p.format, false));
     body.append(&row);
     body.append(&buttons(
         send,
         &[
-            ("Save as-is", pane(P::SaveArchive { raw: true })),
+            ("Save as-is", pane(side, P::SaveArchive { raw: true })),
             (
                 "Decode and save contents to a folder...",
-                pane(P::SaveArchive { raw: false }),
+                pane(side, P::SaveArchive { raw: false }),
             ),
-            ("Cancel", pane(P::CancelSaveArchive)),
+            ("Cancel", pane(side, P::CancelSaveArchive)),
         ],
     ));
     window("Save Mac archive", 520, -1, &body)
@@ -967,7 +1188,8 @@ fn binary_size(bytes: u64) -> String {
     }
 }
 
-fn archive_viewer_dialog(w: &ArchiveViewer, send: &SendFn) -> (adw::Dialog, gtk::Button) {
+fn archive_viewer_dialog(on: &PaneDialogs, w: &ArchiveViewer) -> (adw::Dialog, gtk::Button) {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     body.append(&wrapped(&format!(
         "{} file(s) in archive (read-only view).",
@@ -1015,7 +1237,7 @@ fn archive_viewer_dialog(w: &ArchiveViewer, send: &SendFn) -> (adw::Dialog, gtk:
             let was = ticks.borrow().get(index).copied();
             if was.is_some_and(|m| m != c.is_active()) {
                 ticks.borrow_mut()[index] = c.is_active();
-                send(pane(P::ArchiveMark(index)));
+                send(pane(side, P::ArchiveMark(index)));
             }
         });
     });
@@ -1050,22 +1272,26 @@ fn archive_viewer_dialog(w: &ArchiveViewer, send: &SendFn) -> (adw::Dialog, gtk:
     body.append(&scroll);
     let extract = gtk::Button::with_label("Extract Selected...");
     let to_pane = send.clone();
-    extract.connect_clicked(move |_| to_pane(pane(P::ArchiveExtract { all: false })));
+    extract.connect_clicked(move |_| to_pane(pane(side, P::ArchiveExtract { all: false })));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.append(&gtk::Label::new(Some("Extract as:")));
-    row.append(&fork_dropdown(w.format, send, true));
+    row.append(&fork_dropdown(on, w.format, true));
     row.append(&buttons(
         send,
-        &[("Extract All...", pane(P::ArchiveExtract { all: true }))],
+        &[(
+            "Extract All...",
+            pane(side, P::ArchiveExtract { all: true }),
+        )],
     ));
     row.append(&extract);
-    row.append(&buttons(send, &[("Close", pane(P::CloseArchive))]));
+    row.append(&buttons(send, &[("Close", pane(side, P::CloseArchive))]));
     body.append(&row);
     let title = format!("Archive: {} ({})", w.entry_name, w.kind.label());
     (window(&title, 640, 480, &body), extract)
 }
 
-fn errors_dialog(rows: &[(String, String)], fs: &str, send: &SendFn) -> adw::Dialog {
+fn errors_dialog(on: &PaneDialogs, rows: &[(String, String)], fs: &str) -> adw::Dialog {
+    let (side, send) = (on.side, &on.send);
     let body = page();
     body.append(&toned(
         &format!(
@@ -1085,11 +1311,20 @@ fn errors_dialog(rows: &[(String, String)], fs: &str, send: &SendFn) -> adw::Dia
         })
         .collect();
     body.append(&text_view(&lines.join("\n")));
-    body.append(&buttons(send, &[("OK", pane(P::DismissStagingErrors))]));
+    body.append(&buttons(
+        send,
+        &[("OK", pane(side, P::DismissStagingErrors))],
+    ));
     window("Could not add some files", 520, 320, &body)
 }
 
-fn tool_dialog(r: &ToolReport, repairable: bool, edit: bool, this: &Rc<Dialogs>) -> adw::Dialog {
+fn tool_dialog(
+    r: &ToolReport,
+    repairable: bool,
+    edit: bool,
+    this: &Rc<PaneDialogs>,
+) -> adw::Dialog {
+    let side = this.side;
     let body = page();
     let Some(check) = &r.check else {
         body.append(&text_view(&r.lines.join("\n")));
@@ -1155,7 +1390,7 @@ fn tool_dialog(r: &ToolReport, repairable: bool, edit: bool, this: &Rc<Dialogs>)
         let again = this.clone();
         toggle.connect_toggled(move |b| {
             again.show_debug.set(b.is_active());
-            (again.send)(A::Focus(Side::Left));
+            (again.send)(A::Focus(side));
         });
         body.append(&toggle);
     }
@@ -1166,7 +1401,7 @@ fn tool_dialog(r: &ToolReport, repairable: bool, edit: bool, this: &Rc<Dialogs>)
             repair.set_tooltip_text(Some("Turn on Edit Mode to repair the volume."));
         }
         let send = this.send.clone();
-        repair.connect_clicked(move |_| send(pane(P::Repair)));
+        repair.connect_clicked(move |_| send(pane(side, P::Repair)));
         body.append(&repair);
     }
     window("Filesystem Check Results", 520, 420, &body)
@@ -1179,12 +1414,12 @@ fn tree_dialog(tree: &TreeText, this: &Rc<Dialogs>) -> adw::Dialog {
     copy.connect_clicked(move |b| b.clipboard().set_text(&plain(&text)));
     let save = gtk::Button::with_label("Save to File...");
     let send = this.send.clone();
-    save.connect_clicked(move |_| send(pane(P::SaveTree)));
+    save.connect_clicked(move |_| send(pane(Side::Left, P::SaveTree)));
     let ids = gtk::CheckButton::with_label("Show IDs");
     ids.set_active(tree.ids);
     let send = this.send.clone();
     ids.connect_toggled(move |b| {
-        send(pane(P::ListTree { ids: b.is_active() }));
+        send(pane(Side::Left, P::ListTree { ids: b.is_active() }));
     });
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.append(&copy);

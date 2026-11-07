@@ -33,6 +33,8 @@ pub trait PaneHost {
     fn context(&self, side: Side, row: &DisplayRow) -> Option<P>;
     /// Run a key through the key map; true when it meant something.
     fn key(&self, side: Side, key: Key, mods: Mods) -> bool;
+    /// A row is being dragged, the pointer at `at` on the window `from`; `end` says it was let go.
+    fn dragged(&self, _side: Side, _from: &gtk::Widget, _at: (f64, f64), _end: bool) {}
 }
 
 /// The pane's state, read while the controller is borrowed.
@@ -43,6 +45,7 @@ pub struct PaneShown {
     loaded: bool,
     message: String,
     boxes: bool,
+    active: bool,
     cursor: Option<(u32, String)>,
     selected: Vec<u32>,
     marks: HashSet<String>,
@@ -82,6 +85,13 @@ pub struct PaneView {
     selected: RefCell<Vec<u32>>,
     marks: RefCell<HashSet<String>>,
     boxes: Cell<bool>,
+    active: Cell<bool>,
+    /// A plain press on one of several selected rows: it selects on release, so a drag keeps them all.
+    held_click: RefCell<Option<P>>,
+    /// Where the left press went down, in window coordinates, and whether it was on a row.
+    drag_start: Cell<Option<(f64, f64)>>,
+    drag_armed: Cell<bool>,
+    dragging: Cell<bool>,
     drawn: RefCell<Vec<Drawn>>,
 }
 
@@ -267,6 +277,11 @@ impl PaneView {
                 selected: RefCell::default(),
                 marks: RefCell::default(),
                 boxes: Cell::new(false),
+                active: Cell::new(true),
+                held_click: RefCell::default(),
+                drag_start: Cell::new(None),
+                drag_armed: Cell::new(false),
+                dragging: Cell::new(false),
                 drawn: RefCell::default(),
             }
         })
@@ -284,6 +299,11 @@ impl PaneView {
     /// Give the listing the keyboard.
     pub fn focus(&self) {
         self.view.grab_focus();
+    }
+
+    /// Name the listing with a host's own id, for a host with more than one pane.
+    pub fn set_list_id(&self, id: &str) {
+        self.view.set_widget_name(id);
     }
 
     // --- reading ----------------------------------------------------------
@@ -329,6 +349,7 @@ impl PaneView {
         let message = match (pane.opening(), pane.source_error()) {
             (Some(_), _) => "Reading the volume...".to_string(),
             (None, Some(err)) => err.to_string(),
+            (None, None) if pane.is_opening() => "Opening...".to_string(),
             (None, None) => "Open a disk image or container to browse it here.".to_string(),
         };
         PaneShown {
@@ -337,6 +358,7 @@ impl PaneView {
             loaded: pane.listing.is_loaded(),
             message,
             boxes,
+            active: ctl.is_single() || ctl.active() == self.side,
             cursor,
             selected,
             marks,
@@ -357,6 +379,7 @@ impl PaneView {
         set_text(&self.message, &s.message);
         self.mark.set_visible(s.boxes);
         self.boxes.set(s.boxes);
+        self.active.set(s.active);
         let folder_tree = s.style == ListingStyle::TreeAndList;
         self.folder_scroll.set_visible(folder_tree);
         if let Some(folders) = s.folders {
@@ -370,7 +393,11 @@ impl PaneView {
                 self.folder_view
                     .scroll_to(s.folder_cursor, gtk::ListScrollFlags::NONE, None);
             }
-            toggle_class(&self.folder_view, "rb-tree-focus", s.folder_focus);
+            toggle_class(
+                &self.folder_view,
+                "rb-tree-focus",
+                s.folder_focus && s.active,
+            );
         }
         if let Some(rows) = s.rows {
             let nodes: Vec<_> = rows
@@ -451,7 +478,11 @@ impl PaneView {
     fn mark_cursor(&self, cell: &impl IsA<gtk::Widget>, row: &DisplayRow) {
         let cursor = self.cursor.borrow();
         let here = cursor.as_ref().is_some_and(|(_, id)| *id == row.node_id);
-        toggle_class(cell, "rb-cursor", here && !self.boxes.get());
+        toggle_class(
+            cell,
+            "rb-cursor",
+            here && !self.boxes.get() && self.active.get(),
+        );
     }
 
     fn text_column(
@@ -569,6 +600,7 @@ impl PaneView {
                     ] {
                         toggle_class(&label, class, shown.tone == tone);
                     }
+                    toggle_class(&label, "rb-image", row.is_image);
                     let attrs = gtk::pango::AttrList::new();
                     if shown.tone == RowTone::Deleted {
                         attrs.insert(gtk::pango::AttrInt::new_strikethrough(true));
@@ -696,6 +728,58 @@ impl PaneView {
         cell.add_controller(gesture);
     }
 
+    /// Follow presses from `screen`, an ancestor: raw events, since a claimed click denies a gesture
+    /// and the pointer's grab does not survive the row being selected.
+    pub fn watch_drags(&self, screen: &impl IsA<gtk::Widget>) {
+        let legacy = gtk::EventControllerLegacy::new();
+        legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let target = self.me.clone();
+        legacy.connect_event(move |_, event| {
+            if let Some(pane) = target.upgrade() {
+                pane.drag_event(event);
+            }
+            glib::Propagation::Proceed
+        });
+        screen.add_controller(legacy);
+    }
+
+    fn drag_event(&self, event: &gtk::gdk::Event) {
+        use gtk::gdk::EventType as E;
+        let (Some((x, y)), Some(native), Some(root)) =
+            (event.position(), self.view.native(), self.view.root())
+        else {
+            return;
+        };
+        let (dx, dy) = native.surface_transform();
+        let at = (x - dx, y - dy);
+        let root: &gtk::Widget = root.upcast_ref();
+        match event.event_type() {
+            E::ButtonPress => self.drag_start.set(Some(at)),
+            E::MotionNotify if self.drag_armed.get() => {
+                let Some(start) = self.drag_start.get() else {
+                    return;
+                };
+                let (sx, sy, ex, ey) = (start.0 as i32, start.1 as i32, at.0 as i32, at.1 as i32);
+                if self.dragging.get() || self.view.drag_check_threshold(sx, sy, ex, ey) {
+                    self.dragging.set(true);
+                    self.held_click.borrow_mut().take();
+                    self.host.dragged(self.side, root, at, false);
+                }
+            }
+            E::ButtonRelease => {
+                self.drag_armed.set(false);
+                if self.dragging.replace(false) {
+                    self.host.dragged(self.side, root, at, true);
+                }
+                let held = self.held_click.borrow_mut().take();
+                if let Some(action) = held {
+                    self.host.send(A::Pane(self.side, action));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn pressed(
         &self,
         gesture: &gtk::GestureClick,
@@ -719,8 +803,16 @@ impl PaneView {
                     .send(A::Pane(side, P::Activate(row.node_id.clone())));
             }
             1 if n_press == 1 => {
-                if let Some(action) = self.host.click(side, row, ctrl, shift) {
-                    self.host.send(A::Pane(side, action));
+                self.drag_armed.set(!row.is_parent());
+                let action = self.host.click(side, row, ctrl, shift);
+                let many = self.selected.borrow().len() > 1;
+                let one_of_many = many && self.marks.borrow().contains(&row.node_id);
+                match action {
+                    Some(action) if one_of_many && !ctrl && !shift => {
+                        *self.held_click.borrow_mut() = Some(action);
+                    }
+                    Some(action) => self.host.send(A::Pane(side, action)),
+                    None => {}
                 }
             }
             3 if n_press == 1 => {
@@ -827,6 +919,7 @@ impl PaneView {
                 hit = w.parent();
             }
             pane.view.grab_focus();
+            pane.host.send(A::Focus(pane.side));
             pane.host.send(A::Pane(pane.side, P::ClearSelection));
         });
         view.add_controller(gesture);

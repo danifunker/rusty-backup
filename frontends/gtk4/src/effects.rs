@@ -72,6 +72,11 @@ impl EffectHost {
         }
     }
 
+    /// True while a dialog covers the window, so its keys are the dialog's.
+    pub fn dialog_open(&self) -> bool {
+        self.window.visible_dialog().is_some()
+    }
+
     /// Open `dialog` over the window.
     pub fn present(&self, dialog: &adw::Dialog) {
         dialog.present(Some(&self.window));

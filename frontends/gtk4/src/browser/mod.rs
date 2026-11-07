@@ -6,7 +6,8 @@
 
 mod bars;
 mod detail;
-mod dialogs;
+pub mod dialogs;
+mod info;
 pub mod pane;
 mod tree;
 
@@ -31,11 +32,13 @@ use rusty_backup::controller::{Controller, Effect};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::progress::JobList;
 use crate::sync::SyncGuard;
-use crate::widgets::{keep_focus, plain, set_text};
+use crate::widgets::{keep_focus, plain, set_text, typing};
 
+pub use bars::view_popover;
 use bars::{EditBar, EditShown, Header, HeaderShown, MarkBar, MarkShown};
 use detail::{Detail, DetailShown};
-use dialogs::{present_editor, present_journal, Dialogs, DialogsShown};
+use dialogs::{present_editor, present_journal, Dialogs, DialogsShown, KeyFn};
+pub use info::{FileInfo, InfoShown};
 use pane::{PaneHost, PaneShown, PaneView};
 
 /// Sends an action to the screen's controller; a change a sync made is dropped here.
@@ -75,6 +78,8 @@ pub struct BrowseView {
     host_jobs: RefCell<Vec<Snapshot>>,
     generation: Cell<u64>,
     follow_timer: Cell<bool>,
+    /// The user asked for the File Info window, beyond what the side panel shows.
+    info_asked: Cell<bool>,
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
@@ -220,7 +225,13 @@ impl BrowseView {
             root.append(&foot);
 
             keep_focus(&root);
-            let dialogs = Dialogs::new(host.clone(), send);
+            pane.watch_drags(&root);
+            let target = me.clone();
+            let keys: KeyFn = Rc::new(move |key, mods| {
+                let view = target.upgrade();
+                view.is_some_and(|v| v.key(key, mods))
+            });
+            let dialogs = Dialogs::new(host.clone(), send, &[Side::Left], keys);
             BrowseView {
                 ctrl: RefCell::new(new_controller(&notify)),
                 notify,
@@ -242,6 +253,7 @@ impl BrowseView {
                 host_jobs: RefCell::default(),
                 generation: Cell::new(0),
                 follow_timer: Cell::new(false),
+                info_asked: Cell::new(false),
                 on_change: RefCell::default(),
             }
         })
@@ -351,6 +363,11 @@ impl BrowseView {
     }
 
     pub fn apply(&self, action: A) {
+        match action {
+            A::OpenDetail(..) => self.info_asked.set(true),
+            A::CloseDetail => self.info_asked.set(false),
+            _ => {}
+        }
         let fx = self.ctrl.borrow_mut().apply(action);
         self.after(fx);
     }
@@ -386,8 +403,8 @@ impl BrowseView {
             return;
         }
         self.take_results();
-        // The side panel already shows what File Info would.
-        if self.ctrl.borrow().detail().is_some() {
+        // A double-click or F3 needs no window: the side panel already shows it.
+        if !self.info_asked.get() && self.ctrl.borrow().detail().is_some() {
             self.ctrl.borrow_mut().apply(A::CloseDetail);
         }
         self.refresh();
@@ -488,7 +505,10 @@ impl BrowseView {
     }
 
     /// Run a key through the key map; the Extract command asks for what the panel's options say.
-    fn key(&self, key: Key, mods: Mods) -> bool {
+    pub fn key(&self, key: Key, mods: Mods) -> bool {
+        if !self.active.get() || typing(&self.root) {
+            return false;
+        }
         let command = {
             let ctl = self.ctrl.borrow();
             if ctl.modal_open() || !ctl.binds(key, mods) {
@@ -538,7 +558,7 @@ impl BrowseView {
             jobs,
             pane: self.pane.read(&ctl),
             detail: self.detail.read(&ctl, caps),
-            dialogs: Dialogs::read(&ctl),
+            dialogs: self.dialogs.read(&ctl),
             status: ctl.status().to_string(),
             menu_up: ctl.view_menu_shown(),
             follow: ctl.follow_pending(),

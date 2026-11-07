@@ -66,16 +66,26 @@ pub fn set_source(cr: &gtk::cairo::Context, rgb: Rgb) {
 
 const CSS: &str = "
 .rb-list > listview > row > cell { padding: 0; }
+.rb-list row:focus, .rb-list row:focus-visible, .rb-list cell:focus-visible { outline: none; }
 .rb-row { padding: 3px 6px; }
 .rb-cursor { box-shadow: inset 0 1px @accent_color, inset 0 -1px @accent_color; }
 .rb-added { color: @success_color; }
 .rb-changed, .rb-unresolved { color: @accent_color; }
 .rb-deleted { opacity: 0.6; }
 .rb-tree-focus { outline: 1px solid @accent_color; outline-offset: -1px; }
+.rb-image { color: @accent_color; }
+.rb-crumb { padding: 0 2px; min-height: 0; min-width: 0; }
+.rb-pane { border-top: 2px solid transparent; }
+.rb-pane-active { border-top-color: @accent_color; }
+.rb-drop { outline: 2px solid @accent_color; outline-offset: -2px; }
 ";
 
 /// The shell's few style rules; colours stay the theme's named ones.
 pub fn install_css() {
+    // A selectable label takes a window's first focus, and a full selection reads as a highlight.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_label_select_on_focus(false);
+    }
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
