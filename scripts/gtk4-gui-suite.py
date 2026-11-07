@@ -12,6 +12,7 @@ Build Disk screen and checks its bytes for what the options promise.
 """
 
 import os
+import subprocess
 import sys
 import time
 
@@ -51,13 +52,8 @@ SIDECAR_CHOICES = {
     "mac": ["Use as resource forks", "Leave as-is", "Exclude"],
 }
 
-KEY_RETURN = 0xFF0D
-KEY_DOWN = 0xFF54
-KEY_UP = 0xFF52
-KEY_SPACE = 0x20
-KEY_ESCAPE = 0xFF1B
-
 WORK = ""
+WINDOW = ""
 
 
 class Fail(Exception):
@@ -100,6 +96,10 @@ def describe(n):
     try:
         desc = n.get_description() or ""
         extra = f" desc={desc[:60]!r}" if desc else ""
+        action = n.get_action_iface()
+        if action is not None and action.get_n_actions() > 0:
+            names = [action.get_action_name(i) for i in range(action.get_n_actions())]
+            extra += f" actions={names}"
         return f"{n.get_role_name()} {n.get_name()!r}{extra}"
     except Exception as e:
         return f"<gone: {e}>"
@@ -173,28 +173,67 @@ def sibling_button(root, beside, name, wait=20.0):
     return None
 
 
-def key(keysym, times=1):
+def xdo(*args):
+    out = subprocess.run(["xdotool", *map(str, args)], check=True, capture_output=True, text=True)
+    return out.stdout
+
+
+def main_window():
+    """The app's largest visible X window, raised to a size where no page needs scrolling."""
+    best = None
+    for wid in xdo("search", "--onlyvisible", "--name", ".").split():
+        geo = dict(
+            line.strip().split("=", 1)
+            for line in xdo("getwindowgeometry", "--shell", wid).splitlines()
+            if "=" in line
+        )
+        area = int(geo["WIDTH"]) * int(geo["HEIGHT"])
+        if best is None or area > best[0]:
+            best = (area, wid)
+    if best is None:
+        raise Fail("no X window for the app")
+    return best[1]
+
+
+def window_origin():
+    geo = dict(
+        line.strip().split("=", 1)
+        for line in xdo("getwindowgeometry", "--shell", WINDOW).splitlines()
+        if "=" in line
+    )
+    return int(geo["X"]), int(geo["Y"])
+
+
+def click(n):
+    """A real pointer click in the middle of the node, from its window-relative extents."""
+    comp = n.get_component_iface()
+    if comp is None:
+        raise Fail(f"no extents for {describe(n)}")
+    ext = comp.get_extents(Atspi.CoordType.WINDOW)
+    if ext.width <= 0 or ext.height <= 0:
+        raise Fail(f"{describe(n)} has no size on screen")
+    ox, oy = window_origin()
+    x, y = ox + ext.x + ext.width // 2, oy + ext.y + ext.height // 2
+    xdo("mousemove", x, y)
+    time.sleep(0.2)
+    xdo("click", 1)
+    time.sleep(0.5)
+
+
+def key(name, times=1):
     for _ in range(times):
-        Atspi.generate_keyboard_event(keysym, None, Atspi.KeySynthType.PRESSRELEASE | Atspi.KeySynthType.SYM)
+        xdo("key", name)
         time.sleep(0.15)
 
 
-def focus(n):
-    comp = n.get_component_iface()
-    if comp is None or not comp.grab_focus():
-        raise Fail(f"cannot focus {describe(n)}")
-    time.sleep(0.3)
-
-
 def press(n):
-    """Run a node's action, or focus it and press space when it has none."""
+    """Run a button's action; anything else gets a real click."""
     action = n.get_action_iface()
-    if action is not None and action.get_n_actions() > 0:
+    if n.get_role_name() == "push button" and action is not None and action.get_n_actions() > 0:
         action.do_action(0)
+        time.sleep(0.4)
     else:
-        focus(n)
-        key(KEY_SPACE)
-    time.sleep(0.4)
+        click(n)
 
 
 def button(root, name, wait=20.0):
@@ -227,12 +266,12 @@ def combo_choice(root, label, choices, want):
     now = combo_value(n, choices)
     if now == want:
         return
-    focus(n)
-    key(KEY_RETURN)
+    # The popover opens on the current choice, so walk from there.
+    click(n)
     time.sleep(0.6)
     step = choices.index(want) - choices.index(now)
-    key(KEY_DOWN if step > 0 else KEY_UP, abs(step))
-    key(KEY_RETURN)
+    key("Down" if step > 0 else "Up", abs(step))
+    key("Return")
     end = time.time() + 5
     while combo_value(need(root, label, name=label, roles=COMBO_ROLES, showing=True), choices) != want:
         if time.time() > end:
@@ -329,8 +368,7 @@ def open_build(app):
 def to_cd_disk_step(app, image):
     """From the Kind step: CD-ROM, save as `image`, on to the Disk step."""
     kind = need(app, "CD-ROM kind", contains=CD_KIND, showing=True)
-    radio = find(kind, roles=("radio button",), wait=1.0)
-    press(radio if radio is not None else kind)
+    click(kind)
     press(button(app, "Next"))
     set_picks(output_image=image, cd_folder=os.path.join(WORK, "cdsrc"))
     press(button(app, "Save As..."))
@@ -420,7 +458,7 @@ CASES = [
 
 
 def main():
-    global WORK
+    global WORK, WINDOW
     WORK = sys.argv[1]
     only = set(sys.argv[2:])
     app = app_node("rusty")
@@ -428,6 +466,11 @@ def main():
         log("FAIL: the app never appeared on the accessibility bus")
         sys.exit(1)
     log(f"app: {describe(app)}")
+    WINDOW = main_window()
+    # Tall enough that the Build Disk pages never scroll, so every row has a place to click.
+    xdo("windowmove", WINDOW, 0, 0)
+    xdo("windowsize", WINDOW, 1600, 2300)
+    time.sleep(1.0)
     failed = []
     for name, case in CASES:
         if only and name not in only and name != "browse":

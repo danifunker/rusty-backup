@@ -1927,8 +1927,9 @@ jobs:
       # The GUI regression suite: the shell over AT-SPI under Xvfb (scripts/gtk4-gui-suite.py).
       - name: GUI regression suite over AT-SPI
         run: |
-          sudo apt-get install -y xvfb at-spi2-core python3-gi gir1.2-atspi-2.0 dosfstools mtools
-          dbus-run-session -- xvfb-run -a ../../scripts/gtk4-gui-suite.sh "$PWD/target/release/rusty-backup-gtk"
+          sudo apt-get install -y xvfb xdotool at-spi2-core python3-gi gir1.2-atspi-2.0 dosfstools mtools
+          dbus-run-session -- xvfb-run -a -s "-screen 0 1600x2300x24" \
+            ../../scripts/gtk4-gui-suite.sh "$PWD/target/release/rusty-backup-gtk"
       - name: Install packaging tools
         run: |
           for crate in cargo-deb cargo-generate-rpm; do

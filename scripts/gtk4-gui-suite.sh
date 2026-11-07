@@ -1,7 +1,7 @@
 #!/bin/bash
 # GUI regression suite for the GTK4 shell (scripts/gtk4-gui-suite.py). Run inside
 # `dbus-run-session -- xvfb-run -a`; needs at-spi2-core, python3-gi with the Atspi typelib,
-# dosfstools and mtools.
+# xdotool, dosfstools and mtools; the screen must be at least 1600x2300.
 # Usage: scripts/gtk4-gui-suite.sh <path to rusty-backup-gtk> [case ...]
 set -euo pipefail
 
