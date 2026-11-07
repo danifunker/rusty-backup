@@ -100,6 +100,10 @@ def describe(n):
         if action is not None and action.get_n_actions() > 0:
             names = [action.get_action_name(i) for i in range(action.get_n_actions())]
             extra += f" actions={names}"
+        states = n.get_state_set().get_states()
+        flags = [Atspi.StateType(st).value_nick for st in states
+                 if Atspi.StateType(st).value_nick in ("sensitive", "enabled", "checked", "focused")]
+        extra += f" [{','.join(flags)}]"
         return f"{n.get_role_name()} {n.get_name()!r}{extra}"
     except Exception as e:
         return f"<gone: {e}>"
@@ -117,7 +121,7 @@ def is_showing(n):
 
 
 def is_sensitive(n):
-    return has_state(n, Atspi.StateType.SENSITIVE) or has_state(n, Atspi.StateType.ENABLED)
+    return has_state(n, Atspi.StateType.SENSITIVE)
 
 
 def is_on(n):
@@ -246,13 +250,23 @@ COMBO_ROLES = ("combo box",)
 
 
 def option(root, label):
+    """An option's toggle: the switch inside its row, named after the row."""
     return need(root, f"option {label!r}", name=label, roles=SWITCH_ROLES, showing=True)
+
+
+def option_row(root, label):
+    """An option's row, which carries the greyed-out state."""
+    return need(root, f"row {label!r}", name=label, role="list item", showing=True)
 
 
 def set_option(root, label, on):
     n = option(root, label)
     if is_on(n) != on:
-        press(n)
+        action = n.get_action_iface()
+        if action is not None and action.get_n_actions() > 0:
+            action.do_action(0)
+        else:
+            click(n)
         end = time.time() + 5
         while is_on(option(root, label)) != on:
             if time.time() > end:
@@ -391,19 +405,18 @@ def case_cd_options(app):
     open_build(app)
     to_cd_disk_step(app, os.path.join(WORK, "efs.iso"))
     for label in OPTIONS:
-        if is_sensitive(option(app, label)):
+        if is_sensitive(option_row(app, label)):
             raise Fail(f"{label!r} can be changed before a folder is chosen")
     need_text(app, "Not available: Choose a folder to fill the disc from first.")
     log("every option listed and greyed out with a reason")
 
     press(button(app, "Choose Folder..."))
     need_text(app, "cdsrc")
-    flatten = option(app, OPTIONS[1])
-    if is_sensitive(flatten):
+    if is_sensitive(option_row(app, OPTIONS[1])):
         raise Fail("flatten can be changed with Unpack archives off")
     set_option(app, "Unpack archives", True)
     end = time.time() + 5
-    while not is_sensitive(option(app, OPTIONS[1])):
+    while not is_sensitive(option_row(app, OPTIONS[1])):
         if time.time() > end:
             raise Fail("flatten stayed greyed out with Unpack archives on")
         time.sleep(0.3)
@@ -442,7 +455,7 @@ def case_cd_hfs_fork(app):
     to_cd_disk_step(app, image)
     combo_choice(app, "Layout", LAYOUTS, LAYOUTS[1])
     combo_choice(app, SIDECARS, SIDECAR_CHOICES["mac"], "Use as resource forks")
-    if is_sensitive(option(app, "Ignore this computer's permissions")):
+    if is_sensitive(option_row(app, "Ignore this computer's permissions")):
         raise Fail("an HFS disc offers to ignore permissions")
     build_it(app, image)
     check_bytes(image, present=[b"hello.txt"], absent=[b"._hello"])
