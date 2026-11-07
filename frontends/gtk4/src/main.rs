@@ -6,6 +6,7 @@
 mod app;
 mod backup;
 mod browser;
+mod build_disk;
 mod chd;
 mod commander;
 mod effects;

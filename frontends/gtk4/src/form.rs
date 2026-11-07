@@ -10,17 +10,20 @@ use crate::widgets::{plain, set_text};
 /// How much a line under a form matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
+    /// Body text, at full strength.
+    Plain,
     Info,
     Warning,
     Danger,
 }
 
 impl Tone {
-    fn class(self) -> &'static str {
+    fn class(self) -> Option<&'static str> {
         match self {
-            Tone::Info => "dim-label",
-            Tone::Warning => "warning",
-            Tone::Danger => "error",
+            Tone::Plain => None,
+            Tone::Info => Some("dim-label"),
+            Tone::Warning => Some("warning"),
+            Tone::Danger => Some("error"),
         }
     }
 }
@@ -60,7 +63,9 @@ impl Notes {
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
                 .selectable(true)
                 .build();
-            label.add_css_class(tone.class());
+            if let Some(class) = tone.class() {
+                label.add_css_class(class);
+            }
             self.root.append(&label);
         }
         self.root.set_visible(!notes.is_empty());

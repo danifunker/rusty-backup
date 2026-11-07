@@ -17,6 +17,7 @@ use rusty_backup::controller::{Controller, Effect};
 
 // Through `super`: scripts/check-boundaries.sh takes a crate path to these names for the engine's.
 use super::backup::BackupScreen;
+use super::build_disk::BuildDiskScreen;
 use super::restore::RestoreScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
@@ -66,6 +67,7 @@ pub struct App {
     inspect: Rc<InspectScreen>,
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
+    build: Rc<BuildDiskScreen>,
     close_backup: gtk::Button,
     /// The tabs, or Commander Mode, which takes the whole window while open.
     screens: gtk::Stack,
@@ -117,6 +119,14 @@ pub fn present(application: &adw::Application, image: Option<PathBuf>) {
     app.host_window().present();
     tick();
     if let Some(path) = image {
+        app.apply(AppAction::SelectTab(AppTab::Inspect));
+        app.inspect.open_file(path);
+    }
+}
+
+/// Build Disk's "Open in Inspect" on the image it just wrote.
+pub fn open_in_inspect(path: PathBuf) {
+    if let Some(app) = APP.with(|a| a.borrow().clone()) {
         app.apply(AppAction::SelectTab(AppTab::Inspect));
         app.inspect.open_file(path);
     }
@@ -244,6 +254,7 @@ impl App {
         let inspect = InspectScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let backup = BackupScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let restore = RestoreScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        let build = BuildDiskScreen::build(ctrl.notify(), host.clone());
         for (tab, name, title, icon) in TABS {
             match tab {
                 AppTab::Inspect => {
@@ -255,7 +266,10 @@ impl App {
                 AppTab::Restore => {
                     stack.add_titled_with_icon(restore.root(), Some(name), title, icon);
                 }
-                AppTab::Build | AppTab::Optical | AppTab::Archives => {
+                AppTab::Build => {
+                    stack.add_titled_with_icon(build.root(), Some(name), title, icon);
+                }
+                AppTab::Optical | AppTab::Archives => {
                     let page = adw::StatusPage::builder().title(title).build();
                     stack.add_titled_with_icon(&page, Some(name), title, icon);
                 }
@@ -268,6 +282,7 @@ impl App {
             inspect,
             backup,
             restore,
+            build,
             close_backup: close_backup.clone(),
             screens,
             commander: RefCell::default(),
@@ -387,10 +402,12 @@ impl App {
         let refreshing = self.ctrl.borrow().devices_refreshing().is_some();
         self.backup.set_devices(&devices, refreshing);
         self.restore.set_devices(&devices, refreshing);
+        self.build.set_devices(&devices, refreshing);
         self.inspect.set_devices(devices);
         self.inspect.tick();
         self.backup.tick();
         self.restore.tick();
+        self.build.tick();
         self.share_backup();
         self.lock_tabs();
         let commander = self.commander.borrow().clone();
@@ -438,12 +455,15 @@ impl App {
         let running = [
             (AppTab::Backup, on(self.backup.is_running(), "Backup")),
             (AppTab::Restore, on(self.restore.is_running(), "Restore")),
+            (AppTab::Build, on(self.build.is_running(), "Build Disk")),
             (AppTab::Inspect, self.inspect.running_job()),
         ];
         self.backup
             .set_busy(busy_elsewhere(AppTab::Backup, &running, false));
         self.restore
             .set_busy(busy_elsewhere(AppTab::Restore, &running, false));
+        self.build
+            .set_busy(busy_elsewhere(AppTab::Build, &running, false));
     }
 
     /// Read the controller first and release it: setting a widget can fire its change signal.

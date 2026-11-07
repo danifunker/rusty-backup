@@ -90,6 +90,11 @@ widgets with:
 - A destructive start is only ever `Start`, and the write begins on the answer to the controller's own `Confirm`. The name above the button is `write_target()`, the name that question uses, never the view's copy of a device row. A yes counts only for the question it answered: the controller compares it, so a refresh that moved the row voids it.
 - Off screen a form skips its refresh (`is_mapped`): a job wakes the app many times a second and the tab redraws when it is selected. The tick still runs, so a job's end and its log are seen.
 - In `app.rs` write `super::backup`, not `crate::backup`: `scripts/check-boundaries.sh` reads `crate::backup` and `crate::restore` as the engine's modules, in comments too.
+- A wizard reads only the page on screen: `Panel` is one enum over the steps, matched with no `_` arm, so a job's wakes never lay out a table nobody sees.
+- A controller edit that takes a whole struct (`FormatOptions`, `PresetView`) keeps the struct last shown in a `held` cell, and the handler clones it before it sends: the send refreshes the form, which replaces the cell.
+- A size entry keeps the user's words: while its text parses to the controller's value it is left alone, so `4K` does not turn into `4096` mid-typing, and an unparsable text stays while it has the focus.
+- A partition row is two lines of the grid, fields over content and moves, so a GPT GUID fits at the form's width. The cells are rebuilt only when `Shape` changes: the table, its columns, or which rows can copy.
+- A "Pick..." that only stamps a value is a `MenuButton` with a list, not a `DropDown`: there is nothing to show as selected, and a `DropDown` takes the width of its longest item.
 - `TextView::scroll_mark_onscreen` is queued until the lines are measured, so a mark deleted straight after never scrolls. Keep the mark.
 
 ## Slices
@@ -101,7 +106,7 @@ widgets with:
 | 2 | Browse view on `BrowserPaneController` (`ColumnView`, `TreeListModel`), file detail, journal | done; `browser/` is the reusable pane, detail panel and windows; the metadata editors wait on slice 7, greyed out; the Optical disc browser header and host drag and drop wait on slices 6 and 8 |
 | 3 | Commander: two panes, key map, drag and drop, staged edits | done; `commander/` takes the window over, every source opens (remote included: `Connect` is the controller's own prompt), File Info is `browser/info.rs` with the controller's field prompts, and Browse opens it from the row menu; the graphical metadata editors stay slice 7; a drop from the file manager is slice 8, a drag out to it is not built |
 | 4 | Backup and Restore | done; `backup/` and `restore/` are the tabs, `form.rs` the adw rows and `chd.rs` / `size_row.rs` the controls later slices reuse; Write Image File picks its source but its Physical Disk Export window is slice 7, greyed out; the top bar's Close Backup and the Inspect share live in `app.rs` |
-| 5 | Build Disk wizard | |
+| 5 | Build Disk wizard | done; `build_disk/` is the tab, every step egui has: Kind, Output (image and container, or a device), Disk (table, donor, volume, preset, size), Partitions (`rows.rs`), Options, Review, Build; the option rules, hints and `DiskKind::hint` moved into the controller; "Open in Inspect" is `app::open_in_inspect` |
 | 6 | Optical and Archives | |
 | 7 | Dialogs: resize, expand HFS, Alto resize, partition editor, metadata editor, export, Expand Image, Check results, CHD Info, bulk and floppy convert, remote (with Inspect's Pick Another Image, Back Up Image, Close Remote), settings, update banner | |
 | 8 | Drop routing, file open, cross-tab handoffs, about, `.desktop` and icon, elevated relaunch | |
@@ -129,5 +134,5 @@ Broadway has no GDK drag: a `gtk::DragSource` starts and nothing ever receives i
 A `ComboRow`, picker or `DropDown` opens reliably only if the pointer moved onto it first: hover, wait,
 click, and take a screenshot before clicking anything in the list. A blind click into a device list is
 how a physical disk gets picked. Text goes to whatever has focus, so check a `SpinRow`'s text took the
-click (a double click does) before typing. In a file dialog, Ctrl+L then the path then Return works; a
+click (a double click does) before typing. A synthesized `MouseEvent` does not reach a popup's list, and leaves a text field without the keys after a dialog has closed: use the pane's real click for both. The frame lags the state by a second or more, so wait before reading a screenshot. In a file dialog, Ctrl+L then the path then Return works; a
 save dialog takes the path straight into its name field.
