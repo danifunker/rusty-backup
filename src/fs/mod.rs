@@ -137,7 +137,19 @@ pub fn resize_filesystem_for(
 ) -> anyhow::Result<()> {
     let new_sectors_u32 = (new_size_bytes / 512) as u32;
     let new_sectors_u64 = new_size_bytes / 512;
-    fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
+    // FAT says it declined only through its bool, so a shrink it refused is caught here.
+    if !fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?
+        && detect_filesystem_type(file, partition_offset) == "fat"
+    {
+        let declared = fat_declared_bytes(file, partition_offset)?;
+        if declared > new_size_bytes {
+            anyhow::bail!(
+                "FAT cannot shrink in place from {} to {} (see the log for why)",
+                disk_core::display::format_size(declared),
+                disk_core::display::format_size(new_size_bytes)
+            );
+        }
+    }
     // Human68k SHARP/KG HDD volumes (0x60 BRA.S jump, big-endian BPB + FAT)
     // are rejected by resize_fat_in_place; route them to the Human68k resizer.
     // It takes a byte size because these disks use 1024-byte logical sectors,
@@ -157,6 +169,17 @@ pub fn resize_filesystem_for(
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
+}
+
+/// The size a FAT boot sector says its volume is.
+fn fat_declared_bytes(file: &mut (impl Read + Seek), offset: u64) -> anyhow::Result<u64> {
+    let mut bpb = [0u8; 36];
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut bpb)?;
+    let per_sector = u64::from(u16::from_le_bytes([bpb[11], bpb[12]]));
+    let small = u64::from(u16::from_le_bytes([bpb[19], bpb[20]]));
+    let large = u64::from(u32::from_le_bytes([bpb[32], bpb[33], bpb[34], bpb[35]]));
+    Ok(per_sector * if small != 0 { small } else { large })
 }
 
 /// Whether [`resize_filesystem_for`] can actually patch what lives at

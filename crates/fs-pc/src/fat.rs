@@ -831,22 +831,28 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        match self.highest_used_cluster()? {
+        // A FAT16 shrunk below 4085 clusters reads as FAT12, so the in-place resize refuses it.
+        let floor = match self.fat_type {
+            FatType::Fat16 => (self.data_region_offset() + (4085 + 16) * self.cluster_size())
+                .min(self.total_size()),
+            FatType::Fat12 | FatType::Fat32 => 0,
+        };
+        let used = match self.highest_used_cluster()? {
             Some(cluster) => {
                 // Include all bytes from partition start through the end of
                 // the highest allocated cluster.
                 let cluster_end_abs = self.cluster_offset(cluster) + self.cluster_size();
                 let relative = cluster_end_abs - self.partition_offset;
                 // Round up to sector boundary
-                let aligned = relative.div_ceil(self.bytes_per_sector) * self.bytes_per_sector;
-                Ok(aligned)
+                relative.div_ceil(self.bytes_per_sector) * self.bytes_per_sector
             }
             None => {
                 // No data clusters allocated — still need boot sector, FATs,
                 // and root directory area.
-                Ok(self.data_region_offset())
+                self.data_region_offset()
             }
-        }
+        };
+        Ok(used.max(floor))
     }
 
     fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {

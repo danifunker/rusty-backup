@@ -872,7 +872,7 @@ fn run_per_partition(
             reader.seek(SeekFrom::Start(offset))?;
             let mut limited = reader.take(read_limit);
 
-            let mut writer = BufWriter::new(File::create(&dest_path)?);
+            let mut writer = BufWriter::new(create_export_file(&dest_path)?);
 
             if format == ExportFormat::TwoMg {
                 let hdr = dsk_apple::twomg::build_twomg_header(export_size);
@@ -980,6 +980,16 @@ fn fit_filesystem_to_export(
     crate::fs::resize_filesystem_for(file, fs_offset, export_size, log)
 }
 
+/// An export file the in-place resize can read back: write-only, it finds no filesystem.
+fn create_export_file(path: &std::path::Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
 fn refuse_unpatched_shrink(
     dest_path: &std::path::Path,
     index: usize,
@@ -1041,6 +1051,32 @@ mod tests {
         fit_filesystem_to_export(&mut file, 0, size as u64, false, &mut |_| {}).unwrap();
         let out = file.into_inner();
         assert_eq!(&out[alt..alt + 2], b"BD", "alternate MDB was not rewritten");
+    }
+
+    /// A shrunk FAT export was only cut short: the resizer could not read it, or declined silently.
+    #[test]
+    fn a_shrunk_fat_export_file_is_resized_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partition-0.img");
+        let mut file = create_export_file(&path).unwrap();
+        let fat = fs_pc::fat::create_blank_fat(30 * MIB, Some("T")).unwrap();
+        file.write_all(&fat[..(5 * MIB) as usize]).unwrap();
+        let err = fit_filesystem_to_export(&mut file, 0, 5 * MIB, true, &mut |_| {}).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot shrink"), "{err:#}");
+        file.set_len(20 * MIB).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&fat[..(20 * MIB) as usize]).unwrap();
+        fit_filesystem_to_export(&mut file, 0, 20 * MIB, true, &mut |_| {}).unwrap();
+        drop(file);
+        let boot = std::fs::read(&path).unwrap();
+        let small = u16::from_le_bytes([boot[19], boot[20]]) as u64;
+        let large = u32::from_le_bytes([boot[32], boot[33], boot[34], boot[35]]) as u64;
+        let sectors = if small != 0 { small } else { large };
+        assert!(
+            sectors * 512 <= 20 * MIB,
+            "BPB still says {} bytes",
+            sectors * 512
+        );
     }
 
     /// A filesystem we cannot resize in place is refused by name; bare zeros
