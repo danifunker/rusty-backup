@@ -1,5 +1,5 @@
 use egui::RichText;
-use rusty_backup::controller::app::{format_size, AppController, RateTracker, Snapshot};
+use rusty_backup::controller::app::{progress_text, AppController, RateTracker, Snapshot};
 use rusty_backup::controller::log::{LogLevel, LogStore};
 use rusty_backup::controller::Controller;
 
@@ -121,24 +121,12 @@ impl ProgressState {
             if self.total_bytes > 0 {
                 let fraction = self.current_bytes as f32 / self.total_bytes as f32;
                 let rate_eta = self.tracker.suffix(self.current_bytes, self.total_bytes);
-                let text = if self.full_size_bytes > self.total_bytes {
-                    format!(
-                        "{} / {} to image of {} total ({:.0}%){}",
-                        format_size(self.current_bytes),
-                        format_size(self.total_bytes),
-                        format_size(self.full_size_bytes),
-                        fraction * 100.0,
-                        rate_eta,
-                    )
-                } else {
-                    format!(
-                        "{} / {} ({:.0}%){}",
-                        format_size(self.current_bytes),
-                        format_size(self.total_bytes),
-                        fraction * 100.0,
-                        rate_eta,
-                    )
-                };
+                let text = progress_text(
+                    self.current_bytes,
+                    self.total_bytes,
+                    self.full_size_bytes,
+                    &rate_eta,
+                );
                 let bar = egui::ProgressBar::new(fraction).text(text).animate(true);
                 ui.add(bar);
             } else {

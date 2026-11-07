@@ -12,11 +12,11 @@ mod shell;
 mod update;
 
 pub use shell::{
-    elevation_confirm,
-    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate,
-    host_known_older_than, no_devices_hint, physical_devices_available, picker_start_folder,
-    running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
-    ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
+    busy_elsewhere, busy_elsewhere_notice, elevation_button_hover, elevation_button_label,
+    elevation_confirm, elevation_gate, host_known_older_than, no_devices_hint,
+    physical_devices_available, picker_start_folder, progress_text, running_elevated,
+    unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets, ElevationGate, ShareStep,
+    PHYSICAL_DEVICES_DISABLED,
 };
 #[cfg(any(feature = "gui", feature = "tui-update"))]
 pub use update::{InstallState, UpdateInfo};
@@ -47,6 +47,7 @@ pub mod ids {
     pub const REFRESH_DEVICES: &str = "app.refresh_devices";
     pub const ELEVATE: &str = "app.elevate";
     pub const COMMANDER: &str = "app.commander";
+    pub const CLOSE_BACKUP: &str = "app.close_backup";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

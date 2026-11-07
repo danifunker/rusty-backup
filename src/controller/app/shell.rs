@@ -358,6 +358,31 @@ impl AppController {
     }
 }
 
+/// The one-line notice a tab shows while another tab's job locks its controls.
+pub fn busy_elsewhere_notice(tab: &str) -> String {
+    format!("A disk job is running ({tab}); start controls unlock when it finishes.")
+}
+
+/// The text on the shared progress bar; `full` is the untrimmed size when compaction saves space.
+pub fn progress_text(current: u64, total: u64, full: u64, rate_eta: &str) -> String {
+    use disk_core::display::format_size;
+    let percent = current as f32 / total.max(1) as f32 * 100.0;
+    if full > total {
+        format!(
+            "{} / {} to image of {} total ({percent:.0}%){rate_eta}",
+            format_size(current),
+            format_size(total),
+            format_size(full),
+        )
+    } else {
+        format!(
+            "{} / {} ({percent:.0}%){rate_eta}",
+            format_size(current),
+            format_size(total),
+        )
+    }
+}
+
 /// Another tab (not `tab`) with a disk job in flight, so one job runs at a time.
 pub fn busy_elsewhere(
     tab: AppTab,

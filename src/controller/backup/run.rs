@@ -84,6 +84,16 @@ impl RunState {
         }
     }
 
+    /// Cancel was asked for and the job has not stopped yet.
+    pub fn cancelling(&self) -> bool {
+        match &self.running {
+            Some(Running::Backup { job, .. }) | Some(Running::Vhd { job }) => {
+                job.snapshot().cancel_requested
+            }
+            None => false,
+        }
+    }
+
     pub fn set_vhd_size(&mut self, index: usize, mode: SizeMode, custom_mib: u32) {
         if let Some(row) = self
             .vhd
@@ -288,7 +298,10 @@ impl BackupController {
         self.info(format!(
             "Starting backup: {} -> {}",
             config.source_path.display(),
-            config.destination_dir.join(config.backup_name.as_str()).display()
+            config
+                .destination_dir
+                .join(config.backup_name.as_str())
+                .display()
         ));
         self.spawn_backup(
             "Rusty Backup: disk backup",
@@ -307,7 +320,10 @@ impl BackupController {
         self.remember_chd();
         self.info(format!(
             "Starting remote backup: {display} -> {}",
-            config.destination_dir.join(config.backup_name.as_str()).display()
+            config
+                .destination_dir
+                .join(config.backup_name.as_str())
+                .display()
         ));
         let source = crate::backup::BackupSource::Remote {
             conn,

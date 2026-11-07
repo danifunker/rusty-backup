@@ -12,8 +12,9 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
-    format_size, AlignmentChoice, CaveatLevel, HostRequest, LayoutFit, NewTableType, RestoreAction,
-    RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot,
+    device_label, format_size, hints, AlignmentChoice, CaveatLevel, HostRequest, NewTableType,
+    PlanSegment, RestoreAction, RestoreController, RestoreMode, RestoreServices, SizeMode,
+    TargetSlot, MODES,
 };
 use rusty_backup::controller::{Controller as _, Effect};
 
@@ -29,6 +30,15 @@ fn new_controller() -> RestoreController {
         jobs: rusty_backup::controller::restore::JobRegistry::new(),
         notify: Arc::new(super::ui_logger::EguiWake),
     })
+}
+
+/// A note's colour by how much it matters.
+fn note_color(ui: &egui::Ui, level: CaveatLevel) -> egui::Color32 {
+    match level {
+        CaveatLevel::Info => super::theme::muted(ui.visuals()),
+        CaveatLevel::Warning => super::theme::warning(ui.visuals()),
+        CaveatLevel::Blocked => super::theme::danger(ui.visuals()),
+    }
 }
 
 pub struct RestoreTab {
@@ -59,16 +69,6 @@ impl RestoreTab {
             showing_bar: false,
         }
     }
-}
-
-/// One device combo's label in the list.
-fn device_label(d: &rusty_backup::device::DiskDevice) -> String {
-    format!(
-        "{} ({}){}",
-        d.display_name(),
-        format_size(d.size_bytes),
-        if d.is_system { " [SYSTEM]" } else { "" },
-    )
 }
 
 impl RestoreTab {
@@ -205,19 +205,7 @@ impl RestoreTab {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Mode:").strong());
                 let mode = self.ctl.mode();
-                let modes = [
-                    (RestoreMode::FullDisk, "Full Disk Restore", ""),
-                    (RestoreMode::SinglePartition, "Restore Single Partition", ""),
-                    (RestoreMode::NewDisk, "Restore to New Disk", ""),
-                    (
-                        RestoreMode::WriteImage,
-                        "Write Image File",
-                        "Write a disk image straight to a device or one of its \
-                         partitions. Any format Rusty Backup can read works, \
-                         including DMG, CHD, VHD and compressed images.",
-                    ),
-                ];
-                for (m, label, hover) in modes {
+                for (m, label, hover) in MODES {
                     let mut resp = ui.radio(mode == m, label);
                     if !hover.is_empty() {
                         resp = resp.on_hover_text(hover);
@@ -287,9 +275,7 @@ impl RestoreTab {
             && row.is_some()
             && ui
                 .button("Close Drive")
-                .on_hover_text(
-                    "Clear the selected target device so the drive can be safely removed",
-                )
+                .on_hover_text(hints::CLOSE_TARGET)
                 .clicked()
         {
             self.act(RestoreAction::ClearDevice(slot));
@@ -384,11 +370,8 @@ impl RestoreTab {
             {
                 let mut on = self.ctl.remote_active();
                 if ui
-                    .checkbox(&mut on, "Restore to a remote machine (rb-cli serve)")
-                    .on_hover_text(
-                        "Push the restored image to a drive or image file on a remote \
-                         daemon over the network",
-                    )
+                    .checkbox(&mut on, hints::REMOTE)
+                    .on_hover_text(hints::REMOTE_HOVER)
                     .changed()
                 {
                     self.act(RestoreAction::SetRemote(on));
@@ -407,15 +390,8 @@ impl RestoreTab {
                             true,
                         );
                     });
-                    if self
-                        .ctl
-                        .device(TargetSlot::FullDisk)
-                        .is_some_and(|d| d.is_system)
-                    {
-                        ui.colored_label(
-                            super::theme::danger(ui.visuals()),
-                            "WARNING: This is a system disk! Restoring will destroy your OS.",
-                        );
+                    if let Some(warning) = self.ctl.system_disk_warning(TargetSlot::FullDisk) {
+                        ui.colored_label(super::theme::danger(ui.visuals()), warning);
                     }
                 } else {
                     self.target_image_row(ui, TargetSlot::FullDisk, "Image File:");
@@ -426,28 +402,8 @@ impl RestoreTab {
                 self.remote_target_ui(ui);
             }
 
-            if let Some(source_size) = self.ctl.source_size() {
-                let target_size = self.ctl.target_size();
-                if target_size > 0 {
-                    let color = if target_size >= source_size {
-                        super::theme::muted(ui.visuals())
-                    } else {
-                        super::theme::warning(ui.visuals())
-                    };
-                    ui.colored_label(
-                        color,
-                        format!(
-                            "Target: {} | Source was: {}{}",
-                            format_size(target_size),
-                            format_size(source_size),
-                            if target_size < source_size {
-                                " (target is smaller!)"
-                            } else {
-                                ""
-                            },
-                        ),
-                    );
-                }
+            if let Some(note) = self.ctl.target_readout() {
+                ui.colored_label(note_color(ui, note.level), note.text);
             }
         });
 
@@ -566,74 +522,23 @@ impl RestoreTab {
             self.act(a);
         }
 
-        let target_size = self.ctl.target_size();
-        if target_size == 0 {
-            return;
-        }
-        let total = self.ctl.fixed_total();
-        let color = if total <= target_size {
-            super::theme::muted(ui.visuals())
-        } else {
-            super::theme::danger(ui.visuals())
-        };
-        ui.colored_label(
-            color,
-            format!(
-                "Total: {} / {} available",
-                format_size(total),
-                format_size(target_size),
-            ),
-        );
-        // Sizes adding up is not the layout fitting: Original alignment keeps every start.
-        match self.ctl.layout_fit() {
-            Some(LayoutFit::Refused { message, original }) => {
-                ui.colored_label(
-                    super::theme::danger(ui.visuals()),
-                    format!("This layout will not fit: {message}"),
-                );
-                if original {
-                    ui.colored_label(
-                        super::theme::warning(ui.visuals()),
-                        "Original alignment keeps every partition at its \
-                         original position, so shrinking only leaves gaps. \
-                         Choose 1 MB boundaries or Custom to repack them \
-                         from the start of the disk.",
-                    );
-                }
-            }
-            Some(LayoutFit::Overrun { end, target }) => {
-                ui.colored_label(
-                    super::theme::danger(ui.visuals()),
-                    format!(
-                        "Layout ends at {} but the target holds {}",
-                        format_size(end),
-                        format_size(target),
-                    ),
-                );
-            }
-            Some(LayoutFit::Fits) | None => {}
+        for note in self.ctl.size_notes() {
+            ui.colored_label(note_color(ui, note.level), note.text);
         }
     }
 
     /// "Add free space for in-OS expansion": image targets only (docs/disk_expansion.md).
     fn show_expand_section(&mut self, ui: &mut egui::Ui, controls_enabled: bool) {
-        let source_size = self.ctl.source_size().unwrap_or(0);
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Add free space for in-OS expansion").strong());
+        ui.label(egui::RichText::new(hints::EXPAND_TITLE).strong());
         ui.separator();
         let plan = self.ctl.expand();
         let mut actions = Vec::new();
         ui.add_enabled_ui(controls_enabled, |ui| {
             let mut on = plan.enabled;
             if ui
-                .checkbox(&mut on, "Pad the target image with unallocated free space")
-                .on_hover_text(
-                    "Useful for restoring a backup onto a larger virtual disk and \
-                     letting the guest OS extend or add a partition there. After \
-                     restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
-                     Disk Management) followed by your filesystem's own grow \
-                     tool. Works for any filesystem.",
-                )
+                .checkbox(&mut on, hints::EXPAND)
+                .on_hover_text(hints::EXPAND_HOVER)
                 .changed()
             {
                 actions.push(RestoreAction::SetExpand(on));
@@ -654,42 +559,24 @@ impl RestoreTab {
                 {
                     actions.push(RestoreAction::SetExpandMib(mib));
                 }
-                let new_total = source_size.saturating_add(self.ctl.expand_free_bytes());
-                ui.label(format!(
-                    "(target size {} -> {})",
-                    format_size(source_size),
-                    format_size(new_total),
-                ));
+                ui.label(self.ctl.expand_size_line());
             });
             ui.add_space(4.0);
             if ui
-                .radio(
-                    !plan.extend_last,
-                    "Leave as unpartitioned free space (recommended)",
-                )
-                .on_hover_text(
-                    "Mode A: partition table stays unchanged; the trailing region is \
-                     unallocated. After restore, run your OS's partitioner to extend or \
-                     add a partition, then your filesystem's grow tool. Works for any \
-                     filesystem on any OS.",
-                )
+                .radio(!plan.extend_last, hints::EXPAND_LEAVE)
+                .on_hover_text(hints::EXPAND_LEAVE_HOVER)
                 .clicked()
             {
                 actions.push(RestoreAction::SetExtendLast(false));
             }
             if ui
-                .radio(plan.extend_last, "Extend last partition automatically")
-                .on_hover_text(
-                    "Mode B: the last partition is sized to absorb the new free space \
-                     during restore (equivalent to picking 'Fill' for the last partition \
-                     in the size table below). After restore, only the filesystem's \
-                     own grow tool is needed in the guest OS.",
-                )
+                .radio(plan.extend_last, hints::EXPAND_EXTEND)
+                .on_hover_text(hints::EXPAND_EXTEND_HOVER)
                 .clicked()
             {
                 actions.push(RestoreAction::SetExtendLast(true));
             }
-            self.show_expand_preview_bars(ui, source_size);
+            self.show_expand_preview_bars(ui);
         });
         for a in actions {
             self.act(a);
@@ -697,32 +584,28 @@ impl RestoreTab {
     }
 
     /// The current / after bars at one byte-per-pixel scale, so the after bar is wider.
-    fn show_expand_preview_bars(&self, ui: &mut egui::Ui, source_size: u64) {
-        let segments: Vec<Segment> = self
-            .ctl
-            .plan_segments()
-            .into_iter()
-            .enumerate()
-            .map(|(color_index, s)| Segment {
-                label: s.label,
-                fs: s.fs,
-                size_bytes: s.size_bytes,
-                kind: SegmentKind::Partition { color_index },
-                partition: None,
-            })
-            .collect();
-        let added = self.ctl.expand_free_bytes();
-        let new_total = source_size.saturating_add(added);
+    fn show_expand_preview_bars(&self, ui: &mut egui::Ui) {
+        let preview = self.ctl.expand_preview();
+        let segments = |list: &[PlanSegment]| -> Vec<Segment> {
+            list.iter()
+                .enumerate()
+                .map(|(color_index, s)| Segment {
+                    label: s.label.clone(),
+                    fs: s.fs.clone(),
+                    size_bytes: s.size_bytes,
+                    kind: SegmentKind::Partition { color_index },
+                    partition: None,
+                })
+                .collect()
+        };
 
         ui.add_space(6.0);
         ui.label("Current:");
         let available_width = ui.available_width().max(120.0);
-        let ratio = (source_size as f64 / new_total.max(1) as f64) as f32;
-        let current_segments = segments.clone();
         ui.scope(|ui| {
-            ui.set_width((available_width * ratio).max(60.0));
+            ui.set_width((available_width * preview.scale).max(60.0));
             PartitionBar {
-                segments: current_segments,
+                segments: segments(&preview.current),
                 show_inline_labels: true,
                 show_legend: false,
             }
@@ -730,23 +613,16 @@ impl RestoreTab {
         });
 
         ui.add_space(6.0);
-        ui.label(format!("After  (+ {} free):", format_size(added)));
-        let mut after = segments;
-        if added > 0 {
-            if self.ctl.expand().extend_last {
-                // Mode B: the last partition absorbs the new free space.
-                if let Some(last) = after.last_mut() {
-                    last.size_bytes = last.size_bytes.saturating_add(added);
-                }
-            } else {
-                after.push(Segment {
-                    label: String::new(),
-                    fs: String::new(),
-                    size_bytes: added,
-                    kind: SegmentKind::Free,
-                    partition: None,
-                });
-            }
+        ui.label(format!("After  (+ {} free):", format_size(preview.added)));
+        let mut after = segments(&preview.after);
+        if preview.free_tail > 0 {
+            after.push(Segment {
+                label: String::new(),
+                fs: String::new(),
+                size_bytes: preview.free_tail,
+                kind: SegmentKind::Free,
+                partition: None,
+            });
         }
         PartitionBar {
             segments: after,
@@ -760,20 +636,12 @@ impl RestoreTab {
     fn show_caveats(&mut self, ui: &mut egui::Ui) {
         if self.ctl.mac_driver_missing() {
             let mut on = self.ctl.install_mac_driver();
-            if ui
-                .checkbox(&mut on, "Install the bundled Mac driver")
-                .changed()
-            {
+            if ui.checkbox(&mut on, hints::MAC_DRIVER).changed() {
                 self.act(RestoreAction::SetInstallMacDriver(on));
             }
         }
         for c in self.ctl.size_caveats() {
-            let color = match c.caveat.level {
-                CaveatLevel::Info => super::theme::muted(ui.visuals()),
-                CaveatLevel::Warning => super::theme::warning(ui.visuals()),
-                CaveatLevel::Blocked => super::theme::danger(ui.visuals()),
-            };
-            ui.colored_label(color, c.line());
+            ui.colored_label(note_color(ui, c.caveat.level), c.line());
         }
     }
 
@@ -854,7 +722,7 @@ impl RestoreTab {
             });
         } else if whole_image_note && self.ctl.source_image().is_some() {
             ui.add_space(4.0);
-            ui.label("Source: entire image file");
+            ui.label(hints::ENTIRE_IMAGE);
         }
         if let Some(err) = self.ctl.load_error() {
             ui.colored_label(super::theme::warning(ui.visuals()), err);
@@ -890,15 +758,8 @@ impl RestoreTab {
                     self.act(RestoreAction::ScanTarget);
                 }
             });
-            if self
-                .ctl
-                .device(TargetSlot::SinglePartition)
-                .is_some_and(|d| d.is_system)
-            {
-                ui.colored_label(
-                    super::theme::danger(ui.visuals()),
-                    "WARNING: This is a system disk!",
-                );
+            if let Some(warning) = self.ctl.system_disk_warning(TargetSlot::SinglePartition) {
+                ui.colored_label(super::theme::danger(ui.visuals()), warning);
             }
 
             let parts = self.ctl.target_partitions();
@@ -1044,12 +905,9 @@ impl RestoreTab {
             super::progress::show_job(ui, &snap);
         }
 
-        match self.ctl.write_image() {
-            Some((_, size)) if size > 0 => {
-                ui.label(format!(
-                    "Decoded size: {} (the file on disk may be smaller if it is compressed)",
-                    format_size(size),
-                ));
+        match (self.ctl.write_image(), self.ctl.write_image_line()) {
+            (_, Some(line)) => {
+                ui.label(line);
                 ui.add_space(6.0);
                 if ui
                     .add_enabled(
@@ -1061,21 +919,14 @@ impl RestoreTab {
                     self.act(RestoreAction::WriteImageTarget);
                 }
             }
-            Some(_) => {
+            (Some(_), None) => {
                 ui.colored_label(
                     super::theme::danger(ui.visuals()),
-                    "That file could not be opened as a disk image.",
+                    hints::WRITE_IMAGE_UNREADABLE,
                 );
             }
-            None => {
-                ui.label(
-                    egui::RichText::new(
-                        "Pick an image to write. Any format Rusty Backup can read works -- \
-                         raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
-                         are decoded on the way to the disk.",
-                    )
-                    .weak(),
-                );
+            (None, None) => {
+                ui.label(egui::RichText::new(hints::WRITE_IMAGE_EMPTY).weak());
             }
         }
     }
@@ -1092,7 +943,7 @@ impl RestoreTab {
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut addr)
-                        .hint_text("192.168.1.50:7341")
+                        .hint_text(hints::REMOTE_ADDRESS)
                         .desired_width(200.0),
                 )
                 .changed()
@@ -1122,12 +973,9 @@ impl RestoreTab {
             let drives = self.ctl.remote_drives();
             if drives.is_empty() {
                 ui.label(
-                    egui::RichText::new(
-                        "No physical drives reported (the daemon may need to run as root). \
-                         You can still restore to an image file below.",
-                    )
-                    .italics()
-                    .weak(),
+                    egui::RichText::new(hints::NO_REMOTE_DRIVES)
+                        .italics()
+                        .weak(),
                 );
             } else {
                 let selected = self.ctl.remote_selected_device().map(|s| s.to_string());
@@ -1151,7 +999,7 @@ impl RestoreTab {
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut name)
-                            .hint_text("restored.img")
+                            .hint_text(hints::REMOTE_IMAGE_NAME)
                             .desired_width(200.0),
                     )
                     .changed()

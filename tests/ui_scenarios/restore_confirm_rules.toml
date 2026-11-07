@@ -1,0 +1,32 @@
+# A destructive restore starts only on a yes to the question it asked.
+name = "Restore: a yes with no question out starts nothing"
+vm = "restore"
+
+[[step]]
+action = "OpenBackup"
+arg = "$backup"
+settle = true
+expect = { backup = true }
+
+[[step]]
+action = "SetTargetIsDevice"
+arg = false
+
+[[step]]
+action = "SetTargetImage"
+arg = "$out"
+expect = { error = "" }
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "", output = false }
+
+[[step]]
+action = "Start"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok", output = true }

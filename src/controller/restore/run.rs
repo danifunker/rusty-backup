@@ -3,9 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::source::finished;
-use super::{
-    path_label, purpose, push_log, RestoreBar, RestoreController, RestoreMode, SizeMode, TargetSlot,
-};
+use super::{purpose, push_log, RestoreBar, RestoreController, RestoreMode, SizeMode, TargetSlot};
 use crate::controller::log::LogLevel;
 use crate::controller::{ConfirmSpec, Effect};
 use crate::model::job::Job;
@@ -22,11 +20,20 @@ type RestoreBody = Box<dyn FnOnce(Arc<Mutex<RestoreProgress>>) -> anyhow::Result
 pub(super) struct RunState {
     running: Option<(Job<RunOutcome>, Arc<Mutex<RestoreProgress>>)>,
     pub last: Option<RunOutcome>,
+    /// The question on screen: a yes only counts for exactly what it named.
+    asked: Option<String>,
 }
 
 impl RunState {
     pub fn running(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// Cancel was asked for and the job has not stopped yet.
+    pub fn cancelling(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|(job, _)| job.snapshot().cancel_requested)
     }
 
     pub fn bar(&self) -> Option<RestoreBar> {
@@ -52,45 +59,83 @@ impl RestoreController {
             return Vec::new();
         }
         self.run.last = None;
-        let (message, destructive_title) = match self.mode {
-            RestoreMode::FullDisk => (self.full_disk_question(), "Confirm Restore"),
-            RestoreMode::SinglePartition => (self.single_question(), "Confirm Restore"),
-            RestoreMode::NewDisk => (self.new_disk_question(), "Confirm Restore"),
-            RestoreMode::WriteImage => return Vec::new(),
+        let Some(message) = self.question() else {
+            return Vec::new();
         };
+        self.run.asked = Some(message.clone());
         vec![Effect::Confirm(ConfirmSpec {
             purpose: purpose::RESTORE,
-            title: destructive_title.to_string(),
+            title: "Confirm Restore".to_string(),
             message,
             confirm_label: "I understand, proceed".to_string(),
             destructive: true,
         })]
     }
 
+    /// What the Restore button would ask now; Write Image File has its own window.
+    fn question(&self) -> Option<String> {
+        match self.mode {
+            RestoreMode::FullDisk => Some(self.full_disk_question()),
+            RestoreMode::SinglePartition => Some(self.single_question()),
+            RestoreMode::NewDisk => Some(self.new_disk_question()),
+            RestoreMode::WriteImage => None,
+        }
+    }
+
+    /// The target a restore would write in this mode, as the confirmation names it.
+    pub fn write_target(&self) -> Option<String> {
+        match self.mode {
+            RestoreMode::FullDisk => self.full_disk_target_name(),
+            RestoreMode::SinglePartition => self.single_target_name(),
+            RestoreMode::NewDisk => self.new_disk_target_name(),
+            RestoreMode::WriteImage => None,
+        }
+    }
+
     /// The full-disk target's name, as the confirmation and the log say it.
-    fn full_disk_target_name(&self) -> String {
-        if let Some(d) = self
-            .remote_active()
-            .then(|| self.remote_target_label())
-            .flatten()
-        {
-            return d.to_string();
+    fn full_disk_target_name(&self) -> Option<String> {
+        if self.remote_active() {
+            return self.remote_target_label().map(str::to_string);
         }
-        let t = &self.targets.full;
+        self.target_name(TargetSlot::FullDisk)
+    }
+
+    /// A mode's device or image file.
+    fn target_name(&self, slot: TargetSlot) -> Option<String> {
+        let t = self.targets.target(slot);
         if t.is_device {
-            t.device
-                .as_ref()
-                .map(|p| p.device.display_name())
-                .unwrap_or_else(|| "Unknown".into())
+            t.device.as_ref().map(|p| p.device.display_name())
         } else {
-            path_label(t.image.as_deref())
+            t.image.as_ref().map(|p| p.display().to_string())
         }
+    }
+
+    fn single_partition_name(&self) -> Option<String> {
+        let idx = self.targets.sp_part?;
+        let p = self.targets.sp_parts.iter().find(|p| p.index == idx)?;
+        Some(format!(
+            "Partition {} ({}, {})",
+            p.index,
+            p.type_name,
+            format_size(p.size_bytes)
+        ))
+    }
+
+    fn single_target_name(&self) -> Option<String> {
+        let device = self.device(TargetSlot::SinglePartition)?;
+        let part = self.single_partition_name()?;
+        Some(format!("{part} on {}", device.display_name()))
+    }
+
+    fn new_disk_target_name(&self) -> Option<String> {
+        self.target_name(TargetSlot::NewDisk)
     }
 
     fn full_disk_question(&self) -> String {
         let mut msg = format!(
             "All data on {} will be permanently overwritten!\n",
             self.full_disk_target_name()
+                .unwrap_or_else(|| "Unknown".into())
         );
         for row in self.size_rows() {
             let size = if row.mode == SizeMode::FillRemaining {
@@ -111,17 +156,7 @@ impl RestoreController {
             .map(|d| d.display_name())
             .unwrap_or_else(|| "Unknown".into());
         let part = self
-            .targets
-            .sp_part
-            .and_then(|idx| self.targets.sp_parts.iter().find(|p| p.index == idx))
-            .map(|p| {
-                format!(
-                    "Partition {} ({}, {})",
-                    p.index,
-                    p.type_name,
-                    format_size(p.size_bytes)
-                )
-            })
+            .single_partition_name()
             .unwrap_or_else(|| "Unknown".into());
         format!(
             "{part} on {target} will be overwritten.\nThe partition table will NOT be modified."
@@ -129,15 +164,9 @@ impl RestoreController {
     }
 
     fn new_disk_question(&self) -> String {
-        let t = &self.targets.new_disk;
-        let target = if t.is_device {
-            t.device
-                .as_ref()
-                .map(|p| p.device.display_name())
-                .unwrap_or_else(|| "Unknown".into())
-        } else {
-            path_label(t.image.as_deref())
-        };
+        let target = self
+            .new_disk_target_name()
+            .unwrap_or_else(|| "Unknown".into());
         let table = match self.targets.new_disk_choice.table {
             super::NewTableType::Mbr => "MBR",
             super::NewTableType::Gpt => "GPT",
@@ -148,8 +177,32 @@ impl RestoreController {
         )
     }
 
-    pub(super) fn start_confirmed(&mut self) {
-        if self.run.running() || self.validate().is_err() {
+    /// The answer to the Restore question; a yes with no question out starts nothing.
+    pub(super) fn answered(&mut self, yes: bool) {
+        let asked = self.run.asked.take();
+        if !yes {
+            return;
+        }
+        let Some(asked) = asked else {
+            return;
+        };
+        if self.question().as_deref() != Some(asked.as_str()) {
+            let msg = "The restore target changed while the question was open, so nothing was \
+                       written. Check it and press Restore again.";
+            self.warn(msg);
+            self.run.last = Some(Err(msg.to_string()));
+            return;
+        }
+        self.start_confirmed();
+    }
+
+    fn start_confirmed(&mut self) {
+        if self.run.running() {
+            return;
+        }
+        if let Err(e) = self.validate() {
+            self.warn(e.as_str());
+            self.run.last = Some(Err(e));
             return;
         }
         match self.mode {
