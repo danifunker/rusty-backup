@@ -22,6 +22,7 @@ use super::backup::BackupScreen;
 use super::build_disk::BuildDiskScreen;
 use super::optical::OpticalScreen;
 use super::restore::RestoreScreen;
+use crate::bulk::BulkScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -30,6 +31,7 @@ use crate::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
 use crate::widgets::plain;
+use rusty_backup::controller::bulk_convert::MENU_HINT;
 
 const TABS: [(AppTab, &str, &str, &str); 6] = [
     (AppTab::Backup, "backup", "Backup", "document-save-symbolic"),
@@ -74,6 +76,8 @@ pub struct App {
     build: Rc<BuildDiskScreen>,
     optical: Rc<OpticalScreen>,
     archives: Rc<ArchivesScreen>,
+    bulk: Rc<BulkScreen>,
+    bulk_button: gtk::Button,
     close_backup: gtk::Button,
     settings: RefCell<Option<Rc<SettingsWindow>>>,
     banner: gtk::Revealer,
@@ -240,11 +244,7 @@ impl App {
         settings.set_widget_name(ids::SETTINGS);
         let bulk = gtk::Button::with_label("Bulk Convert...");
         bulk.set_widget_name(ids::BULK_CONVERT);
-        bulk.set_tooltip_text(Some(
-            "Convert every disk image in a folder to one chosen format, \
-             using the same parameters for every file.",
-        ));
-        crate::widgets::coming(&bulk, "Bulk Convert");
+        bulk.set_tooltip_text(Some(MENU_HINT));
         let version = gtk::Label::new(Some(&format!("Version {}", app_version())));
         version.add_css_class("dim-label");
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -347,6 +347,8 @@ impl App {
         let build = BuildDiskScreen::build(ctrl.notify(), host.clone());
         let optical = OpticalScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let archives = ArchivesScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        let bulk_screen = BulkScreen::build(ctrl.notify(), host.clone());
+        view.add_top_bar(bulk_screen.strip());
         for (tab, name, title, icon) in TABS {
             match tab {
                 AppTab::Inspect => {
@@ -379,6 +381,8 @@ impl App {
             build,
             optical,
             archives,
+            bulk: bulk_screen,
+            bulk_button: bulk.clone(),
             close_backup: close_backup.clone(),
             settings: RefCell::default(),
             banner,
@@ -408,6 +412,12 @@ impl App {
         copy.connect_clicked(send(|| AppAction::CopyLog));
         view_release.connect_clicked(send(|| AppAction::ViewRelease));
         dismiss.connect_clicked(send(|| AppAction::DismissUpdate));
+        let a = app.clone();
+        let p = popover.clone();
+        bulk.connect_clicked(move |_| {
+            p.popdown();
+            a.bulk.open();
+        });
         let a = app.clone();
         let p = popover.clone();
         settings.connect_clicked(move |_| {
@@ -525,6 +535,7 @@ impl App {
         self.build.tick();
         self.optical.tick();
         self.archives.tick();
+        self.bulk.tick();
         self.share_backup();
         self.lock_tabs();
         let commander = self.commander.borrow().clone();
@@ -587,6 +598,8 @@ impl App {
 
     /// One disk job at a time: each tab hears who else runs.
     fn lock_tabs(&self) {
+        let bulk = self.bulk.is_running();
+        self.bulk_button.set_sensitive(!bulk);
         let on = |running: bool, name| running.then_some(name);
         let running = [
             (AppTab::Backup, on(self.backup.is_running(), "Backup")),
@@ -596,13 +609,13 @@ impl App {
             (AppTab::Inspect, self.inspect.running_job()),
         ];
         self.backup
-            .set_busy(busy_elsewhere(AppTab::Backup, &running, false));
+            .set_busy(busy_elsewhere(AppTab::Backup, &running, bulk));
         self.restore
-            .set_busy(busy_elsewhere(AppTab::Restore, &running, false));
+            .set_busy(busy_elsewhere(AppTab::Restore, &running, bulk));
         self.build
-            .set_busy(busy_elsewhere(AppTab::Build, &running, false));
+            .set_busy(busy_elsewhere(AppTab::Build, &running, bulk));
         self.optical
-            .set_busy(busy_elsewhere(AppTab::Optical, &running, false));
+            .set_busy(busy_elsewhere(AppTab::Optical, &running, bulk));
     }
 
     /// Read the controller first and release it: setting a widget can fire its change signal.

@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use rusty_backup::controller::bulk_convert::{
-    chd_profile, fmt_bytes, format_label, format_note, BulkConvertAction, BulkConvertController,
-    BulkPhase, ChdOptions, ChdProfile, Conflict, ConflictChoice, ExportFormat, FORMATS,
-    MULTI_BIN_LABEL, MULTI_BIN_NOTE,
+    chd_profile, conflict_heading, fmt_bytes, folder_label, format_label, format_note,
+    BulkConvertAction, BulkConvertController, BulkPhase, ChdOptions, ChdProfile, Conflict,
+    ConflictChoice, ExportFormat, CONFLICT_HELP, CONFLICT_TITLE, FORMATS, INTRO, MULTI_BIN_LABEL,
+    MULTI_BIN_NOTE, REVIEW_NOTE, SAME_FOLDERS_WARNING, SCAN_HINT,
 };
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller, Effect};
@@ -60,29 +61,7 @@ impl BulkConvertDialog {
 
     /// The progress strip's fraction and text while a conversion runs.
     pub fn strip(&self) -> Option<(f32, String)> {
-        let p = self.ctl.progress()?;
-        let frac = if p.total_bytes > 0 {
-            (p.bytes as f32 / p.total_bytes as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let text = if p.total_bytes > 0 {
-            format!(
-                "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
-                p.index,
-                p.total_files,
-                p.file,
-                fmt_bytes(p.bytes),
-                fmt_bytes(p.total_bytes),
-                frac * 100.0,
-            )
-        } else {
-            format!(
-                "Bulk Convert: [{}/{}] {} - preparing...",
-                p.index, p.total_files, p.file,
-            )
-        };
-        Some((frac, text))
+        self.ctl.strip()
     }
 
     fn act(&mut self, action: BulkConvertAction) {
@@ -147,20 +126,12 @@ impl BulkConvertDialog {
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.label(
-                    "Convert every disk image in a folder to a single output format. \
-                     All files use the same parameters; original size is preserved.",
-                );
+                ui.label(INTRO);
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Source folder:").strong());
-                    let label = self
-                        .ctl
-                        .source()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(not selected)".to_string());
-                    ui.label(label);
+                    ui.label(folder_label(self.ctl.source()));
                 });
                 if ui.button("Choose Source Folder...").clicked() {
                     actions.push(BulkConvertAction::PickSource);
@@ -170,12 +141,7 @@ impl BulkConvertDialog {
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Output folder:").strong());
-                    let label = self
-                        .ctl
-                        .output()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(not selected)".to_string());
-                    ui.label(label);
+                    ui.label(folder_label(self.ctl.output()));
                 });
                 if ui.button("Choose Output Folder...").clicked() {
                     actions.push(BulkConvertAction::PickOutput);
@@ -229,13 +195,9 @@ impl BulkConvertDialog {
                     _ => {}
                 }
 
-
                 if self.ctl.same_folders() {
                     ui.add_space(6.0);
-                    ui.colored_label(
-                        super::theme::warning(ui.visuals()),
-                        "Warning: source and output folders are the same - converted files may overwrite originals.",
-                    );
+                    ui.colored_label(super::theme::warning(ui.visuals()), SAME_FOLDERS_WARNING);
                 }
 
                 if let Some(err) = self.ctl.scan_error() {
@@ -247,7 +209,7 @@ impl BulkConvertDialog {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(self.ctl.can_scan(), egui::Button::new("Scan..."))
-                        .on_hover_text("Read the source folder and review the file list before converting.")
+                        .on_hover_text(SCAN_HINT)
                         .clicked()
                     {
                         actions.push(BulkConvertAction::Scan);
@@ -281,17 +243,8 @@ impl BulkConvertDialog {
             .default_width(640.0)
             .default_height(500.0)
             .show(ctx, |ui| {
-                let total = self.ctl.files().len();
-                let selected_count = self.ctl.selected_count();
-
-                ui.label(format!(
-                    "Found {} file(s) in source folder. {} selected for conversion.",
-                    total, selected_count,
-                ));
-                ui.label(
-                    "Files that fail to open or aren't recognized as disk images will be \
-                     reported as warnings in the log after conversion finishes.",
-                );
+                ui.label(self.ctl.review_summary());
+                ui.label(REVIEW_NOTE);
 
                 ui.add_space(6.0);
 
@@ -371,9 +324,11 @@ impl BulkConvertDialog {
                     if ui.button("Back").clicked() {
                         actions.push(BulkConvertAction::Back);
                     }
-                    let label = format!("Start Conversion ({selected_count})");
                     if ui
-                        .add_enabled(self.ctl.can_start(), egui::Button::new(label))
+                        .add_enabled(
+                            self.ctl.can_start(),
+                            egui::Button::new(self.ctl.start_label()),
+                        )
                         .clicked()
                     {
                         actions.push(BulkConvertAction::Start(self.chd_options()));
@@ -395,16 +350,13 @@ impl BulkConvertDialog {
 
 fn show_conflict_modal(ctx: &egui::Context, conflicts: &[Conflict]) -> Option<ConflictChoice> {
     let mut resolution = None;
-    egui::Window::new("Output Files Already Exist")
+    egui::Window::new(CONFLICT_TITLE)
         .collapsible(false)
         .resizable(true)
         .default_width(560.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label(format!(
-                "{} file(s) in the output folder would be overwritten by this conversion:",
-                conflicts.len(),
-            ));
+            ui.label(conflict_heading(conflicts.len()));
             ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
@@ -418,10 +370,7 @@ fn show_conflict_modal(ctx: &egui::Context, conflicts: &[Conflict]) -> Option<Co
                 });
 
             ui.add_space(8.0);
-            ui.label(
-                "Skip: leave existing files alone, convert only the non-conflicting ones.\n\
-                 Overwrite: replace the existing output files.",
-            );
+            ui.label(CONFLICT_HELP);
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {

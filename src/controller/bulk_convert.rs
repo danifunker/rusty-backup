@@ -37,7 +37,15 @@ pub mod ids {
     pub const FILES: &str = "bulk_convert.files";
     pub const START: &str = "bulk_convert.start";
     pub const BACK: &str = "bulk_convert.back";
+    /// Stops a running conversion (the strip's button).
     pub const CANCEL: &str = "bulk_convert.cancel";
+    pub const CLOSE: &str = "bulk_convert.close";
+    pub const SELECT_ALL: &str = "bulk_convert.select_all";
+    pub const SELECT_NONE: &str = "bulk_convert.select_none";
+    pub const RESET_EXTENSION: &str = "bulk_convert.reset_extension";
+    pub const CHD_MODE: &str = "bulk_convert.chd_mode";
+    pub const CHD_HUNK: &str = "bulk_convert.chd_hunk";
+    pub const CHD_CODEC: &str = "bulk_convert.chd_codec";
 }
 
 /// The formats the dialog offers, in its order.
@@ -141,6 +149,31 @@ pub fn chd_profile(format: ExportFormat) -> Option<ChdProfile> {
         ExportFormat::ChdCd => Some(ChdProfile::Cd),
         _ => None,
     }
+}
+
+/// The Setup page's opening line.
+pub const INTRO: &str = "Convert every disk image in a folder to a single output format. \
+    All files use the same parameters; original size is preserved.";
+pub const SCAN_HINT: &str = "Read the source folder and review the file list before converting.";
+pub const SAME_FOLDERS_WARNING: &str =
+    "Warning: source and output folders are the same - converted files may overwrite originals.";
+pub const REVIEW_NOTE: &str = "Files that fail to open or aren't recognized as disk images will \
+    be reported as warnings in the log after conversion finishes.";
+pub const CONFLICT_TITLE: &str = "Output Files Already Exist";
+pub const CONFLICT_HELP: &str = "Skip: leave existing files alone, convert only the \
+    non-conflicting ones.\nOverwrite: replace the existing output files.";
+pub const MENU_HINT: &str = "Convert every disk image in a folder to one chosen format, \
+    using the same parameters for every file.";
+
+/// A folder row's text.
+pub fn folder_label(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(not selected)".to_string())
+}
+
+/// The conflict question's opening line.
+pub fn conflict_heading(count: usize) -> String {
+    format!("{count} file(s) in the output folder would be overwritten by this conversion:")
 }
 
 /// An output file that already exists.
@@ -367,6 +400,42 @@ impl BulkConvertController {
             bytes: s.current_bytes,
             total_bytes: s.current_total_bytes,
         })
+    }
+
+    /// The progress strip's fraction and text while a conversion runs.
+    pub fn strip(&self) -> Option<(f32, String)> {
+        let p = self.progress()?;
+        if p.total_bytes == 0 {
+            let text = format!(
+                "Bulk Convert: [{}/{}] {} - preparing...",
+                p.index, p.total_files, p.file
+            );
+            return Some((0.0, text));
+        }
+        let frac = (p.bytes as f32 / p.total_bytes as f32).clamp(0.0, 1.0);
+        let text = format!(
+            "Bulk Convert: [{}/{}] {} - {} / {} ({:.0}%)",
+            p.index,
+            p.total_files,
+            p.file,
+            fmt_bytes(p.bytes),
+            fmt_bytes(p.total_bytes),
+            frac * 100.0,
+        );
+        Some((frac, text))
+    }
+
+    /// The Review page's count line.
+    pub fn review_summary(&self) -> String {
+        format!(
+            "Found {} file(s) in source folder. {} selected for conversion.",
+            self.files.len(),
+            self.selected_count()
+        )
+    }
+
+    pub fn start_label(&self) -> String {
+        format!("Start Conversion ({})", self.selected_count())
     }
 
     /// The last conversion's counts, or why it could not run.

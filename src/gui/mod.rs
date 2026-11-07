@@ -534,10 +534,7 @@ impl eframe::App for RustyBackupApp {
                     let bulk_running = self.bulk_convert.is_running();
                     if ui
                         .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
-                        .on_hover_text(
-                            "Convert every disk image in a folder to one chosen format, \
-                             using the same parameters for every file.",
-                        )
+                        .on_hover_text(rusty_backup::controller::bulk_convert::MENU_HINT)
                         .clicked()
                     {
                         self.bulk_convert.open();

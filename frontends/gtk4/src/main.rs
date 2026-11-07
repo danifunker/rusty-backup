@@ -8,6 +8,7 @@ mod archives;
 mod backup;
 mod browser;
 mod build_disk;
+mod bulk;
 mod chd;
 mod commander;
 mod effects;
