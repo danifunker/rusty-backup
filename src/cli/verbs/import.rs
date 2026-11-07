@@ -97,6 +97,10 @@ pub struct ImportArgs {
     /// cruft. Only an orphan with no primary file is ever dropped outright.
     #[arg(long = "include-appledouble")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(long = "exclude-appledouble", conflicts_with = "include_appledouble")]
+    pub exclude_appledouble: bool,
 
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
@@ -175,6 +179,7 @@ pub fn run(args: ImportArgs) -> Result<()> {
         flatten_archives: args.flatten_folders,
         expand_gunzip: args.expand_gunzip,
         expand_disk_images: args.expand_images,
+        ignore_appledouble: args.exclude_appledouble,
     };
 
     let stats = import_dir(&mut *fs, &dest, &args.dir, &opts, &progress_cb)

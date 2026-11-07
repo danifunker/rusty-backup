@@ -110,6 +110,8 @@ pub struct CdImport {
     pub no_permissions: bool,
     /// Import macOS AppleDouble sidecars (`._*`) too.
     pub include_appledouble: bool,
+    /// Leave `._*` sidecars out entirely, taking no resource fork from them either.
+    pub ignore_appledouble: bool,
 }
 
 /// One disc to master.
@@ -143,7 +145,8 @@ impl CdRequest {
 
 /// The importer's settings for `layout`, shared by sizing and filling so the disc fits what lands.
 pub fn import_options(layout: CdLayout, import: &CdImport) -> DirImportOptions {
-    let flatten = import.flatten_folders && layout.can_flatten();
+    // Flattening is a way of unpacking, so it counts only while archives are unpacked.
+    let flatten = import.flatten_folders && import.expand_archives && layout.can_flatten();
     DirImportOptions {
         shared: ImportOptions {
             // Flattened archives overlap by design, so they skip rather than stop.
@@ -153,12 +156,13 @@ pub fn import_options(layout: CdLayout, import: &CdImport) -> DirImportOptions {
                 (false, false) => ImportConflict::Error,
             },
             apply_permissions: layout.keeps_permissions() && !import.no_permissions,
-            skip_appledouble: !import.include_appledouble,
+            skip_appledouble: !import.include_appledouble || import.ignore_appledouble,
         },
         expand_archives: import.expand_archives,
         flatten_archives: flatten,
         expand_gunzip: import.expand_gunzip,
         expand_disk_images: import.expand_images,
+        ignore_appledouble: import.ignore_appledouble,
     }
 }
 
@@ -405,6 +409,38 @@ mod tests {
                 .collect();
             assert!(names.iter().any(|n| n == "README"), "{layout:?}: {names:?}");
             assert!(names.iter().any(|n| n == "sub"), "{layout:?}: {names:?}");
+        }
+    }
+
+    /// Leaving sidecars out drops `._` files and the fork they carry; by default a Mac disc keeps the fork.
+    #[test]
+    fn sidecars_fold_into_the_fork_unless_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("App"), b"data").unwrap();
+        let dates = fs_mac::resource_fork::MacFileDates {
+            created: 0,
+            modified: 0,
+        };
+        let ad =
+            fs_mac::resource_fork::build_appledouble(b"APPL", b"TEST", dates, b"RSRC fork bytes");
+        std::fs::write(src.join("._App"), ad).unwrap();
+        for leave_out in [false, true] {
+            let out = dir.path().join(format!("{leave_out}.iso"));
+            let mut req = CdRequest::new(CdLayout::MacHfs);
+            req.size = None;
+            req.from_dir = Some(src.clone());
+            req.import.ignore_appledouble = leave_out;
+            let written = build_cd(&out, &req, &mut |_| {}, &|_| {}).unwrap();
+            let file = std::fs::File::open(&out).unwrap();
+            let mut fs = crate::fs::open_filesystem(file, written.fs_offset, 0, None).unwrap();
+            let root = fs.root().unwrap();
+            let entries = fs.list_directory(&root).unwrap();
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["App"], "leave_out={leave_out}: {names:?}");
+            let fork = fs.resource_fork_size(&entries[0]);
+            assert_eq!(fork > 0, !leave_out, "leave_out={leave_out}: fork {fork}");
         }
     }
 

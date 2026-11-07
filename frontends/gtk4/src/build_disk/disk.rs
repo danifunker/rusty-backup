@@ -6,8 +6,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::build_disk::{
-    format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdView, DiskKind,
-    FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
+    format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdOptionRow,
+    CdView, DiskKind, FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
 };
 use rusty_backup::controller::partition_edit::{BuildAction, BuildView};
 
@@ -26,6 +26,7 @@ pub struct DiskShown {
     preset: PresetView,
     cd: CdView,
     cd_auto: bool,
+    cd_options: Vec<CdOptionRow>,
     volume_fs: FsKind,
     range: Option<String>,
     view: BuildView,
@@ -44,6 +45,7 @@ impl DiskShown {
             preset: ctrl.preset().clone(),
             cd: ctrl.cd().clone(),
             cd_auto: ctrl.cd_auto_size(),
+            cd_options: ctrl.cd_options(),
             volume_fs: ctrl.volume_fs(),
             range: ctrl.volume_size_range(),
             view: ctrl.table_view(),
@@ -172,11 +174,8 @@ struct CdRows {
     auto: adw::SwitchRow,
     folder: adw::ActionRow,
     clear: gtk::Button,
-    archives: adw::SwitchRow,
-    flatten: adw::SwitchRow,
-    gunzip: adw::SwitchRow,
-    images: adw::SwitchRow,
-    no_permissions: adw::SwitchRow,
+    /// One switch per `CdOption::ALL`, in that order.
+    options: Vec<adw::SwitchRow>,
 }
 
 impl CdRows {
@@ -236,45 +235,18 @@ impl CdRows {
         folder.add_suffix(&clear);
         root.add(&folder);
 
-        let flag = |title: &str, id: &str, hint: &str, set: fn(&mut CdView, bool)| {
-            let row = switch(title, id);
-            row.set_tooltip_text(Some(hint));
-            let picked = row.clone();
-            let apply = edit(Rc::new(move |c| set(c, picked.is_active())));
-            row.connect_active_notify(move |_| apply());
-            root.add(&row);
-            row
-        };
-        let archives = flag(
-            "Unpack archives",
-            ids::CD_EXPAND_ARCHIVES,
-            hints::CD_EXPAND_ARCHIVES,
-            |c, on| c.import.expand_archives = on,
-        );
-        let flatten = flag(
-            "Unpack into the root",
-            ids::CD_FLATTEN,
-            hints::CD_FLATTEN,
-            |c, on| c.import.flatten_folders = on,
-        );
-        let gunzip = flag(
-            "Decompress .gz files",
-            ids::CD_EXPAND_GUNZIP,
-            hints::CD_EXPAND_GUNZIP,
-            |c, on| c.import.expand_gunzip = on,
-        );
-        let images = flag(
-            "Open disk images",
-            ids::CD_EXPAND_IMAGES,
-            hints::CD_EXPAND_IMAGES,
-            |c, on| c.import.expand_images = on,
-        );
-        let no_permissions = flag(
-            "Ignore host permissions",
-            ids::CD_NO_PERMISSIONS,
-            hints::CD_NO_PERMISSIONS,
-            |c, on| c.import.no_permissions = on,
-        );
+        let options: Vec<adw::SwitchRow> = CdOption::ALL
+            .iter()
+            .map(|&option| {
+                let row = switch(option.label(), option.id());
+                let s = send.clone();
+                row.connect_active_notify(move |r| {
+                    s(BuildDiskAction::SetCdOption(option, r.is_active()));
+                });
+                root.add(&row);
+                row
+            })
+            .collect();
         CdRows {
             root,
             held,
@@ -283,15 +255,11 @@ impl CdRows {
             auto,
             folder,
             clear,
-            archives,
-            flatten,
-            gunzip,
-            images,
-            no_permissions,
+            options,
         }
     }
 
-    fn show(&self, c: CdView, auto: bool) {
+    fn show(&self, c: CdView, auto: bool, options: &[CdOptionRow]) {
         let at = CdLayout::ALL.iter().position(|l| *l == c.layout);
         set_combo(&self.layout, at.unwrap_or(0) as u32);
         self.layout.set_subtitle(c.layout.hint());
@@ -300,19 +268,15 @@ impl CdRows {
         let dir = c.from_dir.as_ref().map(|d| d.display().to_string());
         set_subtitle(&self.folder, dir.as_deref().unwrap_or("(a blank disc)"));
         self.clear.set_visible(dir.is_some());
-        let filled = dir.is_some();
-        for row in [&self.archives, &self.gunzip, &self.images] {
-            row.set_visible(filled);
+        // Every option stays listed; one that does not apply is greyed with the reason.
+        for (switch, row) in self.options.iter().zip(options) {
+            set_switch(switch, row.on);
+            switch.set_sensitive(row.unavailable.is_none());
+            let tip = row.unavailable.unwrap_or(row.option.hint());
+            if switch.tooltip_text().as_deref() != Some(tip) {
+                switch.set_tooltip_text(Some(tip));
+            }
         }
-        self.flatten
-            .set_visible(filled && c.layout.can_flatten() && c.import.expand_archives);
-        self.no_permissions
-            .set_visible(filled && c.layout.keeps_permissions());
-        set_switch(&self.archives, c.import.expand_archives);
-        set_switch(&self.flatten, c.import.flatten_folders);
-        set_switch(&self.gunzip, c.import.expand_gunzip);
-        set_switch(&self.images, c.import.expand_images);
-        set_switch(&self.no_permissions, c.import.no_permissions);
         *self.held.borrow_mut() = Some(c);
     }
 }
@@ -549,6 +513,6 @@ impl DiskStep {
         set_line(&self.fixed, fixed.then_some(hints::FIXED_SIZE));
         self.show_size(&s);
         self.preset.show(s.preset);
-        self.cd.show(s.cd, s.cd_auto);
+        self.cd.show(s.cd, s.cd_auto, &s.cd_options);
     }
 }

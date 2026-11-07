@@ -2003,6 +2003,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                     })
                 }
             },
@@ -2089,6 +2090,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                     },
                 ),
                 CdTarget::MacHfs | CdTarget::MacHfsPlus => {
@@ -2109,6 +2111,7 @@ impl App {
                             expand_images,
                             force: false,
                             include_appledouble: false,
+                            exclude_appledouble: false,
                             block_size: None,
                         },
                     )
@@ -2126,6 +2129,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                         bytes_per_inode: None,
                     },
                 ),

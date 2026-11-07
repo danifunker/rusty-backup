@@ -81,6 +81,14 @@ pub struct NewSgiHddArgs {
     /// With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// EFS volume label (up to 6 bytes; longer is truncated). Defaults to
     /// `rusty`.
@@ -248,5 +256,6 @@ fn import_options(args: &NewSgiHddArgs) -> crate::fs::dir_import::DirImportOptio
         flatten_archives: args.flatten_folders,
         expand_gunzip: args.expand_gunzip,
         expand_disk_images: args.expand_images,
+        ignore_appledouble: args.exclude_appledouble,
     }
 }

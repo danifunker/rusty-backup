@@ -87,6 +87,14 @@ pub struct NewSgiCdromArgs {
     /// With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// EFS volume label (up to 6 bytes; longer is truncated). Defaults to
     /// `rusty`.
@@ -180,6 +188,7 @@ fn request(args: &NewSgiCdromArgs, size: Option<u64>) -> crate::model::cd_build:
             force: args.force,
             no_permissions: args.no_permissions,
             include_appledouble: args.include_appledouble,
+            ignore_appledouble: args.exclude_appledouble,
         },
         bytes_per_inode: args.bytes_per_inode,
         ..CdRequest::new(CdLayout::SgiEfs)

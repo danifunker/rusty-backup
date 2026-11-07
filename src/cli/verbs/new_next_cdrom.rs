@@ -74,6 +74,14 @@ pub struct NewNextCdromArgs {
     /// With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// Disc name NeXTSTEP shows (`dl_label`, up to 23 bytes; longer is truncated).
     #[arg(long, default_value = "rusty-backup")]
@@ -167,6 +175,7 @@ fn request(args: &NewNextCdromArgs) -> crate::model::cd_build::CdRequest {
             force: args.force,
             no_permissions: args.no_permissions,
             include_appledouble: args.include_appledouble,
+            ignore_appledouble: args.exclude_appledouble,
         },
         bytes_per_inode: args.bytes_per_inode,
         ..CdRequest::new(CdLayout::NextUfs)

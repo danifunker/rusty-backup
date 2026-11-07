@@ -184,6 +184,9 @@ pub mod ids {
     pub const CD_EXPAND_IMAGES: &str = "build_disk.cd_expand_images";
     pub const CD_FLATTEN: &str = "build_disk.cd_flatten";
     pub const CD_NO_PERMISSIONS: &str = "build_disk.cd_no_permissions";
+    pub const CD_FORCE: &str = "build_disk.cd_force";
+    pub const CD_APPLEDOUBLE: &str = "build_disk.cd_appledouble";
+    pub const CD_NO_APPLEDOUBLE: &str = "build_disk.cd_no_appledouble";
     pub const OPTION: &str = "build_disk.option";
 }
 
@@ -209,6 +212,14 @@ pub mod hints {
     pub const CD_FLATTEN: &str = "Unpack every archive into the disc's root rather than a folder \
          each: the shape IRIX inst wants for a set of .tardist files.";
     pub const CD_NO_PERMISSIONS: &str = "Ignore the host's Unix mode and ownership.";
+    pub const CD_FORCE: &str = "When two entries land on the same name, keep the later one \
+         instead of stopping the build.";
+    pub const CD_APPLEDOUBLE: &str = "Copy macOS ._ sidecar files in as files too. With neither \
+         sidecar option on, a Mac disc takes their resource fork into the file itself and the \
+         other discs leave them out.";
+    pub const CD_NO_APPLEDOUBLE: &str = "Leave macOS ._ sidecar files out entirely, taking no \
+         resource fork from them either: for a folder that only has them because it came off a \
+         modern Mac.";
     pub const FIXED_SIZE: &str = "This filesystem has a fixed size; no size to choose.";
     pub const DONOR: &str = "Take the table, its special partitions and their contents from \
          another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
@@ -360,6 +371,94 @@ pub struct CdView {
     pub import: CdImport,
 }
 
+/// One way a folder is copied onto a CD, as every shell lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdOption {
+    ExpandArchives,
+    FlattenFolders,
+    ExpandGunzip,
+    ExpandImages,
+    Force,
+    NoPermissions,
+    ExcludeAppleDouble,
+    IncludeAppleDouble,
+}
+
+impl CdOption {
+    pub const ALL: [CdOption; 8] = [
+        CdOption::ExpandArchives,
+        CdOption::FlattenFolders,
+        CdOption::ExpandGunzip,
+        CdOption::ExpandImages,
+        CdOption::Force,
+        CdOption::NoPermissions,
+        CdOption::ExcludeAppleDouble,
+        CdOption::IncludeAppleDouble,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => "Unpack archives",
+            CdOption::FlattenFolders => "Unpack into the root",
+            CdOption::ExpandGunzip => "Decompress .gz files",
+            CdOption::ExpandImages => "Open disk images",
+            CdOption::Force => "Overwrite entries with the same name",
+            CdOption::NoPermissions => "Ignore host permissions",
+            CdOption::ExcludeAppleDouble => "Leave out macOS ._ sidecar files",
+            CdOption::IncludeAppleDouble => "Copy macOS ._ sidecar files in as files",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => hints::CD_EXPAND_ARCHIVES,
+            CdOption::FlattenFolders => hints::CD_FLATTEN,
+            CdOption::ExpandGunzip => hints::CD_EXPAND_GUNZIP,
+            CdOption::ExpandImages => hints::CD_EXPAND_IMAGES,
+            CdOption::Force => hints::CD_FORCE,
+            CdOption::NoPermissions => hints::CD_NO_PERMISSIONS,
+            CdOption::ExcludeAppleDouble => hints::CD_NO_APPLEDOUBLE,
+            CdOption::IncludeAppleDouble => hints::CD_APPLEDOUBLE,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => ids::CD_EXPAND_ARCHIVES,
+            CdOption::FlattenFolders => ids::CD_FLATTEN,
+            CdOption::ExpandGunzip => ids::CD_EXPAND_GUNZIP,
+            CdOption::ExpandImages => ids::CD_EXPAND_IMAGES,
+            CdOption::Force => ids::CD_FORCE,
+            CdOption::NoPermissions => ids::CD_NO_PERMISSIONS,
+            CdOption::ExcludeAppleDouble => ids::CD_NO_APPLEDOUBLE,
+            CdOption::IncludeAppleDouble => ids::CD_APPLEDOUBLE,
+        }
+    }
+
+    fn flag(self, i: &mut CdImport) -> &mut bool {
+        match self {
+            CdOption::ExpandArchives => &mut i.expand_archives,
+            CdOption::FlattenFolders => &mut i.flatten_folders,
+            CdOption::ExpandGunzip => &mut i.expand_gunzip,
+            CdOption::ExpandImages => &mut i.expand_images,
+            CdOption::Force => &mut i.force,
+            CdOption::NoPermissions => &mut i.no_permissions,
+            CdOption::ExcludeAppleDouble => &mut i.ignore_appledouble,
+            CdOption::IncludeAppleDouble => &mut i.include_appledouble,
+        }
+    }
+}
+
+/// A CD option as the Disk step shows it: always listed, greyed out with the reason when it
+/// does not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdOptionRow {
+    pub option: CdOption,
+    pub on: bool,
+    /// Why it does not apply now, or `None` when it can be changed.
+    pub unavailable: Option<&'static str>,
+}
+
 /// The size text that sizes a CD to its folder.
 pub const CD_AUTO_SIZE: &str = "auto";
 
@@ -417,6 +516,8 @@ pub enum BuildDiskAction {
     SetCd(CdView),
     /// "Choose..." for the folder a CD is filled from.
     PickCdFolder,
+    /// One of the folder-copy switches; ignored while it does not apply.
+    SetCdOption(CdOption, bool),
     /// "Start from an existing disk...": pick a donor image to lay the table out from.
     PickDonor,
     /// Start from a blank table again.
@@ -697,6 +798,45 @@ impl BuildDiskController {
 
     pub fn cd(&self) -> &CdView {
         &self.cd
+    }
+
+    /// Every way a folder is copied onto the CD, with why one does not apply now.
+    pub fn cd_options(&self) -> Vec<CdOptionRow> {
+        let cd = &self.cd;
+        CdOption::ALL
+            .iter()
+            .map(|&option| {
+                let mut i = cd.import.clone();
+                let on = *option.flag(&mut i);
+                let unavailable = if cd.from_dir.is_none() {
+                    Some("Choose a folder to fill the disc from first.")
+                } else {
+                    match option {
+                        CdOption::FlattenFolders if !cd.layout.can_flatten() => {
+                            Some("Only the IRIX EFS and NeXTSTEP UFS discs unpack into one root.")
+                        }
+                        CdOption::FlattenFolders if !cd.import.expand_archives => {
+                            Some("Turn on Unpack archives first.")
+                        }
+                        CdOption::NoPermissions if !cd.layout.keeps_permissions() => {
+                            Some("HFS keeps no Unix permissions.")
+                        }
+                        CdOption::ExcludeAppleDouble if cd.import.include_appledouble => {
+                            Some("Copy macOS ._ sidecar files in as files is on.")
+                        }
+                        CdOption::IncludeAppleDouble if cd.import.ignore_appledouble => {
+                            Some("Leave out macOS ._ sidecar files is on.")
+                        }
+                        _ => None,
+                    }
+                };
+                CdOptionRow {
+                    option,
+                    on,
+                    unavailable,
+                }
+            })
+            .collect()
     }
 
     /// The CD is sized to its folder rather than to the size text.
@@ -1073,6 +1213,14 @@ impl BuildDiskController {
                 }
                 if i.no_permissions && c.layout.keeps_permissions() {
                     how.push("host permissions ignored");
+                }
+                if i.force {
+                    how.push("same-name entries overwritten");
+                }
+                if i.ignore_appledouble {
+                    how.push("macOS ._ sidecars left out");
+                } else if i.include_appledouble {
+                    how.push("macOS ._ sidecars copied in as files");
                 }
                 if c.from_dir.is_some() && !how.is_empty() {
                     v.push(format!("While copying: {}", how.join(", ")));
@@ -1687,6 +1835,15 @@ impl Controller for BuildDiskController {
                     };
                 } else {
                     self.cd = c;
+                }
+            }
+            BuildDiskAction::SetCdOption(option, on) => {
+                let applies = self
+                    .cd_options()
+                    .iter()
+                    .any(|r| r.option == option && r.unavailable.is_none());
+                if applies {
+                    *option.flag(&mut self.cd.import) = on;
                 }
             }
             BuildDiskAction::PickCdFolder => {

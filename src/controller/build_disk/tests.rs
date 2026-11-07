@@ -452,3 +452,65 @@ fn a_donors_boot_flag_comes_with_its_layout() {
     let flags: Vec<bool> = c.table_view().rows.iter().map(|r| r.bootable).collect();
     assert_eq!(flags, [false, true, false], "an MBR has one active flag");
 }
+
+/// Every CD option is listed; one that does not apply says why and ignores a toggle.
+#[test]
+fn cd_options_are_all_listed_and_refuse_with_a_reason() {
+    use super::{CdLayout, CdOption};
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Cd));
+    let rows = c.cd_options();
+    assert_eq!(rows.len(), CdOption::ALL.len());
+    assert!(
+        rows.iter().all(|r| r.unavailable.is_some()),
+        "no folder yet"
+    );
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: super::purpose::CD_FOLDER,
+            path: Some(dir.path().to_path_buf()),
+        },
+    );
+    let why = |c: &BuildDiskController, o: CdOption| {
+        c.cd_options()
+            .into_iter()
+            .find(|r| r.option == o)
+            .unwrap()
+            .unavailable
+    };
+    assert!(
+        why(&c, CdOption::FlattenFolders).is_some(),
+        "HFS cannot flatten"
+    );
+    assert!(
+        why(&c, CdOption::NoPermissions).is_some(),
+        "HFS keeps no permissions"
+    );
+    act(
+        &mut c,
+        BuildDiskAction::SetCdOption(CdOption::FlattenFolders, true),
+    );
+    assert!(
+        !c.cd().import.flatten_folders,
+        "a refused option ignores a toggle"
+    );
+    let mut cd = c.cd().clone();
+    cd.layout = CdLayout::SgiEfs;
+    act(&mut c, BuildDiskAction::SetCd(cd));
+    act(
+        &mut c,
+        BuildDiskAction::SetCdOption(CdOption::ExpandArchives, true),
+    );
+    assert!(why(&c, CdOption::FlattenFolders).is_none());
+    act(
+        &mut c,
+        BuildDiskAction::SetCdOption(CdOption::ExcludeAppleDouble, true),
+    );
+    assert!(
+        why(&c, CdOption::IncludeAppleDouble).is_some(),
+        "leave out and copy in clash"
+    );
+    assert!(c.cd().import.ignore_appledouble);
+}

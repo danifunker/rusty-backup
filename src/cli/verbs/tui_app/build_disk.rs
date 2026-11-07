@@ -17,8 +17,9 @@ use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, parse_size_field, purpose, BuildDiskAction,
-    BuildDiskController, CdLayout, DiskKind, FormatOptions, FsKind, FsOption, MacDriver, NoNotify,
-    OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
+    BuildDiskController, CdLayout, CdOption, DiskKind, FormatOptions, FsKind, FsOption, MacDriver,
+    NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind, AFFS_VARIANTS, CD_AUTO_SIZE,
+    SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::{Controller as _, Effect};
@@ -60,11 +61,7 @@ pub(super) enum Row {
     CdName,
     CdAutoSize,
     CdFolder,
-    CdExpandArchives,
-    CdExpandGunzip,
-    CdExpandImages,
-    CdFlatten,
-    CdNoPermissions,
+    CdOpt(CdOption),
     PSize(usize),
     PType(usize),
     PName(usize),
@@ -208,25 +205,12 @@ impl BuildDiskState {
                 let mut r = Vec::new();
                 match c.kind() {
                     DiskKind::Cd => {
-                        let cd = c.cd();
                         r.extend([Row::CdLayout, Row::CdName, Row::CdAutoSize]);
                         if !c.cd_auto_size() {
                             r.push(Row::Size);
                         }
                         r.push(Row::CdFolder);
-                        if cd.from_dir.is_some() {
-                            r.extend([
-                                Row::CdExpandArchives,
-                                Row::CdExpandGunzip,
-                                Row::CdExpandImages,
-                            ]);
-                            if cd.layout.can_flatten() && cd.import.expand_archives {
-                                r.push(Row::CdFlatten);
-                            }
-                            if cd.layout.keeps_permissions() {
-                                r.push(Row::CdNoPermissions);
-                            }
-                        }
+                        r.extend(CdOption::ALL.iter().map(|o| Row::CdOpt(*o)));
                     }
                     DiskKind::Preset => {
                         r.push(Row::Preset);
@@ -483,22 +467,15 @@ impl BuildDiskState {
                 };
                 self.act(BuildDiskAction::SetSize(text.to_string()));
             }
-            Row::CdExpandArchives
-            | Row::CdExpandGunzip
-            | Row::CdExpandImages
-            | Row::CdFlatten
-            | Row::CdNoPermissions => {
-                let mut cd = c.cd().clone();
-                let i = &mut cd.import;
-                let flag = match row {
-                    Row::CdExpandArchives => &mut i.expand_archives,
-                    Row::CdExpandGunzip => &mut i.expand_gunzip,
-                    Row::CdExpandImages => &mut i.expand_images,
-                    Row::CdFlatten => &mut i.flatten_folders,
-                    _ => &mut i.no_permissions,
-                };
-                *flag = !*flag;
-                self.act(BuildDiskAction::SetCd(cd));
+            Row::CdOpt(option) => {
+                let row = c.cd_options().into_iter().find(|r| r.option == option);
+                match row {
+                    Some(r) if r.unavailable.is_none() => {
+                        self.act(BuildDiskAction::SetCdOption(option, !r.on));
+                    }
+                    Some(r) => self.status = r.unavailable.map(str::to_string),
+                    None => {}
+                }
             }
             Row::MacDriver => {
                 let next = match c.mac_driver() {
@@ -966,12 +943,14 @@ impl App {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(blank disc; Enter to choose a folder)".into()),
                 ),
-                Row::CdExpandArchives => tick("Unpack archives", c.cd().import.expand_archives),
-                Row::CdExpandGunzip => tick("Decompress .gz files", c.cd().import.expand_gunzip),
-                Row::CdExpandImages => tick("Open disk images", c.cd().import.expand_images),
-                Row::CdFlatten => tick("Unpack into the root", c.cd().import.flatten_folders),
-                Row::CdNoPermissions => {
-                    tick("Ignore host permissions", c.cd().import.no_permissions)
+                Row::CdOpt(option) => {
+                    let row = c.cd_options().into_iter().find(|r| r.option == *option);
+                    let on = row.as_ref().is_some_and(|r| r.on);
+                    let (label, value) = tick(option.label(), on);
+                    match row.and_then(|r| r.unavailable) {
+                        Some(why) => (label, format!("{value}  (n/a: {why})")),
+                        None => (label, value),
+                    }
                 }
                 Row::PSize(p) => (
                     "  Size".into(),

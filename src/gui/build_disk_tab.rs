@@ -338,25 +338,24 @@ impl BuildDiskTab {
                 cd.from_dir = None;
             }
         });
-        if cd.from_dir.is_some() {
-            let i = &mut cd.import;
-            ui.checkbox(&mut i.expand_archives, "Unpack archives")
-                .on_hover_text(hints::CD_EXPAND_ARCHIVES);
-            if cd.layout.can_flatten() && i.expand_archives {
-                ui.checkbox(&mut i.flatten_folders, "Unpack into the root")
-                    .on_hover_text(hints::CD_FLATTEN);
-            }
-            ui.checkbox(&mut i.expand_gunzip, "Decompress .gz files")
-                .on_hover_text(hints::CD_EXPAND_GUNZIP);
-            ui.checkbox(&mut i.expand_images, "Open disk images")
-                .on_hover_text(hints::CD_EXPAND_IMAGES);
-            if cd.layout.keeps_permissions() {
-                ui.checkbox(&mut i.no_permissions, "Ignore host permissions")
-                    .on_hover_text(hints::CD_NO_PERMISSIONS);
+        let mut toggled = Vec::new();
+        for row in self.ctl.cd_options() {
+            let mut on = row.on;
+            let enabled = row.unavailable.is_none();
+            let resp = ui
+                .add_enabled(enabled, egui::Checkbox::new(&mut on, row.option.label()))
+                .on_hover_text(row.option.hint());
+            if let Some(why) = row.unavailable {
+                resp.on_disabled_hover_text(why);
+            } else if on != row.on {
+                toggled.push((row.option, on));
             }
         }
         if cd != before {
             self.act(BuildDiskAction::SetCd(cd));
+        }
+        for (option, on) in toggled {
+            self.act(BuildDiskAction::SetCdOption(option, on));
         }
     }
 

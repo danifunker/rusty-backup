@@ -70,6 +70,14 @@ pub struct NewMacCdromArgs {
     /// volume's own resource fork instead.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac
     /// Roman bytes. Defaults to `rusty-backup`.
@@ -154,6 +162,7 @@ fn request(args: &NewMacCdromArgs, fs: MacCdFs) -> crate::model::cd_build::CdReq
             expand_images: args.expand_images,
             force: args.force,
             include_appledouble: args.include_appledouble,
+            ignore_appledouble: args.exclude_appledouble,
             ..CdImport::default()
         },
         mac_block_size: args.block_size,

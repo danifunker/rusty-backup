@@ -871,6 +871,7 @@ Usage: import [OPTIONS] <IMAGE> <DIR> [DEST]
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Ignore the host's Unix mode and ownership. Imported entries then inherit uid/gid from the directory they land in and take the filesystem's default mode, the same rule `put` follows
 - `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) as files of their own, on top of the fork they already contribute. Off by default: on a fork-bearing target (HFS / HFS+ / MFS / ProDOS) a `._name` or `name.rsrc` sidecar is consumed into the resource fork of the file it belongs to, which is where it wanted to end up, and elsewhere it is skipped as Mac metadata cruft. Only an orphan with no primary file is ever dropped outright
+- `--exclude-appledouble` — Leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -1278,6 +1279,7 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
+- `--exclude-appledouble` — With `--from-dir`: leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
 - `--fs` — Root filesystem to format. Only `efs` is supported today
 - `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
@@ -1594,6 +1596,7 @@ Usage: mac-hfs [OPTIONS] <IMAGE>
 - `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
+- `--exclude-appledouble` — With `--from-dir`: leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
 - `--block-size` — Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096
 
@@ -1618,6 +1621,7 @@ Usage: mac-hfsplus [OPTIONS] <IMAGE>
 - `--expand-images` — With `--from-dir`: copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a folder named after each, forks included, instead of the image
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than failing on the collision
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead
+- `--exclude-appledouble` — With `--from-dir`: leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--name` — Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`
 - `--block-size` — Allocation block size in bytes. HFS wants a multiple of 512 and auto- picks the smallest that keeps the volume inside its 65535-block ceiling; HFS+ wants a power of two in [512, 4096] and defaults to 4096
 
@@ -1644,6 +1648,7 @@ Usage: next-ufs [OPTIONS] <IMAGE>
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
+- `--exclude-appledouble` — With `--from-dir`: leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--name` — Disc name NeXTSTEP shows (`dl_label`, up to 23 bytes; longer is truncated)
 - `--bytes-per-inode` — UFS inode density in bytes per inode (smaller = more inodes). Defaults to 4096, the density NeXT's own CDs use
 
@@ -1670,6 +1675,7 @@ Usage: sgi-efs [OPTIONS] <IMAGE>
 - `--force` — With `--from-dir`: overwrite entries that already exist rather than skipping them. Only meaningful alongside `--flatten-folders`, where archives can legitimately carry the same entry
 - `--no-permissions` — With `--from-dir`: ignore the host's Unix mode and ownership
 - `--include-appledouble` — With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too
+- `--exclude-appledouble` — With `--from-dir`: leave macOS AppleDouble sidecars (`._*`) out entirely, taking no resource fork from them either; for a folder that only has them because it came off a modern Mac. Conflicts with `--include-appledouble`
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
 - `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
