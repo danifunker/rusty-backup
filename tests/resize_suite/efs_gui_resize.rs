@@ -291,7 +291,7 @@ fn the_resize_controller_writes_the_same_bytes_as_the_engine() {
         InspectAction, InspectController, InspectServices, InspectSource, JobRegistry, NoNotify,
     };
     use rusty_backup::controller::resize::{ResizeAction, ResizeController, SizeMode};
-    use rusty_backup::controller::Controller;
+    use rusty_backup::controller::{Controller, Effect};
     use std::sync::Arc;
 
     let img = build_seeded_disk();
@@ -336,7 +336,15 @@ fn the_resize_controller_writes_the_same_bytes_as_the_engine() {
     ctl.apply(ResizeAction::Preview);
     assert!(ctl.plan_error().is_none(), "{:?}", ctl.plan_error());
     assert_eq!(ctl.preview().map(|p| p.len()), Some(1));
-    ctl.apply(ResizeAction::Apply);
+    let asked = ctl.apply(ResizeAction::Apply);
+    assert!(
+        asked.iter().any(|e| matches!(e, Effect::Confirm(_))),
+        "Apply asks first"
+    );
+    ctl.apply(ResizeAction::Confirmed {
+        purpose: rusty_backup::controller::resize::purpose::APPLY,
+        yes: true,
+    });
     assert!(ctl.is_running());
     ctl.wait_idle();
     assert!(ctl.take_disk_changed());

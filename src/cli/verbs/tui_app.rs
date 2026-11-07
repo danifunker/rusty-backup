@@ -5134,6 +5134,9 @@ mod tests {
         let v = view(&app);
         assert!(v.errors.is_empty() && v.can_apply, "{:?}", v.errors);
         ikey(&mut app, KeyCode::Char('w'));
+        let asked = &app.inspect.as_ref().unwrap().ask;
+        assert!(matches!(asked, Some(ask::Ask::Confirm(..))), "Apply asks first");
+        ikey(&mut app, KeyCode::Char('y'));
         inspect_settle(&mut app);
         let s = app.inspect.as_ref().unwrap();
         assert_eq!(s.ctl.partitions().len(), 2, "{:?}", s.log);
@@ -5197,6 +5200,9 @@ mod tests {
         let text = backup_screen(&app);
         assert!(text.contains("Resize Partitions"), "{text}");
         ikey(&mut app, KeyCode::Char('w'));
+        let asked = &app.inspect.as_ref().unwrap().ask;
+        assert!(matches!(asked, Some(ask::Ask::Confirm(..))), "Apply asks first");
+        ikey(&mut app, KeyCode::Char('y'));
         inspect_settle(&mut app);
         let s = app.inspect.as_ref().unwrap();
         assert!(
