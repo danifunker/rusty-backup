@@ -32,6 +32,7 @@ pub const CHECK: &str = "browse.check";
 pub const JOURNAL: &str = "browse.journal";
 pub const CHD_INFO: &str = "browse.chd_info";
 pub const TREE: &str = "browse.tree";
+pub const DISC_FS: &str = "browse.disc_fs";
 pub const VIEW_MENU: &str = "browse.view_menu";
 pub const CLOSE: &str = "browse.close";
 pub const SHOW_DELETED: &str = "browse.show_deleted";

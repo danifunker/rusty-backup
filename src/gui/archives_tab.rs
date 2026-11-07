@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
-    ArchivesAction, ArchivesController, ForkFormat, HostRequest,
+    hints, human_size, mount_hint, mount_label, ArchivesAction, ArchivesController, ForkFormat,
+    HostRequest,
 };
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller as _, Effect};
@@ -116,11 +117,7 @@ impl ArchivesTab {
         let mut actions: Vec<ArchivesAction> = Vec::new();
 
         ui.heading("Mac Archives");
-        ui.label(
-            "Browse and extract classic Mac archives. Detection is magic-driven, \
-             so the picker accepts any file: StuffIt (.sit / .sea, classic + StuffIt \
-             5) and BinHex 4.0 (loose .hqx or .sit.hqx / .sea.hqx wrappers).",
-        );
+        ui.label(hints::INTRO);
         ui.separator();
 
         // Source picker.
@@ -141,7 +138,7 @@ impl ArchivesTab {
             if self.ctl.path().is_some()
                 && ui
                     .add_enabled(!running, egui::Button::new("Close"))
-                    .on_hover_text("Unload the current archive")
+                    .on_hover_text(hints::CLOSE)
                     .clicked()
             {
                 actions.push(ArchivesAction::Close);
@@ -238,11 +235,7 @@ impl ArchivesTab {
                         !running && selected_file_count > 0,
                         egui::Button::new(extract_selected_label),
                     )
-                    .on_hover_text(
-                        "Extract only the entries with their checkbox ticked. \
-                         Folder markers are always extracted so the rebuilt \
-                         tree stays rooted.",
-                    )
+                    .on_hover_text(hints::EXTRACT_SELECTED)
                     .clicked()
                 {
                     actions.push(ArchivesAction::ExtractSelected);
@@ -252,16 +245,9 @@ impl ArchivesTab {
             // The archive's single entry decodes to a disk image Inspect can mount.
             if let Some(kind) = self.ctl.mountable() {
                 ui.horizontal(|ui| {
-                    let label = format!("Mount in new Inspect tab ({})", kind.label());
-                    let tooltip = format!(
-                        "The archive's contents are themselves a {} image. \
-                         Open the decoded payload in a new Inspect tab \
-                         instead of extracting it as a file.",
-                        kind.label(),
-                    );
                     if ui
-                        .add_enabled(!running, egui::Button::new(label))
-                        .on_hover_text(tooltip)
+                        .add_enabled(!running, egui::Button::new(mount_label(kind)))
+                        .on_hover_text(mount_hint(kind))
                         .clicked()
                     {
                         actions.push(ArchivesAction::Mount);
@@ -286,20 +272,5 @@ impl ArchivesTab {
         }
         self.carry_out_requests();
         super::progress::drain_log_lines(self.ctl.take_log(), log);
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
     }
 }

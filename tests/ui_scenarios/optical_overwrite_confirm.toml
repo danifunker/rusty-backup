@@ -1,0 +1,45 @@
+# Start asks before it replaces a file, a no leaves it, and a yes counts only for its own question.
+name = "Optical: replacing an output file takes a yes to that question"
+vm = "optical"
+requires = ["optical"]
+
+[[step]]
+action = "OpenImage"
+arg = "$hybrid"
+settle = true
+
+[[step]]
+action = "SetOutputFormat"
+arg = "bincue"
+
+[[step]]
+action = "Pick"
+
+[[step]]
+action = "Touch"
+arg = "bin"
+expect = { bin_bytes = 4, can_start = true }
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "", bin_bytes = 4 }
+
+[[step]]
+action = "Start"
+effects = ["Confirm"]
+expect = { bin_bytes = 4 }
+
+[[step]]
+action = "Deny"
+settle = true
+expect = { result = "", bin_bytes = 4 }
+
+[[step]]
+action = "Start"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok" }

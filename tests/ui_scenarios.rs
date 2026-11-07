@@ -2229,6 +2229,15 @@ impl Target for OpticalTarget {
                 path: Some(self.out()),
             },
             "Start" => OpticalAction::Start(None),
+            "Touch" => {
+                let target = self.out().with_extension(arg_str(arg)?);
+                std::fs::write(target, b"keep").map_err(|e| e.to_string())?;
+                return Ok(Vec::new());
+            }
+            "Confirm" | "Deny" => OpticalAction::Confirmed {
+                purpose: purpose::OVERWRITE,
+                yes: action == "Confirm",
+            },
             "BrowseContents" => OpticalAction::BrowseContents,
             "SelectFs" => {
                 let want = arg_str(arg)?;

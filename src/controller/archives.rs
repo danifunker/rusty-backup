@@ -28,6 +28,7 @@ pub mod purpose {
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
+    pub const SOURCE: &str = "archives.source";
     pub const BROWSE: &str = "archives.browse";
     pub const CLOSE: &str = "archives.close";
     pub const RECENT: &str = "archives.recent";
@@ -36,6 +37,48 @@ pub mod ids {
     pub const EXTRACT_ALL: &str = "archives.extract_all";
     pub const EXTRACT_SELECTED: &str = "archives.extract_selected";
     pub const MOUNT: &str = "archives.mount";
+}
+
+/// The text every shell shows on the same controls.
+pub mod hints {
+    pub const INTRO: &str = "Browse and extract classic Mac archives. Detection is magic-driven, \
+         so the picker accepts any file: StuffIt (.sit / .sea, classic + StuffIt \
+         5) and BinHex 4.0 (loose .hqx or .sit.hqx / .sea.hqx wrappers).";
+    pub const CLOSE: &str = "Unload the current archive";
+    pub const EXTRACT_SELECTED: &str = "Extract only the entries with their checkbox ticked. \
+         Folder markers are always extracted so the rebuilt \
+         tree stays rooted.";
+}
+
+/// The Mount button's label for a payload of this kind.
+pub fn mount_label(kind: MountableImageKind) -> String {
+    format!("Mount in new Inspect tab ({})", kind.label())
+}
+
+/// The Mount button's tooltip.
+pub fn mount_hint(kind: MountableImageKind) -> String {
+    format!(
+        "The archive's contents are themselves a {} image. \
+         Open the decoded payload in a new Inspect tab \
+         instead of extracting it as a file.",
+        kind.label(),
+    )
+}
+
+/// An entry's size in binary units, as the entry lists show it.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 /// What only the host can do.
@@ -210,6 +253,10 @@ impl ArchivesController {
         self.loaded = None;
         self.selected.clear();
         self.load_error = None;
+        // The last extraction's line belongs to the archive it came from.
+        if self.extract.is_none() {
+            self.last_extract = None;
+        }
         self.load = Some(Job::spawn(
             "Reading the archive...",
             Arc::clone(&self.notify),

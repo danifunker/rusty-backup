@@ -2300,7 +2300,9 @@ impl BrowseView {
                                     }
                                     ui.label(&e.path);
                                     ui.label(&e.type_creator);
-                                    ui.label(human_size_b(e.size));
+                                    ui.label(rusty_backup::controller::archives::human_size(
+                                        e.size,
+                                    ));
                                     ui.label(e.method);
                                     ui.end_row();
                                 }
@@ -2765,25 +2767,5 @@ impl BrowseView {
         if !said.is_empty() {
             self.extraction_result = Some(said);
         }
-    }
-}
-
-/// Compact byte-count formatter for the Workflow E archive viewer
-/// window. Mirrors `archives_tab::human_size` rather than
-/// `format_size` (which uses base-1000 GB/MB and is meant
-/// for storage-media advertising units) so the viewer matches the
-/// Archives tab's display.
-fn human_size_b(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
     }
 }
