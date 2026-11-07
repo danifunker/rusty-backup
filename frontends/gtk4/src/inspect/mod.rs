@@ -9,6 +9,7 @@ pub mod bar;
 mod details;
 mod editor;
 mod export;
+mod remote;
 mod table;
 mod tools;
 mod windows;
@@ -29,6 +30,7 @@ use rusty_backup::controller::inspect::{
 };
 use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::remote_pick::RemotePickAction;
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::browser::BrowseView;
@@ -45,6 +47,7 @@ use crate::widgets::set_text;
 
 use bar::PartitionBar;
 use details::{show_note, Details};
+use remote::{RemoteBar, RemotePanel};
 use table::PartitionTable;
 use tools::{ToolBar, ToolState};
 use windows::{Dismiss, Windows, WindowsShown};
@@ -83,6 +86,9 @@ pub struct InspectScreen {
     hfs: RefCell<Option<Rc<ExpandHfsDialog>>>,
     alto: RefCell<Option<Rc<AltoDialog>>>,
     floppy: RefCell<Option<Rc<FloppyDialog>>>,
+    remote: Rc<RemotePanel>,
+    /// Everything under the source bar the remote listing replaces while it is up.
+    main: gtk::Box,
     /// Physical Disk Export, kept once opened so a write is seen after its window hides.
     writer: RefCell<Option<Rc<DiskWriteDialog>>>,
 }
@@ -104,6 +110,7 @@ struct Shown {
     rows: Vec<PartitionRow>,
     shows_min: bool,
     windows: WindowsShown,
+    remote: RemoteBar,
 }
 
 /// Carry out `request`; what this view cannot do yet says so.
@@ -172,7 +179,7 @@ impl InspectScreen {
                 open_folder: None,
                 open_backup: Some(ids::OPEN_BACKUP),
                 connect: Some(ids::CONNECT_REMOTE),
-                connect_live: false,
+                connect_live: true,
                 no_devices: None,
                 width_chars: 44,
                 caption: Some("Source:"),
@@ -270,17 +277,36 @@ impl InspectScreen {
                 .margin_start(12)
                 .margin_end(12)
                 .build();
+            let screen = me.clone();
+            let on_change: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.remote_changed();
+                }
+            });
+            let backup = send.clone();
+            let close = send.clone();
+            let remote = RemotePanel::build(
+                notify.clone(),
+                host.clone(),
+                on_change,
+                Rc::new(move || backup(InspectAction::BackupRemote)),
+                Rc::new(move || close(InspectAction::Unload { quiet: true })),
+            );
             page.append(source.root());
+            page.append(remote.bar());
             page.append(&elevation);
             page.append(&flux);
             page.append(&flux_sectors);
-            page.append(jobs.root());
-            page.append(tools.root());
-            page.append(&error);
-            page.append(details.root());
-            page.append(&layout);
-            page.append(table.root());
-            page.append(&no_partitions);
+            page.append(remote.root());
+            let main = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            main.append(jobs.root());
+            main.append(tools.root());
+            main.append(&error);
+            main.append(details.root());
+            main.append(&layout);
+            main.append(table.root());
+            main.append(&no_partitions);
+            page.append(&main);
             let scroll = gtk::ScrolledWindow::builder()
                 .child(&page)
                 .hscrollbar_policy(gtk::PolicyType::Never)
@@ -337,6 +363,8 @@ impl InspectScreen {
                 alto: RefCell::default(),
                 writer: RefCell::default(),
                 floppy: RefCell::default(),
+                remote,
+                main,
             }
         })
     }
@@ -368,6 +396,7 @@ impl InspectScreen {
     }
 
     pub fn tick(&self) {
+        self.remote.tick();
         self.browse.tick();
         self.tick_dialogs();
         let effects = self.ctrl.borrow_mut().tick();
@@ -431,6 +460,20 @@ impl InspectScreen {
                 *self.alto.borrow_mut() = Some(d);
             }
             Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
+    }
+
+    /// The remote picker changed: log its lines, open a picked image, redraw.
+    fn remote_changed(&self) {
+        let (lines, picked) = self.remote.take();
+        let log = lines
+            .into_iter()
+            .map(|l| (LogLevel::Info, format!("Remote: {l}")));
+        crate::app::append_log(log.collect());
+        if let Some(conn) = picked {
+            self.apply(InspectAction::Load(InspectSource::Remote { conn }));
+        } else {
+            self.refresh();
         }
     }
 
@@ -592,9 +635,17 @@ impl InspectScreen {
             }
             Pick::OpenFile => InspectAction::ChooseImage,
             Pick::OpenBackup => InspectAction::ChooseBackupFolder,
-            // Inspect's picker offers neither: no folder source, and remote is slice 7.
-            Pick::OpenFolder | Pick::Connect => return,
+            Pick::Connect => {
+                self.remote.apply(RemotePickAction::Connect);
+                return;
+            }
+            // Inspect's picker offers no folder source.
+            Pick::OpenFolder => return,
         };
+        // A local source replaces whatever the daemon showed.
+        if matches!(action, InspectAction::Open(_)) {
+            self.remote.apply(RemotePickAction::Disconnect);
+        }
         self.apply(action);
     }
 
@@ -613,6 +664,10 @@ impl InspectScreen {
             Reply::Picked { purpose, path } => {
                 if let Some(image) = path.as_ref().filter(|_| purpose == purpose::OPEN_IMAGE) {
                     self.remember(image);
+                }
+                let source = matches!(purpose, purpose::OPEN_IMAGE | purpose::OPEN_BACKUP);
+                if source && path.is_some() {
+                    self.remote.apply(RemotePickAction::Disconnect);
                 }
                 InspectAction::Picked { purpose, path }
             }
@@ -704,6 +759,11 @@ impl InspectScreen {
                     .then(|| ctrl.expand_image_preview(self.windows.expand_mib.get())),
                 export: export::ExportShown::read(&mut ctrl),
             },
+            remote: RemoteBar {
+                image: ctrl.remote().cloned(),
+                backing_up: ctrl.remote_backup_running(),
+                can_backup: !ctrl.partitions().is_empty(),
+            },
         }
     }
 
@@ -759,5 +819,7 @@ impl InspectScreen {
         self.bar.show(s.segments, s.selected);
         self.table.show(s.rows, s.selected, s.shows_min, slots);
         self.windows.show(s.windows);
+        self.remote.show(s.remote);
+        self.main.set_visible(!self.remote.is_active());
     }
 }

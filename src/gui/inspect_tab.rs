@@ -324,7 +324,7 @@ impl InspectTab {
             if let Some(image) = self.ctl.remote().cloned() {
                 if ui
                     .button("Pick Another Image")
-                    .on_hover_text("Browse the daemon for another image (no reconnect)")
+                    .on_hover_text(rusty_backup::controller::remote_pick::hints::PICK_ANOTHER)
                     .clicked()
                 {
                     self.remote_browser.browse_on(image);
@@ -335,18 +335,18 @@ impl InspectTab {
                         !self.ctl.partitions().is_empty() && !backing_up,
                         egui::Button::new("Back Up Image..."),
                     )
-                    .on_hover_text("Pull a full backup of this remote image to a local folder")
+                    .on_hover_text(rusty_backup::controller::remote_pick::hints::BACKUP)
                     .clicked()
                 {
                     self.act(InspectAction::BackupRemote);
                 }
                 if backing_up {
                     ui.add(egui::Spinner::new());
-                    ui.label("Backing up...");
+                    ui.label(rusty_backup::controller::remote_pick::hints::BACKING_UP);
                 }
                 if ui
                     .add_enabled(!backing_up, egui::Button::new("Close Remote"))
-                    .on_hover_text("Disconnect from the remote daemon")
+                    .on_hover_text(rusty_backup::controller::remote_pick::hints::CLOSE)
                     .clicked()
                 {
                     self.act(InspectAction::Unload { quiet: true });
