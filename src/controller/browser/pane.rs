@@ -15,6 +15,7 @@ use crate::controller::{Controller, Effect};
 mod archives;
 mod edits;
 mod expand;
+mod labels;
 mod remote;
 pub(in crate::controller) mod source;
 mod tools;
@@ -28,6 +29,7 @@ pub use crate::model::dir_listing::SortColumn;
 pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
 pub use archives::{ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice, TarChoice};
 pub use edits::{validate_entry_name, ApplyReport, CursorDetail, StageOutcome};
+pub use labels::{RowLabel, RowTone};
 pub use remote::validate_remote_addr;
 pub use source::{
     purpose, DiscSource, NoRecent, PaneServices, PrefsOnly, RecentStore, SourceKind, VolumeInfo,
@@ -38,7 +40,8 @@ pub use tools::{
 };
 pub use tree::TreeNode;
 pub use volume::{
-    journal_block_class, journal_txn_classes, ArchiveRead, ArchiveUse, CheckSummary, JournalDetail,
+    journal_block_class, journal_status, journal_summary, journal_txn_blocks, journal_txn_classes,
+    journal_txn_rows, ArchiveRead, ArchiveUse, CheckSummary, JournalDetail, JournalTone,
     MacArchiveKind, RepairSummary, TreeText,
 };
 

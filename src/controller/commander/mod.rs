@@ -10,22 +10,24 @@ pub mod ids;
 pub mod screen;
 
 pub use crate::controller::browser::{
-    journal_block_class, journal_txn_classes, purpose, validate_entry_name, ApplyPreflight,
-    ApplyReport, ArchiveRead, ArchiveRow, ArchiveSave, ArchiveUse, ArchiveViewer,
-    BrowserPaneAction, BrowserPaneController, CheckSummary, DetailPlacement, DiscSource,
-    DisplayRow, FailedEdit, ForkFormat, ImportChoice, JournalDetail, ListingStyle, MacArchiveKind,
-    NoRecent, OnConflict, PaneProfile, PaneServices, RecentStore, RepairSummary, RowKind,
-    SortColumn, SourceKind, StageOutcome, TarChoice, TarPreview, ToolReport, TreeText, VolumeInfo,
+    journal_block_class, journal_status, journal_summary, journal_txn_blocks, journal_txn_classes,
+    journal_txn_rows, purpose, validate_entry_name, ApplyPreflight, ApplyReport, ArchiveRead,
+    ArchiveRow, ArchiveSave, ArchiveUse, ArchiveViewer, BrowserPaneAction, BrowserPaneController,
+    CheckSummary, DetailPlacement, DiscSource, DisplayRow, FailedEdit, ForkFormat, ImportChoice,
+    JournalDetail, JournalTone, ListingStyle, MacArchiveKind, NoRecent, OnConflict, PaneProfile,
+    PaneServices, RecentStore, RepairSummary, RowKind, RowLabel, RowTone, SortColumn, SourceKind,
+    StageOutcome, TarChoice, TarPreview, ToolReport, TreeNode, TreeText, VolumeInfo,
     MAX_CONSECUTIVE_FAILURES,
 };
 pub use crate::controller::browser::{metadata, pane, rows};
 pub use screen::{
-    default_export_format, export_choices, extract_applies, extract_fork_modes, BudgetAction,
-    BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction, CommanderController,
-    DetailField, DetailMetadata, ExportChoice, ExportFormat, ExtractApplies, ExtractOptions,
-    FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, RenameNotice, ResourceForkMode,
-    Side, SizePlan, SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr,
-    FOLLOW_DELAY, MIN_NESTED_IMAGE_BYTES,
+    default_export_format, export_choices, extract_applies, extract_fork_modes, BrowseCaps,
+    BudgetAction, BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction,
+    CommanderController, DetailField, DetailMetadata, ExportChoice, ExportFormat, ExtractApplies,
+    ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, ProdosExportMode,
+    RenameNotice, ResourceForkMode, RowMenuEntry, Side, SizePlan, SkippedReport, SpaceReadout,
+    UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY, MAX_PREVIEW_SIZE,
+    MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
@@ -50,7 +52,7 @@ pub use crate::model::browse_session::BrowseSession;
 pub type PartcloneCache =
     std::sync::Arc<std::sync::Mutex<dsk_clonezilla::block_cache::PartcloneBlockCache>>;
 pub use crate::model::edit_queue::EditQueue;
-pub use crate::model::entry_detail::{detect_content_type, FileContent};
+pub use crate::model::entry_detail::{detect_content_type, entry_facts, hex_dump, FileContent};
 pub use crate::model::job::{JobRegistry, Snapshot};
 pub use disk_core::display::format_size;
 pub use disk_core::entry::{EntryType, FileEntry};

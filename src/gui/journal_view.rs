@@ -6,7 +6,8 @@
 //! won't mount. ASCII only — no emoji or arrows beyond `->` (CLAUDE.md rule).
 
 use rusty_backup::controller::commander::{
-    journal_block_class, journal_txn_classes, JournalDetail,
+    journal_status, journal_summary, journal_txn_blocks, journal_txn_rows, JournalDetail,
+    JournalTone,
 };
 
 /// Modal state for the journal viewer. Created when the user clicks "Journal"
@@ -42,175 +43,54 @@ impl JournalView {
     }
 
     fn render(&mut self, ui: &mut egui::Ui) {
-        let h = &self.detail.header;
-        let info = &self.detail.info;
-
-        // ---- Header summary ------------------------------------------------
         ui.label(egui::RichText::new("Volume journal").strong());
-        let location = if info.is_external() {
-            "external device"
-        } else {
-            "in filesystem"
-        };
-        ui.label(format!(
-            "Location: {location}    Journal offset: {}    Size: {}",
-            human_bytes(info.offset),
-            human_bytes(info.size),
-        ));
-        let wrap = if h.end < h.start { "  (wrapped)" } else { "" };
-        ui.label(format!(
-            "start: {}    end: {}{wrap}    sequence: {}    block size: {}",
-            h.start, h.end, h.sequence_num, h.jhdr_size,
-        ));
-
-        let dirty = h.start != h.end;
-        if dirty {
-            ui.colored_label(
-                super::theme::warning(ui.visuals()),
-                format!(
-                    "Warning: journal is dirty - {} pending transaction(s) not yet \
-                     applied to the volume. macOS would replay these on mount.",
-                    self.detail.transactions.len()
-                ),
-            );
-        } else {
-            ui.colored_label(
-                super::theme::success(ui.visuals()),
-                "Journal is clean (empty) - nothing pending.",
-            );
+        for line in journal_summary(&self.detail) {
+            ui.label(line);
         }
-
-        // ---- Pre-flight findings ------------------------------------------
-        if let Some(seq) = self.detail.checksum_mismatch {
-            ui.colored_label(
-                super::theme::danger(ui.visuals()),
-                format!(
-                    "Warning: transaction sequence {seq} has a bad checksum - \
-                     macOS will stop replay here."
-                ),
-            );
-        }
-        for (from, to) in &self.detail.sequence_jumps {
-            ui.colored_label(
-                super::theme::danger(ui.visuals()),
-                format!(
-                    "Warning: sequence jumped {from} -> {to} (expected {}).",
-                    from.wrapping_add(1)
-                ),
-            );
+        for (tone, line) in journal_status(&self.detail) {
+            let color = match tone {
+                JournalTone::Good => super::theme::success(ui.visuals()),
+                JournalTone::Warning => super::theme::warning(ui.visuals()),
+                JournalTone::Fault => super::theme::danger(ui.visuals()),
+            };
+            ui.colored_label(color, line);
         }
 
         ui.separator();
 
-        // ---- Transaction list (newest first) ------------------------------
         ui.label(egui::RichText::new("Transactions (newest first):").strong());
         if self.detail.transactions.is_empty() {
             ui.label("  (none)");
             return;
         }
 
-        // Snapshot the rows we need to render so we don't borrow self.detail
-        // while mutating self.selected.
-        let rows: Vec<TxnRow> = self
-            .detail
-            .transactions
-            .iter()
-            .enumerate()
-            .rev()
-            .map(|(idx, t)| {
-                let range = t.blocks.iter().fold(None::<(u64, u64)>, |acc, b| {
-                    let hi = b.target + b.bsize as u64;
-                    match acc {
-                        None => Some((b.target, hi)),
-                        Some((lo, prev_hi)) => Some((lo.min(b.target), prev_hi.max(hi))),
-                    }
-                });
-                let range_text = match range {
-                    Some((lo, hi)) => format!("{}..{}", lo / 512, hi / 512),
-                    None => "-".to_string(),
-                };
-                TxnRow {
-                    idx,
-                    label: format!(
-                        "#{}  {} block(s)  {}  sectors {range_text}  [{}]",
-                        t.sequence_num,
-                        t.blocks.len(),
-                        human_bytes(t.total_bytes),
-                        journal_txn_classes(&self.detail, t),
-                    ),
-                }
-            })
-            .collect();
-
+        let rows = journal_txn_rows(&self.detail);
         egui::ScrollArea::vertical()
             .id_salt("journal_txns")
             .max_height(180.0)
             .show(ui, |ui| {
-                for row in &rows {
-                    let selected = self.selected == Some(row.idx);
-                    if ui.selectable_label(selected, &row.label).clicked() {
-                        self.selected = if selected { None } else { Some(row.idx) };
+                for (idx, label) in &rows {
+                    let selected = self.selected == Some(*idx);
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selected = if selected { None } else { Some(*idx) };
                     }
                 }
             });
 
-        // ---- Per-block detail of the selected transaction -----------------
-        if let Some(idx) = self.selected {
-            if let Some(txn) = self.detail.transactions.get(idx) {
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!("Transaction #{} blocks:", txn.sequence_num))
-                        .strong(),
-                );
-                egui::ScrollArea::vertical()
-                    .id_salt("journal_blocks")
-                    .max_height(160.0)
-                    .show(ui, |ui| {
-                        for b in &txn.blocks {
-                            let class = journal_block_class(&self.detail, b.target);
-                            ui.label(format!(
-                                "  sector {}  ({} bytes)  [{class}]  {}",
-                                b.target / 512,
-                                b.bsize,
-                                hex_preview(&b.preview),
-                            ));
-                        }
-                    });
-            }
+        let blocks = self
+            .selected
+            .and_then(|i| journal_txn_blocks(&self.detail, i));
+        if let Some((title, lines)) = blocks {
+            ui.separator();
+            ui.label(egui::RichText::new(title).strong());
+            egui::ScrollArea::vertical()
+                .id_salt("journal_blocks")
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for line in lines {
+                        ui.label(line);
+                    }
+                });
         }
-    }
-}
-
-/// A pre-rendered transaction row in the list.
-struct TxnRow {
-    idx: usize,
-    label: String,
-}
-
-/// A compact hex preview of up to the first 16 bytes.
-fn hex_preview(bytes: &[u8]) -> String {
-    let n = bytes.len().min(16);
-    let mut s = String::with_capacity(n * 3 + 2);
-    for (i, b) in bytes[..n].iter().enumerate() {
-        if i > 0 {
-            s.push(' ');
-        }
-        s.push_str(&format!("{b:02x}"));
-    }
-    if bytes.len() > n {
-        s.push_str(" ...");
-    }
-    s
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
     }
 }

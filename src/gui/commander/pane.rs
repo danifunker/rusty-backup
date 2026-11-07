@@ -12,7 +12,7 @@ use eframe::egui;
 use rusty_backup::controller::browser::rows::{DisplayRow, RowKind};
 use rusty_backup::controller::commander::{
     format_size, BrowserPaneAction, BrowserPaneController, CommanderAction, CommanderController,
-    ExportFormat, OnConflict, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
+    OnConflict, RowMenuEntry, Side, SortColumn, MAX_CONSECUTIVE_FAILURES,
 };
 
 const ROW_H: f32 = 20.0;
@@ -872,14 +872,6 @@ impl PaneView {
             out.push(A::SetPageRows(side, page_rows));
         }
         let busy = pane.applying().is_some();
-        // Host panes write immediately (Delete removes now); image panes stage
-        // (Delete / Undelete / Remove-from-staging go on the queue).
-        let host_pane = pane.listing.is_host();
-        // A read-only backup pane offers browse / copy-out actions only — no
-        // delete or rename (both would mutate the backup).
-        let read_only = pane.is_backup();
-        // On a remote *host* pane, a file can be opened as a disk image.
-        let remote_host = pane.is_remote_host();
 
         // Row clicks this frame, run through the controller in order once drawing is done.
         let mut acts: Vec<BrowserPaneAction> = Vec::new();
@@ -942,32 +934,16 @@ impl PaneView {
                     } else if resp.clicked() {
                         if hit_toggle(&resp) {
                             acts.push(P::ToggleExpand(row.node_id.clone()));
-                        } else if row.depth > 0 {
-                            acts.push(P::TreeClick {
-                                node_id: row.node_id.clone(),
-                                ctrl: mods.command,
-                                shift: mods.shift,
-                            });
-                        } else if !row.is_parent() {
-                            acts.push(P::Click {
-                                name: row.name.clone(),
-                                ctrl: mods.command,
-                                shift: mods.shift,
-                            });
+                        } else {
+                            acts.extend(pane.row_click(row, mods.command, mods.shift));
                         }
                     }
 
                     // Right-click a data row for its actions.
                     if !row.is_parent() && !busy {
-                        let menu = resp.context_menu(|ui| {
-                            row_menu(ui, row, side, remote_host, host_pane, read_only, &mut after)
-                        });
+                        let menu = resp.context_menu(|ui| row_menu(ui, ctl, side, row, &mut after));
                         if menu.is_some() {
-                            acts.push(if row.depth > 0 {
-                                P::TreeContextSelect(row.node_id.clone())
-                            } else {
-                                P::ContextSelect(row.name.clone())
-                            });
+                            acts.extend(pane.row_context(row));
                         }
                     }
                 }
@@ -994,86 +970,30 @@ impl PaneView {
 /// A data row's right-click menu; its choices land in `out` after the row's own select.
 fn row_menu(
     ui: &mut egui::Ui,
-    row: &DisplayRow,
+    ctl: &CommanderController,
     side: Side,
-    remote_host: bool,
-    host_pane: bool,
-    read_only: bool,
+    row: &DisplayRow,
     out: &mut Vec<CommanderAction>,
 ) {
-    // A not-yet-applied staged add has no data to copy, export, hash or describe.
-    let real = !matches!(row.kind, RowKind::PendingAdd);
-    // On a remote host pane, a file opens as an image (browse inside it).
-    if remote_host && !row.is_dir && !row.is_tree && ui.button("Open Image").clicked() {
-        out.push(A::Pane(side, P::OpenRemoteImage(row.name.clone())));
-        ui.close();
-    }
-    if real && ui.button("Copy to other pane").clicked() {
-        out.push(A::Copy(side));
-        ui.close();
-    }
-    if real {
-        if ui.button("Export to hard drive...").clicked() {
-            out.push(A::Export {
-                from: side,
-                format: None,
-            });
-            ui.close();
-        }
-        ui.menu_button("Export as", |ui| {
-            for fmt in ExportFormat::ALL {
-                if ui.button(fmt.label()).clicked() {
-                    out.push(A::Export {
-                        from: side,
-                        format: Some(fmt),
-                    });
+    for entry in ctl.row_menu(side, row) {
+        match entry {
+            RowMenuEntry::Item { label, action, .. } => {
+                if ui.button(label).clicked() {
+                    out.push(action);
                     ui.close();
                 }
             }
-        });
-    }
-    if real && ui.button("Calculate checksums...").clicked() {
-        out.push(A::Checksums(side));
-        ui.close();
-    }
-    // File Info works for wrapper-tree rows too, read through the mounted wrapper.
-    if real && ui.button("File Info / Details...").clicked() {
-        out.push(A::OpenDetail(side, row.name.clone()));
-        ui.close();
-    }
-    // A wrapper's contents are read-only (copy out, don't edit), and so is a backup.
-    if row.is_tree || read_only {
-        return;
-    }
-    // A combined-tree row is named by its node id; the row's own select puts the cursor on it.
-    let target = if row.in_folder {
-        row.node_id.clone()
-    } else {
-        row.name.clone()
-    };
-    if matches!(row.kind, RowKind::PendingRename) && ui.button("Cancel rename").clicked() {
-        out.push(A::Pane(side, P::CancelRename(target)));
-        ui.close();
-    } else if matches!(row.kind, RowKind::Normal) && ui.button("Rename...").clicked() {
-        out.push(A::Pane(
-            side,
-            if row.in_folder {
-                P::RenameAtCursor
-            } else {
-                P::RequestRename(target)
-            },
-        ));
-        ui.close();
-    }
-    let label = match row.kind {
-        _ if host_pane => "Delete (immediate)",
-        RowKind::PendingDelete => "Undelete",
-        RowKind::PendingAdd => "Remove from staging",
-        _ => "Delete",
-    };
-    if ui.button(label).clicked() {
-        out.push(A::Pane(side, P::Delete));
-        ui.close();
+            RowMenuEntry::Submenu { label, items } => {
+                ui.menu_button(label, |ui| {
+                    for (label, action) in items {
+                        if ui.button(label).clicked() {
+                            out.push(action);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        }
     }
 }
 

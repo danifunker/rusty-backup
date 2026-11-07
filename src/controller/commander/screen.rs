@@ -39,17 +39,19 @@ pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
 pub use crate::model::extract::ExtractOptions;
+pub use browse::{BrowseCaps, RowMenuEntry};
 pub use budget::{BudgetAction, BudgetForm, BudgetMode};
 pub use detail::{DetailField, DetailMetadata};
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
 pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
 
+mod browse;
 mod budget;
 mod copy;
 mod detail;
 mod extract;
-pub use extract::{extract_applies, extract_fork_modes, ExtractApplies};
+pub use extract::{extract_applies, extract_fork_modes, ExtractApplies, ProdosExportMode};
 mod follow;
 mod modes;
 #[cfg(test)]

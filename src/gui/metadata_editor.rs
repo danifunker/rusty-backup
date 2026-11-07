@@ -198,8 +198,6 @@ pub fn render_hfs_type_row(
     }
 }
 
-pub use rules::resolved_prodos_type;
-
 /// Render the ProDOS type/aux row beneath the file-info header. Read-only
 /// when not in edit mode; full editor (type pulldown + 2-char/4-char hex
 /// inputs + Set/Reset) when edit mode is on.

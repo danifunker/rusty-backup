@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, is_known_prodos_type, preview_bytes, prodos_type_description, ArchiveUse,
-    BrowseSession, BrowserPaneAction, CommanderAction, CommanderController, DiscSource, DisplayRow,
-    EditQueue, EntryType, ExportFormat, ExtractOptions, FileEntry, FileEntryTypeDisplay as _,
-    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
-    PaneProfile, PaneServices, ResourceForkMode, RowKind, Side, Snapshot, TarChoice, TextShape,
-    UnsavedChoice, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
+    format_size, is_known_prodos_type, preview_bytes, ArchiveUse, BrowseSession, BrowserPaneAction,
+    CommanderAction, CommanderController, DiscSource, DisplayRow, ExportFormat, ExtractOptions,
+    FileEntry, ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind,
+    ModeAction, PaneProfile, PaneServices, ProdosExportMode, ResourceForkMode, RowKind, RowTone,
+    Side, Snapshot, TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
+    PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
 use rusty_backup::controller::{Controller as _, Effect};
@@ -21,7 +21,6 @@ use super::commander::pane::PaneView;
 use super::commander::DetailEditors;
 use super::effects::{EffectHost, Reply};
 use super::file_detail::{self, FileContent};
-use super::metadata_editor;
 use super::picker;
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
@@ -134,28 +133,6 @@ pub struct BrowseView {
 
     /// User's password input text for the password prompt.
     password_input: String,
-}
-
-/// How to encode ProDOS file type/aux when extracting files to a host
-/// directory. Only meaningful for ProDOS filesystems.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ProdosExportMode {
-    /// Append a CiderPress `#TTAAAA` suffix to each extracted filename so
-    /// type and aux survive a round-trip back into ProDOS.
-    WithTypeSuffix,
-    /// Write the bare ProDOS name (lossy — type/aux are dropped).
-    Plain,
-}
-
-impl ProdosExportMode {
-    const ALL: [ProdosExportMode; 2] = [ProdosExportMode::WithTypeSuffix, ProdosExportMode::Plain];
-
-    fn label(&self) -> &'static str {
-        match self {
-            ProdosExportMode::WithTypeSuffix => "Name + #TTAAAA suffix",
-            ProdosExportMode::Plain => "Bare name (lossy)",
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -283,11 +260,6 @@ impl BrowseView {
         self.pending_fx.extend(fx);
     }
 
-    /// The pane's staged-edit queue.
-    fn queue(&self) -> &EditQueue {
-        &self.ctl.pane(Side::Left).queue
-    }
-
     /// Open the partition the Inspect controller chose, with its edit flow and header extras.
     pub fn open_request(&mut self, req: BrowseOpen) {
         let BrowseOpen {
@@ -367,43 +339,23 @@ impl BrowseView {
 
     /// Returns true if the current filesystem is HFS or HFS+.
     fn is_hfs_type(&self) -> bool {
-        let ft = self.fs_type.as_str();
-        ft == "HFS" || ft == "HFS+" || ft == "HFSX"
+        self.ctl.browse_caps().hfs
     }
 
     /// Returns true if the current filesystem is ProDOS.
     fn is_prodos_type(&self) -> bool {
-        self.fs_type == "ProDOS"
-    }
-
-    /// Returns true if the current filesystem is a Mac-native one (HFS,
-    /// HFS+, HFSX, MFS, or APFS). Gates the Mac-archive workflows — "Save
-    /// as Mac archive...", "Browse archive...", and the "Export Mac
-    /// archive" bundling row — so they only appear when the source volume
-    /// is one whose files actually carry forks / type / creator codes.
-    /// (APFS is browse-readable; MFS isn't fully readable yet, but both are
-    /// listed so the gate is correct the day a driver reports them.)
-    fn is_mac_filesystem(&self) -> bool {
-        matches!(
-            self.fs_type.as_str(),
-            "HFS" | "HFS+" | "HFSX" | "MFS" | "APFS"
-        )
+        self.ctl.browse_caps().prodos
     }
 
     /// The selected file's Mac-archive kind, once the pane's sniff of it has landed.
     fn ensure_archive_sniff(&mut self, entry: &FileEntry) -> Option<MacArchiveKind> {
-        if !entry.is_file() || !self.is_mac_filesystem() {
-            return None;
-        }
         let pane = self.ctl.pane(Side::Left);
-        if let Some(kind) = pane.archive_sniff(&entry.path) {
-            return kind;
-        }
-        if !pane.is_sniffing() {
+        if pane.wants_sniff(entry) {
             let act = BrowserPaneAction::SniffArchive(entry.path.clone());
             self.ctl.apply(CommanderAction::Pane(Side::Left, act));
+            return None;
         }
-        None
+        pane.archive_sniff(&entry.path).flatten()
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -580,7 +532,7 @@ impl BrowseView {
                 // view only scans the first 10 MB of an image for recoverable
                 // text (fast on large devices); turning this on scans the whole
                 // image. Flipping it re-opens the volume so the new policy applies.
-                if self.fs_type == "Raw carve (no filesystem)" {
+                if self.ctl.browse_caps().carve {
                     ui.add_space(8.0);
                     let mut full = self.ctl.carve_full_scan();
                     let resp = ui.checkbox(&mut full, "Full scan");
@@ -597,7 +549,7 @@ impl BrowseView {
                     }
                 }
 
-                if self.fs_type == "QNX 2" {
+                if self.ctl.browse_caps().qnx2 {
                     ui.add_space(8.0);
                     let mut deleted = self.ctl.show_deleted();
                     let resp = ui.checkbox(&mut deleted, "Show deleted");
@@ -611,7 +563,7 @@ impl BrowseView {
                 }
 
                 // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
-                if self.ctl.edit_supported() && self.fs_type != "Pilot/Cedar" {
+                if self.ctl.browse_caps().edit_toggle {
                     let busy = self.extracting || self.ctl.mode_working().is_some();
                     ui.add_space(8.0);
                     let edit_btn = if self.ctl.edit_mode() {
@@ -647,15 +599,10 @@ impl BrowseView {
 
                 // HFS and Alto BFS packs check here; the Inspect grid's Check covers the rest.
                 let tool_free = self.ctl.pane(Side::Left).tool_working().is_none();
-                if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS")
-                    && tool_free
-                    && ui.button("Check").clicked()
-                {
+                if self.ctl.browse_caps().check && tool_free && ui.button("Check").clicked() {
                     self.pane_act(&ui.ctx().clone(), BrowserPaneAction::Fsck);
                 }
-                if (self.fs_type == "HFS+" || self.fs_type == "HFSX")
-                    && ui.button("Journal").clicked()
-                {
+                if self.ctl.browse_caps().journal && ui.button("Journal").clicked() {
                     self.pane_act(&ui.ctx().clone(), BrowserPaneAction::ShowJournal);
                 }
 
@@ -1164,7 +1111,6 @@ impl BrowseView {
             if row.is_parent() {
                 continue;
             }
-            let entry = pane.row_entry(row);
             let is_cursor = cursor == Some(i) && !root_selected;
             ui.horizontal(|ui| {
                 ui.add_space(indent * (row.depth as f32 + 1.0));
@@ -1189,11 +1135,11 @@ impl BrowseView {
                         acts.push(p(BrowserPaneAction::Mark(row.node_id.clone())));
                     }
                 }
-                let resp = self.row_label(ui, row, entry.as_ref(), is_cursor);
+                let resp = self.row_label(ui, row, is_cursor);
                 if resp.double_clicked() {
                     acts.push(p(BrowserPaneAction::Activate(row.node_id.clone())));
                 } else if resp.clicked() {
-                    acts.push(p(BrowserPaneAction::CursorTo(row.node_id.clone())));
+                    acts.extend(pane.row_click(row, false, false).map(p));
                 }
                 if is_cursor && self.scroll_cursor {
                     resp.scroll_to_me(None);
@@ -1209,83 +1155,19 @@ impl BrowseView {
     }
 
     /// A row's label as the tree always showed it: sizes, ProDOS badges, links, staged edits.
-    fn row_label(
-        &self,
-        ui: &mut egui::Ui,
-        row: &DisplayRow,
-        entry: Option<&FileEntry>,
-        selected: bool,
-    ) -> egui::Response {
-        let dimmed = super::theme::muted(ui.visuals());
-        if row.kind == RowKind::PendingAdd {
-            let text = match entry {
-                Some(e) => self.pending_add_text(ui, e),
-                None => egui::RichText::new(format!("+ {}", row.name)),
-            };
-            return ui.selectable_label(selected, text);
-        }
-        let Some(entry) = entry else {
-            return ui.selectable_label(selected, &row.name);
-        };
-        let mut hover = None;
-        let mut label = match entry.entry_type {
-            EntryType::Directory => {
-                let blessed = self
-                    .blessed_folder
-                    .as_ref()
-                    .is_some_and(|(cnid, _)| *cnid == entry.location);
-                if blessed {
-                    format!("{} [System]", entry.name)
-                } else {
-                    entry.name.clone()
-                }
-            }
-            EntryType::File => {
-                let size_str = entry.size_string();
-                let badge = if self.is_prodos_type() {
-                    entry.type_code_display()
-                } else {
-                    None
-                };
-                hover = badge.as_ref().map(|tc| {
-                    let tt = entry.prodos_file_type.unwrap_or(0);
-                    let desc = prodos_type_description(tt);
-                    let aux = entry.aux_type.unwrap_or(0);
-                    if desc.is_empty() {
-                        format!("{tc} ${:04X}", aux)
-                    } else {
-                        format!("{desc} ${:04X}", aux)
-                    }
-                });
-                match badge {
-                    Some(b) => format!("{}  [{}]  ({})", entry.name, b, size_str),
-                    None => format!("{}  ({})", entry.name, size_str),
-                }
-            }
-            EntryType::Symlink => {
-                let target = entry.symlink_target.as_deref().unwrap_or("?");
-                format!("{} -> {}", entry.name, target)
-            }
-            EntryType::Special => {
-                let stype = entry.special_type.as_deref().unwrap_or("special");
-                format!("{}  ({})", entry.name, stype)
-            }
-        };
-        if row.is_wrapper {
-            label = format!("{label}  {}", row.type_tag);
-        }
-        if let Some(to) = &row.rename_to {
-            label = format!("{label} -> {to}");
-        }
-        let text = match row.kind {
-            RowKind::PendingDelete => egui::RichText::new(label).color(dimmed).strikethrough(),
-            _ if row.meta_changed || row.rename_to.is_some() => {
-                egui::RichText::new(label).color(super::theme::info(ui.visuals()))
-            }
-            _ => egui::RichText::new(label),
+    fn row_label(&self, ui: &mut egui::Ui, row: &DisplayRow, selected: bool) -> egui::Response {
+        let label = self.ctl.pane(Side::Left).row_label(row, true);
+        let text = egui::RichText::new(label.text);
+        let text = match label.tone {
+            RowTone::Normal => text,
+            RowTone::Deleted => text
+                .color(super::theme::muted(ui.visuals()))
+                .strikethrough(),
+            RowTone::Changed | RowTone::Unresolved => text.color(super::theme::info(ui.visuals())),
+            RowTone::Added => text.color(super::theme::success(ui.visuals())),
         };
         let resp = ui.selectable_label(selected, text);
-        match hover {
+        match label.hover {
             Some(h) => resp.on_hover_text(h),
             None => resp,
         }
@@ -1404,54 +1286,6 @@ impl BrowseView {
         }
     }
 
-    /// A staged add's label: green, blue when its type is unresolved, with its fork badge.
-    fn pending_add_text(&self, ui: &egui::Ui, entry: &FileEntry) -> egui::RichText {
-        let green = super::theme::success(ui.visuals());
-        let blue = super::theme::info(ui.visuals());
-        let queue = self.queue();
-        // HFS: no FInfo, no dictionary match, no override. ProDOS: a type byte not in the registry.
-        let color = if self.is_hfs_type() && entry.is_file() {
-            let (t, c) = queue.resolved_hfs_type_creator(entry);
-            if t == [0; 4] && c == [0; 4] {
-                blue
-            } else {
-                green
-            }
-        } else if self.is_prodos_type() && entry.is_file() {
-            let (t, _) = metadata_editor::resolved_prodos_type(queue, entry);
-            if !is_known_prodos_type(t) {
-                blue
-            } else {
-                green
-            }
-        } else {
-            green
-        };
-        let rsrc_badge: Option<String> = queue.pending_resource_fork_for(&entry.path).map(|imp| {
-            let tc = imp
-                .type_code
-                .map(|c| String::from_utf8_lossy(&c).to_string());
-            let cc = imp
-                .creator_code
-                .map(|c| String::from_utf8_lossy(&c).to_string());
-            let codes = match (tc, cc) {
-                (Some(t), Some(c)) => format!("{t}/{c} "),
-                (Some(t), None) => format!("{t} "),
-                (None, Some(c)) => format!("?/{c} "),
-                (None, None) => String::new(),
-            };
-            format!("[{}+rsrc {}]", codes, format_size(imp.data.len() as u64))
-        });
-        let label = if entry.is_directory() {
-            format!("+ {}", entry.name)
-        } else if let Some(ref badge) = rsrc_badge {
-            format!("+ {}  {}  ({})", entry.name, badge, entry.size_string())
-        } else {
-            format!("+ {}  ({})", entry.name, entry.size_string())
-        };
-        egui::RichText::new(label).color(color)
-    }
-
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
         let entry = self.selected_entry.clone();
         let shown = self.render_detail(ui, entry.as_ref());
@@ -1498,7 +1332,7 @@ impl BrowseView {
         // filesystem gate — you can wrap any file/folder.
         // The disc browser offers only Extract, as the Optical tab always did.
         let extras = !self.optical;
-        let is_mac_fs = extras && self.is_mac_filesystem();
+        let is_mac_fs = extras && self.ctl.browse_caps().mac;
         let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
 
         if is_extractable && !extraction_running {
@@ -1521,7 +1355,7 @@ impl BrowseView {
                     ui.add_space(8.0);
                 }
 
-                if self.fs_type == "QNX 2" {
+                if self.ctl.browse_caps().qnx2 {
                     ui.checkbox(&mut self.rs_to_lf, "Text: RS to LF").on_hover_text(
                         "Convert QNX line separators (RS, 0x1E) to LF in files that look like text.",
                     );
@@ -1877,7 +1711,7 @@ impl BrowseView {
             }
 
             // Alto BFS has a flat namespace — no subdirectories to create.
-            if self.fs_type != "Alto BFS" && ui.button("New Folder...").clicked() {
+            if self.ctl.browse_caps().new_folder && ui.button("New Folder...").clicked() {
                 let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::RequestNewFolder);
                 let fx = self.ctl.apply(act);
                 self.run_effects(&ui.ctx().clone(), fx);
