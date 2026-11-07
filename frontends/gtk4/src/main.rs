@@ -4,8 +4,10 @@
 //! engine or the model; `scripts/check-boundaries.sh` enforces that.
 
 mod app;
+mod browser;
 mod effects;
 mod inspect;
+mod keys;
 mod progress;
 mod sync;
 mod theme;

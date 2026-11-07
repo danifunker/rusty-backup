@@ -14,7 +14,6 @@ use crate::widgets::{coming, set_text};
 
 type Cell = fn(&PartitionRow) -> String;
 
-const COMING_BROWSE: &str = "the Browse view";
 const COMING_CHECK: &str = "the Check results window";
 const COMING_EXPAND_HFS: &str = "the Expand HFS dialog";
 const COMING_RESIZE_ALTO: &str = "the Alto resize dialog";
@@ -157,7 +156,14 @@ fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
     factory.connect_setup(move |_, obj| {
         let item = list_item(obj);
         let cell = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        cell.append(&placeholder("Browse", ids::ROW_BROWSE, COMING_BROWSE));
+        let browse = row_button(
+            item,
+            "Browse",
+            ids::ROW_BROWSE,
+            &send,
+            InspectAction::Browse,
+        );
+        cell.append(&browse);
         cell.append(&placeholder("Check", ids::ROW_CHECK, COMING_CHECK));
         cell.append(&placeholder(
             "Expand/Export...",
@@ -200,13 +206,14 @@ fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
             button.set_visible(visible);
             child = button.next_sibling();
         }
-        // Only Defragment is live in this slice; the rows lock while it runs.
-        let defragment = cell.first_child().and_then(|c| {
+        // Browse and Defragment are live so far; the rows lock while Defragment runs.
+        let browse = cell.first_child();
+        let defragment = browse.as_ref().and_then(|c| {
             let c = c.next_sibling()?.next_sibling()?;
             c.next_sibling()
         });
-        if let Some(defragment) = defragment {
-            defragment.set_sensitive(!row.locked);
+        for button in [browse, defragment].into_iter().flatten() {
+            button.set_sensitive(!row.locked);
         }
     });
     gtk::ColumnViewColumn::new(None, Some(factory))

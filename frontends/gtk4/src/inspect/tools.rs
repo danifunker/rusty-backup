@@ -4,7 +4,7 @@ use adw::prelude::*;
 use rusty_backup::controller::inspect::{hints, ids, InspectAction};
 
 use super::ActionFn;
-use crate::widgets::coming;
+use crate::widgets::{coming, flow, flow_show};
 
 /// What the buttons show, read from the controller.
 pub struct ToolState {
@@ -81,13 +81,7 @@ impl ToolBar {
         let chd = stub("CHD Info", ids::CHD_INFO, "the CHD Info window");
         let close = live("Close", ids::CLOSE, send, || InspectAction::Close);
 
-        let root = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .homogeneous(false)
-            .max_children_per_line(12)
-            .column_spacing(4)
-            .row_spacing(4)
-            .build();
+        let root = flow();
         for b in [
             &reinspect, &export, &floppy, &edit, &add, &expand, &bootable, &resize, &chd, &close,
         ] {
@@ -107,19 +101,11 @@ impl ToolBar {
         &self.root
     }
 
-    /// A hidden button's `FlowBoxChild` stays behind, so hide that too.
-    fn set_shown(button: &gtk::Button, on: bool) {
-        button.set_visible(on);
-        if let Some(child) = button.parent() {
-            child.set_visible(on);
-        }
-    }
-
     pub fn show(&self, state: &ToolState) {
         self.reinspect.set_sensitive(state.can_reinspect);
         self.bootable.set_sensitive(state.can_make_bootable);
-        Self::set_shown(&self.floppy, state.is_floppy);
-        Self::set_shown(&self.chd, state.has_chd);
-        Self::set_shown(&self.close, state.can_close);
+        flow_show(&self.floppy, state.is_floppy);
+        flow_show(&self.chd, state.has_chd);
+        flow_show(&self.close, state.can_close);
     }
 }

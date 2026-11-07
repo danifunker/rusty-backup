@@ -17,6 +17,7 @@ use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
+use crate::widgets::plain;
 
 const TABS: [(AppTab, &str, &str, &str); 6] = [
     (AppTab::Backup, "backup", "Backup", "document-save-symbolic"),
@@ -130,6 +131,7 @@ impl App {
         capture::set_wake(wake.clone());
         let mut ctrl = AppController::new(wake);
         ctrl.load_devices();
+        crate::theme::install_css();
 
         let stack = adw::ViewStack::new();
 
@@ -304,7 +306,7 @@ impl App {
         }
         let mut end = buffer.end_iter();
         for entry in &entries[self.log_shown.get()..] {
-            buffer.insert(&mut end, &entry.line());
+            buffer.insert(&mut end, &plain(&entry.line()));
             buffer.insert(&mut end, "\n");
         }
         self.log_shown.set(entries.len());

@@ -11,6 +11,8 @@ use gtk::{gio, glib};
 use rusty_backup::controller::app::picker_start_folder;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec};
 
+use crate::widgets::plain;
+
 /// An answer to an effect, for the view to turn into its controller's action.
 pub enum Reply {
     Picked {
@@ -21,12 +23,10 @@ pub enum Reply {
         purpose: &'static str,
         yes: bool,
     },
-    #[allow(dead_code)] // Until a screen asks for text (Inspect does not).
     Answered {
         purpose: &'static str,
         text: Option<String>,
     },
-    #[allow(dead_code)] // Until a screen asks for a choice (Inspect does not).
     Chose {
         purpose: &'static str,
         choice: usize,
@@ -57,7 +57,7 @@ impl EffectHost {
                 Effect::Choose(spec) => self.choose(spec, reply.clone()),
                 Effect::AskText(spec) => self.ask_text(spec, reply.clone()),
                 Effect::AskPassword(spec) => self.ask_password(spec, reply.clone()),
-                Effect::Message(text) => self.toasts.add_toast(adw::Toast::new(&text)),
+                Effect::Message(text) => self.toasts.add_toast(adw::Toast::new(&plain(&text))),
                 Effect::OpenUrl(url) => {
                     gtk::UriLauncher::new(&url).launch(
                         Some(&self.window),
@@ -65,23 +65,44 @@ impl EffectHost {
                         |_| {},
                     );
                 }
-                Effect::CopyToClipboard(text) => self.window.clipboard().set_text(&text),
+                Effect::CopyToClipboard(text) => self.window.clipboard().set_text(&plain(&text)),
                 Effect::CloseScreen => reply(Reply::CloseScreen),
                 Effect::Quit => self.window.close(),
             }
         }
     }
 
+    /// Open `dialog` over the window.
+    pub fn present(&self, dialog: &adw::Dialog) {
+        dialog.present(Some(&self.window));
+    }
+
+    /// Pick several host files; `done` gets none when cancelled.
+    pub fn pick_files(&self, title: &str, done: impl FnOnce(Vec<PathBuf>) + 'static) {
+        let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
+        if let Some(home) = picker_start_folder() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(home)));
+        }
+        dialog.open_multiple(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            let files = result.ok().map(|m| {
+                let items = (0..m.n_items()).filter_map(|i| m.item(i));
+                let files = items.filter_map(|o| o.downcast::<gio::File>().ok());
+                files.filter_map(|f| f.path()).collect()
+            });
+            done(files.unwrap_or_default());
+        });
+    }
+
     fn pick(&self, spec: PickSpec, folder: bool, reply: ReplyFn) {
         let dialog = gtk::FileDialog::builder()
-            .title(&spec.title)
+            .title(plain(&spec.title).as_ref())
             .modal(true)
             .build();
         if let Some(home) = picker_start_folder() {
             dialog.set_initial_folder(Some(&gio::File::for_path(home)));
         }
         if !spec.file_name.is_empty() {
-            dialog.set_initial_name(Some(&spec.file_name));
+            dialog.set_initial_name(Some(&plain(&spec.file_name)));
         }
         if !spec.filters.is_empty() {
             let filters = gio::ListStore::new::<gtk::FileFilter>();
@@ -114,7 +135,7 @@ impl EffectHost {
     }
 
     fn confirm(&self, spec: ConfirmSpec, reply: ReplyFn) {
-        let dialog = adw::AlertDialog::new(Some(&spec.title), Some(&spec.message));
+        let dialog = adw::AlertDialog::new(Some(&plain(&spec.title)), Some(&plain(&spec.message)));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("ok", &spec.confirm_label);
         dialog.set_close_response("cancel");
@@ -133,9 +154,9 @@ impl EffectHost {
     }
 
     fn choose(&self, spec: ChoiceSpec, reply: ReplyFn) {
-        let dialog = adw::AlertDialog::new(Some(&spec.title), Some(&spec.message));
+        let dialog = adw::AlertDialog::new(Some(&plain(&spec.title)), Some(&plain(&spec.message)));
         for (i, choice) in spec.choices.iter().enumerate() {
-            dialog.add_response(&i.to_string(), &choice.label);
+            dialog.add_response(&i.to_string(), &plain(&choice.label));
         }
         dialog.set_close_response(&spec.dismiss.to_string());
         let purpose = spec.purpose;
@@ -149,19 +170,19 @@ impl EffectHost {
 
     /// The controller's validator runs on every edit: its message shows inline and gates OK.
     fn ask_text(&self, spec: TextSpec, reply: ReplyFn) {
-        let dialog = adw::AlertDialog::new(Some(&spec.title), Some(&spec.prompt));
+        let dialog = adw::AlertDialog::new(Some(&plain(&spec.title)), Some(&plain(&spec.prompt)));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("ok", &spec.ok_label);
         dialog.set_close_response("cancel");
         dialog.set_default_response(Some("ok"));
 
         let entry = gtk::Entry::builder()
-            .text(&spec.initial)
+            .text(plain(&spec.initial).as_ref())
             .activates_default(true)
             .build();
         let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
         error.add_css_class("error");
-        error.set_text(spec.error.as_deref().unwrap_or(""));
+        error.set_text(&plain(spec.error.as_deref().unwrap_or("")));
         let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
         body.append(&entry);
         body.append(&error);
@@ -173,7 +194,7 @@ impl EffectHost {
         let shown = error.clone();
         entry.connect_changed(move |e| {
             let verdict = spec.validate(&e.text());
-            shown.set_text(verdict.as_ref().err().map_or("", |m| m.as_str()));
+            shown.set_text(&plain(verdict.as_ref().err().map_or("", |m| m.as_str())));
             check.set_response_enabled("ok", verdict.is_ok());
         });
         dialog.connect_response(None, move |_, id| {
@@ -184,7 +205,7 @@ impl EffectHost {
     }
 
     fn ask_password(&self, spec: PasswordSpec, reply: ReplyFn) {
-        let dialog = adw::AlertDialog::new(Some("Password required"), Some(&spec.prompt));
+        let dialog = adw::AlertDialog::new(Some("Password required"), Some(&plain(&spec.prompt)));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("ok", "OK");
         dialog.set_close_response("cancel");

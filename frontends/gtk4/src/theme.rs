@@ -63,3 +63,27 @@ pub fn set_source(cr: &gtk::cairo::Context, rgb: Rgb) {
     let channel = |c: u8| f64::from(c) / 255.0;
     cr.set_source_rgb(channel(rgb.0), channel(rgb.1), channel(rgb.2));
 }
+
+const CSS: &str = "
+.rb-list > listview > row > cell { padding: 0; }
+.rb-row { padding: 3px 6px; }
+.rb-cursor { box-shadow: inset 0 1px @accent_color, inset 0 -1px @accent_color; }
+.rb-added { color: @success_color; }
+.rb-changed, .rb-unresolved { color: @accent_color; }
+.rb-deleted { opacity: 0.6; }
+.rb-tree-focus { outline: 1px solid @accent_color; outline-offset: -1px; }
+";
+
+/// The shell's few style rules; colours stay the theme's named ones.
+pub fn install_css() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(CSS);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}

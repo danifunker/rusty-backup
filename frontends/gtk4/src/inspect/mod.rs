@@ -1,7 +1,8 @@
 //! The Inspect tab: a retained view over `controller::inspect::InspectController`.
 //!
-//! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference; Browse
-//! and the dialogs are later slices, so their buttons stay greyed out with a tooltip saying so.
+//! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference; the
+//! dialogs are later slices, so their buttons stay greyed out with a tooltip saying so. The browse
+//! view takes the whole tab while it is open.
 
 mod bar;
 mod details;
@@ -26,6 +27,7 @@ use rusty_backup::controller::inspect::{
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::browser::BrowseView;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::progress::JobList;
 use crate::sync::SyncGuard;
@@ -48,7 +50,8 @@ pub struct InspectScreen {
     devices: RefCell<Vec<DiskDevice>>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
-    root: gtk::ScrolledWindow,
+    root: gtk::Stack,
+    browse: Rc<BrowseView>,
     source: Rc<SourcePicker>,
     elevation: gtk::Label,
     flux: gtk::Label,
@@ -82,15 +85,24 @@ struct Shown {
     shows_min: bool,
 }
 
-/// What this view cannot do yet says so; `None` for a request with nothing to do here.
+/// Carry out `request`; what this view cannot do yet says so.
 /// No `_` arm: a new request fails to compile until this view decides what it means.
-fn not_yet(request: HostRequest) -> Option<String> {
+fn carry_out(browse: &BrowseView, request: HostRequest) -> Option<String> {
     match request {
-        // Nothing to close or upgrade until the Browse view exists (slice 2).
-        HostRequest::CloseBrowse | HostRequest::UpgradeSeekable(_) => None,
+        HostRequest::CloseBrowse => {
+            browse.close();
+            None
+        }
+        HostRequest::UpgradeSeekable(path) => {
+            browse.upgrade_seekable(path);
+            None
+        }
+        HostRequest::OpenBrowse(open) => {
+            browse.open_request(*open);
+            None
+        }
         // No other tab shares the backup folder until Backup and Restore exist (slice 4).
         HostRequest::BackupClosed => None,
-        HostRequest::OpenBrowse(_) => Some("The Browse view is coming soon.".to_string()),
         HostRequest::ExpandHfs(_) => Some("The Expand HFS dialog is coming soon.".to_string()),
         HostRequest::OpenOptical(path) => Some(format!(
             "{} is an optical disc; the Optical tab is coming soon.",
@@ -182,10 +194,20 @@ impl InspectScreen {
             page.append(&layout);
             page.append(table.root());
             page.append(&no_partitions);
-            let root = gtk::ScrolledWindow::builder()
+            let scroll = gtk::ScrolledWindow::builder()
                 .child(&page)
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .build();
+            let browse = BrowseView::build(notify.clone(), host.clone());
+            let target = me.clone();
+            browse.on_change(Rc::new(move || {
+                if let Some(screen) = target.upgrade() {
+                    screen.show_page();
+                }
+            }));
+            let root = gtk::Stack::new();
+            root.add_named(&scroll, Some("inspect"));
+            root.add_named(browse.root(), Some("browse"));
 
             let recent_files = recent.list(RecentMode::Inspect);
             InspectScreen {
@@ -200,6 +222,7 @@ impl InspectScreen {
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 root,
+                browse,
                 source,
                 elevation,
                 flux,
@@ -217,8 +240,20 @@ impl InspectScreen {
         })
     }
 
-    pub fn root(&self) -> &gtk::ScrolledWindow {
+    pub fn root(&self) -> &gtk::Stack {
         &self.root
+    }
+
+    /// The browse view, while it is open, in the tab's place.
+    fn show_page(&self) {
+        let page = if self.browse.is_active() {
+            "browse"
+        } else {
+            "inspect"
+        };
+        if self.root.visible_child_name().as_deref() != Some(page) {
+            self.root.set_visible_child_name(page);
+        }
     }
 
     pub fn apply(&self, action: InspectAction) {
@@ -227,6 +262,7 @@ impl InspectScreen {
     }
 
     pub fn tick(&self) {
+        self.browse.tick();
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -296,14 +332,22 @@ impl InspectScreen {
 
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
+        let dirty = self.browse.has_unsaved_edits();
         let (requests, mut log) = {
             let mut ctrl = self.ctrl.borrow_mut();
+            ctrl.set_browse_dirty(dirty);
             (ctrl.take_requests(), ctrl.take_log())
         };
-        let refused = requests.into_iter().filter_map(not_yet);
+        let refused = requests
+            .into_iter()
+            .filter_map(|r| carry_out(&self.browse, r));
         log.extend(refused.map(|line| (LogLevel::Warning, line)));
         crate::app::append_log(log);
         self.refresh();
+        self.browse.set_host_jobs(self.ctrl.borrow().browse_jobs());
+        if let Some(load) = self.browse.take_nested_load() {
+            self.apply(load);
+        }
     }
 
     fn read(&self) -> Shown {

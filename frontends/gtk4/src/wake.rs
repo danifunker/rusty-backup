@@ -17,7 +17,8 @@ impl Notify for GtkWake {
             return;
         }
         let pending = self.pending.clone();
-        glib::MainContext::default().invoke(move || {
+        // Always queued: a job's cancel wakes from the main thread, inside the controller's borrow.
+        glib::idle_add_once(move || {
             pending.store(false, Ordering::Release);
             crate::app::tick();
         });
