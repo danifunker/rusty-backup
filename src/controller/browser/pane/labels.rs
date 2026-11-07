@@ -43,6 +43,58 @@ impl RowLabel {
 }
 
 impl BrowserPaneController {
+    /// What a source picker's closed state says this pane has open.
+    pub fn source_label(&self) -> String {
+        if let Some(label) = self.remote_label() {
+            return label;
+        }
+        if self.listing.is_host() {
+            return "Local folder".to_string();
+        }
+        let name = self.source_path().map(|p| {
+            let base = p.file_name().unwrap_or_default();
+            base.to_string_lossy().into_owned()
+        });
+        match (name, self.is_backup(), self.is_archive()) {
+            (Some(n), true, _) => format!("Backup: {n}"),
+            (None, true, _) => "Backup folder".to_string(),
+            (Some(n), false, true) => format!("Archive: {n}"),
+            (Some(n), false, false) => format!("Image: {n}"),
+            (None, false, _) => "Open image, backup, or folder...".to_string(),
+        }
+    }
+
+    /// The tag before the path: where the path is rooted.
+    pub fn path_prefix(&self) -> String {
+        if self.listing.is_host() {
+            return "host ".to_string();
+        }
+        match self.selected_partition() {
+            Some(i) => format!("@{} ", i + 1),
+            None => "- ".to_string(),
+        }
+    }
+
+    /// The volume readout's name: "local folder", or the label and filesystem.
+    pub fn volume_title(&self) -> String {
+        if self.listing.is_host() {
+            return "local folder".to_string();
+        }
+        let v = self.volume();
+        match v.label.is_empty() {
+            true => v.fs_type.clone(),
+            false => format!("{} ({})", v.label, v.fs_type),
+        }
+    }
+
+    /// The partition chooser's text when there is nothing to choose.
+    pub fn no_partitions_label(&self) -> &'static str {
+        match self.is_optical() {
+            true => "(no filesystems)",
+            false => "(no partitions)",
+        }
+    }
+
     /// The browse view's combined tree marks rows with checkboxes, so a plain click only moves the cursor.
     pub fn marks_with_boxes(&self) -> bool {
         self.listing_style() == ListingStyle::CombinedTree

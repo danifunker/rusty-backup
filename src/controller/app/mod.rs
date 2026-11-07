@@ -46,6 +46,7 @@ pub mod ids {
     pub const LOG_LIST: &str = "log.list";
     pub const REFRESH_DEVICES: &str = "app.refresh_devices";
     pub const ELEVATE: &str = "app.elevate";
+    pub const COMMANDER: &str = "app.commander";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

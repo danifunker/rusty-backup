@@ -625,6 +625,8 @@ impl BrowserPaneController {
                 if !self.is_busy() && i < self.queue.len() {
                     self.queue.remove_indices(&[i]);
                 }
+                // Emptied, the list closes; the next staged edit must not bring it back.
+                self.ed.show_edits &= !self.queue.is_empty();
                 Vec::new()
             }
             A::ShowEdits(on) => {
@@ -1594,6 +1596,7 @@ mod tests {
         assert!(spec.validate("NEWDIR").is_err());
         vm.apply(A::Unstage(0));
         assert!(vm.queue.is_empty());
+        assert!(!vm.ed.show_edits, "an emptied list stays closed");
     }
 
     #[test]

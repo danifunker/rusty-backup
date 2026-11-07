@@ -21,8 +21,8 @@ pub use crate::controller::browser::{
 };
 pub use crate::controller::browser::{metadata, pane, rows};
 pub use screen::{
-    default_export_format, export_choices, extract_applies, extract_fork_modes, BrowseCaps,
-    BudgetAction, BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction,
+    default_export_format, export_choices, extract_applies, extract_fork_modes, printable,
+    BrowseCaps, BudgetAction, BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction,
     CommanderController, DetailField, DetailMetadata, ExportChoice, ExportFormat, ExtractApplies,
     ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, ProdosExportMode,
     RenameNotice, ResourceForkMode, RowMenuEntry, Side, SizePlan, SkippedReport, SpaceReadout,

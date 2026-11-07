@@ -236,28 +236,7 @@ impl PaneView {
             // opens are not materialized (BrowseSession peels the container).
             let is_backup = pane.is_backup();
             let source = pane.source_path().map(|p| p.to_path_buf());
-            let current_label = if let Some(label) = pane.remote_label() {
-                label
-            } else if pane.listing.is_host() {
-                "Local folder".to_string()
-            } else if is_backup {
-                match &source {
-                    Some(p) => format!(
-                        "Backup: {}",
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    ),
-                    None => "Backup folder".to_string(),
-                }
-            } else if let Some(p) = &source {
-                let base = p.file_name().unwrap_or_default().to_string_lossy();
-                if pane.is_archive() {
-                    format!("Archive: {base}")
-                } else {
-                    format!("Image: {base}")
-                }
-            } else {
-                "Open image, backup, or folder...".to_string()
-            };
+            let current_label = pane.source_label();
             let cfg = super::super::source_picker::PickerConfig {
                 show_devices: false,
                 show_image: true,
@@ -361,11 +340,7 @@ impl PaneView {
                 // partition-table entries.
                 if !pane.listing.is_host() {
                     let labels = pane.partition_label_parts();
-                    let empty_text = if pane.is_optical() {
-                        "(no filesystems)"
-                    } else {
-                        "(no partitions)"
-                    };
+                    let empty_text = pane.no_partitions_label();
                     let selected = pane.selected_partition();
                     let current: egui::WidgetText = match selected.and_then(|i| labels.get(i)) {
                         Some(p) => crate::gui::theme::format_label(ui, p).into(),
@@ -405,16 +380,9 @@ impl PaneView {
                 // so on a narrow pane it wraps to a second line rather than
                 // overflowing left into the New Folder button.
                 ui.separator();
-                if pane.listing.is_host() {
-                    ui.strong("local folder");
-                } else {
+                ui.strong(pane.volume_title());
+                if !pane.listing.is_host() {
                     let vol = pane.volume();
-                    let label = if vol.label.is_empty() {
-                        vol.fs_type.clone()
-                    } else {
-                        format!("{} ({})", vol.label, vol.fs_type)
-                    };
-                    ui.strong(label);
                     ui.separator();
                     let free = vol.total_size.saturating_sub(vol.used_size);
                     ui.label(format!("free: {}", format_size(free)));
@@ -490,14 +458,7 @@ impl PaneView {
     ) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let prefix = if pane.listing.is_host() {
-                "host ".to_string()
-            } else {
-                match pane.selected_partition() {
-                    Some(i) => format!("@{} ", i + 1),
-                    None => "- ".to_string(),
-                }
-            };
+            let prefix = pane.path_prefix();
             ui.monospace(prefix);
             let crumbs = pane.path_crumbs();
             if crumbs.is_empty() {
