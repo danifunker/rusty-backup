@@ -1,0 +1,37 @@
+# The Inspect list and bar share one selection: it follows the action, refuses a partition that
+# is not listed, and goes with the source. Open File and Open Backup Folder ask first.
+name = "Inspect: select a partition, pick a source"
+vm = "inspect"
+
+[[step]]
+action = "ChooseImage"
+effects = ["PickFile"]
+
+[[step]]
+action = "ChooseBackupFolder"
+effects = ["PickFolder"]
+
+[[step]]
+action = "OpenImage"
+arg = "$mbr_gap"
+settle = true
+expect = { partitions = 1, selected = -1, row_number = "1", row_volume = "GAP", layout_segments = 2 }
+
+[[step]]
+action = "Select"
+arg = 0
+expect = { selected = 0 }
+
+[[step]]
+action = "Select"
+arg = 7
+expect = { selected = -1 }
+
+[[step]]
+action = "Select"
+arg = 0
+expect = { selected = 0 }
+
+[[step]]
+action = "Close"
+expect = { source = "none", selected = -1 }

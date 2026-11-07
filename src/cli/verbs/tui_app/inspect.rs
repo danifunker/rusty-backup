@@ -1752,7 +1752,7 @@ impl App {
             .map(|seg| match seg.kind {
                 SegmentKind::Free => format!("[free {}]", format_size(seg.size_bytes)),
                 SegmentKind::Dimmed => format!("({} {})", seg.label, format_size(seg.size_bytes)),
-                SegmentKind::Partition => {
+                SegmentKind::Partition { .. } => {
                     format!("[{} {} {}]", seg.label, seg.fs, format_size(seg.size_bytes))
                 }
             })

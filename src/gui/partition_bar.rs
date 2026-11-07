@@ -12,37 +12,9 @@
 //! is wide enough; otherwise the legend below carries the identification.
 
 use eframe::egui;
-use rusty_backup::controller::app::format_size;
+use rusty_backup::controller::inspect::{segment_at, segment_widths, BAR_HEIGHT, MIN_SEGMENT_PX};
 
-/// One block in the bar: a real partition, trailing unallocated space, or a
-/// dimmed bookkeeping region (APM partition-map entry, SGI volume header).
-#[derive(Debug, Clone)]
-pub struct Segment {
-    /// Human-readable name. For partitions: volume label, falling back to
-    /// `Partition N` when no label is available. For free space: empty.
-    pub label: String,
-    /// Filesystem display name (e.g. "FAT16", "XFS", "ext4"). Empty for free
-    /// space and dimmed regions where no FS applies.
-    pub fs: String,
-    pub size_bytes: u64,
-    pub kind: SegmentKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentKind {
-    /// A real partition. `color_index` indexes into the fixed palette; callers
-    /// typically assign sequentially across the disk so colors are stable.
-    Partition { color_index: usize },
-    /// Trailing unallocated space (or a gap between partitions). Rendered as
-    /// solid neutral gray. Constructed by the planned-layout builder in
-    /// Phase 2 of `docs/disk_expansion.md`; the inspect-tab passive view
-    /// doesn't yet emit it.
-    #[allow(dead_code)]
-    Free,
-    /// Bookkeeping region not owned by the user (APM partition-map entry,
-    /// SGI volume header). Rendered dimmed.
-    Dimmed,
-}
+pub use rusty_backup::controller::inspect::{LayoutSegment as Segment, SegmentKind};
 
 /// Reusable partition-layout bar widget.
 pub struct PartitionBar {
@@ -70,10 +42,6 @@ impl PartitionBar {
             return;
         }
 
-        const BAR_HEIGHT: f32 = 34.0;
-        const MIN_SEGMENT_PX: f32 = 6.0;
-        const LABEL_THRESHOLD_PX: f32 = 60.0;
-
         let available_width = ui.available_width().max(120.0);
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(available_width, BAR_HEIGHT),
@@ -88,16 +56,12 @@ impl PartitionBar {
             ui.visuals().extreme_bg_color,
         );
 
-        // First pass: compute widths honoring the minimum-pip constraint while
-        // keeping the total equal to the bar width. We start with proportional
-        // widths, clamp anything below MIN_SEGMENT_PX up to it, then shrink
-        // larger segments proportionally to absorb the deficit.
-        let widths = compute_segment_widths(&self.segments, available_width, MIN_SEGMENT_PX);
+        let widths = segment_widths(&self.segments, available_width, MIN_SEGMENT_PX);
 
-        // Second pass: paint.
         let mut x = rect.left();
-        let hover_pos = response.hover_pos();
-        let mut hover_idx: Option<usize> = None;
+        let hover_idx = response
+            .hover_pos()
+            .and_then(|pos| segment_at(&widths, pos.x - rect.left()));
         for (i, segment) in self.segments.iter().enumerate() {
             let w = widths[i];
             let seg_rect =
@@ -117,13 +81,7 @@ impl PartitionBar {
                 );
             }
 
-            // Inline label when the segment is wide enough and the kind makes
-            // sense to label. Free segments never get inline labels.
-            if self.show_inline_labels
-                && w >= LABEL_THRESHOLD_PX
-                && !matches!(segment.kind, SegmentKind::Free)
-            {
-                let text = inline_label(segment);
+            if let Some(text) = segment.inline_label(w).filter(|_| self.show_inline_labels) {
                 painter.text(
                     seg_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -133,11 +91,6 @@ impl PartitionBar {
                 );
             }
 
-            if let Some(pos) = hover_pos {
-                if seg_rect.contains(pos) {
-                    hover_idx = Some(i);
-                }
-            }
             x += w;
         }
 
@@ -151,7 +104,7 @@ impl PartitionBar {
 
         if let Some(i) = hover_idx {
             let segment = &self.segments[i];
-            response.on_hover_text(tooltip_text(segment));
+            response.on_hover_text(segment.tooltip_text());
         }
 
         if self.show_legend {
@@ -175,7 +128,7 @@ impl PartitionBar {
                     egui::StrokeKind::Inside,
                 );
 
-                let text = legend_text(segment);
+                let text = segment.legend_text();
                 match segment.kind {
                     SegmentKind::Dimmed => {
                         ui.label(egui::RichText::new(text).italics().weak());
@@ -205,191 +158,4 @@ fn segment_color(visuals: &egui::Visuals, kind: SegmentKind) -> egui::Color32 {
 
 fn inline_text_color(visuals: &egui::Visuals, _kind: SegmentKind) -> egui::Color32 {
     super::theme::on_partition(visuals)
-}
-
-fn inline_label(segment: &Segment) -> String {
-    match (segment.label.is_empty(), segment.fs.is_empty()) {
-        (false, false) => format!("{} [{}]", segment.label, segment.fs),
-        (true, false) => format!("[{}]", segment.fs),
-        (false, true) => segment.label.clone(),
-        (true, true) => String::new(),
-    }
-}
-
-fn legend_text(segment: &Segment) -> String {
-    let body = match (segment.label.is_empty(), segment.fs.is_empty()) {
-        (false, false) => format!("{} [{}]", segment.label, segment.fs),
-        (true, false) => format!("[{}]", segment.fs),
-        (false, true) => segment.label.clone(),
-        (true, true) => match segment.kind {
-            SegmentKind::Free => "Free".to_string(),
-            _ => "Partition".to_string(),
-        },
-    };
-    format!("{}  {}", body, format_size(segment.size_bytes))
-}
-
-fn tooltip_text(segment: &Segment) -> String {
-    let mut lines = Vec::new();
-    if !segment.label.is_empty() {
-        lines.push(segment.label.clone());
-    }
-    if !segment.fs.is_empty() {
-        lines.push(format!("Filesystem: {}", segment.fs));
-    }
-    lines.push(format!("Size: {}", format_size(segment.size_bytes)));
-    match segment.kind {
-        SegmentKind::Free => lines.push("Unallocated free space".to_string()),
-        SegmentKind::Dimmed => lines.push("Bookkeeping region".to_string()),
-        SegmentKind::Partition { .. } => {}
-    }
-    lines.join("\n")
-}
-
-/// Distribute `total_width` across the segments proportional to `size_bytes`,
-/// clamping each segment to at least `min_px`. When the minimum clamps eat
-/// into the total, the surplus is taken from segments above the minimum in
-/// proportion to their (post-clamp-eligible) sizes. Returns one width per
-/// input segment, summing exactly to `total_width` (within float epsilon).
-fn compute_segment_widths(segments: &[Segment], total_width: f32, min_px: f32) -> Vec<f32> {
-    let n = segments.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let total_bytes: u64 = segments.iter().map(|s| s.size_bytes).sum();
-    if total_bytes == 0 {
-        return vec![total_width / n as f32; n];
-    }
-
-    // Initial proportional widths.
-    let mut widths: Vec<f32> = segments
-        .iter()
-        .map(|s| total_width * (s.size_bytes as f64 / total_bytes as f64) as f32)
-        .collect();
-
-    // If even the minimum-pip count exceeds total width, bail to equal split.
-    if min_px * n as f32 > total_width {
-        return vec![total_width / n as f32; n];
-    }
-
-    // Clamp small segments to min_px; track who got clamped and how much surplus
-    // we need to reclaim from the unclamped.
-    let mut clamped = vec![false; n];
-    let mut deficit = 0.0_f32;
-    for i in 0..n {
-        if widths[i] < min_px {
-            deficit += min_px - widths[i];
-            widths[i] = min_px;
-            clamped[i] = true;
-        }
-    }
-
-    if deficit <= 0.0 {
-        return widths;
-    }
-
-    // Shrink unclamped segments proportionally to absorb the deficit. Repeat
-    // if shrinking pushes any below min_px (rare but possible on extreme
-    // disks).
-    loop {
-        let unclamped_total: f32 = widths
-            .iter()
-            .zip(clamped.iter())
-            .filter_map(|(w, c)| if !*c { Some(*w) } else { None })
-            .sum();
-        if unclamped_total <= 0.0 {
-            break;
-        }
-        let scale = (unclamped_total - deficit) / unclamped_total;
-        let mut new_deficit = 0.0_f32;
-        for i in 0..n {
-            if !clamped[i] {
-                let new_w = widths[i] * scale;
-                if new_w < min_px {
-                    new_deficit += min_px - new_w;
-                    widths[i] = min_px;
-                    clamped[i] = true;
-                } else {
-                    widths[i] = new_w;
-                }
-            }
-        }
-        if new_deficit <= 0.0 {
-            break;
-        }
-        deficit = new_deficit;
-    }
-
-    widths
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mk(size: u64) -> Segment {
-        Segment {
-            label: String::new(),
-            fs: String::new(),
-            size_bytes: size,
-            kind: SegmentKind::Partition { color_index: 0 },
-        }
-    }
-
-    #[test]
-    fn widths_sum_to_total() {
-        let segs = vec![mk(100_000_000), mk(600_000_000), mk(250_000_000)];
-        let widths = compute_segment_widths(&segs, 800.0, 6.0);
-        let sum: f32 = widths.iter().sum();
-        assert!((sum - 800.0).abs() < 0.5, "widths sum {sum} != 800");
-    }
-
-    #[test]
-    fn tiny_segments_clamped_to_min() {
-        // Two partitions: one tiny EFI-sized (1 MB), one huge (10 GB).
-        let segs = vec![mk(1_000_000), mk(10_000_000_000)];
-        let widths = compute_segment_widths(&segs, 800.0, 6.0);
-        assert!(widths[0] >= 6.0, "tiny segment not clamped: {}", widths[0]);
-        let sum: f32 = widths.iter().sum();
-        assert!((sum - 800.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn equal_split_when_overcrowded() {
-        // 200 partitions in 800 px with 6px min would need 1200 px.
-        let segs: Vec<Segment> = (0..200).map(|_| mk(1)).collect();
-        let widths = compute_segment_widths(&segs, 800.0, 6.0);
-        assert_eq!(widths.len(), 200);
-        // Each should be ~4.0 (800/200).
-        for w in &widths {
-            assert!((w - 4.0).abs() < 0.1);
-        }
-    }
-
-    #[test]
-    fn legend_text_uses_volume_and_fs() {
-        let seg = Segment {
-            label: "C:".into(),
-            fs: "FAT16".into(),
-            size_bytes: 250_000_000,
-            kind: SegmentKind::Partition { color_index: 0 },
-        };
-        let s = legend_text(&seg);
-        assert!(s.contains("C:"));
-        assert!(s.contains("FAT16"));
-        assert!(s.contains("MB") || s.contains("MiB"));
-    }
-
-    #[test]
-    fn legend_text_free_no_label() {
-        let seg = Segment {
-            label: String::new(),
-            fs: String::new(),
-            size_bytes: 1_024_000_000,
-            kind: SegmentKind::Free,
-        };
-        let s = legend_text(&seg);
-        assert!(s.contains("Free"));
-    }
 }

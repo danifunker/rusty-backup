@@ -244,8 +244,52 @@ fn the_layout_bar_shows_each_volume_and_trailing_free_space() {
     let (_dir, _img, mut ctl) = opened_fat();
     let layout = ctl.layout();
     assert_eq!(layout.len(), 1);
-    assert_eq!(layout[0].kind, SegmentKind::Partition);
+    assert_eq!(layout[0].kind, SegmentKind::Partition { color_index: 0 });
+    assert_eq!(layout[0].partition, Some(ctl.partitions()[0].index));
     assert_eq!(layout[0].label, "T");
+}
+
+#[test]
+fn a_selected_partition_stays_until_the_source_changes() {
+    let (_dir, _img, mut ctl) = opened_fat();
+    let index = ctl.partitions()[0].index;
+    ctl.apply(InspectAction::SelectPartition(Some(index)));
+    assert_eq!(ctl.selected_partition(), Some(index));
+    ctl.apply(InspectAction::SelectPartition(Some(index + 99)));
+    assert_eq!(ctl.selected_partition(), None);
+    ctl.apply(InspectAction::SelectPartition(Some(index)));
+    ctl.apply(InspectAction::Close);
+    assert_eq!(ctl.selected_partition(), None);
+}
+
+#[test]
+fn a_row_carries_what_the_list_shows() {
+    let (_dir, _img, ctl) = opened_fat();
+    let rows = ctl.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].number, "1");
+    assert_eq!(rows[0].volume, "T");
+    assert!(rows[0].actions.browse && !rows[0].container && !rows[0].locked);
+}
+
+#[test]
+fn a_picked_image_or_folder_opens_and_a_cancel_changes_nothing() {
+    let (_dir, img, mut ctl) = opened_fat();
+    let fx = ctl.apply(InspectAction::ChooseImage);
+    assert!(matches!(&fx[..], [Effect::PickFile(s)] if s.purpose == purpose::OPEN_IMAGE));
+    let fx = ctl.apply(InspectAction::ChooseBackupFolder);
+    assert!(matches!(&fx[..], [Effect::PickFolder(s)] if s.purpose == purpose::OPEN_BACKUP));
+    ctl.apply(InspectAction::Picked {
+        purpose: purpose::OPEN_IMAGE,
+        path: None,
+    });
+    assert_eq!(ctl.image_path(), Some(img.as_path()));
+    ctl.set_browse_dirty(true);
+    let fx = ctl.apply(InspectAction::Picked {
+        purpose: purpose::OPEN_BACKUP,
+        path: Some(PathBuf::from("/nonexistent/rb-test-backup")),
+    });
+    assert!(matches!(&fx[..], [Effect::Confirm(_)]));
 }
 
 #[test]

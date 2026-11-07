@@ -708,6 +708,7 @@ impl RestoreTab {
                 fs: s.fs,
                 size_bytes: s.size_bytes,
                 kind: SegmentKind::Partition { color_index },
+                partition: None,
             })
             .collect();
         let added = self.ctl.expand_free_bytes();
@@ -743,6 +744,7 @@ impl RestoreTab {
                     fs: String::new(),
                     size_bytes: added,
                     kind: SegmentKind::Free,
+                    partition: None,
                 });
             }
         }

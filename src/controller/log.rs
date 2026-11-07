@@ -76,6 +76,13 @@ impl LogStore {
         self.add(LogLevel::Error, message);
     }
 
+    /// Add a controller's drained log lines.
+    pub fn extend_lines(&mut self, lines: Vec<(LogLevel, String)>) {
+        for (level, message) in lines {
+            self.add(level, message);
+        }
+    }
+
     pub fn entries(&self) -> &[LogEntry] {
         &self.entries
     }

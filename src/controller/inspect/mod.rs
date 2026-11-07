@@ -17,6 +17,7 @@
 
 mod browse;
 mod export;
+mod layout;
 mod open;
 mod tools;
 
@@ -37,6 +38,11 @@ use dsk_clonezilla::metadata::ClonezillaImage;
 pub use export::{
     per_partition_refusal, ExportFormatChoice, ExportNotes, ExportSettings, LayoutBar, CHD_REFUSAL,
     EXPORT_FORMATS,
+};
+pub use layout::{
+    format_block_size, format_bytes_grouped, format_size_decimal, format_size_exact, hints,
+    segment_at, segment_widths, LayoutSegment, PartitionRow, SegmentKind, BAR_HEIGHT,
+    LABEL_THRESHOLD_PX, MIN_SEGMENT_PX,
 };
 pub use tools::{FsckView, ResizePlan};
 
@@ -73,6 +79,8 @@ pub mod purpose {
     pub const EXPORT_FOLDER: &str = "inspect.export_folder";
     pub const EXPORT_HFV: &str = "inspect.export_hfv";
     pub const REMOTE_BACKUP: &str = "inspect.remote_backup";
+    pub const OPEN_IMAGE: &str = "inspect.open_image";
+    pub const OPEN_BACKUP: &str = "inspect.open_backup";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -86,6 +94,23 @@ pub mod ids {
     pub const RESIZE: &str = "inspect.resize";
     pub const CHD_INFO: &str = "inspect.chd_info";
     pub const CLOSE: &str = "inspect.close";
+    pub const SOURCE: &str = "inspect.source";
+    pub const SOURCE_RECENT: &str = "inspect.source.recent";
+    pub const SOURCE_DEVICE: &str = "inspect.source.device";
+    pub const OPEN_FILE: &str = "inspect.source.open_file";
+    pub const OPEN_BACKUP: &str = "inspect.source.open_backup";
+    pub const CONNECT_REMOTE: &str = "inspect.source.connect_remote";
+    pub const CONVERT_FLOPPY: &str = "inspect.convert_floppy";
+    pub const CANCEL_EXPORT: &str = "inspect.cancel_export";
+    pub const SWAP_WORD_ORDER: &str = "inspect.swap_word_order";
+    pub const PARTITION_BAR: &str = "inspect.partition_bar";
+    pub const PARTITION_TABLE: &str = "inspect.partition_table";
+    pub const ROW_CALC_MIN: &str = "inspect.row.calc_min";
+    pub const ROW_BROWSE: &str = "inspect.row.browse";
+    pub const ROW_CHECK: &str = "inspect.row.check";
+    pub const ROW_EXPAND_HFS: &str = "inspect.row.expand_hfs";
+    pub const ROW_DEFRAGMENT: &str = "inspect.row.defragment";
+    pub const ROW_RESIZE_ALTO: &str = "inspect.row.resize_alto";
 }
 
 /// What the user picked to inspect.
@@ -138,6 +163,10 @@ pub enum UnsavedGate {
 pub enum InspectAction {
     /// Switch to a source the user picked (asks first while the browse view holds edits).
     Open(InspectSource),
+    /// Open File: ask for an image, then open it as [`InspectAction::Open`] does.
+    ChooseImage,
+    /// Open Backup Folder: ask for a folder, then open it as [`InspectAction::Open`] does.
+    ChooseBackupFolder,
     /// The Close button (asks first while the browse view holds edits).
     Close,
     /// Switch without asking: a hand-off from another tab, a nested image, a device list change.
@@ -147,6 +176,8 @@ pub enum InspectAction {
         quiet: bool,
     },
     Reinspect,
+    /// Select the partition with this index in the bar and the list, or clear the selection.
+    SelectPartition(Option<usize>),
     /// Compute the deferred minimum size of the partition with this index.
     CalcMin(usize),
     /// Browse the partition with this index.
@@ -315,23 +346,6 @@ pub struct RowActions {
     pub resize_alto: bool,
 }
 
-/// One segment of the disk-layout bar; the view picks the colours.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayoutSegment {
-    pub label: String,
-    pub fs: String,
-    pub size_bytes: u64,
-    pub kind: SegmentKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentKind {
-    Partition,
-    /// A map or volume-header entry, not a volume.
-    Dimmed,
-    Free,
-}
-
 /// Jobs and the shell's wake handle.
 pub struct InspectServices {
     pub jobs: JobRegistry,
@@ -370,6 +384,8 @@ struct Found {
     device_file: Option<Arc<std::fs::File>>,
     device_guard: Option<crate::os::TempFileGuard>,
     disk_size: Option<Option<u64>>,
+    /// The partition selected in the view, by index.
+    selected: Option<usize>,
 }
 
 pub struct InspectController {
@@ -869,6 +885,7 @@ impl InspectController {
         let disk_size = self.disk_size();
         let mut segments = Vec::new();
         let mut end = 0u64;
+        let mut volumes = 0usize;
         for part in &self.found.partitions {
             if part.is_extended_container {
                 continue;
@@ -889,15 +906,20 @@ impl InspectController {
                 part.partition_type_string.as_deref(),
                 Some("Apple_partition_map") | Some("SGI_volhdr") | Some("SGI_volume"),
             );
+            let kind = if dimmed {
+                SegmentKind::Dimmed
+            } else {
+                volumes += 1;
+                SegmentKind::Partition {
+                    color_index: volumes - 1,
+                }
+            };
             segments.push(LayoutSegment {
                 label,
                 fs: part.type_name.clone(),
                 size_bytes: part.size_bytes,
-                kind: if dimmed {
-                    SegmentKind::Dimmed
-                } else {
-                    SegmentKind::Partition
-                },
+                kind,
+                partition: Some(part.index),
             });
         }
         // Alignment and GPT backup headers leave a MiB or two that is not user-actionable space.
@@ -908,6 +930,7 @@ impl InspectController {
                     fs: String::new(),
                     size_bytes: free,
                     kind: SegmentKind::Free,
+                    partition: None,
                 });
             }
         }
@@ -1092,6 +1115,12 @@ impl Controller for InspectController {
     fn apply(&mut self, action: InspectAction) -> Vec<Effect> {
         match action {
             InspectAction::Open(source) => self.gate(UnsavedGate::Open, Some(source)),
+            InspectAction::ChooseImage => vec![Effect::PickFile(Self::image_picker())],
+            InspectAction::ChooseBackupFolder => {
+                let title = "Open Backup Folder";
+                let spec = Self::picker(purpose::OPEN_BACKUP, title, false, String::new());
+                vec![Effect::PickFolder(spec)]
+            }
             InspectAction::Close => self.gate(UnsavedGate::Close, None),
             InspectAction::Load(source) => {
                 self.load(source);
@@ -1103,6 +1132,10 @@ impl Controller for InspectController {
             }
             InspectAction::Reinspect | InspectAction::DiskChanged => {
                 self.reinspect();
+                Vec::new()
+            }
+            InspectAction::SelectPartition(index) => {
+                self.select_partition(index);
                 Vec::new()
             }
             InspectAction::CalcMin(index) => {
@@ -1230,6 +1263,15 @@ impl InspectController {
 
     fn picked(&mut self, purpose: &'static str, path: Option<PathBuf>) -> Vec<Effect> {
         match purpose {
+            // A wrapper (`.adz`, ...) is decoded to a temporary file in the open's job.
+            purpose::OPEN_IMAGE => {
+                let source = path.map(InspectSource::ImageFile);
+                return self.open_picked(source);
+            }
+            purpose::OPEN_BACKUP => {
+                let source = path.map(|folder| InspectSource::Backup { folder });
+                return self.open_picked(source);
+            }
             purpose::BOOT_DONOR => self.boot_donor_picked(path),
             purpose::SWAB_DEST => self.swab_picked(path),
             purpose::EXPORT_DISK | purpose::EXPORT_FOLDER | purpose::EXPORT_HFV => {
@@ -1239,6 +1281,32 @@ impl InspectController {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// A source the user's picker chose; a cancel changes nothing.
+    fn open_picked(&mut self, source: Option<InspectSource>) -> Vec<Effect> {
+        match source {
+            Some(source) => self.gate(UnsavedGate::Open, Some(source)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Open File's picker: disk images, Mac archives, or anything.
+    fn image_picker() -> PickSpec {
+        let exts = |list: &[&str]| list.iter().map(|e| e.to_string()).collect();
+        let mut spec = Self::picker(purpose::OPEN_IMAGE, "Open Disk Image", false, String::new());
+        spec.filters = vec![
+            (
+                "Disk Images".to_string(),
+                exts(crate::model::file_types::DISK_IMAGE_EXTS),
+            ),
+            (
+                "Mac archives".to_string(),
+                exts(crate::model::file_types::MAC_ARCHIVE_EXTS),
+            ),
+            ("All Files".to_string(), vec!["*".to_string()]),
+        ];
+        spec
     }
 
     fn confirmed(&mut self, purpose: &'static str, yes: bool) -> Vec<Effect> {

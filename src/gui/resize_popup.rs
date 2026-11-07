@@ -234,6 +234,7 @@ fn show_scaled_bar(ui: &mut egui::Ui, bar: &LayoutBar, scale: u64) {
                 Some(color_index) => SegmentKind::Partition { color_index },
                 None => SegmentKind::Free,
             },
+            partition: None,
         })
         .collect();
     let available = ui.available_width().max(120.0);

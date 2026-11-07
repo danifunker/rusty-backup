@@ -314,15 +314,21 @@ impl InspectController {
             .partitions
             .iter()
             .filter(|p| !p.is_extended_container && !p.is_logical);
-        let seg = |p: &crate::partition::PartitionInfo, size: u64| LayoutSegment {
+        let seg = |color_index, p: &crate::partition::PartitionInfo, size: u64| LayoutSegment {
             label: format!("Partition {}", p.index + 1),
             fs: p.type_name.clone(),
             size_bytes: size,
-            kind: SegmentKind::Partition,
+            kind: SegmentKind::Partition { color_index },
+            partition: Some(p.index),
         };
-        let current = parts.clone().map(|p| seg(p, p.size_bytes)).collect();
+        let current = parts
+            .clone()
+            .enumerate()
+            .map(|(i, p)| seg(i, p, p.size_bytes))
+            .collect();
         let after = parts
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let size = match self
                     .export
                     .settings
@@ -334,7 +340,7 @@ impl InspectController {
                     Some(c) if c.effective_size() != 0 => c.effective_size(),
                     _ => p.size_bytes,
                 };
-                seg(p, size)
+                seg(i, p, size)
             })
             .collect();
         LayoutBar { current, after }

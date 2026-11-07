@@ -244,12 +244,15 @@ impl Target for JobProbeController {
 /// `Custom`), `TableDelete` / `TableUndo` (a row), `TableAdd`, `TableValidate`, `ApplyTable`;
 /// probes `can_add_partition`, `editor_open`, `table_rows`, `table_modes` (row 0's choices),
 /// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `floppy_source`, `alto_source`.
+/// The source and the list: `ChooseImage`, `ChooseBackupFolder`, `Select` (a partition index);
+/// probes `selected` (-1 for none), `row_number`, `row_volume` (row 0), `layout_segments`.
 struct InspectTarget {
     ctl: rusty_backup::controller::inspect::InspectController,
     dir: tempfile::TempDir,
     asked: Option<&'static str>,
     log: Vec<String>,
     can_add: bool,
+    layout_segments: usize,
 }
 
 impl InspectTarget {
@@ -266,7 +269,12 @@ impl InspectTarget {
             asked: None,
             log: Vec::new(),
             can_add: false,
+            layout_segments: 0,
         }
+    }
+
+    fn first_row(&self) -> Result<rusty_backup::controller::inspect::PartitionRow, String> {
+        self.ctl.rows().into_iter().next().ok_or("no rows".into())
     }
 
     fn note(&mut self, fx: Vec<Effect>) -> Vec<Effect> {
@@ -278,6 +286,7 @@ impl InspectTarget {
         self.log
             .extend(self.ctl.take_log().into_iter().map(|(_, m)| m));
         self.can_add = self.ctl.can_add_partition();
+        self.layout_segments = self.ctl.layout().len();
         fx
     }
 
@@ -432,6 +441,14 @@ impl Target for InspectTarget {
             }
             "Close" => InspectAction::Close,
             "Reinspect" => InspectAction::Reinspect,
+            "ChooseImage" => InspectAction::ChooseImage,
+            "ChooseBackupFolder" => InspectAction::ChooseBackupFolder,
+            "Select" => {
+                let index = arg
+                    .and_then(Value::as_integer)
+                    .ok_or("Select needs an index")?;
+                InspectAction::SelectPartition(Some(index as usize))
+            }
             "Check" => {
                 let row = arg.and_then(Value::as_integer).ok_or("Check needs a row")? as usize;
                 let index = self.ctl.partitions().get(row).ok_or("no such row")?.index;
@@ -478,6 +495,10 @@ impl Target for InspectTarget {
             }
             "error" => Value::String(self.ctl.last_error().unwrap_or("").to_string()),
             "source_label" => Value::String(self.ctl.source_label(&[])),
+            "selected" => Value::Integer(self.ctl.selected_partition().map_or(-1, |i| i as i64)),
+            "row_number" => Value::String(self.first_row()?.number),
+            "row_volume" => Value::String(self.first_row()?.volume),
+            "layout_segments" => Value::Integer(self.layout_segments as i64),
             "can_close" => Value::Boolean(self.ctl.can_close()),
             "export_format" | "export_whole_disk" | "export_modes" | "export_size_mib" => {
                 self.export_probe(name)?

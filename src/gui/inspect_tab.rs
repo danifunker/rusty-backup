@@ -6,19 +6,16 @@
 //! the Optical and Archives hand-offs, Expand HFS). Dialogs with their own widgets (resize,
 //! Expand HFS, Alto resize, floppy convert, physical export) take their inputs from the controller.
 
-#[cfg(feature = "rust173-polyfill")]
-use rusty_backup::rust173_compat::IntIsMultipleOf as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::inspect::{
-    expand_image_bytes, format_size, per_partition_refusal, BackupSummary, ChdProfile,
-    ClonezillaSummary, ExportFormat, ExportFormatChoice, HostRequest, InspectAction,
-    InspectController, InspectServices, InspectSource, LayoutBar, LayoutSegment, MinCell,
-    SegmentKind, CHD_REFUSAL, EXPAND_IMAGE_MIB_MAX,
+    expand_image_bytes, format_size, format_size_exact, hints, per_partition_refusal, purpose,
+    BackupSummary, ChdProfile, ClonezillaSummary, ExportFormat, ExportFormatChoice, HostRequest,
+    InspectAction, InspectController, InspectServices, InspectSource, LayoutBar, MinCell,
+    CHD_REFUSAL, EXPAND_IMAGE_MIB_MAX,
 };
-use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller as _, Effect};
 
 use super::alto_resize_dialog::AltoResizeDialog;
@@ -29,11 +26,6 @@ use super::effects::{EffectHost, Reply};
 use super::expand_hfs_dialog::ExpandHfsDialog;
 use super::floppy_convert_dialog::FloppyConvertDialog;
 use super::physical_disk_export::PhysicalDiskExport;
-use super::picker;
-
-/// Purposes of the tab's own source pickers, kept apart from the controller's.
-const OWN_PICK_IMAGE: &str = "inspect-tab.open-image";
-const OWN_PICK_BACKUP: &str = "inspect-tab.open-backup-folder";
 
 fn new_controller() -> InspectController {
     InspectController::new(InspectServices {
@@ -46,8 +38,6 @@ pub struct InspectTab {
     ctl: InspectController,
     /// Pickers and confirmations the controller asks for.
     effects: EffectHost,
-    /// Answers to the tab's own pickers that came back at once (a refusal or a sync fallback).
-    own_replies: Vec<Reply>,
     /// Effects from a call made outside `show`, run on the next frame.
     pending_fx: Vec<Effect>,
     /// In-memory mirror of the Inspect recent-image list (config.json), for the picker.
@@ -78,7 +68,6 @@ impl InspectTab {
         Self {
             ctl: new_controller(),
             effects: EffectHost::default(),
-            own_replies: Vec::new(),
             pending_fx: Vec::new(),
             recent_files: recent.list(RecentMode::Inspect),
             recent,
@@ -187,13 +176,7 @@ impl InspectTab {
     }
 
     fn drain_log(&mut self, ctx: &mut TabContext) {
-        for (level, msg) in self.ctl.take_log() {
-            match level {
-                LogLevel::Info => ctx.log.info(msg),
-                LogLevel::Warning => ctx.log.warn(msg),
-                LogLevel::Error => ctx.log.error(msg),
-            }
-        }
+        ctx.log.extend_lines(self.ctl.take_log());
     }
 
     fn carry_out_requests(&mut self) {
@@ -214,49 +197,24 @@ impl InspectTab {
         }
     }
 
-    /// Open the tab's own source picker; its answer reaches `run_effects` on a later frame.
-    fn own_pick(
-        &mut self,
-        ctx: &egui::Context,
-        purpose: &'static str,
-        dialog: rfd::AsyncFileDialog,
-        kind: picker::Kind,
-    ) {
-        if let Some(reply) = self.effects.pick_own(ctx, purpose, dialog, kind) {
-            self.own_replies.push(reply);
-            ctx.request_repaint();
-        }
-    }
-
-    /// A source the tab's own picker chose; a cancel changes nothing.
-    fn open_picked(&mut self, source: Option<InspectSource>) {
-        if let Some(source) = source {
-            self.remote_browser.disconnect();
-            self.act(InspectAction::Open(source));
-        }
-    }
-
     /// Run the effects waiting and the modal on screen; answers go back to the controller.
     fn run_effects(&mut self, ui: &egui::Ui, ctx: &mut TabContext) {
         let fx = std::mem::take(&mut self.pending_fx);
         let mut messages = Vec::new();
-        let mut replies = std::mem::take(&mut self.own_replies);
-        replies.extend(self.effects.run(ui.ctx(), fx, &mut messages));
+        let mut replies = self.effects.run(ui.ctx(), fx, &mut messages);
         replies.extend(self.effects.show(ui.ctx(), "inspect"));
         for msg in messages {
             ctx.log.info(msg);
         }
         for reply in replies {
             let action = match reply {
-                Reply::Picked { purpose, path } if purpose == OWN_PICK_IMAGE => {
-                    self.open_picked(path.map(InspectSource::ImageFile));
-                    continue;
+                Reply::Picked { purpose, path } => {
+                    let source = matches!(purpose, purpose::OPEN_IMAGE | purpose::OPEN_BACKUP);
+                    if source && path.is_some() {
+                        self.remote_browser.disconnect();
+                    }
+                    InspectAction::Picked { purpose, path }
                 }
-                Reply::Picked { purpose, path } if purpose == OWN_PICK_BACKUP => {
-                    self.open_picked(path.map(|folder| InspectSource::Backup { folder }));
-                    continue;
-                }
-                Reply::Picked { purpose, path } => InspectAction::Picked { purpose, path },
                 Reply::Confirmed { purpose, yes } => InspectAction::Confirmed { purpose, yes },
                 Reply::Answered { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
             };
@@ -308,7 +266,7 @@ impl InspectTab {
             }),
             // A wrapper (`.adz`, ...) is decoded to a temporary file in the open's job.
             SourceEvent::Recent(path) => Some(InspectSource::ImageFile(path)),
-            // Inspect offers no host folder; its own pickers answer through `run_effects`.
+            // Inspect offers no host folder; the controller runs the two pickers.
             SourceEvent::Remote
             | SourceEvent::PickImage
             | SourceEvent::PickHostFolder
@@ -342,15 +300,13 @@ impl InspectTab {
             if let Some(ev) =
                 super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
             {
-                use super::source_picker::{image_dialog, SourceEvent};
+                use super::source_picker::SourceEvent;
                 if matches!(ev, SourceEvent::Remote) {
                     self.remote_browser.open();
                 } else if matches!(ev, SourceEvent::PickImage) {
-                    let (dialog, kind) = (image_dialog(true), picker::Kind::Open);
-                    self.own_pick(ui.ctx(), OWN_PICK_IMAGE, dialog, kind);
+                    self.act(InspectAction::ChooseImage);
                 } else if matches!(ev, SourceEvent::PickBackupFolder) {
-                    let (dialog, kind) = (super::file_dialog(), picker::Kind::Folder);
-                    self.own_pick(ui.ctx(), OWN_PICK_BACKUP, dialog, kind);
+                    self.act(InspectAction::ChooseBackupFolder);
                 } else {
                     self.remote_browser.disconnect();
                     if let Some(source) = self.source_for(ev, ctx) {
@@ -626,12 +582,7 @@ impl InspectTab {
                     self.ctl.can_make_bootable(),
                     egui::Button::new("Make Bootable..."),
                 )
-                .on_hover_text(
-                    "Auto-detect what this Mac disk needs to boot (SCSI driver + DDR on a \
-                     full APM disk, boot blocks, blessed System Folder) and apply only the \
-                     missing pieces. A flat HFV is kept flat; you'll be asked for a donor \
-                     disk only if boot blocks are missing.",
-                )
+                .on_hover_text(hints::MAKE_BOOTABLE)
                 .clicked()
             {
                 self.act(InspectAction::MakeBootable);
@@ -960,11 +911,7 @@ impl InspectTab {
                     ui.label("Swapping...");
                 } else if ui
                     .button("Swap Word Order...")
-                    .on_hover_text(
-                        "Write a copy of this image with the two bytes of every 16-bit word \
-                         exchanged, fixing a capture taken through a controller that reverses \
-                         words. The operation is its own inverse.",
-                    )
+                    .on_hover_text(hints::SWAP_WORD_ORDER)
                     .clicked()
                 {
                     want_swab = true;
@@ -998,7 +945,7 @@ impl InspectTab {
             egui::CollapsingHeader::new("Disk layout")
                 .default_open(true)
                 .show(ui, |ui| {
-                    super::partition_bar::PartitionBar::new(bar_segments(&segments)).show(ui);
+                    super::partition_bar::PartitionBar::new(segments).show(ui);
                 });
             ui.add_space(4.0);
         }
@@ -1012,10 +959,9 @@ impl InspectTab {
         }
         let mut action: Option<InspectAction> = None;
         let mut resize_alto = false;
-        let locked = self.ctl.rows_locked();
         let show_min_col = self.ctl.shows_min_columns();
         let has_slots = self.ctl.table_summary().is_some_and(|t| t.has_slots);
-        let parts = self.ctl.partitions().to_vec();
+        let rows = self.ctl.rows();
         let muted = super::theme::muted(ui.visuals());
 
         egui::Grid::new("partition_table")
@@ -1023,13 +969,10 @@ impl InspectTab {
             .min_col_width(60.0)
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("#").strong())
-                    .on_hover_text("Position in this list - the number `IMG@N` takes");
+                    .on_hover_text(hints::NUMBER);
                 if has_slots {
                     ui.label(egui::RichText::new("Slot").strong())
-                        .on_hover_text(
-                            "The partition table's own slot, as the platform names it \
-                         (diskutil's disk4s6, IRIX slot 0) - the number `IMG@sN` takes",
-                        );
+                        .on_hover_text(hints::SLOT);
                 }
                 ui.label(egui::RichText::new("Type").strong());
                 ui.label(egui::RichText::new("Volume").strong());
@@ -1037,41 +980,29 @@ impl InspectTab {
                 ui.label(egui::RichText::new("Size").strong());
                 if show_min_col {
                     ui.label(egui::RichText::new("Min Size").strong())
-                        .on_hover_text("Smallest size achievable by trim alone (no data movement)");
+                        .on_hover_text(hints::MIN_SIZE);
                     ui.label(egui::RichText::new("Defrag Min").strong())
-                        .on_hover_text(
-                            "Smallest size achievable by cloning into a packed target. \
-                             Used when restoring with \"Resize partitions to minimum size.\"",
-                        );
+                        .on_hover_text(hints::DEFRAG_MIN);
                 }
                 ui.label(egui::RichText::new("Block Size").strong());
                 ui.label(egui::RichText::new("Boot").strong());
                 ui.label(egui::RichText::new("").strong());
                 ui.end_row();
 
-                for (pos, part) in parts.iter().enumerate() {
-                    // The position is the number the user types back as `@N`; the slot has its column.
-                    let index_label = if part.is_logical {
-                        format!("  {} (logical)", pos + 1)
-                    } else if part.is_extended_container {
-                        format!("{} (container)", pos + 1)
-                    } else {
-                        format!("{}", pos + 1)
-                    };
-                    let slot = self.ctl.slot(part);
-                    if part.is_extended_container {
-                        ui.label(egui::RichText::new(index_label).color(muted));
+                for row in &rows {
+                    if row.container {
+                        ui.label(egui::RichText::new(&row.number).color(muted));
                         if has_slots {
-                            ui.label(egui::RichText::new(slot).color(muted));
+                            ui.label(egui::RichText::new(&row.slot).color(muted));
                         }
-                        ui.label(egui::RichText::new(&part.type_name).color(muted));
+                        ui.label(egui::RichText::new(&row.type_name).color(muted));
                         ui.label("");
-                        ui.label(egui::RichText::new(format!("{}", part.start_lba)).color(muted));
-                        ui.label(egui::RichText::new(format_size(part.size_bytes)).color(muted));
+                        ui.label(egui::RichText::new(format!("{}", row.start_lba)).color(muted));
+                        ui.label(egui::RichText::new(format_size(row.size_bytes)).color(muted));
                         if show_min_col {
-                            match self.ctl.min_cell(part) {
+                            match &row.min {
                                 MinCell::Size(sz) => {
-                                    ui.label(egui::RichText::new(format_size(sz)).color(muted));
+                                    ui.label(egui::RichText::new(format_size(*sz)).color(muted));
                                 }
                                 _ => {
                                     ui.label("");
@@ -1085,19 +1016,18 @@ impl InspectTab {
                         ui.end_row();
                         continue;
                     }
-                    ui.label(index_label);
+                    ui.label(&row.number);
                     if has_slots {
-                        ui.label(slot);
+                        ui.label(&row.slot);
                     }
-                    ui.label(&part.type_name);
-                    // Probed live from the partition, never from backup metadata.
-                    ui.label(self.ctl.volume_label(part.index).unwrap_or(""));
-                    ui.label(format!("{}", part.start_lba));
-                    ui.label(format_size(part.size_bytes));
+                    ui.label(&row.type_name);
+                    ui.label(&row.volume);
+                    ui.label(format!("{}", row.start_lba));
+                    ui.label(format_size(row.size_bytes));
                     if show_min_col {
-                        match self.ctl.min_cell(part) {
+                        match &row.min {
                             MinCell::Size(sz) => {
-                                ui.label(format_size(sz));
+                                ui.label(format_size(*sz));
                             }
                             MinCell::Pending(phase) => {
                                 ui.add(egui::Spinner::new()).on_hover_text(phase);
@@ -1105,39 +1035,34 @@ impl InspectTab {
                             MinCell::CanCalc => {
                                 if ui
                                     .small_button("Calc min")
-                                    .on_hover_text(
-                                        "Compute minimum size (requires a filesystem walk)",
-                                    )
+                                    .on_hover_text(hints::CALC_MIN)
                                     .clicked()
                                 {
-                                    action = Some(InspectAction::CalcMin(part.index));
+                                    action = Some(InspectAction::CalcMin(row.index));
                                 }
                             }
                             MinCell::Empty => {
                                 ui.label("");
                             }
                         }
-                        match self.ctl.defrag_min(part) {
+                        match row.defrag_min {
                             Some(d) => ui.label(format_size(d)),
                             None => ui.label(""),
                         };
                     }
-                    match part.hfs_block_size {
-                        Some(bs) => ui.label(format_block_size(bs)),
-                        None => ui.label(""),
-                    };
-                    ui.label(if part.bootable { "Yes" } else { "" });
-                    let acts = self.ctl.row_actions(part);
-                    ui.add_enabled_ui(!locked, |ui| {
+                    ui.label(&row.block_size);
+                    ui.label(if row.bootable { "Yes" } else { "" });
+                    let acts = row.actions;
+                    ui.add_enabled_ui(!row.locked, |ui| {
                         if !acts.browse {
                             ui.label("");
                             return;
                         }
                         if ui.small_button("Browse").clicked() {
-                            action = Some(InspectAction::Browse(part.index));
+                            action = Some(InspectAction::Browse(row.index));
                         }
                         if acts.check && ui.small_button("Check").clicked() {
-                            action = Some(InspectAction::Check(part.index));
+                            action = Some(InspectAction::Check(row.index));
                         }
                         if acts.expand_hfs
                             && ui
@@ -1148,19 +1073,15 @@ impl InspectTab {
                                 )
                                 .clicked()
                         {
-                            action = Some(InspectAction::ExpandHfs(part.index));
+                            action = Some(InspectAction::ExpandHfs(row.index));
                         }
                         if acts.defragment
                             && ui
                                 .small_button("Defragment...")
-                                .on_hover_text(
-                                    "Repack this Human68k volume so its files are stored \
-                                     contiguously, reclaiming holes left by deleted files. \
-                                     Rewrites the partition in place - back up first.",
-                                )
+                                .on_hover_text(hints::DEFRAGMENT)
                                 .clicked()
                         {
-                            action = Some(InspectAction::Defragment(part.index));
+                            action = Some(InspectAction::Defragment(row.index));
                         }
                         if acts.resize_alto
                             && ui
@@ -1407,11 +1328,7 @@ fn show_clonezilla_metadata(ui: &mut egui::Ui, cz: &ClonezillaSummary) {
     });
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Source Size:").strong());
-        ui.label(format!(
-            "{} ({} bytes)",
-            format_size_decimal(cz.source_size_bytes),
-            format_bytes_grouped(cz.source_size_bytes),
-        ));
+        ui.label(format_size_exact(cz.source_size_bytes));
         if let Some((c, h, s)) = cz.chs {
             ui.label(format!("  CHS: {c} / {h} / {s}"));
         }
@@ -1448,11 +1365,7 @@ fn show_backup_metadata(ui: &mut egui::Ui, meta: &BackupSummary) {
     ui.horizontal(|ui| {
         if meta.min_restore_bytes > 0 {
             ui.label(egui::RichText::new("Minimum Size:").strong());
-            ui.label(format!(
-                "{} ({} bytes)",
-                format_size_decimal(meta.min_restore_bytes),
-                format_bytes_grouped(meta.min_restore_bytes),
-            ));
+            ui.label(format_size_exact(meta.min_restore_bytes));
         } else if meta.source_size_bytes > 0 {
             ui.label(egui::RichText::new("Source Size:").strong());
             ui.label(format_size(meta.source_size_bytes));
@@ -1463,69 +1376,11 @@ fn show_backup_metadata(ui: &mut egui::Ui, meta: &BackupSummary) {
     ui.add_space(8.0);
 }
 
-/// Base-1000 units, the way storage media is marketed ("8 GB" = 8,000,000,000 bytes).
-fn format_size_decimal(bytes: u64) -> String {
-    const GB: f64 = 1_000_000_000.0;
-    const MB: f64 = 1_000_000.0;
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.2} GB", b / GB)
-    } else {
-        format!("{:.1} MB", b / MB)
-    }
-}
-
-/// An HFS allocation block size: "N KiB" when a whole number of KiB, else "N B".
-fn format_block_size(bytes: u32) -> String {
-    if bytes >= 1024 && bytes.is_multiple_of(1024) {
-        format!("{} KiB", bytes / 1024)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-/// A byte count with digit grouping (1,048,576).
-fn format_bytes_grouped(bytes: u64) -> String {
-    let s = bytes.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    result.chars().rev().collect()
-}
-
-/// The controller's layout as bar segments, the palette cycling over real volumes.
-fn bar_segments(layout: &[LayoutSegment]) -> Vec<super::partition_bar::Segment> {
-    use super::partition_bar::{Segment, SegmentKind as Kind};
-    let mut color_index = 0usize;
-    layout
-        .iter()
-        .map(|s| Segment {
-            label: s.label.clone(),
-            fs: s.fs.clone(),
-            size_bytes: s.size_bytes,
-            kind: match s.kind {
-                SegmentKind::Partition => {
-                    color_index += 1;
-                    Kind::Partition {
-                        color_index: color_index - 1,
-                    }
-                }
-                SegmentKind::Dimmed => Kind::Dimmed,
-                SegmentKind::Free => Kind::Free,
-            },
-        })
-        .collect()
-}
-
 /// The Export window's Current and After bars, at one shared byte-per-pixel scale.
 fn show_export_disk_layout_bars(ui: &mut egui::Ui, layout: &LayoutBar) {
     use super::partition_bar::PartitionBar;
-    let current = bar_segments(&layout.current);
-    let after = bar_segments(&layout.after);
+    let current = layout.current.clone();
+    let after = layout.after.clone();
     let current_total: u64 = current.iter().map(|s| s.size_bytes).sum();
     let after_total: u64 = after.iter().map(|s| s.size_bytes).sum();
     let max_total = current_total.max(after_total).max(1);

@@ -52,13 +52,7 @@ pub fn show_log(ui: &mut egui::Ui, app: &mut AppController) {
 
 /// Move a controller's log lines into the log panel.
 pub fn drain_log_lines(lines: Vec<(LogLevel, String)>, log: &mut LogStore) {
-    for (level, msg) in lines {
-        match level {
-            LogLevel::Info => log.info(msg),
-            LogLevel::Warning => log.warn(msg),
-            LogLevel::Error => log.error(msg),
-        }
-    }
+    log.extend_lines(lines);
 }
 
 /// Draw a running job: its step, a bar (an activity bar when the total is unknown),
