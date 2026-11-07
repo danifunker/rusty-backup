@@ -27,7 +27,7 @@ seekable-zstd, remote, tui, crypto, yaml` (root `Cargo.toml`).
 | macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default | |
 | Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default | |
 | Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default | |
-| Linux GTK4 shell (compile check) | gtk4 | modern | nothing yet: `frontends/gtk4/`, screens in progress | GTK4 (Phase 4) | stable (gtk4-rs needs >= 1.92) | shell features | Not shipped until it reaches parity; needs GTK >= 4.14 and libadwaita >= 1.5, and links ALSA (libasound) for the CD-DA player |
+| Linux GTK4 shell (x64 deb, rpm, Arch) | gtk4 | modern | `rusty-backup-gtk` packages as CI artifacts (not in releases yet): `frontends/gtk4/` | GTK4 (Phase 4) | stable (gtk4-rs needs >= 1.92) | shell features | x64 only so far; needs GTK >= 4.14 and libadwaita >= 1.5, and links ALSA (libasound) for the CD-DA player |
 | Linux riscv64 GUI | riscv64 | modern | egui GUI + rb-cli, deb + rpm | GTK4 (Phase 4) | stable | default | |
 | Linux static musl x64, arm64, i586, i686, ppc64, ppc32 | musl | modern | rb-cli + TUI | TUI | stable; i586 pinned 1.98.1; ppc32 nightly + build-std; ppc via cargo-zigbuild | pure-zstd, remote, tui | no GUI, no CHD, no optical, no crypto |
 | Linux glibc ppc64, ppc, riscv64 (extra-arch) | extra-arch | modern | rb-cli + TUI | TUI | stable | pure-zstd, remote, tui | no GUI, no CHD, no optical, no crypto |

@@ -6,4 +6,6 @@
   `share/icons/hicolor/<size>/apps/io.github.danifunker.RustyBackup.png`. The window asks the
   theme for that name, so an uninstalled build shows the generic icon.
 
-Packaging (slice 9 of `docs/gtk4_shell_plan.md`) installs both.
+`frontends/gtk4/Cargo.toml` carries the `cargo deb` and `cargo generate-rpm` metadata, and the
+`build-gtk4` CI job builds the `.deb`, `.rpm` and an Arch `.pkg.tar.zst` from it, named
+`rusty-backup-gtk` so they install beside egui's packages.

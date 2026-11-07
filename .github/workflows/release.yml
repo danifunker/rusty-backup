@@ -1899,9 +1899,11 @@ jobs:
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.
   build-gtk4:
     name: Build GTK4 shell
-    needs: plan
+    needs: [generate-version, plan]
     if: needs.plan.outputs.gtk4 == 'true'
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     defaults:
       run:
         working-directory: frontends/gtk4
@@ -1910,13 +1912,49 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev
+          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Validate the desktop file
+        run: desktop-file-validate data/io.github.danifunker.RustyBackup.desktop
+      - name: Build
+        run: cargo build --locked --release
+      # The packages sit beside egui's: rusty-backup-gtk, its own desktop file and icon name.
+      - name: Install packaging tools
+        run: |
+          for crate in cargo-deb cargo-generate-rpm; do
+            for attempt in 1 2 3; do
+              cargo install --locked "$crate" && break
+              echo "Install of $crate failed (attempt $attempt/3)"; sleep 15
+              [ "$attempt" = 3 ] && { echo "::error::failed to install $crate"; exit 1; }
+            done
+          done
+      - name: Build packages
+        run: |
+          OUT="Rusty-Backup-GTK-linux-x64-${RELEASE_VERSION}"
+          cargo deb --no-build -o "../../${OUT}.deb"
+          cargo generate-rpm -o "../../${OUT}.rpm"
+          root=arch-pkg
+          install -Dm755 target/release/rusty-backup-gtk "$root/usr/bin/rusty-backup-gtk"
+          install -Dm644 data/io.github.danifunker.RustyBackup.desktop -t "$root/usr/share/applications"
+          for n in 16 32 48 64 128 256; do
+            install -Dm644 "../../assets/icons/icon-${n}.png" \
+              "$root/usr/share/icons/hicolor/${n}x${n}/apps/io.github.danifunker.RustyBackup.png"
+          done
+          tar -C "$root" --zstd -cf "../../${OUT}.pkg.tar.zst" .
+          ls -l ../../"${OUT}".*
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-GTK-linux-x64-${{ needs.generate-version.outputs.version }}
+          path: |
+            Rusty-Backup-GTK-linux-x64-*.deb
+            Rusty-Backup-GTK-linux-x64-*.rpm
+            Rusty-Backup-GTK-linux-x64-*.pkg.tar.zst
 
   # Every crate under crates/ runs its own tests on the Rust 1.73 floor. The app's
   # vintage builds only compile the crates, so this is the one place their tests
