@@ -21,6 +21,7 @@ mod size_row;
 mod source;
 mod sync;
 mod theme;
+mod volume;
 mod wake;
 mod widgets;
 

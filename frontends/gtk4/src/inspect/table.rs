@@ -10,13 +10,9 @@ use rusty_backup::controller::inspect::{
 };
 
 use super::ActionFn;
-use crate::widgets::{coming, set_text};
+use crate::widgets::set_text;
 
 type Cell = fn(&PartitionRow) -> String;
-
-const COMING_CHECK: &str = "the Check results window";
-const COMING_EXPAND_HFS: &str = "the Expand HFS dialog";
-const COMING_RESIZE_ALTO: &str = "the Alto resize dialog";
 
 /// The row bound to a list item.
 fn row_of(item: &gtk::ListItem) -> Option<glib::BoxedAnyObject> {
@@ -85,14 +81,6 @@ fn row_button(
     button
 }
 
-fn placeholder(label: &str, id: &str, what: &str) -> gtk::Button {
-    let button = gtk::Button::with_label(label);
-    button.add_css_class("flat");
-    button.set_widget_name(id);
-    coming(&button, what);
-    button
-}
-
 fn min_column(send: &ActionFn) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let send = send.clone();
@@ -150,9 +138,10 @@ fn min_column(send: &ActionFn) -> gtk::ColumnViewColumn {
     column
 }
 
-fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
+fn actions_column(send: &ActionFn, alto: &Rc<dyn Fn()>) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     let send = send.clone();
+    let alto = alto.clone();
     factory.connect_setup(move |_, obj| {
         let item = list_item(obj);
         let cell = gtk::Box::new(gtk::Orientation::Horizontal, 2);
@@ -164,11 +153,19 @@ fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
             InspectAction::Browse,
         );
         cell.append(&browse);
-        cell.append(&placeholder("Check", ids::ROW_CHECK, COMING_CHECK));
-        cell.append(&placeholder(
+        cell.append(&row_button(
+            item,
+            "Check",
+            ids::ROW_CHECK,
+            &send,
+            InspectAction::Check,
+        ));
+        cell.append(&row_button(
+            item,
             "Expand/Export...",
             ids::ROW_EXPAND_HFS,
-            COMING_EXPAND_HFS,
+            &send,
+            InspectAction::ExpandHfs,
         ));
         let defragment = row_button(
             item,
@@ -179,11 +176,12 @@ fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
         );
         defragment.set_tooltip_text(Some(hints::DEFRAGMENT));
         cell.append(&defragment);
-        cell.append(&placeholder(
-            "Resize...",
-            ids::ROW_RESIZE_ALTO,
-            COMING_RESIZE_ALTO,
-        ));
+        let resize = gtk::Button::with_label("Resize...");
+        resize.add_css_class("flat");
+        resize.set_widget_name(ids::ROW_RESIZE_ALTO);
+        let open = alto.clone();
+        resize.connect_clicked(move |_| open());
+        cell.append(&resize);
         item.set_child(Some(&cell));
     });
     factory.connect_bind(move |_, obj| {
@@ -206,14 +204,11 @@ fn actions_column(send: &ActionFn) -> gtk::ColumnViewColumn {
             button.set_visible(visible);
             child = button.next_sibling();
         }
-        // Browse and Defragment are live so far; the rows lock while Defragment runs.
-        let browse = cell.first_child();
-        let defragment = browse.as_ref().and_then(|c| {
-            let c = c.next_sibling()?.next_sibling()?;
-            c.next_sibling()
-        });
-        for button in [browse, defragment].into_iter().flatten() {
+        // The rows lock while a tool rewrites the disk.
+        let mut child = cell.first_child();
+        while let Some(button) = child {
             button.set_sensitive(!row.locked);
+            child = button.next_sibling();
         }
     });
     gtk::ColumnViewColumn::new(None, Some(factory))
@@ -230,7 +225,8 @@ pub struct PartitionTable {
 }
 
 impl PartitionTable {
-    pub fn build(send: &ActionFn) -> Rc<PartitionTable> {
+    /// `alto` opens Resize Alto Disk, the view's own window.
+    pub fn build(send: &ActionFn, alto: Rc<dyn Fn()>) -> Rc<PartitionTable> {
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let selection = gtk::SingleSelection::builder()
             .model(&store)
@@ -265,7 +261,7 @@ impl PartitionTable {
         ] {
             view.append_column(column);
         }
-        view.append_column(&actions_column(send));
+        view.append_column(&actions_column(send, &alto));
 
         let root = gtk::ScrolledWindow::builder()
             .child(&view)

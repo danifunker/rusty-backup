@@ -198,7 +198,7 @@ impl WriteImageRows {
         root.add(&image);
         let size = line();
         let note = line();
-        let write = super::write_target_button();
+        let write = super::write_target_button(send);
         write.set_halign(gtk::Align::Start);
         write.set_margin_top(6);
         root.add(&size);

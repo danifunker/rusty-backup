@@ -3,7 +3,7 @@
 //! See docs/gtk4_shell_plan.md for the pattern; `src/gui/restore_tab.rs` is the reference. Start
 //! only ever sends `Start`: the write begins on the controller's own `Confirm`, and the target
 //! named above the button is `write_target()`, the name that question uses. Write Image File's
-//! window is the Physical Disk Export, a later slice, so it stays greyed out here.
+//! window is the Physical Disk Export (`crate::volume::disk_write`), whose own Write asks.
 
 mod sizes;
 mod source;
@@ -30,7 +30,8 @@ use crate::form::{button, combo, group, line, set_combo, set_line, set_switch, s
 use crate::form::{Notes, Tone};
 use crate::progress::{JobList, Run, RunBar};
 use crate::sync::SyncGuard;
-use crate::widgets::{coming, set_text};
+use crate::volume::disk_write::DiskWriteDialog;
+use crate::widgets::set_text;
 
 use sizes::{Sizes, SizesShown};
 use source::{SourceRows, SourceShown, WriteImageRows, WriteShown};
@@ -60,6 +61,8 @@ fn slot_of(mode: RestoreMode) -> Option<TargetSlot> {
 
 pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
+    /// Write Image File's window, kept so a running write keeps its controller.
+    writer: Rc<DiskWriteDialog>,
     host: EffectHost,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
@@ -212,8 +215,9 @@ impl RestoreScreen {
             RestoreScreen {
                 ctrl: RefCell::new(RestoreController::new(RestoreServices {
                     jobs: JobRegistry::new(),
-                    notify,
+                    notify: notify.clone(),
                 })),
+                writer: DiskWriteDialog::new(notify, host.clone()),
                 host,
                 recent,
                 recent_files: RefCell::new(recent_files),
@@ -250,12 +254,13 @@ impl RestoreScreen {
     }
 
     pub fn is_running(&self) -> bool {
-        self.ctrl.borrow().is_running()
+        self.ctrl.borrow().is_running() || self.writer.is_writing()
     }
 
     /// The app's device list; a target's row is reconciled before anything shows it.
     pub fn set_devices(&self, devices: &[DiskDevice], refreshing: bool) {
         self.ctrl.borrow_mut().reconcile_devices(devices);
+        self.writer.set_devices(devices);
         *self.devices.borrow_mut() = devices.to_vec();
         self.refreshing.set(refreshing);
     }
@@ -290,6 +295,7 @@ impl RestoreScreen {
     }
 
     pub fn tick(&self) {
+        self.writer.tick();
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -360,18 +366,14 @@ impl RestoreScreen {
 
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
-        let (requests, mut log) = {
+        let (requests, log) = {
             let mut ctrl = self.ctrl.borrow_mut();
             (ctrl.take_requests(), ctrl.take_log())
         };
         for request in requests {
             match request {
                 HostRequest::RememberRecent(path) => self.remember(&path),
-                // The button that sends this stays greyed out until the window exists.
-                HostRequest::WriteImage(_) => log.push((
-                    LogLevel::Warning,
-                    "The Physical Disk Export window is coming soon.".to_string(),
-                )),
+                HostRequest::WriteImage(open) => self.writer.open(open),
             }
         }
         crate::app::append_log(log);
@@ -497,9 +499,10 @@ impl RestoreScreen {
     }
 }
 
-/// "Choose target and write..." opens a window a later slice builds.
-fn write_target_button() -> gtk::Button {
+/// "Choose target and write..." opens the Physical Disk Export window on the image.
+fn write_target_button(send: &ActionFn) -> gtk::Button {
     let write = button("Choose target and write...", ids::WRITE_TARGET);
-    coming(&write, "the Physical Disk Export window");
+    let s = send.clone();
+    write.connect_clicked(move |_| s(RestoreAction::WriteImageTarget));
     write
 }

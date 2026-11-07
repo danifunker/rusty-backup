@@ -99,6 +99,11 @@ widgets with:
 - A screen whose refresh is skipped off screen connects its root's `map` to `refresh`: a tab selected from code is mapped after the tick that would have drawn it.
 - A list whose rows carry a tick box binds the box's state inside the screen's `SyncGuard`, so a recycled cell taking its new row's value sends nothing back.
 - `TextView::scroll_mark_onscreen` is queued until the lines are measured, so a mark deleted straight after never scrolls. Keep the mark.
+- A dialog with a controller of its own (`volume/`: resize, Expand HFS, Alto, the disk writer) is a struct built when it opens and held by its host, which ticks it and drops it once the controller says it closed. Its `adw::Dialog` has `can_close(false)`: a user close sends the controller's Close, and the window goes by `force_close` only when the controller agrees, so a running write keeps it up. Restore keeps its disk writer for good, so `is_running` sees a write after the window is hidden.
+- A button inside a dialog checks `EffectHost::dialog_over(dialog)`, not `dialog_open`: the dialog itself is the visible one, and only the question it asked covers it.
+- A dialog's height is a wish: `content_height` shrinks to the app window, so give the body a `vexpand` scroller (`volume::scroller`). A scroller with `propagate_natural_height` asks for more than the window and the bottom is clipped.
+- A window only the view holds open (Expand Image) still sits on a `Slot`; when the screen's `Action` is not `Clone`, the slot sends a small `Dismiss` enum and the screen maps it.
+- A destructive dialog shows "Writes to:" with the controller's own name (`ResizeController::write_target`, `table_write_target`, `write_target_name`), the name its question uses.
 
 ## Slices
 
@@ -111,7 +116,8 @@ widgets with:
 | 4 | Backup and Restore | done; `backup/` and `restore/` are the tabs, `form.rs` the adw rows and `chd.rs` / `size_row.rs` the controls later slices reuse; Write Image File picks its source but its Physical Disk Export window is slice 7, greyed out; the top bar's Close Backup and the Inspect share live in `app.rs` |
 | 5 | Build Disk wizard | done; `build_disk/` is the tab, every step egui has: Kind, Output (image and container, or a device), Disk (table, donor, volume, preset, size), Partitions (`rows.rs`), Options, Review, Build; the option rules, hints and `DiskKind::hint` moved into the controller; "Open in Inspect" is `app::open_in_inspect` |
 | 6 | Optical and Archives | done; `optical/` is the tab (source, disc line, output form with the CD CHD control, the CHD Info, Add remote daemon and CD-DA player windows) and `archives/` the other (entry list with tick boxes, fork format, Extract All / Selected, Mount in Inspect); the disc browser is `BrowseView::disc`, with its own header and only Extract beside the listing; Inspect hands an optical image or a Mac archive over through `app::open_in_optical` / `open_in_archives`; Start asks before it replaces an output file, and the output follows the format's extension; a drive is unit-tested only |
-| 7 | Dialogs: resize, expand HFS, Alto resize, partition editor, metadata editor, export, Expand Image, Check results, CHD Info, bulk and floppy convert, remote (with Inspect's Pick Another Image, Back Up Image, Close Remote), settings, update banner | |
+| 7a | Volume dialogs: Resize Partitions, Expand HFS, Resize Alto Disk, the partition editor (Edit Partition Table, Add Partition), Physical Disk Export / Write Image File, Expand Image, Check results, CHD Info, the SquashFS budget | done; `volume/` holds the dialogs with their own controllers (`resize.rs`, `expand_hfs.rs`, `alto.rs`, `disk_write.rs`), `inspect/windows.rs` and `inspect/editor.rs` the Inspect ones; Restore's Write Image File opens the disk writer, which can also pick an image-file target (`PickTargetImage`); the SquashFS budget and the browse view's CHD Info and Check were already slice 2. Resize and Apply Changes now ask a `Confirm` a yes must still match, a resize after its write plans nothing more, and the writer voids a yes whose target changed. A device target is unit-tested only |
+| 7b | Dialogs: metadata editor, Export Disk Image (Inspect's door to Physical Disk Export), bulk and floppy convert, remote (with Inspect's Pick Another Image, Back Up Image, Close Remote), settings, update banner | |
 | 8 | Drop routing, file open, cross-tab handoffs, about, `.desktop` and icon, elevated relaunch | |
 | 9 | Tier B smoke over AT-SPI; deb, rpm and Arch packaging beside egui | |
 
@@ -137,7 +143,7 @@ has landed after the page loaded. Motion is compressed, so a slow drag may arriv
 Broadway has no GDK drag: a `gtk::DragSource` starts and nothing ever receives it.
 
 A `ComboRow`, picker or `DropDown` opens reliably only if the pointer moved onto it first: hover, wait,
-click, and take a screenshot before clicking anything in the list. A blind click into a device list is
+click, and take a screenshot before clicking anything in the list. A popup or a closing dialog can leave the page drawing at another scale, so the next click lands elsewhere: reload the page (navigate to it again) before reading coordinates. The pane's `type` and `key` actions drop punctuation; type a path as one `sendInput` press and release per character, the keysym being the Latin-1 code (`0xff0d` is Return, `0xff08` BackSpace, Ctrl+L is `[0x6c, 4]`), and wait, since the frame lags typed text by several seconds. A blind click into a device list is
 how a physical disk gets picked. Text goes to whatever has focus, so check a `SpinRow`'s text took the
 click (a double click does) before typing. A synthesized `MouseEvent` does not reach a popup's list, and leaves a text field without the keys after a dialog has closed: use the pane's real click for both. The frame lags the state by a second or more, so wait before reading a screenshot. In a file dialog, Ctrl+L then the path then Return works; a
 save dialog takes the path straight into its name field.

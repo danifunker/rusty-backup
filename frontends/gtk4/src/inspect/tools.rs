@@ -1,5 +1,7 @@
 //! The tool buttons under the source picker.
 
+use std::rc::Rc;
+
 use adw::prelude::*;
 use rusty_backup::controller::inspect::{hints, ids, InspectAction};
 
@@ -9,7 +11,14 @@ use crate::widgets::{coming, flow, flow_show};
 /// What the buttons show, read from the controller.
 pub struct ToolState {
     pub can_reinspect: bool,
+    pub can_edit_table: bool,
+    pub can_add_partition: bool,
+    pub add_hint: String,
+    pub can_expand_image: bool,
+    pub expand_hint: &'static str,
     pub can_make_bootable: bool,
+    /// Resize Partitions is open on a running write.
+    pub resizing: bool,
     pub can_close: bool,
     pub has_chd: bool,
     pub is_floppy: bool,
@@ -18,7 +27,11 @@ pub struct ToolState {
 pub struct ToolBar {
     root: gtk::FlowBox,
     reinspect: gtk::Button,
+    edit: gtk::Button,
+    add: gtk::Button,
+    expand: gtk::Button,
     bootable: gtk::Button,
+    resize: gtk::Button,
     floppy: gtk::Button,
     chd: gtk::Button,
     close: gtk::Button,
@@ -43,8 +56,15 @@ fn live(label: &str, id: &str, send: &ActionFn, action: fn() -> InspectAction) -
     b
 }
 
+fn view(label: &str, id: &str, run: Rc<dyn Fn()>) -> gtk::Button {
+    let b = button(label, id);
+    b.connect_clicked(move |_| run());
+    b
+}
+
 impl ToolBar {
-    pub fn build(send: &ActionFn) -> ToolBar {
+    /// `expand_image` and `resize` open the view's own windows.
+    pub fn build(send: &ActionFn, expand_image: Rc<dyn Fn()>, resize: Rc<dyn Fn()>) -> ToolBar {
         let reinspect = live("Re-inspect", ids::REINSPECT, send, || {
             InspectAction::Reinspect
         });
@@ -58,27 +78,19 @@ impl ToolBar {
             ids::CONVERT_FLOPPY,
             "the floppy convert dialog",
         );
-        let edit = stub(
-            "Edit Partition Table...",
-            ids::EDIT_TABLE,
-            "the partition editor",
-        );
-        let add = stub(
-            "Add Partition...",
-            ids::ADD_PARTITION,
-            "the partition editor",
-        );
-        let expand = stub(
-            "Expand Image...",
-            ids::EXPAND_IMAGE,
-            "the Expand Image dialog",
-        );
+        let edit = live("Edit Partition Table...", ids::EDIT_TABLE, send, || {
+            InspectAction::EditTable
+        });
+        let add = live("Add Partition...", ids::ADD_PARTITION, send, || {
+            InspectAction::AddPartition
+        });
+        let expand = view("Expand Image...", ids::EXPAND_IMAGE, expand_image);
         let bootable = live("Make Bootable...", ids::MAKE_BOOTABLE, send, || {
             InspectAction::MakeBootable
         });
         bootable.set_tooltip_text(Some(hints::MAKE_BOOTABLE));
-        let resize = stub("Resize Partitions...", ids::RESIZE, "the resize dialog");
-        let chd = stub("CHD Info", ids::CHD_INFO, "the CHD Info window");
+        let resize = view("Resize Partitions...", ids::RESIZE, resize);
+        let chd = live("CHD Info", ids::CHD_INFO, send, || InspectAction::ChdInfo);
         let close = live("Close", ids::CLOSE, send, || InspectAction::Close);
 
         let root = flow();
@@ -90,7 +102,11 @@ impl ToolBar {
         ToolBar {
             root,
             reinspect,
+            edit,
+            add,
+            expand,
             bootable,
+            resize,
             floppy,
             chd,
             close,
@@ -103,7 +119,14 @@ impl ToolBar {
 
     pub fn show(&self, state: &ToolState) {
         self.reinspect.set_sensitive(state.can_reinspect);
+        self.edit.set_sensitive(state.can_edit_table);
+        self.add.set_sensitive(state.can_add_partition);
+        self.add.set_tooltip_text(Some(&state.add_hint));
+        self.expand.set_sensitive(state.can_expand_image);
+        self.expand.set_tooltip_text(Some(state.expand_hint));
         self.bootable.set_sensitive(state.can_make_bootable);
+        self.resize
+            .set_sensitive(state.can_edit_table && !state.resizing);
         flow_show(&self.floppy, state.is_floppy);
         flow_show(&self.chd, state.has_chd);
         flow_show(&self.close, state.can_close);

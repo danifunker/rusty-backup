@@ -1,13 +1,16 @@
 //! The Inspect tab: a retained view over `controller::inspect::InspectController`.
 //!
-//! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference; the
-//! dialogs are later slices, so their buttons stay greyed out with a tooltip saying so. The browse
-//! view takes the whole tab while it is open.
+//! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference. Its
+//! own windows are `windows.rs` and `editor.rs`; Resize, Expand HFS and Alto resize have
+//! controllers of their own (`crate::volume`). Export and floppy convert stay greyed out until
+//! slice 7b. The browse view takes the whole tab while it is open.
 
 pub mod bar;
 mod details;
+mod editor;
 mod table;
 mod tools;
+mod windows;
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -32,18 +35,23 @@ use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::progress::JobList;
 use crate::source::{Pick, PickerSpec, SourcePicker};
 use crate::sync::SyncGuard;
+use crate::volume::alto::AltoDialog;
+use crate::volume::expand_hfs::ExpandHfsDialog;
+use crate::volume::resize::ResizeDialog;
 use crate::widgets::set_text;
 
 use bar::PartitionBar;
 use details::{show_note, Details};
 use table::PartitionTable;
 use tools::{ToolBar, ToolState};
+use windows::{Dismiss, Windows, WindowsShown};
 
 /// Sends an action to the controller; a change a sync made is dropped here, for every widget.
 type ActionFn = Rc<dyn Fn(InspectAction)>;
 
 pub struct InspectScreen {
     ctrl: RefCell<InspectController>,
+    notify: Arc<dyn Notify>,
     host: EffectHost,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
@@ -67,6 +75,10 @@ pub struct InspectScreen {
     bar: PartitionBar,
     table: Rc<PartitionTable>,
     no_partitions: gtk::Label,
+    windows: Windows,
+    resize: RefCell<Option<Rc<ResizeDialog>>>,
+    hfs: RefCell<Option<Rc<ExpandHfsDialog>>>,
+    alto: RefCell<Option<Rc<AltoDialog>>>,
 }
 
 /// Everything a refresh shows, read while the controller is borrowed and shown after it is not.
@@ -85,6 +97,7 @@ struct Shown {
     selected: Option<usize>,
     rows: Vec<PartitionRow>,
     shows_min: bool,
+    windows: WindowsShown,
 }
 
 /// Carry out `request`; what this view cannot do yet says so.
@@ -110,7 +123,11 @@ fn carry_out(screen: &InspectScreen, request: HostRequest) -> Option<String> {
             gtk::glib::idle_add_local_once(crate::app::tick);
             None
         }
-        HostRequest::ExpandHfs(_) => Some("The Expand HFS dialog is coming soon.".to_string()),
+        HostRequest::ExpandHfs(source) => {
+            let dialog = ExpandHfsDialog::open(screen.notify.clone(), screen.host.clone(), *source);
+            *screen.hfs.borrow_mut() = Some(dialog);
+            None
+        }
         HostRequest::OpenOptical(path) => {
             crate::app::open_in_optical(path);
             None
@@ -176,7 +193,19 @@ impl InspectScreen {
                 ids::CANCEL_EXPORT,
                 Rc::new(move || cancel(InspectAction::CancelExport)),
             );
-            let tools = ToolBar::build(&send);
+            let screen = me.clone();
+            let expand_image: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.open_expand_image();
+                }
+            });
+            let screen = me.clone();
+            let resize: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.open_resize();
+                }
+            });
+            let tools = ToolBar::build(&send, expand_image, resize);
             let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
             error.add_css_class("error");
             let details = Details::build(&send);
@@ -188,7 +217,28 @@ impl InspectScreen {
                 .expanded(true)
                 .child(bar.root())
                 .build();
-            let table = PartitionTable::build(&send);
+            let screen = me.clone();
+            let table = PartitionTable::build(
+                &send,
+                Rc::new(move || {
+                    if let Some(s) = screen.upgrade() {
+                        s.open_alto();
+                    }
+                }),
+            );
+            let screen = me.clone();
+            let dismiss: Rc<dyn Fn(Dismiss)> = Rc::new(move |which| {
+                if let Some(s) = screen.upgrade() {
+                    s.dismissed(which);
+                }
+            });
+            let screen = me.clone();
+            let on_mib: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.refresh();
+                }
+            });
+            let windows = Windows::new(host.clone(), send.clone(), dismiss, on_mib);
             let no_partitions = gtk::Label::builder()
                 .label("No partitions found.")
                 .xalign(0.0)
@@ -238,8 +288,9 @@ impl InspectScreen {
             InspectScreen {
                 ctrl: RefCell::new(InspectController::new(InspectServices {
                     jobs: JobRegistry::new(),
-                    notify,
+                    notify: notify.clone(),
                 })),
+                notify,
                 host,
                 recent,
                 recent_files: RefCell::new(recent_files),
@@ -262,6 +313,10 @@ impl InspectScreen {
                 bar,
                 table,
                 no_partitions,
+                windows,
+                resize: RefCell::default(),
+                hfs: RefCell::default(),
+                alto: RefCell::default(),
             }
         })
     }
@@ -294,8 +349,81 @@ impl InspectScreen {
 
     pub fn tick(&self) {
         self.browse.tick();
+        self.tick_dialogs();
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
+    }
+
+    /// Run each open dialog's controller, drop the closed ones, and re-read a resized table.
+    fn tick_dialogs(&self) {
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.tick();
+            if d.take_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if !d.is_open() {
+                self.resize.replace(None);
+            }
+        }
+        let hfs = self.hfs.borrow().clone();
+        if let Some(d) = hfs {
+            d.tick();
+            if !d.is_open() {
+                self.hfs.replace(None);
+            }
+        }
+        let alto = self.alto.borrow().clone();
+        if let Some(d) = alto {
+            d.tick();
+            if !d.is_open() {
+                self.alto.replace(None);
+            }
+        }
+    }
+
+    fn open_resize(&self) {
+        let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
+        let plan = self.ctrl.borrow().resize_plan();
+        if let (false, Some(plan)) = (busy, plan) {
+            let d = ResizeDialog::open(self.notify.clone(), self.host.clone(), plan);
+            d.set_devices(&self.devices.borrow());
+            *self.resize.borrow_mut() = Some(d);
+        }
+    }
+
+    fn open_alto(&self) {
+        let source = self.ctrl.borrow().alto_resize_source();
+        match source {
+            Ok(path) => {
+                let d = AltoDialog::open(self.notify.clone(), self.host.clone(), path);
+                *self.alto.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
+    }
+
+    fn open_expand_image(&self) {
+        if self.ctrl.borrow().can_expand_image() {
+            self.windows.expand_mib.set(0);
+            self.windows.expand_open.set(true);
+            self.refresh();
+        }
+    }
+
+    /// The user closed one of the tab's own windows.
+    fn dismissed(&self, which: Dismiss) {
+        let action = match which {
+            Dismiss::Check => InspectAction::CloseCheck,
+            Dismiss::Chd => InspectAction::CloseChdInfo,
+            Dismiss::Editor => InspectAction::CloseEditor,
+            Dismiss::Expand => {
+                self.windows.expand_open.set(false);
+                self.refresh();
+                return;
+            }
+        };
+        self.apply(action);
     }
 
     /// Open an image named outside the picker (the command line); a wrapper is decoded first.
@@ -307,6 +435,10 @@ impl InspectScreen {
     /// The app's device list; a change under the open device closes or re-inspects it.
     pub fn set_devices(&self, devices: Vec<DiskDevice>) {
         self.ctrl.borrow_mut().reconcile_devices(&devices);
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.set_devices(&devices);
+        }
         *self.devices.borrow_mut() = devices;
     }
 
@@ -345,7 +477,16 @@ impl InspectScreen {
 
     /// The disk job running here, by name, for the other tabs' locks.
     pub fn running_job(&self) -> Option<&'static str> {
-        self.ctrl.borrow().running_job()
+        let running = |d: &Option<Rc<ResizeDialog>>| d.as_ref().is_some_and(|d| d.is_running());
+        if let Some(job) = self.ctrl.borrow().running_job() {
+            Some(job)
+        } else if running(&self.resize.borrow()) {
+            Some("Inspect: Resize")
+        } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
+            Some("Inspect: Expand HFS")
+        } else {
+            None
+        }
     }
 
     fn remember(&self, path: &std::path::Path) {
@@ -438,6 +579,23 @@ impl InspectScreen {
             jobs,
             tools: ToolState {
                 can_reinspect: ctrl.can_reinspect(),
+                can_edit_table: ctrl.can_edit_table(),
+                can_add_partition: ctrl.can_add_partition(),
+                add_hint: ctrl.add_partition_hint(),
+                can_expand_image: ctrl.can_expand_image(),
+                expand_hint: if !ctrl.is_image_file() {
+                    "Only image files can be expanded - devices have fixed size."
+                } else if ctrl.expanding() {
+                    "Expansion already running."
+                } else {
+                    "Grow the image file with zero-padding so you can add or extend partitions \
+                     in the new free space."
+                },
+                resizing: self
+                    .resize
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|d| d.is_running()),
                 can_make_bootable: ctrl.can_make_bootable(),
                 can_close: ctrl.can_close(),
                 has_chd: ctrl.chd_path().is_some(),
@@ -453,6 +611,16 @@ impl InspectScreen {
             selected: ctrl.selected_partition(),
             rows: ctrl.rows(),
             shows_min: ctrl.shows_min_columns(),
+            windows: WindowsShown {
+                check: ctrl.check_report(),
+                chd: ctrl.chd_info_text().map(str::to_string),
+                editor: ctrl.table_editor().map(|v| (v, ctrl.table_write_target())),
+                expand: self
+                    .windows
+                    .expand_open
+                    .get()
+                    .then(|| ctrl.expand_image_preview(self.windows.expand_mib.get())),
+            },
         }
     }
 
@@ -507,5 +675,6 @@ impl InspectScreen {
         let slots = s.table.as_ref().is_some_and(|t| t.has_slots);
         self.bar.show(s.segments, s.selected);
         self.table.show(s.rows, s.selected, s.shows_min, slots);
+        self.windows.show(s.windows);
     }
 }

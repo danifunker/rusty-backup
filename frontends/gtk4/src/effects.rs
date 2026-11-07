@@ -77,6 +77,11 @@ impl EffectHost {
         self.window.visible_dialog().is_some()
     }
 
+    /// True while another dialog covers `below`, such as the question its own button asked.
+    pub fn dialog_over(&self, below: &adw::Dialog) -> bool {
+        self.window.visible_dialog().is_some_and(|d| &d != below)
+    }
+
     /// Open `dialog` over the window.
     pub fn present(&self, dialog: &adw::Dialog) {
         dialog.present(Some(&self.window));
