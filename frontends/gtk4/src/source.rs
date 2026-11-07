@@ -27,13 +27,18 @@ pub struct PickerSpec {
     pub source: &'static str,
     pub recent: &'static str,
     pub device: &'static str,
-    pub open_file: &'static str,
+    /// Offers Open File, with this id.
+    pub open_file: Option<&'static str>,
     /// Offers Open Local Folder, with this id.
     pub open_folder: Option<&'static str>,
-    pub open_backup: &'static str,
-    pub connect: &'static str,
+    /// Offers Open Backup Folder, with this id.
+    pub open_backup: Option<&'static str>,
+    /// Offers Connect to Remote, with this id.
+    pub connect: Option<&'static str>,
     /// Connect to Remote is greyed out until the remote picker exists on this screen.
     pub connect_live: bool,
+    /// Said under Devices when there are none.
+    pub no_devices: Option<&'static str>,
     /// Widest the closed state's text goes, in characters.
     pub width_chars: i32,
     /// The caption before the button, if any.
@@ -195,6 +200,8 @@ fn entries(spec: &PickerSpec, recent: &[String], devices: &[String]) -> Vec<Entr
     }
     if !devices.is_empty() {
         list.push(Entry::heading("Devices"));
+    } else if let Some(hint) = spec.no_devices {
+        list.push(Entry::heading(hint));
     }
     for (i, device) in devices.iter().enumerate() {
         list.push(Entry::pick(
@@ -207,24 +214,26 @@ fn entries(spec: &PickerSpec, recent: &[String], devices: &[String]) -> Vec<Entr
     list.push(Entry::heading("Open"));
     let open =
         |id: &str, label: &str, pick| Entry::pick(id.to_string(), label.to_string(), None, pick);
-    list.push(open(spec.open_file, "Open File...", Pick::OpenFile));
+    if let Some(id) = spec.open_file {
+        list.push(open(id, "Open File...", Pick::OpenFile));
+    }
     if let Some(id) = spec.open_folder {
         list.push(open(id, "Open Local Folder...", Pick::OpenFolder));
     }
-    list.push(open(
-        spec.open_backup,
-        "Open Backup Folder...",
-        Pick::OpenBackup,
-    ));
-    list.push(match spec.connect_live {
-        true => open(spec.connect, "Connect to Remote...", Pick::Connect),
-        false => Entry {
-            id: spec.connect.to_string(),
-            label: "Connect to Remote...".to_string(),
-            tooltip: Some("Coming soon: the remote picker".to_string()),
-            pick: None,
-            coming: true,
-        },
-    });
+    if let Some(id) = spec.open_backup {
+        list.push(open(id, "Open Backup Folder...", Pick::OpenBackup));
+    }
+    if let Some(id) = spec.connect {
+        list.push(match spec.connect_live {
+            true => open(id, "Connect to Remote...", Pick::Connect),
+            false => Entry {
+                id: id.to_string(),
+                label: "Connect to Remote...".to_string(),
+                tooltip: Some("Coming soon: the remote picker".to_string()),
+                pick: None,
+                coming: true,
+            },
+        });
+    }
     list
 }

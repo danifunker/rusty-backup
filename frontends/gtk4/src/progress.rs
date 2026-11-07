@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use rusty_backup::controller::app::Snapshot;
+use rusty_backup::controller::app::{progress_text, RateTracker, Snapshot};
 
 use crate::widgets::set_text;
 
@@ -115,5 +115,76 @@ impl JobList {
             }
         }
         self.root.set_visible(!jobs.is_empty());
+    }
+}
+
+/// One running backup or restore, as the footer's bar draws it.
+pub struct Run {
+    pub operation: String,
+    pub current: u64,
+    pub total: u64,
+    /// The untrimmed size, larger than `total` while compaction saves space.
+    pub full: u64,
+}
+
+/// A backup or restore's bar, with speed and time left; a spinner until the total is known.
+pub struct RunBar {
+    root: gtk::Box,
+    operation: gtk::Label,
+    spinner: gtk::Spinner,
+    bar: gtk::ProgressBar,
+    tracker: RefCell<RateTracker>,
+}
+
+impl RunBar {
+    pub fn new() -> RunBar {
+        let operation = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let spinner = gtk::Spinner::new();
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        head.append(&spinner);
+        head.append(&operation);
+        let bar = gtk::ProgressBar::builder().show_text(true).build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        root.append(&head);
+        root.append(&bar);
+        root.set_visible(false);
+        RunBar {
+            root,
+            operation,
+            spinner,
+            bar,
+            tracker: RefCell::default(),
+        }
+    }
+
+    pub fn root(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    pub fn show(&self, run: Option<&Run>) {
+        self.root.set_visible(run.is_some());
+        let Some(run) = run else {
+            self.tracker.borrow_mut().reset();
+            self.spinner.set_spinning(false);
+            return;
+        };
+        set_text(&self.operation, &run.operation);
+        let measured = run.total > 0;
+        self.spinner.set_visible(!measured);
+        self.spinner.set_spinning(!measured);
+        self.bar.set_visible(measured);
+        if measured {
+            let mut tracker = self.tracker.borrow_mut();
+            tracker.record(run.current, &run.operation);
+            let rate = tracker.suffix(run.current, run.total);
+            let text = progress_text(run.current, run.total, run.full, &rate);
+            self.bar.set_text(Some(&text));
+            self.bar
+                .set_fraction((run.current as f64 / run.total as f64).clamp(0.0, 1.0));
+        }
     }
 }

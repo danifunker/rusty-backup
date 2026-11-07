@@ -22,11 +22,14 @@ fn fill(kind: SegmentKind) -> Rgb {
 struct Drawn {
     segments: Vec<LayoutSegment>,
     selected: Option<usize>,
+    /// The part of the width left blank, for bars drawn to one scale.
+    blank: f32,
 }
 
 impl Drawn {
     fn widths(&self, width: i32) -> Vec<f32> {
-        segment_widths(&self.segments, width as f32, MIN_SEGMENT_PX)
+        let width = width as f32 * (1.0 - self.blank);
+        segment_widths(&self.segments, width, MIN_SEGMENT_PX)
     }
 
     /// The segment under `x` on a bar `width` wide.
@@ -106,6 +109,20 @@ impl PartitionBar {
 
     pub fn root(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Draw into `scale` of the width, so two bars can share a byte-per-pixel scale.
+    pub fn set_scale(&self, scale: f32) {
+        let blank = 1.0 - scale.clamp(0.0, 1.0);
+        let mut drawn = self.drawn.borrow_mut();
+        if drawn.blank != blank {
+            drawn.blank = blank;
+            self.area.queue_draw();
+        }
+    }
+
+    pub fn hide_legend(&self) {
+        self.legend.set_visible(false);
     }
 
     pub fn show(&self, segments: Vec<LayoutSegment>, selected: Option<usize>) {

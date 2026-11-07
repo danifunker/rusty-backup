@@ -4,13 +4,13 @@
 //! dialogs are later slices, so their buttons stay greyed out with a tooltip saying so. The browse
 //! view takes the whole tab while it is open.
 
-mod bar;
+pub mod bar;
 mod details;
 mod table;
 mod tools;
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
@@ -48,6 +48,8 @@ pub struct InspectScreen {
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
     devices: RefCell<Vec<DiskDevice>>,
+    /// The user closed a backup here, so the app drops the shared folder.
+    backup_closed: Cell<bool>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
     root: gtk::Stack,
@@ -87,7 +89,8 @@ struct Shown {
 
 /// Carry out `request`; what this view cannot do yet says so.
 /// No `_` arm: a new request fails to compile until this view decides what it means.
-fn carry_out(browse: &BrowseView, request: HostRequest) -> Option<String> {
+fn carry_out(screen: &InspectScreen, request: HostRequest) -> Option<String> {
+    let browse = &screen.browse;
     match request {
         HostRequest::CloseBrowse => {
             browse.close();
@@ -101,8 +104,12 @@ fn carry_out(browse: &BrowseView, request: HostRequest) -> Option<String> {
             browse.open_request(*open);
             None
         }
-        // No other tab shares the backup folder until Backup and Restore exist (slice 4).
-        HostRequest::BackupClosed => None,
+        HostRequest::BackupClosed => {
+            screen.backup_closed.set(true);
+            // Nothing else wakes the app, and the backup closes on Restore too.
+            gtk::glib::idle_add_local_once(crate::app::tick);
+            None
+        }
         HostRequest::ExpandHfs(_) => Some("The Expand HFS dialog is coming soon.".to_string()),
         HostRequest::OpenOptical(path) => Some(format!(
             "{} is an optical disc; the Optical tab is coming soon.",
@@ -138,11 +145,12 @@ impl InspectScreen {
                 source: ids::SOURCE,
                 recent: ids::SOURCE_RECENT,
                 device: ids::SOURCE_DEVICE,
-                open_file: ids::OPEN_FILE,
+                open_file: Some(ids::OPEN_FILE),
                 open_folder: None,
-                open_backup: ids::OPEN_BACKUP,
-                connect: ids::CONNECT_REMOTE,
+                open_backup: Some(ids::OPEN_BACKUP),
+                connect: Some(ids::CONNECT_REMOTE),
                 connect_live: false,
+                no_devices: None,
                 width_chars: 44,
                 caption: Some("Source:"),
             });
@@ -236,6 +244,7 @@ impl InspectScreen {
                 recent,
                 recent_files: RefCell::new(recent_files),
                 devices: RefCell::new(Vec::new()),
+                backup_closed: Cell::new(false),
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 root,
@@ -301,6 +310,44 @@ impl InspectScreen {
         *self.devices.borrow_mut() = devices;
     }
 
+    /// The backup folder open here, for the share with Restore.
+    pub fn loaded_backup(&self) -> Option<PathBuf> {
+        self.ctrl.borrow().backup_folder().map(Path::to_path_buf)
+    }
+
+    /// Nothing is open, so a shared backup may be adopted.
+    pub fn is_empty(&self) -> bool {
+        let ctrl = self.ctrl.borrow();
+        ctrl.backup_folder().is_none() && !ctrl.has_local_source()
+    }
+
+    /// Open the shared backup folder.
+    pub fn load_backup(&self, folder: &Path) {
+        if self.ctrl.borrow().backup_folder() != Some(folder) {
+            self.apply(InspectAction::Load(InspectSource::Backup {
+                folder: folder.to_path_buf(),
+            }));
+        }
+    }
+
+    /// Close Backup from elsewhere: the app already dropped the shared folder.
+    pub fn clear_backup(&self) {
+        if self.ctrl.borrow().backup_folder().is_some() {
+            self.apply(InspectAction::Unload { quiet: true });
+            self.backup_closed.set(false);
+        }
+    }
+
+    /// The user closed a backup here; asked once.
+    pub fn take_backup_closed(&self) -> bool {
+        self.backup_closed.replace(false)
+    }
+
+    /// The disk job running here, by name, for the other tabs' locks.
+    pub fn running_job(&self) -> Option<&'static str> {
+        self.ctrl.borrow().running_job()
+    }
+
     fn remember(&self, path: &std::path::Path) {
         let list = self
             .recent
@@ -362,9 +409,7 @@ impl InspectScreen {
             ctrl.set_browse_dirty(dirty);
             (ctrl.take_requests(), ctrl.take_log())
         };
-        let refused = requests
-            .into_iter()
-            .filter_map(|r| carry_out(&self.browse, r));
+        let refused = requests.into_iter().filter_map(|r| carry_out(self, r));
         log.extend(refused.map(|line| (LogLevel::Warning, line)));
         crate::app::append_log(log);
         self.refresh();

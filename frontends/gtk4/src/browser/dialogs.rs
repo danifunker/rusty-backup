@@ -49,12 +49,12 @@ pub struct Slot {
 
 impl Slot {
     /// Show what `want` keys, built by `build` when it changed; `None` closes it.
-    pub fn sync(
+    pub fn sync<T: Clone + 'static>(
         &self,
         host: &EffectHost,
-        send: &SendFn,
+        send: &Rc<dyn Fn(T)>,
         want: Option<String>,
-        dismiss: Option<A>,
+        dismiss: Option<T>,
         build: impl FnOnce() -> adw::Dialog,
     ) {
         let same = {

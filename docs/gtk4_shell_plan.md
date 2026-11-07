@@ -84,6 +84,13 @@ widgets with:
   width and ellipsizes, or Cancel walks away from the pointer as the copy goes.
 - `CenterBox` sides take their natural width, so a pane with one more button pushes the column. The
   sides are clipped by a `ScrolledWindow` with an `External` policy to stay equal.
+- A form is `adw::PreferencesGroup`s in a `form::page`, with a footer that never scrolls: the outcome, Start, Cancel and the bar stay on screen. Everything but the footer goes insensitive while a job runs.
+- A partition table inside a form is a `gtk::Grid`: it is bounded by the table, and a `ColumnView` would recycle a `SpinButton` mid-edit. Rows are kept while their indices match.
+- Start asks twice: the button's sensitivity comes from `may_start`, and the click asks `may_start` again, since a button only knows what the last refresh knew. Anything the controller cannot see (another tab's job, a device list being read) goes in `locked_by`.
+- A destructive start is only ever `Start`, and the write begins on the answer to the controller's own `Confirm`. The name above the button is `write_target()`, the name that question uses, never the view's copy of a device row. A yes counts only for the question it answered: the controller compares it, so a refresh that moved the row voids it.
+- Off screen a form skips its refresh (`is_mapped`): a job wakes the app many times a second and the tab redraws when it is selected. The tick still runs, so a job's end and its log are seen.
+- In `app.rs` write `super::backup`, not `crate::backup`: `scripts/check-boundaries.sh` reads `crate::backup` and `crate::restore` as the engine's modules, in comments too.
+- `TextView::scroll_mark_onscreen` is queued until the lines are measured, so a mark deleted straight after never scrolls. Keep the mark.
 
 ## Slices
 
@@ -93,7 +100,7 @@ widgets with:
 | 1 | Inspect: source picker, partition bar (`DrawingArea`), partition table, tools | done; Browse, Check, CHD Info, Export, Expand Image and remote wait on slices 2 and 7, greyed out |
 | 2 | Browse view on `BrowserPaneController` (`ColumnView`, `TreeListModel`), file detail, journal | done; `browser/` is the reusable pane, detail panel and windows; the metadata editors wait on slice 7, greyed out; the Optical disc browser header and host drag and drop wait on slices 6 and 8 |
 | 3 | Commander: two panes, key map, drag and drop, staged edits | done; `commander/` takes the window over, every source opens (remote included: `Connect` is the controller's own prompt), File Info is `browser/info.rs` with the controller's field prompts, and Browse opens it from the row menu; the graphical metadata editors stay slice 7; a drop from the file manager is slice 8, a drag out to it is not built |
-| 4 | Backup and Restore | |
+| 4 | Backup and Restore | done; `backup/` and `restore/` are the tabs, `form.rs` the adw rows and `chd.rs` / `size_row.rs` the controls later slices reuse; Write Image File picks its source but its Physical Disk Export window is slice 7, greyed out; the top bar's Close Backup and the Inspect share live in `app.rs` |
 | 5 | Build Disk wizard | |
 | 6 | Optical and Archives | |
 | 7 | Dialogs: resize, expand HFS, Alto resize, partition editor, metadata editor, export, Expand Image, Check results, CHD Info, bulk and floppy convert, remote (with Inspect's Pick Another Image, Back Up Image, Close Remote), settings, update banner | |
@@ -118,3 +125,9 @@ state])` reaches GTK where a synthesized `KeyboardEvent` does not, with state 4 
 `MouseEvent` dispatched on `document.elementFromPoint` works for clicks and drags once one real click
 has landed after the page loaded. Motion is compressed, so a slow drag may arrive as a single event.
 Broadway has no GDK drag: a `gtk::DragSource` starts and nothing ever receives it.
+
+A `ComboRow`, picker or `DropDown` opens reliably only if the pointer moved onto it first: hover, wait,
+click, and take a screenshot before clicking anything in the list. A blind click into a device list is
+how a physical disk gets picked. Text goes to whatever has focus, so check a `SpinRow`'s text took the
+click (a double click does) before typing. In a file dialog, Ctrl+L then the path then Return works; a
+save dialog takes the path straight into its name field.

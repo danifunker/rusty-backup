@@ -8,13 +8,16 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::app::{
-    elevation_button_hover, elevation_button_label, elevation_confirm, elevation_gate, ids,
-    AppAction, AppController, AppTab, ElevationGate,
+    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_confirm,
+    elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, ShareStep,
 };
 use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
+// Through `super`: scripts/check-boundaries.sh takes a crate path to these names for the engine's.
+use super::backup::BackupScreen;
+use super::restore::RestoreScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -61,6 +64,9 @@ pub struct App {
     ctrl: RefCell<AppController>,
     host: EffectHost,
     inspect: Rc<InspectScreen>,
+    backup: Rc<BackupScreen>,
+    restore: Rc<RestoreScreen>,
+    close_backup: gtk::Button,
     /// The tabs, or Commander Mode, which takes the whole window while open.
     screens: gtk::Stack,
     commander: RefCell<Option<Rc<CommanderScreen>>>,
@@ -175,6 +181,11 @@ impl App {
         commander.set_widget_name(ids::COMMANDER);
         header.pack_start(&commander);
 
+        let close_backup = gtk::Button::with_label("Close Backup");
+        close_backup.set_widget_name(ids::CLOSE_BACKUP);
+        close_backup.set_visible(false);
+        header.pack_end(&close_backup);
+
         let log_view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
@@ -231,12 +242,23 @@ impl App {
 
         let host = EffectHost::new(window, toasts);
         let inspect = InspectScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        let backup = BackupScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
+        let restore = RestoreScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         for (tab, name, title, icon) in TABS {
-            if tab == AppTab::Inspect {
-                stack.add_titled_with_icon(inspect.root(), Some(name), title, icon);
-            } else {
-                let page = adw::StatusPage::builder().title(title).build();
-                stack.add_titled_with_icon(&page, Some(name), title, icon);
+            match tab {
+                AppTab::Inspect => {
+                    stack.add_titled_with_icon(inspect.root(), Some(name), title, icon);
+                }
+                AppTab::Backup => {
+                    stack.add_titled_with_icon(backup.root(), Some(name), title, icon);
+                }
+                AppTab::Restore => {
+                    stack.add_titled_with_icon(restore.root(), Some(name), title, icon);
+                }
+                AppTab::Build | AppTab::Optical | AppTab::Archives => {
+                    let page = adw::StatusPage::builder().title(title).build();
+                    stack.add_titled_with_icon(&page, Some(name), title, icon);
+                }
             }
         }
 
@@ -244,6 +266,9 @@ impl App {
             ctrl: RefCell::new(ctrl),
             host,
             inspect,
+            backup,
+            restore,
+            close_backup: close_backup.clone(),
             screens,
             commander: RefCell::default(),
             stack: stack.clone(),
@@ -259,6 +284,8 @@ impl App {
         };
         let a = app.clone();
         commander.connect_clicked(move |_| a.open_commander());
+        let a = app.clone();
+        close_backup.connect_clicked(move |_| a.close_backup());
         refresh.connect_clicked(send(|| AppAction::RefreshDevices));
         elevate.connect_clicked(send(|| AppAction::RequestElevation));
         copy.connect_clicked(send(|| AppAction::CopyLog));
@@ -357,8 +384,15 @@ impl App {
                 .run(vec![Effect::Confirm(elevation_confirm())], &reply());
         }
         let devices = self.ctrl.borrow().devices().to_vec();
+        let refreshing = self.ctrl.borrow().devices_refreshing().is_some();
+        self.backup.set_devices(&devices, refreshing);
+        self.restore.set_devices(&devices, refreshing);
         self.inspect.set_devices(devices);
         self.inspect.tick();
+        self.backup.tick();
+        self.restore.tick();
+        self.share_backup();
+        self.lock_tabs();
         let commander = self.commander.borrow().clone();
         if let Some(screen) = commander {
             screen.tick();
@@ -366,9 +400,57 @@ impl App {
         self.refresh();
     }
 
+    /// Restore and Inspect share a backup folder: the tab on screen publishes or adopts it.
+    fn share_backup(&self) {
+        let tab = self.ctrl.borrow().active_tab();
+        if self.inspect.take_backup_closed() {
+            self.ctrl.borrow_mut().close_shared_backup();
+            self.restore.clear_backup();
+        }
+        let (loaded, empty) = match tab {
+            AppTab::Restore => (self.restore.loaded_backup(), self.restore.is_empty()),
+            AppTab::Inspect => (self.inspect.loaded_backup(), self.inspect.is_empty()),
+            AppTab::Backup | AppTab::Build | AppTab::Optical | AppTab::Archives => return,
+        };
+        let step = self.ctrl.borrow_mut().share_backup(loaded, empty);
+        match (step, tab) {
+            (ShareStep::Publish(folder), AppTab::Restore)
+            | (ShareStep::Adopt(folder), AppTab::Inspect) => self.inspect.load_backup(&folder),
+            (ShareStep::Publish(folder), _) | (ShareStep::Adopt(folder), _) => {
+                self.restore.load_backup(&folder)
+            }
+            (ShareStep::Nothing, _) => {}
+        }
+    }
+
+    /// The top bar's Close Backup: it closes on both tabs.
+    fn close_backup(&self) {
+        self.ctrl.borrow_mut().close_shared_backup();
+        self.restore.clear_backup();
+        self.inspect.clear_backup();
+        append_log(vec![(LogLevel::Info, "Backup closed".to_string())]);
+        self.refresh();
+    }
+
+    /// One disk job at a time: each tab hears who else runs.
+    fn lock_tabs(&self) {
+        let on = |running: bool, name| running.then_some(name);
+        let running = [
+            (AppTab::Backup, on(self.backup.is_running(), "Backup")),
+            (AppTab::Restore, on(self.restore.is_running(), "Restore")),
+            (AppTab::Inspect, self.inspect.running_job()),
+        ];
+        self.backup
+            .set_busy(busy_elsewhere(AppTab::Backup, &running, false));
+        self.restore
+            .set_busy(busy_elsewhere(AppTab::Restore, &running, false));
+    }
+
     /// Read the controller first and release it: setting a widget can fire its change signal.
     fn refresh(&self) {
         let tab = self.ctrl.borrow().active_tab();
+        let shared = self.ctrl.borrow().shared_backup().is_some();
+        self.close_backup.set_visible(shared);
         self.sync.run(|| {
             if let Some((_, name, ..)) = TABS.iter().find(|t| t.0 == tab) {
                 if self.stack.visible_child_name().as_deref() != Some(*name) {
@@ -396,9 +478,12 @@ impl App {
         }
         self.log_shown.set(entries.len());
         if self.auto_scroll.is_active() {
-            let mark = buffer.create_mark(None, &buffer.end_iter(), false);
-            self.log_view.scroll_mark_onscreen(&mark);
-            buffer.delete_mark(&mark);
+            // A mark that stays: GTK scrolls once the new lines are measured, after this returns.
+            let mark = buffer
+                .mark("log-end")
+                .unwrap_or_else(|| buffer.create_mark(Some("log-end"), &buffer.end_iter(), false));
+            buffer.move_mark(&mark, &buffer.end_iter());
+            self.log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
         }
     }
 }
