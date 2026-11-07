@@ -318,7 +318,7 @@ pub fn export_to_file(
 ) -> Result<ExportSummary> {
     match format {
         ExportFormat::Tar | ExportFormat::TarGz | ExportFormat::TarZstd => {
-            export_tar_file(fs, entries, out_path, format, progress)
+            export_tar_file(fs, entries, out_path, format, progress, cancelled)
         }
         ExportFormat::Zip => export_zip_file(fs, entries, out_path, progress, cancelled),
         ExportFormat::StuffIt | ExportFormat::MacArchive | ExportFormat::StuffItHqx => {
@@ -328,12 +328,32 @@ pub fn export_to_file(
     }
 }
 
+/// A writer that fails once cancelled: the tar exporter has no cancel of its own, but it writes often.
+struct CancelWrite<'a, 'b, W> {
+    inner: W,
+    cancelled: &'a Cancelled<'b>,
+}
+
+impl<W: Write> Write for CancelWrite<'_, '_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.cancelled)() {
+            return Err(crate::compat::io_other("export cancelled"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn export_tar_file(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
     out_path: &Path,
     format: ExportFormat,
     progress: &Progress,
+    cancelled: &Cancelled,
 ) -> Result<ExportSummary> {
     let compression = match format {
         ExportFormat::Tar => TarCompression::None,
@@ -341,12 +361,14 @@ fn export_tar_file(
         ExportFormat::TarZstd => TarCompression::Zstd,
         _ => unreachable!(),
     };
-    let out = std::fs::File::create(out_path)
+    let inner = std::fs::File::create(out_path)
         .with_context(|| format!("creating {}", out_path.display()))?;
+    let out = CancelWrite { inner, cancelled };
     let opts = TarExportOptions::default();
     let stats = export_tar_multi(fs, entries, out, compression, &opts, &|s| {
         progress("", s.files as usize, s.total_bytes);
-    })?;
+    })
+    .map_err(|e| if cancelled() { cancelled_err() } else { e })?;
     Ok(ExportSummary {
         files: stats.files as usize,
         bytes: stats.total_bytes,
@@ -611,6 +633,21 @@ fn mac_dates(e: &FileEntry) -> MacFileDates {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cancelled_tar_stops_at_its_next_write() {
+        use std::cell::Cell;
+        let stop = Cell::new(false);
+        let cancelled = || stop.get();
+        let mut out = super::CancelWrite {
+            inner: Vec::new(),
+            cancelled: &cancelled,
+        };
+        assert!(std::io::Write::write_all(&mut out, b"ok").is_ok());
+        stop.set(true);
+        assert!(std::io::Write::write_all(&mut out, b"no").is_err());
+        assert_eq!(out.inner, b"ok");
+    }
+
     use super::*;
     use disk_core::filesystem::EditableFilesystem;
     use std::io::Read;
