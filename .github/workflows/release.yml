@@ -1618,7 +1618,8 @@ jobs:
     # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
     # toolchain from scratch). It runs on a push to main/master (a real release)
     # and on a manual "Run workflow" with the `appliance` input set to
-    # i586/i686/both; a push to a feature branch (or appliance=none) skips it.
+    # i586/i686/both. A feature-branch push skips it unless it names the target,
+    # as in [ci: all,appliance]; appliance=none skips it too.
     # appliance-matrix turns that into the matrix below; an empty list skips
     # this job. i586 = broadest reach (Pentium / 5x86 / Vortex86 / ITX-Llama and
     # up); i686 = a touch faster on Pentium-Pro+ but won't run on a plain
