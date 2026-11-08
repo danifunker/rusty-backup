@@ -44,10 +44,13 @@ docker run  --rm -v "$PWD":/src rb-linux-packages-focal
 ```
 
 **`linux-packages-focal` is the 20.04 floor, kept on purpose.** It holds the x64 packages to
-glibc 2.31; arm64 builds on the plain 24.04 runner instead. CI builds the image each run (layers
-cached) and runs the build with `docker run`, so no GitHub action runs inside 20.04 and a newer
-runner Node can't break it. When `apt-get` against focal stops resolving, that is the cue to
-review the floor rather than to pin around it.
+glibc 2.31; arm64 builds on the plain 24.04 runner instead. `focal-image.yml` builds it and pushes
+it to `ghcr.io/danifunker/rb-linux-packages-focal` (a date-sha tag plus `latest`), and
+`build-linux-packages` in `release.yml` pins its digest in `FOCAL_IMAGE` and runs the build with
+`docker run`, so no GitHub action runs inside 20.04. Rust (1.99.1), cargo-deb and
+cargo-generate-rpm are pinned in the Dockerfile. To move: bump the Dockerfile, let the workflow
+push, paste the digest it prints. Never delete old tags: if a rebuild fails because focal's mirror
+or rustup moved on, the pinned digest keeps building, and that is the cue to review the floor.
 
 The atomics/CPU rationale (custom target specs in `../targets/`, `max-atomic-width`,
 the cpuid caveat) is in [`../docs/linux_486_build.md`](../docs/linux_486_build.md).

@@ -1,7 +1,7 @@
 # Ubuntu 20.04 build image for the x64 egui Linux packages (deb, rpm, Arch) and rb-cli.
-# Its glibc (2.31) is their floor. CI builds it each run and runs the build with `docker run`,
-# so no GitHub action executes in here; see scripts/ci/build-linux-packages.sh.
-# When focal's apt mirror goes away this stops building: that is the cue to retire the 20.04 floor.
+# Its glibc (2.31) is their floor. focal-image.yml pushes it to GHCR and release.yml pins the
+# digest, then runs scripts/ci/build-linux-packages.sh in it with `docker run`.
+# If a rebuild ever fails on 20.04, keep the pinned digest: that is the cue to retire the floor.
 FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
