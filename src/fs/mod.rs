@@ -1446,22 +1446,41 @@ pub fn is_expensive_minimum(partition_type: u8, partition_type_string: Option<&s
             // SFS last_data_byte is a bitmap walk — cheap.
             return false;
         }
-        return matches!(
-            s,
-            "Apple_HFS"
-                | "Apple_HFSX"
-                | "Apple_UNIX_SVR2"
-                // Rhapsody: a UFS bitmap walk, same cost as the SVR2 slices.
-                | "Apple_Rhapsody_UFS"
-                | "Linux"
-                | "48465300-0000-11AA-AA11-00306543ECAC"
-                | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-                | "933AC7E1-2EB4-4F13-B844-0E14E2AEF915"
-        );
+        return EXPENSIVE_MINIMUM_STRINGS.contains(&s);
     }
-    // 0xA1 (SGI EFS) and 0xA2 (SGI EFS v1): the conservative floor requires
-    // an inode-table walk.
-    matches!(partition_type, 0xAF | 0x83 | 0xA8 | 0xA1 | 0xA2)
+    EXPENSIVE_MINIMUM_BYTES.contains(&partition_type)
+}
+
+/// Type strings whose minimum needs a volume walk (Rhapsody is a UFS bitmap walk, like SVR2).
+const EXPENSIVE_MINIMUM_STRINGS: &[&str] = &[
+    "Apple_HFS",
+    "Apple_HFSX",
+    "Apple_UNIX_SVR2",
+    "Apple_Rhapsody_UFS",
+    "Linux",
+    "48465300-0000-11AA-AA11-00306543ECAC",
+    "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+    "933AC7E1-2EB4-4F13-B844-0E14E2AEF915",
+];
+
+/// Type bytes whose minimum needs a volume walk; SGI EFS (0xA1, 0xA2) walks its inode table.
+const EXPENSIVE_MINIMUM_BYTES: &[u8] = &[0xAF, 0x83, 0xA8, 0xA1, 0xA2];
+
+/// The filesystems [`is_expensive_minimum`] names, for help text.
+pub fn expensive_minimum_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = EXPENSIVE_MINIMUM_BYTES
+        .iter()
+        .map(|&b| fs_name_for(b, None))
+        .chain(
+            EXPENSIVE_MINIMUM_STRINGS
+                .iter()
+                .map(|&s| fs_name_for(0, Some(s))),
+        )
+        .flat_map(|n| n.split('/'))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Compute the minimum size for a partition, optionally gated behind an

@@ -25,6 +25,7 @@ pub mod commander_descend;
 pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
+pub mod convert;
 pub mod dir_listing;
 pub mod disk_builder;
 pub mod disk_write_plan;

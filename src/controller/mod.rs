@@ -26,6 +26,7 @@ pub mod browser;
 pub mod build_disk;
 pub mod bulk_convert;
 pub mod commander;
+pub mod convert;
 pub mod disk_write;
 pub mod expand_hfs;
 pub mod floppy_convert;
