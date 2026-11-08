@@ -787,180 +787,127 @@ jobs:
     if: needs.plan.outputs.linux-packages == 'true'
     needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
-    # x64 builds inside Ubuntu 20.04 so its glibc (2.31) is the floor; an empty container runs on the host.
-    container: ${{ matrix.container }}
-    # A container's steps default to sh, which has no {a,b} expansion for the Arch icon dirs.
-    defaults:
-      run:
-        shell: bash
     # See build-windows: keep APP_VERSION consistent across Test and Build.
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     strategy:
       matrix:
         include:
+          # x64 builds in docker/linux-packages-focal.Dockerfile (glibc 2.31 floor) via `docker run`.
           - target: x86_64-unknown-linux-gnu
             arch: x64
             runs-on: ubuntu-24.04
-            container: ubuntu:20.04
-            base: focal
+            focal: true
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             runs-on: ubuntu-24.04-arm
-            container: ''
-            base: noble
+            focal: false
     steps:
-      # The bare image has no git, curl or sudo, which checkout, rustup and the steps below need.
-      - name: Prepare the Ubuntu 20.04 container
-        if: ${{ matrix.container != '' }}
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          apt-get update
-          apt-get install -y git curl ca-certificates sudo build-essential file
-          # libchdman's default x86_64 prebuilt needs glibc 2.35; its 2.31 one is built on 20.04 too.
-          echo LIBCHDMAN_GLIBC=2.31 >> "$GITHUB_ENV"
-
       - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install dependencies (GitHub-hosted only)
-        if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo -E apt-get install -y cmake libgtk-3-dev libasound2-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
-
-      - name: Install cargo packaging tools
-        # `cargo install` from crates.io is flaky on the hosted runners
-        # (especially arm64): a transient download/build failure used to be
-        # swallowed by `|| true`, so the step went green while the binary was
-        # missing — then "Build RPM package" died with `no such command:
-        # generate-rpm`. Retry each install up to 3 times and fail loudly if a
-        # tool is genuinely unavailable, so the error surfaces here, not later.
-        run: |
-          install_tool() {
-            local crate="$1"
-            if command -v "$crate" >/dev/null 2>&1; then
-              echo "$crate already installed; skipping"
-              return 0
-            fi
-            for attempt in 1 2 3; do
-              echo "::group::Installing $crate (attempt $attempt/3)"
-              if cargo install "$crate"; then
-                echo "::endgroup::"
-                return 0
-              fi
-              echo "::endgroup::"
-              echo "Install of $crate failed (attempt $attempt/3)"
-              sleep 15
-            done
-            echo "::error::failed to install $crate after 3 attempts"
-            return 1
-          }
-          install_tool cargo-deb
-          install_tool cargo-generate-rpm
-          install_tool cargo-aur
 
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
         uses: actions/cache@v5
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
         uses: actions/cache@v5
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.base }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.focal && 'focal' || 'noble' }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      # Tests run upfront on this leg's native runner (x64 + arm64). Failure
-      # fails the job and blocks the release.
-      - name: Test
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+      # x64: the build runs in a throwaway 20.04 container with the checkout mounted, and the
+      # packages land in out/ for the upload steps below. No action runs inside the container.
+      - name: Set up Docker Buildx
+        if: matrix.focal
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build the Ubuntu 20.04 image
+        if: matrix.focal
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          file: docker/linux-packages-focal.Dockerfile
+          tags: rb-linux-packages-focal
+          load: true
+          cache-from: type=gha,scope=linux-packages-focal
+          cache-to: type=gha,mode=max,scope=linux-packages-focal
 
-      - name: Build Debian package
+      - name: Test, build and package (Ubuntu 20.04 container)
+        if: matrix.focal
         run: |
-          # -o: cargo-deb only mirrors into target/<triple>/debian as a deprecated back-compat copy.
-          cargo deb --target ${{ matrix.target }} --no-build \
-            -o Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+          mkdir -p ~/.cargo/registry ~/.cargo/git target out
+          # Root in the container writes root-owned files; hand them back so caching and upload can read them.
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
+            -e RELEASE_VERSION -e CARGO_TERM_COLOR=always \
+            -e HOST_IDS="$(id -u):$(id -g)" \
+            rb-linux-packages-focal bash -c '
+              trap "chown -R \$HOST_IDS /src/target /src/out /usr/local/cargo/registry /usr/local/cargo/git" EXIT
+              rustup update --no-self-update stable >/dev/null
+              scripts/ci/build-linux-packages.sh ${{ matrix.target }} ${{ matrix.arch }} "$RELEASE_VERSION"
+            '
 
-      - name: Build RPM package
-        run: |
-          cargo generate-rpm --target ${{ matrix.target }}
-          mv target/${{ matrix.target }}/generate-rpm/*.rpm Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+      # arm64 builds on the 24.04 runner itself (glibc 2.39 floor).
+      - name: Install Rust
+        if: ${{ !matrix.focal }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Build Arch package
+      - name: Install dependencies
+        if: ${{ !matrix.focal }}
         run: |
-          cargo aur
-          # cargo-aur generates PKGBUILD, build with makepkg equivalent
-          mkdir -p arch-build
-          cp target/release/rusty-backup arch-build/
-          cp rusty-backup.desktop arch-build/
-          cp -r assets arch-build/
-          cd arch-build
-          
-          # Create a simple package structure
-          mkdir -p pkg/usr/bin
-          mkdir -p pkg/usr/share/applications
-          mkdir -p pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps
-          
-          cp rusty-backup pkg/usr/bin/
-          chmod 755 pkg/usr/bin/rusty-backup
-          cp rusty-backup.desktop pkg/usr/share/applications/
-          cp assets/icons/icon-16.png pkg/usr/share/icons/hicolor/16x16/apps/rusty-backup.png
-          cp assets/icons/icon-32.png pkg/usr/share/icons/hicolor/32x32/apps/rusty-backup.png
-          cp assets/icons/icon-48.png pkg/usr/share/icons/hicolor/48x48/apps/rusty-backup.png
-          cp assets/icons/icon-64.png pkg/usr/share/icons/hicolor/64x64/apps/rusty-backup.png
-          cp assets/icons/icon-128.png pkg/usr/share/icons/hicolor/128x128/apps/rusty-backup.png
-          cp assets/icons/icon-256.png pkg/usr/share/icons/hicolor/256x256/apps/rusty-backup.png
-          
-          # Create package with tar and zstd
-          cd pkg
-          tar -czf ../../Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst *
+          sudo apt-get update
+          sudo apt-get install -y cmake libgtk-3-dev libasound2-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm zstd
+
+      - name: Install cargo packaging tools
+        if: ${{ !matrix.focal }}
+        # crates.io installs are flaky on the hosted arm64 runners; retry, and fail here rather than later.
+        run: |
+          for crate in cargo-deb cargo-generate-rpm; do
+            for attempt in 1 2 3; do
+              cargo install --locked "$crate" && break
+              echo "Install of $crate failed (attempt $attempt/3)"; sleep 15
+              [ "$attempt" = 3 ] && { echo "::error::failed to install $crate"; exit 1; }
+            done
+          done
+
+      - name: Test, build and package
+        if: ${{ !matrix.focal }}
+        run: scripts/ci/build-linux-packages.sh ${{ matrix.target }} ${{ matrix.arch }} "$RELEASE_VERSION"
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-deb
-          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+          path: out/Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-rpm
-          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+          path: out/Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
 
       - name: Upload Arch package
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}-arch
-          path: Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
-
-      - name: Package CLI
-        run: |
-          TGZ="rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rb-cli
+          path: out/Rusty-Backup-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v7
         with:
           name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
-          path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+          path: out/rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
   # Installs the x64 .deb from build-linux-packages on the oldest and newest releases it claims,
   # so a dependency that only exists on one of them fails here, not on a user's machine.
@@ -981,6 +928,11 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          # Debian 11's LTS ended 2026-08; its packages now live only on archive.debian.org.
+          if grep -q 'VERSION_ID="11"' /etc/os-release && grep -q '^ID=debian' /etc/os-release; then
+            sed -i -e 's|deb.debian.org|archive.debian.org|g' -e 's|security.debian.org|archive.debian.org|g' \
+              -e '/bullseye-updates/d' /etc/apt/sources.list
+          fi
           apt-get update
           apt-get install -y ./Rusty-Backup-linux-x64-*.deb
           ldd /usr/bin/rusty-backup | tee ldd.txt

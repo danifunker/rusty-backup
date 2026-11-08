@@ -40,6 +40,7 @@ flatpak/bin/
 tests/fixtures/*.img
 outputs/
 /target-cross
+/out/
 /buildroot/output
 /buildroot/dl
 /buildroot/ccache
