@@ -789,6 +789,10 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     # x64 builds inside Ubuntu 20.04 so its glibc (2.31) is the floor; an empty container runs on the host.
     container: ${{ matrix.container }}
+    # A container's steps default to sh, which has no {a,b} expansion for the Arch icon dirs.
+    defaults:
+      run:
+        shell: bash
     # See build-windows: keep APP_VERSION consistent across Test and Build.
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
