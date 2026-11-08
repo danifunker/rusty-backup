@@ -161,7 +161,10 @@ fn scan_mirrors_subfolders_and_skips_sidecars() {
     }
     let names = |v: Vec<std::path::PathBuf>| -> Vec<String> {
         v.iter()
-            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .map(|p| {
+                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                rel.replace('\\', "/")
+            })
             .collect()
     };
     assert_eq!(names(scan(root, false).unwrap()), ["a.img", "game.cue"]);
