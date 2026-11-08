@@ -45,7 +45,7 @@ env:
 
 # Ubuntu runners are pinned to ubuntu-24.04, never `ubuntu-latest`: a glibc-linked
 # Linux binary needs at least the build host's glibc, so the label decides which
-# distros our .deb/.rpm/rb-cli run on. `ubuntu-latest` moves to 26.04 (glibc 2.43)
+# distros our .deb/.rpm/rb-cli run on (the x64 packages build in an ubuntu:20.04 container). `ubuntu-latest` moves to 26.04 (glibc 2.43)
 # between 2026-10-19 and 2026-11-19, and the riscv64 GUI job's `noble` sources
 # only resolve on 24.04. Move to a newer image deliberately, all jobs at once.
 jobs:
@@ -787,6 +787,8 @@ jobs:
     if: needs.plan.outputs.linux-packages == 'true'
     needs: [generate-version, plan]
     runs-on: ${{ matrix.runs-on }}
+    # x64 builds inside Ubuntu 20.04 so its glibc (2.31) is the floor; an empty container runs on the host.
+    container: ${{ matrix.container }}
     # See build-windows: keep APP_VERSION consistent across Test and Build.
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -796,10 +798,25 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: x64
             runs-on: ubuntu-24.04
+            container: ubuntu:20.04
+            base: focal
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             runs-on: ubuntu-24.04-arm
+            container: ''
+            base: noble
     steps:
+      # The bare image has no git, curl or sudo, which checkout, rustup and the steps below need.
+      - name: Prepare the Ubuntu 20.04 container
+        if: ${{ matrix.container != '' }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y git curl ca-certificates sudo build-essential file
+          # libchdman's default x86_64 prebuilt needs glibc 2.35; its 2.31 one is built on 20.04 too.
+          echo LIBCHDMAN_GLIBC=2.31 >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v6
 
       - name: Install Rust
@@ -809,9 +826,11 @@ jobs:
 
       - name: Install dependencies (GitHub-hosted only)
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgtk-3-dev libasound2-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
+          sudo -E apt-get install -y cmake libgtk-3-dev libasound2-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
 
       - name: Install cargo packaging tools
         # `cargo install` from crates.io is flaky on the hosted runners
@@ -860,7 +879,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.base }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       # Tests run upfront on this leg's native runner (x64 + arm64). Failure
       # fails the job and blocks the release.
@@ -938,6 +957,30 @@ jobs:
         with:
           name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # Installs the x64 .deb from build-linux-packages on the oldest and newest releases it claims,
+  # so a dependency that only exists on one of them fails here, not on a user's machine.
+  test-linux-packages:
+    name: Install the x64 .deb (${{ matrix.image }})
+    needs: [generate-version, build-linux-packages]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:20.04, ubuntu:22.04, ubuntu:24.04, debian:11, debian:12, debian:13]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Rusty-Backup-linux-x64-${{ needs.generate-version.outputs.version }}-deb
+      - name: Install and check every library resolves
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y ./Rusty-Backup-linux-x64-*.deb
+          ldd /usr/bin/rusty-backup | tee ldd.txt
+          if grep -q "not found" ldd.txt; then echo "::error::a library is missing"; exit 1; fi
 
   # MiSTer-specific build of `rb-cli` for the FPGA's Intel Cyclone V / Cortex-A9
   # / Buildroot rootfs (`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline).
@@ -2555,6 +2598,8 @@ jobs:
             prebuilt: "yes"
             apt: musl-tools
             strip: strip
+            # libchdman-rs ships x64 and arm64 musl archives with a static libstdc++ inside.
+            extra_features: ",chd"
           - target: aarch64-unknown-linux-musl
             arch: arm64
             runs-on: ubuntu-24.04-arm
@@ -2562,6 +2607,8 @@ jobs:
             prebuilt: "yes"
             apt: musl-tools
             strip: strip
+            # libchdman-rs ships x64 and arm64 musl archives with a static libstdc++ inside.
+            extra_features: ",chd"
           - target: i586-unknown-linux-musl
             arch: i586
             runs-on: ubuntu-24.04
@@ -2669,10 +2716,10 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-musl-build-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build static rb-cli (slim, pure-Rust, CLI + TUI)
+      - name: Build static rb-cli (slim CLI + TUI; CHD on x64 and arm64)
         run: |
-          # pure-zstd + flate2 rust_backend = zero C, so the musl link is fully
-          # self-contained; the GNU cross-gcc only drives ld. `tui` = the
+          # pure-zstd + flate2 rust_backend = zero C (bar the libchdman archive on x64/arm64), so the
+          # musl link is fully self-contained; the GNU cross-gcc only drives ld. `tui` = the
           # full-screen terminal UI on old boxes.
           BUILD_STD=""
           if [ "${{ matrix.prebuilt }}" != "yes" ]; then
@@ -2687,7 +2734,7 @@ jobs:
           else
             # Native/GNU-cross legs, and ppc32 (linker = the zig cc wrapper above).
             cargo build --release --bin rb-cli \
-              --no-default-features --features pure-zstd,remote,tui \
+              --no-default-features --features pure-zstd,remote,tui${{ matrix.extra_features }} \
               --target ${{ matrix.target }} $BUILD_STD
           fi
 
@@ -2734,7 +2781,8 @@ jobs:
       needs.build-windows.result == 'success' &&
       needs.build-macos.result == 'success' &&
       needs.build-linux-appimage.result == 'success' &&
-      needs.build-linux-packages.result == 'success'
+      needs.build-linux-packages.result == 'success' &&
+      needs.test-linux-packages.result == 'success'
     # The MiSTer armv7 build is in `needs:` so the release waits for its
     # artifact to upload before publishing — combined with
     # `continue-on-error: true` on the build job, a transient armv7 failure
@@ -2748,6 +2796,7 @@ jobs:
       - build-macos
       - build-linux-appimage
       - build-linux-packages
+      - test-linux-packages
       - build-rb-cli-mini-armv7
       # Cross-builds for extra CPU arches: PowerPC BE 32/64 (rb-cli only), plus
       # full GUI + rb-cli for Windows ARM64 and Linux RISC-V 64. continue-on-error
@@ -2862,12 +2911,12 @@ jobs:
           | **Windows 11** | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
-          | **Linux** (glibc >= 2.39) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
-          | **Linux** (glibc >= 2.39) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
-          | **Linux** (glibc >= 2.39) | RISC-V 64-bit (\`riscv64gc\`) | [deb](${BASE}/Rusty-Backup-linux-riscv64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-riscv64-${VER}.rpm) · [tar.gz](${BASE}/Rusty-Backup-linux-riscv64-${VER}.tar.gz) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
+          | **Linux** (Ubuntu 20.04+ / Debian 11+) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
+          | **Linux** (Ubuntu 24.04+ / Debian 13+) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
+          | **Linux** (Ubuntu 24.04+ / Debian 13+) | RISC-V 64-bit (\`riscv64gc\`) | [deb](${BASE}/Rusty-Backup-linux-riscv64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-riscv64-${VER}.rpm) · [tar.gz](${BASE}/Rusty-Backup-linux-riscv64-${VER}.tar.gz) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
-          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **Windows ARM64 / RISC-V 64:** cross-compiled, build-only legs — the Windows ARM64 app is a portable zip and the RISC-V 64 app ships as a deb, rpm or plain tarball, all dynamically linked against your system GTK3 (no self-contained AppImage like x64/arm64). · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. The GUI is off; CHD, optical and the full-screen \`rb-cli tui\` terminal UI are in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the x64 packages and \`rb-cli\` are built on Ubuntu 20.04 (**glibc 2.31**: Ubuntu 20.04+, Debian 11+, Fedora 32+, RHEL 9+), the arm64 and RISC-V 64 ones on Ubuntu 24.04 (**glibc 2.39**), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **Windows ARM64 / RISC-V 64:** cross-compiled, build-only legs — the Windows ARM64 app is a portable zip and the RISC-V 64 app ships as a deb, rpm or plain tarball, all dynamically linked against your system GTK3 (no self-contained AppImage like x64/arm64). · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. The GUI is off; CHD, optical and the full-screen \`rb-cli tui\` terminal UI are in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
 
           ### Linux GTK4 app (preview)
 
@@ -2899,15 +2948,15 @@ jobs:
           | **macOS 10.7 – 10.11** (Lion → El Capitan) | Intel x64 | [rb-cli](${BASE}/rb-cli-macos-vintage-x64-${VER}.zip) |
           | **Windows 7 / 8 / 8.1** | x64 | [rb-cli](${BASE}/rb-cli-win7-x64-${VER}.zip) |
           | **Windows 7 / 8 / 8.1** | x86 (32-bit) | [rb-cli](${BASE}/rb-cli-win7-x86-${VER}.zip) |
-          | **Any Linux** (static musl — *any* glibc / distro age) | x64 | [rb-cli](${BASE}/rb-cli-linux-musl-x64-${VER}.tar.gz) |
-          | **Any Linux** (static musl) | arm64 | [rb-cli](${BASE}/rb-cli-linux-musl-arm64-${VER}.tar.gz) |
+          | **Any Linux** (static musl — *any* glibc / distro age, with CHD) | x64 | [rb-cli](${BASE}/rb-cli-linux-musl-x64-${VER}.tar.gz) |
+          | **Any Linux** (static musl, with CHD) | arm64 | [rb-cli](${BASE}/rb-cli-linux-musl-arm64-${VER}.tar.gz) |
           | **Old 32-bit x86 Linux** (static musl) | i586 (Pentium+) | [rb-cli](${BASE}/rb-cli-linux-musl-i586-${VER}.tar.gz) |
           | **Old 32-bit x86 Linux** (static musl) | i686 (Pentium Pro+) | [rb-cli](${BASE}/rb-cli-linux-musl-i686-${VER}.tar.gz) |
           | **PowerPC Linux** (static musl — *any* glibc, incl. old distros) | ppc64 (G5 / POWER, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc64-${VER}.tar.gz) |
           | **PowerPC Linux** (static musl — *any* glibc) | ppc32 (G3 / G4, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc32-${VER}.tar.gz) |
           | **Mac OS X 10.4 – 10.5** (Tiger / Leopard) | PowerPC (G3 / G4 / G5) | [Downloads on the wiki →](https://github.com/${GITHUB_REPOSITORY}/wiki/PPC-Download) |
 
-          <sub>**macOS / Windows** are built with **Rust 1.73** — the last toolchain that still targets macOS 10.7 and Windows 7. The single macOS artifact runs on **10.7 through 10.11** (a 10.7-minimum binary loads on any newer macOS too). · **macOS:** ad-hoc signed, not notarized — run \`xattr -dr com.apple.quarantine ./rb-cli\` on first launch. · **Windows:** the CRT is statically linked, so it runs on a stock Windows 7 with no Universal CRT (KB2999226) update. 32-bit \`x86\` also covers the last 32-bit-only Win7 machines. · **Linux (musl):** fully-static binaries with **zero** dynamic dependencies — drop one on any Linux and it just runs, no matter how old the glibc (unlike the glibc \`rb-cli\` above, which needs glibc ≥ 2.39). Covers modern x64/arm64 plus **vintage** arches: 32-bit x86 (**i586** = Pentium/MMX/K6/Cyrix and up, **i686** = Pentium Pro and up) and big-endian **PowerPC** (**ppc64** = G5/POWER, **ppc32** = G3/G4) — ideal for an old Mac or PC running Linux. These same binaries also ship inside the Buildroot appliance ISO; here they're standalone. (ppc32 is a best-effort leg — a Rust tier-3 target built from std source.) · **Mac OS X on PowerPC** (Tiger / Leopard, the real Mac OS — not Linux) is built on separate hardware with an mrustc-bootstrapped toolchain, so it is **not** part of this release and updates less often than everything above. Its downloads live on the [PPC Download wiki page](https://github.com/${GITHUB_REPOSITORY}/wiki/PPC-Download).</sub>
+          <sub>**macOS / Windows** are built with **Rust 1.73** — the last toolchain that still targets macOS 10.7 and Windows 7. The single macOS artifact runs on **10.7 through 10.11** (a 10.7-minimum binary loads on any newer macOS too). · **macOS:** ad-hoc signed, not notarized — run \`xattr -dr com.apple.quarantine ./rb-cli\` on first launch. · **Windows:** the CRT is statically linked, so it runs on a stock Windows 7 with no Universal CRT (KB2999226) update. 32-bit \`x86\` also covers the last 32-bit-only Win7 machines. · **Linux (musl):** fully-static binaries with **zero** dynamic dependencies — drop one on any Linux and it just runs, no matter how old the glibc (unlike the glibc \`rb-cli\` above, which needs glibc 2.31 on x64 and 2.39 on arm64). The x64 and arm64 builds read and write CHD; the 32-bit and PowerPC ones don't. Covers modern x64/arm64 plus **vintage** arches: 32-bit x86 (**i586** = Pentium/MMX/K6/Cyrix and up, **i686** = Pentium Pro and up) and big-endian **PowerPC** (**ppc64** = G5/POWER, **ppc32** = G3/G4) — ideal for an old Mac or PC running Linux. These same binaries also ship inside the Buildroot appliance ISO; here they're standalone. (ppc32 is a best-effort leg — a Rust tier-3 target built from std source.) · **Mac OS X on PowerPC** (Tiger / Leopard, the real Mac OS — not Linux) is built on separate hardware with an mrustc-bootstrapped toolchain, so it is **not** part of this release and updates less often than everything above. Its downloads live on the [PPC Download wiki page](https://github.com/${GITHUB_REPOSITORY}/wiki/PPC-Download).</sub>
 
           ### Install on a MiSTer FPGA (one line, auto-updating)
 
