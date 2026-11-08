@@ -11,9 +11,10 @@ RUN apt-get update \
       libgtk-3-dev libasound2-dev libssl-dev liblzma-dev dpkg-dev rpm zstd \
  && rm -rf /var/lib/apt/lists/*
 
+# Pinned so a rebuild gives the same compiler; bump it deliberately.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
-RUN cargo install --locked cargo-deb cargo-generate-rpm \
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.99.1
+RUN cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1 \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
 # libchdman-rs's default x86_64 prebuilt needs glibc 2.35; this picks its 20.04-built one.

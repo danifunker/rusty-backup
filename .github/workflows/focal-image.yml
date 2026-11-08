@@ -1,0 +1,53 @@
+# Builds docker/linux-packages-focal.Dockerfile and pushes it to GHCR, so the x64 Linux packages
+# build on a frozen Ubuntu 20.04 toolchain. release.yml pins the digest this prints; after a
+# rebuild, copy the new digest into FOCAL_IMAGE there. See docker/README.md.
+name: Ubuntu 20.04 build image
+
+on:
+  push:
+    paths:
+      - docker/linux-packages-focal.Dockerfile
+      - .github/workflows/focal-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  push:
+    name: Build and push rb-linux-packages-focal
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag
+        id: tag
+        run: echo "tag=$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          file: docker/linux-packages-focal.Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/rb-linux-packages-focal:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/rb-linux-packages-focal:latest
+
+      - name: Print the digest to pin
+        run: |
+          ref="ghcr.io/${{ github.repository_owner }}/rb-linux-packages-focal@${{ steps.push.outputs.digest }}"
+          echo "Pin in release.yml: FOCAL_IMAGE: $ref"
+          echo "FOCAL_IMAGE: \`$ref\` (tag ${{ steps.tag.outputs.tag }})" >> "$GITHUB_STEP_SUMMARY"
+          docker run --rm "$ref" bash -c 'ldd --version | head -1; rustc --version; cargo deb --version; cargo generate-rpm --version'
