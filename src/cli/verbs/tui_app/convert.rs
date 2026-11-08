@@ -681,7 +681,7 @@ impl App {
                 ),
                 CRow::Format(k) => {
                     let f = c.ctl.format(k);
-                    (format!("{}s:", k.label()), format!("< {} >", f.label()))
+                    (format!("{}:", k.plural()), format!("< {} >", f.label()))
                 }
                 CRow::Extension(k) => (
                     "  Extension:".to_string(),

@@ -36,6 +36,15 @@ impl ImageKind {
         }
     }
 
+    /// The heading over a kind's rows.
+    pub const fn plural(self) -> &'static str {
+        match self {
+            ImageKind::HardDisk => "Hard disks",
+            ImageKind::Floppy => "Floppies",
+            ImageKind::Disc => "Discs",
+        }
+    }
+
     /// The format a new form starts on for this kind.
     pub const fn default_format(self) -> Format {
         match self {

@@ -149,7 +149,7 @@ impl ConvertScreen {
             .iter()
             .map(|&kind| {
                 let (format_id, ext_id) = kind_ids(kind);
-                let g = group(&format!("{}s", kind.label()));
+                let g = group(kind.plural());
                 let labels: Vec<String> =
                     formats_for(kind).iter().map(|f| format_label(*f)).collect();
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();

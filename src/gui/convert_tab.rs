@@ -238,7 +238,7 @@ impl ConvertTab {
         let current = self.ctl.format(kind);
         let (format_id, ext_id) = rusty_backup::controller::convert::kind_ids(kind);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("{}s:", kind.label())).strong());
+            ui.label(egui::RichText::new(format!("{}:", kind.plural())).strong());
             egui::ComboBox::from_id_salt(format_id)
                 .selected_text(current.label())
                 .width(180.0)
