@@ -216,13 +216,9 @@ impl InspectController {
             .ok_or_else(|| "Resize: no image file loaded".to_string())
     }
 
-    /// The floppy container Convert Floppy Container starts from, when the source is one.
-    pub fn floppy_convert_source(&self) -> Option<PathBuf> {
-        if self.source_is_floppy() {
-            self.image_path().map(|p| p.to_path_buf())
-        } else {
-            None
-        }
+    /// The image file Convert takes over, when the source is one (not a device, backup or remote).
+    pub fn convert_source(&self) -> Option<PathBuf> {
+        self.image_path().map(|p| p.to_path_buf())
     }
 
     /// Expand HFS is reading its source volume; `HostRequest::ExpandHfs` follows.

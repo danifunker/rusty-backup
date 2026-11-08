@@ -12,10 +12,10 @@ pub mod backup_plan;
 pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
-pub mod cd_build;
 pub mod cache_runner;
 #[cfg(feature = "audio")]
 pub mod cd_audio_player;
+pub mod cd_build;
 #[cfg(feature = "chd")]
 pub mod chd_edit_open;
 #[cfg(feature = "chd")]
@@ -34,7 +34,6 @@ pub mod entry_detail;
 pub mod export_runner;
 pub mod extract;
 pub mod file_types;
-pub mod floppy_convert;
 pub mod format;
 pub mod fs_limits;
 pub mod fsck_runner;

@@ -109,7 +109,7 @@ pub mod ids {
     pub const OPEN_FILE: &str = "inspect.source.open_file";
     pub const OPEN_BACKUP: &str = "inspect.source.open_backup";
     pub const CONNECT_REMOTE: &str = "inspect.source.connect_remote";
-    pub const CONVERT_FLOPPY: &str = "inspect.convert_floppy";
+    pub const CONVERT: &str = "inspect.convert";
     pub const CANCEL_EXPORT: &str = "inspect.cancel_export";
     pub const EXPORT_WHOLE: &str = "inspect.export.whole_disk";
     pub const EXPORT_PER_PARTITION: &str = "inspect.export.per_partition";

@@ -335,16 +335,20 @@ fn disc_fits(format: Format, source: Option<DiscSource>) -> Result<(), String> {
     let Some(source) = source else {
         return Err("The disc's format could not be read.".to_string());
     };
-    let ok = match (source, format) {
-        (Iso, Format::ChdCd | Format::ChdDvd) => true,
-        (Iso, Format::BinCue) => cfg!(feature = "optical"),
-        (Cue, Format::ChdCd) => true,
-        (Cue, Format::Iso) => cfg!(feature = "optical"),
-        (CdChd, Format::BinCue) => true,
-        (CdChd, Format::Iso) => cfg!(feature = "optical"),
-        (DvdChd, Format::Iso) => true,
-        _ => false,
-    };
+    // These three go through the optical disc converter.
+    let needs_optical = matches!(
+        (source, format),
+        (Iso, Format::BinCue) | (Cue, Format::Iso) | (CdChd, Format::Iso)
+    );
+    let routed = needs_optical
+        || matches!(
+            (source, format),
+            (Iso, Format::ChdCd | Format::ChdDvd)
+                | (Cue, Format::ChdCd)
+                | (CdChd, Format::BinCue)
+                | (DvdChd, Format::Iso)
+        );
+    let ok = routed && (!needs_optical || cfg!(feature = "optical"));
     if ok {
         return Ok(());
     }
@@ -492,7 +496,15 @@ pub struct Options {
     pub verify: bool,
     /// BIN/CUE only: one .bin per track.
     pub multi_bin: bool,
-    pub chd: Option<crate::rbformats::chd_options::ChdOptions>,
+    pub chd: ChdChoices,
+}
+
+/// The CHD codec and hunk choices for each CHD format; `None` takes chdman's defaults.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChdChoices {
+    pub hd: Option<crate::rbformats::chd_options::ChdOptions>,
+    pub cd: Option<crate::rbformats::chd_options::ChdOptions>,
+    pub dvd: Option<crate::rbformats::chd_options::ChdOptions>,
 }
 
 impl Default for Options {
@@ -512,7 +524,7 @@ impl Default for Options {
             floppy_size: FloppySize::Same,
             verify: false,
             multi_bin: false,
-            chd: None,
+            chd: ChdChoices::default(),
         }
     }
 }

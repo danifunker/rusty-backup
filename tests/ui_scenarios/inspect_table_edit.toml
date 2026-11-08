@@ -9,7 +9,7 @@ vm = "inspect"
 action = "OpenImage"
 arg = "$mbr_gap"
 settle = true
-expect = { partitions = 1, can_add_partition = true, floppy_source = false, alto_source = true }
+expect = { partitions = 1, can_add_partition = true, convert_source = true, alto_source = true }
 
 [[step]]
 action = "AddPartition"

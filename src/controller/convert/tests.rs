@@ -52,7 +52,7 @@ fn a_folder_lists_each_kind_and_converts_into_a_mirrored_tree() {
     assert_eq!(c.extension(ImageKind::Floppy), "dsk");
     assert_eq!(c.rows()[1].outcome, "-> b.dsk");
     assert_eq!(c.start_label(), "Convert 2 files");
-    c.apply(ConvertAction::Start(None));
+    c.apply(ConvertAction::Start(ChdChoices::default()));
     settle(&mut c);
     assert_eq!(
         c.last_result(),
@@ -65,7 +65,7 @@ fn a_folder_lists_each_kind_and_converts_into_a_mirrored_tree() {
     assert!(out.path().join("sub/b.dsk").is_file());
 
     // Again: both outputs exist, so Start asks.
-    let effects = c.apply(ConvertAction::Start(None));
+    let effects = c.apply(ConvertAction::Start(ChdChoices::default()));
     assert!(matches!(effects.as_slice(), [Effect::Choose(q)] if q.purpose == purpose::CONFLICTS));
     c.apply(ConvertAction::Chose {
         purpose: purpose::CONFLICTS,
@@ -91,7 +91,7 @@ fn one_file_saves_beside_itself_and_follows_the_extension() {
     assert_eq!(c.output(), Some(dir.path().join("disk.d88").as_path()));
     c.apply(ConvertAction::SetFloppySize(FloppySize::Refit(737_280)));
     c.apply(ConvertAction::SetVerify(true));
-    c.apply(ConvertAction::Start(None));
+    c.apply(ConvertAction::Start(ChdChoices::default()));
     settle(&mut c);
     let log: Vec<String> = c.take_log().into_iter().map(|(_, m)| m).collect();
     assert!(

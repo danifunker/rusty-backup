@@ -18,6 +18,8 @@ pub enum AppTab {
     /// Build Disk: a new partitioned disk or volume.
     Build,
     Inspect,
+    /// Convert: images to other formats, one or a folder at a time.
+    Convert,
     Optical,
     Archives,
 }
@@ -39,6 +41,7 @@ pub enum DropRoute {
     Archives(PathBuf),
     Restore(PathBuf),
     Backup(PathBuf),
+    Convert(PathBuf),
     /// The active tab keeps it (Inspect's open volume takes drops itself).
     Ignore,
 }
@@ -329,6 +332,7 @@ impl AppController {
             // Build Disk starts from nothing; a drop has no meaning there.
             AppTab::Build => DropRoute::Ignore,
             AppTab::Backup => DropRoute::Backup(path),
+            AppTab::Convert => DropRoute::Convert(path),
         }
     }
 
@@ -401,17 +405,11 @@ pub fn progress_text(current: u64, total: u64, full: u64, rate_eta: &str) -> Str
 pub fn busy_elsewhere(
     tab: AppTab,
     running: &[(AppTab, Option<&'static str>)],
-    bulk_running: bool,
 ) -> Option<&'static str> {
     running
         .iter()
         .find(|(owner, name)| name.is_some() && *owner != tab)
         .and_then(|(_, name)| *name)
-        .or(if bulk_running {
-            Some("Bulk Convert")
-        } else {
-            None
-        })
 }
 
 #[cfg(test)]
@@ -466,15 +464,12 @@ mod tests {
 
     #[test]
     fn one_disk_job_at_a_time() {
-        let running = [(AppTab::Backup, Some("Backup")), (AppTab::Restore, None)];
-        assert_eq!(
-            busy_elsewhere(AppTab::Restore, &running, false),
-            Some("Backup")
-        );
-        assert_eq!(busy_elsewhere(AppTab::Backup, &running, false), None);
-        assert_eq!(
-            busy_elsewhere(AppTab::Backup, &running, true),
-            Some("Bulk Convert")
-        );
+        let running = [
+            (AppTab::Backup, Some("Backup")),
+            (AppTab::Restore, None),
+            (AppTab::Convert, None),
+        ];
+        assert_eq!(busy_elsewhere(AppTab::Restore, &running), Some("Backup"));
+        assert_eq!(busy_elsewhere(AppTab::Backup, &running), None);
     }
 }

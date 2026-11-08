@@ -1,0 +1,64 @@
+# Convert: a folder of floppies, subfolders, a format that refuses them, then DiskCopy 4.2
+# refitted to 720K with verify; a second Start asks about the outputs that now exist.
+name = "Convert: folder, subfolders, refuse, refit, verify, conflicts"
+vm = "convert"
+
+[[step]]
+action = "SetSource"
+arg = "$folder"
+settle = true
+expect = { files = 1, kinds = "Floppy", output = "", problem = "Choose an output folder." }
+
+[[step]]
+action = "SetRecursive"
+arg = true
+settle = true
+expect = { files = 2 }
+
+[[step]]
+action = "PickOutput"
+effects = ["PickFolder"]
+
+[[step]]
+action = "AnswerOutput"
+
+[[step]]
+action = "SetFormat"
+arg = "floppy:woz"
+expect = { can_start = false, row0 = "~Skipped: WOZ takes 140K", problem = "No selected file can be converted with these choices." }
+
+[[step]]
+action = "SetFormat"
+arg = "floppy:dc42"
+expect = { can_start = true, row0 = "-> a.dsk" }
+
+[[step]]
+action = "SetFloppySize"
+arg = "720k"
+
+[[step]]
+action = "SetVerify"
+arg = true
+
+[[step]]
+action = "Start"
+settle = true
+expect = { running = false, result = "2 ok, 0 failed, 0 skipped", outputs = "a.dsk,sub/b.dsk", log = "~Refitted to 720 KB" }
+
+[[step]]
+action = "Start"
+effects = ["Choose"]
+expect = { running = false }
+
+[[step]]
+action = "Back"
+expect = { running = false }
+
+[[step]]
+action = "Start"
+effects = ["Choose"]
+
+[[step]]
+action = "Skip"
+settle = true
+expect = { running = false, result = "2 ok, 0 failed, 0 skipped" }

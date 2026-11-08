@@ -95,6 +95,7 @@ impl Target for AppController {
                 "restore" => AppTab::Restore,
                 "build" => AppTab::Build,
                 "inspect" => AppTab::Inspect,
+                "convert" => AppTab::Convert,
                 "optical" => AppTab::Optical,
                 "archives" => AppTab::Archives,
                 other => return Err(format!("no tab {other:?}")),
@@ -243,7 +244,7 @@ impl Target for JobProbeController {
 /// rest free); actions `EditTable`, `AddPartition`, `CloseEditor`, `TableMode` (row 0: `Original`,
 /// `Custom`), `TableDelete` / `TableUndo` (a row), `TableAdd`, `TableValidate`, `ApplyTable`;
 /// probes `can_add_partition`, `editor_open`, `table_rows`, `table_modes` (row 0's choices),
-/// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `floppy_source`, `alto_source`.
+/// `table_can_delete` (row 0), `table_can_apply`, `table_errors`, `convert_source`, `alto_source`.
 /// The source and the list: `ChooseImage`, `ChooseBackupFolder`, `Select` (a partition index);
 /// probes `selected` (-1 for none), `row_number`, `row_volume` (row 0), `layout_segments`.
 struct InspectTarget {
@@ -353,7 +354,7 @@ impl InspectTarget {
             "table_can_delete" => Value::Boolean(first.is_some_and(|r| r.can_delete())),
             "table_can_apply" => Value::Boolean(view.as_ref().is_some_and(|v| v.can_apply)),
             "table_errors" => Value::String(view.map(|v| v.errors.join("; ")).unwrap_or_default()),
-            "floppy_source" => Value::Boolean(self.ctl.floppy_convert_source().is_some()),
+            "convert_source" => Value::Boolean(self.ctl.convert_source().is_some()),
             _ => Value::Boolean(self.ctl.alto_resize_source().is_ok()),
         })
     }
@@ -508,7 +509,7 @@ impl Target for InspectTarget {
             }
             "log" => Value::String(self.log.join("\n")),
             "can_add_partition" | "editor_open" | "table_rows" | "table_modes"
-            | "table_can_delete" | "table_can_apply" | "table_errors" | "floppy_source"
+            | "table_can_delete" | "table_can_apply" | "table_errors" | "convert_source"
             | "alto_source" => self.table_probe(name)?,
             other => return Err(format!("InspectController has no probe {other:?}")),
         })
@@ -1565,220 +1566,155 @@ impl Target for ExpandHfsTarget {
     }
 }
 
-/// `FloppyConvertController`. Actions: `Open` (arg: `$xdf` writes a blank 1.2 MB XDF, or a path),
-/// `SetTarget` (`xdf`, `hdm`, `dim`, `d88`), `PickOutput`, `Pick` (the output, `out.<ext>` in the
-/// temp folder), `Start`, `Close`. Probes: `open`, `source_kind`, `source_error`, `target`,
-/// `can_start`, `summary`, `out_bytes`.
-struct FloppyConvertTarget {
-    ctl: rusty_backup::controller::floppy_convert::FloppyConvertController,
-    dir: tempfile::TempDir,
-}
-
-impl FloppyConvertTarget {
-    fn new() -> Self {
-        FloppyConvertTarget {
-            ctl: rusty_backup::controller::floppy_convert::FloppyConvertController::new(
-                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
-            ),
-            dir: tempfile::tempdir().expect("temp dir"),
-        }
-    }
-
-    fn out(&self) -> PathBuf {
-        self.dir
-            .path()
-            .join(format!("out.{}", self.ctl.target().extension()))
-    }
-}
-
-impl Target for FloppyConvertTarget {
-    fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
-        use rusty_backup::controller::floppy_convert::{
-            purpose, FloppyConvertAction, FloppyTarget,
-        };
-        let a = match action {
-            "Open" => FloppyConvertAction::Open(Some(match arg_str(arg)? {
-                "$xdf" => {
-                    let p = self.dir.path().join("disk.xdf");
-                    std::fs::write(&p, vec![0xE5u8; 1_261_568]).map_err(|e| e.to_string())?;
-                    p
-                }
-                other => PathBuf::from(other),
-            })),
-            "SetTarget" => {
-                let want = arg_str(arg)?;
-                let t = FloppyTarget::ALL
-                    .iter()
-                    .copied()
-                    .find(|t| t.extension() == want)
-                    .ok_or("SetTarget takes xdf, hdm, dim or d88")?;
-                FloppyConvertAction::SetTarget(t)
-            }
-            "PickOutput" => FloppyConvertAction::PickOutput,
-            "Pick" => FloppyConvertAction::Picked {
-                purpose: purpose::OUTPUT,
-                path: Some(self.out()),
-            },
-            "Start" => FloppyConvertAction::Start,
-            "Close" => FloppyConvertAction::Close,
-            other => return Err(format!("FloppyConvertController has no action {other:?}")),
-        };
-        Ok(self.ctl.apply(a))
-    }
-
-    fn probe(&self, name: &str) -> Result<Value, String> {
-        Ok(match name {
-            "open" => Value::Boolean(self.ctl.is_open()),
-            "source_kind" => Value::String(self.ctl.source_kind().unwrap_or("").to_string()),
-            "source_error" => Value::String(self.ctl.source_error().unwrap_or("").to_string()),
-            "target" => Value::String(self.ctl.target().extension().to_string()),
-            "can_start" => Value::Boolean(self.ctl.can_start()),
-            "summary" => Value::String(match self.ctl.outcome() {
-                Some(Ok(done)) => done.summary.clone(),
-                Some(Err(e)) => format!("error: {e}"),
-                None => String::new(),
-            }),
-            "out_bytes" => Value::Integer(
-                std::fs::metadata(self.out())
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0),
-            ),
-            other => return Err(format!("FloppyConvertController has no probe {other:?}")),
-        })
-    }
-
-    fn settle(&mut self) -> Vec<Effect> {
-        self.ctl.wait_idle();
-        self.ctl.tick()
-    }
-}
-
-/// `BulkConvertController`. Actions: `Open`, `PickSource` / `PickOutput` (answered with the
-/// scenario's folders: the source holds `a.img` and `b.img`, the output an `a.img` already),
-/// `SetFormat` (an output extension, e.g. `img`, `vhd`), `Scan`, `SelectNone`, `SelectAll`,
-/// `SetExtension`, `ResetExtension`, `SetMultiBin`, `Start`, `Skip` / `Overwrite` / `Back` (the
-/// conflict answer), `Close`. Probes: `open`, `phase`, `files`, `selected`, `extension`,
-/// `can_start`, `problem`, `conflicts`, `running`, `result`, `log`, `outputs` (the output
-/// folder's names, comma-joined), `label`, `note`, `multi_bin`.
-struct BulkConvertTarget {
-    ctl: rusty_backup::controller::bulk_convert::BulkConvertController,
+/// `ConvertController`. Actions: `SetSource` (`$folder`: two 1.44 MB FAT floppies, one in a
+/// subfolder; `$floppy`: one), `SetRecursive` (bool), `SetFormat` (`kind:id`, e.g. `floppy:dc42`),
+/// `SetFloppySize` (`same`, `720k`, ...), `SetSizing` (`keep`, `minimum`, `minimum+10%`),
+/// `SetVerify` (bool), `PickOutput`, `AnswerOutput` (the temp output folder), `SelectNone`,
+/// `SelectAll`, `Start`, `Skip` / `Overwrite` / `Back` (the conflict answer), `Clear`.
+/// Probes: `files`, `kinds` (comma-joined), `row0` (the first row's result), `output`
+/// (`set` / empty), `can_start`, `problem`, `running`, `result`, `outputs` (relative paths
+/// below the output folder, comma-joined), `log`.
+struct ConvertTarget {
+    ctl: rusty_backup::controller::convert::ConvertController,
     src: tempfile::TempDir,
     out: tempfile::TempDir,
     log: Vec<String>,
 }
 
-impl BulkConvertTarget {
+impl ConvertTarget {
     fn new() -> Self {
-        let src = tempfile::tempdir().expect("temp dir");
-        let out = tempfile::tempdir().expect("temp dir");
-        for n in ["a.img", "b.img"] {
-            std::fs::write(src.path().join(n), vec![0u8; 8192]).expect("source file");
-        }
-        std::fs::write(out.path().join("a.img"), b"keep").expect("output file");
-        BulkConvertTarget {
-            ctl: rusty_backup::controller::bulk_convert::BulkConvertController::new(
-                std::sync::Arc::new(rusty_backup::model::job::NoNotify),
-            ),
-            src,
-            out,
+        ConvertTarget {
+            ctl: rusty_backup::controller::convert::ConvertController::new(std::sync::Arc::new(
+                rusty_backup::model::job::NoNotify,
+            )),
+            src: tempfile::tempdir().expect("temp dir"),
+            out: tempfile::tempdir().expect("temp dir"),
             log: Vec::new(),
+        }
+    }
+
+    fn floppy(&self, rel: &str) -> Result<PathBuf, String> {
+        let p = self.src.path().join(rel);
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let img = fs_pc::fat::create_dos_floppy(1_474_560, Some("SCENARIO"))
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&p, img).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                Self::walk(&p, root, out);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.display().to_string().replace('\\', "/"));
+            }
         }
     }
 }
 
-impl Target for BulkConvertTarget {
+impl Target for ConvertTarget {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
-        use rusty_backup::controller::bulk_convert::{
-            purpose, BulkConvertAction as A, ConflictChoice, FORMATS,
+        use rusty_backup::controller::convert::{
+            purpose, ChdChoices, ConvertAction as A, FloppySize, Format, ImageKind, SizeChoice,
         };
         let a = match action {
-            "Open" => A::Open,
-            "PickSource" => A::PickSource,
-            "PickOutput" => A::PickOutput,
-            "AnswerSource" => A::Picked {
-                purpose: purpose::SOURCE,
-                path: Some(self.src.path().to_path_buf()),
+            "SetSource" => match arg_str(arg)? {
+                "$folder" => {
+                    self.floppy("a.img")?;
+                    self.floppy("sub/b.img")?;
+                    A::SetSource(self.src.path().to_path_buf())
+                }
+                "$floppy" => A::SetSource(self.floppy("one.img")?),
+                other => return Err(format!("SetSource takes $folder or $floppy, not {other}")),
             },
+            "SetRecursive" => A::SetRecursive(arg.and_then(Value::as_bool).ok_or("needs a bool")?),
+            "SetVerify" => A::SetVerify(arg.and_then(Value::as_bool).ok_or("needs a bool")?),
+            "SetFormat" => {
+                let (kind, id) = arg_str(arg)?.split_once(':').ok_or("kind:id")?;
+                let kind = match kind {
+                    "hard_disk" => ImageKind::HardDisk,
+                    "floppy" => ImageKind::Floppy,
+                    "disc" => ImageKind::Disc,
+                    other => return Err(format!("no kind {other}")),
+                };
+                A::SetFormat(kind, Format::from_id(id).ok_or("no such format")?)
+            }
+            "SetFloppySize" => A::SetFloppySize(FloppySize::parse(arg_str(arg)?)?),
+            "SetSizing" => A::SetSizing(match arg_str(arg)? {
+                "keep" => SizeChoice::Keep,
+                "minimum" => SizeChoice::Minimum,
+                _ => SizeChoice::Extra,
+            }),
+            "PickOutput" => A::PickOutput,
             "AnswerOutput" => A::Picked {
-                purpose: purpose::OUTPUT,
+                purpose: purpose::OUTPUT_FOLDER,
                 path: Some(self.out.path().to_path_buf()),
             },
-            "SetFormat" => {
-                let want = arg_str(arg)?;
-                A::SetFormat(
-                    *FORMATS
-                        .iter()
-                        .find(|f| f.extension() == want)
-                        .ok_or("SetFormat takes an output extension")?,
-                )
-            }
-            "Scan" => A::Scan,
             "SelectNone" => A::SelectNone,
             "SelectAll" => A::SelectAll,
-            "SetExtension" => A::SetExtension(arg_str(arg)?.to_string()),
-            "ResetExtension" => A::ResetExtension,
-            "SetMultiBin" => A::SetMultiBin(
-                arg.and_then(Value::as_bool)
-                    .ok_or("SetMultiBin takes a bool")?,
-            ),
-            "Start" => A::Start(None),
-            "Skip" => A::ResolveConflicts(ConflictChoice::SkipConflicting),
-            "Overwrite" => A::ResolveConflicts(ConflictChoice::Overwrite),
-            "Back" => A::ResolveConflicts(ConflictChoice::Back),
-            "Close" => A::Close,
-            other => return Err(format!("BulkConvertController has no action {other:?}")),
+            "Start" => A::Start(ChdChoices::default()),
+            "Skip" | "Overwrite" | "Back" => A::Chose {
+                purpose: purpose::CONFLICTS,
+                index: ["Skip", "Overwrite", "Back"]
+                    .iter()
+                    .position(|n| *n == action)
+                    .unwrap_or(2),
+            },
+            "Clear" => A::Clear,
+            other => return Err(format!("ConvertController has no action {other:?}")),
         };
         Ok(self.ctl.apply(a))
     }
 
     fn probe(&self, name: &str) -> Result<Value, String> {
-        use rusty_backup::controller::bulk_convert::BulkPhase;
         Ok(match name {
-            "open" => Value::Boolean(self.ctl.is_open()),
-            "phase" => Value::String(
-                match self.ctl.phase() {
-                    BulkPhase::Setup => "setup",
-                    BulkPhase::Review => "review",
+            "files" => Value::Integer(self.ctl.items().len() as i64),
+            "kinds" => Value::String(
+                self.ctl
+                    .shown_kinds()
+                    .iter()
+                    .map(|k| k.label())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            "row0" => Value::String(
+                self.ctl
+                    .rows()
+                    .first()
+                    .map(|r| r.outcome.clone())
+                    .unwrap_or_default(),
+            ),
+            "output" => Value::String(
+                if self.ctl.output().is_some() {
+                    "set"
+                } else {
+                    ""
                 }
-                .to_string(),
+                .into(),
             ),
-            "files" => Value::Integer(self.ctl.files().len() as i64),
-            "selected" => Value::Integer(self.ctl.selected_count() as i64),
-            "extension" => Value::String(self.ctl.extension().to_string()),
-            "label" => Value::String(
-                rusty_backup::controller::bulk_convert::format_label(self.ctl.format()).to_string(),
-            ),
-            "note" => Value::String(
-                rusty_backup::controller::bulk_convert::format_note(self.ctl.format())
-                    .unwrap_or("")
-                    .to_string(),
-            ),
-            "multi_bin" => Value::Boolean(self.ctl.multi_bin()),
             "can_start" => Value::Boolean(self.ctl.can_start()),
-            "problem" => Value::String(self.ctl.start_problem().unwrap_or("").to_string()),
-            "conflicts" => Value::Integer(self.ctl.conflicts().map_or(0, |c| c.len()) as i64),
+            "problem" => Value::String(self.ctl.start_problem().unwrap_or_default()),
             "running" => Value::Boolean(self.ctl.is_running()),
             "result" => Value::String(match self.ctl.last_result() {
-                Some(Ok(r)) => format!("{} ok, {} failed", r.succeeded, r.failed),
+                Some(Ok(r)) => format!(
+                    "{} ok, {} failed, {} skipped",
+                    r.succeeded, r.failed, r.skipped
+                ),
                 Some(Err(e)) => format!("error: {e}"),
                 None => String::new(),
             }),
-            "log" => Value::String(self.log.join("\n")),
             "outputs" => {
-                let mut names: Vec<String> = std::fs::read_dir(self.out.path())
-                    .map(|rd| {
-                        rd.filter_map(|e| e.ok())
-                            .map(|e| {
-                                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                                format!("{}:{len}", e.file_name().to_string_lossy())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mut names = Vec::new();
+                Self::walk(self.out.path(), self.out.path(), &mut names);
                 names.sort();
                 Value::String(names.join(","))
             }
-            other => return Err(format!("BulkConvertController has no probe {other:?}")),
+            "log" => Value::String(self.log.join("\n")),
+            other => return Err(format!("ConvertController has no probe {other:?}")),
         })
     }
 
@@ -2469,8 +2405,7 @@ fn target_for(vm: &str) -> Result<Box<dyn Target>, String> {
         "disk_write" => Ok(Box::new(DiskWriteTarget::new())),
         "alto_resize" => Ok(Box::new(AltoResizeTarget::new())),
         "expand_hfs" => Ok(Box::new(ExpandHfsTarget::new())),
-        "floppy_convert" => Ok(Box::new(FloppyConvertTarget::new())),
-        "bulk_convert" => Ok(Box::new(BulkConvertTarget::new())),
+        "convert" => Ok(Box::new(ConvertTarget::new())),
         "archives" => Ok(Box::new(ArchivesTarget::new())),
         "settings" => Ok(Box::new(SettingsTarget::new())),
         "resize" => Ok(Box::new(ResizeTarget::new())),

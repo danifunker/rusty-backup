@@ -361,7 +361,7 @@ fn add_partition_needs_a_gap_and_the_dialog_sources_follow_the_image() {
     assert!(ctl.can_edit_table() && ctl.can_add_partition());
     assert!(ctl.add_partition_hint().contains("gap at LBA"));
     assert_eq!(ctl.alto_resize_source(), Ok(img.clone()));
-    assert_eq!(ctl.floppy_convert_source(), None);
+    assert_eq!(ctl.convert_source(), Some(img.clone()));
     assert!(!ctl.summarizing_hfs());
     ctl.apply(InspectAction::AddPartition);
     let v = ctl.table_editor().expect("the editor opens");
@@ -381,7 +381,7 @@ fn add_partition_needs_a_gap_and_the_dialog_sources_follow_the_image() {
         temp: None,
     }));
     settle(&mut fat);
-    assert_eq!(fat.floppy_convert_source(), Some(xdf));
+    assert_eq!(fat.convert_source(), Some(xdf));
     fat.apply(InspectAction::Close);
     assert!(fat.alto_resize_source().is_err());
 }

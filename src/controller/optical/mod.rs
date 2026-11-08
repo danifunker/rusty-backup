@@ -85,10 +85,13 @@ pub mod ids {
     pub const CHD_MODE: &str = "optical.chd_mode";
     pub const CHD_HUNK: &str = "optical.chd_hunk";
     pub const CHD_CODEC: &str = "optical.chd_codec";
+    pub const CONVERT: &str = "optical.convert";
 }
 
 /// Tooltips every shell shows on the same controls.
 pub mod hints {
+    pub const CONVERT: &str = "Change this image's format (CHD, BIN/CUE, ISO) in the Convert tab.";
+    pub const CONVERT_MOVED: &str = "Disc images are converted in the Convert tab.";
     pub const PHYSICAL_DRIVE: &str =
         "Click \"Show Physical Devices\" (top bar) for a local drive, \
          or \"Add remote daemon...\" for a networked one.";
@@ -329,6 +332,14 @@ impl OpticalController {
 
     pub fn image(&self) -> Option<&Path> {
         self.image.as_deref()
+    }
+
+    /// The disc image the Convert tab takes over; a drive is ripped here instead.
+    pub fn convert_source(&self) -> Option<PathBuf> {
+        match self.mode {
+            SourceMode::ImageFile => self.image.clone(),
+            SourceMode::PhysicalDrive => None,
+        }
     }
 
     /// A remote daemon is connected: physical-drive mode is offered without elevation.

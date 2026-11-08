@@ -81,6 +81,7 @@ pub(super) const HINTS_OPTICAL: &[KeyHint] = &[
     hint("R", "Add remote daemon: a drive on an rb-cli serve host"),
     hint("b", "Browse Contents: the disc in the Explorer"),
     hint("c", "Close Disc"),
+    hint("C", "Convert the image in the Convert tab"),
     hint("i", "CHD Info (a .chd image)"),
     hint("s", "Start the rip or conversion"),
     hint(
@@ -120,6 +121,8 @@ pub(super) struct OpticalState {
     pub(super) note: Option<String>,
     /// The disc browser to open, or that it should close (`HostRequest`s for the app).
     browse: Option<DiscSource>,
+    /// The disc image `C` hands to the Convert tab.
+    convert: Option<std::path::PathBuf>,
     close_browser: bool,
     /// A run is on screen: "Rip" or "Conversion"; its end becomes the result line.
     running: Option<&'static str>,
@@ -150,6 +153,7 @@ impl OpticalState {
             log: Vec::new(),
             note: None,
             browse: None,
+            convert: None,
             close_browser: false,
             running: None,
             result: None,
@@ -571,6 +575,12 @@ impl OpticalState {
                 }
             }
             KeyCode::Char('c') => self.act(OpticalAction::CloseDisc),
+            KeyCode::Char('C') => match self.ctl.convert_source() {
+                Some(path) => self.convert = Some(path),
+                None => {
+                    self.note = Some("Convert takes a disc image; a drive is ripped here.".into())
+                }
+            },
             KeyCode::Char('i') => {
                 if self.ctl.can_chd_info() {
                     self.act(OpticalAction::ChdInfo);
@@ -769,6 +779,17 @@ impl App {
         let disc_open = self.explorer.as_ref().is_some_and(|e| e.is_disc());
         if o.ctl.is_browsing() && !disc_open {
             o.act(OpticalAction::BrowserClosed);
+        }
+        if let Some(path) = o.convert.take() {
+            if let Some(idx) = super::TABS
+                .iter()
+                .position(|t| t.0 == super::TabId::Convert)
+            {
+                self.active = idx;
+                self.scroll = 0;
+                self.on_tab_changed();
+                self.convert_open(path);
+            }
         }
     }
 

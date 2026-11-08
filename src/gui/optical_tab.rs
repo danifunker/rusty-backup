@@ -33,6 +33,8 @@ pub struct OpticalTab {
     showing_bar: bool,
     /// The disc browser: the shared browse view, `PaneProfile::optical`.
     browser: super::browse_view::BrowseView,
+    /// The image "Convert..." hands to the Convert tab, taken by the app.
+    pending_convert: Option<std::path::PathBuf>,
 }
 
 impl OpticalTab {
@@ -49,6 +51,7 @@ impl OpticalTab {
             add_remote_addr: String::new(),
             showing_bar: false,
             browser: super::browse_view::BrowseView::optical(),
+            pending_convert: None,
         }
     }
 }
@@ -60,6 +63,10 @@ impl OpticalTab {
     }
 
     /// Scan the drives at start-up; the count reaches the log when the scan ends.
+    pub fn take_convert_request(&mut self) -> Option<std::path::PathBuf> {
+        self.pending_convert.take()
+    }
+
     pub fn find_drives(&mut self) {
         self.act(OpticalAction::FindDrives);
     }
@@ -224,23 +231,41 @@ impl OpticalTab {
 
         ui.separator();
 
-        ui.add_enabled_ui(controls_enabled, |ui| self.output_rows(ui, &mut actions));
-
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            if !self.ctl.is_running() {
-                let label = self.ctl.start_label();
+        if self.ctl.task() == Task::Convert {
+            // An image's format changes in the Convert tab; this tab rips drives.
+            ui.horizontal(|ui| {
+                let src = self.ctl.convert_source();
                 if ui
-                    .add_enabled(self.ctl.can_start(), egui::Button::new(label))
+                    .add_enabled(src.is_some(), egui::Button::new("Convert..."))
+                    .on_hover_text(rusty_backup::controller::optical::hints::CONVERT)
                     .clicked()
                 {
-                    actions.push(OpticalAction::Start(self.chd_choice()));
+                    self.pending_convert = src;
                 }
-            } else if ui.button("Cancel").clicked() {
-                actions.push(OpticalAction::Cancel);
-            }
-        });
+                ui.label(
+                    egui::RichText::new(rusty_backup::controller::optical::hints::CONVERT_MOVED)
+                        .weak(),
+                );
+            });
+        } else {
+            ui.add_enabled_ui(controls_enabled, |ui| self.output_rows(ui, &mut actions));
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if !self.ctl.is_running() {
+                    let label = self.ctl.start_label();
+                    if ui
+                        .add_enabled(self.ctl.can_start(), egui::Button::new(label))
+                        .clicked()
+                    {
+                        actions.push(OpticalAction::Start(self.chd_choice()));
+                    }
+                } else if ui.button("Cancel").clicked() {
+                    actions.push(OpticalAction::Cancel);
+                }
+            });
+        }
 
         ui.separator();
 

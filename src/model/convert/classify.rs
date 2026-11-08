@@ -107,7 +107,7 @@ pub fn classify(path: &Path) -> std::io::Result<Classified> {
         decoded_size(path, file_size)
     };
     found.size = size;
-    let floppy = size <= FLOPPY_MAX && size >= 64 * 1024;
+    let floppy = (64 * 1024..=FLOPPY_MAX).contains(&size);
     found.kind = if floppy {
         ImageKind::Floppy
     } else {
@@ -156,6 +156,7 @@ fn is_cue_sheet(path: &Path, head: &[u8]) -> bool {
     text && (ext_cue || (upper.contains("FILE ") && upper.contains("TRACK ")))
 }
 
+#[cfg_attr(not(feature = "chd"), allow(dead_code))]
 enum ChdKind {
     Cd,
     Dvd,

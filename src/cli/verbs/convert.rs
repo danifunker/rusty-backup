@@ -1,85 +1,29 @@
-//! `rb-cli convert IN OUT --format FMT` — convert one or more disk images
-//! into a chosen output format. Thin headless front-end over
-//! [`crate::model::bulk_convert_runner::start_bulk_convert`], the same
-//! worker the GUI's Bulk Convert dialog uses.
+//! `rb-cli convert IN OUT` — convert one image, or every image in a folder, to other formats.
 //!
-//! `IN` may be a single file or a folder. When it's a folder, every regular
-//! file the chosen format can consume is converted (same scan rules as the
-//! dialog — see [`scan_source_folder`]). `OUT` is always a folder; it's
-//! created if it doesn't exist. Output filenames reuse the source stem
-//! with the format's default extension (overridable with `--extension`).
+//! Drives `controller::convert`, the Convert tab's controller (docs/convert_tab.md): each file is
+//! read as a hard disk, floppy or disc, and each kind has its own format. `--format` sets every
+//! kind that offers it (so `--format chd-cd` still converts a folder of ISOs, and `--format raw`
+//! hard disks and floppies alike); `--floppy-to` and `--disc-to` override one kind. `OUT` is a
+//! folder, created if absent; a folder source keeps its subfolders there.
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, ValueEnum};
+use clap::Args;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cli::logging::log_stderr;
-use crate::model::bulk_convert_runner::{
-    fmt_bytes, scan_source_folder, start_bulk_convert, ScannedFile,
+use crate::controller::convert::{
+    purpose, ChdChoices, ChdProfile, ConvertAction, ConvertController, Extra, ExtraUnit,
+    FloppySize, Format, ImageKind, SizeChoice, Sizing,
 };
-use crate::model::status::{BulkConvertLogLevel, BulkConvertStatus};
-use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
-use crate::rbformats::export::ExportFormat;
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ConvertFormat {
-    /// MAME CHD, hard-disk profile (default).
-    Chd,
-    /// MAME CHD, DVD profile.
-    ChdDvd,
-    /// MAME CHD, CD profile (input must be .iso or .cue).
-    ChdCd,
-    /// BIN/CUE extracted from a CD CHD.
-    Bincue,
-    /// Fixed VHD.
-    Vhd,
-    /// Dynamic (sparse) VHD — all-zero blocks omitted; same .vhd extension.
-    VhdDynamic,
-    /// QCOW2 v3 (uncompressed). Sparse: zero clusters omitted.
-    Qcow2,
-    /// VMDK flat (`monolithicFlat`) — descriptor + sibling `-flat.vmdk` raw extent.
-    VmdkFlat,
-    /// VMDK sparse (`monolithicSparse`) — single self-contained .vmdk; zero grains omitted.
-    VmdkSparse,
-    /// Raw disk image (no header).
-    Raw,
-    /// 2MG (Apple II).
-    Twomg,
-    /// WOZ 2.0 (Apple II floppy).
-    Woz,
-    /// MOOF (Applesauce Macintosh 3.5" floppy — 400K / 800K). Loadable by Snow,
-    /// MAME, and Applesauce; preserves the GCR bitstream.
-    Moof,
-    /// DiskCopy 4.2 (Mac / Apple IIgs floppy).
-    Dc42,
-}
-
-impl From<ConvertFormat> for ExportFormat {
-    fn from(f: ConvertFormat) -> Self {
-        match f {
-            ConvertFormat::Chd => ExportFormat::Chd,
-            ConvertFormat::ChdDvd => ExportFormat::ChdDvd,
-            ConvertFormat::ChdCd => ExportFormat::ChdCd,
-            ConvertFormat::Bincue => ExportFormat::BinCue,
-            ConvertFormat::Vhd => ExportFormat::Vhd,
-            ConvertFormat::VhdDynamic => ExportFormat::VhdDynamic,
-            ConvertFormat::Qcow2 => ExportFormat::Qcow2,
-            ConvertFormat::VmdkFlat => ExportFormat::VmdkFlat,
-            ConvertFormat::VmdkSparse => ExportFormat::VmdkSparse,
-            ConvertFormat::Raw => ExportFormat::Raw,
-            ConvertFormat::Twomg => ExportFormat::TwoMg,
-            ConvertFormat::Woz => ExportFormat::Woz,
-            ConvertFormat::Moof => ExportFormat::Moof,
-            ConvertFormat::Dc42 => ExportFormat::Dc42,
-        }
-    }
-}
+use crate::controller::{Controller as _, Effect};
+use crate::model::job::NoNotify;
+use crate::rbformats::chd_options::ChdOptions;
 
 #[derive(Debug, Args)]
 pub struct ConvertArgs {
-    /// Source file or folder. When a folder, every convertible file is processed.
+    /// Source image or folder. A folder converts every image it holds.
     #[arg(value_name = "IN")]
     pub source: PathBuf,
 
@@ -87,182 +31,221 @@ pub struct ConvertArgs {
     #[arg(value_name = "OUT")]
     pub dest: PathBuf,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "chd")]
-    pub format: ConvertFormat,
+    /// Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat,
+    /// vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88
+    /// (floppies); chd-cd, chd-dvd, bincue, iso (discs).
+    #[arg(long, default_value = "chd")]
+    pub format: String,
 
-    /// Output extension (no leading dot). Defaults to the format's natural
-    /// extension (chd, vhd, img, …).
+    /// The floppies' format, overriding --format for them.
+    #[arg(long = "floppy-to")]
+    pub floppy_to: Option<String>,
+
+    /// The discs' format, overriding --format for them.
+    #[arg(long = "disc-to")]
+    pub disc_to: Option<String>,
+
+    /// Output extension (no leading dot) for the kinds --format sets. Defaults to the format's.
     #[arg(long)]
     pub extension: Option<String>,
 
-    /// For BIN/CUE output, write one .bin per track instead of a single
-    /// concatenated .bin. No effect for other formats.
+    /// Also convert the images in every subfolder; the output keeps the same folders.
+    #[arg(long)]
+    pub recursive: bool,
+
+    /// Hard disk size: keep, minimum, minimum+64MB or minimum+10% (the extra goes on every
+    /// partition, and never past the partition's original size).
+    #[arg(long, default_value = "keep")]
+    pub size: String,
+
+    /// Also measure filesystems that need a full read to find their minimum (HFS, ext, UFS,
+    /// EFS). Without it those partitions keep their size.
+    #[arg(long = "measure-slow")]
+    pub measure_slow: bool,
+
+    /// Floppy size: same, or refit to 360k, 720k, 800k, 880k, 1.2m, 1.44m, 1.76m or 2.88m
+    /// (a blank disk of that size with every file copied across).
+    #[arg(long = "floppy-size", default_value = "same")]
+    pub floppy_size: String,
+
+    /// Read each output back and compare it with its source.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// For BIN/CUE output, write one .bin per track instead of a single concatenated .bin.
     #[arg(long = "bincue-multi-bin")]
     pub bincue_multi_bin: bool,
 
-    /// Overwrite destination files that already exist. Without this,
-    /// existing outputs are skipped with a warning.
+    /// Overwrite destination files that already exist. Without this they are skipped.
     #[arg(long)]
     pub overwrite: bool,
 }
 
+fn format_arg(id: &str) -> Result<Format> {
+    // The old spellings stay accepted.
+    let id = match id.to_ascii_lowercase().as_str() {
+        "twomg" => "2mg".to_string(),
+        other => other.to_string(),
+    };
+    Format::from_id(id.as_str()).with_context(|| format!("unknown format '{id}'"))
+}
+
 pub fn run(args: ConvertArgs) -> Result<()> {
-    let export_format: ExportFormat = args.format.into();
-    let extension = args
-        .extension
-        .clone()
-        .unwrap_or_else(|| export_format.extension().to_string());
+    let format = format_arg(args.format.as_str())?;
+    let floppy_to = args.floppy_to.as_deref().map(format_arg).transpose()?;
+    let disc_to = args.disc_to.as_deref().map(format_arg).transpose()?;
+    let sizing = Sizing::parse(args.size.as_str()).map_err(anyhow::Error::msg)?;
+    let floppy_size = FloppySize::parse(args.floppy_size.as_str()).map_err(anyhow::Error::msg)?;
+    if !args.source.exists() {
+        bail!("{} does not exist", args.source.display());
+    }
+    std::fs::create_dir_all(&args.dest)
+        .with_context(|| format!("creating {}", args.dest.display()))?;
 
-    let files = collect_inputs(&args.source, export_format)?;
-    if files.is_empty() {
-        bail!("no convertible files found in {}", args.source.display());
+    let mut ctl = ConvertController::new(Arc::new(NoNotify));
+    ctl.apply(ConvertAction::SetRecursive(args.recursive));
+    ctl.apply(ConvertAction::SetSource(args.source.clone()));
+    ctl.wait_idle();
+    ctl.tick();
+    if let Some(e) = ctl.scan_error() {
+        bail!("{e}");
     }
 
-    let (files, skipped_existing) = if args.overwrite {
-        (files, Vec::new())
-    } else {
-        skip_existing(&files, &args.dest, &extension)
+    for kind in ImageKind::ALL {
+        let chosen = match kind {
+            ImageKind::Floppy => floppy_to,
+            ImageKind::Disc => disc_to,
+            ImageKind::HardDisk => None,
+        };
+        let pick = chosen.or_else(|| {
+            crate::controller::convert::formats_for(kind)
+                .contains(&format)
+                .then_some(format)
+        });
+        if let Some(f) = pick {
+            if let Some(why) = f.unavailable() {
+                bail!("{}: {why}", f.label());
+            }
+            ctl.apply(ConvertAction::SetFormat(kind, f));
+            if let (Some(ext), true) = (&args.extension, f == format) {
+                ctl.apply(ConvertAction::SetExtension(kind, ext.clone()));
+            }
+        }
+    }
+    let (choice, extra) = match sizing {
+        Sizing::Keep => (SizeChoice::Keep, None),
+        Sizing::Minimum => (SizeChoice::Minimum, None),
+        Sizing::Extra(Extra::Mib(n)) => (SizeChoice::Extra, Some((n, ExtraUnit::Mb))),
+        Sizing::Extra(Extra::Percent(n)) => (SizeChoice::Extra, Some((n, ExtraUnit::Percent))),
     };
-    for path in &skipped_existing {
-        log_stderr(format!(
-            "skipping {} — destination already exists (pass --overwrite to replace)",
-            path.display()
-        ));
+    ctl.apply(ConvertAction::SetSizing(choice));
+    if let Some((n, unit)) = extra {
+        ctl.apply(ConvertAction::SetExtraAmount(n));
+        ctl.apply(ConvertAction::SetExtraUnit(unit));
     }
-    if files.is_empty() {
-        bail!("nothing to do — every destination exists; pass --overwrite to replace");
-    }
+    ctl.apply(ConvertAction::SetMeasureSlow(args.measure_slow));
+    ctl.apply(ConvertAction::SetFloppySize(floppy_size));
+    ctl.apply(ConvertAction::SetVerify(args.verify));
+    ctl.apply(ConvertAction::SetMultiBin(args.bincue_multi_bin));
 
-    let total_bytes: u64 = files
-        .iter()
-        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
-    log_stderr(format!(
-        "rb-cli convert: {} file(s), {} total -> {} (format: {:?}, ext: .{})",
-        files.len(),
-        fmt_bytes(total_bytes),
-        args.dest.display(),
-        args.format,
-        extension,
-    ));
-
-    let chd_options = match export_format {
-        ExportFormat::Chd => Some(ChdOptions::defaults_for(ChdProfile::Hd)),
-        ExportFormat::ChdDvd => Some(ChdOptions::defaults_for(ChdProfile::Dvd)),
-        ExportFormat::ChdCd => Some(ChdOptions::defaults_for(ChdProfile::Cd)),
-        _ => None,
-    };
-
-    let status = start_bulk_convert(
-        files,
-        args.dest.clone(),
-        export_format,
-        extension,
-        chd_options,
-        args.bincue_multi_bin,
-    );
-    drain(status).context("convert failed")
-}
-
-/// Resolve the input argument to a list of source files.
-fn collect_inputs(source: &std::path::Path, format: ExportFormat) -> Result<Vec<PathBuf>> {
-    let meta =
-        std::fs::metadata(source).with_context(|| format!("cannot stat {}", source.display()))?;
-    if meta.is_file() {
-        Ok(vec![source.to_path_buf()])
-    } else if meta.is_dir() {
-        let scan: Vec<ScannedFile> = scan_source_folder(source, format)
-            .with_context(|| format!("scanning {}", source.display()))?;
-        Ok(scan.into_iter().map(|s| s.path).collect())
+    // A one-file source names its output inside OUT.
+    let output = if ctl.source_is_folder() {
+        args.dest.clone()
     } else {
-        bail!(
-            "{} is neither a regular file nor a directory",
-            source.display()
+        let kind = ctl
+            .items()
+            .first()
+            .and_then(|i| i.found.as_ref().ok())
+            .map(|c| c.kind)
+            .unwrap_or(ImageKind::HardDisk);
+        let stem = args
+            .source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "disk".to_string());
+        args.dest.join(format!("{stem}.{}", ctl.extension(kind)))
+    };
+    let purpose = if ctl.source_is_folder() {
+        purpose::OUTPUT_FOLDER
+    } else {
+        purpose::OUTPUT_FILE
+    };
+    ctl.apply(ConvertAction::Picked {
+        purpose,
+        path: Some(output),
+    });
+
+    for row in ctl.rows() {
+        let note = row.note.map(|n| format!("  ({n})")).unwrap_or_default();
+        let line = format!(
+            "{}: {} [{}] {}{note}",
+            row.name, row.kind, row.detail, row.outcome
         );
-    }
-}
-
-/// Partition `files` into (will-convert, skipped-because-dest-exists). Mirrors
-/// the GUI's conflict-resolution flow but without the interactive prompt.
-fn skip_existing(
-    files: &[PathBuf],
-    dest_dir: &std::path::Path,
-    extension: &str,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut keep = Vec::new();
-    let mut skip = Vec::new();
-    for path in files {
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
-        let dest = dest_dir.join(format!("{stem}.{extension}"));
-        if dest.exists() {
-            skip.push(path.clone());
+        log_stderr(if row.skipped {
+            format!("[WARN] {line}")
         } else {
-            keep.push(path.clone());
+            line
+        });
+    }
+    if let Some(problem) = ctl.start_problem() {
+        bail!("{problem}");
+    }
+
+    let chd = ChdChoices {
+        hd: Some(ChdOptions::defaults_for(ChdProfile::Hd)),
+        cd: Some(ChdOptions::defaults_for(ChdProfile::Cd)),
+        dvd: Some(ChdOptions::defaults_for(ChdProfile::Dvd)),
+    };
+    for fx in ctl.apply(ConvertAction::Start(chd)) {
+        if let Effect::Choose(q) = fx {
+            log_stderr(format!(
+                "[WARN] {}",
+                q.message.lines().next().unwrap_or_default()
+            ));
+            let index = if args.overwrite {
+                1
+            } else {
+                log_stderr("Skipping them; pass --overwrite to replace.");
+                0
+            };
+            ctl.apply(ConvertAction::Chose {
+                purpose: q.purpose,
+                index,
+            });
         }
     }
-    (keep, skip)
-}
-
-/// Block until the worker finishes, mirroring its log/progress to stderr.
-fn drain(status: Arc<Mutex<BulkConvertStatus>>) -> Result<()> {
-    let mut last_index: usize = 0;
-    let mut last_pct: i32 = -1;
-    loop {
+    if !ctl.is_running() {
+        bail!("nothing to do: every output already exists; pass --overwrite to replace");
+    }
+    let mut last_pct = -1i32;
+    while ctl.is_running() {
         std::thread::sleep(Duration::from_millis(200));
-        let (logs, idx, total, cur_bytes, cur_total, finished, succeeded, failed) =
-            match status.lock() {
-                Ok(mut s) => {
-                    let drained: Vec<(BulkConvertLogLevel, String)> =
-                        std::mem::take(&mut s.log_messages);
-                    (
-                        drained,
-                        s.current_index,
-                        s.total_files,
-                        s.current_bytes,
-                        s.current_total_bytes,
-                        s.finished,
-                        s.succeeded,
-                        s.failed,
-                    )
-                }
-                Err(_) => bail!("convert worker poisoned its status mutex"),
-            };
-        for (level, message) in logs {
-            let tag = match level {
-                BulkConvertLogLevel::Info => "INFO",
-                BulkConvertLogLevel::Warn => "WARN",
-                BulkConvertLogLevel::Error => "ERROR",
-            };
-            log_stderr(format!("[{tag}] {message}"));
+        ctl.tick();
+        for (level, line) in ctl.take_log() {
+            log_stderr(format!("[{level:?}] {line}"));
         }
-        if idx != last_index {
-            last_index = idx;
-            last_pct = -1;
-        }
-        if cur_total > 0 {
-            let pct = ((cur_bytes as f64 / cur_total as f64) * 100.0) as i32;
-            if pct / 5 != last_pct / 5 {
-                log_stderr(format!(
-                    "  [{}/{}] {:>3}% ({}/{})",
-                    idx,
-                    total,
-                    pct,
-                    fmt_bytes(cur_bytes),
-                    fmt_bytes(cur_total),
-                ));
+        if let Some(crate::model::job::Progress::Determinate { done, total, .. }) =
+            ctl.run_snapshot().map(|s| s.progress)
+        {
+            let pct = (done as f64 / total.max(1) as f64 * 100.0) as i32;
+            if pct / 10 != last_pct / 10 {
+                log_stderr(format!("  {pct:>3}%"));
                 last_pct = pct;
             }
         }
-        if finished {
-            if failed > 0 {
-                bail!(
-                    "convert finished with {} failure(s) ({} succeeded)",
-                    failed,
-                    succeeded
-                );
-            }
-            return Ok(());
-        }
+    }
+    ctl.tick();
+    for (level, line) in ctl.take_log() {
+        log_stderr(format!("[{level:?}] {line}"));
+    }
+    match ctl.last_result() {
+        Some(Ok(r)) if r.failed > 0 => bail!(
+            "convert finished with {} failure(s) ({} converted)",
+            r.failed,
+            r.succeeded
+        ),
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => bail!("convert failed: {e}"),
+        None => bail!("convert did not run"),
     }
 }

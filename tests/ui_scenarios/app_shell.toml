@@ -21,6 +21,16 @@ arg = "/images/a.sit"
 expect = { log_text = "~route: Archives(\"/images/a.sit\")" }
 
 [[step]]
+action = "SelectTab"
+arg = "convert"
+expect = { active_tab = "Convert" }
+
+[[step]]
+action = "Drop"
+arg = "/images/games"
+expect = { log_text = "~route: Convert(\"/images/games\")" }
+
+[[step]]
 action = "ShareBackup"
 arg = "/backups/bk"
 expect = { shared_backup = "/backups/bk", log_text = "~share: Publish(\"/backups/bk\")" }

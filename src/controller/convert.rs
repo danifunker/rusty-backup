@@ -18,11 +18,12 @@ use crate::model::job::{Job, Notify, Snapshot};
 
 pub use crate::model::convert::classify::size_text;
 pub use crate::model::convert::refit::{RefitSize, ONLY_FILES, SIZES as FLOPPY_SIZES};
+pub use crate::model::convert::ChdChoices;
 pub use crate::model::convert::{
     formats_for, Extra, FloppySize, Format, ImageKind, Sizing, DISC_FORMATS, FLOPPY_FORMATS,
     HARD_DISK_FORMATS,
 };
-pub use crate::rbformats::chd_options::ChdOptions;
+pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 
 /// The `purpose` of each picker and question this controller asks.
 pub mod purpose {
@@ -93,6 +94,8 @@ pub mod hints {
     pub const OUTPUT_FILE: &str = "Where the converted image is saved.";
     pub const OUTPUT_FOLDER: &str = "Where the converted images go. Each keeps its name with \
         the new extension.";
+    pub const HANDOFF: &str = "Change this image's format, shrink it, or refit a floppy in the \
+        Convert tab.";
     pub const EXTENSION: &str = "The converted files' extension. Some emulators want a \
         particular one, such as .hdf or .hda.";
 
@@ -146,6 +149,16 @@ impl ExtraUnit {
             ExtraUnit::Mb => "MB",
             ExtraUnit::Percent => "%",
         }
+    }
+}
+
+/// The CHD profile a format writes with, if it is a CHD format.
+pub fn chd_profile(format: Format) -> Option<ChdProfile> {
+    match format {
+        Format::Chd => Some(ChdProfile::Hd),
+        Format::ChdCd => Some(ChdProfile::Cd),
+        Format::ChdDvd => Some(ChdProfile::Dvd),
+        _ => None,
     }
 }
 
@@ -223,8 +236,8 @@ pub enum ConvertAction {
     SetSelected(usize, bool),
     SelectAll,
     SelectNone,
-    /// The CHD options from the shell's CHD control, used when a CHD format is chosen.
-    Start(Option<ChdOptions>),
+    /// The CHD options from the shell's CHD controls, used where a CHD format is chosen.
+    Start(ChdChoices),
     /// The answer to a question this controller asked.
     Chose {
         purpose: &'static str,
@@ -253,7 +266,7 @@ pub struct ConvertController {
     scan_error: Option<String>,
     /// The items Start would write over, while the question is up.
     conflicts: Vec<usize>,
-    pending_chd: Option<ChdOptions>,
+    pending_chd: ChdChoices,
     run: Option<Job<RunResult>>,
     place: Arc<Mutex<Option<Progress>>>,
     lines: Lines,
@@ -277,7 +290,7 @@ impl ConvertController {
             scan: None,
             scan_error: None,
             conflicts: Vec::new(),
-            pending_chd: None,
+            pending_chd: ChdChoices::default(),
             run: None,
             place: Arc::new(Mutex::new(None)),
             lines: Arc::new(Mutex::new(Vec::new())),
@@ -392,11 +405,12 @@ impl ConvertController {
             && self.shown_kinds().contains(&ImageKind::Disc)
     }
 
-    /// A CHD format is chosen for a kind on show, so the shell shows its CHD control.
-    pub fn chd_shown(&self) -> bool {
+    /// The CHD profiles the chosen formats write, so the shell shows a CHD control for each.
+    pub fn chd_profiles(&self) -> Vec<(ImageKind, ChdProfile)> {
         self.shown_kinds()
-            .iter()
-            .any(|&k| matches!(self.format(k), Format::Chd | Format::ChdCd | Format::ChdDvd))
+            .into_iter()
+            .filter_map(|k| chd_profile(self.format(k)).map(|p| (k, p)))
+            .collect()
     }
 
     pub fn items(&self) -> &[Item] {
@@ -711,7 +725,7 @@ impl ConvertController {
         self.follow_extension(kind);
     }
 
-    fn start(&mut self, chd: Option<ChdOptions>) {
+    fn start(&mut self, chd: ChdChoices) {
         if !self.can_start() {
             return;
         }
@@ -766,7 +780,7 @@ impl ConvertController {
 
     fn resolve(&mut self, index: usize) {
         let conflicts = std::mem::take(&mut self.conflicts);
-        let chd = self.pending_chd.take();
+        let chd = std::mem::take(&mut self.pending_chd);
         let ready = self.ready();
         match index {
             0 => {
@@ -783,7 +797,7 @@ impl ConvertController {
         }
     }
 
-    fn launch(&mut self, chosen: Vec<(usize, PathBuf)>, chd: Option<ChdOptions>) {
+    fn launch(&mut self, chosen: Vec<(usize, PathBuf)>, chd: ChdChoices) {
         let jobs: Vec<(Classified, PathBuf, String)> = chosen
             .into_iter()
             .filter_map(|(n, dest)| {

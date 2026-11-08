@@ -26,7 +26,6 @@ use super::chd_options_ui::ChdOptionsControl;
 use super::context::TabContext;
 use super::effects::{EffectHost, Reply};
 use super::expand_hfs_dialog::ExpandHfsDialog;
-use super::floppy_convert_dialog::FloppyConvertDialog;
 use super::physical_disk_export::PhysicalDiskExport;
 
 fn new_controller() -> InspectController {
@@ -61,7 +60,8 @@ pub struct InspectTab {
     resize_popup: Option<Box<super::resize_popup::ResizePopup>>,
     expand_hfs_dialog: Option<ExpandHfsDialog>,
     alto_resize_dialog: Option<AltoResizeDialog>,
-    floppy_convert_dialog: Option<FloppyConvertDialog>,
+    /// The image "Convert..." hands to the Convert tab, taken by the app.
+    pending_convert: Option<PathBuf>,
     physical_disk_export: PhysicalDiskExport,
 }
 
@@ -85,7 +85,7 @@ impl InspectTab {
             resize_popup: None,
             expand_hfs_dialog: None,
             alto_resize_dialog: None,
-            floppy_convert_dialog: None,
+            pending_convert: None,
             physical_disk_export: PhysicalDiskExport::default(),
         }
     }
@@ -121,6 +121,10 @@ impl InspectTab {
     }
 
     /// A browsable optical disc the open found, for the Optical tab.
+    pub fn take_convert_request(&mut self) -> Option<PathBuf> {
+        self.pending_convert.take()
+    }
+
     pub fn take_open_optical_request(&mut self) -> Option<PathBuf> {
         self.pending_open_optical.take()
     }
@@ -239,12 +243,6 @@ impl InspectTab {
             .is_some_and(|d| d.is_running())
         {
             Some("Inspect: Expand HFS")
-        } else if self
-            .floppy_convert_dialog
-            .as_ref()
-            .is_some_and(|d| d.is_running())
-        {
-            Some("Inspect: Floppy convert")
         } else {
             self.browse_view.running_job().map(|_| "Inspect: Browse")
         }
@@ -524,14 +522,13 @@ impl InspectTab {
                 self.act(InspectAction::OpenExport);
             }
 
-            // Only shown for a floppy container, so the long button does not crowd an HDD's bar.
-            if let Some(src) = self.ctl.floppy_convert_source() {
+            if let Some(src) = self.ctl.convert_source() {
                 if ui
-                    .button("Convert Floppy Container...")
-                    .on_hover_text(rusty_backup::controller::floppy_convert::BUTTON_HINT)
+                    .button("Convert...")
+                    .on_hover_text(rusty_backup::controller::convert::hints::HANDOFF)
                     .clicked()
                 {
-                    self.floppy_convert_dialog = Some(FloppyConvertDialog::with_source(src));
+                    self.pending_convert = Some(src);
                 }
             }
 
@@ -1088,11 +1085,6 @@ impl InspectTab {
         if let Some(dlg) = &mut self.alto_resize_dialog {
             if !dlg.show(ui.ctx(), ctx.log) {
                 self.alto_resize_dialog = None;
-            }
-        }
-        if let Some(dlg) = &mut self.floppy_convert_dialog {
-            if !dlg.show(ui.ctx(), ctx.log) {
-                self.floppy_convert_dialog = None;
             }
         }
     }

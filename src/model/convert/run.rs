@@ -104,7 +104,7 @@ fn convert_disc(
             crate::rbformats::export::export_whole_disk_chd_cd(
                 path,
                 dest,
-                opts.chd.clone(),
+                opts.chd.cd.clone(),
                 hooks.cancelled,
                 log,
             )
@@ -117,7 +117,7 @@ fn convert_disc(
             &[],
             dest,
             crate::rbformats::chd_options::ChdProfile::Dvd,
-            opts.chd.clone(),
+            opts.chd.dvd.clone(),
             progress,
             hooks.cancelled,
             log,
@@ -176,7 +176,7 @@ fn optical_convert(
     };
     let progress = Arc::new(Mutex::new(crate::optical::convert::ConvertProgress::new()));
     let watch = Arc::clone(&progress);
-    let (input, dest_owned, chd) = (path.to_path_buf(), dest.to_path_buf(), opts.chd.clone());
+    let (input, dest_owned, chd) = (path.to_path_buf(), dest.to_path_buf(), opts.chd.cd.clone());
     let worker = std::thread::spawn(move || {
         run_conversion(&input, &dest_owned, Some(source), output, chd, watch)
     });
@@ -414,7 +414,7 @@ fn chd_hard_disk(
                     source_partition_table_bytes: &sector0,
                     alignment_sectors: plan.alignment_sectors,
                     dest_path: dest,
-                    chd_options: opts.chd.clone(),
+                    chd_options: opts.chd.hd.clone(),
                     is_dvd: false,
                     resize_targets: Some(plan.targets.as_slice()),
                 },
@@ -439,7 +439,7 @@ fn chd_hard_disk(
         &[],
         dest,
         crate::rbformats::chd_options::ChdProfile::Hd,
-        opts.chd.clone(),
+        opts.chd.hd.clone(),
         progress,
         hooks.cancelled,
         log,
