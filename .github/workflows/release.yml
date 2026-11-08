@@ -2890,7 +2890,7 @@ jobs:
           | **Linux** (glibc >= 2.39) | PowerPC 64-bit, big-endian (G5 / POWER) | [rb-cli](${BASE}/rb-cli-linux-ppc64-${VER}.tar.gz) |
           | **Linux** (glibc >= 2.39) | PowerPC 32-bit, big-endian (G3 / G4) | [rb-cli](${BASE}/rb-cli-linux-ppc32-${VER}.tar.gz) |
 
-          <sub>These PowerPC builds use the same **glibc 2.39** (Ubuntu 24.04) baseline as the x64/arm64 \`rb-cli\`, and each download contains a single \`rb-cli\` executable. (Windows ARM64 and RISC-V 64 now ship a full desktop app — see the main table above.)</sub>
+          <sub>These PowerPC builds need **glibc 2.39** (Ubuntu 24.04), like the arm64 \`rb-cli\` (the x64 one needs 2.31), and each download contains a single \`rb-cli\` executable. (Windows ARM64 and RISC-V 64 now ship a full desktop app — see the main table above.)</sub>
 
           ### Older operating systems (\`rb-cli\`, headless)
 
