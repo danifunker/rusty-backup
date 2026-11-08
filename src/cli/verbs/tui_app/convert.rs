@@ -23,10 +23,9 @@ use crate::controller::app::chd::{
 use crate::controller::app::RateTracker;
 use crate::controller::convert::{
     floppy_size_choices, formats_for, hints, purpose, ChdChoices, ChdProfile, ConvertAction,
-    ConvertController, ExtraUnit, FloppySize, ImageKind, SizeChoice, ONLY_FILES,
+    ConvertController, ExtraUnit, FloppySize, ImageKind, NoNotify, SizeChoice, ONLY_FILES,
 };
 use crate::controller::{ChoiceSpec, Controller as _, Effect};
-use crate::model::job::NoNotify;
 
 pub(super) const HINTS_CONVERT: &[KeyHint] = &[
     hint("Up/Down", "Move between rows"),
@@ -440,13 +439,10 @@ impl App {
         c.absorb(fx);
         let _ = c.ctl.take_log();
         c.clamp();
-        if let (Some(snap), Some(prog)) = (c.ctl.run_snapshot(), self.progress.as_ref()) {
+        if let (Some((done, total)), Some(prog)) = (c.ctl.run_bytes(), self.progress.as_ref()) {
             if let Ok(mut sh) = prog.shared.lock() {
-                if let crate::model::job::Progress::Determinate { done, total, .. } = snap.progress
-                {
-                    sh.current = done;
-                    sh.total = total;
-                }
+                sh.current = done;
+                sh.total = total;
             }
         }
         if c.awaiting && !c.ctl.is_running() {
@@ -855,11 +851,7 @@ mod tests {
     fn the_convert_screen_refits_a_floppy_with_verify() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("disk.img");
-        std::fs::write(
-            &src,
-            fs_pc::fat::create_dos_floppy(1_474_560, Some("F")).unwrap(),
-        )
-        .unwrap();
+        crate::controller::test_fixtures::dos_floppy(&src);
         let mut app = on_convert();
         app.convert_open(src);
         settle(&mut app);

@@ -23,6 +23,10 @@ python3 -I -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack(">II1
   "$WORK/cdsrc/._hello.txt"
 echo "inside" > "$WORK/tarsrc/inner.txt"
 tar -C "$WORK/tarsrc" --format=ustar -cf "$WORK/cdsrc/pack.tar" inner.txt
+# The folder the Convert cases read: the fixture, and a copy in a subfolder.
+mkdir -p "$WORK/convsrc/sub"
+cp "$WORK/fixture.img" "$WORK/convsrc/a.img"
+cp "$WORK/fixture.img" "$WORK/convsrc/sub/b.img"
 # Pickers answer from this file instead of opening a dialog; the suite rewrites it per case.
 : > "$WORK/picks.tsv"
 

@@ -21,7 +21,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
 
-TABS = ["Backup", "Restore", "Build Disk", "Inspect", "Optical", "Archives"]
+TABS = ["Backup", "Restore", "Build Disk", "Inspect", "Convert", "Optical", "Archives"]
 CD_KIND = "CD-ROM image"
 LAYOUTS = [
     "IRIX EFS CD-ROM",
@@ -359,11 +359,11 @@ def need_text(root, text, wait=10.0):
         raise Fail(f"nothing on screen says {text!r}")
 
 
-def set_picks(**answers):
-    """Answer the next pickers: purpose suffix -> path."""
+def set_picks(prefix="build_disk", **answers):
+    """Answer the next pickers: purpose suffix (under `prefix`) -> path."""
     with open(os.path.join(WORK, "picks.tsv"), "w") as f:
         for purpose, path in answers.items():
-            f.write(f"build_disk.{purpose}\t{path}\n")
+            f.write(f"{prefix}.{purpose}\t{path}\n")
 
 
 def contains(path, needle):
@@ -394,7 +394,7 @@ def check_bytes(image, present=(), absent=()):
 def case_browse(app):
     for tab in TABS:
         need(app, f"{tab} tab", name=tab, wait=10.0)
-    log("all six tabs show")
+    log("all seven tabs show")
     need(app, "the fixture's partition", contains="[FAT", wait=30.0)
     press(button(app, "Browse"))
     need(app, "HELLO.TXT in Browse", name="HELLO.TXT", wait=30.0)
@@ -494,12 +494,73 @@ def case_cd_hfs_fork(app):
     check_bytes(image, present=[b"hello.txt"], absent=[b"._hello"])
 
 
+FLOPPY_FORMATS = [
+    "Raw (.img)", "2MG (.2mg)", "WOZ (.woz)", "MOOF (.moof)", "DiskCopy 4.2 (.dsk)",
+    "XDF (.xdf)", "HDM (.hdm)", "DIM (.dim)", "D88 (.d88)",
+]
+FLOPPY_SIZES = [
+    "Same size", "360 KB", "720 KB", "800 KB", "880 KB", "1.2 MB", "1.44 MB", "1.76 MB", "2.88 MB",
+]
+CONVERT_HELP = [
+    "Also convert the images in every folder inside this one",
+    "Only the files are copied",
+    "read the new image back",
+]
+
+
+def open_convert(app):
+    press(need(app, "Convert tab", name="Convert", showing=True, wait=10.0))
+    need(app, "the Convert page", name="Choose Folder...", roles=BUTTON_ROLES, showing=True)
+
+
+def case_convert_folder(app):
+    """A folder with a subfolder; WOZ refuses a 1.44 MB disk; DiskCopy 4.2 refitted to 720K."""
+    open_convert(app)
+    src, out = os.path.join(WORK, "convsrc"), os.path.join(WORK, "convout")
+    set_picks("convert", source_folder=src, output_folder=out)
+    press(button(app, "Choose Folder..."))
+    need_text(app, "1 file(s) found", wait=30.0)
+    set_option(app, "Include subfolders", True)
+    need_text(app, "2 file(s) found", wait=30.0)
+    press(button(app, "Choose..."))
+    need_text(app, "convout")
+    combo_choice(app, "Format", FLOPPY_FORMATS, "WOZ (.woz)")
+    need_text(app, "WOZ takes 140K")
+    combo_choice(app, "Format", FLOPPY_FORMATS, "DiskCopy 4.2 (.dsk)")
+    combo_choice(app, "Size", FLOPPY_SIZES, "720 KB")
+    set_option(app, "Verify after converting", True)
+    for phrase in CONVERT_HELP:
+        need_text(app, phrase)
+    log("the folder lists both floppies, WOZ refuses them, help is on screen")
+    press(button(app, "Convert 2 files"))
+    want = [os.path.join(out, "a.dsk"), os.path.join(out, "sub", "b.dsk")]
+    end = time.time() + 120
+    while not all(os.path.exists(w) and os.path.getsize(w) == 737_364 for w in want):
+        if time.time() > end:
+            raise Fail(f"the outputs never appeared: {want}")
+        time.sleep(0.5)
+    need_text(app, "-> a.dsk")
+    check_bytes(want[0], present=[b"HELLO   TXT"])
+
+
+def case_convert_handoff(app):
+    """Inspect's Convert... hands the open image to the Convert tab."""
+    press(need(app, "Inspect tab", name="Inspect", showing=True, wait=10.0))
+    need(app, "the fixture's partition", contains="[FAT", wait=30.0)
+    press(button(app, "Convert..."))
+    need(app, "the Convert page", name="Choose Folder...", roles=BUTTON_ROLES, showing=True)
+    need_text(app, "fixture.img", wait=20.0)
+    need_text(app, "1 file(s) found", wait=30.0)
+
+
 CASES = [
     ("browse", case_browse),
     ("cd_options", case_cd_options),
     ("cd_efs_unpack_exclude", case_cd_efs_unpack_exclude),
     ("cd_efs_keep", case_cd_efs_keep),
     ("cd_hfs_fork", case_cd_hfs_fork),
+    ("convert_folder", case_convert_folder),
+    ("convert_handoff", case_convert_handoff),
 ]
 
 

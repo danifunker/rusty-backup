@@ -23,6 +23,7 @@ pub use crate::model::convert::{
     formats_for, Extra, FloppySize, Format, ImageKind, Sizing, DISC_FORMATS, FLOPPY_FORMATS,
     HARD_DISK_FORMATS,
 };
+pub use crate::model::job::NoNotify;
 pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 
 /// The `purpose` of each picker and question this controller asks.
@@ -487,6 +488,14 @@ impl ConvertController {
 
     pub fn run_snapshot(&self) -> Option<Snapshot> {
         self.run.as_ref().map(Job::snapshot)
+    }
+
+    /// The running file's bytes done and total, when known.
+    pub fn run_bytes(&self) -> Option<(u64, u64)> {
+        match self.run_snapshot()?.progress {
+            crate::model::job::Progress::Determinate { done, total, .. } => Some((done, total)),
+            _ => None,
+        }
     }
 
     /// The running conversion's place.

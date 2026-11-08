@@ -22,7 +22,7 @@ pub struct ToolState {
     pub resizing: bool,
     pub can_close: bool,
     pub has_chd: bool,
-    pub is_floppy: bool,
+    pub can_convert: bool,
 }
 
 pub struct ToolBar {
@@ -34,7 +34,7 @@ pub struct ToolBar {
     expand: gtk::Button,
     bootable: gtk::Button,
     resize: gtk::Button,
-    floppy: gtk::Button,
+    convert: gtk::Button,
     chd: gtk::Button,
     close: gtk::Button,
 }
@@ -59,12 +59,12 @@ fn view(label: &str, id: &str, run: Rc<dyn Fn()>) -> gtk::Button {
 }
 
 impl ToolBar {
-    /// `expand_image`, `resize` and `floppy` open the view's own windows.
+    /// `expand_image` and `resize` open the view's own windows; `convert` hands over to Convert.
     pub fn build(
         send: &ActionFn,
         expand_image: Rc<dyn Fn()>,
         resize: Rc<dyn Fn()>,
-        floppy: Rc<dyn Fn()>,
+        convert: Rc<dyn Fn()>,
     ) -> ToolBar {
         let reinspect = live("Re-inspect", ids::REINSPECT, send, || {
             InspectAction::Reinspect
@@ -72,8 +72,8 @@ impl ToolBar {
         let export = live("Export Disk Image...", ids::EXPORT, send, || {
             InspectAction::OpenExport
         });
-        let floppy = view("Convert Floppy Container...", ids::CONVERT_FLOPPY, floppy);
-        floppy.set_tooltip_text(Some(rusty_backup::controller::floppy_convert::BUTTON_HINT));
+        let convert = view("Convert...", ids::CONVERT, convert);
+        convert.set_tooltip_text(Some(rusty_backup::controller::convert::hints::HANDOFF));
         let edit = live("Edit Partition Table...", ids::EDIT_TABLE, send, || {
             InspectAction::EditTable
         });
@@ -91,7 +91,7 @@ impl ToolBar {
 
         let root = flow();
         for b in [
-            &reinspect, &export, &floppy, &edit, &add, &expand, &bootable, &resize, &chd, &close,
+            &reinspect, &export, &convert, &edit, &add, &expand, &bootable, &resize, &chd, &close,
         ] {
             root.append(b);
         }
@@ -104,7 +104,7 @@ impl ToolBar {
             expand,
             bootable,
             resize,
-            floppy,
+            convert,
             chd,
             close,
         }
@@ -125,7 +125,7 @@ impl ToolBar {
         self.bootable.set_sensitive(state.can_make_bootable);
         self.resize
             .set_sensitive(state.can_edit_table && !state.resizing);
-        flow_show(&self.floppy, state.is_floppy);
+        flow_show(&self.convert, state.can_convert);
         flow_show(&self.chd, state.has_chd);
         flow_show(&self.close, state.can_close);
     }

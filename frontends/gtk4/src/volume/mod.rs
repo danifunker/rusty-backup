@@ -1,5 +1,5 @@
 //! The volume dialogs with controllers of their own: Resize Partitions, Expand HFS, Resize Alto
-//! Disk, the disk writer (Physical Disk Export / Write Image File) and Convert Floppy Container.
+//! Disk and the disk writer (Physical Disk Export / Write Image File).
 //!
 //! Each is a retained view over its controller (docs/gtk4_shell_plan.md), built when it opens and
 //! dropped when the controller closes. The window cannot close itself: a user close sends the
@@ -8,7 +8,6 @@
 pub mod alto;
 pub mod disk_write;
 pub mod expand_hfs;
-pub mod floppy;
 pub mod resize;
 
 use std::rc::Rc;

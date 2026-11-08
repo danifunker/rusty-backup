@@ -25,8 +25,8 @@ use super::backup::BackupScreen;
 use super::build_disk::BuildDiskScreen;
 use super::optical::OpticalScreen;
 use super::restore::RestoreScreen;
-use crate::bulk::BulkScreen;
 use crate::commander::CommanderScreen;
+use crate::convert::ConvertScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::keys::{key_of, mods_of};
@@ -34,9 +34,8 @@ use crate::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::wake::GtkWake;
 use crate::widgets::plain;
-use rusty_backup::controller::bulk_convert::MENU_HINT;
 
-const TABS: [(AppTab, &str, &str, &str); 6] = [
+const TABS: [(AppTab, &str, &str, &str); 7] = [
     (AppTab::Backup, "backup", "Backup", "document-save-symbolic"),
     (
         AppTab::Restore,
@@ -55,6 +54,12 @@ const TABS: [(AppTab, &str, &str, &str); 6] = [
         "inspect",
         "Inspect",
         "system-search-symbolic",
+    ),
+    (
+        AppTab::Convert,
+        "convert",
+        "Convert",
+        "emblem-synchronizing-symbolic",
     ),
     (
         AppTab::Optical,
@@ -79,8 +84,7 @@ pub struct App {
     build: Rc<BuildDiskScreen>,
     optical: Rc<OpticalScreen>,
     archives: Rc<ArchivesScreen>,
-    bulk: Rc<BulkScreen>,
-    bulk_button: gtk::Button,
+    convert: Rc<ConvertScreen>,
     close_backup: gtk::Button,
     settings: RefCell<Option<Rc<SettingsWindow>>>,
     banner: gtk::Revealer,
@@ -245,15 +249,12 @@ impl App {
 
         let settings = gtk::Button::with_label("Settings...");
         settings.set_widget_name(ids::SETTINGS);
-        let bulk = gtk::Button::with_label("Bulk Convert...");
-        bulk.set_widget_name(ids::BULK_CONVERT);
-        bulk.set_tooltip_text(Some(MENU_HINT));
         let about_button = gtk::Button::with_label("About Rusty Backup");
         about_button.set_widget_name(ids::ABOUT);
         let version = gtk::Label::new(Some(&format!("Version {}", app_version())));
         version.add_css_class("dim-label");
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        for b in [&settings, &bulk, &about_button] {
+        for b in [&settings, &about_button] {
             b.add_css_class("flat");
             if let Some(label) = b.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
                 label.set_xalign(0.0);
@@ -352,8 +353,8 @@ impl App {
         let build = BuildDiskScreen::build(ctrl.notify(), host.clone());
         let optical = OpticalScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
         let archives = ArchivesScreen::build(ctrl.notify(), ctrl.recent_handle(), host.clone());
-        let bulk_screen = BulkScreen::build(ctrl.notify(), host.clone());
-        view.add_top_bar(bulk_screen.strip());
+        let convert = ConvertScreen::build(ctrl.notify(), host.clone());
+        view.add_top_bar(convert.strip());
         for (tab, name, title, icon) in TABS {
             match tab {
                 AppTab::Inspect => {
@@ -374,6 +375,9 @@ impl App {
                 AppTab::Archives => {
                     stack.add_titled_with_icon(archives.root(), Some(name), title, icon);
                 }
+                AppTab::Convert => {
+                    stack.add_titled_with_icon(convert.root(), Some(name), title, icon);
+                }
             }
         }
 
@@ -386,8 +390,7 @@ impl App {
             build,
             optical,
             archives,
-            bulk: bulk_screen,
-            bulk_button: bulk.clone(),
+            convert,
             close_backup: close_backup.clone(),
             settings: RefCell::default(),
             banner,
@@ -422,12 +425,6 @@ impl App {
         about_button.connect_clicked(move |_| {
             p.popdown();
             a.host.present(&about_dialog());
-        });
-        let a = app.clone();
-        let p = popover.clone();
-        bulk.connect_clicked(move |_| {
-            p.popdown();
-            a.bulk.open();
         });
         let a = app.clone();
         let p = popover.clone();
@@ -500,7 +497,11 @@ impl App {
                 match tab {
                     AppTab::Inspect => self.inspect.key(key, mods),
                     AppTab::Optical => self.optical.key(key, mods),
-                    AppTab::Backup | AppTab::Restore | AppTab::Build | AppTab::Archives => false,
+                    AppTab::Backup
+                    | AppTab::Restore
+                    | AppTab::Build
+                    | AppTab::Archives
+                    | AppTab::Convert => false,
                 }
             }
         }
@@ -557,7 +558,14 @@ impl App {
         self.build.tick();
         self.optical.tick();
         self.archives.tick();
-        self.bulk.tick();
+        self.convert.tick();
+        for path in [self.inspect.take_convert(), self.optical.take_convert()]
+            .into_iter()
+            .flatten()
+        {
+            self.ctrl.borrow_mut().select_tab(AppTab::Convert);
+            self.convert.open(path);
+        }
         self.share_backup();
         self.lock_tabs();
         let commander = self.commander.borrow().clone();
@@ -577,7 +585,11 @@ impl App {
         let (loaded, empty) = match tab {
             AppTab::Restore => (self.restore.loaded_backup(), self.restore.is_empty()),
             AppTab::Inspect => (self.inspect.loaded_backup(), self.inspect.is_empty()),
-            AppTab::Backup | AppTab::Build | AppTab::Optical | AppTab::Archives => return,
+            AppTab::Backup
+            | AppTab::Build
+            | AppTab::Optical
+            | AppTab::Archives
+            | AppTab::Convert => return,
         };
         let step = self.ctrl.borrow_mut().share_backup(loaded, empty);
         match (step, tab) {
@@ -636,6 +648,10 @@ impl App {
                 });
                 true
             }
+            DropRoute::Convert(path) => {
+                self.convert.open(path);
+                true
+            }
             DropRoute::Ignore => false,
         };
         self.refresh();
@@ -671,8 +687,6 @@ impl App {
 
     /// One disk job at a time: each tab hears who else runs.
     fn lock_tabs(&self) {
-        let bulk = self.bulk.is_running();
-        self.bulk_button.set_sensitive(!bulk);
         let on = |running: bool, name| running.then_some(name);
         let running = [
             (AppTab::Backup, on(self.backup.is_running(), "Backup")),
@@ -680,15 +694,17 @@ impl App {
             (AppTab::Build, on(self.build.is_running(), "Build Disk")),
             (AppTab::Optical, on(self.optical.is_running(), "Optical")),
             (AppTab::Inspect, self.inspect.running_job()),
+            (AppTab::Convert, on(self.convert.is_running(), "Convert")),
         ];
         self.backup
-            .set_busy(busy_elsewhere(AppTab::Backup, &running, bulk));
+            .set_busy(busy_elsewhere(AppTab::Backup, &running));
         self.restore
-            .set_busy(busy_elsewhere(AppTab::Restore, &running, bulk));
-        self.build
-            .set_busy(busy_elsewhere(AppTab::Build, &running, bulk));
+            .set_busy(busy_elsewhere(AppTab::Restore, &running));
+        self.build.set_busy(busy_elsewhere(AppTab::Build, &running));
         self.optical
-            .set_busy(busy_elsewhere(AppTab::Optical, &running, bulk));
+            .set_busy(busy_elsewhere(AppTab::Optical, &running));
+        self.convert
+            .set_busy(busy_elsewhere(AppTab::Convert, &running));
     }
 
     /// Read the controller first and release it: setting a widget can fire its change signal.

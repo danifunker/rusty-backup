@@ -20,7 +20,7 @@ use rusty_backup::controller::app::{
 };
 use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::optical::{
-    ids, ChdChoice, HostRequest, OpticalAction, OpticalController, OutputFormat,
+    hints, ids, ChdChoice, HostRequest, OpticalAction, OpticalController, OutputFormat, Task,
 };
 use rusty_backup::controller::{Controller, Effect};
 
@@ -65,6 +65,10 @@ pub struct OpticalScreen {
     bar: RunBar,
     start: gtk::Button,
     cancel: gtk::Button,
+    /// An image's format changes in the Convert tab; this hands it over.
+    convert: gtk::Button,
+    convert_note: gtk::Label,
+    pending_convert: RefCell<Option<PathBuf>>,
 }
 
 /// Everything a refresh shows, read while the controller is borrowed and shown after it is not.
@@ -78,6 +82,9 @@ struct Shown {
     start_label: &'static str,
     can_start: bool,
     why: Option<String>,
+    /// The image source, which the Convert tab converts.
+    image_mode: bool,
+    convert_source: Option<PathBuf>,
     target: Option<String>,
     outcome: Option<Result<(), String>>,
     run: Option<Run>,
@@ -158,9 +165,23 @@ impl OpticalScreen {
             cancel.add_css_class("destructive-action");
             let s = send.clone();
             cancel.connect_clicked(move |_| s(OpticalAction::Cancel));
+            let convert = button("Convert...", ids::CONVERT);
+            convert.set_tooltip_text(Some(hints::CONVERT));
+            let target = me.clone();
+            convert.connect_clicked(move |_| {
+                if let Some(screen) = target.upgrade() {
+                    let src = screen.ctrl.borrow().convert_source();
+                    *screen.pending_convert.borrow_mut() = src;
+                    crate::app::tick();
+                }
+            });
+            let convert_note = gtk::Label::new(Some(hints::CONVERT_MOVED));
+            convert_note.add_css_class("dim-label");
             let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             buttons.append(&start);
             buttons.append(&cancel);
+            buttons.append(&convert);
+            buttons.append(&convert_note);
             buttons.append(&why);
             let footer = gtk::Box::new(gtk::Orientation::Vertical, 6);
             footer.set_margin_top(6);
@@ -210,6 +231,9 @@ impl OpticalScreen {
                 bar,
                 start,
                 cancel,
+                convert,
+                convert_note,
+                pending_convert: RefCell::default(),
             }
         })
     }
@@ -225,6 +249,11 @@ impl OpticalScreen {
     /// Another tab's job, if any, which locks this tab's start controls.
     pub fn set_busy(&self, busy: Option<&'static str>) {
         self.busy.set(busy);
+    }
+
+    /// The disc image "Convert..." asked to hand to the Convert tab.
+    pub fn take_convert(&self) -> Option<PathBuf> {
+        self.pending_convert.borrow_mut().take()
     }
 
     /// Scan the drives at start-up; the count reaches the log when the scan ends.
@@ -367,6 +396,8 @@ impl OpticalScreen {
             start_label: ctrl.start_label(),
             can_start: self.may_start(),
             why: ctrl.start_refusal().or(chd_error).or(locked),
+            image_mode: ctrl.task() == Task::Convert,
+            convert_source: ctrl.convert_source(),
             target: ctrl.write_target(),
             outcome: ctrl.last_result().cloned(),
             run: ctrl.progress().map(|b| Run {
@@ -416,8 +447,12 @@ impl OpticalScreen {
         self.jobs.show(&s.jobs);
         self.disc.show(s.disc);
         self.output.show(s.output);
+        self.output.root().set_visible(!s.image_mode);
+        self.convert.set_visible(s.image_mode);
+        self.convert_note.set_visible(s.image_mode);
+        self.convert.set_sensitive(s.convert_source.is_some());
 
-        self.start.set_visible(!s.running);
+        self.start.set_visible(!s.running && !s.image_mode);
         self.start.set_sensitive(s.can_start);
         if self.start.label().as_deref() != Some(s.start_label) {
             self.start.set_label(s.start_label);
@@ -435,7 +470,8 @@ impl OpticalScreen {
         let writes = s.target.map(|t| format!("Writes: {t}"));
         set_line(&self.target, writes.as_deref());
         set_text(&self.why, s.why.as_deref().unwrap_or(""));
-        self.why.set_visible(!s.running && !s.can_start);
+        self.why
+            .set_visible(!s.running && !s.can_start && !s.image_mode);
         self.outcome.show(match &s.outcome {
             Some(Ok(())) => vec![(Tone::Info, "Finished.".to_string())],
             Some(Err(e)) => vec![(Tone::Danger, e.clone())],

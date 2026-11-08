@@ -2,7 +2,7 @@
 //!
 //! See docs/gtk4_shell_plan.md for the pattern. `src/gui/inspect_tab.rs` is the reference. Its
 //! own windows are `windows.rs`, `editor.rs` and `export.rs`, and `remote.rs` the daemon picker;
-//! Resize, Expand HFS, Alto resize, the disk writer and floppy convert have controllers of their
+//! Resize, Expand HFS, Alto resize and the disk writer have controllers of their
 //! own (`crate::volume`). The browse view takes the whole tab while it is open.
 
 pub mod bar;
@@ -41,7 +41,6 @@ use crate::sync::SyncGuard;
 use crate::volume::alto::AltoDialog;
 use crate::volume::disk_write::DiskWriteDialog;
 use crate::volume::expand_hfs::ExpandHfsDialog;
-use crate::volume::floppy::FloppyDialog;
 use crate::volume::resize::ResizeDialog;
 use crate::widgets::set_text;
 
@@ -85,7 +84,8 @@ pub struct InspectScreen {
     resize: RefCell<Option<Rc<ResizeDialog>>>,
     hfs: RefCell<Option<Rc<ExpandHfsDialog>>>,
     alto: RefCell<Option<Rc<AltoDialog>>>,
-    floppy: RefCell<Option<Rc<FloppyDialog>>>,
+    /// The image "Convert..." hands to the Convert tab, taken by the app.
+    convert: RefCell<Option<std::path::PathBuf>>,
     remote: Rc<RemotePanel>,
     /// Everything under the source bar the remote listing replaces while it is up.
     main: gtk::Box,
@@ -219,12 +219,14 @@ impl InspectScreen {
                 }
             });
             let screen = me.clone();
-            let floppy: Rc<dyn Fn()> = Rc::new(move || {
+            let convert: Rc<dyn Fn()> = Rc::new(move || {
                 if let Some(s) = screen.upgrade() {
-                    s.open_floppy();
+                    let src = s.ctrl.borrow().convert_source();
+                    *s.convert.borrow_mut() = src;
+                    crate::app::tick();
                 }
             });
-            let tools = ToolBar::build(&send, expand_image, resize, floppy);
+            let tools = ToolBar::build(&send, expand_image, resize, convert);
             let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
             error.add_css_class("error");
             let details = Details::build(&send);
@@ -362,7 +364,7 @@ impl InspectScreen {
                 hfs: RefCell::default(),
                 alto: RefCell::default(),
                 writer: RefCell::default(),
-                floppy: RefCell::default(),
+                convert: RefCell::default(),
                 remote,
                 main,
             }
@@ -426,13 +428,6 @@ impl InspectScreen {
         if let Some(w) = writer {
             w.tick();
         }
-        let floppy = self.floppy.borrow().clone();
-        if let Some(d) = floppy {
-            d.tick();
-            if !d.is_open() {
-                self.floppy.replace(None);
-            }
-        }
         let alto = self.alto.borrow().clone();
         if let Some(d) = alto {
             d.tick();
@@ -477,13 +472,9 @@ impl InspectScreen {
         }
     }
 
-    fn open_floppy(&self) {
-        let open = self.floppy.borrow().as_ref().is_some_and(|d| d.is_open());
-        let source = self.ctrl.borrow().floppy_convert_source();
-        if let (false, Some(path)) = (open, source) {
-            let d = FloppyDialog::open(self.notify.clone(), self.host.clone(), Some(path));
-            *self.floppy.borrow_mut() = Some(d);
-        }
+    /// The image "Convert..." asked to hand to the Convert tab.
+    pub fn take_convert(&self) -> Option<std::path::PathBuf> {
+        self.convert.borrow_mut().take()
     }
 
     /// Export's Physical Disk Export: the image goes to the disk writer's window.
@@ -606,13 +597,6 @@ impl InspectScreen {
             .is_some_and(|w| w.is_writing())
         {
             Some("Inspect: Physical Disk Export")
-        } else if self
-            .floppy
-            .borrow()
-            .as_ref()
-            .is_some_and(|d| d.is_running())
-        {
-            Some("Inspect: Floppy Convert")
         } else {
             None
         }
@@ -747,7 +731,7 @@ impl InspectScreen {
                 can_make_bootable: ctrl.can_make_bootable(),
                 can_close: ctrl.can_close(),
                 has_chd: ctrl.chd_path().is_some(),
-                is_floppy: ctrl.floppy_convert_source().is_some(),
+                can_convert: ctrl.convert_source().is_some(),
             },
             error: ctrl.last_error().map(str::to_string),
             backup: ctrl.backup_summary(),
