@@ -13,20 +13,34 @@
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;SOURCE&gt;</code></dt>
-<dd>Source file or folder. When a folder, every convertible file is processed</dd>
+<dd>Source image or folder. A folder converts every image it holds</dd>
 <dt><code>&lt;DEST&gt;</code></dt>
 <dd>Destination folder. Created if absent</dd>
 </dl>
 <h2>Options</h2>
 <dl class="args">
 <dt><code>--format</code></dt>
-<dd>Output format</dd>
+<dd>Output format, for every kind that offers it: raw, vhd, vhd-dynamic, qcow2, vmdk-flat, vmdk-sparse, 2mg, chd (hard disks); raw, 2mg, woz, moof, dc42, xdf, hdm, dim, d88 (floppies); chd-cd, chd-dvd, bincue, iso (discs)</dd>
+<dt><code>--floppy-to</code></dt>
+<dd>The floppies' format, overriding --format for them</dd>
+<dt><code>--disc-to</code></dt>
+<dd>The discs' format, overriding --format for them</dd>
 <dt><code>--extension</code></dt>
-<dd>Output extension (no leading dot). Defaults to the format's natural extension (chd, vhd, img, …)</dd>
+<dd>Output extension (no leading dot) for the kinds --format sets. Defaults to the format's</dd>
+<dt><code>--recursive</code></dt>
+<dd>Also convert the images in every subfolder; the output keeps the same folders</dd>
+<dt><code>--size</code></dt>
+<dd>Hard disk size: keep, minimum, minimum+64MB or minimum+10% (the extra goes on every partition, and never past the partition's original size)</dd>
+<dt><code>--measure-slow</code></dt>
+<dd>Also measure filesystems that need a full read to find their minimum (HFS, ext, UFS, EFS). Without it those partitions keep their size</dd>
+<dt><code>--floppy-size</code></dt>
+<dd>Floppy size: same, or refit to 360k, 720k, 800k, 880k, 1.2m, 1.44m, 1.76m or 2.88m (a blank disk of that size with every file copied across)</dd>
+<dt><code>--verify</code></dt>
+<dd>Read each output back and compare it with its source</dd>
 <dt><code>--bincue-multi-bin</code></dt>
-<dd>For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats</dd>
+<dd>For BIN/CUE output, write one .bin per track instead of a single concatenated .bin</dd>
 <dt><code>--overwrite</code></dt>
-<dd>Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning</dd>
+<dd>Overwrite destination files that already exist. Without this they are skipped</dd>
 </dl>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

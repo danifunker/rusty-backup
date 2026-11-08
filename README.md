@@ -340,7 +340,7 @@ Both build from the repo (`buildroot/`, `crusty-backup/`).
 
 ## Usage
 
-The app has five tabs:
+The app has seven tabs:
 
 - **Backup** — pick a source (physical device or image file), choose a
   destination folder, pick an output format and checksum type, and start.
@@ -438,11 +438,7 @@ The app has five tabs:
   - **Export Disk Image…** to write VHD (fixed or dynamic), QCOW2,
     VMDK, Raw, 2MG, WOZ, MOOF, DC42, HFV, or CHD (whole-disk or
     per-partition) — see `docs/vhd-export.md`.
-  - **Convert Floppy Container…** to convert between the four
-    X68000 / PC-98 / FM-7 floppy wrappers (XDF, HDM, DIM, D88) one
-    file at a time. Bulk folder conversion lives in the existing
-    **Bulk Convert** dialog, which now lists the same four formats
-    as output targets.
+  - **Convert…** hands the open image to the **Convert** tab.
   - **Check** (`fsck`) + **Repair** on every filesystem whose driver
     implements it. From the Inspect grid: HFS / HFS+, FAT / exFAT / NTFS / HPFS,
     ext2/3/4, SGI EFS, UFS, XFS, JFS, AmigaDOS OFS/FFS (Disk Validator) /
@@ -505,6 +501,26 @@ The app has five tabs:
     rollback on error. Sun QIC tapes (`.qic`) are editable too, but a tape
     has no free space, so every apply rebuilds the whole tape and keeps the
     original as `<name>.bak`.
+- **Convert** — change the format of one disk image, or of every image in a
+  folder (optionally its subfolders too, mirrored in the output folder). Each
+  file is read as a hard disk, a floppy or a disc from its contents (its
+  extension only breaks a tie, and a mismatch is pointed out), and each kind
+  has its own format and extension: hard disks to raw, VHD (fixed or dynamic),
+  QCOW2, VMDK, 2MG or CHD; floppies to raw, 2MG, WOZ, MOOF, DiskCopy 4.2, XDF,
+  HDM, DIM or D88; discs to CD CHD, DVD CHD, BIN/CUE or ISO. A format a file
+  can't take (a 1.44 MB disk as WOZ) is shown with the reason and skipped, and
+  a format this copy was built without is greyed out. Hard disks can shrink to
+  their minimum, or the minimum plus an amount on every partition (MB or a
+  percentage); filesystems that need a full read to measure (HFS, ext, UFS,
+  EFS) keep their size unless "Measure slow filesystems too" is on. Floppies
+  can be refitted to another standard size (a 1.44 MB DOS disk to 720K, an
+  Amiga DD to HD): a blank disk of the same filesystem with the real drive
+  geometry, every file copied across, and the boot code kept; a disk whose
+  files don't fit is skipped. **Verify** reads each output back and compares
+  it (sectors when the size was kept; files and a filesystem check when it
+  changed). The Inspect and Optical tabs' **Convert…** buttons open an image
+  here. The CLI equivalent is `rb-cli convert IN OUT`, for example
+  `rb-cli convert floppies/ out/ --format dc42 --recursive --floppy-size 720k --verify`.
 - **Optical** — browse and extract files from CD/DVD/BD images and physical
   optical drives. Reads ISO 9660 (with Joliet and Rock Ridge extensions),
   High Sierra (pre-ISO 9660), UDF, HFS and HFS+ (Mac hybrid / data discs),
@@ -668,7 +684,7 @@ readable.
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 "Yes (convert)" means the format isn't a backup wrapper but is fully
-round-trippable via the **Convert Floppy Container…** dialog and
+round-trippable via the **Convert** tab, `rb-cli convert` and
 `rb-cli floppy convert` — useful for moving images between MiSTer cores,
 real hardware utilities, and emulators that each prefer a different
 floppy container.

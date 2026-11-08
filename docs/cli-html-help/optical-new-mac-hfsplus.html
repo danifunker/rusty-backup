@@ -31,6 +31,8 @@
 <dd>With `--from-dir`: overwrite entries that already exist rather than failing on the collision</dd>
 <dt><code>--include-appledouble</code></dt>
 <dd>With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too. Off by default because the resource fork they carry is imported into the Mac volume's own resource fork instead</dd>
+<dt><code>--exclude-appledouble</code></dt>
+<dd>Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's resource fork. For a folder that only has them because it came off a modern Mac</dd>
 <dt><code>--name</code></dt>
 <dd>Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac Roman bytes. Defaults to `rusty-backup`</dd>
 <dt><code>--block-size</code></dt>
