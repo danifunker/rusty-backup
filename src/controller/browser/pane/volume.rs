@@ -49,6 +49,141 @@ pub fn journal_txn_classes(
     }
 }
 
+/// How a journal status line reads: all well, a caution, or a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalTone {
+    Good,
+    Warning,
+    Fault,
+}
+
+fn journal_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// A compact hex preview of up to the first 16 bytes.
+fn journal_hex(bytes: &[u8]) -> String {
+    let n = bytes.len().min(16);
+    let shown: Vec<String> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
+    let mut s = shown.join(" ");
+    if bytes.len() > n {
+        s.push_str(" ...");
+    }
+    s
+}
+
+/// Where the journal lives and its header, as the viewer's summary lines.
+pub fn journal_summary(detail: &JournalDetail) -> Vec<String> {
+    let (h, info) = (&detail.header, &detail.info);
+    let location = if info.is_external() {
+        "external device"
+    } else {
+        "in filesystem"
+    };
+    let wrap = if h.end < h.start { "  (wrapped)" } else { "" };
+    vec![
+        format!(
+            "Location: {location}    Journal offset: {}    Size: {}",
+            journal_bytes(info.offset),
+            journal_bytes(info.size),
+        ),
+        format!(
+            "start: {}    end: {}{wrap}    sequence: {}    block size: {}",
+            h.start, h.end, h.sequence_num, h.jhdr_size,
+        ),
+    ]
+}
+
+/// Whether the journal is clean, and what a replay would stop on.
+pub fn journal_status(detail: &JournalDetail) -> Vec<(JournalTone, String)> {
+    let h = &detail.header;
+    let mut out = vec![if h.start != h.end {
+        (
+            JournalTone::Warning,
+            format!(
+                "Warning: journal is dirty - {} pending transaction(s) not yet \
+                 applied to the volume. macOS would replay these on mount.",
+                detail.transactions.len()
+            ),
+        )
+    } else {
+        (
+            JournalTone::Good,
+            "Journal is clean (empty) - nothing pending.".to_string(),
+        )
+    }];
+    if let Some(seq) = detail.checksum_mismatch {
+        out.push((
+            JournalTone::Fault,
+            format!(
+                "Warning: transaction sequence {seq} has a bad checksum - \
+                 macOS will stop replay here."
+            ),
+        ));
+    }
+    for (from, to) in &detail.sequence_jumps {
+        out.push((
+            JournalTone::Fault,
+            format!(
+                "Warning: sequence jumped {from} -> {to} (expected {}).",
+                from.wrapping_add(1)
+            ),
+        ));
+    }
+    out
+}
+
+/// Each transaction's index and one-line description, newest first.
+pub fn journal_txn_rows(detail: &JournalDetail) -> Vec<(usize, String)> {
+    let rows = detail.transactions.iter().enumerate().rev();
+    rows.map(|(idx, t)| {
+        let range = t.blocks.iter().fold(None::<(u64, u64)>, |acc, b| {
+            let hi = b.target + b.bsize as u64;
+            match acc {
+                None => Some((b.target, hi)),
+                Some((lo, prev_hi)) => Some((lo.min(b.target), prev_hi.max(hi))),
+            }
+        });
+        let range_text = match range {
+            Some((lo, hi)) => format!("{}..{}", lo / 512, hi / 512),
+            None => "-".to_string(),
+        };
+        let label = format!(
+            "#{}  {} block(s)  {}  sectors {range_text}  [{}]",
+            t.sequence_num,
+            t.blocks.len(),
+            journal_bytes(t.total_bytes),
+            journal_txn_classes(detail, t),
+        );
+        (idx, label)
+    })
+    .collect()
+}
+
+/// Transaction `idx`'s blocks, one line each, under its heading; `None` for an index not there.
+pub fn journal_txn_blocks(detail: &JournalDetail, idx: usize) -> Option<(String, Vec<String>)> {
+    let txn = detail.transactions.get(idx)?;
+    let lines = txn.blocks.iter().map(|b| {
+        let class = journal_block_class(detail, b.target);
+        format!(
+            "  sector {}  ({} bytes)  [{class}]  {}",
+            b.target / 512,
+            b.bsize,
+            journal_hex(&b.preview),
+        )
+    });
+    let title = format!("Transaction #{} blocks:", txn.sequence_num);
+    Some((title, lines.collect()))
+}
+
 use crate::model::mac_archive_read;
 use disk_core::entry::FileEntry;
 
@@ -69,7 +204,7 @@ pub struct CheckSummary {
 }
 
 impl CheckSummary {
-    pub(super) fn of(r: &FsckResult) -> Self {
+    pub(crate) fn of(r: &FsckResult) -> Self {
         let mut stats_line = format!(
             "Files: {}  Directories: {}",
             r.stats.files_checked, r.stats.directories_checked
@@ -116,7 +251,7 @@ pub struct RepairSummary {
 }
 
 impl RepairSummary {
-    pub(super) fn of(r: &RepairReport) -> Self {
+    pub(crate) fn of(r: &RepairReport) -> Self {
         RepairSummary {
             applied: r.fixes_applied.clone(),
             failed: r.fixes_failed.clone(),

@@ -1107,6 +1107,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dos_floppies_carry_the_drive_geometry_and_check_clean() {
+        for size in crate::fat::dos_floppy_sizes() {
+            let raw = crate::fat::create_dos_floppy(size, Some("DISK")).expect("format");
+            assert_eq!(raw.len() as u64, size);
+            let spt = u16::from_le_bytes([raw[24], raw[25]]) as u64;
+            let heads = u16::from_le_bytes([raw[26], raw[27]]) as u64;
+            assert_eq!(size / 512 % (spt * heads), 0, "size {size}: whole tracks");
+            assert_eq!(
+                raw[0x200], raw[21],
+                "size {size}: FAT starts with the media byte"
+            );
+            let mut img = Cursor::new(raw);
+            add_file(&mut img, "F.BIN", 8192);
+            let r = run_fsck(&mut img);
+            assert!(r.is_clean(), "size {size}: {:?}", r.errors);
+        }
+    }
+
     // ---- Oracle cross-check against the system `fsck_msdos` (macOS/BSD). ----
     // Auto-skips where the tool is absent (e.g. Linux CI), so it stays hermetic
     // there while giving a strong "an independent checker agrees" signal on dev.

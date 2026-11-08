@@ -51,6 +51,23 @@ impl AppController {
             .filter(|i| i.is_outdated && !self.update.dismissed)
     }
 
+    /// The banner's line for the announced release.
+    pub fn update_banner_text(&self) -> Option<String> {
+        let info = self.update_banner()?;
+        Some(format!(
+            "available: v{} -> v{}",
+            info.current_version, info.latest_version
+        ))
+    }
+
+    /// Open the announced release's page in the browser.
+    pub(super) fn view_release(&self) -> Vec<crate::controller::Effect> {
+        let url = self.update.info.as_ref().map(|i| i.releases_url.clone());
+        url.map(crate::controller::Effect::OpenUrl)
+            .into_iter()
+            .collect()
+    }
+
     pub(super) fn dismiss_update(&mut self) {
         self.update.dismissed = true;
     }

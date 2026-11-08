@@ -18,6 +18,8 @@ pub enum AppTab {
     /// Build Disk: a new partitioned disk or volume.
     Build,
     Inspect,
+    /// Convert: images to other formats, one or a folder at a time.
+    Convert,
     Optical,
     Archives,
 }
@@ -39,6 +41,7 @@ pub enum DropRoute {
     Archives(PathBuf),
     Restore(PathBuf),
     Backup(PathBuf),
+    Convert(PathBuf),
     /// The active tab keeps it (Inspect's open volume takes drops itself).
     Ignore,
 }
@@ -137,6 +140,20 @@ pub fn elevation_button_hover() -> &'static str {
 }
 
 /// The note beside a physical-device picker while unprivileged, naming the remedy.
+/// The Linux "restart as root?" question; answer with `AppAction::ConfirmElevation`.
+pub fn elevation_confirm() -> crate::controller::ConfirmSpec {
+    crate::controller::ConfirmSpec {
+        purpose: "elevate",
+        title: "Unlock Physical Devices".to_string(),
+        message: "Physical disk devices can only be opened by root. Rusty Backup will restart \
+                  with root privileges via pkexec, and you will be prompted for your password. \
+                  Disk image files do not need this. Any unsaved changes will be lost on restart."
+            .to_string(),
+        confirm_label: "Restart as Root".to_string(),
+        destructive: false,
+    }
+}
+
 pub fn unelevated_device_note() -> &'static str {
     if cfg!(windows) {
         "Note: physical devices need administrator privileges. Without it they may \
@@ -315,6 +332,7 @@ impl AppController {
             // Build Disk starts from nothing; a drop has no meaning there.
             AppTab::Build => DropRoute::Ignore,
             AppTab::Backup => DropRoute::Backup(path),
+            AppTab::Convert => DropRoute::Convert(path),
         }
     }
 
@@ -344,21 +362,54 @@ impl AppController {
     }
 }
 
+/// The one-line notice a tab shows while another tab's job locks its controls.
+/// What an About window says.
+pub mod about {
+    pub const NAME: &str = "Rusty Backup";
+    pub const SUMMARY: &str = "Back up, restore and inspect vintage computer disk images";
+    pub const WEBSITE: &str = "https://github.com/danifunker/rusty-backup";
+    pub const ISSUES: &str = "https://github.com/danifunker/rusty-backup/issues";
+    pub const DEVELOPER: &str = "Dani Sarfati";
+}
+
+/// This build's version, as the shells show it.
+pub fn app_version() -> &'static str {
+    env!("APP_VERSION")
+}
+
+pub fn busy_elsewhere_notice(tab: &str) -> String {
+    format!("A disk job is running ({tab}); start controls unlock when it finishes.")
+}
+
+/// The text on the shared progress bar; `full` is the untrimmed size when compaction saves space.
+pub fn progress_text(current: u64, total: u64, full: u64, rate_eta: &str) -> String {
+    use disk_core::display::format_size;
+    let percent = current as f32 / total.max(1) as f32 * 100.0;
+    if full > total {
+        format!(
+            "{} / {} to image of {} total ({percent:.0}%){rate_eta}",
+            format_size(current),
+            format_size(total),
+            format_size(full),
+        )
+    } else {
+        format!(
+            "{} / {} ({percent:.0}%){rate_eta}",
+            format_size(current),
+            format_size(total),
+        )
+    }
+}
+
 /// Another tab (not `tab`) with a disk job in flight, so one job runs at a time.
 pub fn busy_elsewhere(
     tab: AppTab,
     running: &[(AppTab, Option<&'static str>)],
-    bulk_running: bool,
 ) -> Option<&'static str> {
     running
         .iter()
         .find(|(owner, name)| name.is_some() && *owner != tab)
         .and_then(|(_, name)| *name)
-        .or(if bulk_running {
-            Some("Bulk Convert")
-        } else {
-            None
-        })
 }
 
 #[cfg(test)]
@@ -413,15 +464,12 @@ mod tests {
 
     #[test]
     fn one_disk_job_at_a_time() {
-        let running = [(AppTab::Backup, Some("Backup")), (AppTab::Restore, None)];
-        assert_eq!(
-            busy_elsewhere(AppTab::Restore, &running, false),
-            Some("Backup")
-        );
-        assert_eq!(busy_elsewhere(AppTab::Backup, &running, false), None);
-        assert_eq!(
-            busy_elsewhere(AppTab::Backup, &running, true),
-            Some("Bulk Convert")
-        );
+        let running = [
+            (AppTab::Backup, Some("Backup")),
+            (AppTab::Restore, None),
+            (AppTab::Convert, None),
+        ];
+        assert_eq!(busy_elsewhere(AppTab::Restore, &running), Some("Backup"));
+        assert_eq!(busy_elsewhere(AppTab::Backup, &running), None);
     }
 }

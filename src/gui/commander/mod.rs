@@ -21,9 +21,9 @@ use eframe::egui;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, BrowserPaneAction, CommanderAction, CommanderController, EditQueue, ExportFormat,
-    FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices, ResourceForkMode,
-    Side, ViewItemKind, ViewMenuItem,
+    format_size, printable, BrowserPaneAction, CommanderAction, CommanderController, EditQueue,
+    ExportFormat, FileDetail, HashAlgo, JobRegistry, MetadataEdit, OnConflict, PaneServices,
+    RenameNotice, ResourceForkMode, Side, ViewItemKind, ViewMenuItem,
 };
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::Controller;
@@ -364,51 +364,36 @@ impl CommanderMode {
         let Some(notice) = self.ctl.rename_notice() else {
             return;
         };
-        let out = &notice.outcome;
-        egui::Window::new(format!("Names changed for {}", out.fs_type))
+        egui::Window::new(notice.title())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                if !out.renamed.is_empty() {
-                    ui.label(format!(
-                        "{} item(s) have names {} can't store and were renamed:",
-                        out.renamed.len(),
-                        out.fs_type
-                    ));
+                if let Some((head, lines)) = notice.renamed() {
+                    ui.label(head);
                     egui::ScrollArea::vertical()
                         .id_salt("rename_notice_renamed")
                         .max_height(180.0)
                         .show(ui, |ui| {
-                            for c in out.renamed.iter().take(200) {
-                                ui.monospace(format!("{} -> {}", printable(&c.from), c.to));
-                            }
-                            if out.renamed.len() > 200 {
-                                ui.label(format!("... and {} more", out.renamed.len() - 200));
+                            for line in lines {
+                                ui.monospace(line);
                             }
                         });
                 }
-                if !out.dropped.is_empty() {
+                if let Some((head, lines)) = notice.dropped() {
                     ui.add_space(4.0);
-                    ui.label(format!(
-                        "{} item(s) have no usable name on {} and were left out:",
-                        out.dropped.len(),
-                        out.fs_type
-                    ));
+                    ui.label(head);
                     egui::ScrollArea::vertical()
                         .id_salt("rename_notice_dropped")
                         .max_height(120.0)
                         .show(ui, |ui| {
-                            for (path, why) in out.dropped.iter().take(100) {
-                                ui.monospace(format!("{} ({why})", printable(path)));
+                            for line in lines {
+                                ui.monospace(line);
                             }
                         });
                 }
                 ui.add_space(6.0);
-                ui.label(
-                    "Tip: to keep every original name and all Mac metadata, export as \
-                     Mac Archive (.mar) instead.",
-                );
+                ui.label(RenameNotice::TIP);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
@@ -946,32 +931,20 @@ pub(crate) fn detail_preview(ui: &mut egui::Ui, ed: &DetailEditors, id: &str, he
 fn render_middle(ui: &mut egui::Ui, ctl: &CommanderController, acts: &mut Vec<CommanderAction>) {
     ui.add_space(60.0);
     let sz = egui::vec2(100.0, 48.0);
-    // A greyed copy button says why in its hover, so it reads as "by design" rather than broken.
-    let copy_hover = |into: Side| match ctl.pane(into).readonly_reason() {
-        Some(reason) => {
-            let side = if into == Side::Right { "right" } else { "left" };
-            format!("Can't copy into the {side} pane - {reason}")
-        }
-        None if into == Side::Right => "Copy the left pane's selection into the right pane".into(),
-        None => "Copy the right pane's selection into the left pane".into(),
-    };
     // Procedurally painted buttons: no font glyphs, no image assets.
-    let l_hover = copy_hover(Side::Right);
+    let l_hover = ctl.copy_hint(Side::Right);
     let l_copy = |p: &egui::Painter, r, c| draw_copy_icon(p, r, c, true);
     if icon_button(ui, sz, ctl.can_copy(Side::Left), &l_hover, l_copy).clicked() {
         acts.push(A::Copy(Side::Left));
     }
     ui.add_space(6.0);
-    let r_hover = copy_hover(Side::Left);
+    let r_hover = ctl.copy_hint(Side::Left);
     let r_copy = |p: &egui::Painter, r, c| draw_copy_icon(p, r, c, false);
     if icon_button(ui, sz, ctl.can_copy(Side::Right), &r_hover, r_copy).clicked() {
         acts.push(A::Copy(Side::Right));
     }
     ui.add_space(12.0);
-    let del_hover = format!(
-        "Delete the selected item(s) in the {} pane",
-        ctl.active().label()
-    );
+    let del_hover = ctl.delete_hint();
     if icon_button(ui, sz, ctl.can_delete(), &del_hover, draw_delete_icon).clicked() {
         acts.push(A::Delete);
     }
@@ -1144,19 +1117,6 @@ fn draw_compare_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
         egui::FontId::monospace(12.0),
         color,
     );
-}
-
-/// Show control characters in a name (the CR in `Icon\r`) instead of a blank box.
-fn printable(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if (c as u32) < 0x20 {
-                format!("\\x{:02X}", c as u32)
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 /// The shortcut map, logging any lines of the user's file it could not use.

@@ -23,7 +23,7 @@ mod target;
 #[cfg(test)]
 mod tests;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::controller::log::LogLevel;
@@ -74,6 +74,87 @@ pub mod ids {
     pub const WRITE_TARGET: &str = "restore.write_target";
     pub const START: &str = "restore.start";
     pub const CANCEL: &str = "restore.cancel";
+    pub const JOB_CANCEL: &str = "restore.job_cancel";
+    pub const RECENT: &str = "restore.recent";
+    pub const PICK_BACKUP_FOLDER: &str = "restore.pick_backup_folder";
+    pub const PICK_SOURCE_IMAGE: &str = "restore.pick_source_image";
+    pub const TARGET_KIND: &str = "restore.target_kind";
+    pub const PICK_TARGET_IMAGE: &str = "restore.pick_target_image";
+    pub const CUSTOM_ALIGNMENT: &str = "restore.custom_alignment";
+    pub const ROW_MODE: &str = "restore.row_mode";
+    pub const ROW_SIZE: &str = "restore.row_size";
+    pub const EXPAND_MIB: &str = "restore.expand_mib";
+    pub const EXPAND_EXTEND: &str = "restore.expand_extend";
+    pub const TARGET_PARTITION: &str = "restore.target_partition";
+    pub const NEW_DISK_TABLE: &str = "restore.new_disk_table";
+    pub const NEW_DISK_ALIGNMENT: &str = "restore.new_disk_alignment";
+    pub const NEW_DISK_CUSTOM: &str = "restore.new_disk_custom";
+    pub const NEW_DISK_BOOTABLE: &str = "restore.new_disk_bootable";
+    pub const REMOTE_ADDRESS: &str = "restore.remote_address";
+    pub const REMOTE_DRIVE: &str = "restore.remote_drive";
+    pub const REMOTE_IMAGE_NAME: &str = "restore.remote_image_name";
+}
+
+/// The longer words a shell puts beside a control, so every shell says the same thing.
+pub mod hints {
+    pub const CLOSE_TARGET: &str =
+        "Clear the selected target device so the drive can be safely removed";
+    pub const REMOTE: &str = "Restore to a remote machine (rb-cli serve)";
+    pub const REMOTE_HOVER: &str = "Push the restored image to a drive or image file on a remote \
+        daemon over the network";
+    pub const REMOTE_ADDRESS: &str = "192.168.1.50:7341";
+    pub const REMOTE_IMAGE_NAME: &str = "restored.img";
+    pub const NO_REMOTE_DRIVES: &str =
+        "No physical drives reported (the daemon may need to run as root). \
+        You can still restore to an image file below.";
+    pub const EXPAND_TITLE: &str = "Add free space for in-OS expansion";
+    pub const EXPAND: &str = "Pad the target image with unallocated free space";
+    pub const EXPAND_HOVER: &str = "Useful for restoring a backup onto a larger virtual disk and \
+        letting the guest OS extend or add a partition there. After \
+        restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
+        Disk Management) followed by your filesystem's own grow \
+        tool. Works for any filesystem.";
+    pub const EXPAND_LEAVE: &str = "Leave as unpartitioned free space (recommended)";
+    pub const EXPAND_LEAVE_HOVER: &str = "Mode A: partition table stays unchanged; the trailing \
+        region is unallocated. After restore, run your OS's partitioner to extend or \
+        add a partition, then your filesystem's grow tool. Works for any \
+        filesystem on any OS.";
+    pub const EXPAND_EXTEND: &str = "Extend last partition automatically";
+    pub const EXPAND_EXTEND_HOVER: &str = "Mode B: the last partition is sized to absorb the new \
+        free space during restore (equivalent to picking 'Fill' for the last partition \
+        in the size table below). After restore, only the filesystem's \
+        own grow tool is needed in the guest OS.";
+    pub const WRITE_IMAGE_EMPTY: &str =
+        "Pick an image to write. Any format Rusty Backup can read works -- \
+        raw, DMG, CHD, VHD, 2MG, GHO, IMZ, and gzip- or zip-wrapped images \
+        are decoded on the way to the disk.";
+    pub const WRITE_IMAGE_UNREADABLE: &str = "That file could not be opened as a disk image.";
+    pub const MAC_DRIVER: &str = "Install the bundled Mac driver";
+    pub const ENTIRE_IMAGE: &str = "Source: entire image file";
+}
+
+/// The modes the tab offers, with what each one's hover says.
+pub const MODES: [(RestoreMode, &str, &str); 4] = [
+    (RestoreMode::FullDisk, "Full Disk Restore", ""),
+    (RestoreMode::SinglePartition, "Restore Single Partition", ""),
+    (RestoreMode::NewDisk, "Restore to New Disk", ""),
+    (
+        RestoreMode::WriteImage,
+        "Write Image File",
+        "Write a disk image straight to a device or one of its \
+         partitions. Any format Rusty Backup can read works, \
+         including DMG, CHD, VHD and compressed images.",
+    ),
+];
+
+/// One line of a device list, with the system disk marked.
+pub fn device_label(d: &DiskDevice) -> String {
+    format!(
+        "{} ({}){}",
+        d.display_name(),
+        format_size(d.size_bytes),
+        if d.is_system { " [SYSTEM]" } else { "" },
+    )
 }
 
 /// Which restore the tab is set up for.
@@ -212,6 +293,18 @@ pub struct RemoteDrive {
     pub size_bytes: u64,
     /// "path (size) - media [removable]".
     pub label: String,
+}
+
+/// The before and after of a padded image target, at one scale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpandPreview {
+    pub current: Vec<PlanSegment>,
+    pub after: Vec<PlanSegment>,
+    /// The unpartitioned tail of the after bar; 0 when the last partition took the free space.
+    pub free_tail: u64,
+    pub added: u64,
+    /// The current bar's width as a fraction of the after bar's.
+    pub scale: f32,
 }
 
 /// The shared progress bar's content while a restore runs.
@@ -365,6 +458,11 @@ impl RestoreController {
         self.run.running()
     }
 
+    /// Cancel was asked for and the job has not stopped yet.
+    pub fn cancelling(&self) -> bool {
+        self.run.cancelling()
+    }
+
     /// The shared progress bar's content, while a restore runs.
     pub fn progress(&self) -> Option<RestoreBar> {
         self.run.bar()
@@ -377,6 +475,10 @@ impl RestoreController {
 
     /// Why the Restore button is disabled, or `Ok` (each mode's own rule).
     pub fn validate(&self) -> Result<(), String> {
+        // A caveat cannot block what has not been read yet, so nothing starts until it is.
+        if self.src.busy() || self.targets.scanning() || self.remote.busy() {
+            return Err("Wait for the source and target to be read.".into());
+        }
         match self.mode {
             RestoreMode::FullDisk => {
                 if !self.has_backup() {
@@ -409,13 +511,25 @@ impl RestoreController {
                 return Err("This mode starts from its own window.".into());
             }
         }
-        match self
+        if let Some(c) = self
             .size_caveats()
             .into_iter()
             .find(|c| c.caveat.level == CaveatLevel::Blocked)
         {
-            Some(c) => Err(c.caveat.text),
-            None => Ok(()),
+            return Err(c.caveat.text);
+        }
+        if self.mode != RestoreMode::FullDisk {
+            return Ok(());
+        }
+        // The engine would refuse this layout, so the button does not offer it.
+        match self.layout_fit() {
+            Some(LayoutFit::Refused { message, .. }) => Err(message),
+            Some(LayoutFit::Overrun { end, target }) => Err(format!(
+                "Layout ends at {} but the target holds {}",
+                format_size(end),
+                format_size(target),
+            )),
+            Some(LayoutFit::Fits) | None => Ok(()),
         }
     }
 
@@ -518,8 +632,8 @@ impl Controller for RestoreController {
             RestoreAction::RemoteUseImage => self.remote_use_image(),
             RestoreAction::Picked { purpose, path } => self.picked(purpose, path),
             RestoreAction::Confirmed { purpose, yes } => {
-                if yes && purpose == purpose::RESTORE {
-                    self.start_confirmed();
+                if purpose == purpose::RESTORE {
+                    self.answered(yes);
                 }
             }
             RestoreAction::Answered { .. } => {}
@@ -594,10 +708,4 @@ impl RestoreController {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-}
-
-/// The path a mode's image target would be written to, for the confirmation's wording.
-fn path_label(p: Option<&Path>) -> String {
-    p.map(|p| p.display().to_string())
-        .unwrap_or_else(|| "Unknown".into())
 }

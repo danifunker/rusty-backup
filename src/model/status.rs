@@ -151,31 +151,6 @@ pub struct RepackStatus {
     pub summary: Option<String>,
 }
 
-/// Log level for `BulkConvertStatus.log_messages`.
-#[derive(Clone, Copy)]
-pub enum BulkConvertLogLevel {
-    Info,
-    Warn,
-    Error,
-}
-
-/// Status of a Bulk Convert dialog job.
-pub struct BulkConvertStatus {
-    pub finished: bool,
-    pub cancel_requested: bool,
-    /// 1-based index of the file currently being processed.
-    pub current_index: usize,
-    pub total_files: usize,
-    pub current_file: String,
-    /// Bytes written for the currently-processing file (for the progress bar).
-    pub current_bytes: u64,
-    pub current_total_bytes: u64,
-    pub succeeded: usize,
-    pub failed: usize,
-    /// Drained by the main thread into the GUI log panel each frame.
-    pub log_messages: Vec<(BulkConvertLogLevel, String)>,
-}
-
 crate::model::worker::finished_with_error!(
     BlockCacheScan,
     ChdExpandStatus,

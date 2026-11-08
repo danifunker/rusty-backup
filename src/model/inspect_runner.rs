@@ -349,7 +349,7 @@ pub fn inspect_source(
                 }
                 log(format!(
                     "Partition {}: minimum size {} (original {})",
-                    part.index,
+                    part.index + 1,
                     disk_core::display::format_size(clamped),
                     disk_core::display::format_size(part.size_bytes),
                 ));
@@ -358,7 +358,7 @@ pub fn inspect_source(
             crate::fs::MinimumResult::Deferred { fs_name } => {
                 log(format!(
                     "Partition {}: need to calculate minimum size due to filesystem {fs_name} (click \"Calc min\" to compute)",
-                    part.index,
+                    part.index + 1,
                 ));
                 deferred_min_sizes.insert(part.index, fs_name);
             }

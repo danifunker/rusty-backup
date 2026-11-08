@@ -26,6 +26,9 @@ pub mod purpose {
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
     pub const DISCONNECT: &str = "remote_pick.disconnect";
+    pub const PICK_ANOTHER: &str = "remote_pick.pick_another";
+    pub const BACKUP: &str = "remote_pick.backup";
+    pub const CLOSE: &str = "remote_pick.close";
     pub const LIST: &str = "remote_pick.list";
 }
 
@@ -47,6 +50,16 @@ pub enum RemotePickAction {
     Enter(String),
     /// Hand the image at this daemon path to the host.
     OpenImage(String),
+}
+
+/// Hovers and labels every shell shows beside the source picker.
+pub mod hints {
+    pub const DISCONNECT: &str = "Close the connection to the remote daemon";
+    pub const PICK_ANOTHER: &str = "Browse the daemon for another image (no reconnect)";
+    pub const BACKUP: &str = "Pull a full backup of this remote image to a local folder";
+    pub const CLOSE: &str = "Disconnect from the remote daemon";
+    pub const BACKING_UP: &str = "Backing up...";
+    pub const OPENABLE: &str = "Double-click to open this image";
 }
 
 /// One row of the listing.
@@ -139,6 +152,10 @@ impl RemotePickController {
 
     pub fn addr(&self) -> &str {
         self.addr.as_str()
+    }
+
+    pub fn disconnect_label(&self) -> String {
+        format!("Disconnect from {}", self.addr)
     }
 
     /// The connect, reopen or folder read in flight.

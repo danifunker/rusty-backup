@@ -38,7 +38,4 @@ impl<'a> TabContext<'a> {
     }
 }
 
-/// The one-line notice a tab shows while another tab's job locks its controls.
-pub fn busy_elsewhere_notice(tab: &str) -> String {
-    format!("A disk job is running ({tab}); start controls unlock when it finishes.")
-}
+pub use rusty_backup::controller::app::busy_elsewhere_notice;

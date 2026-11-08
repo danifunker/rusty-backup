@@ -39,17 +39,19 @@ pub use crate::fs::export_selection::ExportFormat;
 use crate::model::dir_listing::SortColumn;
 pub use crate::model::edit_queue::MetadataEdit;
 pub use crate::model::extract::ExtractOptions;
+pub use browse::{BrowseCaps, RowMenuEntry};
 pub use budget::{BudgetAction, BudgetForm, BudgetMode};
 pub use detail::{DetailField, DetailMetadata};
 pub use follow::{ViewItemKind, ViewMenuItem, FOLLOW_DELAY};
 pub use fs_mac::resource_fork::ResourceForkMode;
 pub use modes::{ModeAction, SpaceReadout, UnsavedChoice, MIN_NESTED_IMAGE_BYTES};
 
+mod browse;
 mod budget;
 mod copy;
 mod detail;
 mod extract;
-pub use extract::{extract_applies, extract_fork_modes, ExtractApplies};
+pub use extract::{extract_applies, extract_fork_modes, ExtractApplies, ProdosExportMode};
 mod follow;
 mod modes;
 #[cfg(test)]
@@ -309,6 +311,66 @@ pub struct SkippedReport {
 pub struct RenameNotice {
     pub dest: Side,
     pub outcome: StageOutcome,
+}
+
+/// Rows past these go uncounted in the rename notice's lists.
+const NOTICE_RENAMED_ROWS: usize = 200;
+const NOTICE_DROPPED_ROWS: usize = 100;
+
+/// Show control characters in a name (the CR in `Icon\r`) instead of a blank box.
+pub fn printable(name: &str) -> String {
+    let shown = name.chars().map(|c| match (c as u32) < 0x20 {
+        true => format!("\\x{:02X}", c as u32),
+        false => c.to_string(),
+    });
+    shown.collect()
+}
+
+impl RenameNotice {
+    pub const TIP: &'static str = "Tip: to keep every original name and all Mac metadata, \
+         export as Mac Archive (.mar) instead.";
+
+    pub fn title(&self) -> String {
+        format!("Names changed for {}", self.outcome.fs_type)
+    }
+
+    /// The heading over the renamed list and its lines, when any name changed.
+    pub fn renamed(&self) -> Option<(String, Vec<String>)> {
+        let out = &self.outcome;
+        if out.renamed.is_empty() {
+            return None;
+        }
+        let head = format!(
+            "{} item(s) have names {} can't store and were renamed:",
+            out.renamed.len(),
+            out.fs_type
+        );
+        let shown = out.renamed.iter().take(NOTICE_RENAMED_ROWS);
+        let mut lines: Vec<String> = shown
+            .map(|c| format!("{} -> {}", printable(&c.from), c.to))
+            .collect();
+        if out.renamed.len() > NOTICE_RENAMED_ROWS {
+            let more = out.renamed.len() - NOTICE_RENAMED_ROWS;
+            lines.push(format!("... and {more} more"));
+        }
+        Some((head, lines))
+    }
+
+    /// The heading over the left-out list and its lines, when any item had no usable name.
+    pub fn dropped(&self) -> Option<(String, Vec<String>)> {
+        let out = &self.outcome;
+        if out.dropped.is_empty() {
+            return None;
+        }
+        let head = format!(
+            "{} item(s) have no usable name on {} and were left out:",
+            out.dropped.len(),
+            out.fs_type
+        );
+        let shown = out.dropped.iter().take(NOTICE_DROPPED_ROWS);
+        let lines = shown.map(|(path, why)| format!("{} ({why})", printable(path)));
+        Some((head, lines.collect()))
+    }
 }
 
 /// The File Info window's data; `serial` changes whenever it shows another entry.
@@ -1063,6 +1125,26 @@ impl CommanderController {
         self.copy.is_none()
             && self.pane(from).has_selection()
             && self.pane(from.other()).can_receive()
+    }
+
+    /// The hover on a copy button, saying why it is off when the pane `into` can't take a copy.
+    pub fn copy_hint(&self, into: Side) -> String {
+        let (name, from) = match into {
+            Side::Left => ("left", "right"),
+            Side::Right => ("right", "left"),
+        };
+        match self.pane(into).readonly_reason() {
+            Some(reason) => format!("Can't copy into the {name} pane - {reason}"),
+            None => format!("Copy the {from} pane's selection into the {name} pane"),
+        }
+    }
+
+    /// The hover on the middle Delete.
+    pub fn delete_hint(&self) -> String {
+        format!(
+            "Delete the selected item(s) in the {} pane",
+            self.active.label()
+        )
     }
 
     /// Delete acts on the active pane; read-only and remote panes take no deletes.

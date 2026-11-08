@@ -15,6 +15,7 @@ pub mod bulk_convert_runner;
 pub mod cache_runner;
 #[cfg(feature = "audio")]
 pub mod cd_audio_player;
+pub mod cd_build;
 #[cfg(feature = "chd")]
 pub mod chd_edit_open;
 #[cfg(feature = "chd")]
@@ -24,6 +25,7 @@ pub mod commander_descend;
 pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
+pub mod convert;
 pub mod dir_listing;
 pub mod disk_builder;
 pub mod disk_write_plan;
@@ -32,7 +34,6 @@ pub mod entry_detail;
 pub mod export_runner;
 pub mod extract;
 pub mod file_types;
-pub mod floppy_convert;
 pub mod format;
 pub mod fs_limits;
 pub mod fsck_runner;

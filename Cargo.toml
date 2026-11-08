@@ -140,11 +140,12 @@ optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 # In-app CD-DA playback on the Optical tab: preview an audio track straight from
 # a CHD or BIN/CUE image. rodio pulls in cpal, which links ALSA (libasound) on
 # Linux, WASAPI on Windows and CoreAudio on macOS — so this is a DESKTOP-only
-# feature. It force-enables `gui` (the player is UI), `optical` (disc reading)
-# and `chd` (CHD audio streams through libchdman-rs). Left OUT of the
+# feature. It force-enables `optical` (disc reading) and `chd` (CHD audio
+# streams through libchdman-rs); the player itself is a controller, so a shell
+# other than egui can have it. Left OUT of the
 # slim/cross builds (rb-cli-mini, armv7/MiSTer, i486/i586) so no ALSA cross-
 # compile is needed there. The Linux desktop GUI CI legs install libasound.
-audio = ["dep:rodio", "gui", "optical", "chd"]
+audio = ["dep:rodio", "optical", "chd"]
 # Image-files-only build for sandboxed distribution (Mac App Store, Microsoft
 # Store, Flathub/Snap): no raw disk or optical-drive access, no elevation, on
 # every platform. Runtime-gated at the `os::` chokepoints, so it composes with
@@ -227,7 +228,7 @@ ratatui = { version = "0.30", optional = true }
 eframe = { version = "0.37", features = ["glow"], optional = true }
 egui = { version = "0.37", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.289.4", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.289.5", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
@@ -381,7 +382,7 @@ assets = [
     ["assets/icons/icon-32.png", "usr/share/icons/hicolor/32x32/apps/rusty-backup.png", "644"],
     ["assets/icons/icon-16.png", "usr/share/icons/hicolor/16x16/apps/rusty-backup.png", "644"],
 ]
-depends = "$auto, libgtk-3-0, libssl3"
+depends = "$auto, libgtk-3-0"
 
 # RPM package metadata
 [package.metadata.generate-rpm]

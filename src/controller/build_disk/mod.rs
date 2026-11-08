@@ -8,8 +8,11 @@
 //! `model::format`, and the build is one job over `model::provision_runner`. The CLI's `rb-cli
 //! build` fills the same request without the steps. See docs/build_disk_plan.md § 7.
 
+mod options;
 #[cfg(test)]
 mod tests;
+
+pub use options::{OptionEdit, AFFS_VARIANTS, SECTOR_SIZES};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -121,12 +124,14 @@ pub mod purpose {
     pub const MAC_DRIVER: &str = "build_disk.mac_driver";
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const DONOR: &str = "build_disk.donor";
+    pub const CD_FOLDER: &str = "build_disk.cd_folder";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
     pub const STEP: &str = "build_disk.step";
     pub const KIND: &str = "build_disk.kind";
+    pub const OUTPUT_KIND: &str = "build_disk.output_kind";
     pub const OUTPUT_DEVICE: &str = "build_disk.output_device";
     pub const OUTPUT_IMAGE: &str = "build_disk.output_image";
     pub const SIZE: &str = "build_disk.size";
@@ -140,6 +145,118 @@ pub mod ids {
     pub const CREATE: &str = "build_disk.create";
     pub const CANCEL: &str = "build_disk.cancel";
     pub const BUILD_ANOTHER: &str = "build_disk.build_another";
+    pub const OPEN_INSPECT: &str = "build_disk.open_inspect";
+    pub const CONTAINER: &str = "build_disk.container";
+    pub const PICK_IMAGE: &str = "build_disk.pick_image";
+    pub const DONOR: &str = "build_disk.donor";
+    pub const DONOR_BLANK: &str = "build_disk.donor_blank";
+    pub const ALIGN: &str = "build_disk.align";
+    pub const HEADS: &str = "build_disk.heads";
+    pub const SECTORS: &str = "build_disk.sectors";
+    pub const PRESET: &str = "build_disk.preset";
+    pub const X68K_SCSI: &str = "build_disk.x68k_scsi";
+    pub const X68K_PARTS: &str = "build_disk.x68k_parts";
+    pub const SYSTEM_DISK: &str = "build_disk.system_disk";
+    pub const SYSTEM_DISK_CLEAR: &str = "build_disk.system_disk_clear";
+    pub const SGI_LABEL: &str = "build_disk.sgi_label";
+    pub const ROW_SIZE: &str = "build_disk.row_size";
+    pub const ROW_TYPE: &str = "build_disk.row_type";
+    pub const ROW_PICK_TYPE: &str = "build_disk.row_pick_type";
+    pub const ROW_NAME: &str = "build_disk.row_name";
+    pub const ROW_BOOT: &str = "build_disk.row_boot";
+    pub const ROW_IMAGE: &str = "build_disk.row_image";
+    pub const ROW_CLEAR: &str = "build_disk.row_clear";
+    pub const ROW_UP: &str = "build_disk.row_up";
+    pub const ROW_DOWN: &str = "build_disk.row_down";
+    pub const ROW_REMOVE: &str = "build_disk.row_remove";
+    pub const ADD_ROW: &str = "build_disk.add_row";
+    pub const ADD_HANDLER: &str = "build_disk.add_handler";
+    pub const REMOVE_HANDLER: &str = "build_disk.remove_handler";
+    pub const MAC_DRIVER: &str = "build_disk.mac_driver";
+    pub const MAC_DRIVER_DISK: &str = "build_disk.mac_driver_disk";
+    pub const CD_LAYOUT: &str = "build_disk.cd_layout";
+    pub const CD_NAME: &str = "build_disk.cd_name";
+    pub const CD_AUTO_SIZE: &str = "build_disk.cd_auto_size";
+    pub const CD_FOLDER: &str = "build_disk.cd_folder";
+    pub const CD_FOLDER_CLEAR: &str = "build_disk.cd_folder_clear";
+    pub const CD_EXPAND_ARCHIVES: &str = "build_disk.cd_expand_archives";
+    pub const CD_EXPAND_GUNZIP: &str = "build_disk.cd_expand_gunzip";
+    pub const CD_EXPAND_IMAGES: &str = "build_disk.cd_expand_images";
+    pub const CD_FLATTEN: &str = "build_disk.cd_flatten";
+    pub const CD_NO_PERMISSIONS: &str = "build_disk.cd_no_permissions";
+    pub const CD_FORCE: &str = "build_disk.cd_force";
+    pub const CD_SIDECARS: &str = "build_disk.cd_sidecars";
+    pub const OPTION: &str = "build_disk.option";
+}
+
+/// The text every view shows beside a control.
+pub mod hints {
+    pub const CONTAINER: &str = "The disk is built raw, then encoded into this container. The \
+         file name's extension picks one when you save.";
+    pub const DEVICE: &str = "An SD or CF card in a reader, a USB stick, or another disk";
+    pub const DEVICE_WARNING: &str =
+        "Building erases everything on the device. The disk is built at the device's own size.";
+    pub const SIZE: &str = "Accepts K / M / G suffixes, e.g. 512M or 2G.";
+    pub const CD_SIZE: &str = "A CD-R holds about 650-700 MiB; a larger image still works in an \
+         emulator.";
+    pub const CD_AUTO_SIZE: &str =
+        "Size the disc to the folder plus filesystem overhead, for an image to mount rather than burn.";
+    pub const CD_FOLDER: &str = "The folder's contents land at the disc's root; leave it blank \
+         to fill the disc later in Inspect or Commander.";
+    pub const CD_EXPAND_ARCHIVES: &str = "Archives in the folder (.tar, .tardist, .zip, and \
+         classic Mac .sit, .cpt, .hqx) are opened and their contents put on the disc, in a folder \
+         named after each archive. Leave it off to put the archive files on the disc unopened.";
+    pub const CD_EXPAND_GUNZIP: &str = "Files compressed with gzip go on the disc uncompressed: \
+         readme.gz lands as readme, and a .tgz or .tar.gz as a plain .tar. Handy for an old \
+         system with no gunzip. With Unpack archives on too, a .tar.gz is unpacked all the way.";
+    pub const CD_EXPAND_IMAGES: &str = "Disk images in the folder (.dsk, .img, .hfv, .dmg, \
+         DiskCopy) are opened and the files inside them put on the disc, in a folder named after \
+         each image, Mac resource forks included. Leave it off to put the image files themselves \
+         on the disc.";
+    pub const CD_FLATTEN: &str = "Instead of a folder per archive, every archive's contents go \
+         straight into the top of the disc, merged together. This is the layout an IRIX \
+         software CD needs, where inst is pointed at one folder holding every .tardist's \
+         contents. A file found in more than one archive is kept once.";
+    pub const CD_NO_PERMISSIONS: &str = "Normally each file keeps the owner and the read, write \
+         and run permissions it has on this computer. Turn this on to give every file the \
+         disc's standard owner and permissions instead, so the disc does not carry this \
+         computer's user ids.";
+    pub const CD_FORCE: &str = "When two things land at the same place on the disc (two \
+         archives holding the same file, say), the later one replaces the earlier one. With \
+         this off the build stops with an error instead, except when unpacking into the root, \
+         where the first copy is kept.";
+    pub const CD_SIDECARS: &str = "A modern Mac copying files to a disk that is not Mac \
+         formatted stores each file's Mac data (its resource fork, type and creator) in a \
+         hidden ._ file beside it.";
+    pub const CD_SIDECARS_FORK: &str = "Each ._ file is put back into the file it belongs to, \
+         as its resource fork, type and creator, the way a classic Mac kept it. The ._ files \
+         themselves do not appear on the disc.";
+    pub const CD_SIDECARS_KEEP: &str = "The ._ files go on the disc as ordinary files, just as \
+         they are in the folder. On a Mac disc the file they belong to still gets its resource \
+         fork as well.";
+    pub const CD_SIDECARS_EXCLUDE: &str = "The ._ files are left off the disc and nothing is \
+         taken from them. Pick this when they are only there because the folder was on a \
+         modern Mac.";
+    pub const FIXED_SIZE: &str = "This filesystem has a fixed size; no size to choose.";
+    pub const DONOR: &str = "Take the table, its special partitions and their contents from \
+         another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
+         volume header or boot blocks verbatim.";
+    pub const ALIGN: &str = "Partition starts are rounded up to this. Blank uses the table \
+         default. Accepts 1M / 63s (sectors).";
+    pub const SYSTEM_DISK: &str = "A Human68k system floppy cloned into partition 1";
+    pub const NO_SYSTEM_DISK: &str = "(none: seed files)";
+    pub const ROW_SIZE: &str = "20M / 1G / bytes, or `rest` for whatever is left";
+    pub const ROW_FIXED_TYPE: &str = "From the donor's label; the label keeps it";
+    pub const ROW_PICK_TYPE: &str = "Choose a well-known partition type";
+    pub const ROW_COPY: &str = "The donor partition's bytes, verbatim";
+    pub const ROW_IMAGE: &str = "Pour an image into this partition after the table is written";
+    pub const BOOT_MBR: &str = "The MBR active flag: the BIOS boots this partition";
+    pub const BOOT_RDB: &str = "The RDB bootable flag: Kickstart may boot this partition";
+    pub const HANDLER: &str = "The AmigaDOS load file, e.g. L:PFS3 or L:SmartFilesystem; the \
+         strap loads it from the RDB";
+    pub const MAC_DRIVER: &str = "A Mac mounts an APM disk only through a driver on the disk. \
+         Bundled uses a donor's own driver when it has one";
+    pub const FAT32: &str = "An EFI System Partition is FAT32";
 }
 
 /// The wizard's steps, in the order they are walked.
@@ -184,16 +301,45 @@ pub enum DiskKind {
     Volume,
     /// A fixed-shape bootable disk (X68000, SGI IRIX).
     Preset,
+    /// A CD-ROM image in one of the native layouts `model::cd_build` masters.
+    Cd,
 }
 
 impl DiskKind {
-    pub const ALL: [DiskKind; 3] = [DiskKind::Partitioned, DiskKind::Volume, DiskKind::Preset];
+    pub const ALL: [DiskKind; 4] = [
+        DiskKind::Partitioned,
+        DiskKind::Volume,
+        DiskKind::Preset,
+        DiskKind::Cd,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             DiskKind::Partitioned => "Partitioned disk",
             DiskKind::Volume => "Single volume (no partition table)",
             DiskKind::Preset => "Bootable preset (X68000, SGI IRIX)",
+            DiskKind::Cd => "CD-ROM image (IRIX EFS, Mac HFS / HFS+, NeXTSTEP UFS)",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            DiskKind::Partitioned => {
+                "A partition table (MBR, GPT, APM, RDB, SGI, Sun, NeXT, ...) with partitions you \
+                 size, each formatted, filled from an image, or left empty."
+            }
+            DiskKind::Volume => {
+                "One filesystem across the whole disk with no partition table: a floppy, a \
+                 superfloppy, or a bare volume for an emulator."
+            }
+            DiskKind::Preset => {
+                "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or an SGI \
+                 IRIX disk with its volume header and an EFS root."
+            }
+            DiskKind::Cd => {
+                "A CD-ROM image (.iso) in a platform's own layout, blank or filled from a folder. \
+                 There is no ISO 9660 side: each disc is read by the system it is made for."
+            }
         }
     }
 }
@@ -229,6 +375,152 @@ pub struct PresetView {
     /// SGI: the EFS volume label (6 bytes).
     pub sgi_label: String,
 }
+
+pub use crate::model::cd_build::{CdImport, CdLayout};
+
+/// A CD-ROM's fields, for the Disk step; its size is the shared size text, or `auto`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdView {
+    pub layout: CdLayout,
+    pub name: String,
+    /// The folder the disc is filled from; `None` leaves it blank.
+    pub from_dir: Option<PathBuf>,
+    pub import: CdImport,
+}
+
+/// One way a folder is copied onto a CD, as every shell lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdOption {
+    ExpandArchives,
+    FlattenFolders,
+    ExpandGunzip,
+    ExpandImages,
+    Force,
+    NoPermissions,
+}
+
+impl CdOption {
+    pub const ALL: [CdOption; 6] = [
+        CdOption::ExpandArchives,
+        CdOption::FlattenFolders,
+        CdOption::ExpandGunzip,
+        CdOption::ExpandImages,
+        CdOption::Force,
+        CdOption::NoPermissions,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => "Unpack archives",
+            CdOption::FlattenFolders => "Unpack every archive into the root",
+            CdOption::ExpandGunzip => "Decompress .gz files",
+            CdOption::ExpandImages => "Copy files out of disk images",
+            CdOption::Force => "Replace files with the same name",
+            CdOption::NoPermissions => "Ignore this computer's permissions",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => hints::CD_EXPAND_ARCHIVES,
+            CdOption::FlattenFolders => hints::CD_FLATTEN,
+            CdOption::ExpandGunzip => hints::CD_EXPAND_GUNZIP,
+            CdOption::ExpandImages => hints::CD_EXPAND_IMAGES,
+            CdOption::Force => hints::CD_FORCE,
+            CdOption::NoPermissions => hints::CD_NO_PERMISSIONS,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            CdOption::ExpandArchives => ids::CD_EXPAND_ARCHIVES,
+            CdOption::FlattenFolders => ids::CD_FLATTEN,
+            CdOption::ExpandGunzip => ids::CD_EXPAND_GUNZIP,
+            CdOption::ExpandImages => ids::CD_EXPAND_IMAGES,
+            CdOption::Force => ids::CD_FORCE,
+            CdOption::NoPermissions => ids::CD_NO_PERMISSIONS,
+        }
+    }
+
+    fn flag(self, i: &mut CdImport) -> &mut bool {
+        match self {
+            CdOption::ExpandArchives => &mut i.expand_archives,
+            CdOption::FlattenFolders => &mut i.flatten_folders,
+            CdOption::ExpandGunzip => &mut i.expand_gunzip,
+            CdOption::ExpandImages => &mut i.expand_images,
+            CdOption::Force => &mut i.force,
+            CdOption::NoPermissions => &mut i.no_permissions,
+        }
+    }
+}
+
+/// What becomes of the macOS `._` files in the folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdSidecars {
+    /// Taken into their file as its resource fork (Mac discs only).
+    ResourceFork,
+    Keep,
+    Exclude,
+}
+
+impl CdSidecars {
+    pub fn label(self) -> &'static str {
+        match self {
+            CdSidecars::ResourceFork => "Use as resource forks",
+            CdSidecars::Keep => "Leave as-is",
+            CdSidecars::Exclude => "Exclude",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            CdSidecars::ResourceFork => hints::CD_SIDECARS_FORK,
+            CdSidecars::Keep => hints::CD_SIDECARS_KEEP,
+            CdSidecars::Exclude => hints::CD_SIDECARS_EXCLUDE,
+        }
+    }
+
+    /// The choices `layout` offers, its default first.
+    pub fn choices(layout: CdLayout) -> &'static [CdSidecars] {
+        if layout.keeps_forks() {
+            &[
+                CdSidecars::ResourceFork,
+                CdSidecars::Keep,
+                CdSidecars::Exclude,
+            ]
+        } else {
+            &[CdSidecars::Exclude, CdSidecars::Keep]
+        }
+    }
+
+    fn of(layout: CdLayout, i: &CdImport) -> CdSidecars {
+        match (i.include_appledouble, i.ignore_appledouble) {
+            (true, _) => CdSidecars::Keep,
+            (_, true) => CdSidecars::Exclude,
+            // Without a fork to take them into, a disc leaves them out.
+            _ if layout.keeps_forks() => CdSidecars::ResourceFork,
+            _ => CdSidecars::Exclude,
+        }
+    }
+
+    fn apply(self, i: &mut CdImport) {
+        i.include_appledouble = self == CdSidecars::Keep;
+        i.ignore_appledouble = self == CdSidecars::Exclude;
+    }
+}
+
+/// A CD option as the Disk step shows it: always listed, greyed out with the reason when it
+/// does not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdOptionRow {
+    pub option: CdOption,
+    pub on: bool,
+    /// Why it does not apply now, or `None` when it can be changed.
+    pub unavailable: Option<&'static str>,
+}
+
+/// The size text that sizes a CD to its folder.
+pub const CD_AUTO_SIZE: &str = "auto";
 
 /// What a row holds after the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +572,14 @@ pub enum BuildDiskAction {
     SetPreset(PresetView),
     /// "Choose..." for the X68000 preset's system floppy.
     PickSystemDisk,
+    /// The CD-ROM and its fields, edited as one.
+    SetCd(CdView),
+    /// "Choose..." for the folder a CD is filled from.
+    PickCdFolder,
+    /// One of the folder-copy switches; ignored while it does not apply.
+    SetCdOption(CdOption, bool),
+    /// Ignored when the layout does not offer it.
+    SetCdSidecars(CdSidecars),
     /// "Start from an existing disk...": pick a donor image to lay the table out from.
     PickDonor,
     /// Start from a blank table again.
@@ -299,7 +599,7 @@ pub enum BuildDiskAction {
     },
     Create,
     Cancel,
-    /// Back to the start, keeping the choices.
+    /// Back to the start, keeping the choices but the output file, which the last build wrote.
     BuildAnother,
 }
 
@@ -324,6 +624,7 @@ pub struct BuildDiskController {
     builder: DiskBuilder,
     volume: RowFormat,
     preset: PresetView,
+    cd: CdView,
     size_text: String,
     output_is_device: bool,
     device: Option<(usize, DiskDevice)>,
@@ -358,6 +659,12 @@ impl BuildDiskController {
                 x68k_partitions: 1,
                 x68k_system_disk: None,
                 sgi_label: "irix".to_string(),
+            },
+            cd: CdView {
+                layout: CdLayout::MacHfs,
+                name: CdLayout::MacHfs.default_name().to_string(),
+                from_dir: None,
+                import: CdImport::default(),
             },
             size_text: "512M".to_string(),
             output_is_device: false,
@@ -411,7 +718,7 @@ impl BuildDiskController {
                 }
             }
             DiskKind::Volume => v.push(Step::Options),
-            DiskKind::Preset => {}
+            DiskKind::Preset | DiskKind::Cd => {}
         }
         v.push(Step::Review);
         v.push(Step::Build);
@@ -432,6 +739,33 @@ impl BuildDiskController {
 
     pub fn device_row(&self) -> Option<usize> {
         self.device.as_ref().map(|(r, _)| *r)
+    }
+
+    /// "Refresh Devices" replaced the list: the target follows its own disk, and never another one.
+    pub fn reconcile_devices(&mut self, devices: &[DiskDevice]) {
+        if self.is_running() {
+            return;
+        }
+        let Some((row, device)) = &self.device else {
+            return;
+        };
+        let identity = device.identity();
+        if devices.get(*row).map(DiskDevice::identity) == Some(identity.clone()) {
+            return;
+        }
+        match devices.iter().position(|d| d.identity() == identity) {
+            Some(moved) => self.device = Some((moved, devices[moved].clone())),
+            None => {
+                let gone = device.display_name();
+                self.device = None;
+                self.confirm_text.clear();
+                self.push(
+                    LogLevel::Warning,
+                    format!("{gone} is no longer listed, so it is no longer the build target."),
+                );
+            }
+        }
+        self.sync_size();
     }
 
     pub fn image(&self) -> Option<&Path> {
@@ -458,6 +792,9 @@ impl BuildDiskController {
         if self.kind == DiskKind::Volume && self.volume.kind.caps().fixed_size {
             return self.fixed_volume_size();
         }
+        if self.kind == DiskKind::Cd && self.cd_auto_size() {
+            return Err("Sized to the folder when it is built.".to_string());
+        }
         match crate::partition::parse_size(self.size_text.as_str()) {
             Ok(0) => Err("The size must be more than zero.".to_string()),
             Ok(n) => Ok(n),
@@ -475,6 +812,18 @@ impl BuildDiskController {
         crate::model::format::format_into(&mut cur, 0, self.volume.kind, &self.volume.opts)
             .map(|d| d.len)
             .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The sizes a volume's filesystem takes, for the Disk step; a fixed size has none.
+    pub fn volume_size_range(&self) -> Option<String> {
+        let caps = self.volume.kind.caps();
+        (!caps.fixed_size).then(|| {
+            format!(
+                "{} to {}",
+                format_size(caps.min_size),
+                format_size(caps.max_buildable())
+            )
+        })
     }
 
     /// The table and rows, as the partition editor draws them.
@@ -507,6 +856,61 @@ impl BuildDiskController {
 
     pub fn preset(&self) -> &PresetView {
         &self.preset
+    }
+
+    pub fn cd(&self) -> &CdView {
+        &self.cd
+    }
+
+    /// Every way a folder is copied onto the CD, with why one does not apply now.
+    pub fn cd_options(&self) -> Vec<CdOptionRow> {
+        let cd = &self.cd;
+        CdOption::ALL
+            .iter()
+            .map(|&option| {
+                let mut i = cd.import.clone();
+                let on = *option.flag(&mut i);
+                let unavailable = if cd.from_dir.is_none() {
+                    Some("Choose a folder to fill the disc from first.")
+                } else {
+                    match option {
+                        CdOption::FlattenFolders if !cd.layout.can_flatten() => {
+                            Some("Only the IRIX EFS and NeXTSTEP UFS discs unpack into one root.")
+                        }
+                        CdOption::FlattenFolders if !cd.import.expand_archives => {
+                            Some("Turn on Unpack archives first.")
+                        }
+                        CdOption::NoPermissions if !cd.layout.keeps_permissions() => {
+                            Some("HFS keeps no Unix permissions.")
+                        }
+                        _ => None,
+                    }
+                };
+                CdOptionRow {
+                    option,
+                    on,
+                    unavailable,
+                }
+            })
+            .collect()
+    }
+
+    /// What becomes of the folder's macOS `._` files, as the layout reads the settings.
+    pub fn cd_sidecars(&self) -> CdSidecars {
+        CdSidecars::of(self.cd.layout, &self.cd.import)
+    }
+
+    /// Why the `._` choice cannot be changed now.
+    pub fn cd_sidecars_unavailable(&self) -> Option<&'static str> {
+        self.cd
+            .from_dir
+            .is_none()
+            .then_some("Choose a folder to fill the disc from first.")
+    }
+
+    /// The CD is sized to its folder rather than to the size text.
+    pub fn cd_auto_size(&self) -> bool {
+        self.size_text.trim().eq_ignore_ascii_case(CD_AUTO_SIZE)
     }
 
     /// The donor the layout started from: its path and table name.
@@ -560,7 +964,7 @@ impl BuildDiskController {
                 format!("Volume ({})", self.volume.kind.display_name()),
                 &self.volume,
             )],
-            DiskKind::Preset => Vec::new(),
+            DiskKind::Preset | DiskKind::Cd => Vec::new(),
             DiskKind::Partitioned => self
                 .builder
                 .rows
@@ -678,6 +1082,9 @@ impl BuildDiskController {
     }
 
     fn output_blocked(&self) -> Option<String> {
+        if self.kind == DiskKind::Cd && self.output_is_device {
+            return Some("A CD-ROM image is saved as a file; choose Image file.".to_string());
+        }
         if !self.output_is_device {
             return match self.image {
                 Some(_) => None,
@@ -698,6 +1105,9 @@ impl BuildDiskController {
     }
 
     fn disk_blocked(&self) -> Option<String> {
+        if self.kind == DiskKind::Cd {
+            return self.cd_blocked();
+        }
         let size = match self.disk_size() {
             Ok(s) => s,
             Err(e) => return Some(e),
@@ -706,7 +1116,35 @@ impl BuildDiskController {
             DiskKind::Partitioned => None,
             DiskKind::Volume => self.volume.fits(size).err(),
             DiskKind::Preset => self.preset_blocked(size),
+            DiskKind::Cd => self.cd_blocked(),
         }
+    }
+
+    /// What the CD's fields lack: a size or a folder to measure, a folder that exists.
+    fn cd_blocked(&self) -> Option<String> {
+        if let Some(dir) = &self.cd.from_dir {
+            if !dir.is_dir() {
+                return Some(format!("{} is not a folder.", dir.display()));
+            }
+        }
+        if self.cd_auto_size() {
+            return self
+                .cd
+                .from_dir
+                .is_none()
+                .then(|| "An automatic size needs a folder to fill the disc from.".to_string());
+        }
+        let size = match self.disk_size() {
+            Ok(s) => s,
+            Err(e) => return Some(e),
+        };
+        if self.cd.layout == CdLayout::NextUfs {
+            let opts = crate::partition::next_cd_builder::NextCdOptions::new(size, "");
+            return crate::partition::next_cd_builder::plan_next_ufs_cd(&opts)
+                .err()
+                .map(|e| format!("{e:#}"));
+        }
+        None
     }
 
     /// The size the preset is built at: a device's size rounded down to what the preset takes.
@@ -760,7 +1198,7 @@ impl BuildDiskController {
                 return Some(format!("{}: {e}", step.label()));
             }
         }
-        if !self.output_is_device {
+        if !self.output_is_device && self.kind != DiskKind::Cd {
             if let Some(why) = self
                 .disk_size()
                 .ok()
@@ -780,12 +1218,18 @@ impl BuildDiskController {
     /// The Review step's summary lines.
     pub fn review_lines(&self) -> Vec<String> {
         let mut v = Vec::new();
-        let size = self.disk_size().map(format_size).unwrap_or_default();
+        let size = match self.disk_size() {
+            Ok(s) => format_size(s),
+            Err(_) if self.kind == DiskKind::Cd => "sized to the folder".to_string(),
+            Err(_) => String::new(),
+        };
         v.push(match (&self.device, self.output_is_device, &self.image) {
             (Some((_, d)), true, _) => {
                 format!("Write to {} ({size}), erasing it", d.display_name())
             }
-            (_, false, Some(p)) if self.container == ExportFormat::Raw => {
+            (_, false, Some(p))
+                if self.container == ExportFormat::Raw || self.kind == DiskKind::Cd =>
+            {
                 format!("Save as {} ({size})", p.display())
             }
             (_, false, Some(p)) => format!(
@@ -812,6 +1256,43 @@ impl BuildDiskController {
                         }
                     }
                     PresetKind::SgiEfs => v.push(format!("EFS label {:?}", p.sgi_label)),
+                }
+            }
+            DiskKind::Cd => {
+                let c = &self.cd;
+                v.push(format!("{}, volume name {:?}", c.layout.label(), c.name));
+                v.push(match &c.from_dir {
+                    Some(d) => format!("Filled from {}", d.display()),
+                    None => "Left blank".to_string(),
+                });
+                let i = &c.import;
+                let mut how = Vec::new();
+                if i.expand_archives {
+                    how.push(if i.flatten_folders && c.layout.can_flatten() {
+                        "archives unpacked into the root"
+                    } else {
+                        "archives unpacked"
+                    });
+                }
+                if i.expand_gunzip {
+                    how.push(".gz files decompressed");
+                }
+                if i.expand_images {
+                    how.push("disk images opened up");
+                }
+                if i.no_permissions && c.layout.keeps_permissions() {
+                    how.push("host permissions ignored");
+                }
+                if i.force {
+                    how.push("same-name entries overwritten");
+                }
+                if i.ignore_appledouble {
+                    how.push("macOS ._ sidecars left out");
+                } else if i.include_appledouble {
+                    how.push("macOS ._ sidecars copied in as files");
+                }
+                if c.from_dir.is_some() && !how.is_empty() {
+                    v.push(format!("While copying: {}", how.join(", ")));
                 }
             }
             DiskKind::Partitioned => {
@@ -887,6 +1368,23 @@ impl BuildDiskController {
     /// Warnings shown on Review that do not block the build.
     pub fn warnings(&self) -> Vec<String> {
         let mut v = Vec::new();
+        if self.kind == DiskKind::Cd {
+            let limit = self.cd.layout.name_limit();
+            if self.cd.name.len() > limit {
+                v.push(format!(
+                    "Warning: this disc keeps the first {limit} bytes of the volume name"
+                ));
+            }
+            if self
+                .disk_size()
+                .is_ok_and(|s| s > crate::model::cd_build::CD_R_BYTES)
+            {
+                v.push(
+                    "Info: larger than a 700 MB CD-R - fine for an emulator, too big to burn"
+                        .to_string(),
+                );
+            }
+        }
         if self.kind == DiskKind::Partitioned {
             let mut b = self.builder.clone();
             b.validate();
@@ -949,12 +1447,19 @@ impl BuildDiskController {
                 PresetKind::X68k => "x68000.hds".to_string(),
                 PresetKind::SgiEfs => "irix.img".to_string(),
             },
+            DiskKind::Cd => "disc.iso".to_string(),
+        };
+        let (kind_name, ext) = match self.kind {
+            DiskKind::Cd => ("CD-ROM images", "iso"),
+            DiskKind::Partitioned | DiskKind::Volume | DiskKind::Preset => {
+                ("Raw disk images", "img")
+            }
         };
         vec![Effect::PickFile(PickSpec {
             purpose: purpose::OUTPUT_IMAGE,
             title: "Save the new disk image as".to_string(),
             filters: vec![
-                ("Raw disk images".to_string(), vec!["img".to_string()]),
+                (kind_name.to_string(), vec![ext.to_string()]),
                 ("All Files".to_string(), vec!["*".to_string()]),
             ],
             save: true,
@@ -985,7 +1490,20 @@ impl BuildDiskController {
             })];
         }
         if let BuildAction::SetKind(kind) = action {
+            let auto: Vec<bool> = (0..self.builder.rows.len())
+                .map(|i| self.row_type_is_suggested(i))
+                .collect();
+            let sizes = self.planned_sizes();
             self.builder.set_kind(kind);
+            for (i, r) in self.builder.rows.iter_mut().enumerate() {
+                if let (true, Some(f)) = (auto[i], r.format.as_ref()) {
+                    let size = sizes.get(i).copied().unwrap_or(0);
+                    r.type_text = crate::model::disk_builder::suggested_type(kind, f.kind, size)
+                        .unwrap_or_else(|| {
+                            crate::partition::provision::default_type(kind).to_string()
+                        });
+                }
+            }
             return Vec::new();
         }
         partition_edit::apply_build(&mut self.builder, action);
@@ -1005,6 +1523,7 @@ impl BuildDiskController {
                 self.image = Some(path);
             }
             purpose::SYSTEM_DISK => self.preset.x68k_system_disk = Some(path),
+            purpose::CD_FOLDER => self.cd.from_dir = Some(path),
             purpose::DONOR => {
                 self.donor_error = None;
                 self.donor_job = Some(Job::spawn(
@@ -1042,14 +1561,27 @@ impl BuildDiskController {
         }
     }
 
+    fn planned_sizes(&self) -> Vec<u64> {
+        let placed = self.builder.plan().unwrap_or_default();
+        placed.iter().map(|p| p.size_bytes).collect()
+    }
+
+    /// The row's type is the one its filesystem proposed, so it is ours to change, not the user's.
+    fn row_type_is_suggested(&self, row: usize) -> bool {
+        let size = self.planned_sizes().get(row).copied().unwrap_or(0);
+        let Some(r) = self.builder.rows.get(row) else {
+            return false;
+        };
+        let fs = r.format.as_ref().map(|f| f.kind);
+        let kind = self.builder.kind;
+        fs.and_then(|fs| crate::model::disk_builder::suggested_type(kind, fs, size))
+            .is_some_and(|t| t == r.type_text.trim())
+    }
+
     fn set_row_fs(&mut self, row: usize, fs: Option<FsKind>) {
         let kind = self.builder.kind;
-        let size = self
-            .builder
-            .plan()
-            .ok()
-            .and_then(|p| p.get(row).map(|p| p.size_bytes))
-            .unwrap_or(0);
+        let size = self.planned_sizes().get(row).copied().unwrap_or(0);
+        let suggested = self.row_type_is_suggested(row);
         let Some(r) = self.builder.rows.get_mut(row) else {
             return;
         };
@@ -1063,10 +1595,11 @@ impl BuildDiskController {
                 if let Some(label) = r.format.as_ref().and_then(|old| typed_label(old, fs)) {
                     f.opts.label = label;
                 }
-                // A default or donor type follows the filesystem; one the user typed stays.
+                // A default, donor or proposed type follows the filesystem; one the user typed stays.
                 if r.type_text.trim().is_empty()
                     || r.type_text.trim() == crate::partition::provision::default_type(kind)
                     || r.donor_part.is_some()
+                    || suggested
                 {
                     if let Some(t) = crate::model::disk_builder::suggested_type(kind, fs, size) {
                         r.type_text = t;
@@ -1090,10 +1623,34 @@ impl BuildDiskController {
             (false, _, Some(p)) => p.clone(),
             _ => return,
         };
-        let Ok(size) = self.disk_size() else {
+        let size = self.disk_size();
+        if self.kind == DiskKind::Cd {
+            let c = &self.cd;
+            let request = crate::model::provision_runner::BuildRequest::Cd {
+                target_path: target.clone(),
+                request: crate::model::cd_build::CdRequest {
+                    layout: c.layout,
+                    size: size.as_ref().ok().copied(),
+                    name: c.name.clone(),
+                    from_dir: c.from_dir.clone(),
+                    import: c.import.clone(),
+                    mac_block_size: None,
+                    bytes_per_inode: None,
+                },
+            };
+            self.push(
+                LogLevel::Info,
+                format!("Building a CD-ROM image at {}", target.display()),
+            );
+            self.start_job(request, None);
+            return;
+        }
+        let Ok(size) = size else {
             return;
         };
         let request = match self.kind {
+            // Started above, before the size was required.
+            DiskKind::Cd => return,
             DiskKind::Preset => {
                 let p = &self.preset;
                 crate::model::provision_runner::BuildRequest::Preset {
@@ -1155,6 +1712,15 @@ impl BuildDiskController {
             format!("Building on {} ({})", target.display(), format_size(size)),
         );
         let container = (!self.output_is_device).then_some(self.container);
+        self.start_job(request, container);
+    }
+
+    /// Run `request` as the build job, its log lines landing in the panel.
+    fn start_job(
+        &mut self,
+        request: crate::model::provision_runner::BuildRequest,
+        container: Option<ExportFormat>,
+    ) {
         let sink = Arc::clone(&self.log);
         self.outcome = None;
         self.finished = None;
@@ -1275,6 +1841,8 @@ impl Controller for BuildDiskController {
                     self.outcome = None;
                     self.finished = None;
                     self.confirm_text.clear();
+                    // Asked for again: the save picker is what warns before an overwrite.
+                    self.image = None;
                     self.step = Step::Kind;
                 }
             }
@@ -1285,7 +1853,15 @@ impl Controller for BuildDiskController {
                 }
             }
             _ if !editable => {}
-            BuildDiskAction::SetKind(k) => self.kind = k,
+            BuildDiskAction::SetKind(k) => {
+                // A CD is a file, raw, with a CD's size.
+                if k == DiskKind::Cd && self.kind != DiskKind::Cd {
+                    self.output_is_device = false;
+                    self.container = ExportFormat::Raw;
+                    self.size_text = "600M".to_string();
+                }
+                self.kind = k;
+            }
             BuildDiskAction::SetOutputIsDevice(on) => self.output_is_device = on,
             BuildDiskAction::SetContainer(c) => self.container = c,
             BuildDiskAction::SelectDevice { row, device } => {
@@ -1319,6 +1895,41 @@ impl Controller for BuildDiskController {
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
             BuildDiskAction::SetPreset(p) => self.preset = p,
+            BuildDiskAction::SetCd(c) => {
+                // A layout change takes that layout's default name, unless one was typed.
+                if c.layout != self.cd.layout && self.cd.name == self.cd.layout.default_name() {
+                    self.cd = CdView {
+                        name: c.layout.default_name().to_string(),
+                        ..c
+                    };
+                } else {
+                    self.cd = c;
+                }
+            }
+            BuildDiskAction::SetCdOption(option, on) => {
+                let applies = self
+                    .cd_options()
+                    .iter()
+                    .any(|r| r.option == option && r.unavailable.is_none());
+                if applies {
+                    *option.flag(&mut self.cd.import) = on;
+                }
+            }
+            BuildDiskAction::SetCdSidecars(choice) => {
+                let offered = CdSidecars::choices(self.cd.layout).contains(&choice);
+                if offered && self.cd_sidecars_unavailable().is_none() {
+                    choice.apply(&mut self.cd.import);
+                }
+            }
+            BuildDiskAction::PickCdFolder => {
+                return vec![Effect::PickFolder(PickSpec {
+                    purpose: purpose::CD_FOLDER,
+                    title: "Fill the disc from this folder".to_string(),
+                    filters: Vec::new(),
+                    save: false,
+                    file_name: String::new(),
+                })];
+            }
             BuildDiskAction::PickDonor => {
                 return vec![Effect::PickFile(PickSpec {
                     purpose: purpose::DONOR,

@@ -1,7 +1,7 @@
 //! `rb-cli tui` — a full-screen terminal UI (milestone M1: the tab shell).
 //!
 //! This mirrors the desktop GUI: a top tab bar (Backup / Restore / Inspect /
-//! New Disk / Optical / Archives / Commander / Bulk / Settings) over the same
+//! New Disk / Optical / Archives / Commander / Convert / Settings) over the same
 //! shared `src/model/` runner layer the GUI uses. Real tabs so far: **Inspect**
 //! (a selectable disk list; a disk, image, backup or remote image opens on the
 //! shared Inspect controller with its grid and disk tools, see
@@ -10,7 +10,7 @@
 //! creates blank images through the shared `new` verb); and **Settings** (an
 //! interactive `UpdateConfig` editor). The progress overlay (live rate + ETA via
 //! `RateTracker`) is wired as a preview. Later milestones fill the remaining
-//! tabs (Backup / Restore / Optical / Archives / Commander / Bulk). See
+//! tabs (Backup / Restore / Optical / Archives / Commander / Convert). See
 //! `docs/tui_plan.md`.
 //!
 //! Conventions (Midnight Commander / CUA + k9s / lazygit): Left/Right change
@@ -53,8 +53,8 @@ mod archives;
 mod ask;
 mod backup;
 mod build_disk;
-mod bulk;
 mod commander;
+mod convert;
 mod dialogs;
 mod explorer;
 mod inspect;
@@ -70,7 +70,7 @@ mod writer;
 use archives::ArchiveState;
 use backup::BackupState;
 use build_disk::BuildDiskState;
-use bulk::{BulkState, BulkStep};
+use convert::ConvertState;
 use inspect::InspectState;
 #[cfg(feature = "optical")]
 use optical::OpticalState;
@@ -761,7 +761,7 @@ impl Palette {
 }
 
 /// Top-level tabs, mirroring the desktop GUI (the first five) plus Commander,
-/// Bulk, and Settings promoted to their own tabs.
+/// Convert, and Settings promoted to their own tabs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TabId {
     Backup,
@@ -772,7 +772,7 @@ enum TabId {
     Optical,
     Archives,
     Commander,
-    Bulk,
+    Convert,
     Settings,
 }
 
@@ -780,12 +780,12 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Backup, "Backup"),
     (TabId::Restore, "Restore"),
     (TabId::Inspect, "Inspect"),
+    (TabId::Convert, "Convert"),
     (TabId::Build, "Build Disk"),
     (TabId::NewDisk, "New Disk"),
     (TabId::Optical, "Optical"),
     (TabId::Archives, "Archives"),
     (TabId::Commander, "Commander"),
-    (TabId::Bulk, "Bulk"),
     (TabId::Settings, "Settings"),
 ];
 
@@ -1134,8 +1134,8 @@ struct App {
     restore: Option<RestoreState>,
     /// The Build Disk screen state (lazily created on first visit).
     build_disk: Option<BuildDiskState>,
-    /// The Bulk convert screen state (lazily created on first visit).
-    bulk: Option<BulkState>,
+    /// The Convert screen state (lazily created on first visit).
+    convert: Option<ConvertState>,
     /// The Optical screen state (lazily created on first visit).
     #[cfg(feature = "optical")]
     optical: Option<OpticalState>,
@@ -1201,7 +1201,7 @@ impl App {
             backup: None,
             restore: None,
             build_disk: None,
-            bulk: None,
+            convert: None,
             #[cfg(feature = "optical")]
             optical: None,
             archive: None,
@@ -1454,8 +1454,8 @@ impl App {
             return;
         }
 
-        // The Bulk convert screen owns most keys on its tab.
-        if self.current() == TabId::Bulk && self.handle_bulk_key(key.code) {
+        // The Convert screen owns most keys on its tab.
+        if self.current() == TabId::Convert && self.handle_convert_key(key.code) {
             return;
         }
 
@@ -1676,9 +1676,9 @@ impl App {
             }
         }
         self.restore_cancel();
-        if let Some(b) = self.bulk.as_mut() {
-            if b.ctl.is_running() {
-                b.act(crate::controller::bulk_convert::BulkConvertAction::Cancel);
+        if let Some(c) = self.convert.as_mut() {
+            if c.ctl.is_running() {
+                c.act(crate::controller::convert::ConvertAction::Cancel);
             }
         }
         #[cfg(feature = "optical")]
@@ -1747,8 +1747,8 @@ impl App {
             }
             self.load_devices_once();
         }
-        if self.current() == TabId::Bulk && self.bulk.is_none() {
-            self.bulk = Some(BulkState::default());
+        if self.current() == TabId::Convert && self.convert.is_none() {
+            self.convert = Some(ConvertState::default());
         }
         #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.optical.is_none() {
@@ -2003,6 +2003,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                     })
                 }
             },
@@ -2089,6 +2090,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                     },
                 ),
                 CdTarget::MacHfs | CdTarget::MacHfsPlus => {
@@ -2109,6 +2111,7 @@ impl App {
                             expand_images,
                             force: false,
                             include_appledouble: false,
+                            exclude_appledouble: false,
                             block_size: None,
                         },
                     )
@@ -2126,6 +2129,7 @@ impl App {
                         force: false,
                         no_permissions: false,
                         include_appledouble: false,
+                        exclude_appledouble: false,
                         bytes_per_inode: None,
                     },
                 ),
@@ -2179,7 +2183,7 @@ impl App {
         self.inspect_tick();
         // Drive the archives controller: a finished open or extraction becomes the status.
         self.archive_tick();
-        self.bulk_tick();
+        self.convert_tick();
         #[cfg(feature = "optical")]
         self.optical_tick();
         if let Some(p) = &mut self.progress {
@@ -2495,9 +2499,9 @@ impl App {
                 return;
             }
         }
-        if self.current() == TabId::Bulk {
-            if let Some(b) = &self.bulk {
-                self.draw_bulk(frame, area, b);
+        if self.current() == TabId::Convert {
+            if let Some(c) = &self.convert {
+                self.draw_convert(frame, area, c);
                 return;
             }
         }
@@ -2842,7 +2846,7 @@ impl App {
         }
     }
 
-    /// The Bulk convert screen: source -> config (format + review list) -> run.
+    /// The Convert screen: the form, the file list and the run.
     /// The Commander dual-pane file manager.
     /// The physical-disk chooser overlay used by the Backup source step.
     /// Shared physical-disk chooser overlay (Backup source + Restore target).
@@ -2985,21 +2989,8 @@ impl App {
             self.restore_footer_keys()
         } else if self.current() == TabId::Build {
             self.build_disk_footer_keys()
-        } else if self.current() == TabId::Bulk {
-            let step = self.bulk.as_ref().map(|b| b.step);
-            match step {
-                Some(BulkStep::Source) => {
-                    vec![("<-/->", "Tabs"), ("Enter/o", "Folder"), ("?", "Help")]
-                }
-                Some(BulkStep::Config) => vec![
-                    ("Up/Dn", "Move"),
-                    ("<-/->", "Format"),
-                    ("Space", "Toggle"),
-                    ("Enter", "Start"),
-                    ("Esc", "Back"),
-                ],
-                _ => vec![("Esc", "Back")],
-            }
+        } else if self.current() == TabId::Convert {
+            self.convert_footer_keys()
         } else if self.current() == TabId::Optical {
             #[cfg(feature = "optical")]
             {
@@ -3154,8 +3145,8 @@ impl App {
         if self.current() == TabId::Archives {
             return self.archives_key_context();
         }
-        if self.current() == TabId::Bulk {
-            return self.bulk_key_context();
+        if self.current() == TabId::Convert {
+            return self.convert_key_context();
         }
         ("Tabs", HINTS_TAB)
     }
@@ -3276,15 +3267,8 @@ impl App {
             ),
             // The Commander view draws its own tab.
             TabId::Commander => Text::default(),
-            TabId::Bulk => self.stub(
-                "Bulk operations across a folder of images.",
-                &[
-                    "Convert every image in a folder to one output format.",
-                    "Review the scan; un-check any files to skip.",
-                    "Bulk floppy-container conversion too.",
-                ],
-                "M8 - reuses bulk_convert_runner.",
-            ),
+            // The Convert screen draws its own tab.
+            TabId::Convert => Text::default(),
             TabId::NewDisk => self.newdisk_content(),
             TabId::Build => self.stub(
                 "Build a disk: partitioned or one volume, to an image file or a device.",
@@ -5134,6 +5118,12 @@ mod tests {
         let v = view(&app);
         assert!(v.errors.is_empty() && v.can_apply, "{:?}", v.errors);
         ikey(&mut app, KeyCode::Char('w'));
+        let asked = &app.inspect.as_ref().unwrap().ask;
+        assert!(
+            matches!(asked, Some(ask::Ask::Confirm(..))),
+            "Apply asks first"
+        );
+        ikey(&mut app, KeyCode::Char('y'));
         inspect_settle(&mut app);
         let s = app.inspect.as_ref().unwrap();
         assert_eq!(s.ctl.partitions().len(), 2, "{:?}", s.log);
@@ -5197,6 +5187,12 @@ mod tests {
         let text = backup_screen(&app);
         assert!(text.contains("Resize Partitions"), "{text}");
         ikey(&mut app, KeyCode::Char('w'));
+        let asked = &app.inspect.as_ref().unwrap().ask;
+        assert!(
+            matches!(asked, Some(ask::Ask::Confirm(..))),
+            "Apply asks first"
+        );
+        ikey(&mut app, KeyCode::Char('y'));
         inspect_settle(&mut app);
         let s = app.inspect.as_ref().unwrap();
         assert!(
@@ -5218,12 +5214,11 @@ mod tests {
         assert!(!app.inspect.as_ref().unwrap().resize.is_open());
     }
 
-    /// Resize Alto Disk, Expand HFS Volume and Convert Floppy Container, each from its key on
-    /// the grid through its controller's window and Save As picker.
+    /// Resize Alto Disk and Expand HFS Volume from their keys through their windows, and `f`
+    /// hands the image to the Convert tab.
     #[test]
-    fn the_inspect_dialogs_resize_alto_expand_hfs_and_convert_a_floppy() {
+    fn the_inspect_dialogs_resize_alto_expand_hfs_and_hand_off_to_convert() {
         use crate::controller::alto_resize::AltoTarget;
-        use crate::controller::floppy_convert::FloppyTarget;
         let dir = tempfile::tempdir().expect("tempdir");
         let fx = crate::controller::test_fixtures::alto_pack(dir.path());
         let mut app = inspect_on(&fx);
@@ -5278,32 +5273,13 @@ mod tests {
         ikey(&mut app, KeyCode::Esc);
         assert!(!app.inspect.as_ref().unwrap().hfs.is_open());
 
+        // `f` hands the image to the Convert tab.
         let xdf = crate::controller::test_fixtures::blank_xdf(dir.path());
         let mut app = inspect_on(&xdf);
         ikey(&mut app, KeyCode::Char('f'));
-        inspect_settle(&mut app);
-        assert_eq!(app.key_context().0, "Inspect - convert floppy");
-        assert!(app.inspect.as_ref().unwrap().floppy.source_kind().is_some());
-        ikey(&mut app, KeyCode::Down);
-        while app.inspect.as_ref().unwrap().floppy.target() != FloppyTarget::Hdm {
-            ikey(&mut app, KeyCode::Right);
-        }
-        ikey(&mut app, KeyCode::Down);
-        ikey(&mut app, KeyCode::Enter);
-        let hdm = dir.path().join("out.hdm");
-        pick_path(&mut app, &hdm);
-        ikey(&mut app, KeyCode::Down);
-        ikey(&mut app, KeyCode::Enter);
-        inspect_settle(&mut app);
-        let s = app.inspect.as_ref().unwrap();
-        assert!(
-            matches!(s.floppy.outcome(), Some(Ok(_))),
-            "{:?}",
-            s.floppy.outcome().map(|o| o.is_ok())
-        );
-        assert!(hdm.exists());
-        ikey(&mut app, KeyCode::Esc);
-        assert!(!app.inspect.as_ref().unwrap().floppy.is_open());
+        assert!(app.current() == TabId::Convert);
+        let c = app.convert.as_ref().expect("the Convert screen");
+        assert_eq!(c.ctl.source(), Some(xdf.as_path()));
     }
 
     /// The new keys refuse a source they do not apply to, and the dialogs draw in 80x24.
@@ -5320,8 +5296,6 @@ mod tests {
         assert!(inspect_note(&app).contains("classic HFS"));
         ikey(&mut app, KeyCode::Char('A'));
         assert!(inspect_note(&app).contains("Alto"));
-        ikey(&mut app, KeyCode::Char('f'));
-        assert!(inspect_note(&app).contains("XDF"));
         assert!(!app.inspect.as_ref().unwrap().dialog_open());
 
         let gap = crate::controller::test_fixtures::mbr_with_gap(dir.path());

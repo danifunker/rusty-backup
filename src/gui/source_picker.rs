@@ -26,7 +26,7 @@ pub enum SourceEvent {
     /// The user chose "Connect to Remote..." — open the remote file-browser
     /// window. The connection details are gathered by that window, not here.
     Remote,
-    /// "Open File...": the caller runs the picker (a controller effect, or [`image_dialog`]).
+    /// "Open File...": the caller runs the picker, a controller effect.
     PickImage,
     /// "Open Local Folder...".
     PickHostFolder,
@@ -77,21 +77,6 @@ pub struct PickerState<'a> {
     /// scrolling past a long device list); a click emits [`SourceEvent::Recent`].
     /// Empty to omit the group.
     pub recent: &'a [String],
-}
-
-/// The disk-image / container file dialog (Disk Images + Mac archives + All Files filters).
-pub fn image_dialog(include_mac_archives: bool) -> rfd::AsyncFileDialog {
-    let mut dialog = super::file_dialog().add_filter(
-        "Disk Images",
-        rusty_backup::controller::app::DISK_IMAGE_EXTS,
-    );
-    if include_mac_archives {
-        dialog = dialog.add_filter(
-            "Mac archives",
-            rusty_backup::controller::app::MAC_ARCHIVE_EXTS,
-        );
-    }
-    dialog.add_filter("All Files", &["*"])
 }
 
 /// Render the source ComboBox and return the user's choice, if any. `id_salt`

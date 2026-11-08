@@ -47,6 +47,19 @@ pub enum PlayState {
     Playing(f64),
 }
 
+/// The playing track as a shell shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Readout {
+    pub track: u32,
+    /// The line beside the "Audio Tracks" button.
+    pub line: String,
+    /// The player window's heading.
+    pub heading: String,
+    /// The player window's row for this track, and how far the track is; `None` while preparing.
+    pub row: Option<String>,
+    pub fraction: Option<f64>,
+}
+
 /// The playing track; dropping it stops playback.
 #[cfg(feature = "audio")]
 struct Playback {
@@ -141,6 +154,31 @@ impl AudioPlayerController {
                 None => PlayState::Preparing,
             },
         ))
+    }
+
+    /// What every shell says about the playing track.
+    pub fn readout(&self) -> Option<Readout> {
+        let (track, state) = self.now_playing()?;
+        Some(match state {
+            PlayState::Preparing => Readout {
+                track,
+                line: format!("Playing track {track} - preparing..."),
+                heading: format!("Track {track}: preparing..."),
+                row: None,
+                fraction: None,
+            },
+            PlayState::Playing(secs) => {
+                let total = self.track_secs(track);
+                let pos = secs.min(total);
+                Readout {
+                    track,
+                    line: format!("Playing track {track} - {secs:.0}s"),
+                    heading: format!("Playing track {track}   {pos:.0}s / {total:.0}s"),
+                    row: Some(format!("Track {track} - {pos:.0}s")),
+                    fraction: Some(if total > 0.0 { pos / total } else { 0.0 }),
+                }
+            }
+        })
     }
 
     /// A track's length in seconds (75 frames a second).

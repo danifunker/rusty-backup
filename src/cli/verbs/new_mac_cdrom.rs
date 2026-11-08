@@ -70,6 +70,14 @@ pub struct NewMacCdromArgs {
     /// volume's own resource fork instead.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// Volume name, as it appears on the Mac desktop. HFS truncates at 27 Mac
     /// Roman bytes. Defaults to `rusty-backup`.
@@ -117,7 +125,7 @@ pub fn run(fs: MacCdFs, args: NewMacCdromArgs) -> Result<()> {
         // Drop the handle before reopening the image through the normal
         // partition-resolution path.
         drop(file);
-        populate(&args, dir)?;
+        populate(&args, fs, dir, layout.hfs_first_sector * 512)?;
     } else {
         log_stderr(format!(
             "  populate it with: rb-cli import {} <dir>   (or put ...@1 host/file /file)",
@@ -127,84 +135,55 @@ pub fn run(fs: MacCdFs, args: NewMacCdromArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `--size`, including `auto` (measure `--from-dir` and project what
-/// the volume needs). `auto` without `--from-dir` has nothing to measure and
-/// is rejected rather than silently defaulting.
+/// Resolve `--size`, including `auto` (`model::cd_build` measures `--from-dir`).
 fn resolve_disc_size(args: &NewMacCdromArgs, fs: MacCdFs) -> Result<u64> {
     if !args.size.eq_ignore_ascii_case("auto") {
         return parse_size(&args.size).context("parsing --size");
     }
-    let Some(dir) = &args.from_dir else {
-        anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
+    let size = crate::model::cd_build::resolve_size(&request(args, fs))?;
+    log_stderr(format!("size auto: {} MiB disc", size / (1024 * 1024)));
+    Ok(size)
+}
+
+/// The shared disc request these flags describe; HFS keeps no Unix permissions.
+fn request(args: &NewMacCdromArgs, fs: MacCdFs) -> crate::model::cd_build::CdRequest {
+    use crate::model::cd_build::{CdImport, CdLayout, CdRequest};
+    let layout = match fs {
+        MacCdFs::Hfs => CdLayout::MacHfs,
+        MacCdFs::HfsPlus => CdLayout::MacHfsPlus,
     };
-    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir_for(dir, &import_options(args))
-        .with_context(|| format!("measuring {}", dir.display()))?;
-    // Project twice: HFS's allocation block scales with the volume, and on a
-    // disc-sized volume it is what drives per-file slack, so a 512-byte first
-    // pass only exists to pick the block size for the real one.
-    let block = match fs {
-        MacCdFs::Hfs => {
-            let rough = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
-            fs_mac::hfs::pick_cd_block_size(rough) as u64
-        }
-        MacCdFs::HfsPlus => 4096,
-    };
-    let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, block);
-    log_stderr(format!(
-        "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disc",
-        bytes / (1024 * 1024),
-        if args.expand_archives || args.expand_gunzip || args.expand_images {
-            " (measured as it will land)"
-        } else {
-            ""
+    CdRequest {
+        size: None,
+        name: args.name.clone(),
+        from_dir: args.from_dir.clone(),
+        import: CdImport {
+            expand_archives: args.expand_archives,
+            expand_gunzip: args.expand_gunzip,
+            expand_images: args.expand_images,
+            force: args.force,
+            include_appledouble: args.include_appledouble,
+            ignore_appledouble: args.exclude_appledouble,
+            ..CdImport::default()
         },
-        projected / (1024 * 1024),
-    ));
-    Ok(projected)
-}
-
-/// The import settings, shared by `--size auto` and the import so the disc fits what lands.
-fn import_options(args: &NewMacCdromArgs) -> crate::fs::dir_import::DirImportOptions {
-    crate::fs::dir_import::DirImportOptions {
-        // HFS and HFS+ have no Unix permissions, which is why there is no flag for them.
-        shared: super::import::shared_options(
-            args.force,
-            false,
-            true,
-            args.include_appledouble,
-            false,
-        ),
-        expand_archives: args.expand_archives,
-        flatten_archives: false,
-        expand_gunzip: args.expand_gunzip,
-        expand_disk_images: args.expand_images,
+        mac_block_size: args.block_size,
+        ..CdRequest::new(layout)
     }
 }
 
-/// Import `dir` into the freshly-formatted disc's Mac volume.
-fn populate(args: &NewMacCdromArgs, dir: &std::path::Path) -> Result<()> {
-    use crate::cli::resolve::resolve_partition_rw_forced;
-    use crate::fs::dir_import::import_dir;
-
-    if !dir.is_dir() {
-        anyhow::bail!("--from-dir: not a directory: {}", dir.display());
-    }
-    // The Mac volume is the disc's only mountable partition; `@1` is how every
-    // other verb addresses it.
-    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1u32.into()), None)?;
-    let mut fs = ctx
-        .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening the new Mac volume for writing: {e}"))?;
-    let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
-        .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
-
-    let opts = import_options(args);
-    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
-        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
-    fs.sync_metadata()
-        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-    commit.commit()?;
-
+/// Import `dir` into the freshly-formatted disc's Mac volume at `fs_offset`.
+fn populate(
+    args: &NewMacCdromArgs,
+    fs: MacCdFs,
+    dir: &std::path::Path,
+    fs_offset: u64,
+) -> Result<()> {
+    let stats = crate::model::cd_build::fill(
+        &args.image,
+        &request(args, fs),
+        fs_offset,
+        dir,
+        &super::import::progress_cb,
+    )?;
     super::import::summarize(dir, "/", &stats, args.expand_archives);
     Ok(())
 }

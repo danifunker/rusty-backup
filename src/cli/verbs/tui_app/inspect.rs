@@ -24,9 +24,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::ask::Ask;
-use super::dialogs::{
-    DRow, DialogKey, DialogWindow, HINTS_ALTO_RESIZE, HINTS_EXPAND_HFS, HINTS_FLOPPY_CONVERT,
-};
+use super::dialogs::{DRow, DialogKey, DialogWindow, HINTS_ALTO_RESIZE, HINTS_EXPAND_HFS};
 use super::resize::{ResizeKey, ResizeWindow, HINTS_RESIZE};
 use super::table_edit::{TableKey, TableWindow, HINTS_TABLE_EDIT};
 use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
@@ -40,7 +38,6 @@ use crate::controller::app::chd::{
 use crate::controller::app::{DiskDevice, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
-use crate::controller::floppy_convert::{FloppyConvertAction, FloppyConvertController};
 use crate::controller::inspect::{
     expand_image_bytes, format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile,
     ExportFormat, HostRequest, InspectAction, InspectController, InspectServices, InspectSource,
@@ -62,7 +59,6 @@ pub(super) enum Who {
     Resize,
     Alto,
     Hfs,
-    Floppy,
 }
 
 /// A window of the screen's own, drawn over the grid.
@@ -116,7 +112,7 @@ pub(super) const HINTS_INSPECT_SOURCE: &[KeyHint] = &[
     hint("s", "Resize Partitions"),
     hint("H", "Expand HFS Volume (APM disk or flat HFV)"),
     hint("A", "Resize Alto Disk (Diablo 31 / 44)"),
-    hint("f", "Convert Floppy Container (XDF / HDM / DIM / D88)"),
+    hint("f", "Convert this image in the Convert tab"),
     hint("o", "Open another image, backup folder or Clonezilla image"),
     hint("Esc", "Close the source (cancels a running export first)"),
 ];
@@ -160,7 +156,6 @@ pub(super) struct InspectState {
     pub(super) twin: TableWindow,
     pub(super) alto: AltoResizeController,
     pub(super) hfs: ExpandHfsController,
-    pub(super) floppy: FloppyConvertController,
     pub(super) dwin: DialogWindow,
     /// Add Partition applies (refreshed after every action; the check reads the disk size).
     can_add: bool,
@@ -195,6 +190,8 @@ pub(super) struct InspectState {
     archive: Option<PathBuf>,
     /// An optical disc the open found, for the Optical tab.
     optical: Option<PathBuf>,
+    /// The image `f` hands to the Convert tab.
+    convert: Option<PathBuf>,
     /// The writer's run is on screen; its end becomes the note.
     writing: bool,
     /// A backup was closed here; the app closes the shared folder (Restore too).
@@ -222,7 +219,6 @@ impl InspectState {
             twin: TableWindow::default(),
             alto: AltoResizeController::new(Arc::new(NoNotify)),
             hfs: ExpandHfsController::new(Arc::new(NoNotify)),
-            floppy: FloppyConvertController::new(Arc::new(NoNotify)),
             dwin: DialogWindow::default(),
             can_add: false,
             disk: None,
@@ -248,6 +244,7 @@ impl InspectState {
             upgrade: None,
             archive: None,
             optical: None,
+            convert: None,
             writing: false,
             closed_backup: false,
         }
@@ -284,8 +281,6 @@ impl InspectState {
             || self.alto.opening().is_some()
             || self.alto.is_writing()
             || self.hfs.is_running()
-            || self.floppy.probing()
-            || self.floppy.is_running()
             || remote
     }
 
@@ -324,12 +319,6 @@ impl InspectState {
     pub(super) fn hact(&mut self, action: ExpandHfsAction) {
         let fx = self.hfs.apply(action);
         self.absorb(Who::Hfs, fx);
-        self.after();
-    }
-
-    pub(super) fn fact(&mut self, action: FloppyConvertAction) {
-        let fx = self.floppy.apply(action);
-        self.absorb(Who::Floppy, fx);
         self.after();
     }
 
@@ -436,7 +425,6 @@ impl InspectState {
             .chain(self.resize.take_log())
             .chain(self.alto.take_log())
             .chain(self.hfs.take_log())
-            .chain(self.floppy.take_log())
             .map(|(_, msg)| msg)
             .collect();
         self.log.extend(lines);
@@ -488,11 +476,9 @@ impl InspectState {
             Pick::Of(Who::Inspect, purpose) => self.act(InspectAction::Picked { purpose, path }),
             Pick::Of(Who::Alto, purpose) => self.aact(AltoResizeAction::Picked { purpose, path }),
             Pick::Of(Who::Hfs, purpose) => self.hact(ExpandHfsAction::Picked { purpose, path }),
-            Pick::Of(Who::Floppy, purpose) => {
-                self.fact(FloppyConvertAction::Picked { purpose, path })
-            }
-            // The writer, the remote picker and Resize ask for no file.
-            Pick::Of(Who::Writer, _) | Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
+            Pick::Of(Who::Writer, purpose) => self.wact(DiskWriteAction::Picked { purpose, path }),
+            // The remote picker and Resize ask for no file.
+            Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
             Pick::WriterImage => {
                 if let Some(path) = path {
                     self.win.image = path.display().to_string();
@@ -535,13 +521,15 @@ impl InspectState {
                 purpose: spec.purpose,
                 text,
             }),
+            Ask::Confirm(Who::Resize, spec) => self.zact(ResizeAction::Confirmed {
+                purpose: spec.purpose,
+                yes,
+            }),
             // The Inspect controller asks no text; the others ask no y / n.
             Ask::Text { .. }
             | Ask::Confirm(Who::Remote, _)
-            | Ask::Confirm(Who::Resize, _)
             | Ask::Confirm(Who::Alto, _)
-            | Ask::Confirm(Who::Hfs, _)
-            | Ask::Confirm(Who::Floppy, _) => {}
+            | Ask::Confirm(Who::Hfs, _) => {}
         }
     }
 
@@ -899,16 +887,13 @@ impl InspectState {
     fn dialog_key(&mut self, code: KeyCode) {
         let key = if self.hfs.is_open() {
             self.dwin.hfs_key(&self.hfs, code)
-        } else if self.alto.is_open() {
-            self.dwin.alto_key(&self.alto, code)
         } else {
-            self.dwin.floppy_key(&self.floppy, code)
+            self.dwin.alto_key(&self.alto, code)
         };
         match key {
             DialogKey::Done => {}
             DialogKey::Alto(a) => self.aact(a),
             DialogKey::Hfs(a) => self.hact(a),
-            DialogKey::Floppy(a) => self.fact(a),
         }
     }
 
@@ -920,11 +905,7 @@ impl InspectState {
 
     /// A dialog of the screen's own is up over the grid.
     pub(super) fn dialog_open(&self) -> bool {
-        self.ctl.editor_open()
-            || self.resize.is_open()
-            || self.alto.is_open()
-            || self.hfs.is_open()
-            || self.floppy.is_open()
+        self.ctl.editor_open() || self.resize.is_open() || self.alto.is_open() || self.hfs.is_open()
     }
 
     fn open_table_editor(&mut self, add: bool) {
@@ -1052,15 +1033,9 @@ impl InspectState {
                 },
                 _ => self.note = Some("Resize Alto Disk takes an Alto pack image.".into()),
             },
-            KeyCode::Char('f') => match self.ctl.floppy_convert_source() {
-                Some(path) => {
-                    self.dwin.reset(DRow::FloppySource);
-                    self.fact(FloppyConvertAction::Open(Some(path)));
-                }
-                None => {
-                    self.note =
-                        Some("Convert Floppy Container takes an XDF, HDM, DIM or D88 image.".into())
-                }
+            KeyCode::Char('f') => match self.ctl.convert_source() {
+                Some(path) => self.convert = Some(path),
+                None => self.note = Some("Convert takes an image file.".into()),
             },
             // A tool that does not apply here says so rather than reaching the disk list's keys.
             KeyCode::Char(c) if "rexBwiuRtas".contains(c) => {
@@ -1107,9 +1082,6 @@ impl App {
         }
         if s.alto.is_open() {
             return Some(("Inspect - resize Alto", HINTS_ALTO_RESIZE));
-        }
-        if s.floppy.is_open() {
-            return Some(("Inspect - convert floppy", HINTS_FLOPPY_CONVERT));
         }
         s.source_open()
             .then_some(("Inspect - partitions", HINTS_INSPECT_SOURCE))
@@ -1355,7 +1327,7 @@ impl App {
             self.after_inspect();
             return true;
         }
-        if s.hfs.is_open() || s.alto.is_open() || s.floppy.is_open() {
+        if s.hfs.is_open() || s.alto.is_open() {
             s.dialog_key(code);
             self.after_inspect();
             return true;
@@ -1383,6 +1355,7 @@ impl App {
         s.ctl.set_browse_dirty(dirty);
         s.ctl.reconcile_devices(devices.as_slice());
         s.writer.reconcile_devices(devices.as_slice());
+        s.resize.reconcile_devices(devices.as_slice());
         let fx = s.ctl.tick();
         s.absorb(Who::Inspect, fx);
         let fx = s.writer.tick();
@@ -1398,8 +1371,6 @@ impl App {
         s.absorb(Who::Alto, fx);
         let fx = s.hfs.tick();
         s.absorb(Who::Hfs, fx);
-        let fx = s.floppy.tick();
-        s.absorb(Who::Floppy, fx);
         s.after();
         if s.writing && !s.writer.is_writing() {
             s.writing = false;
@@ -1469,6 +1440,7 @@ impl App {
         let upgrade = s.upgrade.take();
         let archive = s.archive.take();
         let optical = s.optical.take();
+        let convert = s.convert.take();
         if let Some((open, label)) = browse {
             self.explorer = Some(super::commander::CommanderView::explorer_open(*open, label));
             self.status = None;
@@ -1504,6 +1476,17 @@ impl App {
         }
         #[cfg(not(feature = "optical"))]
         let _ = optical;
+        if let Some(path) = convert {
+            if let Some(idx) = super::TABS
+                .iter()
+                .position(|t| t.0 == super::TabId::Convert)
+            {
+                self.active = idx;
+                self.scroll = 0;
+                self.on_tab_changed();
+                self.convert_open(path);
+            }
+        }
     }
 
     // --- drawing ------------------------------------------------------------------------
@@ -1573,7 +1556,8 @@ impl App {
             );
         }
         if let Some(view) = s.ctl.table_editor() {
-            self.draw_table_editor(frame, area, &view, &s.twin);
+            let target = s.ctl.table_write_target();
+            self.draw_table_editor(frame, area, &view, &s.twin, target.as_deref());
         }
         if s.resize.is_open() {
             self.draw_resize(frame, area, &s.resize, &s.rwin);
@@ -1583,9 +1567,6 @@ impl App {
         }
         if s.hfs.is_open() {
             self.draw_expand_hfs(frame, area, &s.hfs, &s.dwin);
-        }
-        if s.floppy.is_open() {
-            self.draw_floppy_convert(frame, area, &s.floppy, &s.dwin);
         }
         if s.writer.is_open() {
             self.draw_writer(frame, area, "Physical Disk Export", &s.writer, &s.win);
@@ -1752,7 +1733,7 @@ impl App {
             .map(|seg| match seg.kind {
                 SegmentKind::Free => format!("[free {}]", format_size(seg.size_bytes)),
                 SegmentKind::Dimmed => format!("({} {})", seg.label, format_size(seg.size_bytes)),
-                SegmentKind::Partition => {
+                SegmentKind::Partition { .. } => {
                     format!("[{} {} {}]", seg.label, seg.fs, format_size(seg.size_bytes))
                 }
             })
@@ -1937,8 +1918,8 @@ impl App {
         if c.can_edit_table() && !s.resize.is_running() {
             keys.push("s resize");
         }
-        if c.floppy_convert_source().is_some() {
-            keys.push("f convert floppy");
+        if c.convert_source().is_some() {
+            keys.push("f convert");
         }
         if c.table_summary().is_some_and(|t| t.byte_order.is_some()) {
             keys.push("w swap words");

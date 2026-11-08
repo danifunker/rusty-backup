@@ -360,3 +360,189 @@ fn an_image_that_does_not_open_is_not_converted() {
         Some("The image was not recognised as a disc.")
     );
 }
+
+fn local_drive(name: &str, path: &str) -> RipDevice {
+    RipDevice {
+        display_name: name.to_string(),
+        device_path: path.to_string(),
+        location: crate::model::optical_devices::DeviceLocation::Local,
+    }
+}
+
+#[test]
+fn a_selected_drive_follows_its_row_and_never_takes_the_one_that_moved_in() {
+    let mut ctl = controller();
+    ctl.land_drives(vec![
+        local_drive("A", "/dev/x0"),
+        local_drive("B", "/dev/x1"),
+    ]);
+    ctl.drive = Some(1);
+    ctl.mode = SourceMode::PhysicalDrive;
+
+    ctl.land_drives(vec![
+        local_drive("B", "/dev/x1"),
+        local_drive("C", "/dev/x2"),
+        local_drive("A", "/dev/x0"),
+    ]);
+    assert_eq!(ctl.selected_drive(), Some(0), "B moved up, and it stays B");
+    assert!(ctl.take_log().is_empty());
+
+    ctl.land_drives(vec![local_drive("C", "/dev/x2")]);
+    assert_eq!(
+        ctl.selected_drive(),
+        None,
+        "C sits in B's row, but it is not B"
+    );
+    assert!(!ctl.has_valid_source());
+    let log = ctl.take_log();
+    assert!(log[0].1.contains("is no longer listed"), "{log:?}");
+}
+
+#[test]
+fn an_eject_that_ends_after_the_source_moved_on_keeps_the_new_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("kept.iso");
+    let mut ctl = controller();
+    ctl.land_drives(vec![local_drive("A", "/dev/x0")]);
+    ctl.drive = Some(0);
+    ctl.image = Some(image.clone());
+    ctl.ejecting = Some(Job::spawn(
+        "Ejecting the disc...",
+        Arc::clone(&ctl.notify),
+        |_| Ok(("/dev/x0".to_string(), Ok(()))),
+    ));
+    ctl.wait_idle();
+    assert_eq!(
+        ctl.image(),
+        Some(image.as_path()),
+        "image mode was left alone"
+    );
+}
+
+/// A controller on the committed disc, set to BIN/CUE at `dir/out.cue`, with `found` already there.
+#[cfg(feature = "native-zstd")]
+fn over(dir: &Path, found: &[&str]) -> (OpticalController, PathBuf) {
+    let iso = hybrid_disc(dir);
+    let mut ctl = controller();
+    ctl.apply(OpticalAction::OpenImage(iso));
+    ctl.wait_idle();
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::BinCue));
+    let cue = dir.join("out.cue");
+    ctl.set_output_path(cue.clone());
+    for name in found {
+        std::fs::write(dir.join(name), b"keep me").unwrap();
+    }
+    (ctl, cue)
+}
+
+#[cfg(feature = "native-zstd")]
+fn only_confirm(fx: &[Effect]) -> &crate::controller::ConfirmSpec {
+    match fx {
+        [Effect::Confirm(spec)] => spec,
+        other => panic!("expected one Confirm, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn a_no_leaves_the_files_there_as_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, cue) = over(dir.path(), &["out.bin"]);
+    let fx = ctl.apply(OpticalAction::Start(None));
+    let spec = only_confirm(&fx);
+    assert_eq!(spec.purpose, purpose::OVERWRITE);
+    assert!(spec.destructive);
+    assert!(spec.message.starts_with(&ctl.write_target().unwrap()));
+    assert!(spec
+        .message
+        .contains(&cue.with_extension("bin").display().to_string()));
+    assert!(!ctl.is_running(), "nothing runs before the answer");
+    let purpose = purpose::OVERWRITE;
+    ctl.apply(OpticalAction::Confirmed {
+        purpose,
+        yes: false,
+    });
+    ctl.wait_idle();
+    assert!(!ctl.is_running());
+    assert_eq!(
+        std::fs::read(cue.with_extension("bin")).unwrap(),
+        b"keep me"
+    );
+    assert!(!cue.exists());
+}
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn a_yes_counts_only_for_the_question_it_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, cue) = over(dir.path(), &["out.cue"]);
+    let purpose = purpose::OVERWRITE;
+
+    ctl.apply(OpticalAction::Confirmed { purpose, yes: true });
+    assert!(!ctl.is_running(), "no question was out");
+
+    let fx = ctl.apply(OpticalAction::Start(None));
+    only_confirm(&fx);
+    let other = dir.path().join("other.cue");
+    std::fs::write(&other, b"also kept").unwrap();
+    ctl.set_output_path(other.clone());
+    ctl.apply(OpticalAction::Confirmed { purpose, yes: true });
+    assert!(!ctl.is_running(), "that yes was for out.cue");
+    assert!(matches!(ctl.last_result(), Some(Err(e)) if e.contains("changed")));
+    assert_eq!(std::fs::read(&other).unwrap(), b"also kept");
+
+    ctl.set_output_path(cue.clone());
+    let fx = ctl.apply(OpticalAction::Start(None));
+    only_confirm(&fx);
+    ctl.apply(OpticalAction::Confirmed { purpose, yes: true });
+    assert!(ctl.is_running());
+    ctl.wait_idle();
+    assert_eq!(ctl.last_result(), Some(&Ok(())));
+    assert_ne!(std::fs::read(&cue).unwrap(), b"keep me");
+}
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn the_output_is_never_the_source_a_folder_or_a_bin() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, _) = over(dir.path(), &[]);
+    let iso = ctl.image().unwrap().to_path_buf();
+    let before = std::fs::metadata(&iso).unwrap().len();
+
+    // BIN/CUE writes disc.bin beside disc.cue, so this one takes the image's own name.
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::Chd));
+    ctl.set_output_path(iso.clone());
+    assert!(ctl.start_refusal().unwrap().contains("is the source image"));
+    ctl.apply(OpticalAction::Start(None));
+    assert!(!ctl.is_running());
+    assert_eq!(std::fs::metadata(&iso).unwrap().len(), before);
+
+    ctl.set_output_path(dir.path().to_path_buf());
+    assert!(ctl.start_refusal().unwrap().contains("not a regular file"));
+
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::BinCue));
+    ctl.set_output_path(dir.path().join("x.bin"));
+    assert!(ctl.start_refusal().unwrap().contains("named by its .cue"));
+}
+
+#[test]
+fn a_chd_split_into_tracks_counts_its_track_files() {
+    let files = optical_ops::written_files(Path::new("/o/a.cue"), OutputFormat::BinCue, true);
+    assert_eq!(files[1], Path::new("/o/a.bin"));
+    assert_eq!(files[2], Path::new("/o/a (Track 01).bin"));
+    let iso = optical_ops::written_files(Path::new("/o/a.iso"), OutputFormat::Iso, false);
+    assert_eq!(iso.len(), 1);
+}
+
+#[cfg(feature = "native-zstd")]
+#[test]
+fn the_output_name_follows_the_format_unless_the_user_named_it_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, cue) = over(dir.path(), &[]);
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::Chd));
+    assert_eq!(ctl.output(), Some(cue.with_extension("chd").as_path()));
+    let own = dir.path().join("disc.image");
+    ctl.set_output_path(own.clone());
+    ctl.apply(OpticalAction::SetOutputFormat(OutputFormat::BinCue));
+    assert_eq!(ctl.output(), Some(own.as_path()));
+}

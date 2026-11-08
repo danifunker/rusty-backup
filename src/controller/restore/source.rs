@@ -184,6 +184,15 @@ impl RestoreController {
             .map(|w| (w.path.as_path(), w.size_bytes.unwrap_or(0)))
     }
 
+    /// The decoded size of Write Image File's source, in words; `None` when unreadable or unset.
+    pub fn write_image_line(&self) -> Option<String> {
+        let (_, size) = self.write_image().filter(|(_, size)| *size > 0)?;
+        Some(format!(
+            "Decoded size: {} (the file on disk may be smaller if it is compressed)",
+            format_size(size),
+        ))
+    }
+
     /// Write Image File's source is a table-less volume: its filesystem, for the writer's table.
     pub fn write_image_superfloppy(&self) -> Option<&str> {
         self.src

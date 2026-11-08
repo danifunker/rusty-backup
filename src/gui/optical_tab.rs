@@ -9,8 +9,8 @@
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::optical::{
-    ChdChoice, ChdProfile, HostRequest, OpticalAction, OpticalController, OutputFormat, SourceMode,
-    Task,
+    hints, ChdChoice, ChdProfile, HostRequest, OpticalAction, OpticalController, OutputFormat,
+    SourceMode, Task,
 };
 use rusty_backup::controller::{Controller, Effect};
 
@@ -33,6 +33,8 @@ pub struct OpticalTab {
     showing_bar: bool,
     /// The disc browser: the shared browse view, `PaneProfile::optical`.
     browser: super::browse_view::BrowseView,
+    /// The image "Convert..." hands to the Convert tab, taken by the app.
+    pending_convert: Option<std::path::PathBuf>,
 }
 
 impl OpticalTab {
@@ -49,6 +51,7 @@ impl OpticalTab {
             add_remote_addr: String::new(),
             showing_bar: false,
             browser: super::browse_view::BrowseView::optical(),
+            pending_convert: None,
         }
     }
 }
@@ -60,6 +63,10 @@ impl OpticalTab {
     }
 
     /// Scan the drives at start-up; the count reaches the log when the scan ends.
+    pub fn take_convert_request(&mut self) -> Option<std::path::PathBuf> {
+        self.pending_convert.take()
+    }
+
     pub fn find_drives(&mut self) {
         self.act(OpticalAction::FindDrives);
     }
@@ -224,26 +231,41 @@ impl OpticalTab {
 
         ui.separator();
 
-        ui.add_enabled_ui(controls_enabled, |ui| self.output_rows(ui, &mut actions));
-
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            if !self.ctl.is_running() {
-                let label = match self.ctl.task() {
-                    Task::Rip => "Start Rip",
-                    Task::Convert => "Start Convert",
-                };
+        if self.ctl.task() == Task::Convert {
+            // An image's format changes in the Convert tab; this tab rips drives.
+            ui.horizontal(|ui| {
+                let src = self.ctl.convert_source();
                 if ui
-                    .add_enabled(self.ctl.can_start(), egui::Button::new(label))
+                    .add_enabled(src.is_some(), egui::Button::new("Convert..."))
+                    .on_hover_text(rusty_backup::controller::optical::hints::CONVERT)
                     .clicked()
                 {
-                    actions.push(OpticalAction::Start(self.chd_choice()));
+                    self.pending_convert = src;
                 }
-            } else if ui.button("Cancel").clicked() {
-                actions.push(OpticalAction::Cancel);
-            }
-        });
+                ui.label(
+                    egui::RichText::new(rusty_backup::controller::optical::hints::CONVERT_MOVED)
+                        .weak(),
+                );
+            });
+        } else {
+            ui.add_enabled_ui(controls_enabled, |ui| self.output_rows(ui, &mut actions));
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if !self.ctl.is_running() {
+                    let label = self.ctl.start_label();
+                    if ui
+                        .add_enabled(self.ctl.can_start(), egui::Button::new(label))
+                        .clicked()
+                    {
+                        actions.push(OpticalAction::Start(self.chd_choice()));
+                    }
+                } else if ui.button("Cancel").clicked() {
+                    actions.push(OpticalAction::Cancel);
+                }
+            });
+        }
 
         ui.separator();
 
@@ -268,10 +290,7 @@ impl OpticalTab {
             ui.add_enabled_ui(phys_enabled, |ui| {
                 if ui
                     .radio(mode == SourceMode::PhysicalDrive, "Physical drive")
-                    .on_disabled_hover_text(
-                        "Click \"Show Physical Devices\" (top bar) for a local drive, \
-                         or \"Add remote daemon...\" for a networked one.",
-                    )
+                    .on_disabled_hover_text(hints::PHYSICAL_DRIVE)
                     .clicked()
                 {
                     actions.push(OpticalAction::SetSourceMode(SourceMode::PhysicalDrive));
@@ -316,9 +335,7 @@ impl OpticalTab {
                     ui.add_enabled_ui(self.ctl.can_eject(), |ui| {
                         if ui
                             .button("Eject")
-                            .on_disabled_hover_text(
-                                "Select a local drive with a disc in it to eject.",
-                            )
+                            .on_disabled_hover_text(hints::EJECT)
                             .clicked()
                         {
                             actions.push(OpticalAction::Eject);
@@ -351,14 +368,7 @@ impl OpticalTab {
     fn output_rows(&mut self, ui: &mut egui::Ui, actions: &mut Vec<OpticalAction>) {
         ui.horizontal(|ui| {
             ui.label("Action:");
-            match self.ctl.task() {
-                Task::Rip => {
-                    let _ = ui.radio(true, "Rip to disk");
-                }
-                Task::Convert => {
-                    let _ = ui.radio(true, "Convert format");
-                }
-            }
+            let _ = ui.radio(true, self.ctl.task_label());
         });
 
         ui.horizontal(|ui| {
@@ -401,10 +411,7 @@ impl OpticalTab {
                 let mut eject = self.ctl.eject_after();
                 if ui
                     .checkbox(&mut eject, "Eject after ripping")
-                    .on_hover_text(
-                        "Ejects the source drive on its own machine - the \
-                         remote daemon's drive for a remote source.",
-                    )
+                    .on_hover_text(hints::EJECT_AFTER)
                     .changed()
                 {
                     actions.push(OpticalAction::SetEjectAfter(eject));
@@ -486,10 +493,10 @@ impl OpticalTab {
                 Reply::Picked { purpose, path } => {
                     self.act(OpticalAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. }
-                | Reply::Answered { .. }
-                | Reply::Chose { .. }
-                | Reply::CloseScreen => {}
+                Reply::Confirmed { purpose, yes } => {
+                    self.act(OpticalAction::Confirmed { purpose, yes })
+                }
+                Reply::Answered { .. } | Reply::Chose { .. } | Reply::CloseScreen => {}
             }
         }
     }

@@ -34,6 +34,27 @@ pub fn extract_fork_modes() -> Vec<ResourceForkMode> {
     ResourceForkMode::ALL.iter().copied().filter(here).collect()
 }
 
+/// How an extract names a ProDOS file on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProdosExportMode {
+    /// A CiderPress `#TTAAAA` suffix, so type and aux survive a round trip back into ProDOS.
+    WithTypeSuffix,
+    /// The bare ProDOS name; type and aux are dropped.
+    Plain,
+}
+
+impl ProdosExportMode {
+    pub const ALL: [ProdosExportMode; 2] =
+        [ProdosExportMode::WithTypeSuffix, ProdosExportMode::Plain];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProdosExportMode::WithTypeSuffix => "Name + #TTAAAA suffix",
+            ProdosExportMode::Plain => "Bare name (lossy)",
+        }
+    }
+}
+
 /// An extraction waiting for its destination.
 pub(super) struct PendingExtract {
     from: Side,

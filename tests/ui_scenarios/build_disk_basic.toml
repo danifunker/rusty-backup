@@ -83,3 +83,12 @@ action = "Next"
 action = "Next"
 settle = true
 expect = { step = "Build", result = "ok", opens = 2 }
+
+# The file just written is not reused: the save picker is what warns before an overwrite.
+[[step]]
+action = "BuildAnother"
+expect = { step = "Kind" }
+
+[[step]]
+action = "Next"
+expect = { step = "Output", blocked = "~Choose where to save" }

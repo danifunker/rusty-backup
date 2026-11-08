@@ -301,3 +301,226 @@ fn only_one_mbr_partition_stays_bootable() {
     );
     assert_eq!(c.table_view().boot, None, "GPT has no flag here");
 }
+
+#[test]
+fn a_device_target_follows_its_own_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let card = fake_device(dir.path().join("card").as_path(), 32 * MIB);
+    let other = fake_device(dir.path().join("other").as_path(), 64 * MIB);
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetOutputIsDevice(true));
+    act(
+        &mut c,
+        BuildDiskAction::SelectDevice {
+            row: 0,
+            device: card.clone(),
+        },
+    );
+    c.reconcile_devices(&[other.clone(), card.clone()]);
+    assert_eq!(c.device_row(), Some(1));
+    assert_eq!(c.device().map(|d| d.path.clone()), Some(card.path.clone()));
+
+    act(&mut c, BuildDiskAction::SetConfirmText("typed".to_string()));
+    c.reconcile_devices(std::slice::from_ref(&other));
+    assert!(c.device().is_none(), "the other disk must not take its row");
+    assert_eq!(c.confirm_text(), "");
+    assert!(c.disk_size().is_err());
+    assert!(c
+        .take_log()
+        .iter()
+        .any(|l| l.1.contains("no longer listed")));
+}
+
+#[test]
+fn a_swapped_card_at_the_same_path_is_not_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("card");
+    let card = fake_device(path.as_path(), 32 * MIB);
+    let mut swapped = card.clone();
+    swapped.media_name = "Another card".to_string();
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetOutputIsDevice(true));
+    act(
+        &mut c,
+        BuildDiskAction::SelectDevice {
+            row: 0,
+            device: card,
+        },
+    );
+    c.reconcile_devices(&[swapped]);
+    assert!(c.device().is_none());
+}
+
+#[test]
+fn build_another_asks_where_to_save_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ctl();
+    image_output(&mut c, dir.path().join("a.img").as_path());
+    act(&mut c, BuildDiskAction::BuildAnother);
+    assert!(c.image().is_none());
+    assert!(c.blocked_at(Step::Output).is_some());
+}
+
+#[test]
+fn option_edits_keep_the_rules() {
+    let mut o = FormatOptions::default();
+    OptionEdit::BytesPerInode(Some(4096)).apply(&mut o);
+    OptionEdit::Inodes(Some(100)).apply(&mut o);
+    assert_eq!((o.inodes, o.bytes_per_inode), (Some(100), None));
+    OptionEdit::BytesPerInode(Some(4096)).apply(&mut o);
+    assert_eq!((o.inodes, o.bytes_per_inode), (None, Some(4096)));
+    OptionEdit::Inodes(None).apply(&mut o);
+    assert_eq!(
+        o.bytes_per_inode,
+        Some(4096),
+        "blank leaves the other alone"
+    );
+
+    OptionEdit::SectorSize(4096).apply(&mut o);
+    assert_eq!(o.sector_size, Some(4096));
+    OptionEdit::SectorSize(512).apply(&mut o);
+    assert_eq!(o.sector_size, None);
+    OptionEdit::ClusterSize(Some(u64::MAX)).apply(&mut o);
+    assert_eq!(o.cluster_bytes, Some(u32::MAX));
+}
+
+#[test]
+fn the_btree_sizes_are_not_offered() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Hfs));
+    let t = c.format_targets().remove(0);
+    assert!(t.caps.options.contains(&FsOption::BtreeSizes));
+    assert!(!t.fields().contains(&FsOption::BtreeSizes));
+    let label = t.edited(OptionEdit::Label("X".to_string())).label;
+    assert_eq!(label, "X");
+}
+
+#[test]
+fn a_proposed_type_follows_but_a_typed_one_stays() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetSize("64M".to_string()));
+    let fs = |row, fs| BuildDiskAction::SetRowFs { row, fs: Some(fs) };
+    act(&mut c, fs(0, FsKind::Fat));
+    assert_eq!(c.table_view().rows[0].type_text, "06");
+    act(&mut c, fs(0, FsKind::Ntfs));
+    assert_eq!(c.table_view().rows[0].type_text, "07", "07 follows the fs");
+
+    act(&mut c, fs(0, FsKind::Hfs));
+    let to = |k| BuildDiskAction::Table(BuildAction::SetKind(k));
+    act(&mut c, to(TableKind::Apm));
+    assert_eq!(c.table_view().rows[0].type_text, "Apple_HFS");
+
+    act(&mut c, to(TableKind::Mbr));
+    assert_eq!(c.table_view().rows[0].type_text, "AF");
+    let text = "42".to_string();
+    act(
+        &mut c,
+        BuildDiskAction::Table(BuildAction::SetRowType { row: 0, text }),
+    );
+    act(&mut c, fs(0, FsKind::Fat));
+    assert_eq!(c.table_view().rows[0].type_text, "42");
+    act(&mut c, to(TableKind::Apm));
+    assert_eq!(c.table_view().rows[0].type_text, "42", "typed text stays");
+}
+
+#[test]
+fn a_donors_boot_flag_comes_with_its_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("donor.img");
+    let mut disk = vec![0u8; 4 * MIB as usize];
+    for (slot, active, lba) in [(0usize, 0u8, 2048u32), (1, 0x80, 4096), (2, 0x80, 6144)] {
+        let e = &mut disk[446 + 16 * slot..446 + 16 * (slot + 1)];
+        e[0] = active;
+        e[4] = 0x06;
+        e[8..12].copy_from_slice(&lba.to_le_bytes());
+        e[12..16].copy_from_slice(&2048u32.to_le_bytes());
+    }
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    std::fs::write(path.as_path(), disk).unwrap();
+
+    let mut c = ctl();
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: purpose::DONOR,
+            path: Some(path),
+        },
+    );
+    c.wait();
+    let flags: Vec<bool> = c.table_view().rows.iter().map(|r| r.bootable).collect();
+    assert_eq!(flags, [false, true, false], "an MBR has one active flag");
+}
+
+/// Every CD option is listed; one that does not apply says why and ignores a toggle.
+#[test]
+fn cd_options_are_all_listed_and_refuse_with_a_reason() {
+    use super::{CdLayout, CdOption, CdSidecars};
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Cd));
+    let rows = c.cd_options();
+    assert_eq!(rows.len(), CdOption::ALL.len());
+    assert!(
+        rows.iter().all(|r| r.unavailable.is_some()),
+        "no folder yet"
+    );
+    act(
+        &mut c,
+        BuildDiskAction::Picked {
+            purpose: super::purpose::CD_FOLDER,
+            path: Some(dir.path().to_path_buf()),
+        },
+    );
+    let why = |c: &BuildDiskController, o: CdOption| {
+        c.cd_options()
+            .into_iter()
+            .find(|r| r.option == o)
+            .unwrap()
+            .unavailable
+    };
+    assert!(
+        why(&c, CdOption::FlattenFolders).is_some(),
+        "HFS cannot flatten"
+    );
+    assert!(
+        why(&c, CdOption::NoPermissions).is_some(),
+        "HFS keeps no permissions"
+    );
+    act(
+        &mut c,
+        BuildDiskAction::SetCdOption(CdOption::FlattenFolders, true),
+    );
+    assert!(
+        !c.cd().import.flatten_folders,
+        "a refused option ignores a toggle"
+    );
+    let mut cd = c.cd().clone();
+    cd.layout = CdLayout::SgiEfs;
+    act(&mut c, BuildDiskAction::SetCd(cd));
+    act(
+        &mut c,
+        BuildDiskAction::SetCdOption(CdOption::ExpandArchives, true),
+    );
+    assert!(why(&c, CdOption::FlattenFolders).is_none());
+    assert_eq!(c.cd_sidecars(), CdSidecars::Exclude, "EFS has no forks");
+    act(
+        &mut c,
+        BuildDiskAction::SetCdSidecars(CdSidecars::ResourceFork),
+    );
+    assert_eq!(c.cd_sidecars(), CdSidecars::Exclude, "not offered on EFS");
+    act(&mut c, BuildDiskAction::SetCdSidecars(CdSidecars::Keep));
+    assert!(c.cd().import.include_appledouble);
+    let mut cd = c.cd().clone();
+    cd.layout = CdLayout::MacHfs;
+    act(&mut c, BuildDiskAction::SetCd(cd));
+    assert_eq!(CdSidecars::choices(CdLayout::MacHfs).len(), 3);
+    act(&mut c, BuildDiskAction::SetCdSidecars(CdSidecars::Exclude));
+    assert!(c.cd().import.ignore_appledouble && !c.cd().import.include_appledouble);
+    act(
+        &mut c,
+        BuildDiskAction::SetCdSidecars(CdSidecars::ResourceFork),
+    );
+    assert_eq!(c.cd_sidecars(), CdSidecars::ResourceFork);
+}

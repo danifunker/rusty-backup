@@ -126,7 +126,8 @@ impl PhysicalDiskExport {
         }
         for reply in replies {
             let action = match reply {
-                Reply::Picked { .. } | Reply::Chose { .. } | Reply::CloseScreen => continue,
+                Reply::Picked { purpose, path } => DiskWriteAction::Picked { purpose, path },
+                Reply::Chose { .. } | Reply::CloseScreen => continue,
                 Reply::Confirmed { purpose, yes } => DiskWriteAction::Confirmed { purpose, yes },
                 Reply::Answered { purpose, text } => DiskWriteAction::Answered { purpose, text },
             };
@@ -161,6 +162,7 @@ impl PhysicalDiskExport {
     ) {
         let selected = self.ctl.target_row();
         let mut picked = None;
+        let mut pick_image = false;
         ui.horizontal(|ui| {
             ui.label("Target disk:");
             let current_label = selected
@@ -180,7 +182,16 @@ impl PhysicalDiskExport {
                         }
                     }
                 });
+            if ui.button("Image file...").clicked() {
+                pick_image = true;
+            }
         });
+        if let Some(path) = self.ctl.target_image() {
+            ui.label(format!("Target image: {}", path.display()));
+        }
+        if pick_image {
+            self.act(DiskWriteAction::PickTargetImage);
+        }
         if let Some(row) = picked {
             if let Some(device) = devices.get(row) {
                 self.act(DiskWriteAction::SelectDevice {
@@ -275,6 +286,9 @@ impl PhysicalDiskExport {
         } else {
             "Writing erases all data on the selected device."
         };
+        if let Some(target) = self.ctl.write_target_name() {
+            ui.label(egui::RichText::new(format!("Writes to: {target}")).strong());
+        }
         ui.horizontal(|ui| {
             let write = ui
                 .add_enabled(self.ctl.can_write(), egui::Button::new("Write to disk..."))

@@ -87,7 +87,7 @@ impl DiskWriteController {
         self.target.partitions = done.unwrap_or_default();
     }
 
-    /// A refreshed device list: the target follows its row, and a changed disk is read again.
+    /// A refreshed device list: the target follows its own disk, and never another one.
     pub fn reconcile_devices(&mut self, devices: &[DiskDevice]) {
         if self.run.running() {
             return;
@@ -95,13 +95,12 @@ impl DiskWriteController {
         let Some(picked) = &self.target.device else {
             return;
         };
-        let now = devices.get(picked.row);
-        if now.map(DiskDevice::identity) == Some(picked.device.identity()) {
+        let identity = picked.device.identity();
+        if devices.get(picked.row).map(DiskDevice::identity) == Some(identity.clone()) {
             return;
         }
-        let row = picked.row;
-        match now {
-            Some(d) => self.select_device(row, d.clone()),
+        match devices.iter().position(|d| d.identity() == identity) {
+            Some(row) => self.select_device(row, devices[row].clone()),
             None => {
                 self.target.cancel_scan();
                 self.target.device = None;

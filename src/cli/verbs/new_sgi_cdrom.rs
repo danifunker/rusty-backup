@@ -87,6 +87,14 @@ pub struct NewSgiCdromArgs {
     /// With `--from-dir`: import macOS AppleDouble sidecars (`._*`) too.
     #[arg(long = "include-appledouble", requires = "from_dir")]
     pub include_appledouble: bool,
+    /// Leave macOS `._*` sidecars out entirely: neither copied as files nor taken as a file's
+    /// resource fork. For a folder that only has them because it came off a modern Mac.
+    #[arg(
+        long = "exclude-appledouble",
+        requires = "from_dir",
+        conflicts_with = "include_appledouble"
+    )]
+    pub exclude_appledouble: bool,
 
     /// EFS volume label (up to 6 bytes; longer is truncated). Defaults to
     /// `rusty`.
@@ -144,7 +152,7 @@ pub fn run(args: NewSgiCdromArgs) -> Result<()> {
         // Drop the handle before reopening the image through the normal
         // partition-resolution path.
         drop(file);
-        populate(&args, dir)?;
+        populate(&args, dir, layout.efs_first_sector * 512)?;
     } else {
         log_stderr(format!(
             "  populate it with: rb-cli import {} <dir>   (or put ...@1 host/file /file)",
@@ -155,74 +163,48 @@ pub fn run(args: NewSgiCdromArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `--size`, including `auto` (measure `--from-dir` and project what
-/// the volume needs). `auto` without `--from-dir` has nothing to measure and
-/// is rejected rather than silently defaulting.
+/// Resolve `--size`, including `auto` (`model::cd_build` measures `--from-dir`).
 fn resolve_disc_size(args: &NewSgiCdromArgs) -> Result<u64> {
     if !args.size.eq_ignore_ascii_case("auto") {
         return parse_size(&args.size).context("parsing --size");
     }
-    let Some(dir) = &args.from_dir else {
-        anyhow::bail!("--size auto needs --from-dir to measure; pass an explicit size instead");
-    };
-    let (files, dirs, bytes) = crate::fs::dir_import::measure_dir_for(dir, &import_options(args))
-        .with_context(|| format!("measuring {}", dir.display()))?;
-    // EFS allocates in 512-byte blocks.
-    let projected = crate::fs::dir_import::projected_volume_bytes(files, dirs, bytes, 512);
-    log_stderr(format!(
-        "size auto: {files} file(s), {dirs} dir(s), {} MiB of content{} -> {} MiB disc",
-        bytes / (1024 * 1024),
-        if args.expand_archives || args.expand_gunzip || args.expand_images {
-            " (measured as it will land)"
-        } else {
-            ""
-        },
-        projected / (1024 * 1024),
-    ));
-    Ok(projected)
+    let size = crate::model::cd_build::resolve_size(&request(args, None))?;
+    log_stderr(format!("size auto: {} MiB disc", size / (1024 * 1024)));
+    Ok(size)
 }
 
-/// Import `dir` into the freshly-formatted disc's EFS partition.
-fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path) -> Result<()> {
-    use crate::cli::resolve::resolve_partition_rw_forced;
-    use crate::fs::dir_import::import_dir;
-
-    if !dir.is_dir() {
-        anyhow::bail!("--from-dir: not a directory: {}", dir.display());
+/// The shared disc request these flags describe.
+fn request(args: &NewSgiCdromArgs, size: Option<u64>) -> crate::model::cd_build::CdRequest {
+    use crate::model::cd_build::{CdImport, CdLayout, CdRequest};
+    CdRequest {
+        size,
+        name: args.name.clone(),
+        from_dir: args.from_dir.clone(),
+        import: CdImport {
+            expand_archives: args.expand_archives,
+            expand_gunzip: args.expand_gunzip,
+            expand_images: args.expand_images,
+            flatten_folders: args.flatten_folders,
+            force: args.force,
+            no_permissions: args.no_permissions,
+            include_appledouble: args.include_appledouble,
+            ignore_appledouble: args.exclude_appledouble,
+        },
+        bytes_per_inode: args.bytes_per_inode,
+        ..CdRequest::new(CdLayout::SgiEfs)
     }
-    // The EFS filesystem is the disc's only mountable partition; `@1` is how
-    // every other verb addresses it.
-    let (file, ctx, commit) = resolve_partition_rw_forced(&args.image, Some(1u32.into()), None)?;
-    let mut fs = ctx
-        .open_editable(file)
-        .map_err(|e| anyhow::anyhow!("opening the new EFS filesystem for writing: {e}"))?;
-    let dest = disk_core::filesystem::Filesystem::root(fs.as_filesystem_mut())
-        .map_err(|e| anyhow::anyhow!("resolving volume root: {e}"))?;
+}
 
-    let opts = import_options(args);
-    let stats = import_dir(&mut *fs, &dest, dir, &opts, &super::import::progress_cb)
-        .map_err(|e| anyhow::anyhow!("importing {}: {e}", dir.display()))?;
-    fs.sync_metadata()
-        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
-    commit.commit()?;
-
+/// Import `dir` into the freshly-formatted disc's EFS partition at `fs_offset`.
+fn populate(args: &NewSgiCdromArgs, dir: &std::path::Path, fs_offset: u64) -> Result<()> {
+    let req = request(args, None);
+    let stats = crate::model::cd_build::fill(
+        &args.image,
+        &req,
+        fs_offset,
+        dir,
+        &super::import::progress_cb,
+    )?;
     super::import::summarize(dir, "/", &stats, args.expand_archives);
     Ok(())
-}
-
-/// The import settings, shared by `--size auto` and the import so the disc fits what lands.
-fn import_options(args: &NewSgiCdromArgs) -> crate::fs::dir_import::DirImportOptions {
-    crate::fs::dir_import::DirImportOptions {
-        shared: super::import::shared_options(
-            args.force,
-            false,
-            args.no_permissions,
-            args.include_appledouble,
-            args.flatten_folders,
-        ),
-        expand_archives: args.expand_archives,
-        flatten_archives: args.flatten_folders,
-        expand_gunzip: args.expand_gunzip,
-        expand_disk_images: args.expand_images,
-    }
 }

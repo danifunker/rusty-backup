@@ -9,22 +9,36 @@ use rusty_backup::controller::partition_edit::LayoutBar;
 use rusty_backup::controller::resize::{
     format_size, ResizeAction, ResizeController, ResizePlan, ResizeRow, SizeMode,
 };
-use rusty_backup::controller::Controller;
+use rusty_backup::controller::{Controller, Effect};
+
+use super::effects::{EffectHost, Reply};
 
 pub struct ResizePopup {
     ctl: ResizeController,
+    effects: EffectHost,
+    pending_fx: Vec<Effect>,
 }
 
 impl ResizePopup {
     pub fn new(plan: ResizePlan) -> Self {
         let mut ctl = ResizeController::new(std::sync::Arc::new(super::ui_logger::EguiWake));
         ctl.apply(ResizeAction::Open(Box::new(plan)));
-        ResizePopup { ctl }
+        ResizePopup {
+            ctl,
+            effects: EffectHost::default(),
+            pending_fx: Vec::new(),
+        }
+    }
+
+    /// A refreshed device list: a device that left closes the window unwritten.
+    pub fn reconcile_devices(&mut self, devices: &[rusty_backup::device::DiskDevice]) {
+        self.ctl.reconcile_devices(devices);
     }
 
     /// Drain the controller: log lines, and whether a write just ended (the host re-reads the table).
     pub fn poll(&mut self, log: &mut LogStore) -> bool {
-        self.ctl.tick();
+        let fx = self.ctl.tick();
+        self.pending_fx.extend(fx);
         super::progress::drain_log_lines(self.ctl.take_log(), log);
         self.ctl.take_disk_changed()
     }
@@ -147,6 +161,9 @@ impl ResizePopup {
 
                 ui.add_space(8.0);
 
+                if let Some(target) = self.ctl.write_target() {
+                    ui.label(egui::RichText::new(format!("Writes to: {target}")).strong());
+                }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!running, egui::Button::new("Preview")).clicked() {
                         actions.push(ResizeAction::Preview);
@@ -163,10 +180,36 @@ impl ResizePopup {
                 });
             });
         for a in actions {
-            self.ctl.apply(a);
+            let fx = self.ctl.apply(a);
+            self.pending_fx.extend(fx);
         }
+        self.run_effects(ui.ctx(), log);
         super::progress::drain_log_lines(self.ctl.take_log(), log);
         self.ctl.is_open()
+    }
+
+    fn run_effects(&mut self, ctx: &egui::Context, log: &mut LogStore) {
+        let fx = std::mem::take(&mut self.pending_fx);
+        let mut messages = Vec::new();
+        let mut replies = self.effects.run(ctx, fx, &mut messages);
+        replies.extend(self.effects.show(ctx, "resize"));
+        for msg in messages {
+            log.info(msg);
+        }
+        for reply in replies {
+            let action = match reply {
+                Reply::Confirmed { purpose, yes } => ResizeAction::Confirmed { purpose, yes },
+                Reply::Picked { .. }
+                | Reply::Answered { .. }
+                | Reply::Chose { .. }
+                | Reply::CloseScreen => continue,
+            };
+            let fx = self.ctl.apply(action);
+            self.pending_fx.extend(fx);
+        }
+        if !self.pending_fx.is_empty() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -234,6 +277,7 @@ fn show_scaled_bar(ui: &mut egui::Ui, bar: &LayoutBar, scale: u64) {
                 Some(color_index) => SegmentKind::Partition { color_index },
                 None => SegmentKind::Free,
             },
+            partition: None,
         })
         .collect();
     let available = ui.available_width().max(120.0);

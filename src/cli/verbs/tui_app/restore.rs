@@ -110,6 +110,8 @@ enum Pick {
     Restore(&'static str),
     /// The writer's image-file target.
     WriterImage,
+    /// The writer controller's own picker, answered with `DiskWriteAction::Picked`.
+    Writer(&'static str),
 }
 
 pub(super) const HINTS_RESTORE_FORM: &[KeyHint] = &[
@@ -215,7 +217,14 @@ impl RestoreState {
     fn absorb(&mut self, who: Who, fx: Vec<Effect>) {
         for e in fx {
             match e {
-                Effect::PickFile(spec) | Effect::PickFolder(spec) => self.open_picker(spec),
+                Effect::PickFile(spec) | Effect::PickFolder(spec) => match who {
+                    Who::Restore => self.open_picker(spec),
+                    Who::Writer => {
+                        let mut p = FilePicker::new(PickKind::Save, spec.title.as_str());
+                        p.input = spec.file_name.clone();
+                        self.picker = Some((Pick::Writer(spec.purpose), p));
+                    }
+                },
                 Effect::Confirm(spec) => self.ask = Some(Ask::Confirm(who, spec)),
                 Effect::AskText(spec) => self.ask = Some(Ask::text(who, spec)),
                 Effect::Message(msg) => self.log.push(msg),
@@ -752,11 +761,16 @@ impl App {
             match picker.handle_key(code) {
                 Some(PickResult::Cancel) => {
                     r.picker = None;
-                    if let Pick::Restore(purpose) = pick {
-                        r.act(RestoreAction::Picked {
+                    match pick {
+                        Pick::Restore(purpose) => r.act(RestoreAction::Picked {
                             purpose,
                             path: None,
-                        });
+                        }),
+                        Pick::Writer(purpose) => r.wact(DiskWriteAction::Picked {
+                            purpose,
+                            path: None,
+                        }),
+                        Pick::WriterImage => {}
                     }
                 }
                 Some(PickResult::Confirm(path)) => {
@@ -784,6 +798,10 @@ impl App {
                                 r.wact(a);
                             }
                         }
+                        Pick::Writer(purpose) => r.wact(DiskWriteAction::Picked {
+                            purpose,
+                            path: Some(path),
+                        }),
                     }
                 }
                 None => {}

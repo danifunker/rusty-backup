@@ -3,9 +3,11 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::{ChdChoice, ChdOptions, ChdProfile, OpticalBar, OpticalController, OutputFormat, Task};
-use crate::controller::job_outcome;
+use super::{
+    purpose, ChdChoice, ChdOptions, ChdProfile, OpticalBar, OpticalController, OutputFormat, Task,
+};
 use crate::controller::log::LogLevel;
+use crate::controller::{job_outcome, ConfirmSpec, Effect};
 use crate::model::job::Job;
 use crate::model::optical_ops;
 use crate::model::worker::lock_status;
@@ -28,6 +30,8 @@ struct Running {
 pub(super) struct RunState {
     running: Option<Running>,
     pub last: Option<Result<(), String>>,
+    /// The question out, and the CHD choice Start carried.
+    asked: Option<(String, Option<ChdChoice>)>,
 }
 
 impl RunState {
@@ -80,6 +84,12 @@ impl OpticalController {
         })
     }
 
+    /// Cancel was pressed and the run has not ended yet.
+    pub fn cancelling(&self) -> bool {
+        let running = self.run.running.as_ref();
+        running.is_some_and(|r| r.job.snapshot().cancel_requested)
+    }
+
     /// How the last rip or conversion ended, until the next one starts.
     pub fn last_result(&self) -> Option<&Result<(), String>> {
         self.run.last.as_ref()
@@ -94,13 +104,90 @@ impl OpticalController {
         self.run.running = Some(Running { job, progress });
     }
 
-    pub(super) fn start(&mut self, chd: Option<ChdChoice>) {
+    /// What a run would write, as the question over replacing it names it.
+    pub fn write_target(&self) -> Option<String> {
+        let output = self.output.as_deref()?;
+        Some(match self.format {
+            OutputFormat::BinCue => format!(
+                "{} and {}",
+                output.display(),
+                output.with_extension("bin").display()
+            ),
+            OutputFormat::Iso | OutputFormat::Chd => output.display().to_string(),
+        })
+    }
+
+    fn source_name(&self) -> Option<String> {
+        match self.task() {
+            Task::Rip => self.selected_device().map(|d| d.picker_label()),
+            Task::Convert => self.image.as_ref().map(|p| p.display().to_string()),
+        }
+    }
+
+    /// What Start would ask now; `None` while nothing it writes exists yet.
+    fn question(&self) -> Option<String> {
+        let output = self.output.as_deref()?;
+        let from_chd = self.task() == Task::Convert && self.is_chd_image();
+        let files = optical_ops::written_files(output, self.format, from_chd);
+        let found: Vec<String> = files
+            .iter()
+            .filter(|f| f.exists())
+            .map(|f| format!("  {}", f.display()))
+            .collect();
+        if found.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} will be written from {}.\n\nThese files exist and will be replaced:\n{}",
+            self.write_target()?,
+            self.source_name()?,
+            found.join("\n"),
+        ))
+    }
+
+    pub(super) fn start(&mut self, chd: Option<ChdChoice>) -> Vec<Effect> {
         if let Some(why) = self.start_refusal() {
             if !self.is_running() {
                 self.error(format!("Cannot start: {why}"));
             }
+            return Vec::new();
+        }
+        let Some(message) = self.question() else {
+            self.start_confirmed(chd);
+            return Vec::new();
+        };
+        self.run.last = None;
+        self.run.asked = Some((message.clone(), chd));
+        vec![Effect::Confirm(ConfirmSpec {
+            purpose: purpose::OVERWRITE,
+            title: "Replace Output Files?".to_string(),
+            message,
+            confirm_label: "Replace".to_string(),
+            destructive: true,
+        })]
+    }
+
+    /// The answer to Start's question; a yes with no question out, or to another question, writes nothing.
+    pub(super) fn answered(&mut self, yes: bool) {
+        let Some((asked, chd)) = self.run.asked.take() else {
+            return;
+        };
+        if !yes {
+            self.info("Nothing was written.");
             return;
         }
+        let refusal = self.start_refusal();
+        if refusal.is_some() || self.question().as_deref() != Some(asked.as_str()) {
+            let msg = "The source or output changed while the question was open, so nothing was \
+                       written. Check them and press Start again.";
+            self.warn(msg);
+            self.run.last = Some(Err(msg.to_string()));
+            return;
+        }
+        self.start_confirmed(chd);
+    }
+
+    fn start_confirmed(&mut self, chd: Option<ChdChoice>) {
         match self.task() {
             Task::Rip => self.start_rip(chd),
             Task::Convert => self.start_convert(chd),

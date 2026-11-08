@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::backup::{
-    format_size, BackupAction, BackupController, BackupServices, ChdChoice, ChdProfile,
-    ChecksumType, CompactCell, CompressionType, HostRequest, MinCell, SPLIT_MIB_MAX, SPLIT_MIB_MIN,
+    format_size, hints, BackupAction, BackupController, BackupServices, ChdChoice, ChdProfile,
+    CompactCell, CompressionType, HostRequest, MinCell, CHECKSUMS, FORMATS, SPLIT_MIB_MAX,
+    SPLIT_MIB_MIN,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller as _, Effect};
@@ -155,21 +156,6 @@ impl BackupTab {
         }
     }
 
-    fn source_label(&self, ctx: &TabContext) -> String {
-        if let Some(d) = self.ctl.remote_label() {
-            format!("Remote: {d}")
-        } else if let Some(path) = self.ctl.image_path() {
-            format!("Image: {}", path.display())
-        } else if let Some(idx) = self.ctl.device_slot() {
-            ctx.devices
-                .get(idx)
-                .map(|d| d.display_name())
-                .unwrap_or_else(|| "Unknown".into())
-        } else {
-            "Select a device or image...".into()
-        }
-    }
-
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         self.ctl.reconcile_devices(ctx.devices);
         self.poll(ctx, progress);
@@ -205,7 +191,7 @@ impl BackupTab {
         ui.horizontal(|ui| {
             ui.label("Source:");
             ui.add_enabled_ui(controls_enabled, |ui| {
-                let current_label = self.source_label(ctx);
+                let current_label = self.ctl.source_label(ctx.devices);
                 let slot = self.ctl.device_slot();
                 egui::ComboBox::from_id_salt("backup_source")
                     .selected_text(&current_label)
@@ -242,10 +228,7 @@ impl BackupTab {
                             ui.separator();
                             if ui
                                 .selectable_label(self.ctl.remote_active(), "Remote Drive...")
-                                .on_hover_text(
-                                    "Back up a physical drive on a remote machine running \
-                                     `rb-cli serve` (pulled over the network)",
-                                )
+                                .on_hover_text(hints::REMOTE)
                                 .clicked()
                             {
                                 actions.push(BackupAction::RemoteOpen);
@@ -259,10 +242,7 @@ impl BackupTab {
             });
             if self.ctl.remote_active()
                 && controls_enabled
-                && ui
-                    .button("X")
-                    .on_hover_text("Disconnect / clear the remote source")
-                    .clicked()
+                && ui.button("X").on_hover_text(hints::CLEAR_REMOTE).clicked()
             {
                 actions.push(BackupAction::RemoteClear);
             }
@@ -270,10 +250,7 @@ impl BackupTab {
                 && controls_enabled
                 && ui
                     .button("Close Drive")
-                    .on_hover_text(
-                        "Release the selected disk / image and clear the partition \
-                         selection so the drive can be safely removed",
-                    )
+                    .on_hover_text(hints::CLOSE_SOURCE)
                     .clicked()
             {
                 actions.push(BackupAction::CloseSource);
@@ -282,17 +259,7 @@ impl BackupTab {
 
         // Devices are not auto-scanned (that would prompt for elevation on every pick).
         if self.ctl.can_scan_device() {
-            let (label, hint) = if self.ctl.device_scanned() {
-                (
-                    "Reload partition info",
-                    "Read the partition table again, e.g. after swapping the card in this reader",
-                )
-            } else {
-                (
-                    "Load partition info",
-                    "Read the partition table from the selected device (may prompt for administrator credentials)",
-                )
-            };
+            let (label, hint) = self.ctl.scan_button();
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button(label).on_hover_text(hint).clicked() {
@@ -319,14 +286,8 @@ impl BackupTab {
         let mut actions = Vec::new();
         if self.ctl.has_partitions() {
             ui.add_space(4.0);
-            if let Some(desc) = self.ctl.table_desc() {
-                let n = self.ctl.partition_count();
-                ui.label(format!(
-                    "Partition table: {} ({} partition{})",
-                    desc,
-                    n,
-                    if n == 1 { "" } else { "s" },
-                ));
+            if let Some(line) = self.ctl.table_line() {
+                ui.label(line);
             }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Partitions:").strong());
@@ -351,16 +312,9 @@ impl BackupTab {
                         ui.label(egui::RichText::new("Size").strong());
                         ui.label(egui::RichText::new("Min Size").strong());
                         ui.label(egui::RichText::new("Frag.").strong())
-                            .on_hover_text("Percent of files with data in more than one extent");
+                            .on_hover_text(hints::FRAGMENTATION);
                         ui.label(egui::RichText::new("Compact").strong())
-                            .on_hover_text(
-                                "Compact Space re-emits every allocated fork back-to-back, \
-                                 closing the holes between files and producing a smaller backup. \
-                                 Drastically increases backup time - recommended only when the \
-                                 Min Size column shows meaningful savings vs. the in-place trim. \
-                                 Available for HFS+/HFSX today; other layout-preserving \
-                                 filesystems show the toggle as not implemented.",
-                            );
+                            .on_hover_text(hints::COMPACT);
                         ui.end_row();
 
                         for row in &rows {
@@ -381,9 +335,7 @@ impl BackupTab {
                                 MinCell::CanCalc => {
                                     if ui
                                         .small_button("Calc min")
-                                        .on_hover_text(
-                                            "Compute minimum size (requires a filesystem walk)",
-                                        )
+                                        .on_hover_text(hints::CALC_MIN)
                                         .clicked()
                                     {
                                         actions.push(BackupAction::CalcMin(row.index));
@@ -404,9 +356,7 @@ impl BackupTab {
                                 CompactCell::NotImplemented => {
                                     let mut off = false;
                                     ui.add_enabled(false, egui::Checkbox::new(&mut off, ""))
-                                        .on_hover_text(
-                                            "Compact Space not yet implemented for this filesystem",
-                                        );
+                                        .on_hover_text(hints::COMPACT_NOT_BUILT);
                                 }
                                 CompactCell::Toggle(on) => {
                                     let mut on = on;
@@ -468,25 +418,14 @@ impl BackupTab {
         ui.add_enabled_ui(controls_enabled, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Output Format:");
-                // DVD CHD is the Optical tab's: this tab backs up hard disks.
-                let formats = [
-                    (CompressionType::Chd, "CHD (Hard Disk)"),
-                    (CompressionType::Vhd, "VHD"),
-                    (CompressionType::Zstd, "zstd"),
-                    (CompressionType::None, "None"),
-                ];
-                for (kind, label) in formats {
+                for (kind, label) in FORMATS {
                     if ui.radio(opts.compression == kind, label).clicked() {
                         actions.push(BackupAction::SetFormat(kind));
                     }
                 }
             });
             if opts.compression == CompressionType::Chd {
-                ui.label(
-                    egui::RichText::new("Output: single CHD file (chdman/MAME compatible).")
-                        .small()
-                        .weak(),
-                );
+                ui.label(egui::RichText::new(hints::CHD_OUTPUT).small().weak());
                 super::chd_options_ui::show(
                     ui,
                     "backup_chd",
@@ -496,23 +435,17 @@ impl BackupTab {
             }
 
             let mut sbs = opts.sector_by_sector;
-            if ui
-                .checkbox(&mut sbs, "Sector-by-sector copy (includes all blank space)")
-                .changed()
-            {
+            if ui.checkbox(&mut sbs, hints::SECTOR_BY_SECTOR).changed() {
                 actions.push(BackupAction::SetSectorBySector(sbs));
             }
             ui.add_enabled_ui(opts.size_options_editable(), |ui| {
                 ui.horizontal(|ui| {
                     let mut resize = opts.resize;
-                    if ui
-                        .checkbox(&mut resize, "Resize partitions to minimum size")
-                        .changed()
-                    {
+                    if ui.checkbox(&mut resize, hints::RESIZE).changed() {
                         actions.push(BackupAction::SetResize(resize));
                     }
                     if !opts.size_options_editable() {
-                        ui.label("(not available with sector-by-sector copy)");
+                        ui.label(hints::NOT_WITH_SECTOR_COPY);
                     }
                 });
             });
@@ -520,19 +453,14 @@ impl BackupTab {
                 ui.horizontal(|ui| {
                     let mut keep = opts.keep_swap;
                     if ui
-                        .checkbox(&mut keep, "Keep swap/page-file content (don't exclude)")
-                        .on_hover_text(
-                            "By default a FAT volume's swap/page files (WIN386.SWP, \
-                             386SPART.PAR, PAGEFILE.SYS, HIBERFIL.SYS, SWAPPER.DAT) are \
-                             imaged full-size but zeroed -- they reinitialize on boot, \
-                             and the codec crushes the zeros. Check to image them as-is.",
-                        )
+                        .checkbox(&mut keep, hints::KEEP_SWAP)
+                        .on_hover_text(hints::KEEP_SWAP_HOVER)
                         .changed()
                     {
                         actions.push(BackupAction::SetKeepSwap(keep));
                     }
                     if !opts.size_options_editable() {
-                        ui.label("(not available with sector-by-sector copy)");
+                        ui.label(hints::NOT_WITH_SECTOR_COPY);
                     }
                 });
             });
@@ -559,16 +487,13 @@ impl BackupTab {
                         }
                     });
                     if !editable {
-                        ui.label("(not available for VHD)");
+                        ui.label(hints::NOT_FOR_VHD);
                     }
                 });
             }
             ui.horizontal(|ui| {
                 ui.label("Checksum:");
-                for (kind, label) in [
-                    (ChecksumType::Sha256, "SHA-256"),
-                    (ChecksumType::Crc32, "CRC32"),
-                ] {
+                for (kind, label) in CHECKSUMS {
                     if ui.radio(opts.checksum == kind, label).clicked() {
                         actions.push(BackupAction::SetChecksum(kind));
                     }
@@ -595,18 +520,14 @@ impl BackupTab {
                 let chd_ok = self.ctl.options().compression != CompressionType::Chd
                     || self.chd_hd_control.is_valid(ChdProfile::Hd);
                 let waiting = self.ctl.start_pending();
-                let label = if waiting {
-                    "Computing minimum sizes..."
-                } else {
-                    "Start Backup"
-                };
+                let label = self.ctl.start_label();
                 let enabled = self.ctl.can_start() && chd_ok && ctx.busy_elsewhere.is_none();
                 if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                     actions.push(BackupAction::Start(self.chd_choice()));
                 }
                 if waiting {
                     ui.add(egui::Spinner::new())
-                        .on_hover_text("Waiting for minimum-size calculations to finish");
+                        .on_hover_text(hints::WAITING_FOR_MINIMUMS);
                     if ui.button("Cancel").clicked() {
                         actions.push(BackupAction::CancelPendingStart);
                     }
@@ -736,7 +657,7 @@ impl BackupTab {
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut addr)
-                                .hint_text("192.168.1.50:7341")
+                                .hint_text(hints::REMOTE_ADDRESS)
                                 .desired_width(220.0),
                         )
                         .changed()
@@ -764,9 +685,7 @@ impl BackupTab {
                     ui.separator();
                     let drives = self.ctl.remote_drives();
                     if drives.is_empty() {
-                        ui.label(
-                            "No physical drives reported. The daemon may need to run as root.",
-                        );
+                        ui.label(hints::NO_REMOTE_DRIVES);
                     } else {
                         ui.label("Pick a drive to back up:");
                         egui::ScrollArea::vertical()

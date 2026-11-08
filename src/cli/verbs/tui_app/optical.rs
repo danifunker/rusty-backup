@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use super::ask::Ask;
 use super::commander::CommanderView;
 use super::{
     expand_tilde, hint, App, FilePicker, KeyHint, PickKind, PickResult, Progress, ProgressShared,
@@ -80,6 +81,7 @@ pub(super) const HINTS_OPTICAL: &[KeyHint] = &[
     hint("R", "Add remote daemon: a drive on an rb-cli serve host"),
     hint("b", "Browse Contents: the disc in the Explorer"),
     hint("c", "Close Disc"),
+    hint("C", "Convert the image in the Convert tab"),
     hint("i", "CHD Info (a .chd image)"),
     hint("s", "Start the rip or conversion"),
     hint(
@@ -107,6 +109,8 @@ pub(super) struct OpticalState {
     #[cfg(feature = "chd")]
     pub(super) chd: ChdOptionsControl,
     picker: Option<(Pick, FilePicker)>,
+    /// Start's question about replacing files.
+    ask: Option<Ask<()>>,
     /// The remote window's typed address and the highlighted recent address.
     pub(super) remote_addr: String,
     remote_sel: Option<usize>,
@@ -117,6 +121,8 @@ pub(super) struct OpticalState {
     pub(super) note: Option<String>,
     /// The disc browser to open, or that it should close (`HostRequest`s for the app).
     browse: Option<DiscSource>,
+    /// The disc image `C` hands to the Convert tab.
+    convert: Option<std::path::PathBuf>,
     close_browser: bool,
     /// A run is on screen: "Rip" or "Conversion"; its end becomes the result line.
     running: Option<&'static str>,
@@ -140,12 +146,14 @@ impl OpticalState {
                 c
             },
             picker: None,
+            ask: None,
             remote_addr: String::new(),
             remote_sel: None,
             chd_scroll: 0,
             log: Vec::new(),
             note: None,
             browse: None,
+            convert: None,
             close_browser: false,
             running: None,
             result: None,
@@ -172,9 +180,9 @@ impl OpticalState {
             match e {
                 Effect::PickFile(spec) => self.open_picker(spec),
                 Effect::Message(msg) => self.log.push(msg),
+                Effect::Confirm(spec) => self.ask = Some(Ask::Confirm((), spec)),
                 // The Optical controller asks for nothing else.
                 Effect::PickFolder(_)
-                | Effect::Confirm(_)
                 | Effect::AskText(_)
                 | Effect::AskPassword(_)
                 | Effect::Choose(_)
@@ -339,6 +347,10 @@ impl OpticalState {
                 if !offered.is_empty() {
                     let next = step(offered.as_slice(), self.ctl.output_format(), forward);
                     self.act(OpticalAction::SetOutputFormat(next));
+                    // The controller renames an output that carried the old format's extension.
+                    if let Some(path) = self.ctl.output() {
+                        self.output = path.display().to_string();
+                    }
                 }
             }
             ORow::ChdMode | ORow::ChdHunk | ORow::ChdCodec(_) => {
@@ -426,13 +438,32 @@ impl OpticalState {
             return;
         }
         self.result = None;
-        let what = match self.ctl.task() {
-            Task::Rip => "Rip",
-            Task::Convert => "Conversion",
-        };
         self.act(OpticalAction::Start(chd));
+        self.note_run();
+    }
+
+    /// A run started, at Start or on the answer to its question: its end becomes the result line.
+    fn note_run(&mut self) {
         if self.ctl.is_running() {
-            self.running = Some(what);
+            self.running = Some(match self.ctl.task() {
+                Task::Rip => "Rip",
+                Task::Convert => "Conversion",
+            });
+        }
+    }
+
+    /// One key for Start's question; the answer goes back to the controller.
+    fn ask_key(&mut self, code: KeyCode) {
+        let Some(ask) = self.ask.as_mut() else {
+            return;
+        };
+        let Some((yes, _)) = ask.key(code) else {
+            return;
+        };
+        if let Some(Ask::Confirm((), spec)) = self.ask.take() {
+            let purpose = spec.purpose;
+            self.act(OpticalAction::Confirmed { purpose, yes });
+            self.note_run();
         }
     }
 
@@ -544,6 +575,12 @@ impl OpticalState {
                 }
             }
             KeyCode::Char('c') => self.act(OpticalAction::CloseDisc),
+            KeyCode::Char('C') => match self.ctl.convert_source() {
+                Some(path) => self.convert = Some(path),
+                None => {
+                    self.note = Some("Convert takes a disc image; a drive is ripped here.".into())
+                }
+            },
             KeyCode::Char('i') => {
                 if self.ctl.can_chd_info() {
                     self.act(OpticalAction::ChdInfo);
@@ -586,6 +623,9 @@ impl App {
         let Some(o) = self.optical.as_ref() else {
             return Vec::new();
         };
+        if o.ask.is_some() {
+            return vec![("y", "Yes"), ("n", "No")];
+        }
         if o.ctl.chd_info().is_some() {
             return vec![("Up/Dn", "Scroll"), ("Esc", "Close"), ("?", "Keys")];
         }
@@ -637,6 +677,12 @@ impl App {
             self.after_optical();
             return true;
         }
+        if o.ask.is_some() {
+            o.ask_key(code);
+            self.show_optical_bar();
+            self.after_optical();
+            return true;
+        }
         // `?` and F1 reach the key list from every window, unless `?` is typed into a field.
         let typing = o.ctl.add_remote_open() || o.focus == ORow::Output;
         if code == KeyCode::F(1) || (code == KeyCode::Char('?') && !typing) {
@@ -662,6 +708,16 @@ impl App {
         }
         let o = self.optical_state();
         let consumed = o.form_key(code);
+        self.show_optical_bar();
+        self.after_optical();
+        consumed
+    }
+
+    /// Put up the bar once a run has started.
+    fn show_optical_bar(&mut self) {
+        let Some(o) = self.optical.as_ref() else {
+            return;
+        };
         let label = match o.ctl.task() {
             Task::Rip => "Ripping",
             Task::Convert => "Converting",
@@ -673,8 +729,6 @@ impl App {
                 label: label.to_string(),
             });
         }
-        self.after_optical();
-        consumed
     }
 
     /// Drive the controller and mirror its run into the bar.
@@ -726,6 +780,17 @@ impl App {
         if o.ctl.is_browsing() && !disc_open {
             o.act(OpticalAction::BrowserClosed);
         }
+        if let Some(path) = o.convert.take() {
+            if let Some(idx) = super::TABS
+                .iter()
+                .position(|t| t.0 == super::TabId::Convert)
+            {
+                self.active = idx;
+                self.scroll = 0;
+                self.on_tab_changed();
+                self.convert_open(path);
+            }
+        }
     }
 
     // --- drawing ------------------------------------------------------------------------
@@ -753,6 +818,9 @@ impl App {
         }
         if o.ctl.add_remote_open() {
             self.draw_optical_remote(frame, area, o);
+        }
+        if let Some(ask) = &o.ask {
+            self.draw_ask(frame, area, ask, false);
         }
     }
 

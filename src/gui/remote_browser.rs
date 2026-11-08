@@ -7,7 +7,9 @@
 
 use eframe::egui;
 
-use rusty_backup::controller::remote_pick::{RemoteImage, RemotePickAction, RemotePickController};
+use rusty_backup::controller::remote_pick::{
+    hints, RemoteImage, RemotePickAction, RemotePickController,
+};
 use rusty_backup::controller::{Controller, Effect};
 
 use super::effects::{EffectHost, Reply};
@@ -73,9 +75,9 @@ impl RemoteBrowsePanel {
         if ui
             .add_enabled(
                 !self.ctl.transition_running(),
-                egui::Button::new(format!("Disconnect from {}", self.ctl.addr())),
+                egui::Button::new(self.ctl.disconnect_label()),
             )
-            .on_hover_text("Close the connection to the remote daemon")
+            .on_hover_text(hints::DISCONNECT)
             .clicked()
         {
             self.act(RemotePickAction::Disconnect);
@@ -168,7 +170,7 @@ impl RemoteBrowsePanel {
                                 egui::RichText::new(row.name.as_str()).color(color),
                             );
                             if row.openable {
-                                resp = resp.on_hover_text("Double-click to open this image");
+                                resp = resp.on_hover_text(hints::OPENABLE);
                             }
                             if resp.double_clicked() {
                                 if row.is_dir {

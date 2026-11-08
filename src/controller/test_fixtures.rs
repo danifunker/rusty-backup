@@ -123,3 +123,9 @@ pub fn blank_xdf(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(&path, vec![0xE5u8; 1_261_568]).expect("write disk.xdf");
     path
 }
+
+/// A blank 1.44 MB DOS floppy at `path`.
+pub fn dos_floppy(path: &std::path::Path) {
+    let img = fs_pc::fat::create_dos_floppy(1_474_560, Some("F")).expect("format");
+    std::fs::write(path, img).expect("write floppy");
+}

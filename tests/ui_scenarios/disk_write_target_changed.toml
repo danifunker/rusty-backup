@@ -1,0 +1,51 @@
+# The disk writer onto an image file the user picks: the picker is the controller's, the window
+# names the target, and a yes to a question whose target changed since writes nothing.
+name = "Disk write: a yes counts only for the target asked about"
+vm = "disk_write"
+
+[[step]]
+action = "Open"
+arg = "$image"
+settle = true
+
+[[step]]
+action = "PickTargetImage"
+effects = ["PickFile"]
+
+[[step]]
+action = "Picked"
+arg = "first.img"
+expect = { can_write = true, target = "$dir/first.img" }
+
+[[step]]
+action = "Write"
+effects = ["Confirm"]
+
+[[step]]
+action = "Picked"
+arg = "out.img"
+expect = { target = "$dir/out.img" }
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "", written = false, writing = false }
+
+[[step]]
+action = "Write"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+arg = false
+settle = true
+expect = { result = "", written = false }
+
+[[step]]
+action = "Write"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+settle = true
+expect = { result = "ok", written = true }

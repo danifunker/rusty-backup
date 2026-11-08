@@ -1,7 +1,7 @@
-//! Inspect's small dialogs: Resize Alto Disk, Expand HFS Volume and Convert Floppy Container.
+//! Inspect's small dialogs: Resize Alto Disk and Expand HFS Volume.
 //!
-//! Each is a window over its controller (`controller::alto_resize`, `controller::expand_hfs`,
-//! `controller::floppy_convert`), the same ones the egui dialogs drive. The Inspect screen owns
+//! Each is a window over its controller (`controller::alto_resize`, `controller::expand_hfs`),
+//! the same ones the egui dialogs drive. The Inspect screen owns
 //! the controllers and answers their pickers; this module keeps the cursor (one dialog is up at a
 //! time) and the Expand HFS size being typed, and turns a key into one action. See
 //! docs/phase2_commander_plan.md § "Slice 27".
@@ -15,9 +15,6 @@ use ratatui::Frame;
 use super::{hint, App, KeyHint};
 use crate::controller::alto_resize::{AltoResizeAction, AltoResizeController, AltoTarget};
 use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
-use crate::controller::floppy_convert::{
-    FloppyConvertAction, FloppyConvertController, FloppyTarget,
-};
 
 /// One row of whichever dialog is up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,10 +26,6 @@ pub(super) enum DRow {
     HfsSize,
     HfsOutput,
     HfsExpand,
-    FloppySource,
-    FloppyTarget,
-    FloppyOutput,
-    FloppyConvert,
 }
 
 const ALTO_ROWS: &[DRow] = &[DRow::AltoTarget, DRow::AltoSave];
@@ -42,12 +35,6 @@ const HFS_ROWS: &[DRow] = &[
     DRow::HfsSize,
     DRow::HfsOutput,
     DRow::HfsExpand,
-];
-const FLOPPY_ROWS: &[DRow] = &[
-    DRow::FloppySource,
-    DRow::FloppyTarget,
-    DRow::FloppyOutput,
-    DRow::FloppyConvert,
 ];
 
 pub(super) const HINTS_ALTO_RESIZE: &[KeyHint] = &[
@@ -70,20 +57,11 @@ pub(super) const HINTS_EXPAND_HFS: &[KeyHint] = &[
     hint("Esc", "Close (not while expanding)"),
 ];
 
-pub(super) const HINTS_FLOPPY_CONVERT: &[KeyHint] = &[
-    hint("Up/Down", "Move between rows"),
-    hint("Left/Right", "Choose the output format  (also Space)"),
-    hint("Enter", "Choose the source or output file, or Convert"),
-    hint("s", "Convert"),
-    hint("Esc", "Close (not while converting)"),
-];
-
 /// What a key asks the host to do.
 pub(super) enum DialogKey {
     Done,
     Alto(AltoResizeAction),
     Hfs(ExpandHfsAction),
-    Floppy(FloppyConvertAction),
 }
 
 /// The open dialog's cursor and the Expand HFS size while it is typed.
@@ -238,36 +216,6 @@ impl DialogWindow {
                 }
             },
             KeyCode::Char('s') => DialogKey::Hfs(ExpandHfsAction::Start),
-            _ => DialogKey::Done,
-        }
-    }
-
-    pub(super) fn floppy_key(&mut self, c: &FloppyConvertController, code: KeyCode) -> DialogKey {
-        if self.moved(FLOPPY_ROWS, code).is_some() {
-            return DialogKey::Done;
-        }
-        let target = |forward| {
-            cycle(FloppyTarget::ALL.as_slice(), c.target(), forward).map_or(DialogKey::Done, |t| {
-                DialogKey::Floppy(FloppyConvertAction::SetTarget(t))
-            })
-        };
-        match (code, self.sel) {
-            (KeyCode::Esc, _) => DialogKey::Floppy(FloppyConvertAction::Close),
-            (KeyCode::Left, DRow::FloppyTarget) => target(false),
-            (KeyCode::Right | KeyCode::Char(' '), DRow::FloppyTarget) => target(true),
-            (KeyCode::Enter, DRow::FloppySource) => {
-                DialogKey::Floppy(FloppyConvertAction::PickSource)
-            }
-            (KeyCode::Enter, DRow::FloppyOutput) => {
-                DialogKey::Floppy(FloppyConvertAction::PickOutput)
-            }
-            (KeyCode::Enter, DRow::FloppyConvert) | (KeyCode::Char('s'), _) => {
-                DialogKey::Floppy(FloppyConvertAction::Start)
-            }
-            (KeyCode::Enter, _) => {
-                self.step(FLOPPY_ROWS, 1);
-                DialogKey::Done
-            }
             _ => DialogKey::Done,
         }
     }
@@ -448,86 +396,5 @@ impl App {
             lines.push(Line::styled(format!("  {l}"), pal.dim()));
         }
         self.draw_inspect_popup(frame, area, "Expand HFS Volume", lines, focus);
-    }
-
-    pub(super) fn draw_floppy_convert(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        c: &FloppyConvertController,
-        w: &DialogWindow,
-    ) {
-        let pal = self.palette;
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut focus = 0;
-        let source = c
-            .source()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(not chosen)".to_string());
-        let probing = if c.probing() { "  reading..." } else { "" };
-        focus = self
-            .dialog_row(
-                &mut lines,
-                w,
-                DRow::FloppySource,
-                format!("Source:  {source}  [Choose File...]{probing}"),
-            )
-            .unwrap_or(focus);
-        if let Some(kind) = c.source_kind() {
-            lines.push(Line::raw(format!("    Detected: {kind}")));
-        }
-        if let Some(err) = c.source_error() {
-            lines.push(Line::styled(format!("    {err}"), pal.warn()));
-        }
-        lines.push(Line::styled(
-            "    A folder of floppies converts on the Bulk tab.",
-            pal.dim(),
-        ));
-        lines.push(Line::raw(""));
-        let output = c
-            .output()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(not chosen)".to_string());
-        let convert = if c.can_start() {
-            "[ Convert ]"
-        } else if c.editable() {
-            "[ Convert ]  (choose the source and output first)"
-        } else {
-            "[ Convert ]  (done; Esc closes)"
-        };
-        let rows = [
-            (
-                DRow::FloppyTarget,
-                format!("Output format:  < {} >", c.target().label()),
-            ),
-            (
-                DRow::FloppyOutput,
-                format!("Output file:  {output}  [Save As...]"),
-            ),
-            (DRow::FloppyConvert, convert.to_string()),
-        ];
-        for (row, text) in rows {
-            focus = self.dialog_row(&mut lines, w, row, text).unwrap_or(focus);
-            if row == DRow::FloppyOutput && c.same_format() {
-                lines.push(Line::styled(
-                    "    Source and target match - the output will be a byte-identical copy.",
-                    pal.dim(),
-                ));
-            }
-        }
-        lines.push(Line::raw(""));
-        if let Some(snap) = c.progress() {
-            lines.push(Line::styled(format!("  {}", snap.phase), pal.dim()));
-        } else {
-            match c.outcome() {
-                Some(Err(e)) => lines.push(Line::styled(format!("  Failed: {e}"), pal.warn())),
-                Some(Ok(done)) => {
-                    lines.push(Line::styled(format!("  {}", done.summary), pal.accent()));
-                    lines.push(Line::raw(format!("  {}", done.line)));
-                }
-                None => {}
-            }
-        }
-        self.draw_inspect_popup(frame, area, "Convert Floppy Container", lines, focus);
     }
 }

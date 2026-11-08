@@ -117,68 +117,52 @@ fn sixteen_cell_round_trip_all_formats() {
 }
 
 #[test]
-fn bulk_convert_runner_routes_floppy_targets() {
-    // Confirms the bulk_convert_runner intercepts ExportFormat::Xdf/Hdm/Dim/D88
-    // and dispatches them through convert_floppy_container rather than the
-    // streaming export_whole_disk path (which would write a 1.2 MB raw blob
-    // instead of a real D88 sparse container).
-    use rusty_backup::rbformats::export::ExportFormat;
+fn convert_routes_floppy_targets() {
+    // A folder of XDF / DIM / HDM floppies converted to D88 through the Convert controller must
+    // come out as real D88 track tables (not raw blobs) that decode back to the same sectors.
+    use rusty_backup::controller::convert::{
+        purpose, ChdChoices, ConvertAction, ConvertController, Format, ImageKind,
+    };
+    use rusty_backup::controller::Controller;
 
     let tempdir = tempfile::tempdir().unwrap();
     let temp_path = tempdir.path().to_path_buf();
     let pattern = build_pattern();
-
-    // Make a 3-file fixture in different formats.
     let src_dir = temp_path.join("src");
     let out_dir = temp_path.join("out");
     std::fs::create_dir_all(&src_dir).unwrap();
-
     write_format_with_stem(&src_dir, "disk_a", "xdf", &pattern);
     write_format_with_stem(&src_dir, "disk_b", "dim", &pattern);
     write_format_with_stem(&src_dir, "disk_c", "hdm", &pattern);
 
-    let files: Vec<PathBuf> = std::fs::read_dir(&src_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect();
-    assert_eq!(files.len(), 3);
+    let mut ctl = ConvertController::new(std::sync::Arc::new(rusty_backup::model::job::NoNotify));
+    ctl.apply(ConvertAction::SetSource(src_dir.clone()));
+    ctl.wait_idle();
+    ctl.tick();
+    assert_eq!(ctl.items().len(), 3);
+    ctl.apply(ConvertAction::SetFormat(ImageKind::Floppy, Format::D88));
+    ctl.apply(ConvertAction::Picked {
+        purpose: purpose::OUTPUT_FOLDER,
+        path: Some(out_dir.clone()),
+    });
+    ctl.apply(ConvertAction::Start(ChdChoices::default()));
+    ctl.wait_idle();
+    ctl.tick();
+    let log: Vec<String> = ctl.take_log().into_iter().map(|(_, m)| m).collect();
+    let r = ctl
+        .last_result()
+        .cloned()
+        .expect("a result")
+        .expect("it ran");
+    assert_eq!((r.succeeded, r.failed), (3, 0), "{log:?}");
 
-    let status = rusty_backup::model::bulk_convert_runner::start_bulk_convert(
-        files,
-        out_dir.clone(),
-        ExportFormat::D88,
-        "d88".to_string(),
-        None,
-        false,
-    );
-
-    // Poll until finished (small files, finishes in milliseconds).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if status.lock().map(|s| s.finished).unwrap_or(false) {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("bulk convert runner did not finish within 30s");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    let s = status.lock().unwrap();
-    let log_summary: Vec<String> = s.log_messages.iter().map(|(_, msg)| msg.clone()).collect();
-    assert_eq!(s.failed, 0, "bulk convert had failures: {log_summary:?}");
-    assert_eq!(s.succeeded, 3);
-
-    // Each output must be a valid D88 — decode it back to flat and compare.
     let mut count = 0;
     for entry in std::fs::read_dir(&out_dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
+        let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) == Some("d88") {
             let bytes = std::fs::read(&path).unwrap();
             let flat = dsk_floppy::d88::decode_d88_bytes(&bytes).unwrap();
-            assert_eq!(flat, pattern, "bulk-converted D88 didn't decode to pattern");
+            assert_eq!(flat, pattern, "converted D88 didn't decode to pattern");
             count += 1;
         }
     }

@@ -3,15 +3,14 @@ mod archives_tab;
 mod backup_tab;
 mod browse_view;
 mod build_disk_tab;
-mod bulk_convert_dialog;
 mod chd_options_ui;
 mod commander;
 mod context;
+mod convert_tab;
 mod effects;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod file_detail;
-mod floppy_convert_dialog;
 pub mod fonts;
 mod inspect_tab;
 mod journal_view;
@@ -37,7 +36,7 @@ pub mod ui_logger;
 use archives_tab::ArchivesTab;
 use backup_tab::BackupTab;
 use build_disk_tab::BuildDiskTab;
-use bulk_convert_dialog::BulkConvertDialog;
+use convert_tab::ConvertTab;
 use inspect_tab::InspectTab;
 use optical_tab::OpticalTab;
 use progress::ProgressState;
@@ -45,7 +44,7 @@ use restore_tab::RestoreTab;
 use rusty_backup::controller::app::{
     busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate, AppAction,
     AppController, AppTab, DropRoute, DropTargets, ElevationGate, InstallState, RecentHandle,
-    RecentMode, ShareStep, UpdateInfo,
+    RecentMode, ShareStep,
 };
 use rusty_backup::controller::{Controller, Effect};
 use settings_dialog::SettingsDialog;
@@ -173,6 +172,7 @@ pub struct RustyBackupApp {
     restore_tab: RestoreTab,
     build_disk_tab: BuildDiskTab,
     inspect_tab: InspectTab,
+    convert_tab: ConvertTab,
     optical_tab: OpticalTab,
     archives_tab: ArchivesTab,
     /// App-wide view-model: the log, the jobs, recent files, the tab, devices and updates.
@@ -185,8 +185,6 @@ pub struct RustyBackupApp {
     /// Loaded lazily on first use (the egui context isn't available at
     /// construction time).
     shield_texture: Option<egui::TextureHandle>,
-    /// The Bulk Convert dialog and its running conversion.
-    bulk_convert: BulkConvertDialog,
     /// File path passed on the command line (Windows file-association
     /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
     /// launch). Taken on the first `logic()` tick, routed into the
@@ -214,6 +212,7 @@ impl Default for RustyBackupApp {
             restore_tab: RestoreTab::new(app.recent_handle()),
             build_disk_tab: BuildDiskTab::default(),
             inspect_tab: InspectTab::new(app.recent_handle()),
+            convert_tab: ConvertTab::default(),
             optical_tab,
             archives_tab: ArchivesTab::new(app.recent_handle()),
             settings_dialog: SettingsDialog::new(app.recent_handle()),
@@ -222,7 +221,6 @@ impl Default for RustyBackupApp {
             #[cfg(target_os = "linux")]
             elevation_dialog: ElevationDialog::default(),
             shield_texture: None,
-            bulk_convert: BulkConvertDialog::default(),
             pending_initial_image: None,
             commander: None,
         }
@@ -276,7 +274,7 @@ impl RustyBackupApp {
     /// release asset this offers in-app "Download & Install Update" (download
     /// progress -> "Restart now"); otherwise (other platforms, unmatched arch,
     /// or a missing asset) it opens the releases page in a browser.
-    fn show_update_actions(&mut self, ui: &mut egui::Ui, info: &UpdateInfo) {
+    fn show_update_actions(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
         let mut view_release = false;
         if self.app.can_install_update() {
@@ -324,7 +322,7 @@ impl RustyBackupApp {
             view_release = ui.button("View Release").clicked();
         }
         if view_release {
-            let _ = webbrowser::open(&info.releases_url);
+            actions.push(AppAction::ViewRelease);
         }
         for a in actions {
             let fx = self.app.apply(a);
@@ -353,8 +351,12 @@ impl RustyBackupApp {
                 on(self.optical_tab.is_running(), "Optical"),
             ),
             (AppTab::Inspect, self.inspect_tab.running_job()),
+            (
+                AppTab::Convert,
+                on(self.convert_tab.is_running(), "Convert"),
+            ),
         ];
-        busy_elsewhere(tab, &running, self.bulk_convert.is_running())
+        busy_elsewhere(tab, &running)
     }
 }
 
@@ -371,7 +373,7 @@ impl eframe::App for RustyBackupApp {
             || self.restore_tab.is_running()
             || self.build_disk_tab.is_running()
             || self.optical_tab.is_running()
-            || self.bulk_convert.is_running()
+            || self.convert_tab.is_running()
         {
             ctx.request_repaint();
         }
@@ -425,6 +427,7 @@ impl eframe::App for RustyBackupApp {
                     DropRoute::Archives(path) => self.archives_tab.open_path(path),
                     DropRoute::Restore(path) => self.restore_tab.open_dropped(path),
                     DropRoute::Backup(path) => self.backup_tab.open_image(path),
+                    DropRoute::Convert(path) => self.convert_tab.open(path),
                     DropRoute::Ignore => {}
                 }
             }
@@ -435,8 +438,8 @@ impl eframe::App for RustyBackupApp {
         let effects = self.app.tick();
         run_effects(ctx, effects);
 
-        // Drain bulk-convert worker logs into the panel.
-        self.bulk_convert.poll(&mut self.app.log);
+        // Drain the Convert tab's log, shown or not.
+        self.convert_tab.poll(&mut self.app.log);
     }
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -458,6 +461,7 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut tab, AppTab::Restore, "Restore");
                 ui.selectable_value(&mut tab, AppTab::Build, "Build Disk");
                 ui.selectable_value(&mut tab, AppTab::Inspect, "Inspect");
+                ui.selectable_value(&mut tab, AppTab::Convert, "Convert");
                 ui.selectable_value(&mut tab, AppTab::Optical, "Optical");
                 ui.selectable_value(&mut tab, AppTab::Archives, "Archives");
                 if tab != self.app.active_tab() {
@@ -528,39 +532,23 @@ impl eframe::App for RustyBackupApp {
                             }
                         }
                     }
-                    ui.separator();
-
-                    // Bulk Convert — convert every disk image in a folder.
-                    let bulk_running = self.bulk_convert.is_running();
-                    if ui
-                        .add_enabled(!bulk_running, egui::Button::new("Bulk Convert..."))
-                        .on_hover_text(
-                            "Convert every disk image in a folder to one chosen format, \
-                             using the same parameters for every file.",
-                        )
-                        .clicked()
-                    {
-                        self.bulk_convert.open();
-                    }
-                    if bulk_running && ui.button("Cancel Bulk").clicked() {
-                        self.bulk_convert.cancel();
-                    }
                 });
             });
         });
 
-        // Bulk Convert dialog (modal-ish window, always reachable).
-        self.bulk_convert.show(ctx, &mut self.app.log);
-
-        // Bulk Convert progress strip, visible from any tab while running.
-        if let Some((frac, text)) = self.bulk_convert.strip() {
-            egui::Panel::top("bulk_convert_progress").show(ctx, |ui| {
+        // The Convert tab's progress strip, visible from any tab while it runs.
+        if let Some((frac, text)) = self
+            .convert_tab
+            .strip()
+            .filter(|_| self.app.active_tab() != AppTab::Convert)
+        {
+            egui::Panel::top("convert_progress").show(ctx, |ui| {
                 ui.add(egui::ProgressBar::new(frac).text(text));
             });
         }
 
         // Update notification banner (if update available and not dismissed).
-        if let Some(info) = self.app.update_banner().cloned() {
+        if self.app.update_banner().is_some() {
             egui::Panel::top("update_banner").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -568,11 +556,8 @@ impl eframe::App for RustyBackupApp {
                             .color(theme::warning(ui.visuals()))
                             .strong(),
                     );
-                    ui.label(format!(
-                        "available: v{} -> v{}",
-                        info.current_version, info.latest_version
-                    ));
-                    self.show_update_actions(ui, &info);
+                    ui.label(self.app.update_banner_text().unwrap_or_default());
+                    self.show_update_actions(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Dismiss update notification").clicked() {
                             self.app.apply(AppAction::DismissUpdate);
@@ -706,7 +691,21 @@ impl eframe::App for RustyBackupApp {
             AppTab::Archives => {
                 self.archives_tab.show(ui, &mut self.app.log);
             }
+            AppTab::Convert => {
+                let busy = self.busy_elsewhere(AppTab::Convert);
+                self.convert_tab.show(ui, &mut self.app.log, busy);
+            }
         });
+
+        // Inspect's and Optical's "Convert..." hand their image to the Convert tab.
+        if let Some(path) = self
+            .inspect_tab
+            .take_convert_request()
+            .or_else(|| self.optical_tab.take_convert_request())
+        {
+            self.convert_tab.open(path);
+            self.app.select_tab(AppTab::Convert);
+        }
 
         // Workflow D.2 auto-unwrap: the Archives tab queues a payload
         // when the user clicks "Mount in new Inspect tab". Drain here,

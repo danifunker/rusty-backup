@@ -75,6 +75,17 @@ pub struct DirImportOptions {
     /// Copy the files out of disk images (`.dsk`, `.img`, DiskCopy, `.dmg`, `.hfv`, ...) into a
     /// folder named after each, instead of copying the image in; see [`super::image_import`].
     pub expand_disk_images: bool,
+
+    /// Leave out macOS `._` sidecars entirely: not copied, and no resource fork taken from them.
+    pub ignore_appledouble: bool,
+}
+
+/// `host` has a `._name` sidecar beside it.
+fn has_appledouble_sibling(host: &Path) -> bool {
+    match (host.parent(), host.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => dir.join(format!("._{name}")).is_file(),
+        _ => false,
+    }
 }
 
 /// The name `--expand-gunzip` gives a gzip file: `.tgz` becomes `.tar`, `.gz` is dropped.
@@ -496,6 +507,13 @@ fn import_dir_inner(
                     progress(&sink.stats);
                     continue;
                 }
+                // Sidecars a modern Mac left behind, dropped with whatever they carry.
+                let sidecar = e.host.file_name().and_then(|n| n.to_str());
+                if opts.ignore_appledouble && sidecar.is_some_and(is_appledouble) {
+                    sink.stats.appledouble_skipped += 1;
+                    progress(&sink.stats);
+                    continue;
+                }
                 // A Mac file in a host folder is one file in up to two pieces:
                 // a data fork plus a `._name` / `.rsrc` sidecar, or a single
                 // `.bin` / `.hqx` wrapper holding both. Rejoin them here, where
@@ -511,7 +529,8 @@ fn import_dir_inner(
                     progress(&sink.stats);
                     continue;
                 }
-                let fork = mac_forks_wanted
+                let from_sidecar = opts.ignore_appledouble && has_appledouble_sibling(&e.host);
+                let fork = (mac_forks_wanted && !from_sidecar)
                     .then(|| fs_mac::resource_fork::detect_resource_fork(&e.host))
                     .flatten();
                 // A wrapper's own bytes are not the file: use the data fork it
@@ -684,7 +703,7 @@ pub fn preflight_dir(
     let mut pf = ImportPreflight::default();
     for e in walk(root)? {
         let name_invalid = e.comps.iter().any(|c| efs.validate_name(c).is_err());
-        let appledouble = opts.shared.skip_appledouble
+        let appledouble = (opts.shared.skip_appledouble || opts.ignore_appledouble)
             && e.comps.last().map(|c| is_appledouble(c)).unwrap_or(false);
         if appledouble {
             pf.appledouble += 1;

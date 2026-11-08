@@ -72,6 +72,7 @@ pub struct DonorPart {
     /// The type in the table's own vocabulary, and its display name.
     pub type_text: String,
     pub type_name: String,
+    pub bootable: bool,
 }
 
 impl Donor {
@@ -123,6 +124,7 @@ impl Donor {
                         .unwrap_or_else(|| p.type_name.clone()),
                 },
                 type_name: p.type_name.clone(),
+                bootable: p.bootable,
             })
             .collect();
         Ok(Donor {
@@ -333,6 +335,9 @@ impl DiskBuilder {
     /// A builder laid out like `donor`: one row per donor partition at its own size, each
     /// copying the donor's bytes.
     pub fn from_donor(donor: Donor, disk_size: u64) -> Self {
+        // A table with one boot flag keeps the first, as a donor's own BIOS would.
+        let one_only = provision::bootable_rule(donor.kind) == Some(true);
+        let first = donor.parts.iter().position(|p| p.bootable);
         let rows = donor
             .parts
             .iter()
@@ -340,6 +345,7 @@ impl DiskBuilder {
             .map(|(i, p)| BuilderRow {
                 size_text: p.size.to_string(),
                 type_text: p.type_text.clone(),
+                bootable: p.bootable && (!one_only || first == Some(i)),
                 copy_from: Some(i),
                 donor_part: Some(i),
                 ..Default::default()

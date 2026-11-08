@@ -1,0 +1,67 @@
+# The GTK4 + libadwaita Linux shell (docs/native_frontends_plan.md Phase 4, §9).
+# Its own workspace root and lockfile: gtk4-rs needs a recent rustc, which must not move the engine's 1.73 floor.
+[package]
+name = "rusty-backup-gtk"
+version = "0.1.0"
+description = "Rusty Backup, the GTK4 front end: back up, restore and inspect vintage disk images"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+[[bin]]
+name = "rusty-backup-gtk"
+path = "src/main.rs"
+
+[dependencies]
+rusty-backup = { path = "../..", default-features = false, features = [
+    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "remote", "tui-update", "crypto", "yaml", "audio",
+] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+log = "0.4"
+pangocairo = "0.22"
+
+# Packages beside egui's: a different binary, desktop file and icon name, so both install together.
+[package.metadata.deb]
+name = "rusty-backup-gtk"
+maintainer = "Dani <dani@funkervogt.com>"
+copyright = "2025-2026, Dani <dani@funkervogt.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+The GTK4 / libadwaita front end of Rusty Backup: back up, restore and inspect \
+vintage computer disk images, with partition resizing and CHD compression."""
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/rusty-backup-gtk", "usr/bin/", "755"],
+    ["data/io.github.danifunker.RustyBackup.desktop", "usr/share/applications/", "644"],
+    ["../../assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/io.github.danifunker.RustyBackup.png", "644"],
+    ["../../assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/io.github.danifunker.RustyBackup.png", "644"],
+    ["../../assets/icons/icon-64.png", "usr/share/icons/hicolor/64x64/apps/io.github.danifunker.RustyBackup.png", "644"],
+    ["../../assets/icons/icon-48.png", "usr/share/icons/hicolor/48x48/apps/io.github.danifunker.RustyBackup.png", "644"],
+    ["../../assets/icons/icon-32.png", "usr/share/icons/hicolor/32x32/apps/io.github.danifunker.RustyBackup.png", "644"],
+    ["../../assets/icons/icon-16.png", "usr/share/icons/hicolor/16x16/apps/io.github.danifunker.RustyBackup.png", "644"],
+]
+depends = "$auto"
+
+[package.metadata.generate-rpm]
+name = "rusty-backup-gtk"
+assets = [
+    { source = "target/release/rusty-backup-gtk", dest = "/usr/bin/rusty-backup-gtk", mode = "755" },
+    { source = "data/io.github.danifunker.RustyBackup.desktop", dest = "/usr/share/applications/io.github.danifunker.RustyBackup.desktop", mode = "644" },
+    { source = "../../assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+    { source = "../../assets/icons/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+    { source = "../../assets/icons/icon-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+    { source = "../../assets/icons/icon-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+    { source = "../../assets/icons/icon-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+    { source = "../../assets/icons/icon-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.danifunker.RustyBackup.png", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+gtk4 = "*"
+libadwaita = "*"
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"

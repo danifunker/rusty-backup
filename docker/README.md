@@ -12,6 +12,7 @@ builds**, so a build is a one-liner. Linux cross artifacts land in
 | `cross-i586-musl.Dockerfile` | `rb-cli` i586 | **static** (musl) | Pentium+ Linux | ✅ runs |
 | `cross-i486.Dockerfile` | `rb-cli` i486 | dynamic (glibc) | 486+ Linux¹ | ✅ builds |
 | `cb-dos.Dockerfile` | DOS `.exe`s | — | DOS (486+) | ✅ runs (DOSBox-X) |
+| `linux-packages-focal.Dockerfile` | egui deb / rpm / Arch + `rb-cli`, x64 | dynamic (glibc 2.31) | Ubuntu 20.04+, Debian 11+ | ✅ CI release build |
 
 ¹ i486 *codegen* (no CMPXCHG8B), but Debian's 32-bit glibc is i686-baseline, so
 the binary needs an **i486 rootfs** (Buildroot/musl) to actually run on bare 486
@@ -35,7 +36,21 @@ docker run  --rm -v "$PWD":/src rb-cross-i586-musl
 # cb-dos is amd64 (DJGPP is x86_64; runs under qemu on arm64):
 docker build --platform linux/amd64 -t rb-cb-dos - < docker/cb-dos.Dockerfile
 docker run  --rm --platform linux/amd64 -v "$PWD":/src rb-cb-dos
+
+# x64 Linux packages on Ubuntu 20.04 (what CI's build-linux-packages runs):
+docker build -t rb-linux-packages-focal -f docker/linux-packages-focal.Dockerfile docker
+docker run  --rm -v "$PWD":/src rb-linux-packages-focal
+# -> ./out/Rusty-Backup-linux-x64-dev.{deb,rpm,pkg.tar.zst}, ./out/rb-cli-linux-x64-dev.tar.gz
 ```
+
+**`linux-packages-focal` is the 20.04 floor, kept on purpose.** It holds the x64 packages to
+glibc 2.31; arm64 builds on the plain 24.04 runner instead. `focal-image.yml` builds it and pushes
+it to `ghcr.io/danifunker/rb-linux-packages-focal` (a date-sha tag plus `latest`), and
+`build-linux-packages` in `release.yml` pins its digest in `FOCAL_IMAGE` and runs the build with
+`docker run`, so no GitHub action runs inside 20.04. Rust (1.99.1), cargo-deb and
+cargo-generate-rpm are pinned in the Dockerfile. To move: bump the Dockerfile, let the workflow
+push, paste the digest it prints. Never delete old tags: if a rebuild fails because focal's mirror
+or rustup moved on, the pinned digest keeps building, and that is the cue to review the floor.
 
 The atomics/CPU rationale (custom target specs in `../targets/`, `max-atomic-width`,
 the cpuid caveat) is in [`../docs/linux_486_build.md`](../docs/linux_486_build.md).

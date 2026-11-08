@@ -297,6 +297,9 @@ impl App {
                 )));
             }
         }
+        if let Some(target) = c.write_target() {
+            lines.push(Line::styled(format!("  Writes to: {target}"), pal.accent()));
+        }
         for (row, label) in [(RRow::Preview, "[ Preview ]"), (RRow::Apply, "[ Apply ]")] {
             let sel = w.sel == row;
             if sel {

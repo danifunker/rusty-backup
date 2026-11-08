@@ -831,22 +831,28 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        match self.highest_used_cluster()? {
+        // A FAT16 shrunk below 4085 clusters reads as FAT12, so the in-place resize refuses it.
+        let floor = match self.fat_type {
+            FatType::Fat16 => (self.data_region_offset() + (4085 + 16) * self.cluster_size())
+                .min(self.total_size()),
+            FatType::Fat12 | FatType::Fat32 => 0,
+        };
+        let used = match self.highest_used_cluster()? {
             Some(cluster) => {
                 // Include all bytes from partition start through the end of
                 // the highest allocated cluster.
                 let cluster_end_abs = self.cluster_offset(cluster) + self.cluster_size();
                 let relative = cluster_end_abs - self.partition_offset;
                 // Round up to sector boundary
-                let aligned = relative.div_ceil(self.bytes_per_sector) * self.bytes_per_sector;
-                Ok(aligned)
+                relative.div_ceil(self.bytes_per_sector) * self.bytes_per_sector
             }
             None => {
                 // No data clusters allocated — still need boot sector, FATs,
                 // and root directory area.
-                Ok(self.data_region_offset())
+                self.data_region_offset()
             }
-        }
+        };
+        Ok(used.max(floor))
     }
 
     fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
@@ -5045,6 +5051,64 @@ pub fn create_blank_fat_with_sector_size(
     let mut img = vec![0u8; image_size];
     let mut cur = std::io::Cursor::new(&mut img);
     write_blank_fat_metadata_to_sink(&mut cur, &layout, label)?;
+    Ok(img)
+}
+
+/// A standard DOS floppy layout: size in bytes, sectors per cluster, root entries, sectors
+/// per FAT, sectors per track, heads and media byte (two FATs, one reserved sector).
+const DOS_FLOPPIES: &[(u64, u8, u16, u16, u16, u16, u8)] = &[
+    (163_840, 1, 64, 1, 8, 1, 0xFE),
+    (184_320, 1, 64, 2, 9, 1, 0xFC),
+    (327_680, 2, 112, 1, 8, 2, 0xFF),
+    (368_640, 2, 112, 2, 9, 2, 0xFD),
+    (737_280, 2, 112, 3, 9, 2, 0xF9),
+    (1_228_800, 1, 224, 7, 15, 2, 0xF9),
+    (1_474_560, 1, 224, 9, 18, 2, 0xF0),
+    (2_949_120, 2, 240, 9, 36, 2, 0xF0),
+];
+
+/// The floppy sizes [`create_dos_floppy`] formats, in bytes.
+pub fn dos_floppy_sizes() -> impl Iterator<Item = u64> {
+    DOS_FLOPPIES.iter().map(|f| f.0)
+}
+
+/// Format a blank FAT12 floppy with the BPB, media byte and geometry DOS itself writes
+/// for that size, so a real drive of that kind reads it. `size_bytes` must be a DOS floppy size.
+pub fn create_dos_floppy(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
+    let &(size, spc, root, spf, spt, heads, media) = DOS_FLOPPIES
+        .iter()
+        .find(|f| f.0 == size_bytes)
+        .ok_or_else(|| anyhow::anyhow!("{size_bytes} bytes is not a DOS floppy size"))?;
+    let total = (size / 512) as u32;
+    let mut img = vec![0u8; size as usize];
+    let label_bytes = fat_label_bytes(label);
+    write_fat_boot_sector(
+        &mut img[..512],
+        FatType::Fat12,
+        512,
+        spc as u32,
+        1,
+        2,
+        root,
+        total,
+        spf as u32,
+        0,
+        0,
+        &label_bytes,
+    );
+    img[21] = media;
+    img[24..26].copy_from_slice(&spt.to_le_bytes());
+    img[26..28].copy_from_slice(&heads.to_le_bytes());
+    img[36] = 0x00;
+    for fat in 0..2u64 {
+        let at = (512 + fat * spf as u64 * 512) as usize;
+        img[at..at + 3].copy_from_slice(&[media, 0xFF, 0xFF]);
+    }
+    if label.is_some() {
+        let root_at = (512 + 2 * spf as u64 * 512) as usize;
+        img[root_at..root_at + 11].copy_from_slice(&label_bytes);
+        img[root_at + 11] = 0x08;
+    }
     Ok(img)
 }
 

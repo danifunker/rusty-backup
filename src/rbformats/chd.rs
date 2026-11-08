@@ -265,6 +265,36 @@ pub fn chd_is_cd(path: &Path) -> Result<bool> {
     Ok(info.is_cd)
 }
 
+/// What a CHD holds, from its header's flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChdMedia {
+    Hd,
+    Cd,
+    Dvd,
+    Other,
+}
+
+/// Read a CHD's header and say whether it is a hard disk, a CD or a DVD.
+pub fn chd_media(path: &Path) -> Result<ChdMedia> {
+    let path_str = path
+        .to_str()
+        .with_context(|| format!("CHD path is not valid UTF-8: {}", path.display()))?;
+    let chd = libchdman_rs::Chd::open(path_str, false, None)
+        .map_err(|e| anyhow::anyhow!("failed to open CHD {}: {:?}", path.display(), e))?;
+    let info = chd
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to read CHD info: {:?}", e))?;
+    Ok(if info.is_cd {
+        ChdMedia::Cd
+    } else if info.is_dvd {
+        ChdMedia::Dvd
+    } else if info.is_hd {
+        ChdMedia::Hd
+    } else {
+        ChdMedia::Other
+    })
+}
+
 /// Read+Seek adapter over a CD CHD's cooked MODE1 user data (2048 B/sector).
 ///
 /// Single-track MODE1 / MODE1_RAW CHDs only — multi-track or audio mixes return

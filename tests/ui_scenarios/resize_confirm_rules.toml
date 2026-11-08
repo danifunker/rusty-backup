@@ -1,0 +1,56 @@
+# Resize's question names what Preview showed: an edit after Preview takes Apply away until the
+# next Preview, a no writes nothing, and a yes to a question whose sizes changed since writes
+# nothing either: the edit dropped the question.
+name = "Resize: a yes counts only for the question asked"
+vm = "resize"
+
+[[step]]
+action = "Open"
+arg = "$sgi"
+
+[[step]]
+action = "Custom"
+
+[[step]]
+action = "SetSize"
+arg = "32"
+
+[[step]]
+action = "Preview"
+expect = { can_apply = true }
+
+[[step]]
+action = "SetSize"
+arg = "40"
+expect = { can_apply = false, preview = "" }
+
+[[step]]
+action = "Preview"
+expect = { can_apply = true }
+
+[[step]]
+action = "Apply"
+effects = ["Confirm"]
+
+[[step]]
+action = "Confirm"
+arg = false
+settle = true
+expect = { running = false, changed = false, file_mib = 64 }
+
+[[step]]
+action = "Apply"
+effects = ["Confirm"]
+
+[[step]]
+action = "SetSize"
+arg = "32"
+
+[[step]]
+action = "Preview"
+
+[[step]]
+action = "Confirm"
+arg = true
+settle = true
+expect = { running = false, changed = false, file_mib = 64 }

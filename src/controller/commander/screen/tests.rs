@@ -798,3 +798,30 @@ fn file_info_offers_the_mac_fields_and_stages_type_creator_and_a_date() {
     let result = ctl.detail().and_then(|d| d.result.clone()).unwrap();
     assert!(result.contains("no ProDOS type"), "{result}");
 }
+
+#[test]
+fn printable_shows_control_characters_as_escapes() {
+    assert_eq!(super::printable("Icon\r"), "Icon\\x0D");
+    assert_eq!(super::printable("plain.txt"), "plain.txt");
+}
+
+#[test]
+fn copy_hint_says_why_a_pane_cannot_take_a_copy() {
+    let ctl = CommanderController::headless();
+    let into = ctl.copy_hint(Side::Right);
+    assert!(into.contains("right"), "{into}");
+    assert!(ctl.delete_hint().contains('L'));
+}
+
+#[test]
+fn a_closed_pane_names_nothing_and_a_host_pane_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    let closed = ctl.pane(Side::Left).source_label();
+    assert_eq!(closed, "Open image, backup, or folder...");
+    ctl.left.listing.load_host_root(dir.path().into()).unwrap();
+    let pane = ctl.pane(Side::Left);
+    assert_eq!(pane.source_label(), "Local folder");
+    assert_eq!(pane.path_prefix(), "host ");
+    assert_eq!(pane.volume_title(), "local folder");
+}

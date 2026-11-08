@@ -82,6 +82,61 @@ pub fn default_output_name(
     format!("{stem}.{}", format.extension())
 }
 
+/// The files a run to `output` writes, the output first: a BIN/CUE is a .cue and its .bin.
+pub fn written_files(output: &Path, format: OutputFormat, from_chd: bool) -> Vec<PathBuf> {
+    let mut files = vec![output.to_path_buf()];
+    if format != OutputFormat::BinCue {
+        return files;
+    }
+    files.push(output.with_extension("bin"));
+    // A CHD of several tracks splits its .bin into one file each.
+    if let (true, Some(stem)) = (from_chd, output.file_stem().and_then(|s| s.to_str())) {
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        files.extend((1..=99).map(|n| parent.join(format!("{stem} (Track {n:02}).bin"))));
+    }
+    files
+}
+
+/// The files a conversion reads: the image, and the other half of a BIN/CUE.
+pub fn source_files(image: &Path, source: Option<DiscFormat>) -> Vec<PathBuf> {
+    let mut files = vec![image.to_path_buf()];
+    if source == Some(DiscFormat::BinCue) {
+        files.push(image.with_extension("cue"));
+        files.push(image.with_extension("bin"));
+    }
+    files
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
+/// Why `output` cannot be written: `File::create` truncates, so a source or a device must not get here.
+pub fn output_refusal(output: &Path, format: OutputFormat, sources: &[PathBuf]) -> Option<String> {
+    let is_bin = output
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("bin"));
+    if format == OutputFormat::BinCue && is_bin {
+        return Some("A BIN/CUE output is named by its .cue, not its .bin.".to_string());
+    }
+    for file in written_files(output, format, false) {
+        if std::fs::metadata(&file).is_ok_and(|m| !m.is_file()) {
+            return Some(format!("{} is not a regular file.", file.display()));
+        }
+        if sources.iter().any(|s| same_file(s, &file)) {
+            return Some(format!(
+                "{} is the source image; choose another output file.",
+                file.display()
+            ));
+        }
+    }
+    None
+}
+
 /// Rip `target` to an ISO or BIN/CUE.
 pub fn rip(
     target: OpticalTarget,

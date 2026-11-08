@@ -35,7 +35,7 @@ pub use crate::controller::browser::DiscSource;
 pub use crate::model::job::NoNotify;
 pub use crate::model::optical_ops::OutputFormat;
 pub use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
-pub use audio::{AudioAction, PlayState};
+pub use audio::{AudioAction, PlayState, Readout};
 
 /// The Optical tab's disc browser: the browser pane, one pane, under `PaneProfile::optical`.
 pub fn disc_browser(
@@ -54,6 +54,8 @@ pub fn disc_browser(
 pub mod purpose {
     pub const IMAGE: &str = "optical.image";
     pub const OUTPUT: &str = "optical.output";
+    /// The question Start asks before it replaces files that exist.
+    pub const OVERWRITE: &str = "optical.overwrite";
 }
 
 /// Stable widget ids.
@@ -76,6 +78,27 @@ pub mod ids {
     pub const REMOTE_ADDRESS: &str = "optical.remote_address";
     pub const REMOTE_CONNECT: &str = "optical.remote_connect";
     pub const REMOTE_CANCEL: &str = "optical.remote_cancel";
+    pub const IMAGE: &str = "optical.image";
+    pub const IMAGE_RECENT: &str = "optical.image_recent";
+    pub const WRITE_TARGET: &str = "optical.write_target";
+    pub const PICK_OUTPUT: &str = "optical.pick_output";
+    pub const CHD_MODE: &str = "optical.chd_mode";
+    pub const CHD_HUNK: &str = "optical.chd_hunk";
+    pub const CHD_CODEC: &str = "optical.chd_codec";
+    pub const CONVERT: &str = "optical.convert";
+}
+
+/// Tooltips every shell shows on the same controls.
+pub mod hints {
+    pub const CONVERT: &str = "Change this image's format (CHD, BIN/CUE, ISO) in the Convert tab.";
+    pub const CONVERT_MOVED: &str = "Disc images are converted in the Convert tab.";
+    pub const PHYSICAL_DRIVE: &str =
+        "Click \"Show Physical Devices\" (top bar) for a local drive, \
+         or \"Add remote daemon...\" for a networked one.";
+    pub const EJECT: &str = "Select a local drive with a disc in it to eject.";
+    pub const EJECT_AFTER: &str = "Ejects the source drive on its own machine - the \
+         remote daemon's drive for a remote source.";
+    pub const AUDIO_TRACKS: &str = "Open the CD-DA player";
 }
 
 /// What CHD output and CHD Info say in a build without the `chd` feature.
@@ -160,6 +183,11 @@ pub enum OpticalAction {
     Picked {
         purpose: &'static str,
         path: Option<PathBuf>,
+    },
+    /// The answer to Start's question about replacing files.
+    Confirmed {
+        purpose: &'static str,
+        yes: bool,
     },
     Audio(AudioAction),
 }
@@ -304,6 +332,14 @@ impl OpticalController {
 
     pub fn image(&self) -> Option<&Path> {
         self.image.as_deref()
+    }
+
+    /// The disc image the Convert tab takes over; a drive is ripped here instead.
+    pub fn convert_source(&self) -> Option<PathBuf> {
+        match self.mode {
+            SourceMode::ImageFile => self.image.clone(),
+            SourceMode::PhysicalDrive => None,
+        }
     }
 
     /// A remote daemon is connected: physical-drive mode is offered without elevation.
@@ -452,6 +488,14 @@ impl OpticalController {
         self.start_refusal().is_none()
     }
 
+    /// What the output form says the task is.
+    pub fn task_label(&self) -> &'static str {
+        match self.task() {
+            Task::Rip => "Rip to disk",
+            Task::Convert => "Convert format",
+        }
+    }
+
     /// "Start Rip" or "Start Convert".
     pub fn start_label(&self) -> &'static str {
         match self.task() {
@@ -481,10 +525,20 @@ impl OpticalController {
         if let Some(why) = self.format_refusal(self.format) {
             return Some(why);
         }
-        if self.output.is_none() {
+        let Some(output) = self.output.as_deref() else {
             return Some("Choose an output file.".to_string());
+        };
+        optical_ops::output_refusal(output, self.format, self.source_files().as_slice())
+    }
+
+    /// The image files a conversion reads; a rip reads a drive and has none.
+    fn source_files(&self) -> Vec<PathBuf> {
+        match (self.task(), self.image.as_deref()) {
+            (Task::Convert, Some(image)) => {
+                optical_ops::source_files(image, self.disc.as_ref().map(|i| i.format))
+            }
+            _ => Vec::new(),
         }
-        None
     }
 
     /// Whether this build has remote daemons (`Add remote daemon`).
@@ -532,6 +586,33 @@ impl OpticalController {
             },
         );
         self.drives_job = Some((job, why));
+    }
+
+    /// A scan's drives: the selection stays on its own drive, and never takes the one now in its row.
+    fn land_drives(&mut self, devices: Vec<RipDevice>) {
+        let picked = self.selected_device().map(RipDevice::picker_label);
+        self.drives = devices;
+        let Some(label) = picked else {
+            return;
+        };
+        let at = |i: usize, d: &[RipDevice]| d.get(i).map(RipDevice::picker_label);
+        if self
+            .drive
+            .and_then(|i| at(i, self.drives.as_slice()))
+            .as_ref()
+            == Some(&label)
+        {
+            return;
+        }
+        self.drive = self.drives.iter().position(|d| d.picker_label() == label);
+        if self.drive.is_none() {
+            self.warn(format!(
+                "{label} is no longer listed, so it is no longer the source."
+            ));
+            if self.mode == SourceMode::PhysicalDrive {
+                self.source_changed();
+            }
+        }
     }
 
     /// The source changed: close the browser, detect the new disc, reload the player.
@@ -610,6 +691,19 @@ impl OpticalController {
         }
         self.mode = mode;
         self.source_changed();
+    }
+
+    /// The output keeps following the format: a CHD must not land in the `.cue` chosen for BIN/CUE.
+    fn set_format(&mut self, f: OutputFormat) {
+        let old = self.format.extension();
+        self.format = f;
+        let named_for_old = |p: &PathBuf| {
+            let ext = p.extension().and_then(|e| e.to_str());
+            ext.is_some_and(|e| e.eq_ignore_ascii_case(old))
+        };
+        if let Some(path) = self.output.as_mut().filter(|p| named_for_old(p)) {
+            path.set_extension(f.extension());
+        }
     }
 
     fn format_ok(&self, f: OutputFormat) -> bool {
@@ -699,7 +793,7 @@ impl OpticalController {
         if let Some(found) = self.drives_job.as_ref().and_then(|(j, _)| job_outcome(j)) {
             let why = self.drives_job.take().map_or(DriveScan::Quiet, |(_, w)| w);
             if let Ok(devices) = found {
-                self.drives = devices;
+                self.land_drives(devices);
                 let n = self.drives.len();
                 match why {
                     DriveScan::Startup if n > 0 => self.info(format!("Found {n} optical drive(s)")),
@@ -742,8 +836,13 @@ impl OpticalController {
             match done {
                 Ok((path, Ok(()))) => {
                     self.info(format!("Ejected {path}"));
-                    // The disc is gone: drop what points at it, then re-scan so the drive shows empty.
-                    self.close_disc();
+                    // The disc is gone: drop what points at it, unless the source moved on meanwhile.
+                    let on_it = self.mode == SourceMode::PhysicalDrive
+                        && self.selected_device().map(|d| d.device_path.as_str())
+                            == Some(path.as_str());
+                    if on_it {
+                        self.close_disc();
+                    }
                     self.scan_drives(DriveScan::Quiet);
                 }
                 Ok((_, Err(e))) | Err(e) => self.warn(format!("Eject failed: {e}")),
@@ -843,18 +942,23 @@ impl Controller for OpticalController {
             OpticalAction::CloseChdInfo => self.chd_info = None,
             OpticalAction::SetOutputFormat(f) if !running => {
                 if self.format_ok(f) {
-                    self.format = f;
+                    self.set_format(f);
                 }
             }
             OpticalAction::PickOutput if !running => return self.pick_output(),
             OpticalAction::SetEjectAfter(on) if !running => self.eject_after = on,
-            OpticalAction::Start(chd) => self.start(chd),
+            OpticalAction::Start(chd) => return self.start(chd),
             OpticalAction::Cancel => self.cancel(),
             OpticalAction::Picked { purpose, path } => match (purpose, path) {
                 (purpose::IMAGE, Some(path)) if !running => self.open_image(path),
                 (purpose::OUTPUT, Some(path)) if !running => self.output = Some(path),
                 _ => {}
             },
+            OpticalAction::Confirmed { purpose, yes } => {
+                if purpose == purpose::OVERWRITE {
+                    self.answered(yes);
+                }
+            }
             OpticalAction::Audio(a) => {
                 #[cfg(feature = "audio")]
                 self.audio.apply(a);

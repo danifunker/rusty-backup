@@ -162,6 +162,11 @@ pub enum BuildRequest {
         size: u64,
         preset: Preset,
     },
+    /// A CD-ROM image, mastered by `model::cd_build`; always a raw file.
+    Cd {
+        target_path: PathBuf,
+        request: crate::model::cd_build::CdRequest,
+    },
 }
 
 /// The fixed-shape bootable disks Build Disk offers as presets.
@@ -313,18 +318,18 @@ impl BuildRequest {
     pub fn target_path(&self) -> &std::path::Path {
         match self {
             BuildRequest::Partitioned(p) => p.target_path.as_path(),
-            BuildRequest::Volume { target_path, .. } | BuildRequest::Preset { target_path, .. } => {
-                target_path.as_path()
-            }
+            BuildRequest::Volume { target_path, .. }
+            | BuildRequest::Preset { target_path, .. }
+            | BuildRequest::Cd { target_path, .. } => target_path.as_path(),
         }
     }
 
     fn set_target(&mut self, path: PathBuf) {
         match self {
             BuildRequest::Partitioned(p) => p.target_path = path,
-            BuildRequest::Volume { target_path, .. } | BuildRequest::Preset { target_path, .. } => {
-                *target_path = path
-            }
+            BuildRequest::Volume { target_path, .. }
+            | BuildRequest::Preset { target_path, .. }
+            | BuildRequest::Cd { target_path, .. } => *target_path = path,
         }
     }
 
@@ -352,6 +357,8 @@ impl BuildRequest {
                     0
                 }
             }
+            // Sparse: only labels and metadata are written, so there is no byte count to show.
+            BuildRequest::Cd { .. } => 0,
         }
     }
 }
@@ -402,6 +409,10 @@ pub fn run_build(
             size,
             preset,
         } => run_preset_on(target_path.as_path(), *size, preset, status),
+        BuildRequest::Cd {
+            target_path,
+            request,
+        } => run_cd(target_path.as_path(), request, status),
     };
     let Some(fmt) = container.filter(|c| *c != ExportFormat::Raw) else {
         return raw(&req, status);
@@ -421,6 +432,31 @@ pub fn run_build(
     let result = built.and_then(|()| encode(fmt, tmp.as_path(), dest.as_path(), &status));
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// A CD-ROM image onto a file; a device is refused, as a disc is burned from the image.
+fn run_cd(
+    target: &std::path::Path,
+    request: &crate::model::cd_build::CdRequest,
+    status: Arc<Mutex<PhysicalWriteStatus>>,
+) -> Result<()> {
+    if crate::os::is_device_path(target) {
+        anyhow::bail!("a CD-ROM image is written to a file and burned from there");
+    }
+    let push = |m: &str| {
+        if let Ok(mut s) = status.lock() {
+            s.log_messages.push(m.to_string());
+        }
+    };
+    let mut log = |m: &str| push(m);
+    let built = crate::model::cd_build::build_cd(target, request, &mut log, &|_| {});
+    if built.is_err() {
+        // A disc cut short is not a disc; leave no file behind.
+        let _ = std::fs::remove_file(target);
+    }
+    built?;
+    push("Disk build complete");
+    Ok(())
 }
 
 /// A preset onto a file directly, or onto a device through a temp image written in full.

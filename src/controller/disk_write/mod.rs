@@ -39,11 +39,14 @@ pub mod purpose {
     pub const DEVICE_NAME: &str = "disk_write.device_name";
     /// Overwriting an image file.
     pub const OVERWRITE_FILE: &str = "disk_write.overwrite_file";
+    /// The image file a write goes to.
+    pub const TARGET_IMAGE: &str = "disk_write.target_image";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
     pub const TARGET_DEVICE: &str = "disk_write.target_device";
+    pub const TARGET_IMAGE: &str = "disk_write.target_image";
     pub const TARGET_REGION: &str = "disk_write.target_region";
     pub const SYNTHESIZE: &str = "disk_write.synthesize";
     pub const TABLE_KIND: &str = "disk_write.table_kind";
@@ -68,6 +71,12 @@ pub enum DiskWriteAction {
     },
     /// An image file as the target (the TUI's "Save as image file").
     SetTargetImage(std::path::PathBuf),
+    /// Ask for an image file to write to; the answer is `Picked`.
+    PickTargetImage,
+    Picked {
+        purpose: &'static str,
+        path: Option<std::path::PathBuf>,
+    },
     /// `None` writes the whole target; `Some(index)` writes into that partition.
     SetTargetPartition(Option<usize>),
     /// Step the choice: whole disk, each partition, then the whole disk again.
@@ -307,6 +316,13 @@ impl Controller for DiskWriteController {
                 | DiskWriteAction::Confirmed { .. }
                 | DiskWriteAction::Answered { .. }
         );
+        // Anything but an answer changes what the question named.
+        if !matches!(
+            action,
+            DiskWriteAction::Confirmed { .. } | DiskWriteAction::Answered { .. }
+        ) {
+            self.run.asked = None;
+        }
         if edits_form && self.run.running() {
             return Vec::new();
         }
@@ -315,13 +331,19 @@ impl Controller for DiskWriteController {
             DiskWriteAction::Close => self.close(),
             DiskWriteAction::Cancel => self.run.cancel(),
             DiskWriteAction::Confirmed { purpose, yes } => {
-                if yes && purpose == purpose::OVERWRITE_FILE {
-                    self.start_write();
+                if purpose == purpose::OVERWRITE_FILE {
+                    self.file_answered(yes);
                 }
             }
             DiskWriteAction::Answered { purpose, text } => {
-                if let (purpose::DEVICE_NAME, Some(text)) = (purpose, text) {
-                    self.device_name_answered(text.as_str());
+                if purpose == purpose::DEVICE_NAME {
+                    self.device_name_answered(text);
+                }
+            }
+            DiskWriteAction::PickTargetImage => return self.pick_target_image(),
+            DiskWriteAction::Picked { purpose, path } => {
+                if let (purpose::TARGET_IMAGE, Some(path)) = (purpose, path) {
+                    self.set_target_image(path);
                 }
             }
             DiskWriteAction::SelectDevice { row, device } => self.select_device(row, device),

@@ -6,6 +6,7 @@ use disk_core::id_names::IdNameMap;
 use disk_core::xattr::Xattr;
 use fs_squashfs::squashfs_edit::SizePlan;
 
+use crate::fs::entry::FileEntryTypeDisplay as _;
 use crate::model::commander_ops::StageSource;
 
 /// Where the entry lives.
@@ -27,6 +28,83 @@ pub struct DetailExtras {
     /// uid/gid -> name from the image's own account files, if any.
     pub id_names: IdNameMap,
     pub size_plan: Option<SizePlan>,
+}
+
+/// The start of `data` (256 lines, about 4 KB) as a hex dump with an ASCII column.
+pub fn hex_dump(data: &[u8]) -> String {
+    let bytes_per_line = 16;
+    let lines = data.len().div_ceil(bytes_per_line);
+    let max_lines = 256;
+    let mut hex_text = String::new();
+    for i in 0..lines.min(max_lines) {
+        let offset = i * bytes_per_line;
+        hex_text.push_str(&format!("{offset:08X}  "));
+        for j in 0..bytes_per_line {
+            if offset + j < data.len() {
+                hex_text.push_str(&format!("{:02X} ", data[offset + j]));
+            } else {
+                hex_text.push_str("   ");
+            }
+            if j == 7 {
+                hex_text.push(' ');
+            }
+        }
+        hex_text.push_str(" |");
+        for j in 0..bytes_per_line {
+            if offset + j < data.len() {
+                let b = data[offset + j];
+                hex_text.push(if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                });
+            }
+        }
+        hex_text.push_str("|\n");
+    }
+    if lines > max_lines {
+        hex_text.push_str(&format!("... ({} more lines)\n", lines - max_lines));
+    }
+    hex_text
+}
+
+/// File Info's facts about `entry` as `Label: value` lines; HFS and ProDOS editors show type and creator themselves.
+pub fn entry_facts(
+    entry: &FileEntry,
+    suppress_type_creator: bool,
+    id_names: Option<&IdNameMap>,
+) -> Vec<String> {
+    let mut facts = vec![format!("Size: {}", entry.size_string())];
+    if let Some(modified) = entry.modified.as_ref().filter(|m| !m.is_empty()) {
+        facts.push(format!("Modified: {modified}"));
+    }
+    if !suppress_type_creator {
+        facts.extend(entry.type_code_display().map(|tc| format!("Type: {tc}")));
+        let creator = entry.creator_code_display();
+        facts.extend(creator.map(|cc| format!("Creator: {cc}")));
+    }
+    if let Some(rsrc) = entry.resource_fork_size.filter(|r| *r > 0) {
+        facts.push(format!("Rsrc: {}", disk_core::display::format_size(rsrc)));
+    }
+    if let Some(mode_str) = entry.mode_string() {
+        facts.push(format!("Permissions: {mode_str}"));
+    }
+    if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
+        // The image's own /etc/passwd and /etc/group name them when it has any.
+        let owner = match id_names {
+            Some(names) => names.format_owner(uid, gid),
+            None => format!("{uid}:{gid}"),
+        };
+        facts.push(format!("Owner: {owner}"));
+    }
+    if let Some(target) = &entry.symlink_target {
+        facts.push(format!("Target: {target}"));
+    }
+    if let Some(stype) = &entry.special_type {
+        facts.push(format!("Type: {stype}"));
+    }
+    facts.push(format!("Path: {}", entry.path));
+    facts
 }
 
 /// Read `entry`'s extras; `at_root` asks for the SquashFS budget (it walks the whole tree).
@@ -217,6 +295,30 @@ pub fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hex_dump_has_offsets_an_ascii_column_and_a_line_cap() {
+        let dump = hex_dump(b"Hi\x00");
+        assert_eq!(dump.lines().count(), 1);
+        assert!(dump.starts_with("00000000  48 69 00 "), "{dump}");
+        assert!(dump.ends_with("|Hi.|\n"), "{dump}");
+        let long = hex_dump(&[0u8; 16 * 300]);
+        assert_eq!(long.lines().count(), 257);
+        assert!(long.ends_with("... (44 more lines)\n"), "{long}");
+    }
+
+    #[test]
+    fn facts_name_what_the_entry_carries_and_leave_type_to_an_editor() {
+        let mut e = FileEntry::new_file("f".into(), "/d/f".into(), 512, 0);
+        e.modified = Some(String::new());
+        e.type_code = Some(*b"TEXT");
+        let facts = entry_facts(&e, false, None);
+        assert!(facts.contains(&"Type: TEXT".to_string()), "{facts:?}");
+        assert_eq!(facts.last().map(String::as_str), Some("Path: /d/f"));
+        assert!(!facts.iter().any(|f| f.starts_with("Modified")));
+        let bare = entry_facts(&e, true, None);
+        assert!(!bare.iter().any(|f| f.starts_with("Type")), "{bare:?}");
+    }
 
     #[test]
     fn a_host_file_previews_up_to_the_cap() {

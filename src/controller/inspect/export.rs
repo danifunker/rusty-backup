@@ -121,6 +121,70 @@ pub fn per_partition_refusal(format: ExportFormat) -> Option<&'static str> {
     })
 }
 
+/// The Export window's opening line.
+pub const EXPORT_INTRO: &str = "Export partitions as disk image files.";
+pub const HFV_WHOLE_REFUSAL: &str = "HFV is a single classic-HFS volume with no partition table, \
+    so it is exported per-partition (one .hfv per HFS partition).";
+pub const SIZES_HINT: &str = "Minimum is the trim point: the imaged size of a compacted backup \
+    partition, or the last used byte of a live volume. The exported volume is resized in place \
+    to match. Anything smaller needs a Backup with shrink-to-minimum, which clones the volume.";
+pub const SECTOR_BY_SECTOR_WARNING: &str = "Warning: the source is a sector-by-sector backup. \
+    Re-exporting with new partition sizes drops the byte-for-byte preservation of free space and \
+    unrecognized filesystem regions - only smart-compact areas of recognized partitions carry \
+    over.";
+pub const PHYSICAL_REFUSAL: &str = "Physical Disk Export currently supports raw image file \
+    sources only. Backup folders, devices, and Clonezilla images aren't wired in yet.";
+
+pub const PFS3_SHRINK_TITLE: &str = "PFS3 shrink: volume will be rebuilt";
+/// The PFS3 rebuild's explanation, one line each.
+pub const PFS3_SHRINK_LINES: &[&str] = &[
+    "PFS3's allocator scatters blocks throughout the volume, so in-place trim can't free up \
+     space. The export pipeline will instead walk the source and rebuild a packed copy at the new \
+     size - limitations to be aware of:",
+    "  - PFS3 trashcan (deldir) contents are NOT preserved.",
+    "  - File data, directory tree, protection bits, comments, dates, softlinks, and hardlinks \
+     (both directions) ARE preserved.",
+    "  - Operation is slower than a verbatim copy: every file is read from the source and \
+     re-written to the destination.",
+    "  - Uses a tempfile for the rebuilt image; ensure your temp directory has enough free space \
+     for the target partition size.",
+];
+
+pub fn pfs3_affected(names: &[String]) -> String {
+    format!("Affected partitions: {}", names.join(", "))
+}
+
+/// A capped row's hover: the largest size its volume can grow to in place.
+pub fn max_size_hint(max_size: u64) -> String {
+    let max_mib = (max_size / (1024 * 1024)).max(1);
+    format!(
+        "HFS volumes are capped at 65535 allocation blocks. For this volume's block size, the \
+         maximum is {max_mib} MiB. Growing further requires reformatting."
+    )
+}
+
+/// The CHD estimate line, from [`ExportNotes::chd_estimate`].
+pub fn chd_estimate_line((total, scratch, output): (u64, u64, u64)) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "Estimated peak new disk usage: {} MiB (scratch {} MiB + output {} MiB). Available space \
+         is checked when you pick a destination.",
+        total / MIB,
+        scratch / MIB,
+        output / MIB
+    )
+}
+
+/// The caption over the After bar.
+pub fn after_caption(layout: &LayoutBar) -> String {
+    let total = |s: &[LayoutSegment]| s.iter().map(|x| x.size_bytes).sum::<u64>();
+    format!(
+        "After  ({} -> {}):",
+        super::format_size(total(&layout.current)),
+        super::format_size(total(&layout.after))
+    )
+}
+
 /// The Export window's choices; the window edits them in place.
 #[derive(Debug, Clone)]
 pub struct ExportSettings {
@@ -314,15 +378,21 @@ impl InspectController {
             .partitions
             .iter()
             .filter(|p| !p.is_extended_container && !p.is_logical);
-        let seg = |p: &crate::partition::PartitionInfo, size: u64| LayoutSegment {
+        let seg = |color_index, p: &crate::partition::PartitionInfo, size: u64| LayoutSegment {
             label: format!("Partition {}", p.index + 1),
             fs: p.type_name.clone(),
             size_bytes: size,
-            kind: SegmentKind::Partition,
+            kind: SegmentKind::Partition { color_index },
+            partition: Some(p.index),
         };
-        let current = parts.clone().map(|p| seg(p, p.size_bytes)).collect();
+        let current = parts
+            .clone()
+            .enumerate()
+            .map(|(i, p)| seg(i, p, p.size_bytes))
+            .collect();
         let after = parts
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let size = match self
                     .export
                     .settings
@@ -334,7 +404,7 @@ impl InspectController {
                     Some(c) if c.effective_size() != 0 => c.effective_size(),
                     _ => p.size_bytes,
                 };
-                seg(p, size)
+                seg(i, p, size)
             })
             .collect();
         LayoutBar { current, after }
@@ -417,6 +487,24 @@ impl InspectController {
     #[cfg(not(feature = "chd"))]
     fn chd_estimate(&self) -> Option<(u64, u64, u64)> {
         None
+    }
+
+    pub(super) fn set_export_size(
+        &mut self,
+        index: usize,
+        mode: crate::model::size_mode::SizeMode,
+        custom_mib: u32,
+    ) {
+        let configs = &mut self.export_settings_mut().configs;
+        let Some(cfg) = configs.iter_mut().find(|c| c.index == index) else {
+            return;
+        };
+        let was_custom = cfg.choice == crate::model::size_mode::SizeMode::Custom;
+        cfg.set_choice(mode);
+        // Switching into Custom starts at the minimum; only an edit inside Custom sets the size.
+        if was_custom && mode == crate::model::size_mode::SizeMode::Custom && custom_mib > 0 {
+            cfg.custom_size_mib = custom_mib;
+        }
     }
 
     /// The window's Export button: pick where it goes.

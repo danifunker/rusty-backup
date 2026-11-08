@@ -60,7 +60,77 @@ pub mod ids {
     pub const VHD_CANCEL: &str = "backup.vhd_cancel";
     pub const REMOTE_CONNECT: &str = "backup.remote_connect";
     pub const REMOTE_CLOSE: &str = "backup.remote_close";
+    pub const SOURCE_RECENT: &str = "backup.source_recent";
+    pub const SOURCE_DEVICE: &str = "backup.source_device";
+    pub const OPEN_IMAGE: &str = "backup.open_image";
+    pub const REMOTE_OPEN: &str = "backup.remote_open";
+    pub const REMOTE_ADDRESS: &str = "backup.remote_address";
+    pub const REMOTE_DRIVE: &str = "backup.remote_drive";
+    pub const CANCEL_SCAN: &str = "backup.cancel_scan";
+    pub const ROW_INCLUDE: &str = "backup.row_include";
+    pub const ROW_CALC_MIN: &str = "backup.row_calc_min";
+    pub const ROW_COMPACT: &str = "backup.row_compact";
+    pub const PICK_DESTINATION: &str = "backup.pick_destination";
+    pub const FORMAT: &str = "backup.format";
+    pub const CHECKSUM: &str = "backup.checksum";
+    pub const SECTOR_BY_SECTOR: &str = "backup.sector_by_sector";
+    pub const RESIZE: &str = "backup.resize";
+    pub const KEEP_SWAP: &str = "backup.keep_swap";
+    pub const SPLIT: &str = "backup.split";
+    pub const SPLIT_MIB: &str = "backup.split_mib";
+    pub const CHD_MODE: &str = "backup.chd_mode";
+    pub const CHD_HUNK: &str = "backup.chd_hunk";
+    pub const CHD_CODEC: &str = "backup.chd_codec";
+    pub const CANCEL_PENDING: &str = "backup.cancel_pending";
+    pub const VHD_LAYOUT: &str = "backup.vhd_layout";
+    pub const VHD_SIZE: &str = "backup.vhd_size";
 }
+
+/// The longer words a shell puts beside a control, so every shell says the same thing.
+pub mod hints {
+    pub const FRAGMENTATION: &str = "Percent of files with data in more than one extent";
+    pub const COMPACT: &str = "Compact Space re-emits every allocated fork back-to-back, \
+        closing the holes between files and producing a smaller backup. \
+        Drastically increases backup time - recommended only when the \
+        Min Size column shows meaningful savings vs. the in-place trim. \
+        Available for HFS+/HFSX today; other layout-preserving \
+        filesystems show the toggle as not implemented.";
+    pub const COMPACT_NOT_BUILT: &str = "Compact Space not yet implemented for this filesystem";
+    pub const CALC_MIN: &str = "Compute minimum size (requires a filesystem walk)";
+    pub const CLOSE_SOURCE: &str = "Release the selected disk / image and clear the partition \
+        selection so the drive can be safely removed";
+    pub const CLEAR_REMOTE: &str = "Disconnect / clear the remote source";
+    pub const REMOTE: &str = "Back up a physical drive on a remote machine running \
+        `rb-cli serve` (pulled over the network)";
+    pub const CHD_OUTPUT: &str = "Output: single CHD file (chdman/MAME compatible).";
+    pub const SECTOR_BY_SECTOR: &str = "Sector-by-sector copy (includes all blank space)";
+    pub const RESIZE: &str = "Resize partitions to minimum size";
+    pub const KEEP_SWAP: &str = "Keep swap/page-file content (don't exclude)";
+    pub const KEEP_SWAP_HOVER: &str = "By default a FAT volume's swap/page files (WIN386.SWP, \
+        386SPART.PAR, PAGEFILE.SYS, HIBERFIL.SYS, SWAPPER.DAT) are \
+        imaged full-size but zeroed -- they reinitialize on boot, \
+        and the codec crushes the zeros. Check to image them as-is.";
+    pub const NOT_WITH_SECTOR_COPY: &str = "(not available with sector-by-sector copy)";
+    pub const NOT_FOR_VHD: &str = "(not available for VHD)";
+    pub const WAITING_FOR_MINIMUMS: &str = "Waiting for minimum-size calculations to finish";
+    pub const NO_REMOTE_DRIVES: &str =
+        "No physical drives reported. The daemon may need to run as root.";
+    pub const REMOTE_ADDRESS: &str = "192.168.1.50:7341";
+}
+
+/// The output formats the tab offers; DVD CHD is the Optical tab's, as this tab backs up hard disks.
+pub const FORMATS: [(CompressionType, &str); 4] = [
+    (CompressionType::Chd, "CHD (Hard Disk)"),
+    (CompressionType::Vhd, "VHD"),
+    (CompressionType::Zstd, "zstd"),
+    (CompressionType::None, "None"),
+];
+
+/// The checksums the tab offers.
+pub const CHECKSUMS: [(ChecksumType, &str); 2] = [
+    (ChecksumType::Sha256, "SHA-256"),
+    (ChecksumType::Crc32, "CRC32"),
+];
 
 /// The CHD codec and hunk choice the shell's options control holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +444,22 @@ impl BackupController {
         }
     }
 
+    /// The closed source picker's text; a device row comes from the list on screen.
+    pub fn source_label(&self, devices: &[DiskDevice]) -> String {
+        if let Some(d) = self.remote_label() {
+            format!("Remote: {d}")
+        } else if let Some(path) = self.image_path() {
+            format!("Image: {}", path.display())
+        } else if let Some(idx) = self.device_slot() {
+            devices
+                .get(idx)
+                .map(|d| d.display_name())
+                .unwrap_or_else(|| "Unknown".into())
+        } else {
+            "Select a device or image...".into()
+        }
+    }
+
     /// A device or image is selected (a remote drive is not counted).
     pub fn has_local_source(&self) -> bool {
         self.source.is_some()
@@ -439,6 +525,14 @@ impl BackupController {
 
     pub fn load_error(&self) -> Option<&str> {
         self.found.load_error.as_deref()
+    }
+
+    /// "Partition table: x (n partitions)", once a table is known.
+    pub fn table_line(&self) -> Option<String> {
+        let desc = self.table_desc()?;
+        let n = self.partition_count();
+        let plural = if n == 1 { "" } else { "s" };
+        Some(format!("Partition table: {desc} ({n} partition{plural})"))
     }
 
     pub fn selected_count(&self) -> usize {
@@ -510,6 +604,11 @@ impl BackupController {
         self.run.running()
     }
 
+    /// Cancel was asked for and the job has not stopped yet.
+    pub fn cancelling(&self) -> bool {
+        self.run.cancelling()
+    }
+
     /// The shared progress bar's content, while a backup or VHD export runs.
     pub fn progress(&self) -> Option<BackupBar> {
         self.run.bar()
@@ -549,12 +648,33 @@ impl BackupController {
         self.has_partitions() || self.found.load_error.is_some()
     }
 
+    /// The scan button's label and hover, by whether the device was read.
+    pub fn scan_button(&self) -> (&'static str, &'static str) {
+        if self.device_scanned() {
+            (
+                "Reload partition info",
+                "Read the partition table again, e.g. after swapping the card in this reader",
+            )
+        } else {
+            (
+                "Load partition info",
+                "Read the partition table from the selected device (may prompt for administrator credentials)",
+            )
+        }
+    }
+
+    /// The Start button's label.
+    pub fn start_label(&self) -> &'static str {
+        if self.start_pending() {
+            "Computing minimum sizes..."
+        } else {
+            "Start Backup"
+        }
+    }
+
     /// Start Backup is enabled (the shell adds its own checks, such as valid CHD options).
     pub fn can_start(&self) -> bool {
-        !self.run.running()
-            && !self.run.pending_start
-            && self.src.idle()
-            && self.validate().is_ok()
+        !self.run.running() && !self.run.pending_start && self.src.idle() && self.validate().is_ok()
     }
 
     /// Why Start Backup cannot run now, or `Ok`.

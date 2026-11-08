@@ -5,13 +5,15 @@ use std::path::Path;
 
 use super::source::finished;
 use super::{
-    AlignmentChoice, ExpandPlan, LayoutFit, NewDiskChoice, NewTableType, Picked, PlanSegment,
-    RestoreController, RestoreMode, RowCaveat, SizeRow, Target, TargetPartition, TargetSlot,
+    AlignmentChoice, Caveat, CaveatLevel, ExpandPlan, ExpandPreview, LayoutFit, NewDiskChoice,
+    NewTableType, Picked, PlanSegment, RestoreController, RestoreMode, RowCaveat, SizeRow, Target,
+    TargetPartition, TargetSlot,
 };
 use crate::device::{DeviceIdentity, DiskDevice};
 use crate::model::job::{Job, Snapshot};
 use crate::model::source_scan::ScanFailure;
 use crate::partition::PartitionInfo;
+use disk_core::display::format_size;
 
 /// A target scan's result: the partitions and table name, or why it failed.
 type TargetScan = Result<(Vec<PartitionInfo>, String), ScanFailure>;
@@ -109,7 +111,7 @@ impl RestoreController {
         self.targets.target(slot).image.as_deref()
     }
 
-    /// "Refresh Devices" replaced the list: another disk (or none) may now sit at a target's row.
+    /// "Refresh Devices" replaced the list: a target follows its own disk, and never another one.
     pub fn reconcile_devices(&mut self, devices: &[DiskDevice]) {
         if self.is_running() {
             return;
@@ -123,15 +125,21 @@ impl RestoreController {
             let Some(picked) = &t.device else {
                 continue;
             };
-            let now = devices.get(picked.row);
-            if now.map(DiskDevice::identity) == Some(picked.device.identity()) {
+            if devices.get(picked.row).map(DiskDevice::identity) == Some(picked.device.identity()) {
                 continue;
             }
-            let row = picked.row;
-            t.device = now.map(|d| Picked {
+            let identity = picked.device.identity();
+            let moved = devices.iter().position(|d| d.identity() == identity);
+            let gone = picked.device.display_name();
+            t.device = moved.map(|row| Picked {
                 row,
-                device: d.clone(),
+                device: devices[row].clone(),
             });
+            if moved.is_none() {
+                self.warn(format!(
+                    "{gone} is no longer listed, so it is no longer the restore target."
+                ));
+            }
         }
         // The old disk's scan must not pick a partition on the new one.
         let now = self
@@ -236,6 +244,94 @@ impl RestoreController {
             self.partition_sizes(is_device).as_slice(),
             target,
         ))
+    }
+
+    /// "Target: x | Source was: y" under a full-disk target, once both are known.
+    pub fn target_readout(&self) -> Option<Caveat> {
+        let source = self.source_size()?;
+        let target = self.target_size();
+        if target == 0 {
+            return None;
+        }
+        let small = target < source;
+        Some(Caveat {
+            level: if small {
+                CaveatLevel::Warning
+            } else {
+                CaveatLevel::Info
+            },
+            text: format!(
+                "Target: {} | Source was: {}{}",
+                format_size(target),
+                format_size(source),
+                if small { " (target is smaller!)" } else { "" },
+            ),
+        })
+    }
+
+    /// The size total and the engine's layout check, under the size rows; Blocked means it fails.
+    pub fn size_notes(&self) -> Vec<Caveat> {
+        let target = self.target_size();
+        if target == 0 {
+            return Vec::new();
+        }
+        let note = |level, text| Caveat { level, text };
+        let total = self.fixed_total();
+        let level = if total <= target {
+            CaveatLevel::Info
+        } else {
+            CaveatLevel::Blocked
+        };
+        let mut notes = vec![note(
+            level,
+            format!(
+                "Total: {} / {} available",
+                format_size(total),
+                format_size(target),
+            ),
+        )];
+        // Sizes adding up is not the layout fitting: Original alignment keeps every start.
+        match self.layout_fit() {
+            Some(LayoutFit::Refused { message, original }) => {
+                notes.push(note(
+                    CaveatLevel::Blocked,
+                    format!("This layout will not fit: {message}"),
+                ));
+                if original {
+                    notes.push(note(
+                        CaveatLevel::Warning,
+                        "Original alignment keeps every partition at its \
+                         original position, so shrinking only leaves gaps. \
+                         Choose 1 MB boundaries or Custom to repack them \
+                         from the start of the disk."
+                            .to_string(),
+                    ));
+                }
+            }
+            Some(LayoutFit::Overrun { end, target }) => notes.push(note(
+                CaveatLevel::Blocked,
+                format!(
+                    "Layout ends at {} but the target holds {}",
+                    format_size(end),
+                    format_size(target),
+                ),
+            )),
+            Some(LayoutFit::Fits) | None => {}
+        }
+        notes
+    }
+
+    /// The warning under a target that is the system disk.
+    pub fn system_disk_warning(&self, slot: TargetSlot) -> Option<&'static str> {
+        if !self.device(slot).is_some_and(|d| d.is_system) {
+            return None;
+        }
+        Some(match slot {
+            TargetSlot::SinglePartition => "WARNING: This is a system disk!",
+            TargetSlot::FullDisk | TargetSlot::NewDisk => {
+                "WARNING: This is a system disk! Restoring will destroy your OS."
+            }
+        })
     }
 
     /// The backup lost its Mac driver, so the form offers the bundled one.
@@ -343,6 +439,40 @@ impl RestoreController {
     /// The bytes the free space adds to an image target.
     pub fn expand_free_bytes(&self) -> u64 {
         self.targets.expand.free_bytes(self.targets.full.is_device)
+    }
+
+    /// The padded target's size change, in words.
+    pub fn expand_size_line(&self) -> String {
+        let source = self.source_size().unwrap_or(0);
+        let total = source.saturating_add(self.expand_free_bytes());
+        format!(
+            "(target size {} -> {})",
+            format_size(source),
+            format_size(total),
+        )
+    }
+
+    /// The before and after bars of the padded target.
+    pub fn expand_preview(&self) -> ExpandPreview {
+        let current = self.plan_segments();
+        let source = self.source_size().unwrap_or(0);
+        let added = self.expand_free_bytes();
+        let mut after = current.clone();
+        let mut free_tail = added;
+        if added > 0 && self.targets.expand.extend_last {
+            if let Some(last) = after.last_mut() {
+                last.size_bytes = last.size_bytes.saturating_add(added);
+                free_tail = 0;
+            }
+        }
+        let total = source.saturating_add(added).max(1);
+        ExpandPreview {
+            current,
+            after,
+            free_tail,
+            added,
+            scale: (source as f64 / total as f64) as f32,
+        }
     }
 
     /// The backup's top-level partitions, for the before / after preview bars.

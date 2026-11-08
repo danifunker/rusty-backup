@@ -99,7 +99,7 @@ impl InspectController {
         if let Some(path) = self.disk_path() {
             self.info(format!(
                 "Browsing partition {} from {} at offset {}",
-                index,
+                index + 1,
                 path.display(),
                 offset,
             ));
@@ -172,7 +172,8 @@ impl InspectController {
         match commander_source::session_for_backup_partition(folder.as_path(), &meta, index) {
             Ok(session) => {
                 self.info(format!(
-                    "Browsing partition {index} from {} backup",
+                    "Browsing partition {} from {} backup",
+                    index + 1,
                     meta.compression_type
                 ));
                 self.open_browse(session, edit, None);
@@ -211,7 +212,10 @@ impl InspectController {
         };
         match self.browse.caches.resolve(index, &open) {
             PartcloneLookup::Ready(cache) => {
-                self.info(format!("Browsing partition {index} from cached metadata"));
+                self.info(format!(
+                    "Browsing partition {} from cached metadata",
+                    index + 1
+                ));
                 self.open_browse(
                     BrowseSession::partclone(cache, ptype),
                     BrowseEdit::ReadOnly,
@@ -257,7 +261,8 @@ impl InspectController {
             };
             if fresh {
                 self.info(format!(
-                    "Browsing partition {index} from cached seekable file"
+                    "Browsing partition {} from cached seekable file",
+                    index + 1
                 ));
                 let session = BrowseSession {
                     source_path: Some(cache),

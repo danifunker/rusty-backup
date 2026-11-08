@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, ids, parse_size_field, BuildDiskAction,
-    BuildDiskController, DiskKind, FormatOptions, FormatTarget, FsKind, FsOption, MacDriver,
-    PresetKind, RowContent, Step,
+    containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
+    BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
+    FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
+    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -59,6 +60,7 @@ impl BuildDiskTab {
     }
 
     fn poll(&mut self, ctx: &mut TabContext, _progress: &mut ProgressState) {
+        self.ctl.reconcile_devices(ctx.devices);
         let fx = self.ctl.tick();
         self.pending_fx.extend(fx);
         for (level, msg) in self.ctl.take_log() {
@@ -189,20 +191,7 @@ impl BuildDiskTab {
         ui.label("What are you building?");
         ui.add_space(4.0);
         for kind in DiskKind::ALL {
-            let hint = match kind {
-                DiskKind::Partitioned => {
-                    "A partition table (MBR, GPT, APM, RDB, SGI, Sun, NeXT, ...) with \
-                     partitions you size, each formatted, filled from an image, or left empty."
-                }
-                DiskKind::Volume => {
-                    "One filesystem across the whole disk with no partition table: a floppy, \
-                     a superfloppy, or a bare volume for an emulator."
-                }
-                DiskKind::Preset => {
-                    "A ready-to-boot disk in a fixed shape: a Sharp X68000 Human68k disk, or \
-                     an SGI IRIX disk with its volume header and an EFS root."
-                }
-            };
+            let hint = kind.hint();
             if ui
                 .radio(self.ctl.kind() == kind, kind.label())
                 .on_hover_text(hint)
@@ -217,14 +206,17 @@ impl BuildDiskTab {
 
     fn output_step(&mut self, ui: &mut egui::Ui, ctx: &TabContext) {
         let is_device = self.ctl.output_is_device();
+        let cd = self.ctl.kind() == DiskKind::Cd;
         ui.horizontal(|ui| {
             if ui.radio(!is_device, "Image file").clicked() {
                 self.act(BuildDiskAction::SetOutputIsDevice(false));
             }
-            if ui
-                .radio(is_device, "Physical disk")
-                .on_hover_text("An SD or CF card in a reader, a USB stick, or another disk")
-                .clicked()
+            // A CD-ROM image is burned from the file, never written to a disk.
+            if !cd
+                && ui
+                    .radio(is_device, "Physical disk")
+                    .on_hover_text(hints::DEVICE)
+                    .clicked()
             {
                 self.act(BuildDiskAction::SetOutputIsDevice(true));
             }
@@ -241,6 +233,9 @@ impl BuildDiskTab {
                     self.act(BuildDiskAction::PickOutputImage);
                 }
             });
+            if cd {
+                return;
+            }
             let cur = self.ctl.container();
             let mut picked = None;
             ui.horizontal(|ui| {
@@ -255,10 +250,7 @@ impl BuildDiskTab {
                         }
                     })
                     .response
-                    .on_hover_text(
-                        "The disk is built raw, then encoded into this container. The file \
-                         name's extension picks one when you save.",
-                    );
+                    .on_hover_text(hints::CONTAINER);
             });
             if let Some(c) = picked {
                 self.act(BuildDiskAction::SetContainer(c));
@@ -300,12 +292,91 @@ impl BuildDiskTab {
             self.act(BuildDiskAction::SelectDevice { row, device });
         }
         ui.label(
-            egui::RichText::new(
-                "Building erases everything on the device. The disk is built at the device's \
-                 own size.",
-            )
-            .color(super::theme::warning(ui.visuals())),
+            egui::RichText::new(hints::DEVICE_WARNING).color(super::theme::warning(ui.visuals())),
         );
+    }
+
+    /// The CD-ROM's layout, name, size and the folder it is filled from.
+    fn cd_step(&mut self, ui: &mut egui::Ui) {
+        let mut cd = self.ctl.cd().clone();
+        let before = cd.clone();
+        for l in CdLayout::ALL {
+            ui.radio_value(&mut cd.layout, l, l.label())
+                .on_hover_text(l.hint());
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Volume name:");
+            ui.add(egui::TextEdit::singleline(&mut cd.name).desired_width(200.0));
+        });
+        let mut auto = self.ctl.cd_auto_size();
+        if ui
+            .checkbox(&mut auto, "Size to the folder")
+            .on_hover_text(hints::CD_AUTO_SIZE)
+            .changed()
+        {
+            let text = if auto { CD_AUTO_SIZE } else { "600M" };
+            self.act(BuildDiskAction::SetSize(text.to_string()));
+        }
+        if !auto {
+            self.size_row(ui, Some(hints::CD_SIZE.to_string()));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Fill from:");
+            match &cd.from_dir {
+                Some(d) => ui.label(d.display().to_string()),
+                None => ui.label(egui::RichText::new("(a blank disc)").weak()),
+            };
+            if ui
+                .button("Choose Folder...")
+                .on_hover_text(hints::CD_FOLDER)
+                .clicked()
+            {
+                self.act(BuildDiskAction::PickCdFolder);
+            }
+            if cd.from_dir.is_some() && ui.small_button("Clear").clicked() {
+                cd.from_dir = None;
+            }
+        });
+        let mut toggled = Vec::new();
+        for row in self.ctl.cd_options() {
+            let mut on = row.on;
+            let enabled = row.unavailable.is_none();
+            let resp = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, row.option.label()));
+            if let Some(why) = row.unavailable {
+                resp.on_disabled_hover_text(why);
+            } else if on != row.on {
+                toggled.push((row.option, on));
+            }
+            help(ui, row.option.hint());
+        }
+        let sidecars = self.ctl.cd_sidecars();
+        let mut picked = sidecars;
+        ui.horizontal(|ui| {
+            ui.label("macOS ._ files:");
+            ui.add_enabled_ui(self.ctl.cd_sidecars_unavailable().is_none(), |ui| {
+                egui::ComboBox::from_id_salt(ids::CD_SIDECARS)
+                    .selected_text(sidecars.label())
+                    .show_ui(ui, |ui| {
+                        for &c in CdSidecars::choices(cd.layout) {
+                            ui.selectable_value(&mut picked, c, c.label())
+                                .on_hover_text(c.hint());
+                        }
+                    })
+            })
+            .response
+            .on_disabled_hover_text(self.ctl.cd_sidecars_unavailable().unwrap_or_default());
+        });
+        help(ui, &format!("{} {}", hints::CD_SIDECARS, sidecars.hint()));
+        if cd != before {
+            self.act(BuildDiskAction::SetCd(cd));
+        }
+        for (option, on) in toggled {
+            self.act(BuildDiskAction::SetCdOption(option, on));
+        }
+        if picked != sidecars {
+            self.act(BuildDiskAction::SetCdSidecars(picked));
+        }
     }
 
     fn size_row(&mut self, ui: &mut egui::Ui, hint: Option<String>) {
@@ -328,7 +399,7 @@ impl BuildDiskTab {
                         .desired_width(90.0)
                         .id(egui::Id::unique(ids::SIZE)),
                 )
-                .on_hover_text("Accepts K / M / G suffixes, e.g. 512M or 2G.")
+                .on_hover_text(hints::SIZE)
                 .changed()
             {
                 self.act(BuildDiskAction::SetSize(text));
@@ -349,6 +420,7 @@ impl BuildDiskTab {
 
     fn disk_step(&mut self, ui: &mut egui::Ui) {
         match self.ctl.kind() {
+            DiskKind::Cd => self.cd_step(ui),
             DiskKind::Preset => {
                 let mut p = self.ctl.preset().clone();
                 let before = p.clone();
@@ -371,11 +443,11 @@ impl BuildDiskTab {
                             ui.label("System disk:");
                             match &p.x68k_system_disk {
                                 Some(d) => ui.label(d.display().to_string()),
-                                None => ui.label(egui::RichText::new("(none: seed files)").weak()),
+                                None => ui.label(egui::RichText::new(hints::NO_SYSTEM_DISK).weak()),
                             };
                             if ui
                                 .button("Choose...")
-                                .on_hover_text("A Human68k system floppy cloned into partition 1")
+                                .on_hover_text(hints::SYSTEM_DISK)
                                 .clicked()
                             {
                                 self.act(BuildDiskAction::PickSystemDisk);
@@ -407,22 +479,14 @@ impl BuildDiskTab {
                         self.act(BuildDiskAction::SetVolumeFs(k.unwrap_or(fs)));
                     }
                 });
-                let caps = fs.caps();
-                if caps.fixed_size {
-                    ui.label(
-                        egui::RichText::new("This filesystem has a fixed size; no size to choose.")
-                            .weak(),
-                    );
-                    if self.ctl.output_is_device() {
-                        self.size_row(ui, None);
+                match self.ctl.volume_size_range() {
+                    Some(hint) => self.size_row(ui, Some(hint)),
+                    None => {
+                        ui.label(egui::RichText::new(hints::FIXED_SIZE).weak());
+                        if self.ctl.output_is_device() {
+                            self.size_row(ui, None);
+                        }
                     }
-                } else {
-                    let hint = format!(
-                        "{} to {}",
-                        format_size(caps.min_size),
-                        format_size(caps.max_buildable())
-                    );
-                    self.size_row(ui, Some(hint));
                 }
             }
             DiskKind::Partitioned => {
@@ -438,11 +502,7 @@ impl BuildDiskTab {
                     }
                     if ui
                         .radio(donor.is_some(), "An existing disk's layout...")
-                        .on_hover_text(
-                            "Take the table, its special partitions and their contents from \
-                             another disk image, at this disk's size. A label (SGI, Sun, NeXT, \
-                             RDB, ...) keeps its volume header or boot blocks verbatim.",
-                        )
+                        .on_hover_text(hints::DONOR)
                         .clicked()
                     {
                         self.act(BuildDiskAction::PickDonor);
@@ -476,10 +536,7 @@ impl BuildDiskTab {
                             .desired_width(80.0)
                             .hint_text(view.align_hint.as_str()),
                     )
-                    .on_hover_text(
-                        "Partition starts are rounded up to this. Blank uses the table \
-                         default. Accepts 1M / 63s (sectors).",
-                    );
+                    .on_hover_text(hints::ALIGN);
                     if align != view.align_text {
                         self.act(BuildDiskAction::Table(BuildAction::SetAlign(align)));
                     }
@@ -543,7 +600,7 @@ impl BuildDiskTab {
                             .desired_width(70.0)
                             .id(egui::Id::unique(("bd_size", i))),
                     )
-                    .on_hover_text("20M / 1G / bytes, or `rest` for whatever is left");
+                    .on_hover_text(hints::ROW_SIZE);
                     if size != row.size_text {
                         acts.push(BuildDiskAction::Table(BuildAction::SetRowSize {
                             row: i,
@@ -552,8 +609,7 @@ impl BuildDiskTab {
                     }
                     let mut ty = row.type_text.clone();
                     if view.fixed {
-                        ui.label(ty.as_str())
-                            .on_hover_text("From the donor's label; the label keeps it");
+                        ui.label(ty.as_str()).on_hover_text(hints::ROW_FIXED_TYPE);
                     } else {
                         super::partition_editor_modal::type_field(
                             ui,
@@ -585,9 +641,9 @@ impl BuildDiskTab {
                     if let Some(only_one) = view.boot {
                         let mut on = row.bootable;
                         let hint = if only_one {
-                            "The MBR active flag: the BIOS boots this partition"
+                            hints::BOOT_MBR
                         } else {
-                            "The RDB bootable flag: Kickstart may boot this partition"
+                            hints::BOOT_RDB
                         };
                         if ui.checkbox(&mut on, "").on_hover_text(hint).changed() {
                             acts.push(BuildDiskAction::Table(BuildAction::SetRowBootable {
@@ -612,7 +668,7 @@ impl BuildDiskTab {
                             let copying = content == RowContent::Copy;
                             if ui
                                 .selectable_label(copying, "Copy")
-                                .on_hover_text("The donor partition's bytes, verbatim")
+                                .on_hover_text(hints::ROW_COPY)
                                 .clicked()
                                 && !copying
                             {
@@ -644,9 +700,7 @@ impl BuildDiskTab {
                         }
                         if ui
                             .add_enabled(!probing, egui::Button::new("Image...").small())
-                            .on_hover_text(
-                                "Pour an image into this partition after the table is written",
-                            )
+                            .on_hover_text(hints::ROW_IMAGE)
                             .clicked()
                         {
                             acts.push(BuildDiskAction::Table(BuildAction::PickRowSource(i)));
@@ -712,10 +766,7 @@ impl BuildDiskTab {
                 for t in self.ctl.handlers_missing() {
                     if ui
                         .button(format!("Add {t} handler..."))
-                        .on_hover_text(
-                            "The AmigaDOS load file, e.g. L:PFS3 or L:SmartFilesystem; the \
-                             strap loads it from the RDB",
-                        )
+                        .on_hover_text(hints::HANDLER)
                         .clicked()
                     {
                         acts.push(BuildDiskAction::AddHandler(t));
@@ -732,10 +783,7 @@ impl BuildDiskTab {
                     let label = d.label();
                     if ui
                         .radio(cur == d, label)
-                        .on_hover_text(
-                            "A Mac mounts an APM disk only through a driver on the disk. \
-                             Bundled uses a donor's own driver when it has one",
-                        )
+                        .on_hover_text(hints::MAC_DRIVER)
                         .clicked()
                     {
                         acts.push(BuildDiskAction::SetMacDriver(d));
@@ -911,7 +959,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
             .on_hover_text(format!("Up to {} bytes", t.caps.label_max));
             ui.end_row();
         }
-        for opt in t.caps.options {
+        for opt in t.fields() {
             match opt {
                 FsOption::BlockSize => {
                     ui.label("Block size:");
@@ -920,7 +968,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                         egui::Id::unique(("bd_bs", key)),
                         o.block_size.map(u64::from),
                     ) {
-                        o.block_size = v.map(|v| v.min(u64::from(u32::MAX)) as u32);
+                        OptionEdit::BlockSize(v).apply(&mut o);
                     }
                 }
                 FsOption::BigEndian => {
@@ -930,7 +978,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                 FsOption::Fat32 => {
                     ui.label("FAT type:");
                     ui.checkbox(&mut o.fat32, "FAT32 whatever the size")
-                        .on_hover_text("An EFI System Partition is FAT32");
+                        .on_hover_text(hints::FAT32);
                 }
                 FsOption::CaseSensitive => {
                     ui.label("Case:");
@@ -938,11 +986,12 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                 }
                 FsOption::AffsVariant => {
                     ui.label("Variant:");
+                    let cur = AFFS_VARIANTS.iter().find(|v| v.0 == o.affs_variant);
                     egui::ComboBox::from_id_salt(("bd_affs", key))
-                        .selected_text(affs_variant_name(o.affs_variant))
+                        .selected_text(cur.map_or("?", |v| v.1))
                         .show_ui(ui, |ui| {
-                            for v in 0..=7u8 {
-                                ui.selectable_value(&mut o.affs_variant, v, affs_variant_name(v));
+                            for (v, name) in AFFS_VARIANTS {
+                                ui.selectable_value(&mut o.affs_variant, v, name);
                             }
                         });
                 }
@@ -977,10 +1026,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                 FsOption::Inodes => {
                     ui.label("Inodes:");
                     if let Some(v) = size_option(ui, egui::Id::unique(("bd_ino", key)), o.inodes) {
-                        o.inodes = v;
-                        if v.is_some() {
-                            o.bytes_per_inode = None;
-                        }
+                        OptionEdit::Inodes(v).apply(&mut o);
                     }
                 }
                 FsOption::BytesPerInode => {
@@ -988,10 +1034,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                     if let Some(v) =
                         size_option(ui, egui::Id::unique(("bd_bpi", key)), o.bytes_per_inode)
                     {
-                        o.bytes_per_inode = v;
-                        if v.is_some() {
-                            o.inodes = None;
-                        }
+                        OptionEdit::BytesPerInode(v).apply(&mut o);
                     }
                 }
                 FsOption::ClusterSize => {
@@ -1001,7 +1044,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                         egui::Id::unique(("bd_cl", key)),
                         o.cluster_bytes.map(u64::from),
                     ) {
-                        o.cluster_bytes = v.map(|v| v.min(u64::from(u32::MAX)) as u32);
+                        OptionEdit::ClusterSize(v).apply(&mut o);
                     }
                 }
                 FsOption::SectorSize => {
@@ -1009,7 +1052,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                     egui::ComboBox::from_id_salt(("bd_ss", key))
                         .selected_text(o.sector_size.unwrap_or(512).to_string())
                         .show_ui(ui, |ui| {
-                            for s in [512u32, 1024, 2048, 4096] {
+                            for s in SECTOR_SIZES {
                                 if ui
                                     .selectable_label(
                                         o.sector_size.unwrap_or(512) == s,
@@ -1017,7 +1060,7 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                                     )
                                     .clicked()
                                 {
-                                    o.sector_size = (s != 512).then_some(s);
+                                    OptionEdit::SectorSize(s).apply(&mut o);
                                 }
                             }
                         });
@@ -1030,17 +1073,11 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
     (o != t.opts).then_some(o)
 }
 
-fn affs_variant_name(v: u8) -> &'static str {
-    match v {
-        0 => "OFS (DOS\\0)",
-        1 => "FFS (DOS\\1)",
-        2 => "OFS international (DOS\\2)",
-        3 => "FFS international (DOS\\3)",
-        4 => "OFS dir cache (DOS\\4)",
-        5 => "FFS dir cache (DOS\\5)",
-        6 => "OFS long names (DOS\\6)",
-        _ => "FFS long names (DOS\\7)",
-    }
+/// An option's plain-language help, indented under it.
+fn help(ui: &mut egui::Ui, text: &str) {
+    ui.indent(text, |ui| {
+        ui.label(egui::RichText::new(text).small().weak());
+    });
 }
 
 #[cfg(test)]

@@ -299,16 +299,15 @@ fn a_refreshed_list_drops_the_old_disks_scan() {
         row: 0,
         device: a.clone(),
     });
-    ctl.reconcile_devices(&[a]);
+    ctl.reconcile_devices(std::slice::from_ref(&a));
     assert_eq!(ctl.device_row(TargetSlot::SinglePartition), Some(0));
+    ctl.reconcile_devices(&[b.clone(), a.clone()]);
+    assert_eq!(ctl.device_row(TargetSlot::SinglePartition), Some(1));
     ctl.reconcile_devices(std::slice::from_ref(&b));
-    assert_eq!(
-        ctl.device(TargetSlot::SinglePartition)
-            .map(|d| d.path.clone()),
-        Some(b.path)
+    assert!(
+        ctl.device(TargetSlot::SinglePartition).is_none(),
+        "a write target never becomes the disk that took its row"
     );
-    ctl.reconcile_devices(&[]);
-    assert!(ctl.device(TargetSlot::SinglePartition).is_none());
 }
 
 /// A 16 MiB HFS volume at 512-byte blocks on an MBR disk, backed up through the Backup controller.
@@ -378,6 +377,9 @@ fn caveats_follow_the_size_and_a_volume_past_its_limit_cannot_start() {
     assert!(ctl.size_caveats().is_empty(), "nothing to say at 16 MiB");
     assert!(ctl.validate().is_ok());
 
+    // Room in the image, so only the volume's own limits are in play.
+    ctl.apply(RestoreAction::SetExpand(true));
+    ctl.apply(RestoreAction::SetExpandMib(6 * 1024));
     custom_size(&mut ctl, 3 * 1024);
     let lines: Vec<String> = ctl.size_caveats().iter().map(|c| c.line()).collect();
     assert!(lines.iter().any(|l| l.contains("rebuilt")), "{lines:?}");
@@ -521,4 +523,197 @@ fn a_backup_that_lost_its_mac_driver_offers_the_bundled_one() {
     assert!(says(&ctl, "bundled Apple SCSI driver"));
     ctl.apply(RestoreAction::SetInstallMacDriver(false));
     assert!(says(&ctl, "cannot start up"));
+}
+
+/// A loaded backup with an image target, ready to ask.
+fn ready_to_ask(dir: &Path) -> (RestoreController, PathBuf) {
+    let (_, folder) = backup_of(dir);
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    ctl.apply(RestoreAction::SetTargetIsDevice(
+        TargetSlot::FullDisk,
+        false,
+    ));
+    let target = dir.join("restored.img");
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(target.clone()),
+    ));
+    (ctl, target)
+}
+
+fn answer(ctl: &mut RestoreController, yes: bool) {
+    ctl.apply(RestoreAction::Confirmed {
+        purpose: purpose::RESTORE,
+        yes,
+    });
+}
+
+#[test]
+fn a_yes_with_no_question_out_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, target) = ready_to_ask(dir.path());
+    answer(&mut ctl, true);
+    assert!(!ctl.is_running());
+    ctl.apply(RestoreAction::Start);
+    answer(&mut ctl, false);
+    answer(&mut ctl, true);
+    assert!(!ctl.is_running());
+    assert!(!target.exists());
+}
+
+#[test]
+fn a_yes_only_counts_for_the_target_it_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctl, target) = ready_to_ask(dir.path());
+    assert_eq!(
+        ctl.write_target(),
+        Some(target.display().to_string()),
+        "the target on screen is the one the question names"
+    );
+    ctl.apply(RestoreAction::Start);
+    let other = dir.path().join("other.img");
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(other.clone()),
+    ));
+    answer(&mut ctl, true);
+    assert!(!ctl.is_running());
+    assert!(!other.exists() && !target.exists());
+    assert!(matches!(ctl.last_result(), Some(Err(e)) if e.contains("nothing was written")));
+}
+
+#[test]
+fn a_refresh_moving_the_device_voids_the_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fake_device(dir.path().join("a").as_path());
+    let b = fake_device(dir.path().join("b").as_path());
+    let (_, folder) = backup_of(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    ctl.apply(RestoreAction::SelectDevice {
+        slot: TargetSlot::FullDisk,
+        row: 0,
+        device: a,
+    });
+    ctl.apply(RestoreAction::Start);
+    ctl.reconcile_devices(std::slice::from_ref(&b));
+    assert_eq!(ctl.write_target(), None);
+    answer(&mut ctl, true);
+    assert!(!ctl.is_running());
+}
+
+#[test]
+fn nothing_starts_while_the_source_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = blank_fat(dir.path());
+    let mut ctl = controller();
+    ctl.apply(RestoreAction::SetMode(RestoreMode::NewDisk));
+    ctl.apply(RestoreAction::SetTargetIsDevice(TargetSlot::NewDisk, false));
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::NewDisk,
+        Some(dir.path().join("new.img")),
+    ));
+    ctl.apply(RestoreAction::OpenSourceImage(img));
+    assert!(!ctl.can_start(), "the volume's limits are not known yet");
+    ctl.wait_idle();
+    assert_eq!(ctl.validate(), Ok(()));
+}
+
+#[test]
+fn a_layout_the_engine_refuses_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = hfs_backup(dir.path());
+    let mut ctl = controller();
+    open(&mut ctl, folder);
+    ctl.apply(RestoreAction::SetTargetIsDevice(
+        TargetSlot::FullDisk,
+        false,
+    ));
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(dir.path().join("r.img")),
+    ));
+    assert!(ctl.can_start());
+    custom_size(&mut ctl, 64);
+    assert!(ctl
+        .size_notes()
+        .iter()
+        .any(|n| n.level == CaveatLevel::Blocked));
+    assert!(!ctl.can_start());
+}
+
+/// Two FAT volumes on an MBR disk, the second holding data past its first bytes.
+#[cfg(feature = "chd")]
+fn two_fat_disk(path: &Path) -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    let (first, second) = (MIB, 17 * MIB);
+    let mut disk = vec![0u8; (34 * MIB) as usize];
+    for (slot, start) in [first, second].into_iter().enumerate() {
+        let fat = fs_pc::fat::create_blank_fat(16 * MIB, Some("V")).unwrap();
+        disk[start as usize..start as usize + fat.len()].copy_from_slice(&fat);
+        let entry = 446 + slot * 16;
+        disk[entry + 4] = 0x06;
+        disk[entry + 8..entry + 12].copy_from_slice(&((start / 512) as u32).to_le_bytes());
+        disk[entry + 12..entry + 16].copy_from_slice(&((16 * MIB / 512) as u32).to_le_bytes());
+    }
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    std::fs::write(path, disk).unwrap();
+    (first, second)
+}
+
+#[cfg(feature = "chd")]
+#[test]
+fn a_resized_chd_comes_back_at_its_original_sizes() {
+    use crate::controller::backup::{
+        BackupAction, BackupController, BackupServices, CompressionType,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("two.img");
+    let (first, second) = two_fat_disk(&img);
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut b = BackupController::new(BackupServices {
+        jobs: JobRegistry::new(),
+        notify: Arc::new(NoNotify),
+    });
+    b.apply(BackupAction::OpenImage {
+        path: img,
+        rename: false,
+    });
+    b.wait_idle();
+    b.apply(BackupAction::SetDestination(Some(out.clone())));
+    b.apply(BackupAction::SetName("c".into()));
+    b.apply(BackupAction::SetFormat(CompressionType::Chd));
+    b.apply(BackupAction::Start(None));
+    b.wait_finished();
+    assert_eq!(b.last_result(), Some(&Ok(())));
+
+    let mut ctl = controller();
+    open(&mut ctl, out.join("c"));
+    let target = dir.path().join("r.img");
+    ctl.apply(RestoreAction::SetTargetIsDevice(
+        TargetSlot::FullDisk,
+        false,
+    ));
+    ctl.apply(RestoreAction::SetTargetImage(
+        TargetSlot::FullDisk,
+        Some(target.clone()),
+    ));
+    ctl.apply(RestoreAction::Start);
+    answer(&mut ctl, true);
+    ctl.wait_finished();
+    assert_eq!(ctl.last_result(), Some(&Ok(())));
+
+    let restored = std::fs::read(&target).unwrap();
+    for start in [first, second] {
+        assert_eq!(restored[start as usize], 0xEB, "a boot sector at {start}");
+    }
+    let lba = |entry: usize| {
+        let field = &restored[entry + 8..entry + 12];
+        u32::from_le_bytes(field.try_into().unwrap()) as u64
+    };
+    assert_eq!(lba(446) * 512, first);
+    assert_eq!(lba(462) * 512, second);
 }

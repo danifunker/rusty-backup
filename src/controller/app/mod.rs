@@ -12,8 +12,9 @@ mod shell;
 mod update;
 
 pub use shell::{
-    busy_elsewhere, elevation_button_hover, elevation_button_label, elevation_gate,
-    host_known_older_than, no_devices_hint, physical_devices_available, picker_start_folder,
+    about, app_version, busy_elsewhere, busy_elsewhere_notice, elevation_button_hover,
+    elevation_button_label, elevation_confirm, elevation_gate, host_known_older_than,
+    no_devices_hint, physical_devices_available, picker_start_folder, progress_text,
     running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
     ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
 };
@@ -43,6 +44,16 @@ pub mod ids {
     pub const LOG_CLEAR: &str = "log.clear";
     pub const LOG_AUTO_SCROLL: &str = "log.auto_scroll";
     pub const LOG_LIST: &str = "log.list";
+    pub const REFRESH_DEVICES: &str = "app.refresh_devices";
+    pub const ELEVATE: &str = "app.elevate";
+    pub const COMMANDER: &str = "app.commander";
+    pub const CLOSE_BACKUP: &str = "app.close_backup";
+    pub const MENU: &str = "app.menu";
+    pub const SETTINGS: &str = "app.settings";
+    pub const BULK_CONVERT: &str = "app.bulk_convert";
+    pub const ABOUT: &str = "app.about";
+    pub const UPDATE_VIEW: &str = "app.update.view";
+    pub const UPDATE_DISMISS: &str = "app.update.dismiss";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +69,8 @@ pub enum AppAction {
     /// The answer to the shell's "restart as root?" dialog (Linux).
     ConfirmElevation(bool),
     DismissUpdate,
+    /// Open the announced release's page.
+    ViewRelease,
     /// Download and install the announced release (Windows).
     InstallUpdate,
     /// After a failed install, offer it again.
@@ -156,6 +169,12 @@ impl Controller for AppController {
             AppAction::DismissUpdate => {
                 #[cfg(any(feature = "gui", feature = "tui-update"))]
                 self.dismiss_update();
+                Vec::new()
+            }
+            AppAction::ViewRelease => {
+                #[cfg(any(feature = "gui", feature = "tui-update"))]
+                return self.view_release();
+                #[cfg(not(any(feature = "gui", feature = "tui-update")))]
                 Vec::new()
             }
             AppAction::InstallUpdate => {

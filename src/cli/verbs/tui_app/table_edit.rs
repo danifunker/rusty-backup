@@ -281,6 +281,7 @@ impl App {
         area: Rect,
         v: &TableEditView,
         w: &TableWindow,
+        target: Option<&str>,
     ) {
         let pal = self.palette;
         let style_for = |sel: bool| {
@@ -427,6 +428,9 @@ impl App {
         }
         if let Some(status) = &v.status {
             lines.push(Line::styled(format!("  {status}"), pal.accent()));
+        }
+        if let Some(target) = target {
+            lines.push(Line::styled(format!("  Writes to: {target}"), pal.accent()));
         }
         if !type_choices(v.kind).is_empty() {
             lines.push(Line::styled(

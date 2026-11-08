@@ -543,9 +543,14 @@ pub fn export_whole_disk_vhd(
         }
     }
 
-    // Raw image/device path — use BufWriter for streaming
+    // Raw image/device path — use BufWriter for streaming; read too, as the hidden-sector patch reads.
     let mut writer = BufWriter::new(
-        File::create(dest_path)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?,
     );
 
