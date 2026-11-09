@@ -102,7 +102,8 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
    messages as controller accessors, the shared scripted-pick hook, the staged host copy and the
    Convert-tab hand-off in the controllers. The TUI switches over on Windows (its flows prove it);
    GTK's switch-over is verified on Linux, where its flows run.
-4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices.
+4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices. Already shipped
+   (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so
    every later slice is proved by flows as it lands rather than at the end.
 6. Slices 1 to 8.
@@ -150,11 +151,14 @@ Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` ba
 
 ### The TUI on Windows: ConPTY in `runner/src/tui.rs`
 
-The TUI driver is a Unix pty today, so `--shell tui` resolves to skip-platform on Windows. Add a
-Windows `Session` over `CreatePseudoConsole` (Windows 10 1809+), declared by hand in the runner
-like `openpty` is, so the harness keeps no new crates and its 1.73 floor. The screen parser is
-unchanged: ConPTY emits the same VT sequences. Windows 7 has no ConPTY, so the TUI flows stay
-skip-platform there.
+**Done 2026-11-09.** `runner/src/tui.rs` has a Windows `Session` over `CreatePseudoConsole`,
+its kernel32 calls declared by hand like `openpty`, so the harness keeps no new crates and its
+1.73 floor. The screen parser is unchanged. The child gets `STARTF_USESTDHANDLES` with invalid
+handles, or it inherits the runner's redirected stdio instead of the console. `dirs` ignores
+`HOME` and `APPDATA` on Windows, so the app honours `RUSTY_BACKUP_CONFIG_DIR` and the runner
+points it at the scratch home. First run (Windows 11, 2026-11-09): `--tiers 8 --shell tui`, 46
+cases, 44 pass and 2 xfail (R-089, R-090), the same as Linux. Windows 7 has no ConPTY, so the
+TUI flows stay skip-platform there.
 
 **Gate 0, before slice 9 depends on it:** on Windows 10 and on the Win7 VM, a test window whose
 button carries an AutomationId set by Dynamic Annotation is found by that id from Python.

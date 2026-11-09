@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Backspaces `fill` sends to clear a field: more than any path a flow types.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const FILL_CLEAR: usize = 512;
 
 /// Terminal size every TUI flow runs at, so a flow's screen text is the same on every host.
@@ -12,7 +12,7 @@ pub const TUI_ROWS: u16 = 40;
 pub const TUI_COLS: u16 = 120;
 
 /// Start `rb-cli tui` with `home` as its HOME, holding a config that turns the update check off.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn start_tui(rb_cli: &Path, home: &Path, cwd: &Path) -> Result<crate::tui::Session, String> {
     let config = r#"{"update_check":{"enabled":false,"repository_url":""}}"#;
     for dir in [".config/rusty-backup", "Library/Application Support/rusty-backup"] {
@@ -24,6 +24,12 @@ pub fn start_tui(rb_cli: &Path, home: &Path, cwd: &Path) -> Result<crate::tui::S
         ("HOME".to_string(), home.display().to_string()),
         ("RB_TUI_ASCII".to_string(), "1".to_string()),
         ("XDG_CONFIG_HOME".to_string(), home.join(".config").display().to_string()),
+        (
+            "RUSTY_BACKUP_CONFIG_DIR".to_string(),
+            home.join(".config/rusty-backup").display().to_string(),
+        ),
+        ("APPDATA".to_string(), home.join("AppData/Roaming").display().to_string()),
+        ("LOCALAPPDATA".to_string(), home.join("AppData/Local").display().to_string()),
     ];
     let s = crate::tui::Session::spawn(
         rb_cli,
@@ -38,14 +44,14 @@ pub fn start_tui(rb_cli: &Path, home: &Path, cwd: &Path) -> Result<crate::tui::S
     Ok(s)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn cmd_tui_shot(_rb_cli: &Path, _scratch: &Path, _ops: &[String]) -> i32 {
     eprintln!("tui-shot needs a pseudo-terminal; Windows (ConPTY) is not supported yet");
     2
 }
 
 /// `rb-regress tui-shot OP...`: a key name, `tab:NAME`, `type:TEXT`, `fill:TEXT` or `wait:TEXT`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
     let dir = scratch.join("_tui-shot");
     let _ = std::fs::remove_dir_all(&dir);
@@ -95,7 +101,7 @@ pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
     0
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn print_screen(label: &str, s: &crate::tui::Session) {
     println!("==== after {} ====", label);
     s.with_screen(|sc| {
@@ -224,7 +230,7 @@ pub struct UiSession {
     focused: Control,
     /// A `pick` waiting for the dialog it answers (the TUI's path prompt).
     pending_pick: Option<String>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     tui: Option<crate::tui::Session>,
     gtk_driver: Option<crate::gtk::Driver>,
 }
@@ -245,7 +251,7 @@ impl UiSession {
             controls,
             focused: Control::default(),
             pending_pick: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             tui: None,
             gtk_driver: None,
         }
@@ -253,7 +259,7 @@ impl UiSession {
 
     /// Everything the shell wrote so far, for the failure bundle.
     pub fn transcript(&self) -> String {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(t) = &self.tui {
             if let Ok(b) = t.transcript.lock() {
                 return String::from_utf8_lossy(&b).into_owned();
@@ -394,7 +400,7 @@ impl UiSession {
         serde_json::Value::Object(m)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn run_tui(&mut self, _ops: &[UiOp], _r: &dyn Fn(&str) -> String) -> Result<(), UiError> {
         Err(UiError::Skip(
             Verdict::SkipPlatform,
@@ -402,7 +408,7 @@ impl UiSession {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn run_tui(&mut self, ops: &[UiOp], resolve: &dyn Fn(&str) -> String) -> Result<(), UiError> {
         if self.tui.is_none() {
             let s = start_tui(&self.rb_cli, &self.scratch.join("home"), &self.scratch)
@@ -437,7 +443,7 @@ impl UiSession {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn tui_op(
         &mut self,
         op: &UiOp,
@@ -558,7 +564,7 @@ fn op_target(op: &UiOp) -> &str {
         .unwrap_or("")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn fill_field(s: &mut crate::tui::Session, text: &str) -> Result<(), (String, String)> {
     let mut b = vec![0x7f_u8; FILL_CLEAR];
     b.extend_from_slice(text.as_bytes());
@@ -569,7 +575,7 @@ fn fill_field(s: &mut crate::tui::Session, text: &str) -> Result<(), (String, St
 }
 
 /// The TUI's file and folder dialogs are a path prompt; answer it with a waiting `pick`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn answer_prompt(
     s: &mut crate::tui::Session,
     pending: &mut Option<String>,
@@ -586,7 +592,7 @@ fn answer_prompt(
     press(s, "Enter")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn tui_tab(s: &mut crate::tui::Session, t: &str) -> Result<(), (String, String)> {
     // Row 0 is the tab bar, `|`-separated, the current tab in reverse video; screens may own the arrows.
     let (names, cur) = s.with_screen(|sc| {
@@ -617,7 +623,7 @@ fn tui_tab(s: &mut crate::tui::Session, t: &str) -> Result<(), (String, String)>
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn press(s: &mut crate::tui::Session, name: &str) -> Result<(), (String, String)> {
     let b = crate::tui::key_bytes(name)
         .ok_or_else(|| ("a known key name".to_string(), name.to_string()))?;
@@ -627,7 +633,7 @@ fn press(s: &mut crate::tui::Session, name: &str) -> Result<(), (String, String)
 }
 
 /// The rows the TUI marks as focused: a `> ` marker or reverse video.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn focused_rows(sc: &crate::tui::Screen) -> Vec<String> {
     let mut out = Vec::new();
     for r in 0..sc.rows() {
@@ -647,13 +653,13 @@ pub fn focused_rows(sc: &crate::tui::Screen) -> Vec<String> {
     out
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn focus_has(s: &crate::tui::Session, want: &str) -> bool {
     s.with_screen(|sc| focused_rows(sc).iter().any(|l| l.contains(want)))
 }
 
 /// Press `keys.0` until `done` holds, at most `max` times; then the same with `keys.1`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn seek(
     s: &mut crate::tui::Session,
     keys: (&str, &str),
@@ -671,7 +677,7 @@ fn seek(
     Ok(done(s))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::focused_rows;
     use crate::tui::Screen;

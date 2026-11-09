@@ -198,6 +198,10 @@ impl UpdateConfig {
         if cfg!(test) {
             return Some(std::env::temp_dir().join("rusty-backup-test-config"));
         }
+        // Flows point every shell at a scratch config; `dirs` ignores HOME and APPDATA on Windows.
+        if let Some(dir) = std::env::var_os("RUSTY_BACKUP_CONFIG_DIR").filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir));
+        }
         #[cfg(target_os = "linux")]
         let config_dir = crate::os::linux::real_user_home().map(|h| h.join(".config"));
         #[cfg(not(target_os = "linux"))]

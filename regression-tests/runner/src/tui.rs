@@ -2,9 +2,9 @@
 //!
 //! The screen model covers what ratatui and crossterm emit (cursor moves, erase, SGR,
 //! private modes, OSC strings) and nothing more; see `regression-tests/FLOWS.md`.
-//! Unix only for now: Windows needs ConPTY, and a `ui` step there is skipped.
+//! Unix runs it behind `openpty`, Windows behind ConPTY (Windows 10 1809 or later).
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use imp::Session;
 
 /// One cell: its character and whether it is drawn in reverse video (the TUI's selection).
@@ -565,6 +565,425 @@ mod imp {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::Screen;
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::raw::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        dims: [u32; 7],
+        flags: u32,
+        show_window: u16,
+        cb_reserved2: u16,
+        reserved2: *mut u8,
+        std_input: Handle,
+        std_output: Handle,
+        std_error: Handle,
+    }
+
+    #[repr(C)]
+    struct StartupInfoExW {
+        info: StartupInfoW,
+        attributes: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        process: Handle,
+        thread: Handle,
+        pid: u32,
+        tid: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreatePipe(read: *mut Handle, write: *mut Handle, attrs: *const c_void, size: u32) -> i32;
+        fn CreatePseudoConsole(
+            size: Coord,
+            input: Handle,
+            output: Handle,
+            flags: u32,
+            pc: *mut Handle,
+        ) -> i32;
+        fn ClosePseudoConsole(pc: Handle);
+        fn InitializeProcThreadAttributeList(
+            list: *mut c_void,
+            count: u32,
+            flags: u32,
+            size: *mut usize,
+        ) -> i32;
+        fn UpdateProcThreadAttribute(
+            list: *mut c_void,
+            flags: u32,
+            attribute: usize,
+            value: *const c_void,
+            size: usize,
+            previous: *mut c_void,
+            returned: *mut usize,
+        ) -> i32;
+        fn DeleteProcThreadAttributeList(list: *mut c_void);
+        fn CreateProcessW(
+            app: *const u16,
+            cmdline: *mut u16,
+            process_attrs: *const c_void,
+            thread_attrs: *const c_void,
+            inherit: i32,
+            flags: u32,
+            env: *const c_void,
+            cwd: *const u16,
+            startup: *const StartupInfoExW,
+            info: *mut ProcessInformation,
+        ) -> i32;
+        fn WaitForSingleObject(handle: Handle, ms: u32) -> u32;
+        fn TerminateProcess(handle: Handle, code: u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Quote one argument the way `CommandLineToArgvW` reads it back.
+    fn quote(arg: &str, out: &mut String) {
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            out.push_str(arg);
+            return;
+        }
+        out.push('"');
+        let mut slashes = 0;
+        for c in arg.chars() {
+            match c {
+                '\\' => {
+                    slashes += 1;
+                    continue;
+                }
+                '"' => out.extend(std::iter::repeat('\\').take(slashes * 2 + 1)),
+                _ => out.extend(std::iter::repeat('\\').take(slashes)),
+            }
+            slashes = 0;
+            out.push(c);
+        }
+        out.extend(std::iter::repeat('\\').take(slashes * 2));
+        out.push('"');
+    }
+
+    /// The child's environment block: ours, with `set` replacing names case-insensitively.
+    fn env_block(set: &[(String, String)]) -> Vec<u16> {
+        let mut vars: std::collections::BTreeMap<String, (String, String)> = std::env::vars_os()
+            .map(|(k, v)| {
+                let k = k.to_string_lossy().into_owned();
+                (k.to_uppercase(), (k, v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        for (k, v) in set {
+            vars.insert(k.to_uppercase(), (k.clone(), v.clone()));
+        }
+        let mut out = Vec::new();
+        for (k, v) in vars.values() {
+            out.extend(OsStr::new(&format!("{}={}", k, v)).encode_wide());
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+
+    /// A running `rb-cli tui` behind a pseudo console.
+    pub struct Session {
+        process: Handle,
+        console: Handle,
+        input: File,
+        screen: Arc<Mutex<Screen>>,
+        /// Everything the program wrote, for the failure bundle.
+        pub transcript: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Session {
+        pub fn spawn(
+            program: &Path,
+            args: &[String],
+            cwd: &Path,
+            env: &[(String, String)],
+            rows: u16,
+            cols: u16,
+        ) -> std::io::Result<Session> {
+            let err = std::io::Error::last_os_error;
+            let (mut in_read, mut in_write) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let (mut out_read, mut out_write) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: out-pointers to locals; no security attributes, default buffer size.
+            unsafe {
+                if CreatePipe(&mut in_read, &mut in_write, std::ptr::null(), 0) == 0 {
+                    return Err(err());
+                }
+                if CreatePipe(&mut out_read, &mut out_write, std::ptr::null(), 0) == 0 {
+                    CloseHandle(in_read);
+                    CloseHandle(in_write);
+                    return Err(err());
+                }
+            }
+            // SAFETY: the pipe handles are fresh and owned here; the File closes them.
+            let input = unsafe { File::from_raw_handle(in_write) };
+            let output = unsafe { File::from_raw_handle(out_read) };
+            let size = Coord {
+                x: cols as i16,
+                y: rows as i16,
+            };
+            let mut console = std::ptr::null_mut();
+            // SAFETY: the console duplicates its ends of the pipes, so ours close right after.
+            let hr = unsafe {
+                let hr = CreatePseudoConsole(size, in_read, out_write, 0, &mut console);
+                CloseHandle(in_read);
+                CloseHandle(out_write);
+                hr
+            };
+            if hr < 0 {
+                return Err(std::io::Error::from_raw_os_error(hr));
+            }
+
+            // The reader runs before the child starts: a console with nobody reading stalls.
+            let screen = Arc::new(Mutex::new(Screen::new(rows as usize, cols as usize)));
+            let transcript = Arc::new(Mutex::new(Vec::new()));
+            let mut reader = output;
+            let mut replier = input.try_clone()?;
+            let (scr, tr) = (screen.clone(), transcript.clone());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if let Ok(mut t) = tr.lock() {
+                        t.extend_from_slice(&buf[..n]);
+                    }
+                    let reply = match scr.lock() {
+                        Ok(mut s) => {
+                            s.feed(&buf[..n]);
+                            std::mem::take(&mut s.replies)
+                        }
+                        Err(_) => break,
+                    };
+                    if !reply.is_empty() {
+                        let _ = replier.write_all(&reply);
+                    }
+                }
+            });
+
+            let mut line = String::new();
+            quote(&program.to_string_lossy(), &mut line);
+            for a in args {
+                line.push(' ');
+                quote(a, &mut line);
+            }
+            let mut cmdline = wide(OsStr::new(&line));
+            let mut all = vec![
+                ("TERM".to_string(), "xterm-256color".to_string()),
+                ("COLUMNS".to_string(), cols.to_string()),
+                ("LINES".to_string(), rows.to_string()),
+            ];
+            all.extend(env.iter().cloned());
+            let block = env_block(&all);
+            let dir = wide(cwd.as_os_str());
+
+            let mut bytes = 0usize;
+            // SAFETY: a null list only asks for the size it needs.
+            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };
+            let mut list = vec![0u64; bytes.div_ceil(8)];
+            let list_ptr = list.as_mut_ptr() as *mut c_void;
+            // SAFETY: `list` is at least `bytes` long and outlives CreateProcessW below.
+            unsafe {
+                if InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut bytes) == 0 {
+                    ClosePseudoConsole(console);
+                    return Err(err());
+                }
+                if UpdateProcThreadAttribute(
+                    list_ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                    console,
+                    std::mem::size_of::<Handle>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ) == 0
+                {
+                    let e = err();
+                    DeleteProcThreadAttributeList(list_ptr);
+                    ClosePseudoConsole(console);
+                    return Err(e);
+                }
+            }
+            // Invalid std handles keep the child off our redirected stdio; it takes the console's.
+            let startup = StartupInfoExW {
+                info: StartupInfoW {
+                    cb: std::mem::size_of::<StartupInfoExW>() as u32,
+                    reserved: std::ptr::null_mut(),
+                    desktop: std::ptr::null_mut(),
+                    title: std::ptr::null_mut(),
+                    dims: [0; 7],
+                    flags: STARTF_USESTDHANDLES,
+                    show_window: 0,
+                    cb_reserved2: 0,
+                    reserved2: std::ptr::null_mut(),
+                    std_input: INVALID_HANDLE_VALUE,
+                    std_output: INVALID_HANDLE_VALUE,
+                    std_error: INVALID_HANDLE_VALUE,
+                },
+                attributes: list_ptr,
+            };
+            let mut info = ProcessInformation {
+                process: std::ptr::null_mut(),
+                thread: std::ptr::null_mut(),
+                pid: 0,
+                tid: 0,
+            };
+            // SAFETY: every pointer is to a live local; the command line buffer is mutable.
+            let ok = unsafe {
+                let ok = CreateProcessW(
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    block.as_ptr() as *const c_void,
+                    dir.as_ptr(),
+                    &startup,
+                    &mut info,
+                );
+                DeleteProcThreadAttributeList(list_ptr);
+                ok
+            };
+            if ok == 0 {
+                let e = err();
+                // SAFETY: the console is ours and nothing else holds it.
+                unsafe { ClosePseudoConsole(console) };
+                return Err(e);
+            }
+            // SAFETY: the thread handle is ours and never used.
+            unsafe { CloseHandle(info.thread) };
+            Ok(Session {
+                process: info.process,
+                console,
+                input,
+                screen,
+                transcript,
+            })
+        }
+
+        pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.input.write_all(bytes)?;
+            self.input.flush()
+        }
+
+        /// Run `f` over the current screen.
+        pub fn with_screen<T>(&self, f: impl FnOnce(&Screen) -> T) -> T {
+            match self.screen.lock() {
+                Ok(s) => f(&s),
+                Err(p) => f(&p.into_inner()),
+            }
+        }
+
+        pub fn text(&self) -> String {
+            self.with_screen(|s| s.text())
+        }
+
+        /// Wait until the screen stops changing for `quiet`, or `limit` passes.
+        pub fn settle(&self, quiet: Duration, limit: Duration) {
+            let start = Instant::now();
+            let mut last = self.text();
+            let mut since = Instant::now();
+            while start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(25));
+                let now = self.text();
+                if now != last {
+                    last = now;
+                    since = Instant::now();
+                } else if since.elapsed() >= quiet {
+                    return;
+                }
+            }
+        }
+
+        /// Poll until `pred` holds on the screen; false on timeout.
+        pub fn wait_for(&self, limit: Duration, pred: impl Fn(&Screen) -> bool) -> bool {
+            let start = Instant::now();
+            loop {
+                if self.with_screen(&pred) {
+                    return true;
+                }
+                if start.elapsed() >= limit {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        pub fn exited(&mut self) -> bool {
+            // SAFETY: the process handle is ours until drop.
+            unsafe { WaitForSingleObject(self.process, 0) == 0 }
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // SAFETY: both handles are ours; closing the console ends the reader thread's read.
+            unsafe {
+                TerminateProcess(self.process, 1);
+                WaitForSingleObject(self.process, 5000);
+                CloseHandle(self.process);
+                ClosePseudoConsole(self.console);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn quoting() {
+            let q = |a: &str| {
+                let mut s = String::new();
+                super::quote(a, &mut s);
+                s
+            };
+            assert_eq!(q("tui"), "tui");
+            assert_eq!(
+                q(r"C:\Program Files\rb-cli.exe"),
+                r#""C:\Program Files\rb-cli.exe""#
+            );
+            assert_eq!(q(r"a b\"), r#""a b\\""#);
+            assert_eq!(q(r#"say "hi""#), r#""say \"hi\"""#);
+            assert_eq!(q(r#"a\"b"#), r#""a\\\"b""#);
+            assert_eq!(q(""), r#""""#);
         }
     }
 }

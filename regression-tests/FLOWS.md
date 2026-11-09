@@ -160,10 +160,10 @@ sign the two shells don't offer the same thing.
 
 | Shell | Driver | Needs | Status |
 |---|---|---|---|
-| `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS. Windows needs ConPTY: skip-platform for now. About 4 s a flow |
+| `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS, and Windows 10 1809+ over ConPTY (`RUSTY_BACKUP_CONFIG_DIR` keeps its config in the scratch home there). About 4 s a flow on Linux, 5 s on Windows |
 | `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
 | `appkit` | `drivers/ax_driver.py`: PyObjC over AX, controls found by `AXIdentifier` (the controller id), so no `labels.toml` section | the AX (TCC) permission | planned: [docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md) |
-| `win32` | `drivers/uia_driver.py`: UI Automation, controls found by `AutomationId` (the controller id) | Python with `comtypes` | planned: [docs/win32_shell_plan.md](../docs/win32_shell_plan.md); the TUI gains a ConPTY session for Windows too |
+| `win32` | `drivers/uia_driver.py`: UI Automation, controls found by `AutomationId` (the controller id) | Python with `comtypes` | planned: [docs/win32_shell_plan.md](../docs/win32_shell_plan.md) |
 
 A case whose shell has no driver, or whose driver's tools are missing, resolves
 to `skip-tool` with the reason.
