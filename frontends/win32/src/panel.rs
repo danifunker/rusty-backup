@@ -162,6 +162,14 @@ pub fn client(hwnd: HWND) -> (Rect, u32) {
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let h = handler(hwnd);
     match (msg, h) {
+        // Esc in a window arrives as IDCANCEL from no control: a close request, as the X is.
+        (WM_COMMAND, Some(h)) if lp.0 == 0 && wp.0 & 0xffff == 2 => {
+            // SAFETY: GWLP_USERDATA is ours.
+            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != PAGE {
+                h.close();
+            }
+            LRESULT(0)
+        }
         (WM_COMMAND, Some(h)) => {
             h.command(HWND(lp.0 as _), ((wp.0 >> 16) & 0xffff) as u32);
             LRESULT(0)

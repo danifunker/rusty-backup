@@ -80,3 +80,45 @@ ui = [
 args = ["ls", "{scratch}/f.img", "/"]
 expect_exit = 0
 stdout_contains = ["NEWDIR"]
+
+[[case]]
+id = "flow.browse.inspect-edit-text"
+description = "Browse a FAT floppy from Inspect, open its only file in the text editor, replace the text, save and apply, and compare the file rb-cli reads back"
+level = "smoke"
+area = ["inspect", "browse", "files"]
+shells = ["win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.edit-text"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "{scratch}/t.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/t.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# The only file is under the cursor when the listing opens.
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/t.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "HELLO.TXT" },
+  { activate = "browse.edit_mode" },
+  { wait = "Edit Mode ON" },
+  { activate = "browse.edit_text" },
+  { focus = "window.field.editortext" },
+  { fill = "edited by a flow" },
+  { activate = "window.save" },
+  { wait = "Apply Edits (1)" },
+  { activate = "browse.apply" },
+  { wait_gone = "Apply Edits (1)" },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/t.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/edited.txt", "{scratch}/back.txt"]]

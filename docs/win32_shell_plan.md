@@ -160,9 +160,19 @@ in check-group mode with the bundled icons); the screens and slices below are un
    Info). The windows are described once in the controller (`commander::screen::windows`, a
    `PaneWindow` of parts and buttons that carry actions) and drawn by one Win32 window
    (`window.rs`); the bars read `header_tools` / `edit_bar` / `mark_bar`. GTK still builds its own
-   and can switch to these in the Linux session. `flow.browse.inspect-new-folder` passes. Left:
-   File Info's metadata form, the text editor, the Mac archive and tar import windows, the size
-   budget, passwords, picking a journal transaction, and keys inside the windows (Esc, F1).
+   and can switch to these in the Linux session. `flow.browse.inspect-new-folder` passes.
+   Slice 2 done (2026-11-09): the rest of the windows are `PaneWindow`s too: Edit Metadata (with
+   the known type / creator picker), the text editor (line endings with their "Will convert"
+   note), the tar question and preview, the Mac archive import question, Save Mac archive, the
+   archive viewer (a tick-box list and the fork format), the password prompt and the SquashFS
+   size budget; the journal's transactions show their blocks when picked. Fields are typed in
+   the view and turned into actions by the controller (`field_action` for live fields, `submit`
+   for a form's button), and a window whose key holds takes new text in place, so typing
+   survives a refresh. The side panel gained the ProDOS name and QNX RS-to-LF options, Save /
+   Browse Mac archive, Edit as text, Edit Metadata and Export as Mac archive. Esc closes any of
+   the shell's windows. `flow.browse.inspect-edit-text` passes. Not done: F1 inside a window
+   (the help window's footer names it), and drag and drop onto the listing (slice 3, with
+   Commander).
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

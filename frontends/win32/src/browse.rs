@@ -14,13 +14,13 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
-use rusty_backup::controller::browser::ids;
+use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
-    extract_fork_modes, format_size, journal_window, tree_window, BrowserPaneAction as P,
-    CommanderAction as A, CommanderController, DisplayRow, EditBar, ExportFormat, ExtractOptions,
-    HeaderTools, JobRegistry, ListingStyle, MarkBar, ModeAction, PaneProfile, PaneServices,
-    PaneWindow, PanelActions, ResourceForkMode, RowMenuEntry, Side, SidePanel, SortColumn,
-    TreeText, ViewItemKind, VolumeLine, WindowKind, FOLLOW_DELAY,
+    editor_window, extract_fork_modes, format_size, journal_window, tree_window,
+    BrowserPaneAction as P, CommanderAction as A, CommanderController, DisplayRow, EditBar,
+    ExportFormat, ExtractOptions, HeaderTools, JobRegistry, ListingStyle, MarkBar, ModeAction,
+    PaneProfile, PaneServices, PaneWindow, PanelActions, ResourceForkMode, RowMenuEntry, Side,
+    SidePanel, SortColumn, TreeText, ViewItemKind, VolumeLine, WindowKind, FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
@@ -61,7 +61,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::browse_bars::{BarCmd, EditRow, MarkRow, Tools};
+use crate::browse_bars::{BarCmd, EditRow, MarkRow, PanelCmd, PanelTools, Tools, MAC_FORMATS};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
@@ -230,6 +230,7 @@ pub struct BrowseView {
     preview: HWND,
     status: HWND,
     tools: Tools,
+    panel_tools: PanelTools,
     edit_row: EditRow,
     mark_row: MarkRow,
     windows: RefCell<Vec<Rc<ModelWindow>>>,
@@ -238,6 +239,8 @@ pub struct BrowseView {
     /// The listing Tree handed over, shown until its window closes.
     tree_text: RefCell<Option<TreeText>>,
     journal: RefCell<Option<PaneWindow>>,
+    /// The file Edit as text opened, and why its last Save was refused.
+    editor: RefCell<Option<(TextDoc, Option<String>)>>,
     /// The user asked for the File Info window, beyond what the side panel shows.
     info_asked: Cell<bool>,
     rows: RefCell<Vec<DisplayRow>>,
@@ -253,6 +256,8 @@ pub struct BrowseView {
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
     /// Which optional lines the last layout gave room to.
     shape: Cell<u64>,
+    /// How many lines of facts the side panel shows, which the layout gives room to.
+    facts_rows: Cell<i32>,
 }
 
 thread_local! {
@@ -477,6 +482,7 @@ impl BrowseView {
         ui::set_font(preview, ui::mono_font_at(dpi));
         let status = ui::cell_label(page, "");
         let tools = Tools::build(page);
+        let panel_tools = PanelTools::build(page);
         let edit_row = EditRow::build(page);
         let mark_row = MarkRow::build(page);
         let view = Rc::new_cyclic(|me: &Weak<BrowseView>| BrowseView {
@@ -513,12 +519,14 @@ impl BrowseView {
             preview,
             status,
             tools,
+            panel_tools,
             edit_row,
             mark_row,
             windows: RefCell::default(),
             debug: Cell::new(false),
             tree_text: RefCell::default(),
             journal: RefCell::default(),
+            editor: RefCell::default(),
             info_asked: Cell::new(false),
             rows: RefCell::default(),
             lines: RefCell::default(),
@@ -531,6 +539,7 @@ impl BrowseView {
             follow_timer: Cell::new(0),
             on_change: RefCell::default(),
             shape: Cell::new(u64::MAX),
+            facts_rows: Cell::new(1),
         });
         FOLLOW.with(|f| *f.borrow_mut() = view.me.clone());
         view.set_icons();
@@ -617,6 +626,7 @@ impl BrowseView {
         self.label_prefix.borrow_mut().clear();
         self.tree_text.replace(None);
         self.journal.replace(None);
+        self.editor.replace(None);
         self.windows.borrow_mut().clear();
         self.show_notice(None);
         self.refresh();
@@ -680,9 +690,9 @@ impl BrowseView {
         self.refresh();
     }
 
-    /// What jobs ended with: notices, a tree listing, a journal; the text editor comes later.
+    /// What jobs ended with: notices, a tree listing, a journal, a file for the text editor.
     fn take_results(&self) {
-        let (lines, doc): (Vec<String>, bool) = {
+        let lines: Vec<String> = {
             let mut ctl = self.ctrl.borrow_mut();
             let pane = ctl.host_pane();
             if let Some(tree) = pane.take_tree_text() {
@@ -692,18 +702,13 @@ impl BrowseView {
                 *self.journal.borrow_mut() = Some(journal_window(&j));
             }
             let archive = pane.take_archive_notice();
-            let doc = ctl.take_text_doc().is_some();
+            if let Some(doc) = ctl.take_text_doc() {
+                *self.editor.borrow_mut() = Some((doc, None));
+            }
             let notice = ctl.take_mode_notice();
             let error = ctl.take_mode_error();
-            (
-                [notice, archive, error].into_iter().flatten().collect(),
-                doc,
-            )
+            [notice, archive, error].into_iter().flatten().collect()
         };
-        if doc {
-            let line = "Edit as text arrives in a later pass of the Win32 shell.".to_string();
-            crate::app::append_log(vec![(LogLevel::Warning, line)]);
-        }
         if let Some(last) = lines.last() {
             self.show_notice(Some(last));
         }
@@ -726,9 +731,11 @@ impl BrowseView {
             .ok()
             .and_then(|i| extract_fork_modes().get(i).copied())
             .unwrap_or(ResourceForkMode::AppleDouble);
+        let (prodos_suffix, rs_to_lf) = self.panel_tools.options();
         ExtractOptions {
             fork_mode,
-            ..ExtractOptions::default()
+            prodos_suffix,
+            rs_to_lf,
         }
     }
 
@@ -854,6 +861,9 @@ impl BrowseView {
                     w.push(tree_window(t, false));
                 }
                 w.extend(self.journal.borrow().clone());
+                if let Some((doc, err)) = &*self.editor.borrow() {
+                    w.push(editor_window(doc, err.as_deref()));
+                }
                 w
             },
             view_menu: ctl.view_menu_shown(),
@@ -977,7 +987,8 @@ impl BrowseView {
         open.retain(|w| wanted.iter().any(|p| p.kind == w.kind));
         for p in wanted {
             let at = open.iter().position(|w| w.kind == p.kind);
-            if at.is_some_and(|i| open[i].key == p.key) {
+            if let Some(w) = at.map(|i| &open[i]).filter(|w| w.key == p.key) {
+                w.update(&p);
                 continue;
             }
             let rect = at.map(|i| open.remove(i).rect());
@@ -995,6 +1006,27 @@ impl BrowseView {
 
     fn window_event(&self, kind: WindowKind, e: Event) {
         match e {
+            // A Save is staged like any edit; a refusal keeps the window and the text.
+            Event::Send(actions) if kind == WindowKind::Editor => {
+                let before = self.ctrl.borrow().pane(Side::Left).queue.len();
+                for a in actions {
+                    self.apply(a);
+                }
+                let why = {
+                    let ctl = self.ctrl.borrow();
+                    let staged = ctl.pane(Side::Left).queue.len() > before;
+                    (!staged).then(|| ctl.status().to_string())
+                };
+                match why {
+                    None => drop(self.editor.borrow_mut().take()),
+                    Some(why) => {
+                        if let Some((_, err)) = &mut *self.editor.borrow_mut() {
+                            *err = Some(why);
+                        }
+                    }
+                }
+                self.refresh();
+            }
             Event::Send(actions) => {
                 for a in actions {
                     self.apply(a);
@@ -1009,6 +1041,7 @@ impl BrowseView {
                 match kind {
                     WindowKind::Tree => drop(self.tree_text.borrow_mut().take()),
                     WindowKind::Journal => drop(self.journal.borrow_mut().take()),
+                    WindowKind::Editor => drop(self.editor.borrow_mut().take()),
                     _ => {}
                 }
                 self.refresh();
@@ -1277,12 +1310,23 @@ impl BrowseView {
         if let Some(p) = panel {
             ui::set_text(self.name, &p.name);
             ui::set_text(self.facts, &p.facts.join("\r\n"));
+            if self.facts_rows.replace(p.facts.len() as i32) != p.facts.len() as i32 {
+                self.shape.set(u64::MAX);
+            }
             ui::set_text(self.note, p.note.as_deref().unwrap_or(""));
             ui::set_text(self.budget, &p.budget.join("\r\n"));
             ui::set_text(self.preview, &p.preview.text().replace('\n', "\r\n"));
         }
         ui::set_text(self.result, result.as_deref().unwrap_or(""));
+        for h in [self.note, self.budget, self.result] {
+            let on = !ui::text(h).is_empty();
+            if ui::shown(h) != on {
+                ui::set_visible(h, on);
+                self.shape.set(u64::MAX);
+            }
+        }
         let a = actions.unwrap_or_default();
+        self.panel_tools.show(&a);
         let (extract, export) = match a.folder {
             true => ("Extract Folder...", "Export Folder to .tgz..."),
             false => ("Extract File...", "Export File to .tgz..."),
@@ -1313,6 +1357,7 @@ impl BrowseView {
             self.extract_all,
         ];
         all.extend(self.tools.all());
+        all.extend(self.panel_tools.all());
         all.extend(self.edit_row.all());
         all.extend(self.mark_row.all().into_iter().take(1));
         all.iter()
@@ -1376,13 +1421,24 @@ impl BrowseView {
         if ui::shown(self.message) {
             col.push(line(self.message));
         }
+        // A line of the message font is 16 DIPs; about 46 characters fit across the panel.
+        let lines = |h: HWND| -> i32 {
+            let text = ui::text(h);
+            let n: usize = text
+                .lines()
+                .map(|l| l.chars().count().div_ceil(46).max(1))
+                .sum();
+            16 * n as i32
+        };
         let mut side = vec![
             fixed(self.name, layout::ROW - 8),
-            fixed(self.facts, (layout::ROW - 8) * 6),
-            fixed(self.note, layout::ROW - 8),
-            fixed(self.budget, layout::ROW - 8),
-            fixed(self.result, layout::ROW - 8),
+            fixed(self.facts, 16 * self.facts_rows.get().max(1)),
         ];
+        for h in [self.note, self.budget, self.result] {
+            if !ui::text(h).is_empty() {
+                side.push(fixed(h, lines(h)));
+            }
+        }
         if ui::shown(self.fork) {
             side.push(Node::row(vec![
                 Node::leaf(
@@ -1410,6 +1466,7 @@ impl BrowseView {
         if ui::shown(self.nested) {
             side.push(Node::button(self.nested, 150));
         }
+        side.extend(self.panel_tools.nodes(DETAIL_W));
         side.push(Node::leaf(
             self.preview,
             Size::Fixed(DETAIL_W),
@@ -1635,6 +1692,43 @@ impl Handler for BrowseView {
             .or_else(|| self.mark_row.command(from, code));
         if let Some(cmd) = bar {
             self.bar(cmd);
+            return;
+        }
+        if let Some(cmd) = self.panel_tools.command(from, code) {
+            let Some(path) = self.cursor_path() else {
+                return;
+            };
+            match cmd {
+                PanelCmd::OnPath(f) => {
+                    for a in f(path) {
+                        self.apply(a);
+                    }
+                }
+                PanelCmd::MacMenu(button) => {
+                    let items = MAC_FORMATS
+                        .iter()
+                        .map(|(f, label)| MenuItem::Item {
+                            label: label.to_string(),
+                            enabled: true,
+                            checked: false,
+                            action: A::ExportEntry {
+                                from: Side::Left,
+                                path: path.clone(),
+                                format: Some(*f),
+                            },
+                        })
+                        .collect();
+                    let mut r = RECT::default();
+                    // SAFETY: a plain query of our own button.
+                    let _ = unsafe { GetWindowRect(button, &mut r) };
+                    let Some(export) = track(self.owner(), items, r.left, r.bottom) else {
+                        return;
+                    };
+                    let mode = self.extract_options().fork_mode;
+                    self.apply(A::SetForkMode(mode));
+                    self.apply(export);
+                }
+            }
             return;
         }
         if from == self.fork {

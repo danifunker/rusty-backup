@@ -4,8 +4,8 @@
 
 use rusty_backup::controller::browser::ids;
 use rusty_backup::controller::commander::{
-    BrowserPaneAction as P, CommanderAction as A, EditBar, ExportFormat, HeaderTools, MarkBar,
-    ModeAction, Side,
+    ArchiveUse, BrowserPaneAction as P, CommanderAction as A, EditBar, ExportFormat, HeaderTools,
+    MarkBar, ModeAction, PanelActions, ProdosExportMode, Side,
 };
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -457,5 +457,171 @@ impl MarkRow {
         } else {
             None
         }
+    }
+}
+
+/// What a side-panel tool asks of the view for the entry under the cursor.
+pub enum PanelCmd {
+    /// Actions on the cursor's path.
+    OnPath(fn(String) -> Vec<A>),
+    /// Offer the Mac archive formats under `button`; the one picked exports the cursor's entry.
+    MacMenu(HWND),
+}
+
+/// The Mac archive formats the side panel exports to, with their menu labels.
+pub const MAC_FORMATS: [(ExportFormat, &str); 4] = [
+    (ExportFormat::BinHex, "BinHex (.hqx)"),
+    (ExportFormat::StuffIt, "StuffIt (.sit)"),
+    (ExportFormat::StuffItHqx, "StuffIt over BinHex (.sit.hqx)"),
+    (ExportFormat::MacArchive, "MAR (.mar)"),
+];
+
+/// The side panel's tools beyond Extract and Export: the ProDOS and QNX extract options, the
+/// Mac archive buttons, Edit as text and Edit Metadata.
+pub struct PanelTools {
+    prodos_caption: HWND,
+    prodos: HWND,
+    rs_to_lf: HWND,
+    save_archive: HWND,
+    browse_archive: HWND,
+    edit_text: HWND,
+    metadata: HWND,
+    mac: HWND,
+}
+
+impl PanelTools {
+    pub fn build(page: HWND) -> PanelTools {
+        let style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0);
+        let prodos = ui::child(page, w!("COMBOBOX"), "", style, WINDOW_EX_STYLE(0), "");
+        for m in ProdosExportMode::ALL {
+            let t = ui::wide(m.label());
+            // SAFETY: the combo copies the string.
+            unsafe {
+                SendMessageW(
+                    prodos,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(t.as_ptr() as isize)),
+                );
+            }
+        }
+        // SAFETY: a plain combo message.
+        unsafe {
+            SendMessageW(prodos, CB_SETCURSEL, Some(WPARAM(0)), None);
+        }
+        PanelTools {
+            prodos_caption: ui::cell_label(page, "Export name:"),
+            prodos,
+            rs_to_lf: ui::checkbox(page, "Text: RS to LF", ""),
+            save_archive: ui::button(page, "Save as Mac archive...", ids::SAVE_ARCHIVE),
+            browse_archive: ui::button(page, "Browse archive...", ids::BROWSE_ARCHIVE),
+            edit_text: ui::button(page, "Edit as text...", ids::EDIT_TEXT),
+            metadata: ui::button(page, "Edit Metadata...", ids::EDIT_METADATA),
+            mac: ui::button(page, "Export as Mac archive...", "browse.export_mac"),
+        }
+    }
+
+    pub fn all(&self) -> [HWND; 8] {
+        [
+            self.prodos_caption,
+            self.prodos,
+            self.rs_to_lf,
+            self.save_archive,
+            self.browse_archive,
+            self.edit_text,
+            self.metadata,
+            self.mac,
+        ]
+    }
+
+    pub fn show(&self, a: &PanelActions) {
+        let on = a.extractable;
+        ui::set_visible(self.prodos_caption, on && a.prodos);
+        ui::set_visible(self.prodos, on && a.prodos);
+        ui::set_visible(self.rs_to_lf, on && a.qnx);
+        ui::set_visible(self.save_archive, on && a.archive);
+        ui::set_visible(self.browse_archive, on && a.archive);
+        ui::set_visible(self.edit_text, on && a.text);
+        ui::set_enabled(self.edit_text, a.edit_mode);
+        ui::set_visible(self.metadata, on && a.metadata);
+        ui::set_visible(self.mac, on && a.mac);
+    }
+
+    /// The ProDOS name suffix and QNX line endings the extract options take.
+    pub fn options(&self) -> (bool, bool) {
+        // SAFETY: a plain combo query.
+        let i = unsafe { SendMessageW(self.prodos, CB_GETCURSEL, None, None).0 };
+        let mode = usize::try_from(i)
+            .ok()
+            .and_then(|i| ProdosExportMode::ALL.get(i).copied());
+        (
+            mode != Some(ProdosExportMode::Plain),
+            checked(self.rs_to_lf),
+        )
+    }
+
+    /// The panel's rows below the fork mode, each `width` DIPs wide.
+    pub fn nodes(&self, width: i32) -> Vec<Node<HWND>> {
+        let half = (width - layout::GAP) / 2;
+        let mut rows = Vec::new();
+        if ui::shown(self.prodos) {
+            rows.push(Node::row(vec![
+                Node::leaf(
+                    self.prodos_caption,
+                    Size::Fixed(110),
+                    Size::Fixed(layout::ROW),
+                ),
+                Node::leaf(
+                    self.prodos,
+                    Size::Fixed(width - 110 - layout::GAP),
+                    Size::Fixed(layout::ROW),
+                ),
+            ]));
+        }
+        if ui::shown(self.rs_to_lf) {
+            rows.push(Node::leaf(
+                self.rs_to_lf,
+                Size::Fixed(width),
+                Size::Fixed(layout::ROW),
+            ));
+        }
+        for pair in [
+            [self.save_archive, self.browse_archive],
+            [self.edit_text, self.metadata],
+        ] {
+            let row: Vec<Node<HWND>> = pair.iter().filter_map(|h| shown_button(*h, half)).collect();
+            if !row.is_empty() {
+                rows.push(Node::row(row));
+            }
+        }
+        if let Some(b) = shown_button(self.mac, half) {
+            rows.push(b);
+        }
+        rows
+    }
+
+    pub fn command(&self, from: HWND, code: u32) -> Option<PanelCmd> {
+        if code != BN_CLICKED {
+            return None;
+        }
+        Some(if from == self.save_archive {
+            PanelCmd::OnPath(|path| {
+                let purpose = ArchiveUse::Extract;
+                vec![pane(P::ReadArchive { path, purpose })]
+            })
+        } else if from == self.browse_archive {
+            PanelCmd::OnPath(|path| {
+                let purpose = ArchiveUse::Browse;
+                vec![pane(P::ReadArchive { path, purpose })]
+            })
+        } else if from == self.edit_text {
+            PanelCmd::OnPath(|_| vec![pane(P::EditText)])
+        } else if from == self.metadata {
+            PanelCmd::OnPath(|_| vec![pane(P::EditMetadata)])
+        } else if from == self.mac {
+            PanelCmd::MacMenu(from)
+        } else {
+            return None;
+        })
     }
 }
