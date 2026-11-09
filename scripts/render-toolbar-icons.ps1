@@ -1,11 +1,12 @@
-# Renders assets/icons/toolbar/*.svg to PNGs with WPF, which ships with Windows (no extra tools).
+# Renders assets/icons/<set>/*.svg to PNGs with WPF, which ships with Windows (no extra tools).
 # The SVGs hold only <path> elements with the attributes on <svg>, which both SVG and WPF read.
 # Black icons go to png/ (light theme, macOS template images), white ones to png-dark/ (dark theme).
 # Run from the repo root on Windows:  powershell -ExecutionPolicy Bypass -File scripts/render-toolbar-icons.ps1
-param([int[]]$Sizes = @(24, 32, 48))
+# The browse view's row icons: powershell -Command "& ./scripts/render-toolbar-icons.ps1 -Group rows -Sizes 16,24,32"
+param([string]$Group = "toolbar", [int[]]$Sizes = @(24, 32, 48))
 
 Add-Type -AssemblyName PresentationCore, WindowsBase
-$dir = Join-Path $PSScriptRoot "..\assets\icons\toolbar"
+$dir = Join-Path $PSScriptRoot "..\assets\icons\$Group"
 $sets = @(@{ Dir = "png"; Brush = [System.Windows.Media.Brushes]::Black },
           @{ Dir = "png-dark"; Brush = [System.Windows.Media.Brushes]::White })
 

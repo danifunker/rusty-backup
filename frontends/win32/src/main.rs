@@ -37,6 +37,8 @@ mod report;
 #[cfg(windows)]
 mod resize;
 #[cfg(windows)]
+mod row_icons;
+#[cfg(windows)]
 mod sync;
 #[cfg(windows)]
 mod theme;

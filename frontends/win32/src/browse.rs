@@ -27,16 +27,19 @@ use rusty_backup::controller::{Controller, Effect};
 use windows::core::{w, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Controls::{
-    HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE,
+    ImageList_Destroy, HIMAGELIST, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMICON, LVIF_IMAGE, LVIF_INDENT,
+    LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE,
     LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
-    LVN_KEYDOWN, LVSICF_NOSCROLL, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN,
-    NMTREEVIEWW, NM_DBLCLK, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_PARAM, TVIF_TEXT,
-    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM,
-    TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVN_ITEMEXPANDINGW,
-    TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK,
+    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVSICF_NOSCROLL, LVSIL_SMALL,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NMTREEVIEWW,
+    NM_CLICK, NM_DBLCLK, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM,
+    TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT,
+    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM,
+    TVM_SETIMAGELIST, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_HASBUTTONS,
+    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -55,6 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
+use crate::row_icons;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -91,6 +95,8 @@ fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
 struct Line {
     cells: [String; 5],
     node_id: String,
+    icon: i32,
+    depth: i32,
 }
 
 /// Everything a refresh shows, read while the controller is borrowed.
@@ -252,14 +258,9 @@ fn mods() -> Mods {
 }
 
 fn line_of(row: &DisplayRow, name: String) -> Line {
-    let marker = match (row.expandable, row.expanded) {
-        (true, true) => "- ",
-        (true, false) => "+ ",
-        _ => "",
-    };
     Line {
         cells: [
-            format!("{}{marker}{name}", "    ".repeat(row.depth)),
+            name,
             match row.is_dir {
                 true => String::new(),
                 false => format_size(row.size),
@@ -272,6 +273,8 @@ fn line_of(row: &DisplayRow, name: String) -> Line {
             row.type_tag.clone(),
         ],
         node_id: row.node_id.clone(),
+        icon: row_icons::for_row(row),
+        depth: row.depth as i32,
     }
 }
 
@@ -424,6 +427,7 @@ impl BrowseView {
             shape: Cell::new(u32::MAX),
         });
         FOLLOW.with(|f| *f.borrow_mut() = view.me.clone());
+        view.set_icons();
         let weak: Weak<dyn Handler> = view.me.clone();
         panel::register(page, weak);
         ui::set_visible(notice, false);
@@ -815,6 +819,32 @@ impl BrowseView {
         }
     }
 
+    /// Give the list and the folder tree the row icons for the page's DPI and the theme.
+    pub fn set_icons(&self) {
+        // SAFETY: each control takes its new image list; the one it gives back is freed.
+        unsafe {
+            let dpi = GetDpiForWindow(self.page).max(96);
+            let old = SendMessageW(
+                self.list,
+                LVM_SETIMAGELIST,
+                Some(WPARAM(LVSIL_SMALL as usize)),
+                Some(LPARAM(row_icons::image_list(dpi).0 as isize)),
+            );
+            if old.0 != 0 {
+                let _ = ImageList_Destroy(Some(HIMAGELIST(old.0 as _)));
+            }
+            let old = SendMessageW(
+                self.tree,
+                TVM_SETIMAGELIST,
+                Some(WPARAM(TVSIL_NORMAL as usize)),
+                Some(LPARAM(row_icons::image_list(dpi).0 as isize)),
+            );
+            if old.0 != 0 {
+                let _ = ImageList_Destroy(Some(HIMAGELIST(old.0 as _)));
+            }
+        }
+    }
+
     /// Select the cursor's row in the list, inside the sync guard so no click comes back.
     fn select(&self, i: usize) {
         let on = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
@@ -846,13 +876,12 @@ impl BrowseView {
         let mut parents: Vec<isize> = Vec::new();
         // SAFETY: tree-view messages on our own tree; each text outlives its insert.
         unsafe {
-            SendMessageW(
-                self.tree,
-                TVM_DELETEITEM,
-                None,
-                Some(LPARAM(TVI_ROOT.0)),
-            );
-            for (i, (depth, name, _)) in folders.iter().enumerate() {
+            SendMessageW(self.tree, TVM_DELETEITEM, None, Some(LPARAM(TVI_ROOT.0)));
+            for (i, (depth, name, open)) in folders.iter().enumerate() {
+                let icon = match open {
+                    true => row_icons::FOLDER_OPEN,
+                    false => row_icons::FOLDER,
+                };
                 parents.truncate(*depth);
                 let parent = parents.last().copied().unwrap_or(TVI_ROOT.0);
                 let mut text = ui::wide(&ui::plain(name));
@@ -861,7 +890,13 @@ impl BrowseView {
                     hInsertAfter: TVI_LAST,
                     Anonymous: TVINSERTSTRUCTW_0 {
                         item: TVITEMW {
-                            mask: TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN,
+                            mask: TVIF_TEXT
+                                | TVIF_PARAM
+                                | TVIF_CHILDREN
+                                | TVIF_IMAGE
+                                | TVIF_SELECTEDIMAGE,
+                            iImage: icon,
+                            iSelectedImage: icon,
                             pszText: PWSTR(text.as_mut_ptr()),
                             lParam: LPARAM(i as isize),
                             cChildren: windows::Win32::UI::Controls::TVITEMEXW_CHILDREN(1),
@@ -1068,13 +1103,22 @@ impl BrowseView {
     /// Fill a cell the virtual list asks for, from the rows last read.
     fn display(&self, info: &mut NMLVDISPINFOW) {
         let item = &mut info.item;
-        if item.mask.0 & LVIF_TEXT.0 == 0 || item.pszText.is_null() || item.cchTextMax <= 0 {
-            return;
-        }
         let lines = self.lines.borrow();
         let Some(line) = usize::try_from(item.iItem).ok().and_then(|i| lines.get(i)) else {
             return;
         };
+        if item.iSubItem == 0 {
+            if item.mask.0 & LVIF_IMAGE.0 != 0 {
+                item.iImage = line.icon;
+            }
+            // An indent is counted in icon widths, so a row inside a folder sits one icon in.
+            if item.mask.0 & LVIF_INDENT.0 != 0 {
+                item.iIndent = line.depth;
+            }
+        }
+        if item.mask.0 & LVIF_TEXT.0 == 0 || item.pszText.is_null() || item.cchTextMax <= 0 {
+            return;
+        }
         let cell = line
             .cells
             .get(item.iSubItem as usize)
@@ -1120,6 +1164,30 @@ impl BrowseView {
                     if let Some(action) = click {
                         self.apply(A::Pane(Side::Left, action));
                     }
+                }
+                Some(LRESULT(0))
+            }
+            NM_CLICK => {
+                // A click on an icon that is a +/- opens or shuts its row in place.
+                // SAFETY: NM_CLICK from a list view comes with an NMITEMACTIVATE.
+                let nm = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
+                let mut hit = LVHITTESTINFO {
+                    pt: nm.ptAction,
+                    ..Default::default()
+                };
+                // SAFETY: a hit test with a local struct.
+                unsafe {
+                    SendMessageW(
+                        self.list,
+                        LVM_SUBITEMHITTEST,
+                        None,
+                        Some(LPARAM(&mut hit as *mut _ as isize)),
+                    );
+                }
+                let on_icon = hit.flags.0 & LVHT_ONITEMICON.0 != 0 && hit.iSubItem == 0;
+                let row = usize::try_from(hit.iItem).ok().and_then(|i| self.row_at(i));
+                if let Some(row) = row.filter(|r| on_icon && r.expandable) {
+                    self.apply(A::Pane(Side::Left, P::ToggleExpand(row.node_id)));
                 }
                 Some(LRESULT(0))
             }

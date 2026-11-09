@@ -403,6 +403,11 @@ impl InspectScreen {
         self.after(effects);
     }
 
+    /// The theme or the DPI changed: the browse view's icons follow it.
+    pub fn theme_changed(&self) {
+        self.browse.set_icons();
+    }
+
     /// The browse view is open, in the screen's place.
     pub fn browsing(&self) -> bool {
         self.browse.is_active()

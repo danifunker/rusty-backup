@@ -625,6 +625,7 @@ impl App {
         let names = AppTab::ALL.iter().map(|t| t.icon());
         toolbar::set_icons(self.part(Part::Screens), names, dpi);
         toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
+        self.inspect.theme_changed();
         true
     }
 
@@ -646,6 +647,7 @@ impl App {
         let names = AppTab::ALL.iter().map(|t| t.icon());
         toolbar::set_icons(self.part(Part::Screens), names, dpi);
         toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
+        self.inspect.theme_changed();
         self.relayout();
     }
 }
