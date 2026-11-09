@@ -21,6 +21,8 @@ mod report;
 #[cfg(windows)]
 mod sync;
 #[cfg(windows)]
+mod theme;
+#[cfg(windows)]
 mod toolbar;
 #[cfg(windows)]
 mod ui;
@@ -50,6 +52,7 @@ fn main() {
         };
         let _ = InitCommonControlsEx(&icc);
     }
+    theme::adopt();
     app::start();
     let mut msg = MSG::default();
     // SAFETY: the standard message loop; IsDialogMessage gives Tab its meaning between controls.

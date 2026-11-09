@@ -22,24 +22,50 @@ use crate::layout;
 use crate::ui;
 
 macro_rules! sizes {
-    ($n:literal) => {
+    ($set:literal, $n:literal) => {
         [
             (
                 24,
-                include_bytes!(concat!("../../../assets/icons/toolbar/png/", $n, "-24.png"))
-                    .as_slice(),
+                include_bytes!(concat!(
+                    "../../../assets/icons/toolbar/",
+                    $set,
+                    "/",
+                    $n,
+                    "-24.png"
+                ))
+                .as_slice(),
             ),
             (
                 32,
-                include_bytes!(concat!("../../../assets/icons/toolbar/png/", $n, "-32.png"))
-                    .as_slice(),
+                include_bytes!(concat!(
+                    "../../../assets/icons/toolbar/",
+                    $set,
+                    "/",
+                    $n,
+                    "-32.png"
+                ))
+                .as_slice(),
             ),
             (
                 48,
-                include_bytes!(concat!("../../../assets/icons/toolbar/png/", $n, "-48.png"))
-                    .as_slice(),
+                include_bytes!(concat!(
+                    "../../../assets/icons/toolbar/",
+                    $set,
+                    "/",
+                    $n,
+                    "-48.png"
+                ))
+                .as_slice(),
             ),
         ]
+    };
+    // White icons on a dark theme, black on a light one.
+    ($n:literal) => {
+        if crate::theme::dark() {
+            sizes!("png-dark", $n)
+        } else {
+            sizes!("png", $n)
+        }
     };
 }
 
@@ -172,6 +198,47 @@ pub fn height(tb: HWND, dpi: u32) -> i32 {
     let size = unsafe { SendMessageW(tb, TB_GETBUTTONSIZE, None, None).0 } as u32;
     let px = (size >> 16) as i32;
     px * 96 / dpi.max(96) as i32 + 2
+}
+
+/// Dark mode draws the toolbar itself (`NM_CUSTOMDRAW`): a visual style keeps its own text colour.
+pub fn custom_draw(lp: LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HGDIOBJ};
+    use windows::Win32::UI::Controls::{
+        CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_CHECKED, CDIS_DISABLED, CDIS_HOT, CDRF_DODEFAULT,
+        CDRF_NOTIFYITEMDRAW, NMTBCUSTOMDRAW, TBCDRF_NOBACKGROUND, TBCDRF_NOEDGES,
+        TBCDRF_USECDCOLORS,
+    };
+    // SAFETY: NM_CUSTOMDRAW from a toolbar comes with an NMTBCUSTOMDRAW.
+    let cd = unsafe { &mut *(lp.0 as *mut NMTBCUSTOMDRAW) };
+    let r = match cd.nmcd.dwDrawStage {
+        CDDS_PREPAINT if crate::theme::dark() => CDRF_NOTIFYITEMDRAW,
+        CDDS_ITEMPREPAINT if crate::theme::dark() => {
+            let state = cd.nmcd.uItemState.0;
+            let fill = if state & CDIS_CHECKED.0 != 0 {
+                Some(crate::theme::colors().pressed)
+            } else if state & CDIS_HOT.0 != 0 {
+                Some(crate::theme::colors().hover)
+            } else {
+                None
+            };
+            if let Some(c) = fill {
+                // SAFETY: the DC and rectangle the toolbar handed us for this button.
+                unsafe {
+                    let brush = CreateSolidBrush(c);
+                    FillRect(cd.nmcd.hdc, &cd.nmcd.rc, brush);
+                    let _ = DeleteObject(HGDIOBJ(brush.0));
+                }
+            }
+            cd.clrText = if state & CDIS_DISABLED.0 != 0 {
+                crate::theme::colors().disabled
+            } else {
+                crate::theme::colors().text
+            };
+            CDRF_DODEFAULT | TBCDRF_USECDCOLORS | TBCDRF_NOBACKGROUND | TBCDRF_NOEDGES
+        }
+        _ => CDRF_DODEFAULT,
+    };
+    windows::Win32::Foundation::LRESULT(r as isize)
 }
 
 /// Press button `cmd` (and so release the rest of its group), if it is not pressed already.

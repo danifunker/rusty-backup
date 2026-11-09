@@ -89,6 +89,7 @@ pub fn child(
         )
     }
     .expect("a child control");
+    crate::theme::control(hwnd);
     set_automation_id(hwnd, id);
     set_font(hwnd, font_for(parent));
     hwnd

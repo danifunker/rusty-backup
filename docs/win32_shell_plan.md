@@ -82,9 +82,16 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
   access-violates on Windows 7 only; the shell never adds such a call, and its review checks.
 - **DPI.** Per-monitor v2 in the manifest; every size comes from `GetDpiForWindow`, and the custom
   partition bar redraws on `WM_DPICHANGED`.
-- **Visual styles.** Common Controls v6 through the manifest, the system font from
-  `SystemParametersInfo`, and dark mode left to the system (Win32 has no supported dark API for
-  common controls; follow the system's light theme until there is one).
+- **Visual styles and dark mode.** Common Controls v6 through the manifest and the system font
+  from `SystemParametersInfo`. The shell follows the system's app theme (`AppsUseLightTheme`,
+  re-read on `WM_SETTINGCHANGE` "ImmersiveColorSet"; `RUSTY_BACKUP_THEME=dark|light` forces one,
+  for tests). `theme.rs`: the title bar through the documented `DWMWA_USE_IMMERSIVE_DARK_MODE`;
+  scroll bars, buttons, lists and menus through the undocumented `uxtheme` ordinals every dark
+  Win32 app uses (133, 135, 104, 136; Windows 10 1809+) and the `DarkMode_*` style classes;
+  backgrounds and text through `WM_CTLCOLOR*`. Two things are drawn by the shell in dark mode:
+  the toolbar (custom draw over an unstyled toolbar, white icons from `png-dark/`) and the list
+  headers (a subclass answers the header's custom draw). Limits: Task Dialogs stay light; tick
+  boxes and radios lose their visual style in dark mode so their labels can be light.
 - **Drag and drop.** `IDropTarget` routes through `AppController::route_drop`; a drag out to
   Explorer (`IDataObject` with `CF_HDROP` after extracting to a temp folder) is optional.
 - **File associations and update.** The egui build's associations and in-app updater move to the

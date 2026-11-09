@@ -39,8 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsDialogMessageW, IsWindow, PostMessageW, RegisterClassW, SendMessageW, SetWindowPos,
     TranslateMessage, BN_CLICKED, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, ES_PASSWORD, HMENU,
     IDCANCEL, IDOK, MSG, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WNDCLASSW, WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP,
+    WM_DESTROY, WM_ERASEBKGND, WNDCLASSW, WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_POPUP, WS_SYSMENU, WS_TABSTOP,
 };
 
 use crate::layout::{self, Node, Rect, Size};
@@ -424,6 +424,7 @@ impl Prompt {
                 None,
             )
             .ok()?;
+            crate::theme::title_bar(window);
             let label = ui::label(window, prompt);
             let style =
                 ES_AUTOHSCROLL as u32 | WS_TABSTOP.0 | if secret { ES_PASSWORD as u32 } else { 0 };
@@ -576,6 +577,22 @@ unsafe extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             LRESULT(0)
         }
         WM_DESTROY => LRESULT(0),
+        WM_ERASEBKGND => {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            // SAFETY: painting our own window's background with the mode's brush.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc);
+                windows::Win32::Graphics::Gdi::FillRect(
+                    windows::Win32::Graphics::Gdi::HDC(wp.0 as _),
+                    &rc,
+                    crate::theme::window_brush(),
+                );
+            }
+            LRESULT(1)
+        }
+        msg if crate::theme::ctl_color(msg, wp, lp, false).is_some() => {
+            crate::theme::ctl_color(msg, wp, lp, false).unwrap_or_default()
+        }
         // SAFETY: the default handling of a window we registered.
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }

@@ -23,9 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadIconW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowPos, BM_GETCHECK,
     BM_SETCHECK, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE,
     ES_READONLY, HMENU, IDC_ARROW, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_SIZE, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VSCROLL,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NOTIFY,
+    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
@@ -141,6 +142,7 @@ pub fn start() {
         .expect("the main window")
     };
     wake.set_window(window);
+    crate::theme::title_bar(window);
     let app = App::build(window, wake);
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     app.relayout();
@@ -587,6 +589,36 @@ impl App {
         }
     }
 
+    /// The system theme may have changed (`WM_SETTINGCHANGE` "ImmersiveColorSet"): follow it.
+    fn theme_changed(&self, lp: LPARAM) -> bool {
+        // SAFETY: the setting's name, a NUL-terminated string the system owns for this message.
+        let name = unsafe {
+            (lp.0 != 0)
+                .then(|| PCWSTR(lp.0 as *const u16).to_string().ok())
+                .flatten()
+        };
+        if name.as_deref() != Some("ImmersiveColorSet") || !crate::theme::adopt() {
+            return false;
+        }
+        unsafe extern "system" fn each(h: HWND, _: LPARAM) -> windows::core::BOOL {
+            crate::theme::restyle(h);
+            true.into()
+        }
+        // SAFETY: re-styling every window of this thread: the main window and its dialogs.
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+                Some(each),
+                LPARAM(0),
+            );
+        }
+        let dpi = unsafe { GetDpiForWindow(self.window) }.max(96);
+        let names = AppTab::ALL.iter().map(|t| t.icon());
+        toolbar::set_icons(self.part(Part::Screens), names, dpi);
+        toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
+        true
+    }
+
     fn dpi_changed(&self, dpi: u32, suggested: &RECT) {
         let font = ui::font_at(dpi);
         // SAFETY: the suggested rectangle comes with WM_DPICHANGED; children get the new font.
@@ -631,6 +663,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ((wp.0 >> 16) & 0xffff) as u32,
         ),
         WM_SIZE => app.relayout(),
+        WM_ERASEBKGND => {
+            let mut rc = RECT::default();
+            // SAFETY: painting our own window's background with the mode's brush.
+            unsafe {
+                let _ = GetClientRect(hwnd, &mut rc);
+                windows::Win32::Graphics::Gdi::FillRect(
+                    windows::Win32::Graphics::Gdi::HDC(wp.0 as _),
+                    &rc,
+                    crate::theme::window_brush(),
+                );
+            }
+            return LRESULT(1);
+        }
+        WM_SETTINGCHANGE => {
+            if app.theme_changed(lp) {
+                return LRESULT(0);
+            }
+            // SAFETY: other setting changes get the default handling.
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        WM_NOTIFY => {
+            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
+            let hdr = unsafe { &*(lp.0 as *const windows::Win32::UI::Controls::NMHDR) };
+            if hdr.code == windows::Win32::UI::Controls::NM_CUSTOMDRAW {
+                return toolbar::custom_draw(lp);
+            }
+            // SAFETY: the default handling.
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORDLG
+        | WM_CTLCOLORLISTBOX => {
+            return crate::theme::ctl_color(msg, wp, lp, false).unwrap_or_default();
+        }
         WM_DPICHANGED => {
             // SAFETY: WM_DPICHANGED's lParam is the suggested window rectangle.
             let r = unsafe { *(lp.0 as *const RECT) };

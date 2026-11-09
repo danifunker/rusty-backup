@@ -9,21 +9,19 @@ use std::rc::{Rc, Weak};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    FillRect, GetSysColor, GetSysColorBrush, SetBkColor, COLOR_BTNFACE, COLOR_WINDOW, HBRUSH, HDC,
-};
+use windows::Win32::Graphics::Gdi::{FillRect, COLOR_BTNFACE, HBRUSH, HDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, GetWindowLongPtrW, GetWindowRect,
     RegisterClassW, SetWindowLongPtrW, SetWindowPos, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
-    SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_NOTIFY, WM_SIZE,
-    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME,
+    SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_NOTIFY, WM_SIZE, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use crate::layout::{self, Rect};
+use crate::theme;
 
 /// What a panel's owner does with its window's messages.
 pub trait Handler {
@@ -131,6 +129,7 @@ pub fn dialog(owner: HWND, title: &str, w: i32, h: i32) -> HWND {
         let x = r.left + ((r.right - r.left) - cw) / 2;
         let y = r.top + ((r.bottom - r.top) - ch) / 3;
         let _ = SetWindowPos(hwnd, None, x, y, cw, ch, SWP_NOZORDER);
+        crate::theme::title_bar(hwnd);
         hwnd
     }
 }
@@ -178,21 +177,24 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             h.close();
             LRESULT(0)
         }
-        // SAFETY: GWLP_USERDATA is ours; a page paints like the tab control's body.
-        (WM_ERASEBKGND, _) if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == PAGE => unsafe {
+        // SAFETY: GWLP_USERDATA is ours; a page paints as a screen's body, a dialog as a window.
+        (WM_ERASEBKGND, _) => unsafe {
+            let page = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PAGE;
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
-            FillRect(HDC(wp.0 as _), &rc, GetSysColorBrush(COLOR_WINDOW));
+            let brush = if page {
+                theme::panel_brush()
+            } else {
+                theme::window_brush()
+            };
+            FillRect(HDC(wp.0 as _), &rc, brush);
             LRESULT(1)
         },
-        // SAFETY: GWLP_USERDATA is ours; a page's statics take the tab body's colour.
-        (WM_CTLCOLORSTATIC, _) if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == PAGE => unsafe {
-            SetBkColor(
-                HDC(wp.0 as _),
-                windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOW)),
-            );
-            LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
-        },
+        // SAFETY: GWLP_USERDATA is ours.
+        (msg, _) if theme::ctl_color(msg, wp, lp, false).is_some() => {
+            let page = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == PAGE;
+            theme::ctl_color(msg, wp, lp, page).unwrap_or_default()
+        }
         // SAFETY: everything else gets the default handling.
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
