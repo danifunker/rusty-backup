@@ -32,7 +32,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, ShellExecuteW,
-    FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
@@ -189,6 +190,53 @@ impl EffectHost {
                 let _ = unsafe { DestroyWindow(owner) };
             }
         }
+    }
+}
+
+impl EffectHost {
+    /// Pick several host files; none when cancelled. A script answers `add_files` with one path.
+    pub fn pick_files(&self, title: &str) -> Vec<PathBuf> {
+        if let Some(answer) = picks::scripted("add_files") {
+            return answer.into_iter().collect();
+        }
+        // SAFETY: COM is initialised on this thread; every string outlives the call that takes it.
+        unsafe {
+            let Ok(dialog) =
+                CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let opts = dialog.GetOptions().unwrap_or_default()
+                | FOS_FORCEFILESYSTEM
+                | FOS_ALLOWMULTISELECT;
+            let _ = dialog.SetOptions(opts);
+            let t = ui::wide(title);
+            let _ = dialog.SetTitle(PCWSTR(t.as_ptr()));
+            if dialog.Show(Some(self.inner.owner)).is_err() {
+                return Vec::new();
+            }
+            let Ok(items) = dialog.GetResults() else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for i in 0..items.GetCount().unwrap_or(0) {
+                let Ok(item) = items.GetItemAt(i) else {
+                    continue;
+                };
+                if let Ok(name) = item.GetDisplayName(SIGDN_FILESYSPATH) {
+                    if let Ok(path) = name.to_string() {
+                        out.push(PathBuf::from(path));
+                    }
+                    CoTaskMemFree(Some(name.0 as *const _));
+                }
+            }
+            out
+        }
+    }
+
+    /// Put `text` on the clipboard.
+    pub fn copy(&self, text: &str) {
+        copy_text(self.inner.owner, &ui::plain(text));
     }
 }
 

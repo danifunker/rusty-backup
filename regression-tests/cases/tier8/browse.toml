@@ -43,3 +43,40 @@ args = ["fsck", "{scratch}/h.img", "--format", "json"]
 expect_exit = 0
 fsck_clean = true
 files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/rusty-backup/HELLO.TXT"]]
+
+[[case]]
+id = "flow.browse.inspect-new-folder"
+description = "Browse a FAT floppy from Inspect, turn on Edit Mode, stage a new folder through the name prompt, apply it, and list the image with rb-cli"
+level = "smoke"
+area = ["inspect", "browse", "files"]
+shells = ["win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.new-folder"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/f.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "Filesystem Browser" },
+  { activate = "browse.edit_mode" },
+  { wait = "Edit Mode ON" },
+  { activate = "browse.new_folder" },
+  { focus = "prompt.text" },
+  { fill = "NEWDIR" },
+  { activate = "prompt.ok" },
+  { wait = "Apply Edits (1)" },
+  { activate = "browse.apply" },
+  { wait_gone = "Apply Edits (1)" },
+]
+
+[[case.step]]
+args = ["ls", "{scratch}/f.img", "/"]
+expect_exit = 0
+stdout_contains = ["NEWDIR"]

@@ -233,4 +233,4 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk | against `rb-cli optical extract` |
 | `audio.toml` | play a CD-DA track | gtk (no TUI player by design) | the position advances |
 | `win32-shell.toml` | the Win32 skeleton starts, switches tabs, clears the log by id | win32 | a stand-in until a screen's flows run on win32 |
-| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect | win32 | the TUI and GTK can join once their extract-to-folder step is checked |
+| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it | win32 | the TUI and GTK can join once their extract-to-folder step is checked |

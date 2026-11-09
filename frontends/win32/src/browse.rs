@@ -1,11 +1,12 @@
 //! The Inspect browse view over a single-pane `CommanderController`; GTK's `browser/mod.rs` is
 //! the reference.
 //!
-//! Slice 2, first pass: the volume line, Extract All, Export to .tar.gz and Close, the running
-//! job with Cancel, the controller's notices, the folder tree, the listing (a virtual list view),
-//! the side panel with Extract, Export and Open as Disk Image over a text or hex preview, and the
-//! status line. Keys go through the controller's key map. Still to come: marks, Edit Mode and its
-//! bar, the View menu, the row menu, Check / Journal / Tree / CHD Info, and the dialogs.
+//! The volume line and the header's tools ([`crate::browse_bars`]), the edit bar, the running
+//! job with Cancel, notices, the folder tree, the listing (a virtual list view with tick boxes
+//! for marks), the side panel over a text or hex preview, the status line and the mark bar, the
+//! View and row menus, and the windows the controller describes ([`crate::window`]). Keys go
+//! through the controller's key map. Still to come: File Info's window and metadata form, the
+//! text editor, Mac archive and tar import windows, the size budget, checksums and passwords.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -15,27 +16,30 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::ids;
 use rusty_backup::controller::commander::{
-    extract_fork_modes, format_size, BrowserPaneAction as P, CommanderAction as A,
-    CommanderController, DisplayRow, ExportFormat, ExtractOptions, JobRegistry, ListingStyle,
-    ModeAction, PaneProfile, PaneServices, PanelActions, ResourceForkMode, Side, SidePanel,
-    SortColumn, VolumeLine, FOLLOW_DELAY,
+    extract_fork_modes, format_size, journal_window, tree_window, BrowserPaneAction as P,
+    CommanderAction as A, CommanderController, DisplayRow, EditBar, ExportFormat, ExtractOptions,
+    HeaderTools, JobRegistry, ListingStyle, MarkBar, ModeAction, PaneProfile, PaneServices,
+    PaneWindow, PanelActions, ResourceForkMode, RowMenuEntry, Side, SidePanel, SortColumn,
+    TreeText, ViewItemKind, VolumeLine, WindowKind, FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
-use windows::core::{w, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::UI::Controls::{
     ImageList_Destroy, HIMAGELIST, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMICON, LVIF_IMAGE, LVIF_INDENT,
-    LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE,
-    LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVSICF_NOSCROLL, LVSIL_SMALL,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMICON, LVHT_ONITEMSTATEICON,
+    LVIF_IMAGE, LVIF_INDENT, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED,
+    LVIS_STATEIMAGEMASK, LVITEMW, LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS,
+    LVM_SETCALLBACKMASK, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST,
+    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
+    LVN_ITEMCHANGED, LVN_KEYDOWN, LVSICF_NOSCROLL, LVSIL_SMALL, LVS_EX_CHECKBOXES,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
     LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NMTREEVIEWW,
-    NM_CLICK, NM_DBLCLK, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM,
+    NM_CLICK, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM,
     TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT,
     TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM,
     TVM_SETIMAGELIST, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_HASBUTTONS,
@@ -49,18 +53,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, PostMessageW, SendMessageW, SetTimer, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, DLGC_WANTMESSAGE, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, MSG,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetCursorPos, GetWindowRect, KillTimer,
+    PostMessageW, SendMessageW, SetTimer, TrackPopupMenu, CBN_SELCHANGE, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DLGC_WANTMESSAGE, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_READONLY, GA_ROOT, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_STRING, MSG, TPM_RETURNCMD,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_GETDLGCODE, WM_KEYDOWN, WS_EX_CLIENTEDGE,
     WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::browse_bars::{BarCmd, EditRow, MarkRow, Tools};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::row_icons;
 use crate::sync::SyncGuard;
 use crate::ui;
+use crate::window::{Event, ModelWindow};
 
 /// The listing's columns: title, width in DIPs, right-aligned, the sort they ask for.
 const COLUMNS: [(&str, i32, bool, Option<SortColumn>); 5] = [
@@ -77,6 +85,66 @@ const TREE_W: i32 = 200;
 
 /// A `WM_COMMAND` code the view posts to itself: run the folder-tree action a notification held.
 const DEFERRED: u32 = 0x7F00;
+/// Another: pop up the View menu the key map asked for.
+const VIEW_MENU: u32 = 0x7F01;
+
+/// One entry of a popup menu.
+enum MenuItem {
+    Item {
+        label: String,
+        enabled: bool,
+        checked: bool,
+        action: A,
+    },
+    Sub {
+        label: String,
+        items: Vec<(String, A)>,
+    },
+}
+
+/// Track a popup menu of `items` at screen point `(x, y)`; the action picked, if any.
+fn track(owner: HWND, items: Vec<MenuItem>, x: i32, y: i32) -> Option<A> {
+    let mut actions: Vec<A> = Vec::new();
+    // SAFETY: menus we create, track and destroy here; each label outlives its append.
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for item in items {
+            match item {
+                MenuItem::Item {
+                    label,
+                    enabled,
+                    checked,
+                    action,
+                } => {
+                    actions.push(action);
+                    let mut flags = MF_STRING;
+                    if !enabled {
+                        flags |= MF_GRAYED;
+                    }
+                    if checked {
+                        flags |= MF_CHECKED;
+                    }
+                    let t = ui::wide(&ui::plain(&label));
+                    let _ = AppendMenuW(menu, flags, actions.len(), PCWSTR(t.as_ptr()));
+                }
+                MenuItem::Sub { label, items } => {
+                    let Ok(sub) = CreatePopupMenu() else { continue };
+                    for (l, a) in items {
+                        actions.push(a);
+                        let t = ui::wide(&ui::plain(&l));
+                        let _ = AppendMenuW(sub, MF_STRING, actions.len(), PCWSTR(t.as_ptr()));
+                    }
+                    let t = ui::wide(&ui::plain(&label));
+                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t.as_ptr()));
+                }
+            }
+        }
+        let picked = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, None, owner, None);
+        let _ = DestroyMenu(menu);
+        let i = usize::try_from(picked.0).ok()?;
+        (i > 0).then(|| actions.swap_remove(i - 1))
+    }
+}
 
 fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
     let services = PaneServices {
@@ -94,6 +162,7 @@ fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
 #[derive(Clone, PartialEq)]
 struct Line {
     cells: [String; 5],
+    marked: bool,
     node_id: String,
     icon: i32,
     depth: i32,
@@ -119,6 +188,12 @@ struct Shown {
     actions: Option<PanelActions>,
     status: String,
     follow: bool,
+    tools: HeaderTools,
+    edit: EditBar,
+    marks: MarkBar,
+    marked: Vec<bool>,
+    windows: Vec<PaneWindow>,
+    view_menu: bool,
 }
 
 pub struct BrowseView {
@@ -154,6 +229,17 @@ pub struct BrowseView {
     nested: HWND,
     preview: HWND,
     status: HWND,
+    tools: Tools,
+    edit_row: EditRow,
+    mark_row: MarkRow,
+    windows: RefCell<Vec<Rc<ModelWindow>>>,
+    /// The Check report's "Show debug messages", which only this view keeps.
+    debug: Cell<bool>,
+    /// The listing Tree handed over, shown until its window closes.
+    tree_text: RefCell<Option<TreeText>>,
+    journal: RefCell<Option<PaneWindow>>,
+    /// The user asked for the File Info window, beyond what the side panel shows.
+    info_asked: Cell<bool>,
     rows: RefCell<Vec<DisplayRow>>,
     lines: RefCell<Vec<Line>>,
     /// Listing positions shift by the `..` rows a tick-box listing leaves out.
@@ -166,7 +252,7 @@ pub struct BrowseView {
     follow_timer: Cell<usize>,
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
     /// Which optional lines the last layout gave room to.
-    shape: Cell<u32>,
+    shape: Cell<u64>,
 }
 
 thread_local! {
@@ -214,7 +300,8 @@ fn key_of(vk: u16) -> Option<Key> {
         // Moving the selection is the list's own: its change moves the controller's cursor.
         VK_LEFT => Key::Left,
         VK_RIGHT => Key::Right,
-        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END | VK_SPACE => return None,
+        VK_SPACE => Key::Space,
+        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END => return None,
         _ => {
             let c = char::from_u32(u32::from(vk)).filter(|c| c.is_ascii_alphanumeric())?;
             Key::Char(c.to_ascii_lowercase())
@@ -259,6 +346,7 @@ fn mods() -> Mods {
 
 fn line_of(row: &DisplayRow, name: String) -> Line {
     Line {
+        marked: false,
         cells: [
             name,
             match row.is_dir {
@@ -320,7 +408,14 @@ impl BrowseView {
         // SAFETY: plain list-view setup; each column title outlives its insert.
         unsafe {
             let _ = SetWindowSubclass(list, Some(list_proc), 1, 0);
-            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
+            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES;
+            // A virtual list asks for its tick boxes' state, which is the controller's marks.
+            SendMessageW(
+                list,
+                LVM_SETCALLBACKMASK,
+                Some(WPARAM(LVIS_STATEIMAGEMASK.0 as usize)),
+                None,
+            );
             SendMessageW(
                 list,
                 LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -380,7 +475,10 @@ impl BrowseView {
         // SAFETY: a plain query of our own page.
         let dpi = unsafe { GetDpiForWindow(page) }.max(96);
         ui::set_font(preview, ui::mono_font_at(dpi));
-        let status = ui::label(page, "");
+        let status = ui::cell_label(page, "");
+        let tools = Tools::build(page);
+        let edit_row = EditRow::build(page);
+        let mark_row = MarkRow::build(page);
         let view = Rc::new_cyclic(|me: &Weak<BrowseView>| BrowseView {
             ctrl: RefCell::new(new_controller(&notify)),
             notify,
@@ -414,6 +512,14 @@ impl BrowseView {
             nested,
             preview,
             status,
+            tools,
+            edit_row,
+            mark_row,
+            windows: RefCell::default(),
+            debug: Cell::new(false),
+            tree_text: RefCell::default(),
+            journal: RefCell::default(),
+            info_asked: Cell::new(false),
             rows: RefCell::default(),
             lines: RefCell::default(),
             skip: Cell::new(0),
@@ -424,7 +530,7 @@ impl BrowseView {
             deferred: RefCell::default(),
             follow_timer: Cell::new(0),
             on_change: RefCell::default(),
-            shape: Cell::new(u32::MAX),
+            shape: Cell::new(u64::MAX),
         });
         FOLLOW.with(|f| *f.borrow_mut() = view.me.clone());
         view.set_icons();
@@ -509,6 +615,9 @@ impl BrowseView {
         // The old pane's readers go before its CHD diff or archive temp is removed.
         self.ctrl.replace(fresh).close_inspect();
         self.label_prefix.borrow_mut().clear();
+        self.tree_text.replace(None);
+        self.journal.replace(None);
+        self.windows.borrow_mut().clear();
         self.show_notice(None);
         self.refresh();
         self.changed();
@@ -524,6 +633,11 @@ impl BrowseView {
     }
 
     fn apply(&self, action: A) {
+        match action {
+            A::OpenDetail(..) => self.info_asked.set(true),
+            A::CloseDetail => self.info_asked.set(false),
+            _ => {}
+        }
         let fx = self.ctrl.borrow_mut().apply(action);
         self.after(fx);
     }
@@ -560,25 +674,36 @@ impl BrowseView {
         }
         self.take_results();
         // The side panel already shows File Info, so the window a double-click asks for is not opened.
-        if self.ctrl.borrow().detail().is_some() {
+        if !self.info_asked.get() && self.ctrl.borrow().detail().is_some() {
             self.ctrl.borrow_mut().apply(A::CloseDetail);
         }
         self.refresh();
     }
 
-    /// What jobs ended with: the notices; the tree listing, journal and text editor come later.
+    /// What jobs ended with: notices, a tree listing, a journal; the text editor comes later.
     fn take_results(&self) {
-        let lines: Vec<String> = {
+        let (lines, doc): (Vec<String>, bool) = {
             let mut ctl = self.ctrl.borrow_mut();
             let pane = ctl.host_pane();
-            let _ = pane.take_tree_text();
-            let _ = pane.take_journal();
+            if let Some(tree) = pane.take_tree_text() {
+                *self.tree_text.borrow_mut() = Some(tree);
+            }
+            if let Some(j) = pane.take_journal() {
+                *self.journal.borrow_mut() = Some(journal_window(&j));
+            }
             let archive = pane.take_archive_notice();
-            let _ = ctl.take_text_doc();
+            let doc = ctl.take_text_doc().is_some();
             let notice = ctl.take_mode_notice();
             let error = ctl.take_mode_error();
-            [notice, archive, error].into_iter().flatten().collect()
+            (
+                [notice, archive, error].into_iter().flatten().collect(),
+                doc,
+            )
         };
+        if doc {
+            let line = "Edit as text arrives in a later pass of the Win32 shell.".to_string();
+            crate::app::append_log(vec![(LogLevel::Warning, line)]);
+        }
         if let Some(last) = lines.last() {
             self.show_notice(Some(last));
         }
@@ -656,6 +781,11 @@ impl BrowseView {
             true => all.iter().take_while(|r| r.is_parent()).count(),
             false => 0,
         };
+        let marked: Vec<bool> = all
+            .iter()
+            .skip(skip)
+            .map(|r| pane.has_selection() && pane.row_selected(r))
+            .collect();
         let lines = match &rows {
             Some(rows) => rows
                 .iter()
@@ -714,6 +844,19 @@ impl BrowseView {
             actions: ctl.panel_actions(Side::Left, false),
             status: ctl.status().to_string(),
             follow: ctl.follow_pending(),
+            tools: ctl.header_tools(Side::Left),
+            edit: ctl.edit_bar(Side::Left),
+            marks: ctl.mark_bar(Side::Left),
+            marked,
+            windows: {
+                let mut w = ctl.pane_windows(Side::Left, self.debug.get());
+                if let Some(t) = &*self.tree_text.borrow() {
+                    w.push(tree_window(t, false));
+                }
+                w.extend(self.journal.borrow().clone());
+                w
+            },
+            view_menu: ctl.view_menu_shown(),
         }
     }
 
@@ -721,7 +864,19 @@ impl BrowseView {
     fn refresh(&self) {
         let shown = self.read();
         let follow = shown.follow;
+        let view_menu = shown.view_menu && self.active.get();
         self.sync.run(|| self.show(shown));
+        if view_menu {
+            // SAFETY: posting to our own page; the menu opens once this refresh is done.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(self.page),
+                    WM_COMMAND,
+                    WPARAM((VIEW_MENU as usize) << 16),
+                    LPARAM(self.tools.view.0 as isize),
+                );
+            }
+        }
         if self.shape.get() != self.shape_now() {
             self.layout();
         }
@@ -781,6 +936,180 @@ impl BrowseView {
         }
         self.show_panel(s.panel_key, s.panel, s.result, s.actions);
         ui::set_text(self.status, &s.status);
+        self.tools.show(&s.tools);
+        self.edit_row.show(&s.edit);
+        self.mark_row.show(&s.marks);
+        self.show_marks(s.marked);
+        self.show_windows(s.windows);
+    }
+
+    /// Draw the tick boxes again where the marks changed.
+    fn show_marks(&self, marked: Vec<bool>) {
+        let (changed, count) = {
+            let mut lines = self.lines.borrow_mut();
+            let mut changed = false;
+            for (line, m) in lines.iter_mut().zip(marked) {
+                if line.marked != m {
+                    line.marked = m;
+                    changed = true;
+                }
+            }
+            (changed, lines.len())
+        };
+        // The list may ask for a row's text while it redraws, so the rows are not held here.
+        if changed {
+            let last = count.saturating_sub(1);
+            // SAFETY: the virtual list reads the marks back through LVN_GETDISPINFO.
+            unsafe {
+                SendMessageW(
+                    self.list,
+                    LVM_REDRAWITEMS,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(last as isize)),
+                );
+            }
+        }
+    }
+
+    /// Open, keep or close the controller's windows: one per kind, built again when it changes.
+    fn show_windows(&self, wanted: Vec<PaneWindow>) {
+        let mut open = self.windows.borrow_mut();
+        open.retain(|w| wanted.iter().any(|p| p.kind == w.kind));
+        for p in wanted {
+            let at = open.iter().position(|w| w.kind == p.kind);
+            if at.is_some_and(|i| open[i].key == p.key) {
+                continue;
+            }
+            let rect = at.map(|i| open.remove(i).rect());
+            let owner = self.owner();
+            let me = self.me.clone();
+            let kind = p.kind;
+            let on_event: Rc<dyn Fn(Event)> = Rc::new(move |e| {
+                if let Some(view) = me.upgrade() {
+                    view.window_event(kind, e);
+                }
+            });
+            open.push(ModelWindow::open(owner, &p, rect, on_event));
+        }
+    }
+
+    fn window_event(&self, kind: WindowKind, e: Event) {
+        match e {
+            Event::Send(actions) => {
+                for a in actions {
+                    self.apply(a);
+                }
+            }
+            Event::Copy(text) => self.host.copy(&text),
+            Event::Toggle(on) => {
+                self.debug.set(on);
+                self.refresh();
+            }
+            Event::Closed => {
+                match kind {
+                    WindowKind::Tree => drop(self.tree_text.borrow_mut().take()),
+                    WindowKind::Journal => drop(self.journal.borrow_mut().take()),
+                    _ => {}
+                }
+                self.refresh();
+            }
+        }
+    }
+
+    /// The main window, which owns the browse view's windows and menus.
+    fn owner(&self) -> HWND {
+        // SAFETY: a plain query of our own page.
+        unsafe { GetAncestor(self.page, GA_ROOT) }
+    }
+
+    fn bar(&self, cmd: BarCmd) {
+        match cmd {
+            BarCmd::Send(actions) => {
+                for a in actions {
+                    self.apply(a);
+                }
+            }
+            BarCmd::AddFiles => {
+                let paths = self.host.pick_files("Select files to add");
+                if !paths.is_empty() {
+                    self.apply(A::Pane(Side::Left, P::AddPicked(paths)));
+                }
+            }
+            BarCmd::ExportMarked(format) => {
+                let mode = self.extract_options().fork_mode;
+                self.apply(A::SetForkMode(mode));
+                self.apply(A::Export {
+                    from: Side::Left,
+                    format: Some(format),
+                });
+            }
+            BarCmd::ViewMenu => self.view_menu(),
+        }
+    }
+
+    /// The View menu under its button: listing styles, quick view, the log and help.
+    fn view_menu(&self) {
+        let items: Vec<MenuItem> = self
+            .ctrl
+            .borrow()
+            .view_menu()
+            .into_iter()
+            .map(|v| MenuItem::Item {
+                label: match v.hint.is_empty() {
+                    true => v.label,
+                    false => format!("{}\t{}", v.label, v.hint),
+                },
+                enabled: v.enabled,
+                checked: v.checked && v.kind != ViewItemKind::Command,
+                action: v.action,
+            })
+            .collect();
+        if self.ctrl.borrow().view_menu_shown() {
+            self.apply(A::ShowViewMenu(false));
+        }
+        let mut r = RECT::default();
+        // SAFETY: a plain query of our own button.
+        let _ = unsafe { GetWindowRect(self.tools.view, &mut r) };
+        if let Some(a) = track(self.owner(), items, r.left, r.bottom) {
+            self.apply(a);
+        }
+    }
+
+    /// The right-click menu of `row` at the pointer.
+    fn row_menu(&self, row: &DisplayRow) {
+        let context = self.ctrl.borrow().pane(Side::Left).row_context(row);
+        self.apply(A::Focus(Side::Left));
+        if let Some(a) = context {
+            self.apply(A::Pane(Side::Left, a));
+        }
+        let items: Vec<MenuItem> = self
+            .ctrl
+            .borrow()
+            .row_menu(Side::Left, row)
+            .into_iter()
+            .map(|e| match e {
+                RowMenuEntry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => MenuItem::Item {
+                    label,
+                    enabled,
+                    checked: false,
+                    action,
+                },
+                RowMenuEntry::Submenu { label, items } => MenuItem::Sub { label, items },
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let mut at = POINT::default();
+        // SAFETY: a plain query of the pointer.
+        let _ = unsafe { GetCursorPos(&mut at) };
+        if let Some(a) = track(self.owner(), items, at.x, at.y) {
+            self.apply(a);
+        }
     }
 
     fn show_rows(&self, rows: Vec<DisplayRow>, lines: Vec<Line>, rsrc: bool) {
@@ -970,9 +1299,10 @@ impl BrowseView {
     }
 
     /// Which optional controls are up, so a change lays the page out again.
-    fn shape_now(&self) -> u32 {
-        [
+    fn shape_now(&self) -> u64 {
+        let mut all = vec![
             self.job,
+            self.cancel,
             self.notice,
             self.message,
             self.tree,
@@ -981,11 +1311,14 @@ impl BrowseView {
             self.nested,
             self.fork,
             self.extract_all,
-        ]
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (ui::shown(*h) as u32) << i)
-        .sum()
+        ];
+        all.extend(self.tools.all());
+        all.extend(self.edit_row.all());
+        all.extend(self.mark_row.all().into_iter().take(1));
+        all.iter()
+            .enumerate()
+            .map(|(i, h)| u64::from(ui::shown(*h)) << i)
+            .sum()
     }
 
     fn layout(&self) {
@@ -993,18 +1326,33 @@ impl BrowseView {
         let (area, dpi) = panel::client(self.page);
         let line = |h: HWND| Node::leaf(h, Size::Stretch(1), Size::Fixed(layout::ROW - 8));
         let fixed = |h: HWND, n: i32| Node::leaf(h, Size::Fixed(DETAIL_W), Size::Fixed(n));
-        let mut col = vec![Node::row(vec![
+        let mut head = vec![
             Node::leaf(self.title, Size::Fixed(130), Size::Fixed(layout::ROW - 8)),
             line(self.volume),
-        ])];
-        let mut tools = Vec::new();
-        if ui::shown(self.extract_all) {
-            tools.push(Node::button(self.extract_all, 110));
-            tools.push(Node::button(self.export_volume, 150));
+        ];
+        if ui::shown(self.tools.boot) {
+            head.push(Node::leaf(
+                self.tools.boot,
+                Size::Fixed(150),
+                Size::Fixed(layout::ROW - 8),
+            ));
         }
+        let mut col = vec![Node::row(head)];
+        let mut tools = Vec::new();
+        if ui::shown(self.tools.edit) {
+            tools.push(Node::button(self.tools.edit, 100));
+        }
+        if ui::shown(self.extract_all) {
+            tools.push(Node::button(self.extract_all, 100));
+            tools.push(Node::button(self.export_volume, 140));
+        }
+        let (before, after) = self.tools.nodes();
+        tools.extend(before);
         tools.push(Node::Space(Size::Stretch(1)));
-        tools.push(Node::button(self.close, 80));
+        tools.extend(after);
+        tools.push(Node::button(self.close, 70));
         col.push(Node::row(tools));
+        col.extend(self.edit_row.nodes());
         if ui::shown(self.job) {
             let mut r = vec![
                 line(self.job),
@@ -1074,29 +1422,18 @@ impl BrowseView {
         body.push(Node::leaf(self.list, Size::Stretch(1), Size::Stretch(1)));
         body.push(Node::column(side));
         col.push(Node::row(body));
-        col.push(line(self.status));
+        let mut foot = vec![Node::leaf(
+            self.status,
+            Size::Stretch(1),
+            Size::Fixed(layout::ROW),
+        )];
+        foot.extend(self.mark_row.nodes());
+        col.push(Node::row(foot));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        let hidden = [
-            self.job,
-            self.progress,
-            self.cancel,
-            self.notice,
-            self.notice_ok,
-            self.message,
-            self.tree,
-            self.fork_caption,
-            self.fork,
-            self.extract,
-            self.export,
-            self.nested,
-            self.extract_all,
-            self.export_volume,
-        ];
         for (h, r) in layout::layout(&tree, area, dpi) {
-            if hidden.contains(&h) && !ui::shown(h) {
-                continue;
+            if ui::shown(h) {
+                ui::move_to(h, r);
             }
-            ui::move_to(h, r);
         }
     }
 
@@ -1108,6 +1445,12 @@ impl BrowseView {
             return;
         };
         if item.iSubItem == 0 {
+            if item.mask.0 & LVIF_STATE.0 != 0 {
+                // State image 2 is a ticked box, 1 an empty one.
+                let image = if line.marked { 2u32 } else { 1 };
+                item.state = LIST_VIEW_ITEM_STATE_FLAGS(image << 12);
+                item.stateMask = LVIS_STATEIMAGEMASK;
+            }
             if item.mask.0 & LVIF_IMAGE.0 != 0 {
                 item.iImage = line.icon;
             }
@@ -1185,9 +1528,25 @@ impl BrowseView {
                     );
                 }
                 let on_icon = hit.flags.0 & LVHT_ONITEMICON.0 != 0 && hit.iSubItem == 0;
+                let on_box = hit.flags.0 & LVHT_ONITEMSTATEICON.0 != 0;
                 let row = usize::try_from(hit.iItem).ok().and_then(|i| self.row_at(i));
-                if let Some(row) = row.filter(|r| on_icon && r.expandable) {
-                    self.apply(A::Pane(Side::Left, P::ToggleExpand(row.node_id)));
+                match row {
+                    Some(row) if on_box => {
+                        self.apply(A::Pane(Side::Left, P::Mark(row.node_id)));
+                    }
+                    Some(row) if on_icon && row.expandable => {
+                        self.apply(A::Pane(Side::Left, P::ToggleExpand(row.node_id)));
+                    }
+                    _ => {}
+                }
+                Some(LRESULT(0))
+            }
+            NM_RCLICK => {
+                // SAFETY: NM_RCLICK from a list view comes with an NMITEMACTIVATE.
+                let nm = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
+                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
+                if let Some(row) = row {
+                    self.row_menu(&row);
                 }
                 Some(LRESULT(0))
             }
@@ -1262,7 +1621,20 @@ impl Handler for BrowseView {
             }
             return;
         }
+        if code == VIEW_MENU {
+            self.view_menu();
+            return;
+        }
         if self.sync.active() {
+            return;
+        }
+        let bar = self
+            .tools
+            .command(from, code)
+            .or_else(|| self.edit_row.command(from, code))
+            .or_else(|| self.mark_row.command(from, code));
+        if let Some(cmd) = bar {
+            self.bar(cmd);
             return;
         }
         if from == self.fork {

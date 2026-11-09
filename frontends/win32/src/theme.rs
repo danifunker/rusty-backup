@@ -9,6 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use rusty_backup::controller::commander::Tone;
 use windows::core::{w, BOOL, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
@@ -31,6 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 thread_local! {
     static DARK: Cell<bool> = const { Cell::new(false) };
+    /// Labels drawn in a tone's colour rather than the text colour.
+    static TONES: RefCell<Vec<(isize, Tone)>> = const { RefCell::new(Vec::new()) };
     /// The brushes of the current mode: window, panel, field.
     static BRUSHES: RefCell<Option<[isize; 3]>> = const { RefCell::new(None) };
 }
@@ -344,6 +347,36 @@ pub fn restyle(top: HWND) {
     }
 }
 
+/// Draw label `hwnd` in `tone`'s colour, or the text colour again with `None`.
+pub fn set_tone(hwnd: HWND, tone: Option<Tone>) {
+    TONES.with(|t| {
+        let mut t = t.borrow_mut();
+        t.retain(|(h, _)| *h != hwnd.0 as isize);
+        if let Some(tone) = tone {
+            t.push((hwnd.0 as isize, tone));
+        }
+    });
+}
+
+fn tone_color(hwnd: HWND) -> Option<COLORREF> {
+    let tone = TONES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(h, _)| *h == hwnd.0 as isize)
+            .map(|(_, tone)| *tone)
+    })?;
+    let dark = dark();
+    Some(match tone {
+        Tone::Error if dark => rgb(0xff, 0x6b, 0x6b),
+        Tone::Error => rgb(0xc4, 0x2b, 0x1c),
+        Tone::Warning if dark => rgb(0xf0, 0xb4, 0x40),
+        Tone::Warning => rgb(0x9d, 0x5d, 0x00),
+        Tone::Success if dark => rgb(0x6c, 0xcb, 0x5f),
+        Tone::Success => rgb(0x10, 0x7c, 0x10),
+        Tone::Plain => return None,
+    })
+}
+
 /// Answer a `WM_CTLCOLOR*` with the mode's colours; `page` is a screen's page, not a window.
 pub fn ctl_color(msg: u32, wp: WPARAM, lp: LPARAM, page: bool) -> Option<LRESULT> {
     if !matches!(
@@ -364,9 +397,10 @@ pub fn ctl_color(msg: u32, wp: WPARAM, lp: LPARAM, page: bool) -> Option<LRESULT
     } else {
         (c.window, window_brush())
     };
+    let ink = tone_color(HWND(lp.0 as _)).unwrap_or(c.text);
     // SAFETY: the DC the control handed us for this paint.
     unsafe {
-        SetTextColor(hdc, c.text);
+        SetTextColor(hdc, ink);
         SetBkColor(hdc, bg);
     }
     Some(LRESULT(br.0 as isize))

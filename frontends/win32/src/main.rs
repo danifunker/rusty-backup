@@ -12,6 +12,8 @@ mod app;
 #[cfg(windows)]
 mod browse;
 #[cfg(windows)]
+mod browse_bars;
+#[cfg(windows)]
 mod chd;
 #[cfg(windows)]
 mod darkdraw;
@@ -48,6 +50,8 @@ mod toolbar;
 mod ui;
 #[cfg(windows)]
 mod wake;
+#[cfg(windows)]
+mod window;
 
 #[cfg(windows)]
 fn main() {

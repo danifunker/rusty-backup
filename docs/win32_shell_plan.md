@@ -152,9 +152,17 @@ in check-group mode with the bundled icons); the screens and slices below are un
    status line. The side panel's text, its action rules and the volume line moved into the
    controller (`commander::screen::panel`). `flow.browse.inspect-extract-all` passes. Rows carry
    icons from `assets/icons/rows` (Tabler, as the toolbar): a folder with a + or - is the
-   expander, and a click on it opens or shuts the folder; GTK can take the same set later. Left:
-   marks, Edit Mode and its bar, the View and row menus, Check / Journal / Tree / CHD Info, the
-   dialogs.
+   expander, and a click on it opens or shuts the folder; GTK can take the same set later.
+   Second pass (2026-11-09): tick-box marks and the mark bar, Edit Mode and the edit bar, the
+   header's Check / Journal / Tree / CHD Info / View, the row menu, and every window the edit
+   flows need (review, report, pending edits, staging errors, Check results, unsaved changes,
+   conflicts, skipped, CHD Info, tree, journal, session log, keyboard shortcuts, checksums, File
+   Info). The windows are described once in the controller (`commander::screen::windows`, a
+   `PaneWindow` of parts and buttons that carry actions) and drawn by one Win32 window
+   (`window.rs`); the bars read `header_tools` / `edit_bar` / `mark_bar`. GTK still builds its own
+   and can switch to these in the Linux session. `flow.browse.inspect-new-folder` passes. Left:
+   File Info's metadata form, the text editor, the Mac archive and tar import windows, the size
+   budget, passwords, picking a journal transaction, and keys inside the windows (Esc, F1).
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
