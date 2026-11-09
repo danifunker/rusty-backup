@@ -38,6 +38,22 @@ pub mod ids {
     pub const CLOSE: &str = "expand_hfs.close";
 }
 
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const TARGET_SIZE: &str = "Target size (MiB)";
+    pub const SAVE_AS: &str = "Save As...";
+    pub const EXPAND: &str = "Expand";
+    pub const DONE: &str = "Expand complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (ids::TARGET_SIZE, TARGET_SIZE),
+        (ids::SAVE_AS, SAVE_AS),
+        (ids::EXPAND, EXPAND),
+        ("expand_hfs.done", DONE),
+    ];
+}
+
 /// User intents.
 pub enum ExpandHfsAction {
     Open(ExpandSource),

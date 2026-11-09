@@ -1557,7 +1557,10 @@ fn run_case(
 
     let controls = if case.shell.is_some() {
         match flow::load_controls(&regression_dir().join("drivers").join("labels.toml")) {
-            Ok(c) => c,
+            Ok(mut c) => {
+                flow::add_controller_labels(&mut c, &args.rb_cli);
+                c
+            }
             Err(e) => {
                 result.verdict = Verdict::Error;
                 result.skip_reason = Some(e);

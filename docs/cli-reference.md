@@ -2333,6 +2333,14 @@ Launch the full-screen terminal UI (preview): a menu-driven ratatui app that run
 Usage: tui
 ```
 
+### `ui-labels`
+
+Every controller's control labels as `id<TAB>label` lines, for the flow drivers (FLOWS.md)
+
+```
+Usage: ui-labels
+```
+
 ### `untar`
 
 Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them

@@ -12,20 +12,20 @@ level = "smoke"
 area = ["optical"]
 shells = ["tui", "gtk"]
 fixture = "optical.iso9660.joliet.cd"
-capabilities = ["optical.open-image", "optical.browse", "optical.extract"]
+capabilities = ["optical.open-image", "optical.browse_contents", "browse.extract"]
 timeout_ms = 240000
 
 [[case.step]]
 ui = [
   { tab = "Optical" },
   { pick = "{fixture}" },
-  { activate = "optical.open_image" },
+  { activate = "optical.browse_image" },
   { wait = "ISO 9660", timeout_ms = 20000 },
-  { activate = "optical.browse" },
+  { activate = "optical.browse_contents" },
   { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
   { focus = "CIV_II_GOLD_111_UPDATE.SIT" },
   { pick = "{scratch}" },
-  { activate = "optical.extract" },
+  { activate = "browse.extract" },
   { wait_file = "{scratch}/CIV_II_GOLD_111_UPDATE.SIT", timeout_ms = 60000 },
 ]
 
@@ -41,7 +41,7 @@ level = "full"
 area = ["optical"]
 shells = ["tui", "gtk"]
 fixture = "optical.iso9660.joliet.cd"
-capabilities = ["optical.open-image", "optical.browse", "optical.extract", "optical.chd"]
+capabilities = ["optical.open-image", "optical.browse_contents", "browse.extract", "optical.chd"]
 timeout_ms = 240000
 
 [[case.step]]
@@ -52,13 +52,13 @@ expect_exit = 0
 ui = [
   { tab = "Optical" },
   { pick = "{scratch}/disc.chd" },
-  { activate = "optical.open_image" },
+  { activate = "optical.browse_image" },
   { wait = "ISO 9660", timeout_ms = 20000 },
-  { activate = "optical.browse" },
+  { activate = "optical.browse_contents" },
   { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
   { focus = "CIV_II_GOLD_111_UPDATE.SIT" },
   { pick = "{scratch}" },
-  { activate = "optical.extract" },
+  { activate = "browse.extract" },
   { wait_file = "{scratch}/CIV_II_GOLD_111_UPDATE.SIT", timeout_ms = 60000 },
 ]
 

@@ -30,11 +30,13 @@ pub mod disk_write;
 pub mod expand_hfs;
 pub mod inspect;
 pub mod keys;
+pub mod labels;
 pub mod log;
 pub mod new_disk;
 #[cfg(feature = "optical")]
 pub mod optical;
 pub mod partition_edit;
+pub mod picks;
 #[cfg(feature = "remote")]
 pub mod remote_pick;
 pub mod resize;

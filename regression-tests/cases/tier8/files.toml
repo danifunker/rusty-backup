@@ -22,15 +22,15 @@ expect_exit = 0
 
 [[case.step]]
 ui = [
-  { activate = "commander.open" },
+  { activate = "app.commander" },
   { pick = "{scratch}/vol.img" },
-  { activate = "commander.right.open_image" },
+  { activate = "commander.right.open_file" },
   { wait = "[R] opened" },
   { pick = "{cases}/tier8/data/inject" },
   { activate = "commander.left.open_folder" },
   { wait = "HELLO.TXT" },
   { focus = "HELLO.TXT" },
-  { activate = "commander.copy_to_right" },
+  { activate = "commander.copy_ltr" },
   { activate = "commander.right.apply" },
   { wait_gone = "commander.staged", timeout_ms = 60000 },
 ]
@@ -66,9 +66,9 @@ expect_exit = 0
 
 [[case.step]]
 ui = [
-  { activate = "commander.open" },
+  { activate = "app.commander" },
   { pick = "{scratch}/vol.img" },
-  { activate = "commander.right.open_image" },
+  { activate = "commander.right.open_file" },
   { wait = "[R] opened" },
   { pick = "{scratch}" },
   { activate = "commander.left.open_folder" },
@@ -76,7 +76,7 @@ ui = [
   # The TUI copies from the active pane; GTK has a Copy button per direction.
   { key = "Tab", only = "tui" },
   { focus = "HELLO.TXT" },
-  { activate = "commander.copy_to_left" },
+  { activate = "commander.copy_rtl" },
   { activate = "commander.left.apply" },
   { wait_gone = "commander.staged", timeout_ms = 60000 },
 ]

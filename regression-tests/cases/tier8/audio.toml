@@ -20,7 +20,7 @@ timeout_ms = 120000
 ui = [
   { tab = "Optical" },
   { pick = "{fixture}" },
-  { activate = "optical.open_image" },
+  { activate = "optical.browse_image" },
   { wait = "Audio Tracks (1)", timeout_ms = 20000 },
   { activate = "Audio Tracks (1)" },
   { activate = "Play" },

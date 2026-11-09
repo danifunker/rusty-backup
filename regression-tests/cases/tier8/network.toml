@@ -29,7 +29,7 @@ background = true
 [[case.step]]
 ui = [
   { tab = "Inspect" },
-  { activate = "inspect.remote" },
+  { activate = "inspect.source.connect_remote" },
   { wait = "Connect to remote" },
   { type = "127.0.0.1:{port}" },
   { key = "Enter" },
@@ -38,7 +38,7 @@ ui = [
   { key = "Enter" },
   { wait = "FAT" },
   { pick = "{scratch}" },
-  { activate = "inspect.remote_backup" },
+  { activate = "remote_pick.backup" },
   # The checksum file is the last thing a backup writes.
   { wait_file = "{scratch}/disk-backup/partition-0.zst.sha256", timeout_ms = 120000 },
 ]

@@ -431,15 +431,8 @@ mod imp {
                 ws_ypixel: 0,
             };
             // SAFETY: out-pointers to locals; null name and termios are allowed.
-            let rc = unsafe {
-                openpty(
-                    &mut m,
-                    &mut s,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &ws,
-                )
-            };
+            let rc =
+                unsafe { openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), &ws) };
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -622,7 +615,12 @@ mod imp {
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn CreatePipe(read: *mut Handle, write: *mut Handle, attrs: *const c_void, size: u32) -> i32;
+        fn CreatePipe(
+            read: *mut Handle,
+            write: *mut Handle,
+            attrs: *const c_void,
+            size: u32,
+        ) -> i32;
         fn CreatePseudoConsole(
             size: Coord,
             input: Handle,

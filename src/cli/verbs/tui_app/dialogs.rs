@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use super::{hint, App, KeyHint};
 use crate::controller::alto_resize::{AltoResizeAction, AltoResizeController, AltoTarget};
-use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
+use crate::controller::expand_hfs::{labels, ExpandHfsAction, ExpandHfsController};
 
 /// One row of whichever dialog is up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -344,12 +344,13 @@ impl App {
             .output()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(not chosen)".to_string());
+        let expand = format!("[ {} ]", labels::EXPAND);
         let expand = if c.can_start() {
-            "[ Expand ]"
+            expand
         } else if c.editable() {
-            "[ Expand ]  (choose the output file first)"
+            format!("{expand}  (choose the output file first)")
         } else {
-            "[ Expand ]  (done; Esc closes)"
+            format!("{expand}  (done; Esc closes)")
         };
         let rows = [
             (DRow::HfsFormat, format!("Output format:  < {format} >")),
@@ -359,13 +360,13 @@ impl App {
             ),
             (
                 DRow::HfsSize,
-                format!("Target size MiB:  {size}  ({lo}-{hi})"),
+                format!("{}:  {size}  ({lo}-{hi})", labels::TARGET_SIZE),
             ),
             (
                 DRow::HfsOutput,
-                format!("Output file:  {output}  [Save As...]"),
+                format!("Output file:  {output}  [{}]", labels::SAVE_AS),
             ),
-            (DRow::HfsExpand, expand.to_string()),
+            (DRow::HfsExpand, expand),
         ];
         for (row, text) in rows {
             focus = self.dialog_row(&mut lines, w, row, text).unwrap_or(focus);
@@ -388,7 +389,7 @@ impl App {
         } else if let Some(Err(e)) = c.outcome() {
             lines.push(Line::styled(format!("  Failed: {e}"), pal.warn()));
         } else if c.outcome().is_some() {
-            lines.push(Line::styled("  Expand complete.", pal.accent()));
+            lines.push(Line::styled(format!("  {}", labels::DONE), pal.accent()));
         }
         let all = c.lines();
         let skip = all.len().saturating_sub(6);

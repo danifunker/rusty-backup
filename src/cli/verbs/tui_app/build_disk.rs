@@ -16,7 +16,7 @@ use ratatui::Frame;
 use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, hints, parse_size_field, purpose,
+    containers, cpm_presets, format_size, geometries, hints, labels, parse_size_field, purpose,
     BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdSidecars, DiskKind, FormatOptions,
     FsKind, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
     AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
@@ -746,7 +746,7 @@ impl App {
             return if s.ctl.is_running() {
                 vec![("Esc", "Cancel")]
             } else {
-                vec![("a", "Build another"), ("<-/->", "Tabs")]
+                vec![("a", labels::BUILD_ANOTHER), ("<-/->", "Tabs")]
             };
         }
         vec![
@@ -811,7 +811,7 @@ impl App {
                     lines.push(Line::raw(phase));
                 }
                 match c.outcome() {
-                    Some(Ok(())) => lines.push(Line::styled("Disk build complete.", pal.accent())),
+                    Some(Ok(())) => lines.push(Line::styled(labels::DONE, pal.accent())),
                     Some(Err(e)) => lines.push(Line::styled(format!("Error: {e}"), pal.warn())),
                     None => {}
                 }
@@ -844,7 +844,7 @@ impl App {
                 }
             }
             let (label, value): (String, String) = match row {
-                Row::Kind => ("Kind".into(), format!("< {} >", c.kind().label())),
+                Row::Kind => (labels::KIND.into(), format!("< {} >", c.kind().label())),
                 Row::OutputKind => (
                     "Output".into(),
                     if c.output_is_device() {
@@ -854,10 +854,14 @@ impl App {
                     },
                 ),
                 Row::OutputImage => (
-                    "Save as".into(),
-                    c.image()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(Enter to choose)".into()),
+                    "Image file".into(),
+                    format!(
+                        "{}  [{}]",
+                        c.image()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(Enter to choose)".into()),
+                        labels::PICK_IMAGE
+                    ),
                 ),
                 Row::Container => (
                     "Format".into(),
@@ -935,23 +939,30 @@ impl App {
                         .unwrap_or_else(|| "(none: seed files; Enter to choose)".into()),
                 ),
                 Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
-                Row::CdLayout => ("Layout".into(), format!("< {} >", c.cd().layout.label())),
+                Row::CdLayout => (
+                    labels::CD_LAYOUT.into(),
+                    format!("< {} >", c.cd().layout.label()),
+                ),
                 Row::CdName => ("Volume name".into(), c.cd().name.clone()),
                 Row::CdAutoSize => (
-                    "Size".into(),
+                    labels::CD_AUTO_SIZE.into(),
                     if c.cd_auto_size() {
-                        "< sized to the folder >".into()
+                        "< on >".into()
                     } else {
-                        "< fixed size >".into()
+                        "< off >".into()
                     },
                 ),
                 Row::CdFolder => (
                     "Fill from".into(),
-                    c.cd()
-                        .from_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(blank disc; Enter to choose a folder)".into()),
+                    format!(
+                        "{}  [{}]",
+                        c.cd()
+                            .from_dir
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(blank disc)".into()),
+                        labels::CD_FOLDER
+                    ),
                 ),
                 Row::CdOpt(option) => {
                     let row = c.cd_options().into_iter().find(|r| r.option == *option);
@@ -1097,7 +1108,7 @@ impl App {
             } else {
                 ratatui::style::Style::default()
             };
-            lines.push(Line::styled(format!("{marker}{label:<16} {value}"), style));
+            lines.push(Line::styled(format!("{marker}{label:<18} {value}"), style));
             if sel {
                 if let Some(help) = row_help(c, row) {
                     lines.push(Line::styled(format!("    {help}"), pal.dim()));

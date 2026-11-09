@@ -1,62 +1,43 @@
 # What each controller id is called in each shell (FLOWS.md "Controls").
 #
-# A flow names a control by its controller id (`src/controller/*/mod.rs` `ids`); the driver
-# looks it up here. A value is the label, or a table:
+# A flow names a control by its controller id (`src/controller/*` `ids`); the driver
+# looks it up here, then in the controllers' own labels (`rb-cli ui-labels`), then uses
+# the name as a literal label. A value is the label, or a table:
 #   label = "..."   the visible label
 #   key   = "o"     activate it by this key (the TUI has keys where GTK has buttons)
 #   pick  = "..."   the button whose file dialog fills this field (GTK path rows)
 #   via   = "..."   open this first (the dropdown a menu entry lives in)
 #   nth   = 1       the Nth same-named control (on the `via` dropdown when there is one)
 #   skip  = true    this shell has no such step: behaviour drift, listed like label drift
-# `wait` / `expect` names resolve here too, for messages each shell words its own way.
+# `wait` / `expect` names resolve here too; `<task>.done` is a controller's outcome message.
 #
-# Two shells naming one control differently is label drift; once labels come from the
-# controllers this table shrinks to nothing. AppKit and Win32 will use the id directly.
-# `[all]` holds what every shell shows the same (controller messages): not drift.
+# Every label entry is drift from the controllers' words (D8). The TUI keeps only its keys;
+# `[gtk]` empties once GTK reads the controller labels (a Linux session). Win32 finds
+# controls by AutomationId and needs no section.
 
 [all]
-"expand_hfs.done" = "Expand complete."
 
 [tui]
 "backup.open_image" = { key = "o" }
-"backup.destination" = "Output:"
-"backup.name" = "Name:"
-"backup.format" = "Format:"
-"backup.start" = "[ Start backup ]"
-"backup.done" = "Backup complete."
-"restore.backup_folder" = "Backup:"
-"restore.target_kind" = "Target:"
-"restore.target_image" = "Image file:"
-"restore.start" = "[ Start restore ]"
 "restore.confirm" = { key = "y" }
-"restore.done" = "Restore complete."
-"commander.open" = { key = "9" }
-"commander.right.open_image" = { key = "Tab Ctrl+O" }
+"app.commander" = { key = "9" }
+"commander.right.open_file" = { key = "Tab Ctrl+O" }
 "commander.left.open_folder" = { key = "Tab Ctrl+D" }
-"commander.copy_to_right" = { key = "F6" }
+"commander.copy_ltr" = { key = "F6" }
 "commander.right.apply" = { key = "Tab F10" }
-"commander.copy_to_left" = { key = "F6" }
-"commander.left.open_image" = { key = "Ctrl+O" }
+"commander.copy_rtl" = { key = "F6" }
+"commander.left.open_file" = { key = "Ctrl+O" }
 "commander.left.apply" = { key = "Tab F10" }
 "commander.staged" = "[1 staged]"
-"inspect.open_image" = { key = "o" }
-"inspect.remote" = { key = "R" }
-"inspect.remote_backup" = { key = "u" }
-"optical.open_image" = { key = "o" }
-"optical.browse" = { key = "b" }
-"optical.extract" = { key = "Ctrl+X" }
-"build.kind" = "Kind"
-"build.next" = { key = "n" }
-"build.save_as" = "Save as"
-"build.cd_layout" = "Layout"
-"build.cd_size" = "Size"
-"build.cd_fill_from" = "Fill from"
-"build.create" = { key = "n" }
-"build.done" = "Build another"
-"expand_hfs.open" = { key = "H" }
-"expand_hfs.target_size" = "Target size MiB:"
-"expand_hfs.save_as" = "Output file:"
-"expand_hfs.expand" = "[ Expand ]"
+"inspect.source.open_file" = { key = "o" }
+"inspect.source.connect_remote" = { key = "R" }
+"remote_pick.backup" = { key = "u" }
+"optical.browse_image" = { key = "o" }
+"optical.browse_contents" = { key = "b" }
+"browse.extract" = { key = "Ctrl+X" }
+"build_disk.next" = { key = "n" }
+"build_disk.create" = { key = "n" }
+"inspect.row.expand_hfs" = { key = "H" }
 
 [gtk]
 "backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
@@ -71,30 +52,30 @@
 "restore.start" = "Restore"
 "restore.confirm" = "I understand, proceed"
 "restore.done" = "Restore finished."
-"commander.open" = "Commander Mode"
-"commander.right.open_image" = { label = "Open File...", via = "Open image, backup, or folder...", nth = 1 }
+"app.commander" = "Commander Mode"
+"commander.right.open_file" = { label = "Open File...", via = "Open image, backup, or folder...", nth = 1 }
 "commander.left.open_folder" = { label = "Open Local Folder...", via = "Open image, backup, or folder..." }
-"commander.copy_to_right" = "Copy"
+"commander.copy_ltr" = "Copy"
 "commander.right.apply" = "Apply (1)"
-"commander.copy_to_left" = { label = "Copy", nth = 1 }
-"commander.left.open_image" = { label = "Open File...", via = "Open image, backup, or folder..." }
+"commander.copy_rtl" = { label = "Copy", nth = 1 }
+"commander.left.open_file" = { label = "Open File...", via = "Open image, backup, or folder..." }
 "commander.left.apply" = { skip = true }
 "commander.staged" = "Apply (1)"
-"inspect.open_image" = { label = "Open File...", via = "Select a device or image..." }
-"inspect.remote" = { label = "Connect to Remote...", via = "Select a device or image..." }
-"inspect.remote_backup" = "Back Up Image..."
-"optical.open_image" = { label = "Open File...", via = "No file selected" }
-"optical.browse" = "Browse Contents"
-"optical.extract" = "Extract File..."
-"build.kind" = { skip = true }
-"build.next" = "Next"
-"build.save_as" = "Save As..."
-"build.cd_layout" = "Layout"
-"build.cd_size" = "Size to the folder"
-"build.cd_fill_from" = "Choose Folder..."
-"build.create" = "Create Disk"
-"build.done" = "Build Another"
-"expand_hfs.open" = "Expand/Export..."
+"inspect.source.open_file" = { label = "Open File...", via = "Select a device or image..." }
+"inspect.source.connect_remote" = { label = "Connect to Remote...", via = "Select a device or image..." }
+"remote_pick.backup" = "Back Up Image..."
+"optical.browse_image" = { label = "Open File...", via = "No file selected" }
+"optical.browse_contents" = "Browse Contents"
+"browse.extract" = "Extract File..."
+"build_disk.kind" = { skip = true }
+"build_disk.next" = "Next"
+"build_disk.pick_image" = "Save As..."
+"build_disk.cd_layout" = "Layout"
+"build_disk.cd_auto_size" = "Size to the folder"
+"build_disk.cd_folder" = "Choose Folder..."
+"build_disk.create" = "Create Disk"
+"build_disk.build_another" = "Build Another"
+"inspect.row.expand_hfs" = "Expand/Export..."
 "expand_hfs.target_size" = "Target size (MiB):"
 "expand_hfs.save_as" = "Save As..."
 "expand_hfs.expand" = "Expand"

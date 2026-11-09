@@ -102,6 +102,21 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
    messages as controller accessors, the shared scripted-pick hook, the staged host copy and the
    Convert-tab hand-off in the controllers. The TUI switches over on Windows (its flows prove it);
    GTK's switch-over is verified on Linux, where its flows run.
+
+   Progress (2026-11-09, Windows):
+   - **Flow ids are controller ids.** Twenty flow names were the flows' own (`build.*`,
+     `commander.copy_to_right`, `optical.browse`, ...); they now use the `ids` constants, which is
+     what Win32 sets as `AutomationId`.
+   - **Labels.** Backup, Restore, Expand HFS and Build Disk have a `labels` module (control
+     captions and the `<task>.done` outcome line) beside `ids`; `controller::labels::table()`
+     joins them and the hidden `rb-cli ui-labels` prints it for the drivers. The words are egui's
+     (the reference shell) without its `:`. The TUI uses them and its `labels.toml` section holds
+     only keys plus `commander.staged`. Still to do: the other controllers' captions, egui reading
+     the constants, and GTK's switch (Linux), after which `[gtk]` empties.
+   - **Scripted picks.** `controller::picks` is the shared helper; the TUI's `FilePicker` confirms
+     a `*` answer by itself, and the runner writes the picks file for the TUI as the GTK driver
+     does. GTK's own copy in `effects.rs` moves to the helper in the Linux session.
+   - Not started: the staged host copy and the Convert-tab hand-off.
 4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices. Already shipped
    (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so

@@ -25,9 +25,9 @@ use super::{
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::restore::{
-    format_size, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry, LayoutFit,
-    NewTableType, NoNotify, RestoreAction, RestoreController, RestoreMode, RestoreServices,
-    SizeMode, TargetSlot,
+    format_size, labels, purpose, AlignmentChoice, CaveatLevel, HostRequest, JobRegistry,
+    LayoutFit, NewTableType, NoNotify, RestoreAction, RestoreController, RestoreMode,
+    RestoreServices, SizeMode, TargetSlot,
 };
 use crate::controller::{Controller as _, Effect, PickSpec};
 
@@ -345,7 +345,7 @@ impl RestoreState {
             };
         }
         match self.ctl.last_result()? {
-            Ok(()) => Some(("Restore complete.".to_string(), false)),
+            Ok(()) => Some((labels::DONE.to_string(), false)),
             Err(e) => Some((e.clone(), true)),
         }
     }
@@ -1106,7 +1106,7 @@ impl App {
                     ("Mode:".into(), format!("< {name} >"))
                 }
                 Field::Backup => (
-                    "Backup:".into(),
+                    format!("{}:", labels::BACKUP_FOLDER),
                     c.backup_folder()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| {
@@ -1166,7 +1166,7 @@ impl App {
                     ("  Or file:".into(), shown)
                 }
                 Field::TargetKind => (
-                    "Target:".into(),
+                    format!("{}:", labels::TARGET_KIND),
                     format!(
                         "< {} >",
                         if c.target_is_device(slot) {
@@ -1185,7 +1185,7 @@ impl App {
                 Field::TargetImage => {
                     let t = r.target_text(slot);
                     (
-                        "Image file:".into(),
+                        format!("{}:", labels::TARGET_IMAGE),
                         if t.is_empty() && !sel {
                             "(type a path; Tab browses)".into()
                         } else {
@@ -1412,14 +1412,14 @@ impl App {
                     };
                     let why = c.validate().err().unwrap_or_default();
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{m}[ Start restore ]"), style),
+                        Span::styled(format!("{m}[ {} ]", labels::START), style),
                         Span::styled(format!("  {why}"), pal.dim()),
                     ]));
                     continue;
                 }
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{m}{label:<11}"), style),
+                Span::styled(format!("{m}{label:<15}"), style),
                 Span::raw(value),
                 cursor,
             ]));

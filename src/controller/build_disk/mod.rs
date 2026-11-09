@@ -189,6 +189,32 @@ pub mod ids {
     pub const OPTION: &str = "build_disk.option";
 }
 
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const KIND: &str = "Kind";
+    pub const NEXT: &str = "Next";
+    pub const CREATE: &str = "Create Disk";
+    pub const BUILD_ANOTHER: &str = "Build Another";
+    pub const PICK_IMAGE: &str = "Save As...";
+    pub const CD_LAYOUT: &str = "Layout";
+    pub const CD_AUTO_SIZE: &str = "Size to the folder";
+    pub const CD_FOLDER: &str = "Choose Folder...";
+    pub const DONE: &str = "Disk build complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (ids::KIND, KIND),
+        (ids::NEXT, NEXT),
+        (ids::CREATE, CREATE),
+        (ids::BUILD_ANOTHER, BUILD_ANOTHER),
+        (ids::PICK_IMAGE, PICK_IMAGE),
+        (ids::CD_LAYOUT, CD_LAYOUT),
+        (ids::CD_AUTO_SIZE, CD_AUTO_SIZE),
+        (ids::CD_FOLDER, CD_FOLDER),
+        ("build_disk.done", DONE),
+    ];
+}
+
 /// The text every view shows beside a control.
 pub mod hints {
     pub const CONTAINER: &str = "The disk is built raw, then encoded into this container. The \

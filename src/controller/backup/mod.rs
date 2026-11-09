@@ -86,6 +86,24 @@ pub mod ids {
     pub const VHD_SIZE: &str = "backup.vhd_size";
 }
 
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const DESTINATION: &str = "Destination";
+    pub const NAME: &str = "Backup Name";
+    pub const FORMAT: &str = "Output Format";
+    pub const START: &str = "Start Backup";
+    pub const DONE: &str = "Backup complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (ids::DESTINATION, DESTINATION),
+        (ids::NAME, NAME),
+        (ids::FORMAT, FORMAT),
+        (ids::START, START),
+        ("backup.done", DONE),
+    ];
+}
+
 /// The longer words a shell puts beside a control, so every shell says the same thing.
 pub mod hints {
     pub const FRAGMENTATION: &str = "Percent of files with data in more than one extent";
@@ -668,7 +686,7 @@ impl BackupController {
         if self.start_pending() {
             "Computing minimum sizes..."
         } else {
-            "Start Backup"
+            labels::START
         }
     }
 

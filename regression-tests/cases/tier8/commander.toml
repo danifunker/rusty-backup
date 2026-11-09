@@ -20,10 +20,10 @@ expect_exit = 0
 
 [[case.step]]
 ui = [
-  { activate = "commander.open" },
+  { activate = "app.commander" },
   # Open the right pane first: an opened pane renames its dropdown, which would shift `nth`.
   { pick = "{scratch}/dst.img" },
-  { activate = "commander.right.open_image" },
+  { activate = "commander.right.open_file" },
   { wait = "(0 item(s))" },
   { pick = "{cases}/tier8/data/zipdir" },
   { activate = "commander.left.open_folder" },
@@ -32,7 +32,7 @@ ui = [
   { key = "Enter" },
   { wait = "HELLO.TXT" },
   { focus = "HELLO.TXT" },
-  { activate = "commander.copy_to_right" },
+  { activate = "commander.copy_ltr" },
   { activate = "commander.right.apply" },
   { wait = "(1 item(s))", timeout_ms = 60000 },
 ]
@@ -53,8 +53,8 @@ timeout_ms = 120000
 
 [[case.step]]
 ui = [
-  { activate = "commander.open" },
+  { activate = "app.commander" },
   { pick = "{cases}/tier8/data/zipdir/in.zip" },
-  { activate = "commander.left.open_image" },
+  { activate = "commander.left.open_file" },
   { wait = "HELLO.TXT", timeout_ms = 15000 },
 ]

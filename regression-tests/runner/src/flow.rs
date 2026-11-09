@@ -15,31 +15,42 @@ pub const TUI_COLS: u16 = 120;
 #[cfg(any(unix, windows))]
 pub fn start_tui(rb_cli: &Path, home: &Path, cwd: &Path) -> Result<crate::tui::Session, String> {
     let config = r#"{"update_check":{"enabled":false,"repository_url":""}}"#;
-    for dir in [".config/rusty-backup", "Library/Application Support/rusty-backup"] {
+    for dir in [
+        ".config/rusty-backup",
+        "Library/Application Support/rusty-backup",
+    ] {
         let d = home.join(dir);
         std::fs::create_dir_all(&d).map_err(|e| format!("{}: {}", d.display(), e))?;
         std::fs::write(d.join("config.json"), config).map_err(|e| e.to_string())?;
     }
+    let picks = picks_file(cwd);
+    std::fs::write(&picks, "").map_err(|e| format!("{}: {}", picks.display(), e))?;
     let env = vec![
+        (
+            "RUSTY_BACKUP_TEST_PICKS".to_string(),
+            picks.display().to_string(),
+        ),
         ("HOME".to_string(), home.display().to_string()),
         ("RB_TUI_ASCII".to_string(), "1".to_string()),
-        ("XDG_CONFIG_HOME".to_string(), home.join(".config").display().to_string()),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            home.join(".config").display().to_string(),
+        ),
         (
             "RUSTY_BACKUP_CONFIG_DIR".to_string(),
             home.join(".config/rusty-backup").display().to_string(),
         ),
-        ("APPDATA".to_string(), home.join("AppData/Roaming").display().to_string()),
-        ("LOCALAPPDATA".to_string(), home.join("AppData/Local").display().to_string()),
+        (
+            "APPDATA".to_string(),
+            home.join("AppData/Roaming").display().to_string(),
+        ),
+        (
+            "LOCALAPPDATA".to_string(),
+            home.join("AppData/Local").display().to_string(),
+        ),
     ];
-    let s = crate::tui::Session::spawn(
-        rb_cli,
-        &["tui".to_string()],
-        cwd,
-        &env,
-        TUI_ROWS,
-        TUI_COLS,
-    )
-    .map_err(|e| format!("could not start {} tui: {}", rb_cli.display(), e))?;
+    let s = crate::tui::Session::spawn(rb_cli, &["tui".to_string()], cwd, &env, TUI_ROWS, TUI_COLS)
+        .map_err(|e| format!("could not start {} tui: {}", rb_cli.display(), e))?;
     s.settle(Duration::from_millis(400), Duration::from_secs(10));
     Ok(s)
 }
@@ -50,7 +61,19 @@ pub fn cmd_tui_shot(_rb_cli: &Path, _scratch: &Path, _ops: &[String]) -> i32 {
     2
 }
 
-/// `rb-regress tui-shot OP...`: a key name, `tab:NAME`, `type:TEXT`, `fill:TEXT` or `wait:TEXT`.
+/// The scripted-pick file (`controller::picks`) a TUI started in `cwd` reads.
+#[cfg(any(unix, windows))]
+fn picks_file(cwd: &Path) -> PathBuf {
+    cwd.join("picks.tsv")
+}
+
+/// Answer every later picker with `path`, as the GTK driver does.
+#[cfg(any(unix, windows))]
+fn set_pick(cwd: &Path, path: &str) -> std::io::Result<()> {
+    std::fs::write(picks_file(cwd), format!("*\t{}\n", path))
+}
+
+/// `rb-regress tui-shot OP...`: a key name, `tab:NAME`, `type:TEXT`, `fill:TEXT`, `pick:PATH` or `wait:TEXT`.
 #[cfg(any(unix, windows))]
 pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
     let dir = scratch.join("_tui-shot");
@@ -78,6 +101,8 @@ pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
             s.send(&b).is_ok()
         } else if let Some(t) = op.strip_prefix("wait:") {
             s.wait_for(Duration::from_secs(60), |sc| sc.text().contains(t))
+        } else if let Some(p) = op.strip_prefix("pick:") {
+            set_pick(&dir, p).is_ok()
         } else {
             match crate::tui::key_bytes(op) {
                 Some(b) => s.send(&b).is_ok(),
@@ -169,6 +194,9 @@ pub struct Control {
     /// This shell has no such step (GTK copies to a host folder at once; the TUI stages it).
     #[serde(default)]
     pub skip: bool,
+    /// No table names it: the name is literal text (a file in a list), found anywhere in a row.
+    #[serde(skip)]
+    pub literal: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -206,15 +234,43 @@ pub fn load_controls(path: &Path) -> Result<Controls, String> {
         .collect())
 }
 
+/// Add the controllers' own labels (`rb-cli ui-labels`) as `[controller]`, below the table's entries.
+pub fn add_controller_labels(controls: &mut Controls, rb_cli: &Path) {
+    static TABLE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let out = match std::process::Command::new(rb_cli).arg("ui-labels").output() {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(id, label)| (id.to_string(), label.to_string()))
+            .collect()
+    });
+    let m = controls.entry("controller".to_string()).or_default();
+    for (id, label) in table {
+        m.insert(
+            id.clone(),
+            Control {
+                label: Some(label.clone()),
+                ..Control::default()
+            },
+        );
+    }
+}
+
 /// Resolve `name` for `shell`: a listed controller id, or a literal label.
 fn control(controls: &Controls, shell: &str, name: &str) -> Control {
     controls
         .get(shell)
         .and_then(|m| m.get(name))
         .or_else(|| controls.get("all").and_then(|m| m.get(name)))
+        .or_else(|| controls.get("controller").and_then(|m| m.get(name)))
         .cloned()
         .unwrap_or_else(|| Control {
             label: Some(name.to_string()),
+            literal: true,
             ..Control::default()
         })
 }
@@ -228,8 +284,6 @@ pub struct UiSession {
     controls: Controls,
     /// The control the last `focus` landed on, which `fill` and `choose` act on.
     focused: Control,
-    /// A `pick` waiting for the dialog it answers (the TUI's path prompt).
-    pending_pick: Option<String>,
     #[cfg(any(unix, windows))]
     tui: Option<crate::tui::Session>,
     gtk_driver: Option<crate::gtk::Driver>,
@@ -250,7 +304,6 @@ impl UiSession {
             scratch: scratch.to_path_buf(),
             controls,
             focused: Control::default(),
-            pending_pick: None,
             #[cfg(any(unix, windows))]
             tui: None,
             gtk_driver: None,
@@ -295,7 +348,11 @@ impl UiSession {
             if let Some(f) = &op.wait_file {
                 let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
                 if !wait_file(Path::new(&resolve(f)), limit) {
-                    let screen = self.gtk_driver.as_mut().map(|d| d.log()).unwrap_or_default();
+                    let screen = self
+                        .gtk_driver
+                        .as_mut()
+                        .map(|d| d.log())
+                        .unwrap_or_default();
                     return Err(UiError::Fail(
                         FailedAssertion {
                             op: format!("ui {}", describe(op)),
@@ -457,10 +514,13 @@ impl UiSession {
         let s = self.tui.as_mut().expect("started");
         let screen = |s: &crate::tui::Session| s.text();
         let label = ctl.label.clone().unwrap_or_default();
+        let literal = ctl.literal;
+        let on = move |s: &crate::tui::Session| focus_names(s, &label, literal);
+        let label = ctl.label.clone().unwrap_or_default();
         if let Some(t) = &op.tab {
             tui_tab(s, &resolve(t))?;
         } else if op.focus.is_some() {
-            if !seek(s, ("Down", "Up"), 60, &|s| focus_has(s, &label))? {
+            if !seek(s, ("Down", "Up"), 60, &on)? {
                 return Err((format!("focus on '{}'", label), screen(s)));
             }
             self.focused = ctl;
@@ -477,28 +537,26 @@ impl UiSession {
                     }
                 }
                 None => {
-                    if !seek(s, ("Down", "Up"), 60, &|s| focus_has(s, &label))? {
+                    if !seek(s, ("Down", "Up"), 60, &on)? {
                         return Err((format!("focus on '{}'", label), screen(s)));
                     }
                     press(s, "Enter")?;
                 }
             }
-            answer_prompt(s, &mut self.pending_pick)?;
         } else if let Some(f) = &op.wait_file {
             let f = resolve(f);
             if !wait_file(Path::new(&f), limit) {
                 return Err((format!("{} written", f), screen(s)));
             }
         } else if let Some(p) = &op.pick {
-            self.pending_pick = Some(resolve(p));
+            set_pick(&self.scratch, &resolve(p))
+                .map_err(|e| ("the pick written".to_string(), e.to_string()))?;
         } else if let Some(k) = &op.key {
             press(s, k)?;
-            answer_prompt(s, &mut self.pending_pick)?;
         } else if let Some(ks) = &op.keys {
             for k in ks {
                 press(s, k)?;
             }
-            answer_prompt(s, &mut self.pending_pick)?;
         } else if let Some(t) = &op.text {
             s.send(resolve(t).as_bytes())
                 .map_err(|e| ("text typed".to_string(), e.to_string()))?;
@@ -574,29 +632,15 @@ fn fill_field(s: &mut crate::tui::Session, text: &str) -> Result<(), (String, St
     Ok(())
 }
 
-/// The TUI's file and folder dialogs are a path prompt; answer it with a waiting `pick`.
-#[cfg(any(unix, windows))]
-fn answer_prompt(
-    s: &mut crate::tui::Session,
-    pending: &mut Option<String>,
-) -> Result<(), (String, String)> {
-    let prompt = |sc: &crate::tui::Screen| {
-        let t = sc.text();
-        t.contains("Tab browse") && t.contains("Esc cancel")
-    };
-    if pending.is_none() || !s.wait_for(Duration::from_secs(3), prompt) {
-        return Ok(());
-    }
-    let path = pending.take().unwrap_or_default();
-    fill_field(s, &path)?;
-    press(s, "Enter")
-}
-
 #[cfg(any(unix, windows))]
 fn tui_tab(s: &mut crate::tui::Session, t: &str) -> Result<(), (String, String)> {
     // Row 0 is the tab bar, `|`-separated, the current tab in reverse video; screens may own the arrows.
     let (names, cur) = s.with_screen(|sc| {
-        let names: Vec<String> = sc.line(0).split('|').map(|n| n.trim().to_string()).collect();
+        let names: Vec<String> = sc
+            .line(0)
+            .split('|')
+            .map(|n| n.trim().to_string())
+            .collect();
         let rev = sc.reverse_text(0);
         (names.clone(), names.iter().position(|n| *n == rev))
     });
@@ -627,7 +671,8 @@ fn tui_tab(s: &mut crate::tui::Session, t: &str) -> Result<(), (String, String)>
 fn press(s: &mut crate::tui::Session, name: &str) -> Result<(), (String, String)> {
     let b = crate::tui::key_bytes(name)
         .ok_or_else(|| ("a known key name".to_string(), name.to_string()))?;
-    s.send(&b).map_err(|e| ("the key sent".to_string(), e.to_string()))?;
+    s.send(&b)
+        .map_err(|e| ("the key sent".to_string(), e.to_string()))?;
     s.settle(Duration::from_millis(120), Duration::from_secs(5));
     Ok(())
 }
@@ -658,6 +703,32 @@ fn focus_has(s: &crate::tui::Session, want: &str) -> bool {
     s.with_screen(|sc| focused_rows(sc).iter().any(|l| l.contains(want)))
 }
 
+/// The focused row is the control `label` names; `literal` text may sit anywhere in it.
+#[cfg(any(unix, windows))]
+fn focus_names(s: &crate::tui::Session, label: &str, literal: bool) -> bool {
+    if literal {
+        return focus_has(s, label);
+    }
+    s.with_screen(|sc| focused_rows(sc).iter().any(|l| names(l, label)))
+}
+
+/// A row names a control when it opens with its label (then `:`, `]` or column padding),
+/// or carries it as an inline button; a title or a sentence that merely mentions it does not.
+#[cfg(any(unix, windows))]
+fn names(row: &str, label: &str) -> bool {
+    if row.contains(&format!("[{}]", label)) || row.contains(&format!("[ {} ]", label)) {
+        return true;
+    }
+    let row = row.trim_start_matches(['|', ' ', '>', '[']);
+    match row.strip_prefix(label) {
+        Some(rest) => {
+            let next = |p: &str| rest.starts_with(p);
+            rest.is_empty() || [":", "]", "  ", " <", " ["].iter().any(|p| next(p))
+        }
+        None => false,
+    }
+}
+
 /// Press `keys.0` until `done` holds, at most `max` times; then the same with `keys.1`.
 #[cfg(any(unix, windows))]
 fn seek(
@@ -679,8 +750,23 @@ fn seek(
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
-    use super::focused_rows;
+    use super::{focused_rows, names};
     use crate::tui::Screen;
+
+    #[test]
+    fn a_label_names_its_own_row_only() {
+        assert!(names("[ Restore ]", "Restore"));
+        assert!(names("Backup Folder: C:/bk", "Backup Folder"));
+        assert!(names("Size to the folder  < on >", "Size to the folder"));
+        assert!(names("Size to the folder < on >", "Size to the folder"));
+        assert!(names("Output file:  C:/x.hfv  [Save As...]", "Save As..."));
+        assert!(!names(
+            "Remote:        [ ] Restore to a remote machine",
+            "Restore"
+        ));
+        assert!(!names(" Warning+ Expand HFS Volume ----", "Expand"));
+        assert!(!names("Target size (MiB):  8", "Target"));
+    }
 
     #[test]
     fn focus_marker_opens_a_box_not_mid_row() {

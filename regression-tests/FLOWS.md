@@ -76,12 +76,14 @@ Placeholders: `{fs}` (the matrix value), plus the usual `{scratch}`,
 
 A flow names a control by its **controller id** (the `ids` module of the screen's
 controller, e.g. `backup.format`), never by what one shell happens to call it.
-Each driver looks the id up in [`drivers/labels.toml`](drivers/labels.toml):
+Each controller says what its controls are called in a `labels` module, and
+`rb-cli ui-labels` prints every controller's table; a driver that finds controls
+by their text uses it. Where a shell still differs, the driver looks the id up
+in [`drivers/labels.toml`](drivers/labels.toml) first:
 
 ```toml
 [tui]
 "backup.open_image" = { key = "o" }          # the TUI opens it with a key
-"backup.format" = "Format:"
 [gtk]
 "backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
 "backup.destination" = { label = "Folder", pick = "Browse..." }
@@ -99,16 +101,16 @@ An entry is a label, or a table with:
 | `nth` | the Nth same-named control, from 0 (on the `via` dropdown when there is one) |
 | `skip` | `true`: this shell has no such step (GTK copies to a host folder at once; the TUI stages it) |
 
-`wait`, `wait_gone` and `expect` names resolve here too, for messages each shell
-words its own way (`backup.done`). `[all]` holds what every shell shows the same,
-which is a controller message and not drift. A name the table doesn't list is
-used as a literal label.
+`wait`, `wait_gone` and `expect` names resolve the same way; `<task>.done`
+(`backup.done`) is the controller's outcome message. The order is the shell's
+section, then `[all]`, then the controllers' labels; a name none of them lists
+is used as a literal label.
 
-**Every entry where two shells differ is drift**: a label (`Output:` against
-`Folder`), a message (`Backup complete.` against `Backup finished.`), or a
-behaviour (`skip`). The table is the list of it; once labels and messages come
-from the controllers, entries disappear. AppKit and Win32 can use the id itself
-as the accessibility identifier and need no entries at all.
+**Every label entry in `labels.toml` is drift** from the controllers' words
+(D8): a label (`Folder` against `Destination`), a message (`Backup finished.`
+against `Backup complete.`), or a behaviour (`skip`). The TUI keeps only its
+keys; `[gtk]` empties once GTK reads the controllers' labels. AppKit and Win32
+use the id itself as the accessibility identifier and need no section at all.
 
 ### UI ops
 
@@ -120,7 +122,7 @@ Each op sets exactly one action.
 | `focus = "id"` | move to a control | Down, then Up, until the focused row (`> `) holds the label | finds the showing node with that name |
 | `choose = "Zstd"` | set the focused control's value | Right, then Left, until the row shows it | opens the combo and picks the entry (case-insensitive); `on` / `off` for a switch |
 | `activate = "id"` | press a control | its `key`, or focus it and Enter | `via` first, then the button's action; a popover entry by keyboard |
-| `pick = "path"` | answer the next file or folder dialog; put it **before** what opens one | fills the path prompt when it appears | writes `*<TAB>path` to the test-picks file |
+| `pick = "path"` | answer every later file or folder dialog (`RUSTY_BACKUP_TEST_PICKS`, read by `controller::picks`); put it **before** what opens one | writes `*<TAB>path` to the test-picks file; the picker confirms it at once | writes `*<TAB>path` to the test-picks file |
 | `fill = "text"` | clear the focused field and type | 512 Backspaces, then the text | sets the entry's text; a `pick` field goes through its dialog |
 | `key = "Enter"` / `keys = [..]` | named keys: `Enter Tab Esc Up Down Left Right F1..F12 Ctrl+K` or one character | key bytes | xdotool; Enter on a focused button presses it |
 | `type = "text"` | type text | bytes | xdotool |
@@ -197,7 +199,7 @@ Each of these failed silently until it was handled; keep them in mind before
 ## Finding what to press
 
 `rb-regress tui-shot` starts the TUI the way a flow does, runs the ops given on
-its command line (key names, `tab:NAME`, `type:TEXT`, `fill:TEXT`,
+its command line (key names, `tab:NAME`, `type:TEXT`, `fill:TEXT`, `pick:PATH`,
 `wait:TEXT`), and prints the screen after each one (reverse-video text is shown
 beside its row):
 
