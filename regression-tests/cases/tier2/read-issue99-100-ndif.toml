@@ -4,10 +4,12 @@
 # method 14; arc-mac `shrinkwrap`, Aaru's `stuffit/shrinkwrap.c`). The images
 # arrive inside StuffIt archives as BinHex; each rebuild matches the CRC in the
 # `bcem` header, so a CRC warning on stderr would be a regression.
-# #99: the three Apple Legacy Recovery CD images are damaged, not a second ADC
-# codec: the uncompressed sector-2 MDB is missing and the start of the data fork
-# holds bytes from elsewhere. The rebuild must say so. These fixtures are the
-# data fork with its `._name` AppleDouble sidecar beside it in the corpus.
+# #99: the three Apple Legacy Recovery CD images are damaged on the CD itself,
+# not a second ADC codec. Each file's first 10752-byte CD allocation block holds
+# a copy of another block (hfsutils extracts the same bytes, and the Feb 2000
+# edition of the CD carries them too), so chunks 1-2 do not decode and the
+# catalog in sectors 16-47 is gone. The rebuild zero-fills those chunks, names
+# the lost sectors, and opens the rest. Fixtures: data fork + `._name` sidecar.
 
 [meta]
 tier = 2
@@ -69,27 +71,30 @@ file_sha256 = [{ path = "{scratch}/info", sha256 = "d29d305cf6ac753aa41c95c52f34
 
 [[case]]
 id = "read.ndif.adc.issue99-damaged-laserwriter"
-description = "A data fork whose first 10752 bytes repeat a later extent is reported as damaged"
+description = "A data fork whose first 10752 bytes repeat a later CD block: bad chunks read as zeros, with a warning"
 fixture = "ndif.adc.issue99-laserwriter-disk1"
 [[case.step]]
 args = ["ls", "{fixture}", "/"]
-expect_exit = 1
-stderr_contains = ["chunk 1 (sector 4, type 0x83 ADC) does not decode", "data fork looks damaged"]
+expect_exit = 0
+stderr_contains = ["chunk 1 (sectors 4-35, type 0x83 ADC) does not decode", "read as zeros", "data fork is damaged", "CRC"]
+stdout_contains = ["whole-disk.img"]
 
 [[case]]
 id = "read.ndif.adc.issue99-damaged-colorsw"
-description = "Color SW Pro GX: the damaged ADC data fork is named, not 'Unrecognized media'"
+description = "Color SW Pro GX: the one bad ADC chunk is named and zero-filled, and the rest opens"
 fixture = "ndif.adc.issue99-colorsw-progx"
 [[case.step]]
 args = ["ls", "{fixture}", "/"]
-expect_exit = 1
-stderr_contains = ["data fork looks damaged"]
+expect_exit = 0
+stderr_contains = ["chunk 1 (sectors 4-35, type 0x83 ADC) does not decode", "read as zeros"]
+stdout_contains = ["whole-disk.img"]
 
 [[case]]
 id = "read.ndif.adc.issue99-damaged-installmefirst"
-description = "InstallMeFirst (System 7.1.1 PowerBook 500): the damaged ADC data fork is named"
+description = "InstallMeFirst (System 7.1.1 PowerBook 500): both bad ADC chunks are named and zero-filled"
 fixture = "ndif.adc.issue99-installmefirst"
 [[case.step]]
 args = ["ls", "{fixture}", "/"]
-expect_exit = 1
-stderr_contains = ["data fork looks damaged"]
+expect_exit = 0
+stderr_contains = ["chunk 1 (sectors 4-35", "chunk 2 (sectors 36-67", "read as zeros"]
+stdout_contains = ["whole-disk.img"]

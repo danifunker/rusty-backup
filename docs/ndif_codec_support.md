@@ -45,8 +45,16 @@ and [`src/rbformats/README.md`](../src/rbformats/README.md)):
   table CRC with the unreflected polynomial `0x04C11DB7`, seed `0xFFFFFFFF`, low
   28 bits); a mismatch is logged as damage.
 - An `0x83` chunk that does not decode as ADC means a damaged data fork, not a
-  second codec (issue #99: the three samples had bytes from elsewhere at the start
-  of the fork; the uncompressed sector-2 MDB was missing).
+  second codec. Issue #99's three Disk Copy 6.1 samples are damaged on the Apple
+  Legacy Recovery CD itself: each file's first 10752-byte CD allocation block
+  holds a copy of another block (hfsutils extracts the same bytes, and the
+  Feb 2000 edition carries the same files). A few bad ADC chunks (at most a
+  quarter of them) are zero-filled with a warning naming the lost sectors, so
+  the rest of the image opens; more than that is an error.
+- A data fork read without its resource fork has no `bcem`, so the raw-disk
+  probe may still find an HFS MDB at 1024 (uncompressed first chunk) over a
+  garbage catalog. Listing it reports the unreadable catalog and suggests
+  keeping the fork (issue #98).
 - Chunk codecs **recognized but not decoded**: `0x81` RLE, `0x82` LZH, `0x80`
   KenCode. As of the codec-dispatch refactor these produce a
   **clear per-codec error** (e.g. "NDIF chunk N uses LZH compression (type

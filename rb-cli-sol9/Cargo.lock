@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "dsk-dmg"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arc-mac",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "fs-mac"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "byteorder",

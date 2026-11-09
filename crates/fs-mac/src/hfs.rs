@@ -618,15 +618,19 @@ impl<R: Read + Seek> HfsFilesystem<R> {
         if self.catalog_data.len() < 512 {
             return Ok(vec![]);
         }
-
-        // Read B-tree header from node 0
-        // Node descriptor: 14 bytes, then BTHeaderRec starts
-        // BTHeaderRec: treeDepth(2) + rootNode(4) + leafRecords(4) + firstLeafNode(4) + ...
+        // 0 is a blank catalog not yet initialized; any other size under 512 is not a catalog.
         let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as u32;
+        if node_size == 0 {
+            return Ok(vec![]);
+        }
         if (node_size as usize) < crate::hfs_common::BTREE_MIN_NODE_SIZE
             || self.catalog_data.len() < node_size as usize
         {
-            return Ok(vec![]);
+            return Err(FilesystemError::InvalidData(format!(
+                "HFS catalog is unreadable (B-tree node size {node_size}). A Disk Copy \
+                 6 (NDIF) .img/.smi copied without its resource fork looks like this: keep the \
+                 fork (MacBinary, BinHex or a ._ AppleDouble file beside it) and open that"
+            )));
         }
         let header_node = &self.catalog_data[0..node_size as usize];
         let first_leaf = BigEndian::read_u32(&header_node[24..28]);
@@ -5087,7 +5091,7 @@ mod tests {
         assert!(utf8_to_mac_roman(text).is_err());
     }
 
-    /// A node size under 512 (a Disk Copy 6 data fork read without `bcem`) used to panic.
+    /// A node size other than 512 (a Disk Copy 6 data fork read without `bcem`) is an error, not a panic.
     #[test]
     fn tiny_catalog_node_size_does_not_panic() {
         use disk_core::filesystem::Filesystem;
@@ -5103,11 +5107,8 @@ mod tests {
             img[cat_off + 32..cat_off + 34].copy_from_slice(&bad.to_be_bytes());
             let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
             let root = fs.root().unwrap();
-            let listed = fs.list_directory(&root);
-            assert!(
-                listed.map(|v| v.is_empty()).unwrap_or(true),
-                "node size {bad}: expected an empty listing or an error"
-            );
+            let err = fs.list_directory(&root).unwrap_err().to_string();
+            assert!(err.contains("resource fork"), "node size {bad}: {err}");
         }
     }
 

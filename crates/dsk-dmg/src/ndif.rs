@@ -120,6 +120,8 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
     }
 
     let mut crc = Crc28::new();
+    let adc_chunks = chunks.iter().filter(|c| c.1 == TYPE_ADC && c.3 > 0).count();
+    let mut lost = 0usize;
     for (i, &(sector, ty, off, len)) in chunks.iter().enumerate() {
         if ty == TYPE_END {
             break;
@@ -141,16 +143,30 @@ pub fn reconstruct_to<W: std::io::Write + std::io::Seek>(
         let piece: Vec<u8> = match ty {
             // Uncompressed: the stored length equals the span it covers.
             TYPE_RAW => src[..len.min(span)].to_vec(),
-            TYPE_ADC => {
-                let mut dec = decompress_adc(&src, span).with_context(|| {
-                    format!(
-                        "NDIF chunk {i} (sector {sector}, type 0x83 ADC) does not decode; the \
-                         image's data fork looks damaged (bytes Disk Copy did not write there)"
-                    )
-                })?;
-                dec.truncate(span);
-                dec
-            }
+            TYPE_ADC => match decompress_adc(&src, span) {
+                Ok(mut dec) => {
+                    dec.truncate(span);
+                    dec
+                }
+                // A few bad chunks are salvaged as zeros; mostly bad means this is not the right data.
+                Err(e) if (lost + 1) * 4 <= adc_chunks => {
+                    let last = sector + (span / 512) as u32 - 1;
+                    log::warn!(
+                        "NDIF chunk {i} (sectors {sector}-{last}, type 0x83 ADC) does not decode \
+                         ({e}); those sectors read as zeros. The image's data fork is damaged."
+                    );
+                    lost += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "NDIF chunk {i} (sector {sector}, type 0x83 ADC) does not decode; the \
+                             image's data fork looks damaged (bytes Disk Copy did not write there)"
+                        )
+                    })
+                }
+            },
             // Recognized-but-unimplemented codecs: report clearly instead of
             // silently misrouting the bytes to the ADC decoder. These await a
             // real sample image that uses them (Disk Copy 6 almost always emits
