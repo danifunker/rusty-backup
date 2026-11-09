@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 0 and Phase 1 done (2026-11-01). Phase 2 done (2026-11-04)** apart from the macOS / Windows GUI smoke: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
+Status: **Phase 4 (GTK4) shipped as a preview beside egui (merged 2026-11-08), and front-end flows (tier 8) drive the TUI and GTK from one flow file (2026-11-09). Next: Phase 2b, then Phase 3 (AppKit, [appkit_shell_plan.md](appkit_shell_plan.md)) and Phase 5 (Win32, [win32_shell_plan.md](win32_shell_plan.md)).** Phases 0 and 1 done (2026-11-01). Phase 2 done (2026-11-04) apart from the macOS / Windows GUI smoke, which the tier 8 flows now cover once those shells have drivers: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -207,37 +207,64 @@ Then go screen by screen, ordered by logic weight:
 
 **Done (2026-11-04), slices 1-29:** the boundary check enforces `src/gui` and the whole TUI at 0 engine references (979 at the start). Every gap left in `docs/platform_matrix.md` is a terminal limit (no drag-and-drop, text layout bars, OSC 52 may be refused, no disc-browser preview column) or one of the two agreed exceptions: the CD-DA player (GUI only) and Build Disk (`build_disk_plan.md`, its own top-level section). GUI pickers are async (slice 23). Full fixture suite 461/461 at 4e0ee6a6 (release rb-cli, 26.5 min); CI green on every slice incl. Solaris 9 / mrustc. Open before Phase 3/4: a GUI smoke on macOS and Windows (async pickers above all).
 
+### Phase 2b: before the next shells (shared, 2026-11-09)
+
+The GTK shell and the tier 8 flows ([regression-tests/FLOWS.md](../regression-tests/FLOWS.md))
+showed what a new shell costs when it invents its own words. The flows had to carry a table of
+what each shell calls each control (`regression-tests/drivers/labels.toml`), and that table is a
+list of drift. Before AppKit or Win32 starts:
+
+1. **Labels and result messages come from the controllers.** Every control's visible label and
+   every job's outcome line ("Backup complete." in the TUI, "Backup finished." in GTK) becomes a
+   controller accessor, next to the `hints` modules that already exist. The TUI and GTK switch to
+   them, their `labels.toml` entries disappear, and the new shells start with none. What stays in
+   the shell is layout: a TUI key hint, a GTK `Browse...` button beside a path row.
+2. **The scripted-pick hook is shared.** GTK's `RUSTY_BACKUP_TEST_PICKS` (`purpose<TAB>path`,
+   `*` for any purpose) moves into `src/controller` as one helper every shell's effect host calls
+   before it opens a real dialog. The TUI gets it too, so its flows stop typing into a prompt.
+3. **The behaviour drift is settled**, one answer per question, in the controller where it can be:
+   - Copying from an image into a host folder: staged with Apply (TUI) or at once (GTK).
+   - Converting a disc: on the Optical screen (TUI) or handed to the Convert tab (GTK).
+   - Each answer removes a `skip` entry from `labels.toml`.
+4. **`docs/capabilities.md` exists**, one row per capability, a column per shell, each row naming
+   the flows that prove it; a new row needs the user's OK. The AppKit and Win32
+   columns start empty: they are the new shells' checklists.
+5. **Two bugs the flows found are fixed or consciously left:** R-089 (Commander says a fresh UFS
+   volume has 0 B free) and R-090 (Commander's open takes a zip for a disk image). Both are in the
+   shared controller or engine, so every new shell would inherit them.
+
+**Exit:** `labels.toml` holds only `[all]` messages and the TUI's keys; the tier 8 run is green on
+TUI and GTK; `capabilities.md` lists every flow.
+
 ### Phase 3: macOS modern (AppKit)
 
-- Shell package `frontends/appkit/`, built on `objc2` and `objc2-app-kit`, with a minimum of macOS 10.13 (same as today).
-- Build order:
-  1. App skeleton and `Notify`
-  2. Inspect and the partition bar (custom `NSView`)
-  3. Commander (`NSOutlineView`, Cmd key bindings, file-promise drag-out)
-  4. Backup and Restore
-  5. Browse and the editors
-  6. Optical, Archives, Bulk, dialogs
-- Ships as a second .app beside the egui one (for example "Rusty Backup (Native)") until parity. Packaging reuses the DMG and notarization job.
-- Privilege flow: keep authopen and the descriptor cache (see `macos_authopen_descriptor_cache`). Jobs carry the descriptor.
+Plan: [appkit_shell_plan.md](appkit_shell_plan.md). `frontends/appkit/` on `objc2-app-kit` 0.3,
+macOS 10.13+, a second `.app` beside egui until parity. Controller ids become `AXIdentifier`, so
+its flow driver (`drivers/ax_driver.py`, PyObjC over AX) finds controls by id. Slices follow the
+GTK shell's; each is done when its tier 8 flows pass on `appkit`.
 
-**Exit:** Tier B smoke passes in CI, and Tier C full automation passes once.
+**Exit:** every tier 8 flow passes on `appkit`, and its `capabilities.md` column has no
+unexplained gap.
 
 ### Phase 4: Linux modern (GTK4)
 
-- Shell package `frontends/gtk4/`.
-- Widgets: `ColumnView` / `ListView` for listings, `TreeListModel` for trees, a custom `DrawingArea` for the partition bar, `FileDialog` (portal-aware) for pickers.
-- Packaging and the pre-22.04 question: see §9.
+**Done (merged 2026-11-08, preview beside egui).** Plan and the rules it learned:
+[gtk4_shell_plan.md](gtk4_shell_plan.md). Every tier 8 flow passes on `gtk` (2026-11-09).
+Packaging and the pre-22.04 question: §9.
 
 ### Phase 5: Windows modern (Win32)
 
-- Shell package `frontends/win32/`.
-- Uses Common Controls v6 through `windows`: `ListView` in virtual mode, `TreeView`, a custom-drawn partition bar, `IFileDialog`.
-- Per-monitor DPI v2 manifest.
-- UAC flow unchanged.
+Plan: [win32_shell_plan.md](win32_shell_plan.md). `frontends/win32/` on `windows` 0.62 and Common
+Controls v6, Windows 10/11, beside egui until parity. Controller ids become UIA `AutomationId`s
+(Dynamic Annotation, Gate 0), so its flow driver (`drivers/uia_driver.py`) finds controls by id.
+The TUI driver gains a ConPTY session so the TUI flows run on Windows too.
+
+**Exit:** every tier 8 flow passes on `win32` and on the TUI over ConPTY, and its
+`capabilities.md` column has no unexplained gap.
 
 ### Phase 6: Vintage shells (D4)
 
-- **Win7/8:** `frontends-vintage/win32-win7/` on Rust 1.73 with `windows` 0.58.
+- **Win7/8:** `frontends-vintage/win32-win7/` on Rust 1.73 with `windows` 0.58 ([win32_shell_plan.md](win32_shell_plan.md) § Toward Windows 7).
   - Start by forking the modern Win32 shell, since Win32 has changed little.
   - Keep them two packages per D4, even if they stay near-identical at first.
 - **macOS 10.7:** `frontends-vintage/appkit-10.7/`.
@@ -250,6 +277,18 @@ Then go screen by screen, ordered by logic weight:
 When a platform's native shell passes Tier B and Tier C at parity, drop egui from that platform's release job. After the last platform, remove the `gui` feature and `src/gui/`.
 
 ## 6. Testing (D6)
+
+**As built (2026-11-09).** Tier A is `tests/ui_scenarios/`. Tier B and C became one thing: the
+**tier 8 front-end flows** in `rb-regress` ([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)).
+A flow drives a real shell through its driver, then checks what it wrote with `rb-cli`; one flow
+file runs on every shell in its `shells` list, and `level` (smoke / full), `area` and `fs` tags
+select what to run. Drivers exist for the TUI (a pty, Linux and macOS) and GTK (AT-SPI under Xvfb);
+AppKit (AX) and Win32 (UIA) are planned with their shells, and the TUI gains ConPTY for Windows.
+The egui-through-AccessKit drivers below were never built: egui retires per platform (Phase 7),
+so the flows target the native shells instead. The first full run: 89 pass, 4 expected failures
+(R-089, R-090), on TUI and GTK.
+
+The table is the original plan, kept for the record:
 
 | Tier | What it covers | How it runs | When |
 |---|---|---|---|
@@ -382,6 +421,9 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 ## 11. Open decisions
 
 1. Linux (§9): does gtk3-rs build on 1.73; the oldest distro to test the GTK3 AppImage on; the Flatpak images-only edition.
+7. Phase 2b's drift questions: staged or immediate copy into a host folder; disc conversion on the Optical screen or in the Convert tab.
+8. AppKit: PyObjC or a Swift helper for the AX driver, and whether GitHub's macOS runners grant AX (its plan's Gate 0).
+9. Win32: Dynamic Annotation for `AutomationId` or a numeric id table (its plan's Gate 0).
 2. macOS 10.7 bindings: which ObjC crate builds on 1.73, or ObjC shell + C ABI.
 3. C ABI over JSON versus an engine process over the extended daemon protocol, for PPC and Sol9 (§8).
 4. Whether the Buildroot appliance gains the `tui` feature or keeps `menu.rs`.

@@ -49,11 +49,14 @@ for wasm32) is a CI target too; the check script knows it.
 |---|---|---|
 | egui | `src/gui/` | the modern GUI rows, until Phase 7 retires it |
 | TUI | `src/cli/verbs/tui*` (ratatui) | every rb-cli row |
-| GTK4 + libadwaita | `frontends/gtk4/` (in progress, not shipped; CI target `gtk4` compiles it) | Linux modern, Phase 4 |
-| AppKit, Win32 | `frontends/{appkit,win32}/` (not yet) | Phases 3, 5 |
+| GTK4 + libadwaita | `frontends/gtk4/` (shipped as a preview beside egui since 2026-11-08; CI target `gtk4`) | Linux modern, Phase 4 |
+| AppKit | `frontends/appkit/` (not yet; [appkit_shell_plan.md](appkit_shell_plan.md)) | macOS modern, Phase 3 |
+| Win32 | `frontends/win32/` (not yet; [win32_shell_plan.md](win32_shell_plan.md)) | Windows modern, Phase 5 |
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 
-Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`).
+Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`), and every
+shell with a flow driver runs the tier 8 front-end flows (`regression-tests/FLOWS.md`): today the
+TUI (Linux, macOS) and GTK4.
 
 ## Screens on the shared controllers
 
