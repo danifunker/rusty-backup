@@ -10,6 +10,8 @@ mod alto;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod browse;
+#[cfg(windows)]
 mod chd;
 #[cfg(windows)]
 mod darkdraw;

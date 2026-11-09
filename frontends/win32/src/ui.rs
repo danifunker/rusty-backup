@@ -241,8 +241,19 @@ pub fn font_for(hwnd: HWND) -> HFONT {
 }
 
 pub fn font_at(dpi: u32) -> HFONT {
+    cached_font(dpi, false)
+}
+
+/// Consolas at the message font's size, for hex dumps and file previews.
+pub fn mono_font_at(dpi: u32) -> HFONT {
+    cached_font(dpi, true)
+}
+
+fn cached_font(dpi: u32, mono: bool) -> HFONT {
+    // The top bit of the cache key marks the monospace font.
+    let key = dpi | (u32::from(mono) << 31);
     FONTS.with(|f| {
-        if let Some((_, h)) = f.borrow().iter().find(|(d, _)| *d == dpi) {
+        if let Some((_, h)) = f.borrow().iter().find(|(d, _)| *d == key) {
             return HFONT(*h as _);
         }
         let mut m = NONCLIENTMETRICSW {
@@ -258,9 +269,14 @@ pub fn font_at(dpi: u32) -> HFONT {
                 0,
                 dpi,
             );
+            if mono {
+                let face = wide("Consolas");
+                m.lfMessageFont.lfFaceName = [0; 32];
+                m.lfMessageFont.lfFaceName[..face.len()].copy_from_slice(&face);
+            }
             CreateFontIndirectW(&m.lfMessageFont)
         };
-        f.borrow_mut().push((dpi, font.0 as isize));
+        f.borrow_mut().push((key, font.0 as isize));
         font
     })
 }

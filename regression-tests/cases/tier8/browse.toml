@@ -1,0 +1,45 @@
+# Tier 8: the Inspect browse view, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.browse"
+description = "Browse a volume from Inspect, extract it through the UI, and compare with the file put in."
+
+[[case]]
+id = "flow.browse.inspect-extract-all"
+description = "Open a classic HFS floppy on Inspect, browse its partition, Extract All into a host folder, and compare the file with the one rb-cli put in"
+level = "smoke"
+area = ["inspect", "browse"]
+shells = ["win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.extract"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "1440K", "{scratch}/h.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/h.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# Extract All writes the volume into a folder named after its label.
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/h.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "HFS" },
+  { activate = "inspect.row.browse" },
+  { wait = "HELLO.TXT" },
+  { pick = "{scratch}" },
+  { activate = "browse.extract" },
+  { wait_file = "{scratch}/rusty-backup/HELLO.TXT", timeout_ms = 30000 },
+  { activate = "browse.close" },
+  { wait = "Calc min" },
+]
+
+[[case.step]]
+args = ["fsck", "{scratch}/h.img", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/rusty-backup/HELLO.TXT"]]

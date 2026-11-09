@@ -142,9 +142,17 @@ in check-group mode with the bundled icons); the screens and slices below are un
    bar, the partition list and its row tools (Calc min, Check, Expand/Export, Defragment, Alto
    Resize), and the windows: Check results and CHD Info, Expand Image, Export Disk Image (with the
    shared `ChdControl`), Resize Partitions, the partition-table editor, Expand HFS and Resize Alto
-   Disk. Left: Physical Disk Export (the disk writer, slice 7a), the remote listing (7b) and
-   browsing (slice 2). The facts, the Check report, the export notes and the editor bars'
+   Disk. Left: Physical Disk Export (the disk writer, slice 7a) and the remote listing (7b). The facts, the Check report, the export notes and the editor bars'
    segments moved into the controller on the way.
+   Slice 2 (browsing) first pass (2026-11-09): Inspect's Browse opens `browse.rs` in the
+   Inspect page's place: the volume line, Extract All, Export to .tar.gz, Close, the job line
+   with Cancel, notices, the folder tree, the listing (a virtual list; the combined tree shows
+   folders inline, Right and Left expand and collapse through the key map), the side panel with
+   its fork mode, Extract, Export and Open as Disk Image over a text or hex preview, and the
+   status line. The side panel's text, its action rules and the volume line moved into the
+   controller (`commander::screen::panel`). `flow.browse.inspect-extract-all` passes. Left:
+   marks, Edit Mode and its bar, the View and row menus, Check / Journal / Tree / CHD Info, the
+   dialogs, row icons.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

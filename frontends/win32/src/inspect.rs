@@ -3,8 +3,8 @@
 //! Slice 1: the source (a split button whose menu lists recent files and devices, beside Open
 //! File and Open Backup Folder), the facts, the running jobs, the tools, the partition list (a
 //! virtual list view) with the tools that act on its selected row, and the Check and CHD Info
-//! windows. Still to come: the partition bar, Export, the table editor, Expand Image, Resize,
-//! Defragment, Alto resize, the remote listing (slice 7b) and browsing (slice 2).
+//! windows, the partition bar, Export, the table editor, Expand Image, Resize, Defragment, Alto
+//! resize, and browsing ([`crate::browse`], slice 2). Still to come: the remote listing (slice 7b).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -39,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::alto::AltoWindow;
+use crate::browse::BrowseView;
 use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
@@ -84,7 +85,7 @@ fn cell(row: &PartitionRow, column: usize) -> String {
 }
 
 /// A job's one-line summary (what runs, its phase, how far) and its percentage when known.
-fn job_line(s: &Snapshot) -> (String, Option<u32>) {
+pub(crate) fn job_line(s: &Snapshot) -> (String, Option<u32>) {
     let pct = match &s.progress {
         Progress::Determinate { done, total, .. } if *total > 0 => {
             Some((done.saturating_mul(100) / total).min(100) as u32)
@@ -100,6 +101,37 @@ fn job_line(s: &Snapshot) -> (String, Option<u32>) {
         line.push_str(&format!(" ({p}%)"));
     }
     (line, pct)
+}
+
+/// Show a progress bar for a running job: its percentage, or a marquee when it has none.
+pub(crate) fn set_progress(progress: HWND, running: bool, pct: Option<u32>) {
+    ui::set_visible(progress, running);
+    // SAFETY: plain progress-bar messages; a marquee needs its style bit, set here.
+    unsafe {
+        let style = GetWindowLongPtrW(progress, GWL_STYLE) as u32;
+        let marquee = running && pct.is_none();
+        let want = if marquee {
+            style | PBS_MARQUEE
+        } else {
+            style & !PBS_MARQUEE
+        };
+        if want != style {
+            SetWindowLongPtrW(progress, GWL_STYLE, want as isize);
+        }
+        SendMessageW(
+            progress,
+            PBM_SETMARQUEE,
+            Some(WPARAM(marquee as usize)),
+            Some(LPARAM(30)),
+        );
+        SendMessageW(progress, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(100)));
+        SendMessageW(
+            progress,
+            PBM_SETPOS,
+            Some(WPARAM(pct.unwrap_or(0) as usize)),
+            None,
+        );
+    }
 }
 
 /// Everything a refresh shows, read while the controller is borrowed.
@@ -176,12 +208,15 @@ pub struct InspectScreen {
     /// Which optional lines the last layout gave room to, so a change lays the page out again.
     shape: Cell<u32>,
     no_partitions: HWND,
+    browse_btn: HWND,
     calc_min: HWND,
     check: HWND,
     expand: HWND,
     defragment: HWND,
     resize_alto: HWND,
     alto: RefCell<Option<Rc<AltoWindow>>>,
+    browse: Rc<BrowseView>,
+    browse_page: HWND,
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
     expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     check_window: RefCell<Option<Rc<ReportWindow>>>,
@@ -192,6 +227,7 @@ impl InspectScreen {
     pub fn build(
         owner: HWND,
         page: HWND,
+        browse_page: HWND,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
@@ -283,11 +319,13 @@ impl InspectScreen {
             }
         }
         let no_partitions = ui::label(page, "No partitions found.");
+        let browse_btn = ui::button(page, "Browse", ids::ROW_BROWSE);
         let calc_min = ui::button(page, "Calc min", ids::ROW_CALC_MIN);
         let check = ui::button(page, "Check", ids::ROW_CHECK);
         let expand = ui::button(page, "Expand/Export...", ids::ROW_EXPAND_HFS);
         let defragment = ui::button(page, "Defragment...", ids::ROW_DEFRAGMENT);
         let resize_alto = ui::button(page, "Resize...", ids::ROW_RESIZE_ALTO);
+        let browse = BrowseView::build(browse_page, notify.clone(), host.clone());
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             ctrl: RefCell::new(InspectController::new(InspectServices {
                 jobs: JobRegistry::new(),
@@ -333,18 +371,27 @@ impl InspectScreen {
             cursor: Cell::new(0),
             shape: Cell::new(u32::MAX),
             no_partitions,
+            browse_btn,
             calc_min,
             check,
             expand,
             defragment,
             resize_alto,
             alto: RefCell::default(),
+            browse,
+            browse_page,
             hfs: RefCell::default(),
             expand_window: RefCell::default(),
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
         });
         *bar_target.borrow_mut() = screen.me.clone();
+        let target = screen.me.clone();
+        screen.browse.on_change(Rc::new(move || {
+            if let Some(s) = target.upgrade() {
+                s.show_page();
+            }
+        }));
         let weak: Weak<dyn Handler> = screen.me.clone();
         panel::register(page, weak);
         screen.refresh();
@@ -356,7 +403,21 @@ impl InspectScreen {
         self.after(effects);
     }
 
+    /// The browse view is open, in the screen's place.
+    pub fn browsing(&self) -> bool {
+        self.browse.is_active()
+    }
+
+    /// Show the browse view while it is open, the screen otherwise; only while the tab is up.
+    fn show_page(&self) {
+        let here = ui::shown(self.page) || ui::shown(self.browse_page);
+        let browsing = self.browse.is_active();
+        ui::set_visible(self.page, here && !browsing);
+        ui::set_visible(self.browse_page, here && browsing);
+    }
+
     pub fn tick(&self) {
+        self.browse.tick();
         let hfs = self.hfs.borrow().clone();
         if let Some(d) = hfs {
             d.tick();
@@ -527,9 +588,10 @@ impl InspectScreen {
 
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
+        let dirty = self.browse.has_unsaved_edits();
         let (requests, mut log) = {
             let mut c = self.ctrl.borrow_mut();
-            c.set_browse_dirty(false);
+            c.set_browse_dirty(dirty);
             (c.take_requests(), c.take_log())
         };
         for r in requests {
@@ -539,14 +601,25 @@ impl InspectScreen {
         }
         crate::app::append_log(log);
         self.refresh();
+        if let Some(load) = self.browse.take_nested_load() {
+            self.apply(load);
+        }
     }
 
     /// Carry out `request`; what this shell cannot do yet says so. No `_` arm.
     fn carry_out(&self, request: HostRequest) -> Option<String> {
         match request {
-            HostRequest::CloseBrowse | HostRequest::UpgradeSeekable(_) => None,
-            HostRequest::OpenBrowse(_) => {
-                Some("Browsing arrives in slice 2 of the Win32 shell.".into())
+            HostRequest::CloseBrowse => {
+                self.browse.close();
+                None
+            }
+            HostRequest::UpgradeSeekable(path) => {
+                self.browse.upgrade_seekable(path);
+                None
+            }
+            HostRequest::OpenBrowse(open) => {
+                self.browse.open_request(*open);
+                None
             }
             HostRequest::OpenOptical(_) => {
                 Some("The Optical screen arrives in slice 6 of the Win32 shell.".into())
@@ -677,38 +750,7 @@ impl InspectScreen {
     fn show_job(&self, job: Option<&Snapshot>) {
         let (line, pct) = job.map(job_line).unwrap_or_default();
         ui::set_text(self.job, &line);
-        ui::set_visible(self.progress, job.is_some());
-        // SAFETY: plain progress-bar messages; a marquee needs its style bit, set here.
-        unsafe {
-            let style = GetWindowLongPtrW(self.progress, GWL_STYLE) as u32;
-            let marquee = job.is_some() && pct.is_none();
-            let want = if marquee {
-                style | PBS_MARQUEE
-            } else {
-                style & !PBS_MARQUEE
-            };
-            if want != style {
-                SetWindowLongPtrW(self.progress, GWL_STYLE, want as isize);
-            }
-            SendMessageW(
-                self.progress,
-                PBM_SETMARQUEE,
-                Some(WPARAM(marquee as usize)),
-                Some(LPARAM(30)),
-            );
-            SendMessageW(
-                self.progress,
-                PBM_SETRANGE32,
-                Some(WPARAM(0)),
-                Some(LPARAM(100)),
-            );
-            SendMessageW(
-                self.progress,
-                PBM_SETPOS,
-                Some(WPARAM(pct.unwrap_or(0) as usize)),
-                None,
-            );
-        }
+        set_progress(self.progress, job.is_some(), pct);
     }
 
     fn show_rows(&self, rows: Vec<PartitionRow>) {
@@ -741,6 +783,7 @@ impl InspectScreen {
         let row = rows.get(self.cursor.get());
         let (acts, locked) = row.map(|r| (r.actions, r.locked)).unwrap_or_default();
         let can_calc = row.is_some_and(|r| matches!(r.min, MinCell::CanCalc));
+        ui::set_enabled(self.browse_btn, acts.browse && !locked);
         ui::set_enabled(self.calc_min, can_calc && !locked);
         ui::set_enabled(self.check, acts.browse && acts.check && !locked);
         ui::set_enabled(self.expand, acts.browse && acts.expand_hfs && !locked);
@@ -1024,6 +1067,7 @@ impl InspectScreen {
             children.push(line(self.no_partitions, 1));
         }
         children.push(Node::row(vec![
+            Node::button(self.browse_btn, 80),
             Node::button(self.calc_min, 80),
             Node::button(self.check, 80),
             Node::button(self.expand, 130),
@@ -1139,7 +1183,9 @@ impl Handler for InspectScreen {
             crate::app::tick();
             return;
         } else if let Some(index) = self.row_index() {
-            if from == self.calc_min {
+            if from == self.browse_btn {
+                InspectAction::Browse(index)
+            } else if from == self.calc_min {
                 InspectAction::CalcMin(index)
             } else if from == self.check {
                 InspectAction::Check(index)

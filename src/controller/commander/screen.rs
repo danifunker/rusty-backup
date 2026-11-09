@@ -54,6 +54,8 @@ mod extract;
 pub use extract::{extract_applies, extract_fork_modes, ExtractApplies, ProdosExportMode};
 mod follow;
 mod modes;
+mod panel;
+pub use panel::{PanelActions, PanelPreview, SidePanel, VolumeLine};
 #[cfg(test)]
 mod tests;
 

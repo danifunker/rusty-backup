@@ -70,6 +70,8 @@ pub struct App {
     parts: Vec<(Part, HWND)>,
     /// One page per tab, shown inside the tab control; the screens not built yet hold a note.
     pages: Vec<(AppTab, HWND)>,
+    /// The Inspect tab's browse view, shown in its page's place while it is open.
+    browse_page: HWND,
     inspect: Rc<InspectScreen>,
     log_shown: Cell<usize>,
     sync: SyncGuard,
@@ -281,6 +283,8 @@ impl App {
         }
         let host = EffectHost::new(window, status);
         let mut inspect = None;
+        let browse_page = crate::panel::page(window);
+        ui::set_visible(browse_page, false);
         let pages = AppTab::ALL
             .iter()
             .map(|t| {
@@ -290,6 +294,7 @@ impl App {
                         let screen = InspectScreen::build(
                             window,
                             page,
+                            browse_page,
                             ctrl.notify(),
                             ctrl.recent_handle(),
                             host.clone(),
@@ -323,6 +328,7 @@ impl App {
             window,
             parts,
             pages,
+            browse_page,
             inspect,
             log_shown: Cell::new(0),
             sync: SyncGuard::default(),
@@ -399,9 +405,11 @@ impl App {
                     None,
                 );
             }
+            let browsing = self.inspect.browsing();
             for (t, page) in &self.pages {
-                ui::set_visible(*page, *t == tab);
+                ui::set_visible(*page, *t == tab && !(browsing && *t == AppTab::Inspect));
             }
+            ui::set_visible(self.browse_page, browsing && tab == AppTab::Inspect);
         });
         if banner_was != banner.is_some() {
             self.relayout();
@@ -535,6 +543,7 @@ impl App {
             for (_, h) in &self.pages {
                 ui::move_to(*h, *r);
             }
+            ui::move_to(self.browse_page, *r);
         }
     }
 

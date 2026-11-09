@@ -24,10 +24,10 @@ pub use screen::{
     default_export_format, export_choices, extract_applies, extract_fork_modes, printable,
     BrowseCaps, BudgetAction, BudgetForm, BudgetMode, ChecksumRow, Checksums, CommanderAction,
     CommanderController, DetailField, DetailMetadata, ExportChoice, ExportFormat, ExtractApplies,
-    ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, ProdosExportMode,
-    RenameNotice, ResourceForkMode, RowMenuEntry, Side, SizePlan, SkippedReport, SpaceReadout,
-    UnsavedChoice, ViewItemKind, ViewMenuItem, Xattr, FOLLOW_DELAY, MAX_PREVIEW_SIZE,
-    MIN_NESTED_IMAGE_BYTES,
+    ExtractOptions, FileDetail, HashAlgo, IdNameMap, MetadataEdit, ModeAction, PanelActions,
+    PanelPreview, ProdosExportMode, RenameNotice, ResourceForkMode, RowMenuEntry, Side, SidePanel,
+    SizePlan, SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, VolumeLine,
+    Xattr, FOLLOW_DELAY, MAX_PREVIEW_SIZE, MIN_NESTED_IMAGE_BYTES,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
