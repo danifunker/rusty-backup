@@ -1,0 +1,30 @@
+# Tier 8: the CD-DA player, end to end through a front-end (FLOWS.md).
+# GTK only: the TUI has no player by design (docs/platform_matrix.md, Optical row).
+
+[meta]
+tier = 8
+group = "flow.audio"
+description = "Play a CD audio track from a disc image and watch it advance."
+
+[[case]]
+id = "flow.audio.cdda-play"
+description = "Open a mixed-mode BIN/CUE on the Optical screen, open the CD-DA player, play the audio track and see its position advance (into a null ALSA sink)"
+level = "smoke"
+area = ["optical", "audio"]
+shells = ["gtk"]
+fixture = "optical.cdda.mixedmode.cd"
+capabilities = ["optical.cdda-play"]
+timeout_ms = 120000
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { pick = "{fixture}" },
+  { activate = "optical.open_image" },
+  { wait = "Audio Tracks (1)", timeout_ms = 20000 },
+  { activate = "Audio Tracks (1)" },
+  { activate = "Play" },
+  { wait = "Playing track 2" },
+  # The position moves, so the track is really being decoded and timed.
+  { wait = "3s / 211s", timeout_ms = 15000 },
+]

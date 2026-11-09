@@ -42,6 +42,9 @@
 "inspect.open_image" = { key = "o" }
 "inspect.remote" = { key = "R" }
 "inspect.remote_backup" = { key = "u" }
+"optical.open_image" = { key = "o" }
+"optical.browse" = { key = "b" }
+"optical.extract" = { key = "Ctrl+X" }
 "build.kind" = "Kind"
 "build.next" = { key = "n" }
 "build.save_as" = "Save as"
@@ -80,6 +83,9 @@
 "inspect.open_image" = { label = "Open File...", via = "Select a device or image..." }
 "inspect.remote" = { label = "Connect to Remote...", via = "Select a device or image..." }
 "inspect.remote_backup" = "Back Up Image..."
+"optical.open_image" = { label = "Open File...", via = "No file selected" }
+"optical.browse" = "Browse Contents"
+"optical.extract" = "Extract File..."
 "build.kind" = { skip = true }
 "build.next" = "Next"
 "build.save_as" = "Save As..."

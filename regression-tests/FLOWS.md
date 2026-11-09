@@ -22,6 +22,7 @@ least one flow that proves it. A capability with no flow is untested.
 rb-regress run --tiers 8                      # every flow on every shell with a driver
 rb-regress run --tiers 8 --level smoke        # the high-level set, minutes
 rb-regress run --area inspect --fs hfs        # after working on HFS in Inspect
+rb-regress run --area files --fs ufs          # one filesystem through Commander
 rb-regress run --shell gtk                    # one front-end
 rb-regress list --tiers 8 --level smoke       # what would run
 ```
@@ -87,16 +88,27 @@ Each driver looks the id up in [`drivers/labels.toml`](drivers/labels.toml):
 "backup.format" = "Output Format"
 ```
 
-An entry is a label, or a table with `label`, `key` (activate by key), `pick`
-(the button whose file dialog fills this field) and `via` (open this first, the
-dropdown an entry lives in). `wait` and `expect` names resolve here too, for
-messages each shell words its own way (`backup.done`). A name the table doesn't
-list is used as a literal label.
+An entry is a label, or a table with:
 
-**Every entry where two shells differ is label drift.** The table is the list of
-it; once labels and messages come from the controllers, entries disappear.
-AppKit and Win32 can use the id itself as the accessibility identifier and need
-no entries at all.
+| Key | Meaning |
+|---|---|
+| `label` | the visible label |
+| `key` | activate by these keys, space-separated (`"Tab F10"`): the TUI has keys where GTK has buttons |
+| `pick` | the button whose file dialog fills this field (GTK path rows) |
+| `via` | open this first: the dropdown a menu entry lives in |
+| `nth` | the Nth same-named control, from 0 (on the `via` dropdown when there is one) |
+| `skip` | `true`: this shell has no such step (GTK copies to a host folder at once; the TUI stages it) |
+
+`wait`, `wait_gone` and `expect` names resolve here too, for messages each shell
+words its own way (`backup.done`). `[all]` holds what every shell shows the same,
+which is a controller message and not drift. A name the table doesn't list is
+used as a literal label.
+
+**Every entry where two shells differ is drift**: a label (`Output:` against
+`Folder`), a message (`Backup complete.` against `Backup finished.`), or a
+behaviour (`skip`). The table is the list of it; once labels and messages come
+from the controllers, entries disappear. AppKit and Win32 can use the id itself
+as the accessibility identifier and need no entries at all.
 
 ### UI ops
 
@@ -113,7 +125,13 @@ Each op sets exactly one action.
 | `key = "Enter"` / `keys = [..]` | named keys: `Enter Tab Esc Up Down Left Right F1..F12 Ctrl+K` or one character | key bytes | xdotool; Enter on a focused button presses it |
 | `type = "text"` | type text | bytes | xdotool |
 | `wait = "text or id"` | wait up to `timeout_ms` (default 30 s) | polls the screen | polls node names, descriptions and entry text |
+| `wait_gone = "text or id"` | wait until it is no longer shown (a staged count clearing) | polls the screen | likewise |
+| `wait_file = "path"` | wait until the file exists and its size holds for half a second | the runner, the same for every shell | likewise |
 | `expect` / `expect_not` | the screen shows / does not show it now | after a short settle | likewise |
+
+Prefer `wait_file` for a job's end: it is the output itself, the same on every
+shell, and GTK's log panel is not in its accessibility tree, so a log line is
+unreadable there.
 
 `only = "tui"` on an op runs it on that shell only. Keep these rare: one is a
 sign the two shells don't offer the same thing.
@@ -130,13 +148,20 @@ sign the two shells don't offer the same thing.
 - **One `ui` step can hold many ops.** The shell starts at the case's first `ui`
   step and keeps running across later steps, so a flow can drive, check with
   `rb-cli`, and drive again.
+- **A daemon is a background step.** `background = true` starts that `rb-cli`
+  and leaves it running until the case ends; `{port}` is a free local port, and
+  the runner waits until it takes connections. `network.toml` serves an image
+  this way.
+- **A bug a flow finds is pinned, not worked around.** Record it in
+  `docs/Regression_Bugs.md` and list the case in `data/known-failures.toml`; it
+  then reads `xfail` until the fix turns it `XPASS`.
 
 ## Shells and drivers
 
 | Shell | Driver | Needs | Status |
 |---|---|---|---|
 | `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS. Windows needs ConPTY: skip-platform for now. About 4 s a flow |
-| `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
+| `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
 | `appkit` | Accessibility API (`accessibilityIdentifier`) | | with the AppKit shell |
 | `win32` | UI Automation (`AutomationId`) | | with the Win32 shell |
 
@@ -146,22 +171,62 @@ to `skip-tool` with the reason.
 Without sudo, Xvfb can be unpacked: `apt-get download xvfb` then
 `dpkg-deb -x xvfb_*.deb <dir>`, and put `<dir>/usr/bin` on `PATH`.
 
+### What the GTK driver works around
+
+Each of these failed silently until it was handled; keep them in mind before
+"fixing" the driver.
+
+- AT-SPI's screen coordinates are wrong under Xvfb: clicks use window
+  coordinates plus the X window's origin.
+- A popover is its own X surface, so a click into one misses. Popover rows (a
+  dropdown's entries, a combo's choices) are reached by keyboard: a combo steps
+  the counted number of rows from its current value, a menu walks until the row
+  is focused.
+- GTK 4 has no AT-SPI `grab_focus`, and some menu buttons ignore their action:
+  a `via` dropdown is opened with a real click.
+- A label exposes clipboard actions, so "has an action" doesn't mean "is a
+  control": controls are ranked by role first.
+- A combo row's title and subtitle are labels too; its value is the label in
+  its list row.
+- An unnamed field beside its caption (the size spin in Expand HFS Volume) is
+  found from the caption; a spin button is set through its Value interface, as
+  a click to commit typed text can land on its "-" button (8 MiB came out 7).
+- The AT-SPI bus launcher's daemon outlives a plain kill: every child runs in
+  its own process group.
+
 ## Finding what to press
 
 `rb-regress tui-shot` starts the TUI the way a flow does, runs the ops given on
-its command line (key names, `type:TEXT`, `fill:TEXT`, `wait:TEXT`), and prints the screen after each one (reverse-video text is
-shown beside its row):
+its command line (key names, `tab:NAME`, `type:TEXT`, `fill:TEXT`,
+`wait:TEXT`), and prints the screen after each one (reverse-video text is shown
+beside its row):
 
 ```bash
 rb-regress tui-shot Right Right Down type:/tmp/x.img Enter wait:partition
 ```
 
-For GTK, the driver takes JSON ops on stdin, plus two that only help writing
-flows: `{"op":"text"}` prints every showing node, and
-`{"op":"ancestors","arg":"Label"}` prints a node's parents with their actions.
+For GTK, the driver takes JSON ops on stdin, plus four that only help writing
+flows: `{"op":"text"}` prints every showing node, `{"op":"tree","arg":"Label"}`
+a node and its descendants with their states, `{"op":"ancestors","arg":"Label"}`
+a node's parents with their actions, and `{"op":"click","arg":"Label"}` a real
+click.
 
 ```bash
 printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
   dbus-run-session -- xvfb-run -a -s "-screen 0 1600x2300x24" \
   python3 -I drivers/gtk_driver.py ../frontends/gtk4/target/release/rusty-backup-gtk /tmp/gtk-probe
 ```
+
+## The flows
+
+| File | Flows | Shells | Checks |
+|---|---|---|---|
+| `backup.toml` | a FAT image to zstd from the Backup screen | tui, gtk | restore + byte-compare |
+| `restore.toml` | a backup folder to a new image file | tui, gtk | byte-compare |
+| `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, xfail) | tui, gtk | byte-compare |
+| `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk | byte-compare + fsck; UFS inject is R-089, xfail |
+| `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
+| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk | tui, gtk | byte-compare out of the ISO |
+| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |
+| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk | against `rb-cli optical extract` |
+| `audio.toml` | play a CD-DA track | gtk (no TUI player by design) | the position advances |

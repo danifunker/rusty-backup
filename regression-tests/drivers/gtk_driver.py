@@ -554,7 +554,13 @@ def main():
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, start_new_session=True)
     time.sleep(1)
+    # Flows never make a sound: ALSA's default output is a null sink, and PulseAudio is unreachable.
+    alsa = os.path.join(work, "asound.conf")
+    with open(alsa, "w") as f:
+        # The system config first (the audio stack expects its definitions), then the override.
+        f.write("</usr/share/alsa/alsa.conf>\npcm.!default { type null }\nctl.!default { type hw card 0 }\n")
     env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=os.path.join(home, ".config"),
+               ALSA_CONFIG_PATH=alsa, PULSE_SERVER="unix:/nonexistent",
                GTK_A11Y="atspi", GDK_BACKEND="x11", GDK_DEBUG="no-portals", NO_AT_BRIDGE="0",
                RUSTY_BACKUP_TEST_PICKS=PICKS)
     log = open(os.path.join(work, "gtk-app.log"), "w")

@@ -1,0 +1,68 @@
+# Tier 8: the Optical screen's disc browser, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.optical"
+description = "Open a disc image, browse it and extract a file, then compare with rb-cli's own extract."
+
+[[case]]
+id = "flow.optical.iso-browse-extract"
+description = "Open an ISO 9660 disc image on the Optical screen, browse its contents, extract a file through the UI and compare it with rb-cli optical extract"
+level = "smoke"
+area = ["optical"]
+shells = ["tui", "gtk"]
+fixture = "optical.iso9660.joliet.cd"
+capabilities = ["optical.open-image", "optical.browse", "optical.extract"]
+timeout_ms = 240000
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { pick = "{fixture}" },
+  { activate = "optical.open_image" },
+  { wait = "ISO 9660", timeout_ms = 20000 },
+  { activate = "optical.browse" },
+  { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { focus = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { pick = "{scratch}" },
+  { activate = "optical.extract" },
+  { wait_file = "{scratch}/CIV_II_GOLD_111_UPDATE.SIT", timeout_ms = 60000 },
+]
+
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/ref"]
+expect_exit = 0
+files_identical = [["{scratch}/ref/CIV_II_GOLD_111_UPDATE.SIT", "{scratch}/CIV_II_GOLD_111_UPDATE.SIT"]]
+
+[[case]]
+id = "flow.optical.chd-browse-extract"
+description = "Open a CD CHD (made from the ISO by rb-cli) on the Optical screen, browse it, extract a file through the UI and compare it with rb-cli optical extract"
+level = "full"
+area = ["optical"]
+shells = ["tui", "gtk"]
+fixture = "optical.iso9660.joliet.cd"
+capabilities = ["optical.open-image", "optical.browse", "optical.extract", "optical.chd"]
+timeout_ms = 240000
+
+[[case.step]]
+args = ["optical", "convert", "--format", "chd", "{fixture}", "{scratch}/disc.chd"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { pick = "{scratch}/disc.chd" },
+  { activate = "optical.open_image" },
+  { wait = "ISO 9660", timeout_ms = 20000 },
+  { activate = "optical.browse" },
+  { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { focus = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { pick = "{scratch}" },
+  { activate = "optical.extract" },
+  { wait_file = "{scratch}/CIV_II_GOLD_111_UPDATE.SIT", timeout_ms = 60000 },
+]
+
+[[case.step]]
+args = ["optical", "extract", "{scratch}/disc.chd", "--to", "{scratch}/ref"]
+expect_exit = 0
+files_identical = [["{scratch}/ref/CIV_II_GOLD_111_UPDATE.SIT", "{scratch}/CIV_II_GOLD_111_UPDATE.SIT"]]
