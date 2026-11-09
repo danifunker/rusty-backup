@@ -347,19 +347,22 @@ impl AppController {
     // Only Linux relaunches here, so elsewhere the early return ends the body.
     #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_return))]
     pub(super) fn confirm_elevation(&mut self, yes: bool) {
-        if !yes {
+        // An if/else rather than an early return: off Linux the relaunch block
+        // compiles away, which would leave the `return` as the last statement
+        // and fail clippy's needless_return on Windows and macOS.
+        if yes {
+            #[cfg(target_os = "linux")]
+            {
+                self.log.info("Relaunching with elevated privileges...");
+                if let Err(e) = crate::os::linux::relaunch_with_elevation() {
+                    self.log.error(format!("Failed to elevate: {}", e));
+                }
+            }
+        } else {
             self.log.warn(
                 "Elevation cancelled. Physical devices stay unavailable; \
                  image files are unaffected.",
             );
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.log.info("Relaunching with elevated privileges...");
-            if let Err(e) = crate::os::linux::relaunch_with_elevation() {
-                self.log.error(format!("Failed to elevate: {}", e));
-            }
         }
     }
 

@@ -362,6 +362,7 @@ dependencies = [
  "byteorder",
  "disk-core",
  "dsk-apple",
+ "filetime",
  "flate2",
  "fs-mac",
  "sha1 0.10.7",
