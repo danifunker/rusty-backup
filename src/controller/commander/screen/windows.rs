@@ -1,17 +1,28 @@
 //! The windows a browse view opens over its listing, described once for every view.
 //!
-//! Each [`PaneWindow`] is a title, parts (lines, lists, a choice) and buttons that carry the
-//! actions they send; a view draws it with its own toolkit and sends what a button holds. The
-//! words and rules came out of the GTK shell's `browser/dialogs.rs`. A view keeps only what is
-//! its own: which option of a [`Part::Choice`] is picked, and a [`Part::Toggle`] with no actions.
+//! Each [`PaneWindow`] is a title, parts (lines, lists, choices, fields) and buttons that carry
+//! the actions they send; a view draws it with its own toolkit and sends what a button holds.
+//! The words and rules came out of the GTK shell's `browser/dialogs.rs`. A view keeps only what
+//! is its own: the option a [`Part::Choice`] has picked, a [`Part::Toggle`] with no actions, and
+//! what is typed in a [`Part::Field`], which [`field_action`] or [`submit`] turns into actions.
+//! A window whose `key` is unchanged keeps its fields and takes the new text of its lines.
 
 use std::path::Path;
 
-use super::{CommanderController, HashAlgo, ModeAction, Side, UnsavedChoice};
+use super::{
+    BudgetAction, BudgetForm, BudgetMode, CommanderController, HashAlgo, ModeAction, Side,
+    UnsavedChoice,
+};
+use crate::controller::browser::metadata::known_type_creators;
+use crate::controller::browser::{MetadataFields, MetadataForm, TextDoc};
 use crate::controller::commander::{
     format_size, journal_status, journal_summary, journal_txn_rows, ApplyPreflight, ApplyReport,
     BrowserPaneAction as P, Checksums, CommanderAction as A, JournalDetail, JournalTone,
     OnConflict, ToolReport, TreeText, MAX_CONSECUTIVE_FAILURES,
+};
+use crate::controller::commander::{
+    import_prompt, journal_txn_blocks, ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice,
+    LineEnding, MacArchiveKind, TarChoice, TarPreview, TextShape,
 };
 
 /// How a line reads: a plain line, or one that warns, reports a failure or a success.
@@ -32,8 +43,48 @@ pub enum Part {
     List(Vec<String>),
     /// A block of text in a fixed-width font, scrolled.
     Block(String),
-    /// Options of which one is picked; a [`Press::PerChoice`] button sends the picked one's actions.
-    Choice { options: Vec<String>, picked: usize },
+    /// Options of which one is picked; a [`Press::PerChoice`] button sends the picked one's
+    /// actions, and `send`, when set, is what picking each sends at once.
+    Choice {
+        options: Vec<String>,
+        picked: usize,
+        send: Option<Vec<Vec<A>>>,
+        /// A line shown under the options for the one picked; empty for none.
+        notes: Vec<String>,
+    },
+    /// A drop-down list; picking an option sends its actions.
+    Select {
+        label: String,
+        options: Vec<String>,
+        picked: usize,
+        send: Vec<Vec<A>>,
+    },
+    /// A field to type in; `live` sends [`field_action`] on every change.
+    Field {
+        id: FieldId,
+        label: String,
+        value: String,
+        hint: String,
+        secret: bool,
+        multiline: bool,
+        live: bool,
+    },
+    /// A button whose menu fills fields: each option sets `(field, value)` pairs.
+    Picker {
+        label: String,
+        options: Vec<(String, Vec<(FieldId, String)>)>,
+    },
+    /// Lines with tick boxes (`None`: no box); ticking one sends its actions.
+    Checklist {
+        lines: Vec<String>,
+        ticked: Vec<Option<bool>>,
+        send: Vec<Vec<A>>,
+    },
+    /// A list whose selected line shows its detail text below it.
+    Browse {
+        lines: Vec<String>,
+        details: Vec<String>,
+    },
     /// A tick box; `send` is what turning it on and off sends, `None` when the view keeps it.
     Toggle {
         label: String,
@@ -57,6 +108,96 @@ pub enum Press {
     PerChoice(Vec<Vec<A>>),
     /// Put the text on the clipboard.
     Copy(String),
+    /// Hand the window's fields and its picked option to [`submit`].
+    Submit(Form),
+}
+
+/// A field a window asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldId {
+    BudgetAbsolute,
+    BudgetHeadroom,
+    Password,
+    MetaType,
+    MetaCreator,
+    MetaModified,
+    MetaCreated,
+    MetaMode,
+    MetaOwner,
+    EditorText,
+}
+
+/// What a [`Press::Submit`] button sends its fields to.
+#[derive(Debug, Clone)]
+pub enum Form {
+    Password,
+    Metadata(Side),
+    /// The text editor: the file it writes back, in which encoding.
+    Editor {
+        name: String,
+        folder: String,
+        shape: TextShape,
+    },
+}
+
+/// The line endings the editor offers, in its choice's order.
+const ENDINGS: [(LineEnding, &str); 3] = [
+    (LineEnding::Lf, "LF (Unix)"),
+    (LineEnding::CrLf, "CRLF (DOS)"),
+    (LineEnding::Cr, "CR (classic Mac)"),
+];
+
+/// What a live field's text sends; `None` while it does not parse.
+pub fn field_action(id: FieldId, text: &str) -> Option<A> {
+    let mib = || text.trim().parse::<u64>().ok().filter(|n| *n > 0);
+    let budget = |a| A::Mode(ModeAction::Budget(a));
+    match id {
+        FieldId::BudgetAbsolute => mib().map(|n| budget(BudgetAction::SetAbsoluteMib(n))),
+        FieldId::BudgetHeadroom => mib().map(|n| budget(BudgetAction::SetHeadroomMib(n))),
+        _ => None,
+    }
+}
+
+/// What a form's Submit sends for its typed `values` and the option its choice has `picked`.
+pub fn submit(form: &Form, values: &[(FieldId, String)], picked: usize) -> Vec<A> {
+    let get = |id| {
+        values
+            .iter()
+            .find(|(f, _)| *f == id)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    match form {
+        Form::Password => vec![A::Mode(ModeAction::Password(get(FieldId::Password)))],
+        Form::Metadata(side) => {
+            let fields = MetadataFields {
+                type_code: get(FieldId::MetaType),
+                creator: get(FieldId::MetaCreator),
+                modified: get(FieldId::MetaModified),
+                created: get(FieldId::MetaCreated),
+                mode: get(FieldId::MetaMode),
+                owner: get(FieldId::MetaOwner),
+            };
+            vec![pane(*side, P::SubmitMetadata(Box::new(fields)))]
+        }
+        Form::Editor {
+            name,
+            folder,
+            shape,
+        } => {
+            let mut shape = *shape;
+            shape.ending = ENDINGS.get(picked).map_or(shape.ending, |(e, _)| *e);
+            vec![pane(
+                Side::Left,
+                P::SaveText {
+                    name: name.clone(),
+                    folder: folder.clone(),
+                    text: get(FieldId::EditorText),
+                    shape,
+                },
+            )]
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +237,15 @@ pub enum WindowKind {
     Help,
     Checksums,
     FileInfo,
+    Tar,
+    TarPreview,
+    Import,
+    ArchiveSave,
+    ArchiveViewer,
+    Metadata,
+    Password,
+    Budget,
+    Editor,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +287,30 @@ impl CommanderController {
         if !pane.staging_errors().is_empty() {
             let fs = &pane.volume().fs_type;
             out.push(errors_window(side, pane.staging_errors(), fs));
+        }
+        if let Some(name) = pane.pending_tar() {
+            out.push(tar_window(side, &name));
+        }
+        if let Some(p) = pane.tar_preview() {
+            out.push(tar_preview_window(side, p, &pane.volume().fs_type));
+        }
+        if let Some((name, kind)) = pane.pending_import() {
+            out.push(import_window(side, &name, kind));
+        }
+        if let Some(p) = pane.archive_save() {
+            out.push(archive_save_window(side, p));
+        }
+        if let Some(w) = pane.archive_viewer() {
+            out.push(archive_viewer_window(side, w));
+        }
+        if let Some(f) = pane.metadata_form() {
+            out.push(metadata_window(side, f));
+        }
+        if pane.needs_password() && self.is_single() {
+            out.push(password_window(pane.volume().fs_type == "APFS"));
+        }
+        if let Some(form) = self.size_budget() {
+            out.push(budget_window(form));
         }
         if let Some(r) = pane.tool_report() {
             let repairable = !self.has_archive_flow();
@@ -343,6 +517,8 @@ fn review_window(side: Side, p: &ApplyPreflight) -> PaneWindow {
         parts.push(Part::Choice {
             options: vec!["Skip existing".into(), "Overwrite".into()],
             picked: 0,
+            send: None,
+            notes: Vec::new(),
         });
     }
     if !p.scan.blocked_folders.is_empty() {
@@ -690,10 +866,17 @@ pub fn journal_window(detail: &JournalDetail) -> PaneWindow {
     let rows = journal_txn_rows(detail);
     parts.push(match rows.is_empty() {
         true => text("  (none)".into()),
-        false => Part::Block(rows.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join(
-            "
-",
-        )),
+        false => Part::Browse {
+            details: rows
+                .iter()
+                .map(|(idx, _)| {
+                    journal_txn_blocks(detail, *idx)
+                        .map(|(title, lines)| format!("{title}\n{}", lines.join("\n")))
+                        .unwrap_or_default()
+                })
+                .collect(),
+            lines: rows.into_iter().map(|(_, l)| l).collect(),
+        },
     });
     PaneWindow {
         kind: WindowKind::Journal,
@@ -702,6 +885,475 @@ pub fn journal_window(detail: &JournalDetail) -> PaneWindow {
         size: (640, 520),
         parts,
         buttons: Vec::new(),
+        dismiss: None,
+    }
+}
+
+fn fork_select(side: Side, current: ForkFormat, viewer: bool, label: &str) -> Part {
+    Part::Select {
+        label: label.into(),
+        options: ForkFormat::ALL
+            .iter()
+            .map(|f| f.label().to_string())
+            .collect(),
+        picked: ForkFormat::ALL
+            .iter()
+            .position(|f| *f == current)
+            .unwrap_or(0),
+        send: ForkFormat::ALL
+            .iter()
+            .map(|f| vec![pane(side, P::ArchiveFormat { viewer, format: *f })])
+            .collect(),
+    }
+}
+
+fn tar_window(side: Side, name: &str) -> PaneWindow {
+    let choose = |c| vec![pane(side, P::ChooseTar(c))];
+    PaneWindow {
+        kind: WindowKind::Tar,
+        key: name.to_string(),
+        title: "Tar archive".into(),
+        size: (460, 0),
+        parts: vec![
+            text(format!("\"{name}\" is a tar archive.")),
+            text(
+                "Import its contents into the current folder, or add the archive itself as a file?"
+                    .into(),
+            ),
+        ],
+        buttons: vec![
+            WindowButton::send("Import contents", choose(TarChoice::Import)),
+            WindowButton::send("Add as file", choose(TarChoice::AsFile)),
+            WindowButton::send("Cancel", choose(TarChoice::Cancel)),
+        ],
+        dismiss: Some(choose(TarChoice::Cancel)),
+    }
+}
+
+fn tar_preview_window(side: Side, p: &TarPreview, fs: &str) -> PaneWindow {
+    let mut parts = vec![Part::Text(
+        format!("This [{fs}] volume can't store everything in the archive:"),
+        Tone::Warning,
+    )];
+    parts.extend(p.warnings.iter().map(|w| text(format!("- {w}"))));
+    if p.sidecars > 0 {
+        parts.push(text(format!(
+            "- {} macOS ._ sidecar(s) will be skipped.",
+            p.sidecars
+        )));
+    }
+    parts.push(text(format!(
+        "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
+        p.files, p.dirs
+    )));
+    let answer = |yes| vec![pane(side, P::ConfirmTarImport(yes))];
+    PaneWindow {
+        kind: WindowKind::TarPreview,
+        key: "preview".into(),
+        title: "Import archive - some content can't be kept".into(),
+        size: (520, 0),
+        parts,
+        buttons: vec![
+            WindowButton::send("Continue", answer(true)),
+            WindowButton::send("Cancel", answer(false)),
+        ],
+        dismiss: Some(answer(false)),
+    }
+}
+
+fn import_window(side: Side, name: &str, kind: MacArchiveKind) -> PaneWindow {
+    let prompt = import_prompt(name, kind);
+    let choose = |c| vec![pane(side, P::ChooseImport(c))];
+    let mut buttons = vec![WindowButton::send(
+        prompt.expand,
+        choose(ImportChoice::Expand),
+    )];
+    if let Some(label) = prompt.convert_only {
+        buttons.push(WindowButton::send(label, choose(ImportChoice::ConvertOnly)));
+    }
+    buttons.push(WindowButton::send("Add as-is", choose(ImportChoice::AsIs)));
+    buttons.push(WindowButton::send("Cancel", choose(ImportChoice::Cancel)));
+    PaneWindow {
+        kind: WindowKind::Import,
+        key: format!("{name}{}", kind.label()),
+        title: prompt.title.into(),
+        size: (520, 0),
+        parts: vec![text(prompt.intro), text(prompt.question)],
+        buttons,
+        dismiss: Some(choose(ImportChoice::Cancel)),
+    }
+}
+
+fn archive_save_window(side: Side, p: &ArchiveSave) -> PaneWindow {
+    let cancel = vec![pane(side, P::CancelSaveArchive)];
+    PaneWindow {
+        kind: WindowKind::ArchiveSave,
+        key: p.entry_name.clone(),
+        title: "Save Mac archive".into(),
+        size: (520, 0),
+        parts: vec![
+            text(format!("{} is a {} archive.", p.entry_name, p.kind.label())),
+            text("How would you like to save it?".into()),
+            fork_select(side, p.format, false, "Decoded fork container:"),
+        ],
+        buttons: vec![
+            WindowButton::send("Save as-is", vec![pane(side, P::SaveArchive { raw: true })]),
+            WindowButton::send(
+                "Decode and save contents to a folder...",
+                vec![pane(side, P::SaveArchive { raw: false })],
+            ),
+            WindowButton::send("Cancel", cancel.clone()),
+        ],
+        dismiss: Some(cancel),
+    }
+}
+
+/// A compact binary size, as the Archives tab shows it.
+fn binary_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    match u {
+        0 => format!("{bytes} B"),
+        _ => format!("{v:.1} {}", UNITS[u]),
+    }
+}
+
+fn archive_viewer_window(side: Side, w: &ArchiveViewer) -> PaneWindow {
+    let lines = w
+        .rows
+        .iter()
+        .map(|r| match r.is_dir {
+            true => format!("[ {} ]", r.path),
+            false => format!(
+                "{}   {}   {}   {}",
+                r.path,
+                r.type_creator,
+                binary_size(r.size),
+                r.method
+            ),
+        })
+        .collect();
+    let ticked = w
+        .rows
+        .iter()
+        .zip(&w.marked)
+        .map(|(r, m)| (!r.is_dir).then_some(*m))
+        .collect();
+    let close = vec![pane(side, P::CloseArchive)];
+    let marked = w.marked_files();
+    PaneWindow {
+        kind: WindowKind::ArchiveViewer,
+        key: w.entry_name.clone(),
+        title: format!("Archive: {} ({})", w.entry_name, w.kind.label()),
+        size: (640, 480),
+        parts: vec![
+            text(format!(
+                "{} file(s) in archive (read-only view).",
+                w.file_count()
+            )),
+            Part::Checklist {
+                lines,
+                ticked,
+                send: (0..w.rows.len())
+                    .map(|i| vec![pane(side, P::ArchiveMark(i))])
+                    .collect(),
+            },
+            fork_select(side, w.format, true, "Extract as:"),
+        ],
+        buttons: vec![
+            WindowButton::send(
+                "Extract All...",
+                vec![pane(side, P::ArchiveExtract { all: true })],
+            ),
+            WindowButton {
+                label: format!("Extract Selected... ({marked})"),
+                press: Press::Send(vec![pane(side, P::ArchiveExtract { all: false })]),
+                enabled: marked > 0,
+                hint: None,
+            },
+            WindowButton::send("Close", close.clone()),
+        ],
+        dismiss: Some(close),
+    }
+}
+
+fn field(id: FieldId, label: &str, value: &str, hint: &str) -> Part {
+    Part::Field {
+        id,
+        label: label.into(),
+        value: value.into(),
+        hint: hint.into(),
+        secret: false,
+        multiline: false,
+        live: false,
+    }
+}
+
+fn metadata_window(side: Side, form: &MetadataForm) -> PaneWindow {
+    let e = &form.entry;
+    let init = &form.initial;
+    let mut parts = vec![text(format!("Metadata for {}", e.name))];
+    let mac = e.is_file() && e.type_code.is_some();
+    if mac {
+        parts.push(field(
+            FieldId::MetaType,
+            "Type:",
+            &init.type_code,
+            "4 characters",
+        ));
+        parts.push(field(
+            FieldId::MetaCreator,
+            "Creator:",
+            &init.creator,
+            "4 characters",
+        ));
+    }
+    if e.mac_dates.is_some() {
+        let hint = "YYYY-MM-DD HH:MM:SS (UTC)";
+        parts.push(field(
+            FieldId::MetaModified,
+            "Modified:",
+            &init.modified,
+            hint,
+        ));
+        parts.push(field(FieldId::MetaCreated, "Created:", &init.created, hint));
+    }
+    if e.mode.is_some() {
+        parts.push(field(
+            FieldId::MetaMode,
+            "Permissions:",
+            &init.mode,
+            "octal, e.g. 644",
+        ));
+        parts.push(field(FieldId::MetaOwner, "Owner:", &init.owner, "uid:gid"));
+    }
+    if mac {
+        let code = |b: [u8; 4]| b.iter().map(|&c| c as char).collect::<String>();
+        parts.push(Part::Picker {
+            label: "Pick a known type...".into(),
+            options: known_type_creators()
+                .into_iter()
+                .map(|(label, t, c)| {
+                    let set = vec![
+                        (FieldId::MetaType, code(t)),
+                        (FieldId::MetaCreator, code(c)),
+                    ];
+                    (label, set)
+                })
+                .collect(),
+        });
+    }
+    if let Some(err) = &form.error {
+        parts.push(Part::Text(err.clone(), Tone::Error));
+    }
+    let cancel = vec![pane(side, P::CancelMetadata)];
+    PaneWindow {
+        kind: WindowKind::Metadata,
+        key: e.path.clone(),
+        title: "Edit Metadata".into(),
+        size: (460, 0),
+        parts,
+        buttons: vec![
+            WindowButton::send("Cancel", cancel.clone()),
+            WindowButton {
+                label: "Stage".into(),
+                press: Press::Submit(Form::Metadata(side)),
+                enabled: true,
+                hint: None,
+            },
+        ],
+        dismiss: Some(cancel),
+    }
+}
+
+fn password_window(apfs: bool) -> PaneWindow {
+    let mut parts = match apfs {
+        true => vec![
+            text("This APFS volume is encrypted with FileVault.".into()),
+            text("Enter the volume password or personal recovery key.".into()),
+        ],
+        false => vec![text("This image is password-protected.".into())],
+    };
+    parts.push(Part::Field {
+        id: FieldId::Password,
+        label: String::new(),
+        value: String::new(),
+        hint: String::new(),
+        secret: true,
+        multiline: false,
+        live: false,
+    });
+    let close = vec![A::Mode(ModeAction::RequestClose)];
+    PaneWindow {
+        kind: WindowKind::Password,
+        key: apfs.to_string(),
+        title: if apfs { "Passphrase" } else { "Password" }.into(),
+        size: (420, 0),
+        parts,
+        buttons: vec![
+            WindowButton::send("Close", close.clone()),
+            WindowButton {
+                label: "Unlock".into(),
+                press: Press::Submit(Form::Password),
+                enabled: true,
+                hint: None,
+            },
+        ],
+        dismiss: Some(close),
+    }
+}
+
+fn budget_window(form: &BudgetForm) -> PaneWindow {
+    let plan = *form.plan();
+    let room = match (plan.capacity, plan.headroom) {
+        (Some(cap), Some(head)) => format!("{} ({} unused)", format_size(cap), format_size(head)),
+        _ => "unbounded - this file is the filesystem".to_string(),
+    };
+    let facts = [
+        format!("Image occupies   {}", format_size(plan.image_len)),
+        format!(
+            "File content     {} uncompressed",
+            format_size(plan.content_len)
+        ),
+        format!("Compressed to    {}", plan.describe_ratio()),
+        format!("Room available   {room}"),
+    ];
+    let budget = |a| vec![A::Mode(ModeAction::Budget(a))];
+    let modes = [BudgetMode::Fit, BudgetMode::Absolute, BudgetMode::Headroom];
+    let ceiling = match form.ceiling() {
+        Some(c) => format!("Ceiling: {}", format_size(c)),
+        None => "Ceiling: none beyond what the container allows".to_string(),
+    };
+    let mut parts = vec![
+        text(
+            "SquashFS has no free space to report and no in-place write: saving an edit rebuilds \
+             the whole image. Choose how large the result may be."
+                .into(),
+        ),
+        Part::Block(facts.join("\n")),
+        Part::Choice {
+            options: vec![
+                "Fit - accept whatever it becomes".into(),
+                "At most (MiB)".into(),
+                "Grow by at most (MiB)".into(),
+            ],
+            picked: modes.iter().position(|m| *m == form.mode()).unwrap_or(0),
+            send: Some(
+                modes
+                    .iter()
+                    .map(|m| budget(BudgetAction::SetMode(*m)))
+                    .collect(),
+            ),
+            notes: Vec::new(),
+        },
+        Part::Field {
+            id: FieldId::BudgetAbsolute,
+            label: "At most (MiB):".into(),
+            value: form.absolute_mib().to_string(),
+            hint: String::new(),
+            secret: false,
+            multiline: false,
+            live: true,
+        },
+        Part::Field {
+            id: FieldId::BudgetHeadroom,
+            label: "Grow by (MiB):".into(),
+            value: form.headroom_mib().to_string(),
+            hint: String::new(),
+            secret: false,
+            multiline: false,
+            live: true,
+        },
+        text(ceiling),
+    ];
+    if form.over_capacity() {
+        parts.push(Part::Text(
+            format!(
+                "That is more than the {} available where this image lives.",
+                format_size(plan.capacity.unwrap_or(0))
+            ),
+            Tone::Error,
+        ));
+    }
+    let cancel = budget(BudgetAction::Cancel);
+    PaneWindow {
+        kind: WindowKind::Budget,
+        key: format!("budget{}", form.over_capacity()),
+        title: "SquashFS size budget".into(),
+        size: (480, 0),
+        parts,
+        buttons: vec![
+            WindowButton {
+                label: "Start editing".into(),
+                press: Press::Send(budget(BudgetAction::Start)),
+                enabled: !form.over_capacity(),
+                hint: None,
+            },
+            WindowButton::send("Cancel", cancel.clone()),
+        ],
+        dismiss: Some(cancel),
+    }
+}
+
+/// The text editor over `doc`; `error` is why the last Save was refused.
+pub fn editor_window(doc: &TextDoc, error: Option<&str>) -> PaneWindow {
+    let original = doc.shape.ending;
+    let mut parts = vec![text(format!("Encoding: {}", doc.shape.encoding.label()))];
+    parts.push(Part::Choice {
+        options: ENDINGS.iter().map(|(_, l)| l.to_string()).collect(),
+        picked: ENDINGS
+            .iter()
+            .position(|(e, _)| *e == original)
+            .unwrap_or(0),
+        send: None,
+        notes: ENDINGS
+            .iter()
+            .map(|(e, _)| match *e == original {
+                true => String::new(),
+                false => format!("Will convert {} -> {}", original.label(), e.label()),
+            })
+            .collect(),
+    });
+    if doc.shape.mixed_endings {
+        parts.push(Part::Text(
+            "This file mixes line-ending styles; saving makes them all the same.".into(),
+            Tone::Warning,
+        ));
+    }
+    parts.push(Part::Field {
+        id: FieldId::EditorText,
+        label: String::new(),
+        value: doc.text.clone(),
+        hint: String::new(),
+        secret: false,
+        multiline: true,
+        live: false,
+    });
+    parts.push(Part::Text(error.unwrap_or("").to_string(), Tone::Error));
+    PaneWindow {
+        kind: WindowKind::Editor,
+        key: format!("{}/{}", doc.folder, doc.name),
+        title: format!("Edit  {}", doc.name),
+        size: (720, 520),
+        parts,
+        buttons: vec![
+            WindowButton {
+                label: "Save".into(),
+                press: Press::Submit(Form::Editor {
+                    name: doc.name.clone(),
+                    folder: doc.folder.clone(),
+                    shape: doc.shape,
+                }),
+                enabled: true,
+                hint: Some("Stage the new text; Apply Edits writes it.".into()),
+            },
+            WindowButton::send("Cancel", Vec::new()),
+        ],
         dismiss: None,
     }
 }

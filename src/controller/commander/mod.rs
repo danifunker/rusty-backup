@@ -30,8 +30,8 @@ pub use screen::{
     Xattr, FOLLOW_DELAY, MAX_PREVIEW_SIZE, MIN_NESTED_IMAGE_BYTES,
 };
 pub use screen::{
-    journal_window, tree_window, EditBar, HeaderTools, MarkBar, PaneWindow, Part, Press, Tone,
-    WindowButton, WindowKind,
+    editor_window, field_action, journal_window, submit, tree_window, EditBar, FieldId, Form,
+    HeaderTools, MarkBar, PaneWindow, Part, Press, Tone, WindowButton, WindowKind,
 };
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).

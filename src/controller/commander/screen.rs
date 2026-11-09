@@ -58,7 +58,8 @@ mod panel;
 pub use panel::{EditBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SidePanel, VolumeLine};
 mod windows;
 pub use windows::{
-    journal_window, tree_window, PaneWindow, Part, Press, Tone, WindowButton, WindowKind,
+    editor_window, field_action, journal_window, submit, tree_window, FieldId, Form, PaneWindow,
+    Part, Press, Tone, WindowButton, WindowKind,
 };
 #[cfg(test)]
 mod tests;

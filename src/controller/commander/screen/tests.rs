@@ -903,3 +903,45 @@ fn the_checksum_window_copies_each_value() {
         "{fx:?}"
     );
 }
+
+#[test]
+fn submit_reads_the_fields_and_the_picked_option() {
+    use crate::controller::browser::{LineEnding, TextShape};
+    use crate::model::text_edit::TextEncoding;
+    let shape = TextShape {
+        encoding: TextEncoding::Utf8,
+        ending: LineEnding::Lf,
+        mixed_endings: false,
+    };
+    let form = Form::Editor {
+        name: "A.TXT".into(),
+        folder: "/".into(),
+        shape,
+    };
+    let values = [(FieldId::EditorText, "one\ntwo".to_string())];
+    match submit(&form, &values, 1).as_slice() {
+        [A::Pane(Side::Left, P::SaveText { text, shape, .. })] => {
+            assert_eq!(text, "one\ntwo");
+            assert_eq!(shape.ending, LineEnding::CrLf);
+        }
+        other => panic!("{other:?}"),
+    }
+    let values = [(FieldId::Password, "secret".to_string())];
+    assert!(matches!(
+        submit(&Form::Password, &values, 0).as_slice(),
+        [A::Mode(ModeAction::Password(p))] if p == "secret"
+    ));
+}
+
+#[test]
+fn a_live_field_sends_only_what_parses() {
+    assert!(matches!(
+        field_action(FieldId::BudgetAbsolute, " 12 "),
+        Some(A::Mode(ModeAction::Budget(BudgetAction::SetAbsoluteMib(
+            12
+        ))))
+    ));
+    assert!(field_action(FieldId::BudgetHeadroom, "lots").is_none());
+    assert!(field_action(FieldId::BudgetHeadroom, "0").is_none());
+    assert!(field_action(FieldId::Password, "x").is_none());
+}
