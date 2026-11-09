@@ -113,7 +113,16 @@ def visible_text():
 # Roles that are controls; a label also has (clipboard) actions, so actions alone don't count.
 CONTROL_ROLES = BUTTON_ROLES + COMBO_ROLES + ENTRY_ROLES + (
     "toggle button", "switch", "check box", "radio button", "page tab", "spin button",
-    "list item", "menu item", "table cell", "slider")
+    "list item", "menu item", "table cell", "table row", "tree item", "slider")
+# Rows carry every column in their name; they match on the first column.
+ROW_ROLES = ("table row", "table cell", "tree item", "list item")
+
+
+def named(n, want):
+    nm = name_of(n).rstrip(":").strip()
+    if nm == want:
+        return True
+    return role_of(n) in ROW_ROLES and nm.startswith(want + " ")
 
 
 def rank(n):
@@ -125,23 +134,27 @@ def rank(n):
     return 2
 
 
-def find(label, wait=20.0, pred=None):
-    """A showing node named `label` (trailing ':' ignored), a control before a mere label."""
+def find(label, wait=20.0, pred=None, nth=0):
+    """The `nth` showing node named `label` (trailing ':' ignored), a control before a mere label."""
     want = label.rstrip(":").strip()
     end = time.time() + wait
     while True:
-        best = None
+        controls, best = [], None
         for n in nodes(APP):
-            if name_of(n).rstrip(":").strip() != want or not showing(n):
+            if not named(n, want) or not showing(n):
                 continue
             if pred is not None and not pred(n):
                 continue
             r = rank(n)
             if r == 0:
-                return n
-            if best is None or r < best[0]:
+                # A toggle button and its inner button share a name; count each control once.
+                if not any(is_inside(n, c) or is_inside(c, n) for c in controls):
+                    controls.append(n)
+            elif best is None or r < best[0]:
                 best = (r, n)
-        if best is not None:
+        if len(controls) > nth:
+            return controls[nth]
+        if nth == 0 and best is not None:
             return best[1]
         if time.time() >= end:
             raise Fail(f"a control labelled {label!r}", visible_text())
@@ -370,15 +383,19 @@ def run(op):
     if kind == "tab":
         activate(find(arg))
     elif kind == "focus":
-        CURRENT = find(arg)
+        CURRENT = find(arg, nth=op.get("nth", 0))
+        if role_of(CURRENT) in ROW_ROLES and row_of(CURRENT) is None:
+            click(CURRENT)  # select a row in a list or table; popover rows are walked instead
     elif kind == "choose":
         choose(CURRENT or find(op["label"]), arg)
     elif kind == "activate":
+        nth = op.get("nth", 0)
         if op.get("via"):
             # Some menu buttons ignore the AT-SPI action; a dropdown is in the main window, so click it.
-            click(find(op["via"]))
+            click(find(op["via"], nth=nth))
             time.sleep(0.4)
-        activate(find(arg))
+            nth = 0
+        activate(find(arg, nth=nth))
     elif kind == "pick":
         set_pick(arg)
     elif kind == "key":

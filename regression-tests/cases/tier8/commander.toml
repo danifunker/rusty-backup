@@ -1,0 +1,43 @@
+# Tier 8: Commander, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.commander"
+description = "Copy between Commander panes, then prove the result with rb-cli."
+
+[[case]]
+id = "flow.commander.zip-to-image"
+description = "Open a host folder holding a zip in one Commander pane and a FAT image in the other, copy a file out of the zip into the image, apply, and read it back with rb-cli"
+level = "smoke"
+area = ["commander"]
+shells = ["tui", "gtk"]
+capabilities = ["commander.host-folder", "commander.archive-browse", "commander.copy", "commander.apply"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/dst.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { activate = "commander.open" },
+  # Open the right pane first: an opened pane renames its dropdown, which would shift `nth`.
+  { pick = "{scratch}/dst.img" },
+  { activate = "commander.right.open_image" },
+  { wait = "(0 item(s))" },
+  { pick = "{cases}/tier8/data/zipdir" },
+  { activate = "commander.left.open_folder" },
+  { wait = "in.zip" },
+  { focus = "in.zip" },
+  { key = "Enter" },
+  { wait = "HELLO.TXT" },
+  { focus = "HELLO.TXT" },
+  { activate = "commander.copy_to_right" },
+  { activate = "commander.right.apply" },
+  { wait = "(1 item(s))", timeout_ms = 60000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/dst.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]

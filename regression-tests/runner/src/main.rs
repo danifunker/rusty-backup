@@ -374,7 +374,7 @@ COMMANDS:
     export       Write the normalised JSON snapshot of the registry
     query        Ask the registry a named question
     tui-shot     Start `rb-cli tui`, run the ops that follow (key names,
-                 type:TEXT, fill:TEXT, wait:TEXT) and print the screen after each;
+                 tab:NAME, type:TEXT, fill:TEXT, wait:TEXT) and print the screen after each;
                  put --rb-cli before it. See FLOWS.md
 
 OPTIONS:

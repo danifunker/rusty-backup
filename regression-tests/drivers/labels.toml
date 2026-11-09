@@ -24,6 +24,11 @@
 "restore.start" = "[ Start restore ]"
 "restore.confirm" = { key = "y" }
 "restore.done" = "Restore complete."
+"commander.open" = { key = "9" }
+"commander.right.open_image" = { key = "Tab Ctrl+O" }
+"commander.left.open_folder" = { key = "Tab Ctrl+D" }
+"commander.copy_to_right" = { key = "F6" }
+"commander.right.apply" = { key = "Tab F10" }
 
 [gtk]
 "backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
@@ -38,3 +43,8 @@
 "restore.start" = "Restore"
 "restore.confirm" = "I understand, proceed"
 "restore.done" = "Restore finished."
+"commander.open" = "Commander Mode"
+"commander.right.open_image" = { label = "Open File...", via = "Open image, backup, or folder...", nth = 1 }
+"commander.left.open_folder" = { label = "Open Local Folder...", via = "Open image, backup, or folder..." }
+"commander.copy_to_right" = "Copy"
+"commander.right.apply" = "Apply (1)"

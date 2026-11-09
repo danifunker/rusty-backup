@@ -44,7 +44,7 @@ pub fn cmd_tui_shot(_rb_cli: &Path, _scratch: &Path, _ops: &[String]) -> i32 {
     2
 }
 
-/// `rb-regress tui-shot OP...`: each OP is a key name, `type:TEXT` or `wait:TEXT`.
+/// `rb-regress tui-shot OP...`: a key name, `tab:NAME`, `type:TEXT`, `fill:TEXT` or `wait:TEXT`.
 #[cfg(unix)]
 pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
     let dir = scratch.join("_tui-shot");
@@ -62,7 +62,9 @@ pub fn cmd_tui_shot(rb_cli: &Path, scratch: &Path, ops: &[String]) -> i32 {
     };
     print_screen("start", &s);
     for op in ops {
-        let ok = if let Some(t) = op.strip_prefix("type:") {
+        let ok = if let Some(t) = op.strip_prefix("tab:") {
+            tui_tab(&mut s, t).is_ok()
+        } else if let Some(t) = op.strip_prefix("type:") {
             s.send(t.as_bytes()).is_ok()
         } else if let Some(t) = op.strip_prefix("fill:") {
             let mut b = vec![0x7f_u8; FILL_CLEAR];
@@ -154,6 +156,8 @@ pub struct Control {
     pub key: Option<String>,
     pub pick: Option<String>,
     pub via: Option<String>,
+    /// Which of several same-named controls (0 first); on the `via` dropdown when there is one.
+    pub nth: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -309,6 +313,9 @@ impl UiSession {
             let c = ctl(self, f);
             put("op", "focus".into());
             put("arg", label(&c, f));
+            if let Some(n) = c.nth {
+                m.insert("nth".to_string(), serde_json::Value::from(n));
+            }
             self.focused = c;
         } else if let Some(v) = &op.choose {
             put("op", "choose".into());
@@ -319,6 +326,9 @@ impl UiSession {
             put("arg", label(&c, a));
             if let Some(v) = &c.via {
                 put("via", v.clone());
+            }
+            if let Some(n) = c.nth {
+                m.insert("nth".to_string(), serde_json::Value::from(n));
             }
         } else if let Some(p) = &op.pick {
             put("op", "pick".into());
@@ -383,7 +393,7 @@ impl UiSession {
                         expected: exp,
                         observed: obs,
                     },
-                    s.text(),
+                    s.with_screen(|sc| sc.marked()),
                 )
             };
             let r = self.tui_op(op, resolve, limit);
@@ -423,7 +433,11 @@ impl UiSession {
             }
         } else if op.activate.is_some() {
             match &ctl.key {
-                Some(k) => press(s, k)?,
+                Some(ks) => {
+                    for k in ks.split_whitespace() {
+                        press(s, k)?;
+                    }
+                }
                 None => {
                     if !seek(s, ("Down", "Up"), 60, &|s| focus_has(s, &label))? {
                         return Err((format!("focus on '{}'", label), screen(s)));
@@ -522,6 +536,14 @@ fn tui_tab(s: &mut crate::tui::Session, t: &str) -> Result<(), (String, String)>
         (Some(c), Some(w)) => (c, w),
         _ => return Err((format!("tab '{}' in the tab bar", t), s.text())),
     };
+    // Digits 1-9 jump straight to a tab (no screen in between to swallow arrows); arrows otherwise.
+    if want < 9 && want != cur {
+        press(s, &(want + 1).to_string())?;
+    }
+    let cur = s.with_screen(|sc| {
+        let rev = sc.reverse_text(0);
+        names.iter().position(|n| *n == rev).unwrap_or(cur)
+    });
     let key = if want > cur { "Right" } else { "Left" };
     for _ in 0..(want as isize - cur as isize).unsigned_abs() {
         press(s, key)?;
@@ -548,8 +570,13 @@ pub fn focused_rows(sc: &crate::tui::Screen) -> Vec<String> {
     for r in 0..sc.rows() {
         let line = sc.line(r);
         let rev = sc.reverse_text(r);
-        if let Some(i) = line.find("> ") {
-            out.push(line[i + 2..].to_string());
+        // The marker opens a box's content (`|> Name:`); `<ARC> |` mid-row is not one.
+        let marked: Vec<&str> = line
+            .split('|')
+            .filter_map(|seg| seg.strip_prefix("> "))
+            .collect();
+        if !marked.is_empty() {
+            out.extend(marked.iter().map(|m| m.to_string()));
         } else if !rev.is_empty() {
             out.push(line);
         }
@@ -579,4 +606,17 @@ fn seek(
         }
     }
     Ok(done(s))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::focused_rows;
+    use crate::tui::Screen;
+
+    #[test]
+    fn focus_marker_opens_a_box_not_mid_row() {
+        let mut sc = Screen::new(3, 60);
+        sc.feed(b"|> Format:  < Zstd >\r\n|  [+] in.zip  144 B <ARC> ||  |");
+        assert_eq!(focused_rows(&sc), vec!["Format:  < Zstd >".to_string()]);
+    }
 }

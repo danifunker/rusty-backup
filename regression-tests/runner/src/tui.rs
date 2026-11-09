@@ -72,6 +72,20 @@ impl Screen {
         out
     }
 
+    /// The screen as text with each row's reverse-video text noted beside it, for failure bundles.
+    pub fn marked(&self) -> String {
+        let mut out = String::new();
+        for r in 0..self.rows {
+            let rev = self.reverse_text(r);
+            out.push_str(&self.line(r));
+            if !rev.is_empty() {
+                out.push_str(&format!("    [rev: {}]", rev));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn line(&self, r: usize) -> String {
         let s: String = self.cells[r].iter().map(|c| c.ch).collect();
         s.trim_end().to_string()
