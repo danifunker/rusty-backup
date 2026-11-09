@@ -25,15 +25,7 @@ cargo generate-rpm --target "$target" --set-metadata "version = \"$pkgver\""
 mv "target/${target}/generate-rpm/"*.rpm "out/${name}.rpm"
 [ "$(rpm -qp --qf '%{VERSION}' "out/${name}.rpm")" = "$pkgver" ] || { echo "rpm version is not $pkgver" >&2; exit 1; }
 
-root=$(mktemp -d)
-install -Dm755 "${bin}/rusty-backup" "${root}/usr/bin/rusty-backup"
-install -Dm644 rusty-backup.desktop -t "${root}/usr/share/applications"
-for n in 16 32 48 64 128 256; do
-  install -Dm644 "assets/icons/icon-${n}.png" "${root}/usr/share/icons/hicolor/${n}x${n}/apps/rusty-backup.png"
-done
-# Pipe through zstd: 20.04's tar (1.30) has no --zstd.
-tar -C "$root" -cf - . | zstd -q -f -19 -T0 -o "out/${name}.pkg.tar.zst"
-rm -rf "$root"
+# The Arch package is made from this .deb on the runner (scripts/ci/build-arch-package.sh).
 
 tar -C "$bin" -czf "out/rb-cli-linux-${arch}-${version}.tar.gz" rb-cli
 ls -l out

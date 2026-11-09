@@ -882,6 +882,17 @@ jobs:
         if: ${{ !matrix.focal }}
         run: scripts/ci/build-linux-packages.sh ${{ matrix.target }} ${{ matrix.arch }} "$RELEASE_VERSION"
 
+      # Made from the .deb on the runner, so both carry the same files; pacman metadata included.
+      - name: Build Arch package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools fakeroot zstd
+          case "${{ matrix.arch }}" in x64) A=x86_64 ;; arm64) A=aarch64 ;; esac
+          N="out/Rusty-Backup-linux-${{ matrix.arch }}-${RELEASE_VERSION}"
+          scripts/ci/build-arch-package.sh "$N.deb" "$N.pkg.tar.zst" rusty-backup "$A" \
+            "${RELEASE_VERSION//-/.}" "Back up, restore and inspect vintage computer disk images" \
+            gtk3 alsa-lib glib2 glibc gcc-libs
+
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
@@ -934,6 +945,36 @@ jobs:
           apt-get install -y ./Rusty-Backup-linux-x64-*.deb
           ldd /usr/bin/rusty-backup | tee ldd.txt
           if grep -q "not found" ldd.txt; then echo "::error::a library is missing"; exit 1; fi
+
+  # Installs the x64 Arch packages (egui, and GTK when it built) with pacman on Arch Linux:
+  # every declared dependency must resolve, `pacman -Qkk` must pass, and ldd must find every library.
+  test-arch-packages:
+    name: Install the x64 Arch packages (archlinux)
+    needs: [generate-version, build-linux-packages, build-gtk4]
+    if: ${{ !cancelled() && needs.build-linux-packages.result == 'success' }}
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Rusty-Backup-linux-x64-${{ needs.generate-version.outputs.version }}-arch
+      - uses: actions/download-artifact@v8
+        if: needs.build-gtk4.result == 'success'
+        with:
+          name: Rusty-Backup-GTK-linux-x64-${{ needs.generate-version.outputs.version }}
+      - name: Install with pacman and check
+        run: |
+          pacman -Syu --noconfirm
+          for f in Rusty-Backup-*linux-x64-*.pkg.tar.zst; do
+            pacman -U --noconfirm "$f"
+            p=$(pacman -Qqp "$f")
+            pacman -Qi "$p"
+            pacman -Qkk "$p"
+            for bin in $(pacman -Qlq "$p" | grep '^/usr/bin/.'); do
+              ldd "$bin" | tee ldd.txt
+              if grep -q "not found" ldd.txt; then echo "::error::$bin: a library is missing"; exit 1; fi
+            done
+          done
 
   # MiSTer-specific build of `rb-cli` for the FPGA's Intel Cyclone V / Cortex-A9
   # / Buildroot rootfs (`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline).
@@ -1919,7 +1960,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils
+          sudo apt-get install -y cmake libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config liblzma-dev libasound2-dev rpm zstd desktop-file-utils libarchive-tools fakeroot
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1956,14 +1997,10 @@ jobs:
           cargo generate-rpm --set-metadata "version = \"$PKG_VERSION\"" -o "../../${OUT}.rpm"
           [ "$(dpkg-deb -f "../../${OUT}.deb" Version)" = "$PKG_VERSION" ] || { echo "::error::deb version"; exit 1; }
           [ "$(rpm -qp --qf '%{VERSION}' "../../${OUT}.rpm")" = "$PKG_VERSION" ] || { echo "::error::rpm version"; exit 1; }
-          root=arch-pkg
-          install -Dm755 target/release/rusty-backup-gtk "$root/usr/bin/rusty-backup-gtk"
-          install -Dm644 data/io.github.danifunker.RustyBackup.desktop -t "$root/usr/share/applications"
-          for n in 16 32 48 64 128 256; do
-            install -Dm644 "../../assets/icons/icon-${n}.png" \
-              "$root/usr/share/icons/hicolor/${n}x${n}/apps/io.github.danifunker.RustyBackup.png"
-          done
-          tar -C "$root" --zstd -cf "../../${OUT}.pkg.tar.zst" .
+          case "${{ matrix.arch }}" in x64) A=x86_64 ;; arm64) A=aarch64 ;; esac
+          ../../scripts/ci/build-arch-package.sh "../../${OUT}.deb" "../../${OUT}.pkg.tar.zst" \
+            rusty-backup-gtk "$A" "$PKG_VERSION" "Rusty Backup's GTK4 / libadwaita front end" \
+            gtk4 libadwaita alsa-lib cairo glib2 graphene pango glibc gcc-libs
           ls -l ../../"${OUT}".*
       - name: Upload packages
         uses: actions/upload-artifact@v7
@@ -2744,7 +2781,8 @@ jobs:
       needs.build-macos.result == 'success' &&
       needs.build-linux-appimage.result == 'success' &&
       needs.build-linux-packages.result == 'success' &&
-      needs.test-linux-packages.result == 'success'
+      needs.test-linux-packages.result == 'success' &&
+      needs.test-arch-packages.result == 'success'
     # The MiSTer armv7 build is in `needs:` so the release waits for its
     # artifact to upload before publishing — combined with
     # `continue-on-error: true` on the build job, a transient armv7 failure
@@ -2759,6 +2797,7 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - test-linux-packages
+      - test-arch-packages
       - build-rb-cli-mini-armv7
       # Cross-builds for extra CPU arches: PowerPC BE 32/64 (rb-cli only), plus
       # full GUI + rb-cli for Windows ARM64 and Linux RISC-V 64. continue-on-error
