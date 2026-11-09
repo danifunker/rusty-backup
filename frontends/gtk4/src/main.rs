@@ -41,6 +41,12 @@ fn main() -> glib::ExitCode {
         .build();
     // The installed icon carries the app id's name, as the .desktop file says; GTK is up by now.
     application.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
+    // GNOME on Wayland finds the dock icon through `<app id>.desktop`, which an AppImage lacks.
+    rusty_backup::controller::app::install_appimage_entry(
+        APP_ID,
+        include_str!("../data/io.github.danifunker.RustyBackup.desktop"),
+        include_bytes!("../../../assets/icons/icon-256.png"),
+    );
     application.connect_activate(|a| app::present(a, None));
     application.connect_open(|a, files, _hint| {
         app::present(a, files.first().and_then(|f| f.path()));

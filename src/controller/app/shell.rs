@@ -93,6 +93,17 @@ pub fn running_elevated() -> bool {
     crate::os::is_elevated()
 }
 
+/// From an AppImage, install `<stem>.desktop` and its icon so the dock can match the window.
+/// Skipped when elevated: a root instance must not write into the user's data dirs.
+pub fn install_appimage_entry(stem: &str, desktop: &str, icon_png: &[u8]) {
+    #[cfg(target_os = "linux")]
+    if !running_elevated() {
+        crate::os::linux::install_appimage_entry(stem, desktop, icon_png);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (stem, desktop, icon_png);
+}
+
 /// True only when the host OS version was read and is older than `major.minor`.
 pub fn host_known_older_than(major: u32, minor: u32) -> bool {
     let host = crate::os::host_version::HostVersion::detect();

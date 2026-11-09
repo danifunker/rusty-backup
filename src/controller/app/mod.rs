@@ -14,9 +14,9 @@ mod update;
 pub use shell::{
     about, app_version, busy_elsewhere, busy_elsewhere_notice, elevation_button_hover,
     elevation_button_label, elevation_confirm, elevation_gate, host_known_older_than,
-    no_devices_hint, physical_devices_available, picker_start_folder, progress_text,
-    running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute, DropTargets,
-    ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
+    install_appimage_entry, no_devices_hint, physical_devices_available, picker_start_folder,
+    progress_text, running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute,
+    DropTargets, ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
 };
 #[cfg(any(feature = "gui", feature = "tui-update"))]
 pub use update::{InstallState, UpdateInfo};

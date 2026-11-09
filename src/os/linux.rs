@@ -792,6 +792,22 @@ pub fn set_permissive_umask_if_elevated() {
 ///
 /// Best-effort: any failure is logged and swallowed. No-op outside AppImage.
 pub fn install_appimage_desktop_integration(icon_png: &[u8]) {
+    let template = "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Rusty Backup\n\
+         Comment=Backup and restore vintage computer hard disk images\n\
+         Exec=rusty-backup %F\n\
+         Icon=rusty-backup\n\
+         Categories=Utility;System;\n\
+         Terminal=false\n\
+         StartupNotify=true\n\
+         StartupWMClass=rusty-backup\n";
+    install_appimage_entry("rusty-backup", template, icon_png);
+}
+
+/// [`install_appimage_desktop_integration`] for any app: `<stem>.desktop` from `template` with
+/// its `Exec=` program swapped for the AppImage, and the PNG under the template's `Icon=` name.
+pub fn install_appimage_entry(stem: &str, template: &str, icon_png: &[u8]) {
     let appimage = match std::env::var_os("APPIMAGE") {
         Some(p) => PathBuf::from(p),
         None => return,
@@ -806,22 +822,26 @@ pub fn install_appimage_desktop_integration(icon_png: &[u8]) {
         .unwrap_or_else(|| home.join(".local/share"));
     let apps_dir = data_home.join("applications");
     let icon_dir = data_home.join("icons/hicolor/256x256/apps");
-    let desktop_path = apps_dir.join("rusty-backup.desktop");
-    let icon_path = icon_dir.join("rusty-backup.png");
+    let desktop_path = apps_dir.join(format!("{stem}.desktop"));
+    let icon_name = template
+        .lines()
+        .find_map(|l| l.strip_prefix("Icon="))
+        .unwrap_or(stem);
+    let icon_path = icon_dir.join(format!("{icon_name}.png"));
 
-    let desktop = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=Rusty Backup\n\
-         Comment=Backup and restore vintage computer hard disk images\n\
-         Exec={} %F\n\
-         Icon=rusty-backup\n\
-         Categories=Utility;System;\n\
-         Terminal=false\n\
-         StartupNotify=true\n\
-         StartupWMClass=rusty-backup\n",
-        appimage.display(),
-    );
+    let desktop: String = template
+        .lines()
+        .map(|l| match l.strip_prefix("Exec=") {
+            Some(cmd) => {
+                let args = cmd.split_once(' ').map(|(_, a)| a).unwrap_or("");
+                format!("Exec={} {args}", appimage.display())
+                    .trim_end()
+                    .to_string()
+                    + "\n"
+            }
+            None => format!("{l}\n"),
+        })
+        .collect();
 
     let needs_install = std::fs::read_to_string(&desktop_path)
         .map(|existing| existing != desktop)
