@@ -181,7 +181,10 @@ impl BackupOptions {
 
     /// The split option is offered at all (chdman and MAME do not read split CHDs).
     pub fn split_shown(&self) -> bool {
-        !matches!(self.compression, CompressionType::Chd | CompressionType::Dvd)
+        !matches!(
+            self.compression,
+            CompressionType::Chd | CompressionType::Dvd
+        )
     }
 
     /// The split option can be changed (a VHD is always one file).

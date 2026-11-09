@@ -320,6 +320,9 @@ pub fn extract_filtered(
 
     let mut stats = ExtractStats::default();
     let mut done = 0usize;
+    // Folder dates are applied after the loop: writing a file into a folder
+    // bumps the folder's mtime, so stamping it on creation would not stick.
+    let mut dated_dirs: Vec<(PathBuf, u32)> = Vec::new();
 
     for (idx, e) in archive.entries.iter().enumerate() {
         let target = entry_target(dest, e);
@@ -335,6 +338,7 @@ pub fn extract_filtered(
                 stats.names_sanitized += 1;
             }
             std::fs::create_dir_all(&target)?;
+            dated_dirs.push((target, e.mod_date));
             continue;
         }
         if !keep(idx) {
@@ -404,6 +408,11 @@ pub fn extract_filtered(
         stats.files += 1;
     }
 
+    // Deepest folders first, so dating a child can't disturb its parent.
+    for (dir, mod_date) in dated_dirs.iter().rev() {
+        set_host_mtime(dir, *mod_date);
+    }
+
     if stats.names_sanitized > 0 {
         log(format!(
             "{} name(s) contain characters this filesystem can't store and were changed. \
@@ -458,6 +467,11 @@ fn decompress_named(
 /// written; the orchestrator passes a collision-free path here (see
 /// [`raw_rsrc_sidecar_path`]). It is ignored for every other format, and a
 /// `None` falls back to the natural `name.rsrc` next to `target`.
+///
+/// The entry's Mac create/modify dates are kept: MacBinary and AppleDouble
+/// carry both in their headers, and every file written (container, data fork
+/// and sidecar alike) gets the modify date as its host mtime. BinHex has no
+/// date fields, so for `.hqx` the host mtime is the only place they survive.
 pub fn write_entry(
     target: &Path,
     entry: &StuffItEntry,
@@ -466,6 +480,11 @@ pub fn write_entry(
     format: ForkFormat,
     raw_rsrc_path: Option<&Path>,
 ) -> Result<()> {
+    let dates = resource_fork::MacFileDates {
+        created: entry.create_date,
+        modified: entry.mod_date,
+    };
+    let mut written: Vec<PathBuf> = Vec::with_capacity(2);
     match format {
         ForkFormat::BinHex => {
             let bh = binhex::BinHexFile {
@@ -476,45 +495,65 @@ pub fn write_entry(
                 data_fork: data.to_vec(),
                 resource_fork: rsrc.to_vec(),
             };
-            std::fs::write(
-                with_added_extension(target, "hqx"),
-                binhex::build_binhex(&bh).as_bytes(),
-            )?;
+            let out = with_added_extension(target, "hqx");
+            std::fs::write(&out, binhex::build_binhex(&bh).as_bytes())?;
+            written.push(out);
         }
         ForkFormat::MacBinary => {
             let mb = resource_fork::build_macbinary(
                 &entry.name,
                 &entry.type_code,
                 &entry.creator_code,
-                resource_fork::MacFileDates::default(),
+                dates,
                 data,
                 rsrc,
             );
-            std::fs::write(with_added_extension(target, "bin"), mb)?;
+            let out = with_added_extension(target, "bin");
+            std::fs::write(&out, mb)?;
+            written.push(out);
         }
         ForkFormat::AppleDouble => {
             std::fs::write(target, data)?;
+            written.push(target.to_path_buf());
             if !rsrc.is_empty() || entry.type_code != [0; 4] || entry.creator_code != [0; 4] {
                 let ad = resource_fork::build_appledouble(
                     &entry.type_code,
                     &entry.creator_code,
-                    resource_fork::MacFileDates::default(),
+                    dates,
                     rsrc,
                 );
-                std::fs::write(sidecar_path(target, "._"), ad)?;
+                let side = sidecar_path(target, "._");
+                std::fs::write(&side, ad)?;
+                written.push(side);
             }
         }
         ForkFormat::Raw => {
             std::fs::write(target, data)?;
+            written.push(target.to_path_buf());
             if !rsrc.is_empty() {
                 let rsrc_dst = raw_rsrc_path
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| with_added_extension(target, "rsrc"));
-                std::fs::write(rsrc_dst, rsrc)?;
+                std::fs::write(&rsrc_dst, rsrc)?;
+                written.push(rsrc_dst);
             }
         }
     }
+    for path in &written {
+        set_host_mtime(path, entry.mod_date);
+    }
     Ok(())
+}
+
+/// Stamp a host file or folder's mtime (and atime) from a Mac-epoch modify
+/// date. Best effort: an undated entry (0, or before 1970) keeps the extract
+/// time, and a filesystem that refuses to set times doesn't fail extraction.
+fn set_host_mtime(path: &Path, mac_mod_date: u32) {
+    let Some(secs) = fs_mac::hfs_common::mac_date_to_unix(mac_mod_date) else {
+        return;
+    };
+    let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+    let _ = filetime::set_file_times(path, ft, ft);
 }
 
 /// Destination path for an entry's data fork: `dest` joined with the entry's
@@ -696,6 +735,80 @@ mod tests {
             "file2 should be skipped"
         );
         assert!(dir.path().join("subdir/file3.txt").exists());
+    }
+
+    /// Every container format keeps the archive entry's dates: MacBinary
+    /// carries create/modify in header bytes 91-98 under a valid CRC, and
+    /// every host file written (and the folder) gets the modify date as its
+    /// mtime. Regression: extraction used to write zero dates and leave the
+    /// extract time on every host file.
+    #[test]
+    fn extract_keeps_entry_dates_in_every_format() {
+        use crate::stuffit::{build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod};
+        use byteorder::{BigEndian, ByteOrder};
+
+        // 2019-05-31 10:20:48 / :50 (Mac epoch), from a real StuffIt 1.5
+        // archive (mar-0.2.0.sit); the folder is a day older.
+        const CREATED: u32 = 3_642_142_848;
+        const MODIFIED: u32 = 3_642_142_850;
+        const DIR_MODIFIED: u32 = MODIFIED - 86_400;
+        let unix = |mac: u32| (mac as i64) - 2_082_844_800;
+
+        let tree = vec![StuffItInputNode::Folder {
+            name: "Folder".into(),
+            finder_flags: 0,
+            create_date: DIR_MODIFIED,
+            mod_date: DIR_MODIFIED,
+            children: vec![StuffItInputNode::File(StuffItInput {
+                name: "Tool".into(),
+                type_code: *b"MPST",
+                creator_code: *b"MPS ",
+                finder_flags: 0,
+                create_date: CREATED,
+                mod_date: MODIFIED,
+                data_fork: b"data fork".to_vec(),
+                resource_fork: b"resource fork".to_vec(),
+            })],
+        }];
+        let arc_bytes = build_archive_tree(&tree, WriteMethod::Store).expect("build");
+        let (bytes, archive) = open_bytes(arc_bytes).expect("open");
+
+        let mtime = |p: &Path| {
+            let md = std::fs::metadata(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            filetime::FileTime::from_last_modification_time(&md).unix_seconds()
+        };
+
+        for format in ForkFormat::ALL {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let stats = extract_all(&bytes, &archive, dir.path(), format, |_, _, _| {}, |_| {})
+                .expect("extract");
+            assert_eq!(stats.files, 1, "{format:?}");
+            let folder = dir.path().join("Folder");
+            let outputs: Vec<PathBuf> = match format {
+                ForkFormat::BinHex => vec![folder.join("Tool.hqx")],
+                ForkFormat::MacBinary => vec![folder.join("Tool.bin")],
+                ForkFormat::AppleDouble => vec![folder.join("Tool"), folder.join("._Tool")],
+                ForkFormat::Raw => vec![folder.join("Tool"), folder.join("Tool.rsrc")],
+            };
+            for out in &outputs {
+                assert_eq!(mtime(out), unix(MODIFIED), "{format:?} {}", out.display());
+            }
+            assert_eq!(mtime(&folder), unix(DIR_MODIFIED), "{format:?} folder");
+
+            if format == ForkFormat::MacBinary {
+                let mb = std::fs::read(&outputs[0]).expect("read .bin");
+                assert_eq!(BigEndian::read_u32(&mb[91..95]), CREATED);
+                assert_eq!(BigEndian::read_u32(&mb[95..99]), MODIFIED);
+                assert_eq!(
+                    BigEndian::read_u16(&mb[124..126]),
+                    resource_fork::macbinary_crc16(&mb[..124]),
+                    "MacBinary II header CRC covers the dates"
+                );
+                let parsed = crate::macbinary::parse(&mb).expect("parse .bin");
+                assert_eq!(parsed.create_date, CREATED);
+                assert_eq!(parsed.modify_date, MODIFIED);
+            }
+        }
     }
 
     /// A Mac filename containing `/` (legal on HFS, illegal as a host path

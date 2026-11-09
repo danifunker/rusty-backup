@@ -288,7 +288,10 @@ impl BackupController {
         self.info(format!(
             "Starting backup: {} -> {}",
             config.source_path.display(),
-            config.destination_dir.join(config.backup_name.as_str()).display()
+            config
+                .destination_dir
+                .join(config.backup_name.as_str())
+                .display()
         ));
         self.spawn_backup(
             "Rusty Backup: disk backup",
@@ -307,7 +310,10 @@ impl BackupController {
         self.remember_chd();
         self.info(format!(
             "Starting remote backup: {display} -> {}",
-            config.destination_dir.join(config.backup_name.as_str()).display()
+            config
+                .destination_dir
+                .join(config.backup_name.as_str())
+                .display()
         ));
         let source = crate::backup::BackupSource::Remote {
             conn,

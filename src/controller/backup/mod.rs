@@ -551,10 +551,7 @@ impl BackupController {
 
     /// Start Backup is enabled (the shell adds its own checks, such as valid CHD options).
     pub fn can_start(&self) -> bool {
-        !self.run.running()
-            && !self.run.pending_start
-            && self.src.idle()
-            && self.validate().is_ok()
+        !self.run.running() && !self.run.pending_start && self.src.idle() && self.validate().is_ok()
     }
 
     /// Why Start Backup cannot run now, or `Ok`.

@@ -24,6 +24,8 @@ dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, 
 anyhow = "1"
 byteorder = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Extracted files keep the archive's modify date as their host mtime.
+filetime = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
