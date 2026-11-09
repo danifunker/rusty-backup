@@ -127,6 +127,17 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
    (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so
    every later slice is proved by flows as it lands rather than at the end.
+   Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
+   tab, update banner, status line and log, the effect host (common file dialog after the
+   scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
+   AskPassword, clipboard, URLs), `Win32Wake` posting `WM_APP_JOB`, the manifest embedded by the
+   linker (the engine's build script already links the icon and version resource, so a second
+   resource collides), and CI target `win32`. Commander and Settings are shown but off until
+   slices 3 and 7b. `drivers/uia_driver.py` + `runner/src/uia.rs` drive it; the stand-in flow
+   `win32-shell.toml` passes. `AppTab::ALL` / `label()` give every shell the tab titles.
+   Learned: `IsWindowVisible` is false for every child until the main window shows, so the shell
+   reads the `WS_VISIBLE` bit (`ui::shown`); sizes come from `GetDpiForSystem` before a window
+   exists.
    Slice 0a done (2026-11-09): `frontends/win32/src/layout.rs`, its own workspace and lockfile,
    seven rectangle tests; `scripts/check-boundaries.sh` enforces `frontends/win32/src` from the
    start.

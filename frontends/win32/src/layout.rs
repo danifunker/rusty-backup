@@ -36,6 +36,7 @@ pub enum Node<T> {
     /// Children top to bottom, `gap` DIPs apart.
     Column { children: Vec<Node<T>>, gap: i32 },
     /// A label before its field: the label takes `label_width` DIPs and is centred on the field.
+    #[allow(dead_code)] // the screens' forms, from slice 1 on
     Pair {
         label: T,
         field: Box<Node<T>>,
@@ -89,6 +90,7 @@ impl<T> Node<T> {
         Node::Column { children, gap: GAP }
     }
 
+    #[allow(dead_code)]
     pub fn pair(label: T, label_width: i32, field: Node<T>) -> Self {
         Node::Pair {
             label,
@@ -111,7 +113,7 @@ impl<T> Node<T> {
             Node::Leaf { width, .. } => *width,
             Node::Space(s) => *s,
             Node::Row { children, gap } => sum(children.iter().map(Node::width), *gap),
-            Node::Column { children, .. } => widest(children.iter().map(Node::width)),
+            Node::Column { children, .. } => widest(across(children).map(Node::width)),
             Node::Pair {
                 field, label_width, ..
             } => match field.width() {
@@ -127,12 +129,17 @@ impl<T> Node<T> {
         match self {
             Node::Leaf { height, .. } => *height,
             Node::Space(s) => *s,
-            Node::Row { children, .. } => widest(children.iter().map(Node::height)),
+            Node::Row { children, .. } => widest(across(children).map(Node::height)),
             Node::Column { children, gap } => sum(children.iter().map(Node::height), *gap),
             Node::Pair { height, .. } => *height,
             Node::Inset { child, margin } => grow(child.height(), *margin),
         }
     }
+}
+
+/// The children that have a size across their parent's axis: a space only has one along it.
+fn across<T>(children: &[Node<T>]) -> impl Iterator<Item = &Node<T>> {
+    children.iter().filter(|c| !matches!(c, Node::Space(_)))
 }
 
 /// Children in a line: fixed if they all are, else a stretch of their summed weights.
@@ -396,6 +403,15 @@ mod tests {
         assert_eq!(out, vec![(1, r(0, 0, 75, 23)), (2, r(82, 0, 18, 23))]);
         let out = layout(&n, r(0, 0, 0, 0), 96);
         assert!(out.iter().all(|(_, rc)| rc.w >= 0 && rc.h >= 0));
+    }
+
+    #[test]
+    fn a_stretching_space_does_not_make_its_row_tall() {
+        let bar = Node::row(vec![Node::button(1, 75), Node::Space(Size::Stretch(1))]);
+        assert_eq!(bar.height(), Size::Fixed(ROW));
+        let n = Node::column(vec![bar, Node::leaf(2, Size::Stretch(1), Size::Stretch(1))]);
+        let out = layout(&n, r(0, 0, 200, 200), 96);
+        assert_eq!(out, vec![(1, r(0, 0, 75, 23)), (2, r(0, 30, 200, 170))]);
     }
 
     #[test]

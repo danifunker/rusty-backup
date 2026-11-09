@@ -280,6 +280,7 @@ pub struct UiSession {
     shell: Option<String>,
     rb_cli: PathBuf,
     gtk: PathBuf,
+    win32: PathBuf,
     scratch: PathBuf,
     controls: Controls,
     /// The control the last `focus` landed on, which `fill` and `choose` act on.
@@ -294,6 +295,7 @@ impl UiSession {
         shell: Option<String>,
         rb_cli: &Path,
         gtk: &Path,
+        win32: &Path,
         scratch: &Path,
         controls: Controls,
     ) -> Self {
@@ -301,6 +303,7 @@ impl UiSession {
             shell,
             rb_cli: rb_cli.to_path_buf(),
             gtk: gtk.to_path_buf(),
+            win32: win32.to_path_buf(),
             scratch: scratch.to_path_buf(),
             controls,
             focused: Control::default(),
@@ -328,7 +331,7 @@ impl UiSession {
         let shell = self.shell.clone().unwrap_or_default();
         match shell.as_str() {
             "tui" => self.run_tui(ops, resolve),
-            "gtk" => self.run_gtk(ops, resolve),
+            "gtk" | "win32" => self.run_driver(&shell, ops, resolve),
             other => Err(UiError::Skip(
                 Verdict::SkipTool,
                 format!("no driver for the '{}' shell yet", other),
@@ -336,13 +339,22 @@ impl UiSession {
         }
     }
 
-    fn run_gtk(&mut self, ops: &[UiOp], resolve: &dyn Fn(&str) -> String) -> Result<(), UiError> {
+    /// A shell driven by a JSON-lines driver script: GTK over AT-SPI, Win32 over UIA.
+    fn run_driver(
+        &mut self,
+        shell: &str,
+        ops: &[UiOp],
+        resolve: &dyn Fn(&str) -> String,
+    ) -> Result<(), UiError> {
         if self.gtk_driver.is_none() {
-            let d = crate::gtk::Driver::start(&self.gtk, &self.scratch.join("gtk"))?;
+            let d = match shell {
+                "win32" => crate::uia::start(&self.win32, &self.scratch.join("win32"))?,
+                _ => crate::gtk::Driver::start(&self.gtk, &self.scratch.join("gtk"))?,
+            };
             self.gtk_driver = Some(d);
         }
         for op in ops {
-            if op.only.as_deref().is_some_and(|o| o != "gtk") {
+            if op.only.as_deref().is_some_and(|o| o != shell) {
                 continue;
             }
             if let Some(f) = &op.wait_file {
@@ -365,11 +377,17 @@ impl UiSession {
                 }
                 continue;
             }
-            let target = control(&self.controls, "gtk", &resolve(op_target(op)));
+            let target = control(&self.controls, shell, &resolve(op_target(op)));
             if target.skip && !op_target(op).is_empty() {
                 continue;
             }
-            let msg = self.gtk_message(op, resolve);
+            let mut msg = self.driver_message(shell, op, resolve);
+            // Win32 finds a control by its AutomationId, the controller id itself.
+            if shell == "win32" && (op.focus.is_some() || op.activate.is_some()) {
+                if let Some(m) = msg.as_object_mut() {
+                    m.insert("id".to_string(), serde_json::Value::String(resolve(op_target(op))));
+                }
+            }
             let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
             let d = self.gtk_driver.as_mut().expect("started above");
             if let Err((exp, obs)) = d.send(&msg, limit) {
@@ -387,9 +405,14 @@ impl UiSession {
         Ok(())
     }
 
-    /// The JSON line the GTK driver gets for `op`, with controller ids resolved to labels.
-    fn gtk_message(&mut self, op: &UiOp, resolve: &dyn Fn(&str) -> String) -> serde_json::Value {
-        let ctl = |s: &Self, n: &str| control(&s.controls, "gtk", &resolve(n));
+    /// The JSON line a driver gets for `op`, with controller ids resolved to labels.
+    fn driver_message(
+        &mut self,
+        shell: &str,
+        op: &UiOp,
+        resolve: &dyn Fn(&str) -> String,
+    ) -> serde_json::Value {
+        let ctl = |s: &Self, n: &str| control(&s.controls, shell, &resolve(n));
         let label = |c: &Control, n: &str| c.label.clone().unwrap_or_else(|| resolve(n));
         let mut m = serde_json::Map::new();
         let mut put = |k: &str, v: String| {

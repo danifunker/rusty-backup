@@ -26,6 +26,7 @@ mod produce;
 mod registry;
 mod report;
 mod tui;
+mod uia;
 mod verify;
 
 use report::{Bundle, CaseResult, RunIdentity, Verdict};
@@ -41,6 +42,7 @@ struct Args {
     cases_dir: PathBuf,
     rb_cli: PathBuf,
     gtk: PathBuf,
+    win32: PathBuf,
     identify: bool,
     detect: bool,
     set_oracle: Option<String>,
@@ -144,6 +146,9 @@ fn parse_args() -> Result<Args, String> {
         gtk: base
             .join("..")
             .join("frontends/gtk4/target/release/rusty-backup-gtk"),
+        win32: base
+            .join("..")
+            .join("frontends/win32/target/release/rusty-backup-win32.exe"),
         identify: false,
         detect: false,
         set_oracle: None,
@@ -233,6 +238,10 @@ fn parse_args() -> Result<Args, String> {
                         args.gtk = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--win32" => {
+                        args.win32 = PathBuf::from(value()?);
+                        i += 1;
+                    }
                     "--rb-cli" => {
                         args.rb_cli = PathBuf::from(value()?);
                         i += 1;
@@ -313,6 +322,7 @@ fn parse_args() -> Result<Args, String> {
     // absolute before it gets there. See exec::absolutise.
     args.rb_cli = exec::absolutise(&args.rb_cli);
     args.gtk = exec::absolutise(&args.gtk);
+    args.win32 = exec::absolutise(&args.win32);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -1571,7 +1581,14 @@ fn run_case(
     } else {
         flow::Controls::new()
     };
-    let mut ui = flow::UiSession::new(case.shell.clone(), &args.rb_cli, &args.gtk, &scratch, controls);
+    let mut ui = flow::UiSession::new(
+        case.shell.clone(),
+        &args.rb_cli,
+        &args.gtk,
+        &args.win32,
+        &scratch,
+        controls,
+    );
     for (idx, step) in steps.iter().enumerate() {
         if !step.ui.is_empty() {
             match ui.run(&step.ui, &resolve) {

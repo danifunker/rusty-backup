@@ -24,6 +24,32 @@ pub enum AppTab {
     Archives,
 }
 
+impl AppTab {
+    /// The tabs in the order every window shell shows them (D8).
+    pub const ALL: [AppTab; 7] = [
+        AppTab::Backup,
+        AppTab::Restore,
+        AppTab::Build,
+        AppTab::Inspect,
+        AppTab::Convert,
+        AppTab::Optical,
+        AppTab::Archives,
+    ];
+
+    /// The tab's title.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppTab::Backup => "Backup",
+            AppTab::Restore => "Restore",
+            AppTab::Build => "Build Disk",
+            AppTab::Inspect => "Inspect",
+            AppTab::Convert => "Convert",
+            AppTab::Optical => "Optical",
+            AppTab::Archives => "Archives",
+        }
+    }
+}
+
 /// What the tabs a drop may go to are doing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DropTargets {

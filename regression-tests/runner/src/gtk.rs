@@ -35,16 +35,22 @@ impl Driver {
             }
         }
         let script = crate::regression_dir().join("drivers").join("gtk_driver.py");
-        let _ = std::fs::remove_dir_all(work);
-        std::fs::create_dir_all(work)
-            .map_err(|e| UiError::Skip(Verdict::Error, format!("{}: {}", work.display(), e)))?;
-        let mut child = Command::new("dbus-run-session")
-            .args(["--", "xvfb-run", "-a", "-s", SCREEN, "python3", "-I"])
+        let mut cmd = Command::new("dbus-run-session");
+        cmd.args(["--", "xvfb-run", "-a", "-s", SCREEN, "python3", "-I"])
             .arg(&script)
             .arg(gtk)
             .arg(work)
             .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_DISPLAY");
+        Driver::launch(cmd, work, "GTK")
+    }
+
+    /// Start a driver script built by `cmd`; it answers `{"ready": true}` once the app is up.
+    pub fn launch(mut cmd: Command, work: &Path, what: &str) -> Result<Driver, UiError> {
+        let _ = std::fs::remove_dir_all(work);
+        std::fs::create_dir_all(work)
+            .map_err(|e| UiError::Skip(Verdict::Error, format!("{}: {}", work.display(), e)))?;
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(
@@ -52,7 +58,7 @@ impl Driver {
                     .map_err(|e| UiError::Skip(Verdict::Error, e.to_string()))?,
             ))
             .spawn()
-            .map_err(|e| UiError::Skip(Verdict::Error, format!("GTK driver: {}", e)))?;
+            .map_err(|e| UiError::Skip(Verdict::Error, format!("{} driver: {}", what, e)))?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         let (tx, rx) = channel();
@@ -74,11 +80,11 @@ impl Driver {
             work: work.to_path_buf(),
         };
         let ready = d.reply(Duration::from_secs(90)).map_err(|why| {
-            UiError::Skip(Verdict::Error, format!("GTK driver did not start: {}", why))
+            UiError::Skip(Verdict::Error, format!("{} driver did not start: {}", what, why))
         })?;
         if ready.get("ready").and_then(|v| v.as_bool()) != Some(true) {
             let why = ready.get("why").and_then(|v| v.as_str()).unwrap_or("no reason given");
-            return Err(UiError::Skip(Verdict::Error, format!("GTK driver: {}", why)));
+            return Err(UiError::Skip(Verdict::Error, format!("{} driver: {}", what, why)));
         }
         Ok(d)
     }
@@ -122,7 +128,13 @@ impl Driver {
     /// The driver's and the app's logs, for the failure bundle.
     pub fn log(&self) -> String {
         let read = |n: &str| std::fs::read_to_string(self.work.join(n)).unwrap_or_default();
-        format!("--- driver.log ---\n{}\n--- gtk-app.log ---\n{}", read("driver.log"), read("gtk-app.log"))
+        let mut out = format!("--- driver.log ---\n{}", read("driver.log"));
+        for app in ["gtk-app.log", "win32-app.log"] {
+            if self.work.join(app).exists() {
+                out.push_str(&format!("\n--- {} ---\n{}", app, read(app)));
+            }
+        }
+        out
     }
 }
 

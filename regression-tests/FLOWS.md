@@ -165,7 +165,7 @@ sign the two shells don't offer the same thing.
 | `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS, and Windows 10 1809+ over ConPTY (`RUSTY_BACKUP_CONFIG_DIR` keeps its config in the scratch home there). About 4 s a flow on Linux, 5 s on Windows |
 | `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
 | `appkit` | `drivers/ax_driver.py`: PyObjC over AX, controls found by `AXIdentifier` (the controller id), so no `labels.toml` section | the AX (TCC) permission | planned: [docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md) |
-| `win32` | `drivers/uia_driver.py`: UI Automation, controls found by `AutomationId` (the controller id) | Python with `comtypes` | planned: [docs/win32_shell_plan.md](../docs/win32_shell_plan.md) |
+| `win32` | `drivers/uia_driver.py` over UI Automation, run by `runner/src/uia.rs` (`--win32 <exe>`, default `frontends/win32/target/release/rusty-backup-win32.exe`): controls found by `AutomationId`, the controller id, else by name; scratch config and picks file as for the other shells | Python with `comtypes` | Windows, CI target `win32`. Only `win32-shell.toml` runs on it until the screens land ([docs/win32_shell_plan.md](../docs/win32_shell_plan.md)) |
 
 A case whose shell has no driver, or whose driver's tools are missing, resolves
 to `skip-tool` with the reason.
@@ -232,3 +232,4 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk | against `rb-cli optical extract` |
 | `audio.toml` | play a CD-DA track | gtk (no TUI player by design) | the position advances |
+| `win32-shell.toml` | the Win32 skeleton starts, switches tabs, clears the log by id | win32 | a stand-in until a screen's flows run on win32 |

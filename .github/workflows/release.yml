@@ -83,7 +83,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -106,6 +106,7 @@ jobs:
       musl: ${{ steps.p.outputs.musl }}
       crates-msrv: ${{ steps.p.outputs.crates-msrv }}
       gtk4: ${{ steps.p.outputs.gtk4 }}
+      win32: ${{ steps.p.outputs.win32 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -121,7 +122,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -1934,6 +1935,46 @@ jobs:
           path: |
             crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
             crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
+
+  # The Win32 shell (docs/win32_shell_plan.md): not shipped yet; it must keep compiling, and its
+  # tier 8 flows run over UI Automation. The artifact is the bare exe until slice 9 packages it.
+  build-win32:
+    name: Build Win32 shell (x64)
+    needs: [generate-version, plan]
+    if: needs.plan.outputs.win32 == 'true'
+    runs-on: windows-latest
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        working-directory: frontends/win32
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Layout tests
+        working-directory: frontends/win32
+        run: cargo test --locked
+      - name: Build
+        working-directory: frontends/win32
+        run: cargo build --locked --release
+      - name: Build rb-cli and rb-regress
+        run: |
+          cargo build --locked --release --bin rb-cli
+          cargo build --locked --release --manifest-path regression-tests/runner/Cargo.toml
+      - name: Tier 8 flows over UI Automation
+        shell: bash
+        working-directory: regression-tests
+        run: |
+          python -m pip install comtypes
+          ./runner/target/release/rb-regress.exe run --tiers 8 --shell win32 --no-prompt
+      - name: Upload the exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-preview-x64-${{ needs.generate-version.outputs.version }}
+          path: frontends/win32/target/release/rusty-backup-win32.exe
 
   # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.

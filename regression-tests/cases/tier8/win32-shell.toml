@@ -1,0 +1,27 @@
+# Tier 8: the Win32 shell's skeleton (slice 0) starts under the UIA driver (FLOWS.md).
+#
+# A stand-in until the first screen's flows gain "win32": it proves the driver can start the
+# shell, find controls by AutomationId and switch tabs. Remove it then.
+
+[meta]
+tier = 8
+group = "flow.shell"
+description = "The Win32 shell starts under the UIA driver and switches tabs."
+
+[[case]]
+id = "flow.shell.win32-start"
+description = "Start the Win32 shell, switch between two tabs, and clear the log by its controller id"
+level = "smoke"
+area = ["shell"]
+shells = ["win32"]
+capabilities = []
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { wait = "The Optical screen" },
+  { tab = "Backup" },
+  { wait = "The Backup screen" },
+  { activate = "log.clear" },
+  { expect = "Copy Log" },
+]
