@@ -17,6 +17,8 @@ mod layout;
 #[cfg(windows)]
 mod panel;
 #[cfg(windows)]
+mod partition_bar;
+#[cfg(windows)]
 mod report;
 #[cfg(windows)]
 mod sync;

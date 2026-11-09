@@ -16,7 +16,7 @@ use rusty_backup::controller::app::{
 };
 use rusty_backup::controller::inspect::{
     format_size, ids, purpose, HostRequest, InspectAction, InspectController, InspectServices,
-    InspectSource, JobRegistry, MinCell, PartitionRow,
+    InspectSource, JobRegistry, LayoutSegment, MinCell, PartitionRow,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
@@ -106,6 +106,8 @@ struct Shown {
     details: Vec<String>,
     has_table: bool,
     rows: Vec<PartitionRow>,
+    segments: Vec<LayoutSegment>,
+    selected: Option<usize>,
     can_reinspect: bool,
     can_bootable: bool,
     can_close: bool,
@@ -142,10 +144,13 @@ pub struct InspectScreen {
     chd: HWND,
     close: HWND,
     details: HWND,
+    bar: HWND,
     table: HWND,
     rows: RefCell<Vec<PartitionRow>>,
     /// The row the tools act on: the list's selection, else the first row (as the TUI's cursor).
     cursor: Cell<usize>,
+    /// Which optional lines the last layout gave room to, so a change lays the page out again.
+    shape: Cell<u32>,
     no_partitions: HWND,
     calc_min: HWND,
     check: HWND,
@@ -193,6 +198,16 @@ impl InspectScreen {
         let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
         let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
+        let bar_target: Rc<RefCell<Weak<InspectScreen>>> = Rc::default();
+        let target = bar_target.clone();
+        let bar = crate::partition_bar::build(
+            page,
+            Box::new(move |p| {
+                if let Some(s) = target.borrow().upgrade() {
+                    s.apply(InspectAction::SelectPartition(p));
+                }
+            }),
+        );
         let style = LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
         let table = ui::child(
             page,
@@ -267,9 +282,11 @@ impl InspectScreen {
             chd,
             close,
             details,
+            bar,
             table,
             rows: RefCell::default(),
             cursor: Cell::new(0),
+            shape: Cell::new(u32::MAX),
             no_partitions,
             calc_min,
             check,
@@ -278,6 +295,7 @@ impl InspectScreen {
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
         });
+        *bar_target.borrow_mut() = screen.me.clone();
         let weak: Weak<dyn Handler> = screen.me.clone();
         panel::register(page, weak);
         screen.refresh();
@@ -404,7 +422,12 @@ impl InspectScreen {
 
     fn read(&self) -> Shown {
         let devices = self.devices.borrow();
-        let c = self.ctrl.borrow();
+        let mut c = self.ctrl.borrow_mut();
+        let segments = if c.partitions().is_empty() {
+            Vec::new()
+        } else {
+            c.layout()
+        };
         let mut jobs = Vec::new();
         jobs.extend(c.loading());
         jobs.extend(c.export_job());
@@ -422,6 +445,8 @@ impl InspectScreen {
             details: c.detail_lines(),
             has_table: c.table_summary().is_some(),
             rows: c.rows(),
+            segments,
+            selected: c.selected_partition(),
             can_reinspect: c.can_reinspect(),
             can_bootable: c.can_make_bootable(),
             can_close: c.can_close(),
@@ -461,7 +486,20 @@ impl InspectScreen {
         ui::set_visible(self.close, s.can_close);
         ui::set_text(self.details, &s.details.join("\r\n"));
         ui::set_visible(self.no_partitions, s.has_table && s.rows.is_empty());
+        ui::set_visible(self.bar, s.has_table && !s.rows.is_empty());
+        crate::partition_bar::show(self.bar, s.segments, s.selected);
         self.show_rows(s.rows);
+        if self.shape.get() != self.shape_now() {
+            self.layout();
+        }
+        // A click on the bar selects the partition; the list follows it.
+        let at = s
+            .selected
+            .and_then(|p| self.rows.borrow().iter().position(|r| r.index == p));
+        if let Some(i) = at.filter(|i| Some(*i) != self.selected()) {
+            self.cursor.set(i);
+            self.select(i);
+        }
         self.show_windows(s.check, s.chd);
     }
 
@@ -690,53 +728,111 @@ impl InspectScreen {
         }
     }
 
+    /// The optional lines' state, one bit each, and the facts' line count.
+    fn shape_now(&self) -> u32 {
+        let has = |h: HWND| !ui::text(h).is_empty();
+        let bits = [
+            has(self.note),
+            has(self.flux),
+            has(self.error),
+            ui::shown(self.progress),
+            ui::shown(self.bar),
+            ui::shown(self.no_partitions),
+        ];
+        let mut v = ui::text(self.details).lines().count() as u32;
+        for (i, b) in bits.iter().enumerate() {
+            v |= (*b as u32) << (8 + i);
+        }
+        v
+    }
+
     fn layout(&self) {
         let (area, dpi) = panel::client(self.page);
+        // A line left out of the tree must not keep its old place and paint over its neighbours.
+        let optional = [
+            self.note,
+            self.flux,
+            self.error,
+            self.job,
+            self.progress,
+            self.details,
+            self.bar,
+            self.no_partitions,
+        ];
+        for h in optional {
+            ui::move_to(h, layout::Rect::default());
+        }
         let line =
             |h: HWND, n: i32| Node::leaf(h, Size::Stretch(1), Size::Fixed((layout::ROW - 8) * n));
-        let tree = Node::inset(
-            Node::column(vec![
-                Node::row(vec![
-                    Node::leaf(
-                        self.source_caption,
-                        Size::Fixed(60),
-                        Size::Fixed(layout::ROW - 8),
-                    ),
-                    Node::leaf(self.source, Size::Stretch(1), Size::Fixed(layout::ROW)),
-                    Node::button(self.open_file, 110),
-                    Node::button(self.open_backup, 160),
-                ]),
-                line(self.note, 2),
-                line(self.flux, 1),
-                line(self.error, 1),
-                Node::row(vec![
-                    Node::leaf(self.job, Size::Stretch(2), Size::Fixed(layout::ROW - 8)),
-                    Node::leaf(
-                        self.progress,
-                        Size::Stretch(1),
-                        Size::Fixed(layout::ROW - 8),
-                    ),
-                ]),
-                Node::row(vec![
-                    Node::button(self.reinspect, 90),
-                    Node::button(self.convert_btn, 90),
-                    Node::button(self.bootable, 120),
-                    Node::button(self.chd, 80),
-                    Node::Space(Size::Stretch(1)),
-                    Node::button(self.close, 80),
-                ]),
-                line(self.details, 6),
-                Node::leaf(self.table, Size::Stretch(1), Size::Stretch(1)),
-                line(self.no_partitions, 1),
-                Node::row(vec![
-                    Node::button(self.calc_min, 80),
-                    Node::button(self.check, 80),
-                    Node::button(self.expand, 130),
-                    Node::Space(Size::Stretch(1)),
-                ]),
-            ]),
+        let mut tree = Node::inset(
+            Node::column(vec![Node::row(vec![
+                Node::leaf(
+                    self.source_caption,
+                    Size::Fixed(60),
+                    Size::Fixed(layout::ROW - 8),
+                ),
+                Node::leaf(self.source, Size::Stretch(1), Size::Fixed(layout::ROW)),
+                Node::button(self.open_file, 110),
+                Node::button(self.open_backup, 160),
+            ])]),
             layout::MARGIN,
         );
+        // Only the lines with something to say take room; the rest of the page moves up.
+        let Node::Inset { child, .. } = &mut tree else {
+            unreachable!()
+        };
+        let Node::Column { children, .. } = child.as_mut() else {
+            unreachable!()
+        };
+        let lines = |h: HWND| {
+            let t = ui::text(h);
+            if t.is_empty() {
+                0
+            } else {
+                t.lines().count() as i32
+            }
+        };
+        let note = (lines(self.note) > 0).then(|| line(self.note, 2));
+        children.extend(note);
+        children.extend((lines(self.flux) > 0).then(|| line(self.flux, 1)));
+        children.extend((lines(self.error) > 0).then(|| line(self.error, 1)));
+        if ui::shown(self.progress) {
+            children.push(Node::row(vec![
+                Node::leaf(self.job, Size::Stretch(2), Size::Fixed(layout::ROW - 8)),
+                Node::leaf(
+                    self.progress,
+                    Size::Stretch(1),
+                    Size::Fixed(layout::ROW - 8),
+                ),
+            ]));
+        }
+        children.extend([Node::row(vec![
+            Node::button(self.reinspect, 90),
+            Node::button(self.convert_btn, 90),
+            Node::button(self.bootable, 120),
+            Node::button(self.chd, 80),
+            Node::Space(Size::Stretch(1)),
+            Node::button(self.close, 80),
+        ])]);
+        children.extend((lines(self.details) > 0).then(|| line(self.details, lines(self.details))));
+        if ui::shown(self.bar) {
+            children.push(Node::leaf(
+                self.bar,
+                Size::Stretch(1),
+                Size::Fixed(crate::partition_bar::HEIGHT),
+            ));
+        }
+        children.push(Node::leaf(self.table, Size::Stretch(1), Size::Stretch(1)));
+        if ui::shown(self.no_partitions) {
+            children.push(line(self.no_partitions, 1));
+        }
+        children.push(Node::row(vec![
+            Node::button(self.calc_min, 80),
+            Node::button(self.check, 80),
+            Node::button(self.expand, 130),
+            Node::Space(Size::Stretch(1)),
+        ]));
+        self.shape.set(self.shape_now());
         for (h, r) in layout::layout(&tree, area, dpi) {
             ui::move_to(h, r);
         }
