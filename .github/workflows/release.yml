@@ -1532,10 +1532,12 @@ jobs:
         run: |
           set -euo pipefail
           DEB="Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}.deb"
+          PKG_VERSION="${{ needs.generate-version.outputs.version }}"; PKG_VERSION="${PKG_VERSION//-/.}"
           # --no-strip: already stripped with the cross strip above; the host
           # `strip` can't read a riscv64 ELF.
           # -o: cargo-deb only mirrors into target/<triple>/debian as a deprecated back-compat copy.
-          cargo deb --target riscv64gc-unknown-linux-gnu --no-build --no-strip -o "$DEB"
+          cargo deb --target riscv64gc-unknown-linux-gnu --no-build --no-strip --deb-version "$PKG_VERSION" -o "$DEB"
+          [ "$(dpkg-deb -f "$DEB" Version)" = "$PKG_VERSION" ] || { echo "::error::deb version is not $PKG_VERSION"; exit 1; }
           dpkg-deb -f "$DEB" Package Version Architecture Depends
           # $auto runs dpkg-shlibdeps against the :riscv64 multiarch packages.
           # When it fails cargo-deb only warns and ships a .deb whose Depends is
@@ -1563,8 +1565,9 @@ jobs:
             | awk '$1 == "NEEDED" { printf "\"%s()(64bit)\" = \"*\", ", $2 }')
           [ -n "$REQS" ] || { echo "::error::no NEEDED entries in $ELF"; exit 1; }
           # The target triple's first segment is riscv64gc; RPM distros say riscv64.
+          PKG_VERSION="${{ needs.generate-version.outputs.version }}"; PKG_VERSION="${PKG_VERSION//-/.}"
           cargo generate-rpm --target riscv64gc-unknown-linux-gnu --arch riscv64 \
-            --auto-req disabled \
+            --auto-req disabled --set-metadata "version = \"$PKG_VERSION\"" \
             --set-metadata "requires = { ${REQS}gtk3 = \"*\", openssl = \"*\" }"
           mv target/riscv64gc-unknown-linux-gnu/generate-rpm/*.rpm "$RPM"
           rpm -qp --qf '%{NAME} %{VERSION} %{ARCH}\n' "$RPM"
@@ -1948,8 +1951,11 @@ jobs:
       - name: Build packages
         run: |
           OUT="Rusty-Backup-GTK-linux-${{ matrix.arch }}-${RELEASE_VERSION}"
-          cargo deb --no-build -o "../../${OUT}.deb"
-          cargo generate-rpm -o "../../${OUT}.rpm"
+          PKG_VERSION="${RELEASE_VERSION//-/.}"
+          cargo deb --no-build --deb-version "$PKG_VERSION" -o "../../${OUT}.deb"
+          cargo generate-rpm --set-metadata "version = \"$PKG_VERSION\"" -o "../../${OUT}.rpm"
+          [ "$(dpkg-deb -f "../../${OUT}.deb" Version)" = "$PKG_VERSION" ] || { echo "::error::deb version"; exit 1; }
+          [ "$(rpm -qp --qf '%{VERSION}' "../../${OUT}.rpm")" = "$PKG_VERSION" ] || { echo "::error::rpm version"; exit 1; }
           root=arch-pkg
           install -Dm755 target/release/rusty-backup-gtk "$root/usr/bin/rusty-backup-gtk"
           install -Dm644 data/io.github.danifunker.RustyBackup.desktop -t "$root/usr/share/applications"
@@ -2122,7 +2128,9 @@ jobs:
           T=riscv64gc-unknown-linux-gnu
           OUT="../../Rusty-Backup-GTK-linux-riscv64-${RELEASE_VERSION}"
           ELF=target/$T/release/rusty-backup-gtk
-          cargo deb --target $T --no-build --no-strip -o "${OUT}.deb"
+          PKG_VERSION="${RELEASE_VERSION//-/.}"
+          cargo deb --target $T --no-build --no-strip --deb-version "$PKG_VERSION" -o "${OUT}.deb"
+          [ "$(dpkg-deb -f "${OUT}.deb" Version)" = "$PKG_VERSION" ] || { echo "::error::deb version"; exit 1; }
           [ "$(dpkg-deb -f "${OUT}.deb" Architecture)" = riscv64 ] \
             || { echo "::error::the deb is not Architecture: riscv64"; exit 1; }
           case "$(dpkg-deb -f "${OUT}.deb" Depends)" in
@@ -2133,6 +2141,7 @@ jobs:
           REQS=$(riscv64-linux-gnu-objdump -p "$ELF" \
             | awk '$1 == "NEEDED" { printf "\"%s()(64bit)\" = \"*\", ", $2 }')
           cargo generate-rpm --target $T --arch riscv64 --auto-req disabled \
+            --set-metadata "version = \"$PKG_VERSION\"" \
             --set-metadata "requires = { ${REQS}gtk4 = \"*\", libadwaita = \"*\" }"
           mv target/$T/generate-rpm/*.rpm "${OUT}.rpm"
           rpm -qp --requires "${OUT}.rpm"
