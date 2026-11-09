@@ -159,6 +159,16 @@ skip-platform there.
 **Gate 0, before slice 9 depends on it:** on Windows 10 and on the Win7 VM, a test window whose
 button carries an AutomationId set by Dynamic Annotation is found by that id from Python.
 
+**Gate 0 result (2026-11-09): passed on Windows 11 (build 26300); Win7 still open.** A test window
+(`windows` 0.62.2) annotated a `BUTTON` and an `EDIT` with `SetHwndPropStr(hwnd, OBJID_CLIENT,
+CHILDID_SELF, AutomationId_Property_GUID, id)`. Python 3.9 with `comtypes` 1.4 over
+`UIAutomationCore.dll` found both by `AutomationId` under the window, pressed the button through
+`InvokePattern` (the click reached `WM_COMMAND`) and set the edit through `ValuePattern`. The
+annotation outlives the `IAccPropServices` it was set through, so the shell need not hold one.
+The `uiautomation` package is not needed. No Win7 VM is reachable from this machine; the gate is
+rerun there before Phase 6 relies on it, and only the vintage shell falls back to the id table if
+it fails.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `win32` and on the TUI over ConPTY, and the expected failures match
@@ -175,6 +185,8 @@ against it on the Win7 VM if Gate 0 passed there. Tier 8 flows then gain a `win3
 
 ## Open questions
 
-1. Dynamic Annotation for AutomationId (Gate 0), or the numeric id table.
-2. Python `comtypes` / `uiautomation` for the driver, or a Rust helper outside the 1.73 harness.
+1. ~~Dynamic Annotation for AutomationId (Gate 0), or the numeric id table.~~ Dynamic Annotation
+   (Gate 0 passed on Windows 11; Win7 not yet tried).
+2. ~~Python `comtypes` / `uiautomation` for the driver, or a Rust helper outside the 1.73 harness.~~
+   Python with `comtypes` alone (Gate 0).
 3. Whether the Win32 preview shares the egui installer or gets its own until parity.
