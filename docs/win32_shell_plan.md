@@ -137,6 +137,14 @@ in check-group mode with the bundled icons); the screens and slices below are un
    (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so
    every later slice is proved by flows as it lands rather than at the end.
+   Slice 1 (Inspect) nearly done (2026-11-09): the source menu (recent files, devices), Open File
+   and Open Backup Folder, the facts, the job line with progress and Cancel Export, the partition
+   bar, the partition list and its row tools (Calc min, Check, Expand/Export, Defragment, Alto
+   Resize), and the windows: Check results and CHD Info, Expand Image, Export Disk Image (with the
+   shared `ChdControl`), Resize Partitions, the partition-table editor, Expand HFS and Resize Alto
+   Disk. Left: Physical Disk Export (the disk writer, slice 7a), the remote listing (7b) and
+   browsing (slice 2). The facts, the Check report, the export notes and the editor bars'
+   segments moved into the controller on the way.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
