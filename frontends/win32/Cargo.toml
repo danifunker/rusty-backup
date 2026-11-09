@@ -1,0 +1,19 @@
+# The Win32 shell (docs/native_frontends_plan.md Phase 5, docs/win32_shell_plan.md).
+# Its own workspace root and lockfile, like frontends/gtk4: stable Rust, not the engine's 1.73 floor.
+[package]
+name = "rusty-backup-win32"
+version = "0.1.0"
+description = "Rusty Backup, the Win32 front end: back up, restore and inspect vintage disk images"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"

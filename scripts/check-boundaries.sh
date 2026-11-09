@@ -18,8 +18,8 @@ cd "$(dirname "$0")/.."
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src)
-ENFORCED=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src)
+SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src frontends/win32/src)
+ENFORCED=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src frontends/win32/src)
 # `update` owns config.json (recent files, settings); views reach it through controller::app (slice 22).
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model|update'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'

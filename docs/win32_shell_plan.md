@@ -116,11 +116,20 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
    - **Scripted picks.** `controller::picks` is the shared helper; the TUI's `FilePicker` confirms
      a `*` answer by itself, and the runner writes the picks file for the TUI as the GTK driver
      does. GTK's own copy in `effects.rs` moves to the helper in the Linux session.
-   - Not started: the staged host copy and the Convert-tab hand-off.
+   - **Convert hand-off.** The TUI's Optical screen now hands an open image to the Convert tab
+     (a `Convert...` row and `C`), as egui and GTK do; its own format, output and start rows
+     remain for ripping a drive.
+   - **Left for the Linux session:** the staged host copy (only GTK copies at once, so the change
+     and `commander.left.apply`'s `skip` are GTK's), GTK reading the labels and the picks helper.
+   - **Needs the user:** `docs/capabilities.md` (each new row needs an OK). R-089 and R-090 are
+     still open.
 4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices. Already shipped
    (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so
    every later slice is proved by flows as it lands rather than at the end.
+   Slice 0a done (2026-11-09): `frontends/win32/src/layout.rs`, its own workspace and lockfile,
+   seven rectangle tests; `scripts/check-boundaries.sh` enforces `frontends/win32/src` from the
+   start.
 6. Slices 1 to 8.
 
 ## Slices
