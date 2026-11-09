@@ -227,6 +227,12 @@ pub fn control(hwnd: HWND) {
             } else {
                 w!("Explorer")
             }),
+            // 4 is ES_MULTILINE: DarkMode_CFD leaves a text box's scroll bars light, Explorer's do not.
+            "Edit" if style & 4 != 0 => Some(if dark {
+                w!("DarkMode_Explorer")
+            } else {
+                w!("Explorer")
+            }),
             "Edit" | "ComboBox" => Some(if dark {
                 w!("DarkMode_CFD")
             } else {
