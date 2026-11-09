@@ -1,1 +1,0 @@
-{"case_id":"flow.build.efs-cd.gtk","group":"flow.build.cd","tier":8,"verdict":"pass","duration_ms":15659,"platform":"linux","run_id":"1794238723-m900-linux","git_sha":"2229f72f9205f36c404294ccd43f0ddfcd365f0c","rb_version":"rb-cli 0.1.0+g2229f72f.dirty"}
