@@ -4,8 +4,8 @@
 //! have no documented switch, so dark scroll bars, buttons, lists and menus come from the
 //! `uxtheme` calls every dark Win32 app uses (by ordinal, Windows 10 1809 and later) and the
 //! `DarkMode_*` visual-style classes. Backgrounds and text are ours, through `WM_CTLCOLOR*`.
-//! Task Dialogs have no dark form and stay light. A themed tick box draws its label black on any
-//! background, so in dark mode tick boxes and radios drop their visual style.
+//! Task Dialogs have no dark form and stay light. Tick boxes, radios and drop-down lists are
+//! painted by [`crate::darkdraw`] in dark mode, where their dark styles fall short.
 
 use std::cell::{Cell, RefCell};
 
@@ -20,7 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Controls::{
-    SetWindowTheme, LVM_GETHEADER, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
+    GetComboBoxInfo, SetWindowTheme, COMBOBOXINFO, LVM_GETHEADER, LVM_SETBKCOLOR,
+    LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -166,6 +167,10 @@ pub fn panel_brush() -> HBRUSH {
     brush(1)
 }
 
+pub fn field_brush() -> HBRUSH {
+    brush(2)
+}
+
 /// Give a top-level window the mode's title bar.
 pub fn title_bar(hwnd: HWND) {
     let on = BOOL::from(dark());
@@ -201,12 +206,12 @@ pub fn control(hwnd: HWND) {
         let theme: Option<PCWSTR> = match class.as_str() {
             // 2, 3, 4, 5, 6 and 9 are the tick-box and radio kinds.
             "Button" if matches!(style, 2 | 3 | 4 | 5 | 6 | 9) => {
-                if dark {
-                    let _ = SetWindowTheme(hwnd, w!(""), w!(""));
-                    None
+                let _ = SetWindowSubclass(hwnd, Some(crate::darkdraw::check_proc), 2, 0);
+                Some(if dark {
+                    w!("DarkMode_Explorer")
                 } else {
-                    Some(w!("Explorer"))
-                }
+                    w!("Explorer")
+                })
             }
             // Unstyled in dark mode, so its custom draw (toolbar::custom_draw) decides the colours.
             "ToolbarWindow32" => {
@@ -229,6 +234,22 @@ pub fn control(hwnd: HWND) {
             }),
             _ => None,
         };
+        // 3 is CBS_DROPDOWNLIST, whose face DarkMode_CFD leaves light.
+        if class == "ComboBox" && style & 3 == 3 {
+            let _ = SetWindowSubclass(hwnd, Some(crate::darkdraw::combo_proc), 2, 0);
+            let mut info = COMBOBOXINFO {
+                cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            if GetComboBoxInfo(hwnd, &mut info).is_ok() {
+                let t = if dark {
+                    w!("DarkMode_Explorer")
+                } else {
+                    w!("Explorer")
+                };
+                let _ = SetWindowTheme(info.hwndList, t, PCWSTR::null());
+            }
+        }
         if let Some(t) = theme {
             let _ = SetWindowTheme(hwnd, t, PCWSTR::null());
         }
@@ -331,7 +352,7 @@ pub fn ctl_color(msg: u32, wp: WPARAM, lp: LPARAM, page: bool) -> Option<LRESULT
     let field =
         msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX || class_of(HWND(lp.0 as _)) == "Edit";
     let (bg, br) = if field {
-        (c.field, brush(2))
+        (c.field, field_brush())
     } else if page {
         (c.panel, panel_brush())
     } else {

@@ -141,6 +141,19 @@ pub fn path_label(parent: HWND, text: &str) -> HWND {
     )
 }
 
+/// A one-line label in a row of fields, centred on the row's height like the fields beside it.
+pub fn cell_label(parent: HWND, text: &str) -> HWND {
+    // SS_CENTERIMAGE (0x200) centres one line vertically; SS_ENDELLIPSIS (0x4000) cuts what overflows.
+    child(
+        parent,
+        w!("STATIC"),
+        text,
+        WINDOW_STYLE(0x4200),
+        WINDOW_EX_STYLE(0),
+        "",
+    )
+}
+
 pub fn edit(parent: HWND, id: &str) -> HWND {
     child(
         parent,

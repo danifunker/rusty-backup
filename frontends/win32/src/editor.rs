@@ -162,7 +162,7 @@ impl EditorWindow {
             "",
         ]
         .map(|t| ui::label(w, t));
-        let add_captions = ["Start LBA:", "Size (MiB):", "Type:"].map(|t| ui::label(w, t));
+        let add_captions = ["Start LBA:", "Size (MiB):", "Type:"].map(|t| ui::cell_label(w, t));
         let me = Rc::new_cyclic(|me: &Weak<EditorWindow>| EditorWindow {
             window: w,
             send,
@@ -176,7 +176,7 @@ impl EditorWindow {
             heads,
             rows: RefCell::default(),
             shape: RefCell::default(),
-            gaps_caption: ui::label(w, ""),
+            gaps_caption: ui::cell_label(w, ""),
             gaps: RefCell::default(),
             add_head: ui::label(w, "Add Partition"),
             add_captions,
@@ -184,7 +184,7 @@ impl EditorWindow {
             add_size: ui::edit(w, ids::TABLE_ADD_SIZE),
             add_type: ui::edit(w, ids::TABLE_ADD_TYPE),
             add_pick: ui::button(w, "Pick...", ""),
-            add_note: ui::label(w, ""),
+            add_note: ui::cell_label(w, ""),
             add_boot: ui::checkbox(w, "Bootable", ids::TABLE_ADD_BOOT),
             add: ui::button(w, "Add", ids::TABLE_ADD),
             next_slot: ui::label(w, ""),
@@ -348,19 +348,19 @@ impl EditorWindow {
                 _ => row.index.to_string(),
             };
             let mut c = RowCells {
-                number: ui::label(w, &number),
-                start: ui::label(w, &row.start_lba.to_string()),
+                number: ui::cell_label(w, &number),
+                start: ui::cell_label(w, &row.start_lba.to_string()),
                 ..RowCells::default()
             };
             if !row.editable() {
-                c.kind_label = Some(ui::label(w, &row.type_name));
+                c.kind_label = Some(ui::cell_label(w, &row.type_name));
                 if row.deleted {
-                    c.size_label = Some(ui::label(w, "deleted"));
+                    c.size_label = Some(ui::cell_label(w, "deleted"));
                     let undo = ui::button(w, "Undo", &format!("{}.{i}", ids::TABLE_ROW_UNDO));
                     cmds.push((undo, Cmd::RowUndo(i)));
                     c.action = Some(undo);
                 } else {
-                    c.size_label = Some(ui::label(
+                    c.size_label = Some(ui::cell_label(
                         w,
                         &format!("{:.2}", row.size_bytes as f64 / 1048576.0),
                     ));
@@ -373,7 +373,7 @@ impl EditorWindow {
             let pick = ui::button(w, "Pick...", "");
             ui::set_visible(pick, picks);
             cmds.push((pick, Cmd::RowPick(i)));
-            c.kind = Some((entry, pick, Some(ui::label(w, ""))));
+            c.kind = Some((entry, pick, Some(ui::cell_label(w, ""))));
             let style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0);
             let mode = ui::child(
                 w,
@@ -438,7 +438,7 @@ impl EditorWindow {
                     cmds.push((no, Cmd::RowBoot(i, false)));
                     c.boot = vec![yes, no];
                 }
-                BootStyle::Label => c.boot_label = Some(ui::label(w, "")),
+                BootStyle::Label => c.boot_label = Some(ui::cell_label(w, "")),
             }
             if row.can_delete() {
                 let delete = ui::button(w, "Delete", &format!("{}.{i}", ids::TABLE_ROW_DELETE));
@@ -489,7 +489,7 @@ impl EditorWindow {
                 Size::Fixed(partition_bar::HEIGHT),
             ),
         ];
-        let widths = [60, type_w, 100, 120, 90, 110, 80];
+        let widths = [30, type_w, 100, 120, 90, 110, 80];
         col.push(Node::row(
             self.heads
                 .iter()
@@ -504,12 +504,13 @@ impl EditorWindow {
                 (Some((entry, pick, note)), _) => {
                     let (ew, pw) = if gpt { (190, 60) } else { (60, 60) };
                     let mut t = vec![cell(*entry, ew)];
+                    let mut left = widths[1] - ew - 4;
                     if ui::shown(*pick) {
                         t.push(cell(*pick, pw));
+                        left -= pw + 4;
                     }
-                    t.extend(
-                        note.map(|n| Node::leaf(n, Size::Stretch(1), Size::Fixed(layout::ROW - 8))),
-                    );
+                    // A nested row takes its children's width, so the note fills the column itself.
+                    t.extend(note.map(|n| cell(n, left.max(0))));
                     r.push(Node::Row {
                         children: t,
                         gap: 4,
@@ -548,7 +549,7 @@ impl EditorWindow {
         let mut gap_row = vec![Node::leaf(
             self.gaps_caption,
             Size::Fixed(220),
-            Size::Fixed(layout::ROW - 8),
+            Size::Fixed(layout::ROW),
         )];
         gap_row.extend(self.gaps.borrow().iter().map(|g| Node::button(*g, 200)));
         col.push(Node::row(gap_row));
@@ -556,19 +557,19 @@ impl EditorWindow {
             Node::leaf(
                 self.add_captions[0],
                 Size::Fixed(70),
-                Size::Fixed(layout::ROW - 8),
+                Size::Fixed(layout::ROW),
             ),
             cell(self.add_start, 90),
             Node::leaf(
                 self.add_captions[1],
                 Size::Fixed(75),
-                Size::Fixed(layout::ROW - 8),
+                Size::Fixed(layout::ROW),
             ),
             cell(self.add_size, 70),
             Node::leaf(
                 self.add_captions[2],
                 Size::Fixed(40),
-                Size::Fixed(layout::ROW - 8),
+                Size::Fixed(layout::ROW),
             ),
             cell(self.add_type, if gpt { 200 } else { 60 }),
         ];
@@ -578,7 +579,7 @@ impl EditorWindow {
         add_row.push(Node::leaf(
             self.add_note,
             Size::Stretch(1),
-            Size::Fixed(layout::ROW - 8),
+            Size::Fixed(layout::ROW),
         ));
         if ui::shown(self.add_boot) {
             add_row.push(cell(self.add_boot, 90));

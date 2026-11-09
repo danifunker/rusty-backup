@@ -12,6 +12,8 @@ mod app;
 #[cfg(windows)]
 mod chd;
 #[cfg(windows)]
+mod darkdraw;
+#[cfg(windows)]
 mod editor;
 #[cfg(windows)]
 mod effects;

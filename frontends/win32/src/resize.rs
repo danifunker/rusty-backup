@@ -366,7 +366,7 @@ impl ResizeWindow {
                 format_size(row.original_size),
                 format_size(row.minimum_size),
             ]
-            .map(|t| ui::label(w, &t));
+            .map(|t| ui::cell_label(w, &t));
             let style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0);
             let mode = ui::child(
                 w,
