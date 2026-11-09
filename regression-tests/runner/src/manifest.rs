@@ -65,7 +65,7 @@ pub struct Meta {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Case {
     /// Stable, globally unique. Renaming one breaks run-to-run comparison,
     /// so treat it as an API.
@@ -98,6 +98,31 @@ pub struct Case {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 
+    // ---- flow tags (FLOWS.md) ----------------------------------------------
+    /// `smoke` or `full`; `--level smoke` runs only smoke cases.
+    #[serde(default)]
+    pub level: Option<String>,
+    /// The `fs` values that count as smoke; empty means every one does.
+    #[serde(default)]
+    pub smoke_fs: Vec<String>,
+    /// Areas of the app this case exercises (`backup`, `inspect`, ...), for `--area`.
+    #[serde(default)]
+    pub area: Vec<String>,
+    /// Filesystem matrix: the case runs once per value, with `{fs}` filled in.
+    #[serde(default)]
+    pub fs: Vec<String>,
+    /// Front-ends the `ui` steps run on; one case per shell.
+    #[serde(default)]
+    pub shells: Vec<String>,
+    /// Rows of docs/capabilities.md this case proves.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Set by matrix expansion: the shell and filesystem this instance runs.
+    #[serde(skip)]
+    pub shell: Option<String>,
+    #[serde(skip)]
+    pub fs_value: Option<String>,
+
     /// Extra environment for every step, e.g. `TZ = "UTC"` so local-time exports hash the same anywhere.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
@@ -113,10 +138,15 @@ pub struct Case {
     pub steps: Vec<Step>,
 }
 
-/// One `rb-cli` invocation plus the assertions that apply to its result.
-#[derive(Debug, Default, Deserialize)]
+/// One `rb-cli` invocation plus the assertions that apply to its result, or a run of `ui` ops.
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct Step {
+    #[serde(default)]
     pub args: Vec<String>,
+
+    /// Front-end ops, run in the case's shell instead of an `rb-cli` invocation.
+    #[serde(default)]
+    pub ui: Vec<UiOp>,
 
     /// Expected process exit code. Values come from `src/cli/exit.rs`:
     /// 0 success, 1 generic failure, 2 usage error, 3 not found,
@@ -167,13 +197,64 @@ pub struct Step {
     pub fsck_clean: bool,
 }
 
-#[derive(Debug, Deserialize)]
+/// One front-end op; exactly one action field is set. FLOWS.md lists them.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiOp {
+    /// Switch to the named screen.
+    pub tab: Option<String>,
+    /// Move the focus to the control labelled this.
+    pub focus: Option<String>,
+    /// Step the focused control's value until it shows this.
+    pub choose: Option<String>,
+    /// Press one named key (`Enter`, `Down`, `Ctrl+K`, `s`).
+    pub key: Option<String>,
+    /// Press these keys in order.
+    pub keys: Option<Vec<String>>,
+    /// Type this text.
+    #[serde(rename = "type")]
+    pub text: Option<String>,
+    /// Clear the focused text field, then type this.
+    pub fill: Option<String>,
+    /// Wait until the screen shows this.
+    pub wait: Option<String>,
+    /// The screen must show this now (after a short settle).
+    pub expect: Option<String>,
+    /// The screen must not show this.
+    pub expect_not: Option<String>,
+    /// Budget for `wait`, `focus` and `choose`.
+    pub timeout_ms: Option<u64>,
+    /// Run only on this shell; a shell-specific step (a TUI-only key, say).
+    pub only: Option<String>,
+}
+
+impl UiOp {
+    pub fn action_count(&self) -> usize {
+        [
+            self.tab.is_some(),
+            self.focus.is_some(),
+            self.choose.is_some(),
+            self.key.is_some(),
+            self.keys.is_some(),
+            self.text.is_some(),
+            self.fill.is_some(),
+            self.wait.is_some(),
+            self.expect.is_some(),
+            self.expect_not.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct JsonEquals {
     pub path: String,
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FileSha {
     pub path: String,
     pub sha256: String,
@@ -236,12 +317,13 @@ fn load_file(path: &Path) -> Result<Manifest, LoadError> {
         message: format!("cannot read: {}", e),
     })?;
 
-    let manifest: Manifest = toml::from_str(&text).map_err(|e| LoadError {
+    let mut manifest: Manifest = toml::from_str(&text).map_err(|e| LoadError {
         path: path.to_path_buf(),
         message: format!("malformed manifest: {}", e),
     })?;
 
     validate(path, &manifest)?;
+    manifest.cases = manifest.cases.iter().flat_map(|c| c.expand()).collect();
     Ok(manifest)
 }
 
@@ -262,6 +344,43 @@ fn validate(path: &Path, m: &Manifest) -> Result<(), LoadError> {
             return Err(LoadError {
                 path: path.to_path_buf(),
                 message: format!("case '{}' has no `args` and no `[[case.step]]`", case.id),
+            });
+        }
+        for (i, st) in case.steps.iter().enumerate() {
+            let bad = if st.args.is_empty() == st.ui.is_empty() {
+                Some("needs exactly one of `args` and `ui`".to_string())
+            } else {
+                st.ui
+                    .iter()
+                    .find(|o| o.action_count() != 1)
+                    .map(|o| format!("ui op {:?} must set exactly one action", o))
+            };
+            if let Some(why) = bad {
+                return Err(LoadError {
+                    path: path.to_path_buf(),
+                    message: format!("case '{}' step {}: {}", case.id, i, why),
+                });
+            }
+        }
+        let has_ui = case.steps.iter().any(|s| !s.ui.is_empty());
+        if has_ui && case.shells.is_empty() {
+            return Err(LoadError {
+                path: path.to_path_buf(),
+                message: format!("case '{}' has `ui` steps but no `shells`", case.id),
+            });
+        }
+        if let Some(l) = &case.level {
+            if l != "smoke" && l != "full" {
+                return Err(LoadError {
+                    path: path.to_path_buf(),
+                    message: format!("case '{}': level must be smoke or full, not '{}'", case.id, l),
+                });
+            }
+        }
+        if let Some(f) = case.smoke_fs.iter().find(|f| !case.fs.contains(f)) {
+            return Err(LoadError {
+                path: path.to_path_buf(),
+                message: format!("case '{}': smoke_fs '{}' is not in fs", case.id, f),
             });
         }
         for pair in case.steps.iter().flat_map(|s| s.files_identical.iter()) {
@@ -291,40 +410,89 @@ impl Case {
                 ..Default::default()
             }]
         } else {
-            self.steps
-                .iter()
-                .map(|s| Step {
-                    args: s.args.clone(),
-                    expect_exit: s.expect_exit,
-                    expect_envelope_ok: s.expect_envelope_ok,
-                    stdout_contains: s.stdout_contains.clone(),
-                    stdout_matches: s.stdout_matches.clone(),
-                    stdout_not_contains: s.stdout_not_contains.clone(),
-                    stderr_contains: s.stderr_contains.clone(),
-                    stderr_not_contains: s.stderr_not_contains.clone(),
-                    stderr_empty: s.stderr_empty,
-                    json_equals: s
-                        .json_equals
-                        .iter()
-                        .map(|j| JsonEquals {
-                            path: j.path.clone(),
-                            value: j.value.clone(),
-                        })
-                        .collect(),
-                    json_exists: s.json_exists.clone(),
-                    files_exist: s.files_exist.clone(),
-                    files_identical: s.files_identical.clone(),
-                    file_sha256: s
-                        .file_sha256
-                        .iter()
-                        .map(|f| FileSha {
-                            path: f.path.clone(),
-                            sha256: f.sha256.clone(),
-                        })
-                        .collect(),
-                    fsck_clean: s.fsck_clean,
-                })
-                .collect()
+            self.steps.clone()
+        }
+    }
+
+    /// The case as it runs: one instance per filesystem and shell, `{fs}` filled in.
+    pub fn expand(&self) -> Vec<Case> {
+        let fss: Vec<Option<&String>> = if self.fs.is_empty() {
+            vec![None]
+        } else {
+            self.fs.iter().map(Some).collect()
+        };
+        let has_ui = self.steps.iter().any(|s| !s.ui.is_empty());
+        let shells: Vec<Option<&String>> = if has_ui {
+            self.shells.iter().map(Some).collect()
+        } else {
+            vec![None]
+        };
+        let mut out = Vec::new();
+        for f in &fss {
+            for sh in &shells {
+                let mut c = self.clone();
+                if let Some(f) = f {
+                    c.id = format!("{}.{}", c.id, f);
+                    let fill = |t: &str| t.replace("{fs}", f);
+                    c.fixture = c.fixture.as_deref().map(fill);
+                    c.description = c.description.as_deref().map(fill);
+                    for st in &mut c.steps {
+                        st.fill(&fill);
+                    }
+                    if c.level.as_deref() == Some("smoke")
+                        && !self.smoke_fs.is_empty()
+                        && !self.smoke_fs.contains(f)
+                    {
+                        c.level = Some("full".to_string());
+                    }
+                    c.fs_value = Some(f.to_string());
+                }
+                if let Some(sh) = sh {
+                    c.id = format!("{}.{}", c.id, sh);
+                    c.shell = Some(sh.to_string());
+                }
+                out.push(c);
+            }
+        }
+        out
+    }
+}
+
+impl Step {
+    fn fill(&mut self, f: &dyn Fn(&str) -> String) {
+        let each = |v: &mut Vec<String>| {
+            for x in v.iter_mut() {
+                *x = f(x);
+            }
+        };
+        each(&mut self.args);
+        each(&mut self.stdout_contains);
+        each(&mut self.stdout_matches);
+        each(&mut self.stdout_not_contains);
+        each(&mut self.files_exist);
+        for pair in &mut self.files_identical {
+            each(pair);
+        }
+        for op in &mut self.ui {
+            for v in [
+                &mut op.tab,
+                &mut op.focus,
+                &mut op.choose,
+                &mut op.key,
+                &mut op.text,
+                &mut op.fill,
+                &mut op.wait,
+                &mut op.expect,
+                &mut op.expect_not,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *v = f(v);
+            }
+            if let Some(ks) = &mut op.keys {
+                each(ks);
+            }
         }
     }
 }

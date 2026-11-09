@@ -38,7 +38,10 @@ fn opening_an_image_previews_it_and_names_the_backup() {
     assert_eq!(ctl.partition_count(), 1);
     assert_eq!(ctl.selected_count(), 1);
     assert!(ctl.name().contains("vol"), "{}", ctl.name());
-    assert!(ctl.take_log().iter().any(|(_, m)| m.contains("Source has 1")));
+    assert!(ctl
+        .take_log()
+        .iter()
+        .any(|(_, m)| m.contains("Source has 1")));
     assert_eq!(ctl.default_destination(), Some(dir.path().to_path_buf()));
 }
 
@@ -70,7 +73,10 @@ fn start_is_refused_until_the_form_is_complete() {
 #[test]
 fn a_missing_image_is_not_found() {
     let mut ctl = controller();
-    open(&mut ctl, PathBuf::from("/nonexistent/rb-backup-test/missing.img"));
+    open(
+        &mut ctl,
+        PathBuf::from("/nonexistent/rb-backup-test/missing.img"),
+    );
     assert_eq!(ctl.validate(), Err("Source not found.".to_string()));
     assert!(ctl.load_error().is_some());
 }

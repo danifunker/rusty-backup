@@ -1,0 +1,51 @@
+# Tier 8: the Backup screen, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.backup"
+description = "Back up from the Backup screen, then prove the backup with rb-cli."
+
+[[case]]
+id = "flow.backup.image-zstd"
+description = "Open a FAT floppy image on the Backup screen, back it up to zstd, restore it with rb-cli and read the file back"
+level = "smoke"
+area = ["backup"]
+shells = ["tui"]
+capabilities = ["backup.source-image", "backup.format", "backup.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { key = "Enter" },
+  { wait = "Choose source image" },
+  { type = "{scratch}/src.img" },
+  { key = "Enter" },
+  { wait = "step 2/3" },
+  { focus = "Output:" },
+  { fill = "{scratch}/bk" },
+  { focus = "Name:" },
+  { fill = "job" },
+  { focus = "Format:" },
+  { choose = "Zstd" },
+  { focus = "[ Start backup ]" },
+  { key = "Enter" },
+  { wait = "complete", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["get", "{scratch}/out.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
