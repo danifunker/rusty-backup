@@ -1,0 +1,30 @@
+# Tier 2 — GitHub issue #98: a Disk Copy 6 (NDIF) image copied without its
+# resource fork. The data fork's uncompressed first chunk puts a real HFS MDB at
+# 1024, so the raw probe opens it, but the catalog behind it is garbage (node
+# size 9). That used to panic, then listed nothing; it must name the lost fork.
+# The same data fork with its `._` sidecar (from the Feb 2000 Legacy Recovery CD)
+# rebuilds and lists.
+
+[meta]
+tier = 2
+group = "ndif.read.issue98"
+description = "An NDIF data fork without its fork says so; with the fork it lists."
+
+[[case]]
+id = "read.ndif.issue98-datafork-only-names-the-fork"
+description = "Tidbits.img with no resource fork errors with the missing-fork hint"
+fixture = "ndif.datafork-only.issue98-tidbits"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 1
+stderr_contains = ["HFS catalog is unreadable (B-tree node size 9)", "without its resource fork"]
+
+[[case]]
+id = "read.ndif.issue98-with-fork-lists"
+description = "The same data fork with its ._ sidecar rebuilds and lists the System 7.1 Tidbits disk"
+fixture = "ndif.adc.issue98-tidbits-with-fork"
+[[case.step]]
+args = ["ls", "{fixture}", "/"]
+expect_exit = 0
+stdout_contains = ["Apple Menu Items", "CloseView", "Scrapbook File"]
+stderr_not_contains = ["CRC"]
