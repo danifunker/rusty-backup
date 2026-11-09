@@ -141,7 +141,6 @@ pub fn path_label(parent: HWND, text: &str) -> HWND {
     )
 }
 
-#[allow(dead_code)] // the screens' text fields, from slice 1 on
 pub fn edit(parent: HWND, id: &str) -> HWND {
     child(
         parent,

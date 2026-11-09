@@ -45,6 +45,7 @@ use crate::expand_image::{self, ExpandImageWindow};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::report::{self, ReportWindow};
+use crate::resize::ResizeWindow;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -113,6 +114,7 @@ struct Shown {
     can_reinspect: bool,
     can_bootable: bool,
     can_expand_image: bool,
+    can_edit_table: bool,
     can_close: bool,
     has_chd: bool,
     can_convert: bool,
@@ -146,6 +148,8 @@ pub struct InspectScreen {
     bootable: HWND,
     chd: HWND,
     expand_image: HWND,
+    resize_btn: HWND,
+    resize: RefCell<Option<Rc<ResizeWindow>>>,
     close: HWND,
     details: HWND,
     bar: HWND,
@@ -205,6 +209,7 @@ impl InspectScreen {
         let bootable = ui::button(page, "Make Bootable...", ids::MAKE_BOOTABLE);
         let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
         let expand_image = ui::button(page, "Expand Image...", ids::EXPAND_IMAGE);
+        let resize_btn = ui::button(page, "Resize Partitions...", ids::RESIZE);
         let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
         let bar_target: Rc<RefCell<Weak<InspectScreen>>> = Rc::default();
@@ -292,6 +297,8 @@ impl InspectScreen {
             bootable,
             chd,
             expand_image,
+            resize_btn,
+            resize: RefCell::default(),
             close,
             details,
             bar,
@@ -331,6 +338,16 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.tick();
+            if d.take_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if !d.is_open() {
+                self.resize.replace(None);
+            }
+        }
         let alto = self.alto.borrow().clone();
         if let Some(d) = alto {
             d.tick();
@@ -340,6 +357,17 @@ impl InspectScreen {
         }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
+    }
+
+    /// Resize Partitions: a dialog with its own controller, on the table read here.
+    fn open_resize(&self) {
+        let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
+        let plan = self.ctrl.borrow().resize_plan();
+        if let (false, Some(plan)) = (busy, plan) {
+            let d = ResizeWindow::open(self.owner, self.notify.clone(), self.host.clone(), plan);
+            d.set_devices(&self.devices.borrow());
+            *self.resize.borrow_mut() = Some(d);
+        }
     }
 
     /// Resize Alto Disk: a dialog with its own controller, on the open image file.
@@ -360,6 +388,10 @@ impl InspectScreen {
     /// The app's device list; a change under the open device closes or re-inspects it.
     pub fn set_devices(&self, devices: &[DiskDevice]) {
         self.ctrl.borrow_mut().reconcile_devices(devices);
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.set_devices(devices);
+        }
         *self.devices.borrow_mut() = devices.to_vec();
     }
 
@@ -368,6 +400,13 @@ impl InspectScreen {
     pub fn running_job(&self) -> Option<&'static str> {
         if let Some(job) = self.ctrl.borrow().running_job() {
             Some(job)
+        } else if self
+            .resize
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_running())
+        {
+            Some("Inspect: Resize")
         } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
             Some("Inspect: Expand HFS")
         } else {
@@ -488,6 +527,7 @@ impl InspectScreen {
             can_reinspect: c.can_reinspect(),
             can_bootable: c.can_make_bootable(),
             can_expand_image: c.can_expand_image(),
+            can_edit_table: c.can_edit_table(),
             can_close: c.can_close(),
             has_chd: c.chd_path().is_some(),
             can_convert: c.convert_source().is_some(),
@@ -521,6 +561,12 @@ impl InspectScreen {
         ui::set_enabled(self.reinspect, s.can_reinspect);
         ui::set_enabled(self.bootable, s.can_bootable);
         ui::set_enabled(self.expand_image, s.can_expand_image);
+        let resizing = self
+            .resize
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_running());
+        ui::set_enabled(self.resize_btn, s.can_edit_table && !resizing);
         ui::set_visible(self.convert_btn, s.can_convert);
         ui::set_visible(self.chd, s.has_chd);
         ui::set_visible(self.close, s.can_close);
@@ -856,6 +902,7 @@ impl InspectScreen {
             Node::button(self.bootable, 120),
             Node::button(self.chd, 80),
             Node::button(self.expand_image, 120),
+            Node::button(self.resize_btn, 140),
             Node::Space(Size::Stretch(1)),
             Node::button(self.close, 80),
         ])]);
@@ -967,6 +1014,9 @@ impl Handler for InspectScreen {
             InspectAction::ChdInfo
         } else if from == self.expand_image {
             self.open_expand_image();
+            return;
+        } else if from == self.resize_btn {
+            self.open_resize();
             return;
         } else if from == self.close {
             InspectAction::Close

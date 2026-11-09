@@ -84,6 +84,29 @@ pub struct LayoutBar {
     pub legend: bool,
 }
 
+impl LayoutBar {
+    /// The bar's segments as Inspect draws them: a colour is a partition, none is free space.
+    pub fn layout_segments(&self) -> Vec<crate::controller::inspect::LayoutSegment> {
+        use crate::controller::inspect::{LayoutSegment, SegmentKind};
+        let each = self.segments.iter().map(|s| LayoutSegment {
+            label: s.label.clone(),
+            fs: s.fs.clone(),
+            size_bytes: s.size_bytes,
+            kind: match s.color {
+                Some(color_index) => SegmentKind::Partition { color_index },
+                None => SegmentKind::Free,
+            },
+            partition: None,
+        });
+        each.collect()
+    }
+
+    /// The bar's total size in bytes, for drawing two bars to one scale.
+    pub fn total_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.size_bytes).sum()
+    }
+}
+
 /// A partition's place on the disk, before the gaps are filled in.
 struct Placed {
     label: String,

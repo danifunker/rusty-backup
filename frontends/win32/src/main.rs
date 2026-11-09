@@ -25,6 +25,8 @@ mod partition_bar;
 #[cfg(windows)]
 mod report;
 #[cfg(windows)]
+mod resize;
+#[cfg(windows)]
 mod sync;
 #[cfg(windows)]
 mod theme;

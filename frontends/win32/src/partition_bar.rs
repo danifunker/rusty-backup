@@ -18,8 +18,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, RegisterClassW, HMENU, WINDOW_EX_STYLE,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetParent, RegisterClassW, HMENU,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_CHILD,
+    WS_VISIBLE,
 };
 
 use crate::layout;
@@ -31,6 +32,9 @@ const LEGEND: i32 = 20;
 
 /// The bar and its legend's height in DIPs.
 pub const HEIGHT: i32 = BAR_HEIGHT as i32 + 6 + LEGEND;
+
+/// The bar alone, without its legend.
+pub const BAR_ONLY: i32 = BAR_HEIGHT as i32;
 
 const DARK_FILLS: [(u8, u8, u8); 8] = [
     (62, 118, 166),
@@ -84,6 +88,9 @@ fn on_partition() -> COLORREF {
 struct State {
     segments: Vec<LayoutSegment>,
     selected: Option<usize>,
+    /// The part of the width the bar spans, so two bars share one scale.
+    scale: f32,
+    legend: bool,
     on_select: Option<Box<dyn Fn(Option<usize>)>>,
 }
 
@@ -132,6 +139,8 @@ pub fn build(parent: HWND, on_select: Box<dyn Fn(Option<usize>)>) -> HWND {
     ui::set_automation_id(hwnd, ids::PARTITION_BAR);
     let s = State {
         on_select: Some(on_select),
+        scale: 1.0,
+        legend: true,
         ..State::default()
     };
     BARS.with(|b| {
@@ -139,6 +148,21 @@ pub fn build(parent: HWND, on_select: Box<dyn Fn(Option<usize>)>) -> HWND {
             .push((hwnd.0 as isize, Rc::new(RefCell::new(s))))
     });
     hwnd
+}
+
+/// Draw across `scale` of the width, with or without the legend line.
+pub fn set_options(hwnd: HWND, scale: f32, legend: bool) {
+    let Some(s) = state(hwnd) else { return };
+    let mut s = s.borrow_mut();
+    let scale = scale.clamp(0.0, 1.0);
+    if s.scale != scale || s.legend != legend {
+        s.scale = scale;
+        s.legend = legend;
+        // SAFETY: invalidating our own window.
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, true);
+        }
+    }
 }
 
 /// Show `segments` with `selected` outlined; repaints only on a change.
@@ -163,14 +187,21 @@ fn paint(hwnd: HWND, s: &State) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        FillRect(hdc, &rc, theme::panel_brush());
+        // The bar sits on a page or in a dialog, and paints its parent's background around it.
+        let parent = GetParent(hwnd).unwrap_or_default();
+        let back = if crate::panel::is_page(parent) {
+            theme::panel_brush()
+        } else {
+            theme::window_brush()
+        };
+        FillRect(hdc, &rc, back);
         let dpi = GetDpiForWindow(hwnd).max(96);
         let bar_h = layout::scale(BAR_HEIGHT as i32, dpi);
         let old_font = SelectObject(hdc, HGDIOBJ(ui::font_at(dpi).0));
         SetBkMode(hdc, TRANSPARENT);
         let widths = segment_widths(
             &s.segments,
-            rc.right as f32,
+            rc.right as f32 * s.scale,
             MIN_SEGMENT_PX * dpi as f32 / 96.0,
         );
         let line = CreatePen(PS_SOLID, 1, theme::colors().disabled);
@@ -224,10 +255,11 @@ fn paint(hwnd: HWND, s: &State) {
         }
         // The legend: a swatch and a name per segment, on one line under the bar.
         let top = bar_h + layout::scale(6, dpi);
+        let segments: &[LayoutSegment] = if s.legend { &s.segments } else { &[] };
         let sw = layout::scale(12, dpi);
         let mut lx = 0;
         SetTextColor(hdc, theme::colors().text);
-        for seg in &s.segments {
+        for seg in segments {
             let brush = CreateSolidBrush(fill(seg.kind));
             let swatch = RECT {
                 left: lx,
@@ -293,7 +325,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 };
                 let widths = segment_widths(
                     &s.segments,
-                    rc.right as f32,
+                    rc.right as f32 * s.scale,
                     MIN_SEGMENT_PX * dpi as f32 / 96.0,
                 );
                 segment_at(&widths, x)

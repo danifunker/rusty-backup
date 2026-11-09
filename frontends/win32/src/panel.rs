@@ -134,6 +134,12 @@ pub fn dialog(owner: HWND, title: &str, w: i32, h: i32) -> HWND {
     }
 }
 
+/// `hwnd` is a tab's page (painted as a screen's body), not a dialog.
+pub fn is_page(hwnd: HWND) -> bool {
+    // SAFETY: a plain read of our own tag.
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PAGE }
+}
+
 /// The panel's client area, for its layout.
 pub fn client(hwnd: HWND) -> (Rect, u32) {
     let mut rc = RECT::default();
