@@ -33,7 +33,7 @@
 //! (after masking the encryption + folder-contains-encrypted bits) mark the
 //! start/end of a folder. The low nibble is the compression method.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use byteorder::{BigEndian, ByteOrder};
 
 use fs_mac::binhex;
@@ -63,6 +63,8 @@ pub enum ForkCodec {
     /// file (in [`ForkInfo::crc32`]) over the resource fork followed by the
     /// data fork, so it's verified once per entry rather than per fork.
     CompactPro { lzh: bool },
+    /// Apple Installer Tome (`super::tome`): stored, InstaCompOne or text blocks; no usable checksum.
+    Tome,
 }
 
 /// One fork (data or resource) of a StuffIt or Compact Pro entry.
@@ -94,6 +96,8 @@ impl ForkInfo {
             ForkCodec::StuffIt => method_name(self.method),
             ForkCodec::CompactPro { lzh: true } => "Compact Pro (LZH+RLE)",
             ForkCodec::CompactPro { lzh: false } => "Compact Pro (RLE)",
+            // Each 64 KiB block picks stored, InstaCompOne or text, so one name covers the fork.
+            ForkCodec::Tome => "Installer Tome",
         }
     }
 }
@@ -433,12 +437,37 @@ pub(crate) fn damage_hint(data: &[u8]) -> &'static str {
     ""
 }
 
+/// Decode a Tome fork; a stream that does not end at its stated length is corrupt.
+fn decompress_tome_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
+    let tf = super::tome::TomeFork {
+        len: fork.uncompressed_len,
+        offset: u32::try_from(fork.offset).context("Tome fork offset past 4 GB")?,
+        compressed_len: fork.compressed_len,
+        checksum: 0,
+    };
+    let d = super::tome::decode_fork(archive, &tf)?;
+    if d.consumed != fork.compressed_len as usize {
+        bail!(
+            "Installer Tome: fork stream ended at {} of {} bytes (corrupt or an unknown variant)",
+            d.consumed,
+            fork.compressed_len
+        );
+    }
+    Ok(d.data)
+}
+
 /// Decompress one fork from the archive bytes, verifying its CRC.
 ///
 /// `archive` is the full file passed to [`parse`] (offsets in [`ForkInfo`] are
 /// absolute within it). Returns an error for encrypted forks and for
 /// compression methods not yet implemented.
 pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
+    // Every caller (viewer, extract, export) comes here, so route the other codecs from here.
+    match fork.codec {
+        ForkCodec::StuffIt => {}
+        ForkCodec::CompactPro { .. } => return super::compactpro::decompress_fork(archive, fork),
+        ForkCodec::Tome => return decompress_tome_fork(archive, fork),
+    }
     if fork.encrypted {
         bail!("StuffIt: encrypted forks are not supported");
     }

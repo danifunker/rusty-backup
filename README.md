@@ -537,9 +537,12 @@ The app has seven tabs:
   Macintosh port — a `.zip` carrying `Mac3` Finder metadata and `XtraStuf.mac/`
   resource forks), and BinHex (`.hqx`) wrappers around any of them. `.bin` and
   `.zip` are content-detected, so a raw `.bin` disk image or a plain
-  disk-image-in-a-zip still opens as a disk image. A MacBinary whose data fork
-  is itself a StuffIt/Compact Pro archive is peeled through to the inner
-  entries.
+  disk-image-in-a-zip still opens as a disk image. Apple Installer Tomes
+  (type `idcp`, the archives on System 7.5 to Mac OS 9 install discs; stored,
+  InstaCompOne and text-coded forks) are content-detected too, so a Tome on
+  a mounted HFS CD or floppy opens straight from the browse view. A MacBinary
+  or BinHex whose data fork is itself a StuffIt/Compact Pro archive or a Tome
+  is peeled through to the inner entries.
   Pick an archive, browse the entry tree (name / type / creator / size /
   codec), tick the entries to keep, and extract to a folder in your choice
   of fork-preserving container — BinHex, MacBinary, AppleDouble, or raw

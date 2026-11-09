@@ -61,6 +61,10 @@ rusty-backup has a working, multi-codec Mac archive decoder family. The pieces:
   - SEA self-extracting — `stuffit::find_sea_archive` scans the app data fork
     for an embedded `SIT!` / `rLau`.
   - Compact Pro `.cpt` — `compactpro::parse`; RLE + optional LZH, CRC-32 checked.
+  - Apple Installer Tome (type `idcp`, creator `kakc`) — `tome::parse` +
+    `tome::decode_fork` via `ForkCodec::Tome`; stored, InstaCompOne and the
+    7-bit text codec, checked by the stream ending at its stated length. See
+    [installer_tome.md](installer_tome.md).
   - MacArc `.mar` — `mar::parse` (stored read/write; LZW + LZ4 frames recognized
     but `bail!` as unsupported).
   - BinHex 4.0 `.hqx` — `src/fs/binhex.rs` (`parse_binhex`, `rle90_decode`).

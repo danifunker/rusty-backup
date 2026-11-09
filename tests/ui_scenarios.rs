@@ -1790,6 +1790,35 @@ impl Target for ArchivesTarget {
                     std::fs::write(&p, bytes).map_err(|e| e.to_string())?;
                     p
                 }
+                "$tome" => {
+                    // An Installer Tome with stored forks, named as on a disc: no extension.
+                    let mut t = vec![0u8; 0x24 + 2 * 0x80];
+                    t[0..4].copy_from_slice(&arc_mac::tome::TOME_MAGIC);
+                    t[0x1b] = 2;
+                    let files: [(&str, &[u8], &[u8]); 2] =
+                        [("Read Me", b"hello", b""), ("Beep", b"", b"snd!")];
+                    for (i, (name, data, rsrc)) in files.into_iter().enumerate() {
+                        let r = 0x24 + i * 0x80;
+                        t[r + 6] = name.len() as u8;
+                        t[r + 7..r + 7 + name.len()].copy_from_slice(name.as_bytes());
+                        t[r + 0x26..r + 0x2e].copy_from_slice(b"TEXTttxt");
+                        for (at, fork) in [(0x3c, data), (0x4c, rsrc)] {
+                            if fork.is_empty() {
+                                continue;
+                            }
+                            let rec = [fork.len() as u32, t.len() as u32, fork.len() as u32 + 4];
+                            for (k, v) in rec.iter().enumerate() {
+                                t[r + at + 4 * k..r + at + 4 * k + 4]
+                                    .copy_from_slice(&v.to_be_bytes());
+                            }
+                            t.extend_from_slice(&[1, 0, 0, 0]);
+                            t.extend_from_slice(fork);
+                        }
+                    }
+                    let p = self.dir.path().join("Installation Tome");
+                    std::fs::write(&p, t).map_err(|e| e.to_string())?;
+                    p
+                }
                 "$sit_hfs" => {
                     use arc_mac::stuffit::{build_archive, StuffItInput, WriteMethod};
                     let disk = fs_mac::hfs::create_blank_hfs(1024 * 1024, 512, "Disk")

@@ -51,13 +51,13 @@ pub struct CreateArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`).
+    /// StuffIt, Compact Pro, MAR or Installer Tome archive (`.sit`, `.sea`, `.cpt`, `.mar`, `.hqx`, or a Tome).
     pub archive: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct ExtractArgs {
-    /// StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`).
+    /// StuffIt, Compact Pro, MAR or Installer Tome archive (`.sit`, `.sea`, `.cpt`, `.mar`, `.hqx`, or a Tome).
     pub archive: PathBuf,
 
     /// Destination directory on the host (created if missing).

@@ -10,14 +10,14 @@ pub mod ids;
 pub mod screen;
 
 pub use crate::controller::browser::{
-    journal_block_class, journal_status, journal_summary, journal_txn_blocks, journal_txn_classes,
-    journal_txn_rows, purpose, validate_entry_name, ApplyPreflight, ApplyReport, ArchiveRead,
-    ArchiveRow, ArchiveSave, ArchiveUse, ArchiveViewer, BrowserPaneAction, BrowserPaneController,
-    CheckSummary, DetailPlacement, DiscSource, DisplayRow, FailedEdit, ForkFormat, ImportChoice,
-    JournalDetail, JournalTone, ListingStyle, MacArchiveKind, NoRecent, OnConflict, PaneProfile,
-    PaneServices, RecentStore, RepairSummary, RowKind, RowLabel, RowTone, SortColumn, SourceKind,
-    StageOutcome, TarChoice, TarPreview, ToolReport, TreeNode, TreeText, VolumeInfo,
-    MAX_CONSECUTIVE_FAILURES,
+    import_prompt, journal_block_class, journal_status, journal_summary, journal_txn_blocks,
+    journal_txn_classes, journal_txn_rows, purpose, validate_entry_name, ApplyPreflight,
+    ApplyReport, ArchiveRead, ArchiveRow, ArchiveSave, ArchiveUse, ArchiveViewer,
+    BrowserPaneAction, BrowserPaneController, CheckSummary, DetailPlacement, DiscSource,
+    DisplayRow, FailedEdit, ForkFormat, ImportChoice, ImportPrompt, JournalDetail, JournalTone,
+    ListingStyle, MacArchiveKind, NoRecent, OnConflict, PaneProfile, PaneServices, RecentStore,
+    RepairSummary, RowKind, RowLabel, RowTone, SortColumn, SourceKind, StageOutcome, TarChoice,
+    TarPreview, ToolReport, TreeNode, TreeText, VolumeInfo, MAX_CONSECUTIVE_FAILURES,
 };
 pub use crate::controller::browser::{metadata, pane, rows};
 pub use screen::{

@@ -78,6 +78,9 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
             // the decoded forks (method = 0 / store, fork bytes laid
             // out back-to-back in the returned buffer).
             let bh = binhex::parse_binhex(&raw)?;
+            if super::tome::is_tome(&bh.data_fork) {
+                return parse_tome(bh.data_fork);
+            }
             Ok(synth_single_file_archive(bh))
         }
         Some(MacArchiveKind::BinHexOverSit) | Some(MacArchiveKind::BinHexOverSea) => {
@@ -97,6 +100,7 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
         }
         Some(MacArchiveKind::Mar) => super::mar::parse(&raw),
         Some(MacArchiveKind::MacZip) => super::maczip::parse(&raw),
+        Some(MacArchiveKind::InstallerTome) => parse_tome(raw),
         Some(MacArchiveKind::MacBinary) => {
             let mb = super::macbinary::parse(&raw)?;
             // Peel: a MacBinary's data fork is frequently itself an archive we
@@ -111,6 +115,7 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
                     let archive = super::compactpro::parse(&mb.data_fork)?;
                     Ok((mb.data_fork, archive))
                 }
+                Some(MacArchiveKind::InstallerTome) => parse_tome(mb.data_fork),
                 // Plain Mac file (app, document, wrapped disk image): one entry.
                 // A wrapped disk image is surfaced via detect_mountable_image on
                 // the single entry's data fork, exactly like other archives.
@@ -128,7 +133,7 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
                      PPMd-variant-G codec). Use `unar` for now."
                 );
             }
-            bail!("not a recognized Mac archive (BinHex / StuffIt / SEA)");
+            bail!("not a recognized Mac archive (BinHex / StuffIt / SEA / Installer Tome)");
         }
     }
 }
@@ -141,6 +146,43 @@ fn parse_sit_family(bytes: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
         stuffit::parse(&bytes)?
     } else {
         bail!("not a recognized StuffIt archive (classic SIT! / StuffIt 5)");
+    };
+    Ok((bytes, archive))
+}
+
+/// An Installer Tome's records as a flat archive whose forks decode through [`stuffit::ForkCodec::Tome`].
+fn parse_tome(bytes: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
+    let fork = |f: &super::tome::TomeFork| {
+        (!f.is_empty()).then(|| stuffit::ForkInfo {
+            method: 0,
+            codec: stuffit::ForkCodec::Tome,
+            encrypted: false,
+            uncompressed_len: f.len,
+            compressed_len: f.compressed_len,
+            crc: 0,
+            crc32: 0,
+            offset: u64::from(f.offset),
+        })
+    };
+    let entries = super::tome::parse(&bytes)?
+        .iter()
+        .map(|e| StuffItEntry {
+            path: vec![e.name.clone()],
+            name: e.name.clone(),
+            is_dir: false,
+            type_code: e.type_code,
+            creator_code: e.creator_code,
+            finder_flags: e.finder_flags,
+            create_date: e.create_date,
+            mod_date: e.mod_date,
+            data: fork(&e.data),
+            rsrc: fork(&e.rsrc),
+        })
+        .collect();
+    let archive = StuffItArchive {
+        entries,
+        truncated: None,
+        damage: Vec::new(),
     };
     Ok((bytes, archive))
 }
@@ -433,21 +475,13 @@ fn decompress_named(
     log: &mut impl FnMut(String),
 ) -> Result<Vec<u8>, ()> {
     match fork {
-        Some(f) if f.uncompressed_len > 0 => {
-            let result = match f.codec {
-                stuffit::ForkCodec::StuffIt => stuffit::decompress_fork(bytes, f),
-                stuffit::ForkCodec::CompactPro { .. } => {
-                    super::compactpro::decompress_fork(bytes, f)
-                }
-            };
-            match result {
-                Ok(d) => Ok(d),
-                Err(err) => {
-                    log(format!("Skipped {}: {err}", e.display_path()));
-                    Err(())
-                }
+        Some(f) if f.uncompressed_len > 0 => match stuffit::decompress_fork(bytes, f) {
+            Ok(d) => Ok(d),
+            Err(err) => {
+                log(format!("Skipped {}: {err}", e.display_path()));
+                Err(())
             }
-        }
+        },
         _ => Ok(Vec::new()),
     }
 }
@@ -896,5 +930,34 @@ mod tests {
             msg.contains("not a recognized Mac archive"),
             "expected magic-driven error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn an_installer_tome_opens_bare_and_inside_macbinary() {
+        let tome = crate::tome::build_stored_tome(&[
+            ("Read Me", *b"ttro", *b"ttxt", b"SimpleText", b""),
+            ("Beep", *b"sfil", *b"movr", b"", b"snd resource"),
+        ]);
+        let wrapped = resource_fork::build_macbinary(
+            "Installation Tome",
+            b"idcp",
+            b"kakc",
+            resource_fork::MacFileDates::default(),
+            &tome,
+            b"",
+        );
+        for raw in [tome.clone(), wrapped] {
+            let (bytes, archive) = open_bytes(raw).unwrap();
+            let names: Vec<_> = archive.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["Read Me", "Beep"]);
+            let readme = &archive.entries[0];
+            assert!(readme.rsrc.is_none());
+            let data = stuffit::decompress_fork(&bytes, readme.data.as_ref().unwrap()).unwrap();
+            assert_eq!(data, b"SimpleText");
+            let beep = &archive.entries[1];
+            assert_eq!(&beep.type_code, b"sfil");
+            let rsrc = stuffit::decompress_fork(&bytes, beep.rsrc.as_ref().unwrap()).unwrap();
+            assert_eq!(rsrc, b"snd resource");
+        }
     }
 }

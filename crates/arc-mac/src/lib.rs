@@ -11,6 +11,8 @@
 //!   commonly distributed BinHex-wrapped.
 //! - [`mar`] — Hampa Hug's `mar` archive (`.mar`): a single Mac file or folder
 //!   tree, read + written (stored).
+//! - [`tome`] — Apple Installer Tome (type `idcp`, creator `kakc`): read only, stored,
+//!   InstaCompOne and the text codec.
 //!
 //! See `docs/native_mac_archives.md` in rusty-backup for the format references and roadmap.
 //!
@@ -37,3 +39,4 @@ pub mod stuffit_huffman;
 pub mod stuffit_lzah;
 pub mod stuffit_lzh;
 pub mod stuffit_lzw;
+pub mod tome;

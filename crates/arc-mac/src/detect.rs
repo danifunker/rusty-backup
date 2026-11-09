@@ -69,6 +69,8 @@ pub enum MacArchiveKind {
     /// Content-detected (presence of a `Mac3` field), so a plain
     /// disk-image-in-a-zip stays a disk image.
     MacZip,
+    /// An Apple Installer Tome (type `idcp`, creator `kakc`): the flat file list an Installer reads.
+    InstallerTome,
 }
 
 impl MacArchiveKind {
@@ -88,6 +90,7 @@ impl MacArchiveKind {
             MacArchiveKind::Mar => "MAR",
             MacArchiveKind::MacBinary => "MacBinary",
             MacArchiveKind::MacZip => "MacZip",
+            MacArchiveKind::InstallerTome => "Installer Tome",
         }
     }
 
@@ -162,6 +165,10 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
     }
     if super::mar::is_mar(bytes) {
         return Some(MacArchiveKind::Mar);
+    }
+    // Four bytes of magic, so is_tome also requires the record table to fit.
+    if super::tome::is_tome(bytes) {
+        return Some(MacArchiveKind::InstallerTome);
     }
     // MacBinary after the strong-magic formats (it has no magic of its own and
     // uses a confidence heuristic), but before the broad SEA signature scan so
@@ -479,5 +486,20 @@ mod tests {
         assert_eq!(detect_mac_archive(&mar), Some(MacArchiveKind::Mar));
         assert!(!MacArchiveKind::Mar.is_binhex_wrapped());
         assert_eq!(MacArchiveKind::Mar.label(), "MAR");
+    }
+
+    #[test]
+    fn detects_an_installer_tome_only_when_its_table_fits() {
+        let tome = crate::tome::build_stored_tome(&[("Beep", *b"sfil", *b"movr", b"", b"snd")]);
+        assert_eq!(
+            detect_mac_archive(&tome),
+            Some(MacArchiveKind::InstallerTome)
+        );
+        assert!(MacArchiveKind::InstallerTome.is_multi_file());
+        assert_eq!(
+            detect_mac_archive(&tome[..0x30]),
+            None,
+            "magic alone is not enough"
+        );
     }
 }

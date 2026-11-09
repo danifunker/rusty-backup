@@ -260,7 +260,9 @@ fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
 pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
     let lzh = match fork.codec {
         ForkCodec::CompactPro { lzh } => lzh,
-        ForkCodec::StuffIt => bail!("compactpro::decompress_fork called on a StuffIt fork"),
+        ForkCodec::StuffIt | ForkCodec::Tome => {
+            bail!("compactpro::decompress_fork called on a non-Compact Pro fork")
+        }
     };
     if fork.encrypted {
         bail!("Compact Pro: encrypted entries are not supported");

@@ -1,0 +1,22 @@
+# Archives: an Apple Installer Tome with no extension opens by content and extracts both forks.
+name = "Archives: open an Installer Tome, extract it"
+vm = "archives"
+
+[[step]]
+action = "Open"
+arg = "$tome"
+settle = true
+expect = { loaded = true, files = 2, selected = 2, error = "" }
+
+[[step]]
+action = "SetFormat"
+arg = "raw"
+
+[[step]]
+action = "ExtractSelected"
+effects = ["PickFolder"]
+
+[[step]]
+action = "Pick"
+settle = true
+expect = { extracted = 2, outputs = "Beep,Beep.rsrc,Read Me", log = "~Extraction complete: 2 files" }

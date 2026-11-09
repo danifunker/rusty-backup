@@ -302,7 +302,7 @@ Usage: extract [OPTIONS] <ARCHIVE> <DEST>
 
 **Arguments**
 
-- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+- `<ARCHIVE>` — StuffIt, Compact Pro, MAR or Installer Tome archive (`.sit`, `.sea`, `.cpt`, `.mar`, `.hqx`, or a Tome)
 - `<DEST>` — Destination directory on the host (created if missing)
 
 **Options**
@@ -319,7 +319,7 @@ Usage: list <ARCHIVE>
 
 **Arguments**
 
-- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+- `<ARCHIVE>` — StuffIt, Compact Pro, MAR or Installer Tome archive (`.sit`, `.sea`, `.cpt`, `.mar`, `.hqx`, or a Tome)
 
 ### `backup`
 

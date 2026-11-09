@@ -226,6 +226,56 @@ fn a_picked_binhex_expands_on_an_hfs_volume_and_stays_plain_elsewhere() {
     );
 }
 
+/// An Installer Tome holding one file whose data fork is stored (block type 1).
+fn stored_tome(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut t = vec![0u8; 0x24 + 0x80];
+    t[0..4].copy_from_slice(&arc_mac::tome::TOME_MAGIC);
+    t[0x1b] = 1;
+    let r = 0x24;
+    t[r + 6] = name.len() as u8;
+    t[r + 7..r + 7 + name.len()].copy_from_slice(name.as_bytes());
+    t[r + 0x26..r + 0x2e].copy_from_slice(b"TEXTttxt");
+    let fork = [data.len() as u32, t.len() as u32, data.len() as u32 + 4, 0];
+    for (k, v) in fork.iter().enumerate() {
+        t[r + 0x3c + 4 * k..r + 0x40 + 4 * k].copy_from_slice(&v.to_be_bytes());
+    }
+    t.extend_from_slice(&[1, 0, 0, 0]);
+    t.extend_from_slice(data);
+    t
+}
+
+#[test]
+fn a_picked_installer_tome_with_no_extension_expands_on_an_hfs_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let tome = dir.path().join("Installation Tome");
+    std::fs::write(&tome, stored_tome("Read Me", b"hello")).unwrap();
+    let img = dir.path().join("vol.hfv");
+    let bytes = fs_mac::hfs::create_blank_hfs(4 * 1024 * 1024, 512, "T").unwrap();
+    std::fs::write(&img, bytes).unwrap();
+    let mut ctl = inspect(&img);
+    pane(&mut ctl, A::AddPicked(vec![tome]));
+    settle(&mut ctl);
+    let (name, kind) = ctl.pane(Side::Left).pending_import().expect("asks first");
+    assert_eq!(kind, MacArchiveKind::InstallerTome);
+    let prompt = crate::controller::browser::import_prompt(&name, kind);
+    assert_eq!(
+        (prompt.title, prompt.expand, prompt.convert_only),
+        ("Expand archive?", "Expand", None)
+    );
+    assert_eq!(
+        prompt.intro,
+        "Installation Tome is an Installer Tome archive."
+    );
+    pane(&mut ctl, A::ChooseImport(ImportChoice::Expand));
+    settle(&mut ctl);
+    assert_eq!(notice(&mut ctl), "Imported contents of Installation Tome");
+    let adds = ctl.pane(Side::Left).queue.pending_adds_for("/");
+    assert_eq!(
+        adds.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+        ["Read Me"]
+    );
+}
+
 #[test]
 fn the_tree_listing_saves_to_a_picked_file_in_a_job() {
     let dir = tempfile::tempdir().unwrap();

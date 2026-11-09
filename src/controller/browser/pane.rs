@@ -27,7 +27,9 @@ pub use crate::model::archive_import::{ArchiveRow, TarPreview};
 pub use crate::model::commander_ops::{ApplyPreflight, FailedEdit, MAX_CONSECUTIVE_FAILURES};
 pub use crate::model::dir_listing::SortColumn;
 pub use crate::model::text_edit::{LineEnding, TextEncoding, TextShape};
-pub use archives::{ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice, TarChoice};
+pub use archives::{
+    import_prompt, ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice, ImportPrompt, TarChoice,
+};
 pub use edits::{validate_entry_name, ApplyReport, CursorDetail, StageOutcome};
 pub use labels::{RowLabel, RowTone};
 pub use remote::validate_remote_addr;

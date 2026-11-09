@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, is_known_prodos_type, preview_bytes, ArchiveUse, BrowseSession, BrowserPaneAction,
-    CommanderAction, CommanderController, DiscSource, DisplayRow, ExportFormat, ExtractOptions,
-    FileEntry, ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind,
-    ModeAction, PaneProfile, PaneServices, ProdosExportMode, ResourceForkMode, RowKind, RowTone,
-    Side, Snapshot, TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
+    format_size, import_prompt, is_known_prodos_type, preview_bytes, ArchiveUse, BrowseSession,
+    BrowserPaneAction, CommanderAction, CommanderController, DiscSource, DisplayRow, ExportFormat,
+    ExtractOptions, FileEntry, ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle,
+    MacArchiveKind, ModeAction, PaneProfile, PaneServices, ProdosExportMode, ResourceForkMode,
+    RowKind, RowTone, Side, Snapshot, TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
     PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
@@ -2072,55 +2072,21 @@ impl BrowseView {
         let Some((filename, kind)) = self.ctl.pane(Side::Left).pending_import() else {
             return;
         };
-        let kind_label = kind.label();
+        let prompt = import_prompt(&filename, kind);
         let mut choice: Option<ImportChoice> = None;
-        // A single BinHex converts; an archive expands; BinHex over an archive does either.
-        let (title, body, expand) = match kind {
-            MacArchiveKind::BinHexSingleFile => (
-                "Convert HQX file?",
-                format!("Would you like to convert {filename} to binary?"),
-                "Convert",
-            ),
-            MacArchiveKind::BinHexOverSit
-            | MacArchiveKind::BinHexOverSea
-            | MacArchiveKind::BinHexOverCompactPro => (
-                "Convert and/or expand?",
-                format!(
-                    "Would you like to convert {filename} to binary and/or expand the contents?"
-                ),
-                "Convert and expand",
-            ),
-            MacArchiveKind::Sit
-            | MacArchiveKind::Sit5
-            | MacArchiveKind::Sea
-            | MacArchiveKind::CompactPro
-            | MacArchiveKind::Mar
-            | MacArchiveKind::MacBinary
-            | MacArchiveKind::MacZip => (
-                "Expand archive?",
-                format!("Would you like to expand the contents of {filename}?"),
-                "Expand",
-            ),
-        };
-        let convert_only = match kind {
-            MacArchiveKind::BinHexOverSea => Some("Convert only (.sea lands here)"),
-            MacArchiveKind::BinHexOverCompactPro => Some("Convert only (inner archive lands here)"),
-            MacArchiveKind::BinHexOverSit => Some("Convert only (.sit lands here)"),
-            _ => None,
-        };
-        egui::Window::new(title)
+        egui::Window::new(prompt.title)
             .id(egui::Id::unique("archive_import_dialog"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
-                ui.label(format!("{filename} is a {kind_label} archive."));
+                ui.label(&prompt.intro);
                 ui.add_space(4.0);
-                ui.label(body);
+                ui.label(&prompt.question);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .button(expand)
+                        .button(prompt.expand)
                         .on_hover_text(
                             "Decode the archive and add each enclosed file to this directory \
                              (resource forks preserved on HFS/HFS+).",
@@ -2129,7 +2095,7 @@ impl BrowseView {
                     {
                         choice = Some(ImportChoice::Expand);
                     }
-                    if let Some(label) = convert_only {
+                    if let Some(label) = prompt.convert_only {
                         if ui
                             .button(label)
                             .on_hover_text(

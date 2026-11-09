@@ -34,6 +34,66 @@ pub enum ImportChoice {
     Cancel,
 }
 
+/// The words of the "what to do with this archive" question; one per archive kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPrompt {
+    pub title: &'static str,
+    /// "NAME is a KIND archive."
+    pub intro: String,
+    pub question: String,
+    /// The `Expand` button's label.
+    pub expand: &'static str,
+    /// The `ConvertOnly` button's label, offered only for BinHex over an archive.
+    pub convert_only: Option<&'static str>,
+}
+
+/// The import question for the archive `name` of `kind`; every shell shows these words.
+pub fn import_prompt(name: &str, kind: MacArchiveKind) -> ImportPrompt {
+    use MacArchiveKind as K;
+    // A single BinHex converts; an archive expands; BinHex over an archive does either.
+    let (title, question, expand) = match kind {
+        K::BinHexSingleFile => (
+            "Convert HQX file?",
+            format!("Would you like to convert {name} to binary?"),
+            "Convert",
+        ),
+        K::BinHexOverSit | K::BinHexOverSea | K::BinHexOverCompactPro => (
+            "Convert and/or expand?",
+            format!("Would you like to convert {name} to binary and/or expand the contents?"),
+            "Convert and expand",
+        ),
+        K::Sit
+        | K::Sit5
+        | K::Sea
+        | K::CompactPro
+        | K::Mar
+        | K::MacBinary
+        | K::MacZip
+        | K::InstallerTome => (
+            "Expand archive?",
+            format!("Would you like to expand the contents of {name}?"),
+            "Expand",
+        ),
+    };
+    let convert_only = match kind {
+        K::BinHexOverSea => Some("Convert only (.sea lands here)"),
+        K::BinHexOverCompactPro => Some("Convert only (inner archive lands here)"),
+        K::BinHexOverSit => Some("Convert only (.sit lands here)"),
+        _ => None,
+    };
+    ImportPrompt {
+        title,
+        intro: {
+            let label = kind.label();
+            let an = matches!(label.chars().next(), Some('A' | 'E' | 'I' | 'O' | 'U'));
+            format!("{name} is {} {label} archive.", if an { "an" } else { "a" })
+        },
+        question,
+        expand,
+        convert_only,
+    }
+}
+
 /// How to bring in a picked tar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TarChoice {

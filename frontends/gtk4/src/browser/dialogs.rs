@@ -15,12 +15,13 @@ use rusty_backup::controller::browser::metadata::known_type_creators;
 use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::browser::{MetadataFields, MetadataForm};
 use rusty_backup::controller::commander::{
-    format_size, journal_status, journal_summary, journal_txn_blocks, journal_txn_rows,
-    ApplyPreflight, ApplyReport, ArchiveSave, ArchiveViewer, BrowserPaneAction as P, BudgetAction,
-    BudgetForm, BudgetMode, ChecksumRow, CommanderAction as A, CommanderController, ForkFormat,
-    HashAlgo, ImportChoice, JournalDetail, JournalTone, LineEnding, MacArchiveKind, ModeAction,
-    OnConflict, Side, SkippedReport, TarChoice, TarPreview, TextShape, ToolReport, TreeText,
-    UnsavedChoice, MAX_CONSECUTIVE_FAILURES,
+    format_size, import_prompt, journal_status, journal_summary, journal_txn_blocks,
+    journal_txn_rows, ApplyPreflight, ApplyReport, ArchiveSave, ArchiveViewer,
+    BrowserPaneAction as P, BudgetAction, BudgetForm, BudgetMode, ChecksumRow,
+    CommanderAction as A, CommanderController, ForkFormat, HashAlgo, ImportChoice, JournalDetail,
+    JournalTone, LineEnding, MacArchiveKind, ModeAction, OnConflict, Side, SkippedReport,
+    TarChoice, TarPreview, TextShape, ToolReport, TreeText, UnsavedChoice,
+    MAX_CONSECUTIVE_FAILURES,
 };
 use rusty_backup::controller::keys::{Key, Mods};
 
@@ -1118,55 +1119,21 @@ fn edits_dialog(on: &PaneDialogs, lines: &[String], busy: bool) -> adw::Dialog {
 
 fn import_dialog(on: &PaneDialogs, name: &str, kind: MacArchiveKind) -> adw::Dialog {
     let (side, send) = (on.side, &on.send);
-    // A single BinHex converts; an archive expands; BinHex over an archive does either.
-    let (title, text, expand) = match kind {
-        MacArchiveKind::BinHexSingleFile => (
-            "Convert HQX file?",
-            format!("Would you like to convert {name} to binary?"),
-            "Convert",
-        ),
-        MacArchiveKind::BinHexOverSit
-        | MacArchiveKind::BinHexOverSea
-        | MacArchiveKind::BinHexOverCompactPro => (
-            "Convert and/or expand?",
-            format!("Would you like to convert {name} to binary and/or expand the contents?"),
-            "Convert and expand",
-        ),
-        MacArchiveKind::Sit
-        | MacArchiveKind::Sit5
-        | MacArchiveKind::Sea
-        | MacArchiveKind::CompactPro
-        | MacArchiveKind::Mar
-        | MacArchiveKind::MacBinary
-        | MacArchiveKind::MacZip => (
-            "Expand archive?",
-            format!("Would you like to expand the contents of {name}?"),
-            "Expand",
-        ),
-    };
-    let convert_only = match kind {
-        MacArchiveKind::BinHexOverSea => Some("Convert only (.sea lands here)"),
-        MacArchiveKind::BinHexOverCompactPro => Some("Convert only (inner archive lands here)"),
-        MacArchiveKind::BinHexOverSit => Some("Convert only (.sit lands here)"),
-        MacArchiveKind::BinHexSingleFile
-        | MacArchiveKind::Sit
-        | MacArchiveKind::Sit5
-        | MacArchiveKind::Sea
-        | MacArchiveKind::CompactPro
-        | MacArchiveKind::Mar
-        | MacArchiveKind::MacBinary
-        | MacArchiveKind::MacZip => None,
-    };
+    let prompt = import_prompt(name, kind);
     let body = page();
-    body.append(&wrapped(&format!("{name} is a {} archive.", kind.label())));
-    body.append(&wrapped(&text));
+    body.append(&wrapped(&prompt.intro));
+    body.append(&wrapped(&prompt.question));
     let choose = |c| pane(side, P::ChooseImport(c));
-    let mut list = vec![(expand, choose(ImportChoice::Expand))];
-    list.extend(convert_only.map(|l| (l, choose(ImportChoice::ConvertOnly))));
+    let mut list = vec![(prompt.expand, choose(ImportChoice::Expand))];
+    list.extend(
+        prompt
+            .convert_only
+            .map(|l| (l, choose(ImportChoice::ConvertOnly))),
+    );
     list.push(("Add as-is", choose(ImportChoice::AsIs)));
     list.push(("Cancel", choose(ImportChoice::Cancel)));
     body.append(&buttons(send, &list));
-    window(title, 520, -1, &body)
+    window(prompt.title, 520, -1, &body)
 }
 
 fn fork_dropdown(on: &PaneDialogs, current: ForkFormat, viewer: bool) -> gtk::DropDown {
