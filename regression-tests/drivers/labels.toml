@@ -10,6 +10,10 @@
 #
 # Two shells naming one control differently is label drift; once labels come from the
 # controllers this table shrinks to nothing. AppKit and Win32 will use the id directly.
+# `[all]` holds what every shell shows the same (controller messages): not drift.
+
+[all]
+"expand_hfs.done" = "Expand complete."
 
 [tui]
 "backup.open_image" = { key = "o" }
@@ -29,6 +33,11 @@
 "commander.left.open_folder" = { key = "Tab Ctrl+D" }
 "commander.copy_to_right" = { key = "F6" }
 "commander.right.apply" = { key = "Tab F10" }
+"inspect.open_image" = { key = "o" }
+"expand_hfs.open" = { key = "H" }
+"expand_hfs.target_size" = "Target size MiB:"
+"expand_hfs.save_as" = "Output file:"
+"expand_hfs.expand" = "[ Expand ]"
 
 [gtk]
 "backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
@@ -48,3 +57,8 @@
 "commander.left.open_folder" = { label = "Open Local Folder...", via = "Open image, backup, or folder..." }
 "commander.copy_to_right" = "Copy"
 "commander.right.apply" = "Apply (1)"
+"inspect.open_image" = { label = "Open File...", via = "Select a device or image..." }
+"expand_hfs.open" = "Expand/Export..."
+"expand_hfs.target_size" = "Target size (MiB):"
+"expand_hfs.save_as" = "Save As..."
+"expand_hfs.expand" = "Expand"

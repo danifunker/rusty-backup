@@ -200,6 +200,7 @@ fn control(controls: &Controls, shell: &str, name: &str) -> Control {
     controls
         .get(shell)
         .and_then(|m| m.get(name))
+        .or_else(|| controls.get("all").and_then(|m| m.get(name)))
         .cloned()
         .unwrap_or_else(|| Control {
             label: Some(name.to_string()),

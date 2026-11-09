@@ -24,7 +24,7 @@ from gi.repository import Atspi  # noqa: E402
 
 BUTTON_ROLES = ("push button", "button")
 COMBO_ROLES = ("combo box",)
-ENTRY_ROLES = ("text", "entry", "password text")
+ENTRY_ROLES = ("text", "entry", "password text", "spin button")
 PICKS = ""
 APP = None
 WINDOW = ""
@@ -357,6 +357,13 @@ def fill(n, text, pick=None):
             if role_of(c) in ENTRY_ROLES:
                 target = c
                 break
+    if role_of(target) == "spin button":
+        # Its Value interface sets the number; a click to commit typed text can land on "-".
+        val = target.get_value_iface()
+        if val is not None and val.set_current_value(float(text)):
+            if wait_until(lambda: abs(val.get_current_value() - float(text)) < 1e-6, 2):
+                return
+        raise Fail(f"spin button set to {text}", visible_text())
     et = target.get_editable_text_iface() if target else None
     if et is not None and et.set_text_contents(text):
         time.sleep(0.3)
@@ -365,6 +372,21 @@ def fill(n, text, pick=None):
     xdo("key", "ctrl+a")
     xdo("type", "--delay", "5", text)
     time.sleep(0.3)
+
+
+def field_beside(label):
+    """The unnamed field a caption labels: its next sibling that takes input."""
+    parent = label.get_parent()
+    if parent is None:
+        return None
+    seen = False
+    for i in range(parent.get_child_count()):
+        c = parent.get_child_at_index(i)
+        if c == label:
+            seen = True
+        elif seen and role_of(c) in ENTRY_ROLES + COMBO_ROLES + ("switch", "check box"):
+            return c
+    return None
 
 
 def wait_until(pred, secs):
@@ -384,6 +406,8 @@ def run(op):
         activate(find(arg))
     elif kind == "focus":
         CURRENT = find(arg, nth=op.get("nth", 0))
+        if role_of(CURRENT) == "label":
+            CURRENT = field_beside(CURRENT) or CURRENT
         if role_of(CURRENT) in ROW_ROLES and row_of(CURRENT) is None:
             click(CURRENT)  # select a row in a list or table; popover rows are walked instead
     elif kind == "choose":
@@ -439,7 +463,7 @@ def run(op):
         out = []
 
         def walk(n, depth):
-            if n is None or depth > 6 or len(out) > 200:
+            if n is None or depth > 14 or len(out) > 300:
                 return
             flags = [Atspi.StateType(st).value_nick for st in n.get_state_set().get_states()
                      if Atspi.StateType(st).value_nick in ("showing", "focused", "selected",
