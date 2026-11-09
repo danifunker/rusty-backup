@@ -1,8 +1,10 @@
 # Navigation: from tabs to "open a thing, then act on it"
 
-Proposal, drafted 2026-11-09 on `win32-shell` while the Win32 shell had only its skeleton and a
-first pass of Inspect. Nothing here is decided; the questions at the end are the user's. Under D8
-whatever is decided applies to every shell, so the change belongs in the controllers.
+**Not taken (2026-11-09).** The user chose a lighter change: keep the screens and switch them
+with an icon toolbar (decision D9 in [native_frontends_plan.md](native_frontends_plan.md)). The
+four layouts compared were A, today's tabs; B, a grouped sidebar; C, a start page with task
+cards; D, an icon toolbar. This "open a thing" redesign stays here as a record of the hand-off
+problems it would solve.
 
 ## Why the tabs are in question
 

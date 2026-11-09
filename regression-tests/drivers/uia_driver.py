@@ -220,9 +220,9 @@ def run(op):
     ident = op.get("id", arg)
     limit = op.get("timeout_ms", 30000) / 1000.0
     if kind == "tab":
-        tab = find(arg, arg)
-        pattern(tab, U.UIA_SelectionItemPatternId, U.IUIAutomationSelectionItemPattern).Select()
-        time.sleep(0.3)
+        # A screen is a button on the screen toolbar (D9), found by its label.
+        activate(find(arg, arg))
+        time.sleep(0.2)
     elif kind == "focus":
         CURRENT = find(ident, arg, nth=op.get("nth", 0))
         try:

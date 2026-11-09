@@ -10,29 +10,33 @@ use rusty_backup::controller::app::{
 };
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     EM_GETFIRSTVISIBLELINE, EM_LINESCROLL, EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT,
-    EM_SETSEL, NMHDR, TCIF_TEXT, TCITEMW, TCM_ADJUSTRECT, TCM_GETCURSEL, TCM_INSERTITEMW,
-    TCM_SETCURSEL, TCN_SELCHANGE, TCS_FOCUSNEVER,
+    EM_SETSEL,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, EnumChildWindows, GetClientRect, LoadCursorW,
     LoadIconW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowPos, BM_GETCHECK,
     BM_SETCHECK, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_READONLY, HMENU, IDC_ARROW, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_NOTIFY,
-    WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
+    ES_READONLY, HMENU, IDC_ARROW, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_SIZE, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VSCROLL,
 };
 
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
 use crate::sync::SyncGuard;
+use crate::toolbar;
+
+/// The screen switcher's command ids, in `AppTab::ALL` order, and Commander's.
+const SCREEN_CMD: i32 = 100;
+const COMMANDER_CMD: i32 = 200;
 use crate::ui;
 use crate::wake::{Win32Wake, WM_APP_JOB};
 
@@ -48,7 +52,8 @@ enum Part {
     BannerText,
     ViewRelease,
     Dismiss,
-    Tabs,
+    /// The screen switcher (D9).
+    Screens,
     Status,
     LogCopy,
     LogClear,
@@ -177,12 +182,26 @@ impl App {
             parts.push((p, h));
             h
         };
+        let screens: Vec<(i32, &str, &str)> = AppTab::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (SCREEN_CMD + i as i32, t.label(), t.icon()))
+            .collect();
+        add(
+            Part::Screens,
+            toolbar::build(window, "app.screens", &screens, true),
+        );
         let commander = add(
             Part::Commander,
-            ui::button(window, "Commander Mode", ids::COMMANDER),
+            toolbar::build(
+                window,
+                ids::COMMANDER,
+                &[(COMMANDER_CMD, "Commander", "commander")],
+                false,
+            ),
         );
         // Commander arrives in slice 3 and Settings in 7b; until then their buttons are shown but off.
-        ui::set_enabled(commander, false);
+        toolbar::enable(commander, COMMANDER_CMD, false);
         add(
             Part::CloseBackup,
             ui::button(window, "Close Backup", ids::CLOSE_BACKUP),
@@ -219,34 +238,6 @@ impl App {
             Part::Dismiss,
             ui::button(window, "Dismiss update notification", ids::UPDATE_DISMISS),
         );
-        let tabs = add(
-            Part::Tabs,
-            ui::child(
-                window,
-                w!("SysTabControl32"),
-                "",
-                WINDOW_STYLE(TCS_FOCUSNEVER | WS_TABSTOP.0),
-                WINDOW_EX_STYLE(0),
-                "app.tabs",
-            ),
-        );
-        for (i, tab) in AppTab::ALL.iter().enumerate() {
-            let mut text = ui::wide(tab.label());
-            let item = TCITEMW {
-                mask: TCIF_TEXT,
-                pszText: PWSTR(text.as_mut_ptr()),
-                ..Default::default()
-            };
-            // SAFETY: `text` outlives the call; the control copies it.
-            unsafe {
-                SendMessageW(
-                    tabs,
-                    TCM_INSERTITEMW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&item as *const _ as isize)),
-                );
-            }
-        }
         let status = add(Part::Status, ui::label(window, ""));
         add(Part::LogCopy, ui::button(window, "Copy Log", ids::LOG_COPY));
         add(
@@ -387,13 +378,10 @@ impl App {
             if let Some(text) = &banner {
                 ui::set_text(self.part(Part::BannerText), &format!("Update: {text}"));
             }
-            let tabs = self.part(Part::Tabs);
             let want = AppTab::ALL.iter().position(|t| *t == tab).unwrap_or(0);
-            // SAFETY: plain control messages; TCM_SETCURSEL sends no TCN_SELCHANGE.
+            toolbar::check(self.part(Part::Screens), SCREEN_CMD + want as i32);
+            // SAFETY: a plain button message.
             unsafe {
-                if SendMessageW(tabs, TCM_GETCURSEL, None, None).0 as usize != want {
-                    SendMessageW(tabs, TCM_SETCURSEL, Some(WPARAM(want)), None);
-                }
                 let on = if auto { 1 } else { 0 };
                 SendMessageW(
                     self.part(Part::LogAuto),
@@ -468,18 +456,27 @@ impl App {
         };
         let banner = ui_visible(self.part(Part::BannerText));
         let p = |x: Part| self.part(x);
-        let mut rows = vec![Node::Row {
-            children: vec![
-                Node::button(p(Part::Commander), 120),
-                Node::Space(Size::Stretch(1)),
-                Node::button(p(Part::CloseBackup), 100),
-                Node::button(p(Part::Refresh), 110),
-                Node::button(p(Part::Elevate), 190),
-                Node::button(p(Part::Settings), 85),
-                Node::button(p(Part::About), 130),
-            ],
-            gap: layout::GAP,
-        }];
+        let bar = toolbar::height(p(Part::Screens), dpi);
+        let mut rows = vec![
+            Node::Row {
+                children: vec![
+                    Node::leaf(p(Part::Screens), Size::Stretch(1), Size::Fixed(bar)),
+                    Node::leaf(p(Part::Commander), Size::Fixed(100), Size::Fixed(bar)),
+                ],
+                gap: layout::GAP,
+            },
+            Node::Row {
+                children: vec![
+                    Node::Space(Size::Stretch(1)),
+                    Node::button(p(Part::CloseBackup), 100),
+                    Node::button(p(Part::Refresh), 110),
+                    Node::button(p(Part::Elevate), 190),
+                    Node::button(p(Part::Settings), 85),
+                    Node::button(p(Part::About), 130),
+                ],
+                gap: layout::GAP,
+            },
+        ];
         if banner {
             rows.push(Node::row(vec![
                 Node::leaf(
@@ -491,11 +488,9 @@ impl App {
                 Node::button(p(Part::Dismiss), 200),
             ]));
         }
-        rows.push(Node::leaf(
-            p(Part::Tabs),
-            Size::Stretch(1),
-            Size::Stretch(3),
-        ));
+        // Every page takes the same place; the first stands for them in the tree.
+        let page = self.pages[0].1;
+        rows.push(Node::leaf(page, Size::Stretch(1), Size::Stretch(3)));
         rows.push(Node::leaf(
             p(Part::Status),
             Size::Stretch(1),
@@ -522,56 +517,27 @@ impl App {
             .filter(|h| !ui_visible(*h))
             .collect();
         for (h, r) in &placed {
-            if hidden.contains(h) {
+            if hidden.contains(h) || *h == page {
                 continue;
             }
             ui::move_to(*h, *r);
         }
-        if let Some((_, r)) = placed.iter().find(|(h, _)| *h == p(Part::Tabs)) {
-            let mut inner = RECT {
-                left: r.x,
-                top: r.y,
-                right: r.x + r.w,
-                bottom: r.y + r.h,
-            };
-            // SAFETY: TCM_ADJUSTRECT fills the rectangle we pass.
-            unsafe {
-                SendMessageW(
-                    p(Part::Tabs),
-                    TCM_ADJUSTRECT,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(&mut inner as *mut _ as isize)),
-                );
-            }
-            let m = layout::scale(layout::MARGIN, dpi);
-            let page = Rect {
-                x: inner.left + m,
-                y: inner.top + m,
-                w: (inner.right - inner.left - 2 * m).max(0),
-                h: (inner.bottom - inner.top - 2 * m).max(0),
-            };
+        if let Some((_, r)) = placed.iter().find(|(h, _)| *h == page) {
             for (_, h) in &self.pages {
-                ui::move_to(*h, page);
-                // SAFETY: pages sit above the tab control in z-order, so they draw over it.
-                let _ = unsafe {
-                    SetWindowPos(
-                        *h,
-                        Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOP),
-                        0,
-                        0,
-                        0,
-                        0,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                            | SWP_NOACTIVATE,
-                    )
-                };
+                ui::move_to(*h, *r);
             }
         }
     }
 
-    fn command(&self, from: HWND, code: u32) {
+    fn command(&self, from: HWND, id: u32, code: u32) {
         if self.sync.active() || code != BN_CLICKED {
+            return;
+        }
+        if from == self.part(Part::Screens) {
+            let i = (id as i32 - SCREEN_CMD) as usize;
+            if let Some(tab) = AppTab::ALL.get(i) {
+                self.apply(AppAction::SelectTab(*tab));
+            }
             return;
         }
         let Some(part) = self.parts.iter().find(|(_, h)| *h == from).map(|(p, _)| *p) else {
@@ -608,20 +574,9 @@ impl App {
             Part::Commander
             | Part::Settings
             | Part::BannerText
-            | Part::Tabs
+            | Part::Screens
             | Part::Status
             | Part::Log => {}
-        }
-    }
-
-    fn tab_changed(&self) {
-        if self.sync.active() {
-            return;
-        }
-        // SAFETY: a plain query of our tab control.
-        let i = unsafe { SendMessageW(self.part(Part::Tabs), TCM_GETCURSEL, None, None).0 };
-        if let Some(tab) = usize::try_from(i).ok().and_then(|i| AppTab::ALL.get(i)) {
-            self.apply(AppAction::SelectTab(*tab));
         }
     }
 
@@ -640,6 +595,9 @@ impl App {
             );
             let _ = EnumChildWindows(Some(self.window), Some(refont), LPARAM(font.0 as isize));
         }
+        let names = AppTab::ALL.iter().map(|t| t.icon());
+        toolbar::set_icons(self.part(Part::Screens), names, dpi);
+        toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
         self.relayout();
     }
 }
@@ -660,14 +618,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     };
     match msg {
         WM_APP_JOB => app.tick(),
-        WM_COMMAND => app.command(HWND(lp.0 as _), ((wp.0 >> 16) & 0xffff) as u32),
-        WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY's lParam is an NMHDR.
-            let hdr = unsafe { &*(lp.0 as *const NMHDR) };
-            if hdr.hwndFrom == app.part(Part::Tabs) && hdr.code == TCN_SELCHANGE {
-                app.tab_changed();
-            }
-        }
+        WM_COMMAND => app.command(
+            HWND(lp.0 as _),
+            (wp.0 & 0xffff) as u32,
+            ((wp.0 >> 16) & 0xffff) as u32,
+        ),
         WM_SIZE => app.relayout(),
         WM_DPICHANGED => {
             // SAFETY: WM_DPICHANGED's lParam is the suggested window rectangle.

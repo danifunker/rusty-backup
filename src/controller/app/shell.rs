@@ -48,6 +48,19 @@ impl AppTab {
             AppTab::Archives => "Archives",
         }
     }
+
+    /// The screen's toolbar icon, a file stem in `assets/icons/toolbar/` (D9).
+    pub fn icon(self) -> &'static str {
+        match self {
+            AppTab::Backup => "backup",
+            AppTab::Restore => "restore",
+            AppTab::Build => "build",
+            AppTab::Inspect => "inspect",
+            AppTab::Convert => "convert",
+            AppTab::Optical => "disc",
+            AppTab::Archives => "archive",
+        }
+    }
 }
 
 /// What the tabs a drop may go to are doing.

@@ -19,6 +19,8 @@ mod panel;
 #[cfg(windows)]
 mod sync;
 #[cfg(windows)]
+mod toolbar;
+#[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod wake;
@@ -28,7 +30,7 @@ fn main() {
     use rusty_backup::controller::log::capture;
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Controls::{
-        InitCommonControlsEx, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
+        InitCommonControlsEx, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
         INITCOMMONCONTROLSEX,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -42,7 +44,7 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES,
+            dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES,
         };
         let _ = InitCommonControlsEx(&icc);
     }
