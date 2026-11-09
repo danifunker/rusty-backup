@@ -29,6 +29,10 @@ pub use screen::{
     SizePlan, SkippedReport, SpaceReadout, UnsavedChoice, ViewItemKind, ViewMenuItem, VolumeLine,
     Xattr, FOLLOW_DELAY, MAX_PREVIEW_SIZE, MIN_NESTED_IMAGE_BYTES,
 };
+pub use screen::{
+    journal_window, tree_window, EditBar, HeaderTools, MarkBar, PaneWindow, Part, Press, Tone,
+    WindowButton, WindowKind,
+};
 
 // Plain data and helpers the views need, so they never name the model (CONTRIBUTING.md MVC).
 pub use crate::controller::browser::{LineEnding, TextShape};

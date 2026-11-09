@@ -825,3 +825,81 @@ fn a_closed_pane_names_nothing_and_a_host_pane_says_so() {
     assert_eq!(pane.path_prefix(), "host ");
     assert_eq!(pane.volume_title(), "local folder");
 }
+
+#[test]
+fn the_edit_bar_and_the_edits_window_follow_the_queue() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Delete);
+    let bar = ctl.edit_bar(Side::Left);
+    assert_eq!(bar.staged, 1);
+    assert_eq!(bar.apply_label, "Apply Edits (1)");
+    assert!(bar.deletable);
+    ctl.apply(A::Pane(Side::Left, P::ShowEdits(true)));
+    let windows = ctl.pane_windows(Side::Left, false);
+    let edits = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::Edits)
+        .unwrap();
+    let Part::Items { lines, actions, .. } = &edits.parts[1] else {
+        panic!(
+            "the edits are listed with their own button: {:?}",
+            edits.parts
+        );
+    };
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("1. "), "{lines:?}");
+    for a in actions[0].clone() {
+        ctl.apply(a);
+    }
+    assert!(ctl.pane(Side::Left).queue.is_empty());
+    assert_eq!(ctl.edit_bar(Side::Left).staged, 0);
+}
+
+#[test]
+fn the_mark_bar_counts_marked_rows() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    assert_eq!(ctl.mark_bar(Side::Left).count, 0);
+    let name = files(&ctl, Side::Left)[0].clone();
+    let id = ctl
+        .pane(Side::Left)
+        .rows()
+        .iter()
+        .find(|r| r.name == name)
+        .map(|r| r.node_id.clone())
+        .unwrap();
+    ctl.apply(A::Pane(Side::Left, P::Mark(id)));
+    let bar = ctl.mark_bar(Side::Left);
+    assert_eq!(bar.count, 1);
+    assert_eq!(bar.label, "1 selected");
+}
+
+#[test]
+fn the_checksum_window_copies_each_value() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Checksums(Side::Left));
+    settle(&mut ctl);
+    let windows = ctl.pane_windows(Side::Left, false);
+    let sums = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::Checksums)
+        .unwrap();
+    let Some(Part::Items { lines, actions, .. }) = sums.parts.last() else {
+        panic!("one line per value: {:?}", sums.parts);
+    };
+    assert_eq!(lines.len(), HashAlgo::ALL.len(), "{lines:?}");
+    let fx = ctl.apply(actions[0][0].clone());
+    assert!(
+        matches!(fx.as_slice(), [Effect::CopyToClipboard(_)]),
+        "{fx:?}"
+    );
+}

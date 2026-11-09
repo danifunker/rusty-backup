@@ -55,7 +55,11 @@ pub use extract::{extract_applies, extract_fork_modes, ExtractApplies, ProdosExp
 mod follow;
 mod modes;
 mod panel;
-pub use panel::{PanelActions, PanelPreview, SidePanel, VolumeLine};
+pub use panel::{EditBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SidePanel, VolumeLine};
+mod windows;
+pub use windows::{
+    journal_window, tree_window, PaneWindow, Part, Press, Tone, WindowButton, WindowKind,
+};
 #[cfg(test)]
 mod tests;
 

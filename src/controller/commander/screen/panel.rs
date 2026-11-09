@@ -1,10 +1,11 @@
-//! What a view shows beside and above the listing: the volume line, the cursor row's side panel
-//! and which of its actions apply.
+//! What a view shows beside and above the listing: the volume line and header tools, the edit
+//! and mark bars, the cursor row's side panel and which of its actions apply.
 //!
 //! The rules came out of the GTK shell's `browser/detail.rs` and `browser/bars.rs`, so a second
 //! view reads them here rather than writing them again.
 
-use super::{BrowseCaps, CommanderController, FileDetail, Side, MAX_PREVIEW_SIZE};
+use super::windows::Tone;
+use super::{BrowseCaps, CommanderController, ExportFormat, FileDetail, Side, MAX_PREVIEW_SIZE};
 use crate::controller::commander::{
     detect_content_type, entry_facts, extract_applies, hex_dump, is_known_prodos_type,
     preview_bytes, FileContent, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
@@ -211,5 +212,152 @@ impl CommanderController {
             edit_mode: self.edit_mode(),
             metadata: extras && d.editable,
         })
+    }
+}
+
+/// The header's tools beyond the volume line: which apply and what their labels say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderTools {
+    pub caps: BrowseCaps,
+    pub loaded: bool,
+    pub edit_mode: bool,
+    /// "Edit Mode" or "Edit Mode ON".
+    pub edit_label: &'static str,
+    pub edit_enabled: bool,
+    pub export_volume: bool,
+    pub check: bool,
+    pub chd: bool,
+    /// HFS in Edit Mode: whether the volume's first sector has boot blocks.
+    pub boot: Option<bool>,
+    pub show_deleted: bool,
+    pub full_scan: bool,
+    pub full_scan_hint: String,
+}
+
+/// The edit bar's state while Edit Mode is on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditBar {
+    pub on: bool,
+    /// "Editing: /FOLDER".
+    pub target: String,
+    /// Why the edits land in a copy (an archive, a CHD's diff) and what Apply does then.
+    pub copy_note: Option<&'static str>,
+    pub caps: BrowseCaps,
+    /// Rename, Delete and the ProDOS lock act on the cursor or the marked rows.
+    pub deletable: bool,
+    /// Bless acts on a folder under the cursor.
+    pub folder: bool,
+    pub staged: usize,
+    pub apply_label: String,
+    pub edits_label: String,
+    pub apply_enabled: bool,
+    pub apply_hint: Option<&'static str>,
+    pub discard_enabled: bool,
+    pub edits_shown: bool,
+    /// "Free: 1.2 MiB".
+    pub free: String,
+    /// "After: 900 KiB", in red when the edits do not fit and amber when space runs short.
+    pub after: Option<(String, Tone)>,
+}
+
+/// The bar shown while rows are marked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkBar {
+    pub count: usize,
+    /// "3 selected".
+    pub label: String,
+    /// The export format, an index into `ExportFormat::ALL`.
+    pub format: usize,
+}
+
+impl CommanderController {
+    pub fn header_tools(&self, side: Side) -> HeaderTools {
+        let pane = self.pane(side);
+        let caps = self.browse_caps();
+        let edit = self.edit_mode();
+        HeaderTools {
+            caps,
+            loaded: pane.listing.is_loaded(),
+            edit_mode: edit,
+            edit_label: if edit { "Edit Mode ON" } else { "Edit Mode" },
+            edit_enabled: self.copy_job().is_none() && self.mode_working().is_none(),
+            export_volume: !edit && self.copy_job().is_none(),
+            check: caps.check && pane.tool_working().is_none(),
+            chd: self.is_chd_source(),
+            boot: pane.boot_blocks_present().filter(|_| edit && caps.hfs),
+            show_deleted: self.show_deleted(),
+            full_scan: self.carve_full_scan(),
+            full_scan_hint: format!(
+                "Off: scan only the first {} MB for recoverable text (fast). On: scan the entire \
+                 image (slower on large disks). 'whole-disk.img' is always the full image.",
+                self.carve_scan_limit_mb()
+            ),
+        }
+    }
+
+    pub fn edit_bar(&self, side: Side) -> EditBar {
+        let pane = self.pane(side);
+        let target = match pane.cwd_entry().filter(|e| e.path != "/") {
+            Some(e) => format!("Editing: /{}", e.name),
+            None => "Editing: /root".to_string(),
+        };
+        let cursor = pane.cursor_index().map(|i| &pane.rows()[i]);
+        let copy_note = if self.editing_archive() {
+            Some("Editing temporary copy. Click 'Apply Edits' to write changes.")
+        } else if self.editing_chd() {
+            Some("Editing CHD via diff. Click 'Apply Edits' to flush, or exit Edit Mode to merge into the CHD.")
+        } else {
+            None
+        };
+        let staged = pane.queue.len();
+        let reading = self.copy_job().is_some();
+        let busy = pane.is_busy();
+        let space = self.space();
+        EditBar {
+            on: self.edit_mode(),
+            target,
+            copy_note,
+            caps: self.browse_caps(),
+            deletable: pane.has_selection() || cursor.is_some_and(|r| !r.is_parent()),
+            folder: cursor.is_some_and(|r| r.is_dir && !r.is_parent()),
+            staged,
+            apply_label: format!("Apply Edits ({staged})"),
+            edits_label: format!("Edits ({staged})"),
+            apply_enabled: !reading && !busy,
+            apply_hint: reading.then_some("Wait for the running extraction or export to finish"),
+            discard_enabled: !busy,
+            edits_shown: pane.edits_shown(),
+            free: space
+                .map(|s| format!("Free: {}", format_size(s.free)))
+                .unwrap_or_default(),
+            after: space.and_then(|s| {
+                let tone = if s.overflows {
+                    Tone::Error
+                } else if s.tight {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                };
+                s.after
+                    .map(|a| (format!("After: {}", format_size(a)), tone))
+            }),
+        }
+    }
+
+    pub fn mark_bar(&self, side: Side) -> MarkBar {
+        let pane = self.pane(side);
+        let count = match pane.has_selection() {
+            true => pane.selected_entries().len(),
+            false => 0,
+        };
+        let format = self.export_format();
+        MarkBar {
+            count,
+            label: format!("{count} selected"),
+            format: ExportFormat::ALL
+                .iter()
+                .position(|f| *f == format)
+                .unwrap_or(0),
+        }
     }
 }
