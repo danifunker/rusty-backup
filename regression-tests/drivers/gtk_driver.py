@@ -110,8 +110,23 @@ def visible_text():
     return "\n".join(lines)
 
 
+# Roles that are controls; a label also has (clipboard) actions, so actions alone don't count.
+CONTROL_ROLES = BUTTON_ROLES + COMBO_ROLES + ENTRY_ROLES + (
+    "toggle button", "switch", "check box", "radio button", "page tab", "spin button",
+    "list item", "menu item", "table cell", "slider")
+
+
+def rank(n):
+    role = role_of(n)
+    if role in CONTROL_ROLES:
+        return 0
+    if has_action(n) and role not in ("label", "static"):
+        return 1
+    return 2
+
+
 def find(label, wait=20.0, pred=None):
-    """A showing node named `label` (trailing ':' ignored), preferring one that acts."""
+    """A showing node named `label` (trailing ':' ignored), a control before a mere label."""
     want = label.rstrip(":").strip()
     end = time.time() + wait
     while True:
@@ -121,11 +136,13 @@ def find(label, wait=20.0, pred=None):
                 continue
             if pred is not None and not pred(n):
                 continue
-            if has_action(n) or role_of(n) in ENTRY_ROLES + COMBO_ROLES:
+            r = rank(n)
+            if r == 0:
                 return n
-            best = best or n
+            if best is None or r < best[0]:
+                best = (r, n)
         if best is not None:
-            return best
+            return best[1]
         if time.time() >= end:
             raise Fail(f"a control labelled {label!r}", visible_text())
         time.sleep(0.4)
@@ -191,22 +208,33 @@ def activate(n):
         n.get_action_iface().do_action(0)
         time.sleep(0.4)
         return
-    row = n
-    for _ in range(3):
-        if row is None or role_of(row) == "list item":
+    row = row_of(n)
+    if row is not None:
+        walk_to(row, name_of(n))
+        return
+    click(n)
+
+
+def row_of(n):
+    """The list row holding `n` (a popover entry), if any."""
+    for _ in range(4):
+        if n is None or role_of(n) == "list item":
             break
-        row = row.get_parent()
-    if row is not None and role_of(row) == "list item":
-        # GTK 4 has no AT-SPI grab_focus; an open popover holds the keyboard, so walk to the row.
-        for _ in range(40):
-            if has_state(row, Atspi.StateType.FOCUSED):
+        n = n.get_parent()
+    return n if n is not None and role_of(n) == "list item" else None
+
+
+def walk_to(row, what):
+    """GTK 4 has no AT-SPI grab_focus; an open popover holds the keyboard, so walk to the row."""
+    for direction in ("Down", "Up"):
+        for _ in range(30):
+            if has_state(row, Atspi.StateType.FOCUSED) or has_state(row, Atspi.StateType.SELECTED):
                 xdo("key", "Return")
                 time.sleep(0.4)
                 return
-            xdo("key", "Down")
+            xdo("key", direction)
             time.sleep(0.12)
-        raise Fail(f"keyboard focus to reach {name_of(n)!r}", visible_text())
-    click(n)
+    raise Fail(f"keyboard focus to reach {what!r}", visible_text())
 
 
 XKEYS = {"Enter": "Return", "Esc": "Escape", "Backspace": "BackSpace", "Space": "space",
@@ -225,13 +253,20 @@ def set_pick(path):
 
 
 def combo_value(n, choices=None):
+    """The value a combo row shows: a label inside it that is not the row's own title."""
+    title = name_of(n)
     for c in nodes(n, limit=200):
         if c is n or not showing(c):
             continue
         nm = name_of(c)
-        if nm and (choices is None or nm in choices) and role_of(c) in ("label", "text", "static"):
+        # Breadth first: the shown value is shallower than the popover's rows.
+        if not nm or nm == title:
+            continue
+        if (choices is None or nm in choices) and role_of(c) in ("label", "text", "static"):
             return nm
     return ""
+
+
 
 
 def choose(n, value):
@@ -242,17 +277,31 @@ def choose(n, value):
             return
         click(n)
         time.sleep(0.5)
+        want = value.casefold()
+        row = None
         end = time.time() + 5
-        while time.time() < end:
+        while row is None and time.time() < end:
             for c in nodes(APP):
-                if c is n or not showing(c) or name_of(c).casefold() != value.casefold():
-                    continue
-                if role_of(c) in ("list item", "label", "menu item", "table cell"):
-                    click(c)
-                    time.sleep(0.4)
-                    if shows_value(n, value):
-                        return
-            time.sleep(0.3)
+                if c is not n and showing(c) and name_of(c).casefold() == want \
+                        and not is_inside(c, n) and row_of(c) is not None:
+                    row = row_of(c)
+                    break
+            time.sleep(0.2)
+        if row is not None:
+            # A drop-down may move its value as the keyboard moves, so either sign means "there".
+            here = lambda: (has_state(row, Atspi.StateType.FOCUSED)
+                            or has_state(row, Atspi.StateType.SELECTED)
+                            or combo_value(n).casefold() == want)
+            for direction in ("Down", "Up"):
+                for _ in range(30):
+                    if here():
+                        xdo("key", "Return")
+                        time.sleep(0.4)
+                        if wait_until(lambda: combo_value(n).casefold() == want, 3):
+                            return
+                        break
+                    xdo("key", direction)
+                    time.sleep(0.12)
         raise Fail(f"{name_of(n)!r} set to {value!r}", visible_text())
     if value in ("on", "off"):
         on = has_state(n, Atspi.StateType.CHECKED) or has_state(n, Atspi.StateType.PRESSED)
@@ -260,6 +309,18 @@ def choose(n, value):
             activate(n)
         return
     raise Fail(f"{label_of(n)} to take a choice", visible_text())
+
+
+def is_inside(c, n):
+    """`c` is drawn in `n` itself (the combo's current value), not in its popover list."""
+    p = c.get_parent()
+    for _ in range(3):
+        if p is None:
+            return False
+        if p == n:
+            return True
+        p = p.get_parent()
+    return False
 
 
 def shows_value(n, value):
@@ -314,7 +375,8 @@ def run(op):
         choose(CURRENT or find(op["label"]), arg)
     elif kind == "activate":
         if op.get("via"):
-            activate(find(op["via"]))
+            # Some menu buttons ignore the AT-SPI action; a dropdown is in the main window, so click it.
+            click(find(op["via"]))
             time.sleep(0.4)
         activate(find(arg))
     elif kind == "pick":
@@ -353,6 +415,23 @@ def run(op):
                 acts = [ai.get_action_name(i) for i in range(ai.get_n_actions())]
             out.append(f"{role_of(n)} {name_of(n)[:40]!r} {acts}")
             n = n.get_parent()
+        return {"ok": True, "text": "\n".join(out)}
+    elif kind == "click":
+        click(find(arg))
+    elif kind == "tree":
+        out = []
+
+        def walk(n, depth):
+            if n is None or depth > 6 or len(out) > 200:
+                return
+            flags = [Atspi.StateType(st).value_nick for st in n.get_state_set().get_states()
+                     if Atspi.StateType(st).value_nick in ("showing", "focused", "selected",
+                                                           "checked", "expanded")]
+            out.append("  " * depth + f"{role_of(n)} {name_of(n)[:50]!r} {flags}")
+            for i in range(n.get_child_count()):
+                walk(n.get_child_at_index(i), depth + 1)
+
+        walk(find(arg), 0)
         return {"ok": True, "text": "\n".join(out)}
     elif kind == "text":
         return {"ok": True, "text": visible_text()}

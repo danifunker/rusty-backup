@@ -18,6 +18,12 @@
 "backup.format" = "Format:"
 "backup.start" = "[ Start backup ]"
 "backup.done" = "Backup complete."
+"restore.backup_folder" = "Backup:"
+"restore.target_kind" = "Target:"
+"restore.target_image" = "Image file:"
+"restore.start" = "[ Start restore ]"
+"restore.confirm" = { key = "y" }
+"restore.done" = "Restore complete."
 
 [gtk]
 "backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
@@ -26,3 +32,9 @@
 "backup.format" = "Output Format"
 "backup.start" = "Start Backup"
 "backup.done" = "Backup finished."
+"restore.backup_folder" = { label = "Open Backup Folder...", via = "No folder selected" }
+"restore.target_kind" = "Target"
+"restore.target_image" = { label = "Image File", pick = "Save As..." }
+"restore.start" = "Restore"
+"restore.confirm" = "I understand, proceed"
+"restore.done" = "Restore finished."
