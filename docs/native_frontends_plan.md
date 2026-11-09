@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 4 (GTK4) shipped as a preview beside egui (merged 2026-11-08), and front-end flows (tier 8) drive the TUI and GTK from one flow file (2026-11-09). Next: Phase 2b, then Phase 3 (AppKit, [appkit_shell_plan.md](appkit_shell_plan.md)) and Phase 5 (Win32, [win32_shell_plan.md](win32_shell_plan.md)).** Phases 0 and 1 done (2026-11-01). Phase 2 done (2026-11-04) apart from the macOS / Windows GUI smoke, which the tier 8 flows now cover once those shells have drivers: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
+Status: **Phase 4 (GTK4) shipped as a preview beside egui (merged 2026-11-08), and front-end flows (tier 8) drive the TUI and GTK from one flow file (2026-11-09). Next: Phase 5 (Win32, [win32_shell_plan.md](win32_shell_plan.md)) with Phase 2b's shared work, then Phase 3 (AppKit, [appkit_shell_plan.md](appkit_shell_plan.md)); D7. Resume on the Windows box: [RESUME-win32-shell.md](RESUME-win32-shell.md).** Phases 0 and 1 done (2026-11-01). Phase 2 done (2026-11-04) apart from the macOS / Windows GUI smoke, which the tier 8 flows now cover once those shells have drivers: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -18,7 +18,7 @@ Companion documents:
 | D4 | **Two shells per OS.** A *modern* shell may use current crates. A *vintage* shell covers anything built with Rust 1.73 or older (or mrustc), and keeps its dependencies frozen. Both shells sit on the same view-models. |
 | D5 | Future sessions survey every build target for each new feature and wire it in by default (§7). |
 | D6 | Tests run in three tiers: view-model tests and per-shell smoke tests on every CI run, plus full UI automation monthly, quarterly, or around major UI changes (§6). |
-| D7 | macOS is the first native shell. Linux is discussed in detail first (§9). |
+| D7 | ~~macOS is the first native shell.~~ **Windows (Win32) is the next native shell, then macOS** (decided 2026-11-09): the app's tabs, toolbars and F-key Commander are Windows conventions, so under D8 Win32 fits without bending, and UI Automation runs on stock GitHub runners while AX needs a permission they may not grant. Linux (GTK4) shipped first in practice. |
 | D8 | **Every front-end presents the same UI**: the same screens, controls, labels, steps and outcomes, laid out in each toolkit's own widgets. A difference is a bug to fix in the controller, not a per-shell choice. Decided 2026-11-09. |
 
 ## 2. Where the code stands
@@ -240,7 +240,7 @@ TUI and GTK; `capabilities.md` lists every flow.
 
 ### Phase 3: macOS modern (AppKit)
 
-Plan: [appkit_shell_plan.md](appkit_shell_plan.md). `frontends/appkit/` on `objc2-app-kit` 0.3,
+Second, after Win32 (D7). Plan: [appkit_shell_plan.md](appkit_shell_plan.md). `frontends/appkit/` on `objc2-app-kit` 0.3,
 macOS 10.13+, a second `.app` beside egui until parity. Controller ids become `AXIdentifier`, so
 its flow driver (`drivers/ax_driver.py`, PyObjC over AX) finds controls by id. Slices follow the
 GTK shell's; each is done when its tier 8 flows pass on `appkit`.
@@ -256,7 +256,7 @@ Packaging and the pre-22.04 question: §9.
 
 ### Phase 5: Windows modern (Win32)
 
-Plan: [win32_shell_plan.md](win32_shell_plan.md). `frontends/win32/` on `windows` 0.62 and Common
+**Next (D7).** Plan: [win32_shell_plan.md](win32_shell_plan.md). `frontends/win32/` on `windows` 0.62 and Common
 Controls v6, Windows 10/11, beside egui until parity. Controller ids become UIA `AutomationId`s
 (Dynamic Annotation, Gate 0), so its flow driver (`drivers/uia_driver.py`) finds controls by id.
 The TUI driver gains a ConPTY session so the TUI flows run on Windows too.

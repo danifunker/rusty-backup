@@ -2,7 +2,8 @@
 
 Phase 5 of [native_frontends_plan.md](native_frontends_plan.md). Drafted 2026-11-09 from what the
 GTK4 shell ([gtk4_shell_plan.md](gtk4_shell_plan.md)) and the tier 8 flows
-([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started.
+([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. **The next shell** (D7:
+Windows before macOS). Not started; resume prompt: [RESUME-win32-shell.md](RESUME-win32-shell.md).
 
 The shell is `frontends/win32/`: Win32 and Common Controls v6 through the `windows` crate (0.62,
 which the engine already links), a pure view over `rusty_backup::controller`, built on stable Rust
@@ -92,12 +93,27 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
 - **Build memory.** The OOM fix (`debug = "line-tables-only"`, `jobs = 4`) applies; keep the repo's
   `target` out of Defender's real-time scan on the dev machine.
 
+## Order of work
+
+1. **Gate 0** (below): an AutomationId set by Dynamic Annotation is visible to Python UIA.
+2. **The TUI over ConPTY** in `runner/src/tui.rs`, then the tier 8 TUI flows on Windows. This is
+   the Windows baseline: anything that fails here fails in the shared code, not in Win32.
+3. **Phase 2b's shared work** that the shell builds on (main plan § Phase 2b): labels and result
+   messages as controller accessors, the shared scripted-pick hook, the staged host copy and the
+   Convert-tab hand-off in the controllers. The TUI switches over on Windows (its flows prove it);
+   GTK's switch-over is verified on Linux, where its flows run.
+4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices.
+5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so
+   every later slice is proved by flows as it lands rather than at the end.
+6. Slices 1 to 8.
+
 ## Slices
 
 The GTK slices, in the same order; each is done when its tier 8 flows pass on `win32`.
 
 | # | Slice | Proved by |
 |---|---|---|
+| 0a | **Layout helper** (`layout.rs`): rows, columns, label-and-field pairs, stretch and fixed sizes, measured in DPI-scaled units and laid out on `WM_SIZE` / `WM_DPICHANGED`. Raw Win32 has no layout engine, and without this every screen hand-places its controls. Unit-tested on rectangles, no window needed | its unit tests |
 | 0 | Skeleton: window, tab control, log, effect host, `Notify`, UAC relaunch, manifest, CI target | the app starts under the driver |
 | 1 | Inspect: source picker, partition bar (custom-drawn), partition table, tools | `flow.inspect.hfs-*` (with slice 7a) |
 | 2 | Browse view on `BrowserPaneController` (virtual list and tree view), file detail, journal | `flow.optical.*` (with slice 6) |

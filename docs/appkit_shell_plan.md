@@ -2,7 +2,8 @@
 
 Phase 3 of [native_frontends_plan.md](native_frontends_plan.md). Drafted 2026-11-09 from what the
 GTK4 shell ([gtk4_shell_plan.md](gtk4_shell_plan.md)) and the tier 8 flows
-([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started.
+([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started: second, after
+the Win32 shell (main plan D7), which settles Phase 2b and the driver pattern first.
 
 The shell is `frontends/appkit/`: AppKit through `objc2` / `objc2-app-kit` 0.3 (the versions the
 engine already links for IOKit and DiskArbitration), a pure view over `rusty_backup::controller`,
