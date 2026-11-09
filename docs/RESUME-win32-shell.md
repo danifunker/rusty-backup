@@ -1,16 +1,17 @@
 # RESUME: the Win32 shell, on the Windows box (handoff 2026-11-09)
 
 The next native shell is Windows (main plan D7). This session starts it on the Windows
-development machine.
+development machine, on branch **`win32-shell`**: all of this initiative lands there. Don't open a
+PR into `main` unless asked.
 
 ## Paste this into the new session
 
 > Read `docs/RESUME-win32-shell.md`, then `docs/win32_shell_plan.md`,
 > `docs/native_frontends_plan.md` § 1 (decisions D7, D8) and § Phase 2b, CONTRIBUTING.md
 > § Architecture policy (MVC), `docs/gtk4_shell_plan.md` § Rules and the retained-mode pattern,
-> and `regression-tests/FLOWS.md`. Pull `main` and check `git status`. Ask me whether to work on
-> `main` or open a branch before the first commit. Then follow the plan's "Order of work",
-> starting with Gate 0, and keep going until something actually blocks you.
+> and `regression-tests/FLOWS.md`. Check out and pull the `win32-shell` branch, and check
+> `git status`. Then follow the plan's "Order of work", starting with Gate 0, and keep going until
+> something actually blocks you.
 
 ## Where things stand
 
@@ -88,5 +89,6 @@ development machine.
 - Every `Action` and `Effect` is matched with no `_` arm; `scripts/check-boundaries.sh` must
   report `frontends/win32` at 0 engine references.
 - The pre-commit hook runs `git add -u` and clippy with `-D warnings`: commit with explicit paths.
-- Commit often, one coherent step per commit. Don't open a PR into `main` unless asked.
+- Commit often, one coherent step per commit, on `win32-shell`. Pushing it runs CI on every target
+  but the appliance, with no release; batch pushes rather than pushing every commit.
 - A crate fix ships with a version bump and a publish.
