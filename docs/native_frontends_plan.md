@@ -19,6 +19,7 @@ Companion documents:
 | D5 | Future sessions survey every build target for each new feature and wire it in by default (§7). |
 | D6 | Tests run in three tiers: view-model tests and per-shell smoke tests on every CI run, plus full UI automation monthly, quarterly, or around major UI changes (§6). |
 | D7 | macOS is the first native shell. Linux is discussed in detail first (§9). |
+| D8 | **Every front-end presents the same UI**: the same screens, controls, labels, steps and outcomes, laid out in each toolkit's own widgets. A difference is a bug to fix in the controller, not a per-shell choice. Decided 2026-11-09. |
 
 ## 2. Where the code stands
 
@@ -222,10 +223,11 @@ list of drift. Before AppKit or Win32 starts:
 2. **The scripted-pick hook is shared.** GTK's `RUSTY_BACKUP_TEST_PICKS` (`purpose<TAB>path`,
    `*` for any purpose) moves into `src/controller` as one helper every shell's effect host calls
    before it opens a real dialog. The TUI gets it too, so its flows stop typing into a prompt.
-3. **The behaviour drift is settled**, one answer per question, in the controller where it can be:
-   - Copying from an image into a host folder: staged with Apply (TUI) or at once (GTK).
-   - Converting a disc: on the Optical screen (TUI) or handed to the Convert tab (GTK).
-   - Each answer removes a `skip` entry from `labels.toml`.
+3. **The behaviour drift is settled** (decided 2026-11-09, D8), in the controller where it can be:
+   - Copying from an image into a host folder is **staged and written on Apply**, as the TUI
+     does; GTK's immediate copy changes to match, and `commander.left.apply`'s `skip` goes.
+   - Converting a disc happens **in the Convert tab**: the Optical screen's Convert... hands the
+     image over, as egui and GTK do; the TUI's in-place convert on its Optical screen goes.
 4. **`docs/capabilities.md` exists**, one row per capability, a column per shell, each row naming
    the flows that prove it; a new row needs the user's OK. The AppKit and Win32
    columns start empty: they are the new shells' checklists.
@@ -421,7 +423,7 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 ## 11. Open decisions
 
 1. Linux (§9): does gtk3-rs build on 1.73; the oldest distro to test the GTK3 AppImage on; the Flatpak images-only edition.
-7. Phase 2b's drift questions: staged or immediate copy into a host folder; disc conversion on the Optical screen or in the Convert tab.
+7. ~~Phase 2b's drift questions~~: decided 2026-11-09 (D8): staged copy into a host folder; disc conversion in the Convert tab.
 8. AppKit: PyObjC or a Swift helper for the AX driver, and whether GitHub's macOS runners grant AX (its plan's Gate 0).
 9. Win32: Dynamic Annotation for `AutomationId` or a numeric id table (its plan's Gate 0).
 2. macOS 10.7 bindings: which ObjC crate builds on 1.73, or ObjC shell + C ABI.
