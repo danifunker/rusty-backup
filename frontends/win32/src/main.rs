@@ -10,11 +10,15 @@ mod alto;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod chd;
+#[cfg(windows)]
 mod effects;
 #[cfg(windows)]
 mod expand_hfs;
 #[cfg(windows)]
 mod expand_image;
+#[cfg(windows)]
+mod export;
 #[cfg(windows)]
 mod inspect;
 mod layout;

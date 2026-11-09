@@ -42,6 +42,7 @@ use crate::alto::AltoWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
 use crate::expand_image::{self, ExpandImageWindow};
+use crate::export::{self, ExportWindow};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::report::{self, ReportWindow};
@@ -115,6 +116,9 @@ struct Shown {
     can_bootable: bool,
     can_expand_image: bool,
     can_edit_table: bool,
+    can_export: bool,
+    exporting: bool,
+    export: Option<export::Shown>,
     can_close: bool,
     has_chd: bool,
     can_convert: bool,
@@ -149,6 +153,9 @@ pub struct InspectScreen {
     chd: HWND,
     expand_image: HWND,
     resize_btn: HWND,
+    export_btn: HWND,
+    cancel_export: HWND,
+    export_window: RefCell<Option<Rc<ExportWindow>>>,
     resize: RefCell<Option<Rc<ResizeWindow>>>,
     close: HWND,
     details: HWND,
@@ -210,6 +217,8 @@ impl InspectScreen {
         let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
         let expand_image = ui::button(page, "Expand Image...", ids::EXPAND_IMAGE);
         let resize_btn = ui::button(page, "Resize Partitions...", ids::RESIZE);
+        let export_btn = ui::button(page, "Export Disk Image...", ids::EXPORT);
+        let cancel_export = ui::button(page, "Cancel Export", ids::CANCEL_EXPORT);
         let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
         let bar_target: Rc<RefCell<Weak<InspectScreen>>> = Rc::default();
@@ -298,6 +307,9 @@ impl InspectScreen {
             chd,
             expand_image,
             resize_btn,
+            export_btn,
+            cancel_export,
+            export_window: RefCell::default(),
             resize: RefCell::default(),
             close,
             details,
@@ -357,6 +369,27 @@ impl InspectScreen {
         }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
+    }
+
+    /// The Export window follows the controller: open while it says so, updated each refresh.
+    fn show_export(&self, shown: Option<export::Shown>) {
+        let Some(shown) = shown else {
+            self.export_window.replace(None);
+            return;
+        };
+        let existing = self.export_window.borrow().clone();
+        let w = existing.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(InspectAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            let w = ExportWindow::open(self.owner, send);
+            *self.export_window.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(shown);
     }
 
     /// Resize Partitions: a dialog with its own controller, on the table read here.
@@ -528,6 +561,9 @@ impl InspectScreen {
             can_bootable: c.can_make_bootable(),
             can_expand_image: c.can_expand_image(),
             can_edit_table: c.can_edit_table(),
+            can_export: c.can_export(),
+            exporting: c.export_job().is_some(),
+            export: export::Shown::read(&mut c),
             can_close: c.can_close(),
             has_chd: c.chd_path().is_some(),
             can_convert: c.convert_source().is_some(),
@@ -561,6 +597,9 @@ impl InspectScreen {
         ui::set_enabled(self.reinspect, s.can_reinspect);
         ui::set_enabled(self.bootable, s.can_bootable);
         ui::set_enabled(self.expand_image, s.can_expand_image);
+        ui::set_enabled(self.export_btn, s.can_export);
+        ui::set_visible(self.cancel_export, s.exporting);
+        self.show_export(s.export);
         let resizing = self
             .resize
             .borrow()
@@ -845,6 +884,7 @@ impl InspectScreen {
             self.error,
             self.job,
             self.progress,
+            self.cancel_export,
             self.details,
             self.bar,
             self.no_partitions,
@@ -894,6 +934,7 @@ impl InspectScreen {
                     Size::Stretch(1),
                     Size::Fixed(layout::ROW - 8),
                 ),
+                Node::button(self.cancel_export, 110),
             ]));
         }
         children.extend([Node::row(vec![
@@ -903,6 +944,7 @@ impl InspectScreen {
             Node::button(self.chd, 80),
             Node::button(self.expand_image, 120),
             Node::button(self.resize_btn, 140),
+            Node::button(self.export_btn, 150),
             Node::Space(Size::Stretch(1)),
             Node::button(self.close, 80),
         ])]);
@@ -1018,6 +1060,10 @@ impl Handler for InspectScreen {
         } else if from == self.resize_btn {
             self.open_resize();
             return;
+        } else if from == self.export_btn {
+            InspectAction::OpenExport
+        } else if from == self.cancel_export {
+            InspectAction::CancelExport
         } else if from == self.close {
             InspectAction::Close
         } else if from == self.convert_btn {
