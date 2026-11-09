@@ -6,6 +6,8 @@
 #   key   = "o"     activate it by this key (the TUI has keys where GTK has buttons)
 #   pick  = "..."   the button whose file dialog fills this field (GTK path rows)
 #   via   = "..."   open this first (the dropdown a menu entry lives in)
+#   nth   = 1       the Nth same-named control (on the `via` dropdown when there is one)
+#   skip  = true    this shell has no such step: behaviour drift, listed like label drift
 # `wait` / `expect` names resolve here too, for messages each shell words its own way.
 #
 # Two shells naming one control differently is label drift; once labels come from the
@@ -33,7 +35,21 @@
 "commander.left.open_folder" = { key = "Tab Ctrl+D" }
 "commander.copy_to_right" = { key = "F6" }
 "commander.right.apply" = { key = "Tab F10" }
+"commander.copy_to_left" = { key = "F6" }
+"commander.left.open_image" = { key = "Ctrl+O" }
+"commander.left.apply" = { key = "Tab F10" }
+"commander.staged" = "[1 staged]"
 "inspect.open_image" = { key = "o" }
+"inspect.remote" = { key = "R" }
+"inspect.remote_backup" = { key = "u" }
+"build.kind" = "Kind"
+"build.next" = { key = "n" }
+"build.save_as" = "Save as"
+"build.cd_layout" = "Layout"
+"build.cd_size" = "Size"
+"build.cd_fill_from" = "Fill from"
+"build.create" = { key = "n" }
+"build.done" = "Build another"
 "expand_hfs.open" = { key = "H" }
 "expand_hfs.target_size" = "Target size MiB:"
 "expand_hfs.save_as" = "Output file:"
@@ -57,7 +73,21 @@
 "commander.left.open_folder" = { label = "Open Local Folder...", via = "Open image, backup, or folder..." }
 "commander.copy_to_right" = "Copy"
 "commander.right.apply" = "Apply (1)"
+"commander.copy_to_left" = { label = "Copy", nth = 1 }
+"commander.left.open_image" = { label = "Open File...", via = "Open image, backup, or folder..." }
+"commander.left.apply" = { skip = true }
+"commander.staged" = "Apply (1)"
 "inspect.open_image" = { label = "Open File...", via = "Select a device or image..." }
+"inspect.remote" = { label = "Connect to Remote...", via = "Select a device or image..." }
+"inspect.remote_backup" = "Back Up Image..."
+"build.kind" = { skip = true }
+"build.next" = "Next"
+"build.save_as" = "Save As..."
+"build.cd_layout" = "Layout"
+"build.cd_size" = "Size to the folder"
+"build.cd_fill_from" = "Choose Folder..."
+"build.create" = "Create Disk"
+"build.done" = "Build Another"
 "expand_hfs.open" = "Expand/Export..."
 "expand_hfs.target_size" = "Target size (MiB):"
 "expand_hfs.save_as" = "Save As..."

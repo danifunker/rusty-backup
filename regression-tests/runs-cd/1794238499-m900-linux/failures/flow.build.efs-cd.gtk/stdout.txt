@@ -1,0 +1,103 @@
+frame: Rusty Backup
+button: Copy Log
+button: Clear Log
+check box: Auto-scroll
+label: Copy Log
+label: Clear Log
+label: Auto-scroll
+button: 1. Kind -- Go back to this step
+label: ->
+button: 2. Output -- Go back to this step
+label: ->
+label: 3. Disk
+label: ->
+label: 4. Review
+label: ->
+label: 5. Build
+button: Back
+button: Next
+label: 1. Kind
+label: 2. Output
+label: Back
+label: Next
+button: Commander Mode
+page tab: Backup
+page tab: Restore
+page tab: Build Disk
+page tab: Inspect
+page tab: Convert
+page tab: Optical
+page tab: Archives
+button: Menu
+button: Unlock Physical Devices -- Restart with root privileges (pkexec) to read and write physical disk devices. Disk image files do not need this.
+label: Commander Mode
+toggle button: Menu
+label: Unlock Physical Devices
+button: Minimize -- Minimize the window
+button: Maximize -- Maximize the window
+button: Close -- Close the window
+grouping: CD-ROM
+label: Backup
+label: Restore
+label: Build Disk
+label: Inspect
+label: Convert
+label: Optical
+label: Archives
+label: macOS ._ files: not available: Choose a folder to fill the disc from first.
+A modern Mac copying files to a disk that is not Mac formatted stores each file's Mac data (its resource fork, type and creator) in a hidden ._ file beside it. Each ._ file is put back into the file it belongs to, as its resource fork, type and creator, the way a classic Mac kept it. The ._ files themselves do not appear on the disc.
+label: CD-ROM
+combo box: Layout
+list item: Volume name Volume name
+switch: Size to the folder
+list item: Fill from
+switch: Unpack archives
+switch: Unpack every archive into the root
+switch: Decompress .gz files
+switch: Copy files out of disk images
+switch: Replace files with the same name
+switch: Ignore this computer's permissions
+combo box: macOS ._ files
+list item: Size Size -- Accepts K / M / G suffixes, e.g. 512M or 2G.
+label: Layout
+label: An Apple Partition Map with one HFS volume: what every Mac since System 3 mounts. Mac-only, no ISO 9660 side.
+label: Volume name
+label: Volume name
+text: Volume name
+label: Size to the folder
+switch: Size to the folder
+label: Fill from
+label: (a blank disc)
+button: Choose Folder... -- The folder's contents land at the disc's root; leave it blank to fill the disc later in Inspect or Commander.
+label: Unpack archives
+label: Not available: Choose a folder to fill the disc from first.
+Archives in the folder (.tar, .tardist, .zip, and classic Mac .sit, .cpt, .hqx) are opened and their contents put on the disc, in a folder named after each archive. Leave it off to put the archive files on the disc unopened.
+switch: Unpack archives
+label: Unpack every archive into the root
+label: Not available: Choose a folder to fill the disc from first.
+Instead of a folder per archive, every archive's contents go straight into the top of the disc, merged together. This is the layout an IRIX software CD needs, where inst is pointed at one folder holding every .tardist's contents. A file found in more than one archive is kept once.
+switch: Unpack every archive into the root
+label: Decompress .gz files
+label: Not available: Choose a folder to fill the disc from first.
+Files compressed with gzip go on the disc uncompressed: readme.gz lands as readme, and a .tgz or .tar.gz as a plain .tar. Handy for an old system with no gunzip. With Unpack archives on too, a .tar.gz is unpacked all the way.
+switch: Decompress .gz files
+label: Copy files out of disk images
+label: Not available: Choose a folder to fill the disc from first.
+Disk images in the folder (.dsk, .img, .hfv, .dmg, DiskCopy) are opened and the files inside them put on the disc, in a folder named after each image, Mac resource forks included. Leave it off to put the image files themselves on the disc.
+switch: Copy files out of disk images
+label: Replace files with the same name
+label: Not available: Choose a folder to fill the disc from first.
+When two things land at the same place on the disc (two archives holding the same file, say), the later one replaces the earlier one. With this off the build stops with an error instead, except when unpacking into the root, where the first copy is kept.
+switch: Replace files with the same name
+label: Ignore this computer's permissions
+label: Not available: Choose a folder to fill the disc from first.
+Normally each file keeps the owner and the read, write and run permissions it has on this computer. Turn this on to give every file the disc's standard owner and permissions instead, so the disc does not carry this computer's user ids.
+switch: Ignore this computer's permissions
+label: macOS ._ files
+label: Size
+label: Size
+text: Size
+label: 600.0 MiB, A CD-R holds about 650-700 MiB; a larger image still works in an emulator.
+label: Choose Folder...
+label: Classic Mac CD-ROM (HFS)
+label: Use as resource forks

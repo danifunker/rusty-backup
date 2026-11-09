@@ -1529,6 +1529,12 @@ fn run_case(
         None
     };
 
+    // A free local port for a case's daemon; `{port}` in any step names it.
+    let port_s = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port().to_string())
+        .unwrap_or_else(|_| "17341".to_string());
+    let mut daemons = Background(Vec::new());
     let scratch_s = scratch.display().to_string();
     let fixture_s = fixture_path.as_ref().map(|p| p.display().to_string());
     let copy_s = fixture_copy.as_ref().map(|p| p.display().to_string());
@@ -1536,6 +1542,7 @@ fn run_case(
 
     let resolve = move |raw: &str| -> String {
         let mut s = raw.replace("{scratch}", &scratch_s);
+        s = s.replace("{port}", &port_s);
         s = s.replace("{cases}", &cases_s);
         if let Some(f) = &fixture_s {
             s = s.replace("{fixture}", f);
@@ -1595,6 +1602,21 @@ fn run_case(
         }
         let args_resolved: Vec<String> = step.args.iter().map(|a| resolve(a)).collect();
 
+        if step.background {
+            if let Err(e) = daemons.start(&args.rb_cli, &args_resolved, &scratch, idx) {
+                result.verdict = Verdict::Error;
+                result.failed_step = Some(idx);
+                result.skip_reason = Some(e);
+                result.duration_ms = started.elapsed().as_millis();
+                return result;
+            }
+            if step.args.iter().any(|a| a.contains("{port}")) {
+                let port: u16 = resolve("{port}").parse().unwrap_or(0);
+                daemons.wait_port(port, Duration::from_secs(15));
+            }
+            continue;
+        }
+
         let out = match exec::run_with_env(&args.rb_cli, &args_resolved, &scratch, timeout, &case.env) {
             Ok(o) => o,
             Err(e) => {
@@ -1635,6 +1657,46 @@ fn run_case(
         let _ = fs::remove_dir_all(&scratch);
     }
     result
+}
+
+/// Processes a case started with `background = true`; killed when the case ends, however it ends.
+struct Background(Vec<std::process::Child>);
+
+impl Background {
+    fn start(&mut self, rb_cli: &Path, args: &[String], cwd: &Path, idx: usize) -> Result<(), String> {
+        let log = fs::File::create(cwd.join(format!("background-{}.log", idx)))
+            .map_err(|e| format!("background log: {}", e))?;
+        let err = log.try_clone().map_err(|e| e.to_string())?;
+        let child = std::process::Command::new(rb_cli)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(log)
+            .stderr(err)
+            .spawn()
+            .map_err(|e| format!("could not start {} in the background: {}", rb_cli.display(), e))?;
+        self.0.push(child);
+        Ok(())
+    }
+
+    fn wait_port(&self, port: u16, limit: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 /// The binary under test, as an absolute path into the repo's **release**

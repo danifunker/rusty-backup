@@ -1,0 +1,87 @@
+# Tier 8: putting files into and taking them out of each filesystem through Commander (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.files"
+description = "Inject a host file into, and extract one out of, every writable filesystem through a front-end."
+
+[[case]]
+id = "flow.files.inject"
+description = "Copy a host file into a fresh {fs} volume across Commander panes, apply, and check it with rb-cli get and fsck"
+level = "smoke"
+smoke_fs = ["fat", "hfs"]
+area = ["commander", "files"]
+fs = ["fat", "hfs", "hfsplus", "ntfs", "hpfs", "ext", "ext3", "ext4", "affs", "pfs3", "sfs", "prodos", "efs", "efs-v1", "minix2", "minix3", "ufs", "ofs"]
+shells = ["tui", "gtk"]
+capabilities = ["commander.host-folder", "commander.copy", "commander.apply"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "volume", "{fs}", "--size", "16M", "{scratch}/vol.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { activate = "commander.open" },
+  { pick = "{scratch}/vol.img" },
+  { activate = "commander.right.open_image" },
+  { wait = "[R] opened" },
+  { pick = "{cases}/tier8/data/inject" },
+  { activate = "commander.left.open_folder" },
+  { wait = "HELLO.TXT" },
+  { focus = "HELLO.TXT" },
+  { activate = "commander.copy_to_right" },
+  { activate = "commander.right.apply" },
+  { wait_gone = "commander.staged", timeout_ms = 60000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/vol.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case.step]]
+args = ["fsck", "{scratch}/vol.img", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+[[case]]
+id = "flow.files.extract"
+description = "Copy a file out of a {fs} volume into a host folder across Commander panes, apply, and compare the bytes"
+level = "smoke"
+smoke_fs = ["fat", "hfs"]
+area = ["commander", "files"]
+fs = ["fat", "hfs", "hfsplus", "ntfs", "hpfs", "ext", "ext3", "ext4", "affs", "pfs3", "sfs", "prodos", "efs", "efs-v1", "minix2", "minix3", "ufs", "ofs"]
+shells = ["tui", "gtk"]
+capabilities = ["commander.host-folder", "commander.copy", "commander.apply"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "volume", "{fs}", "--size", "16M", "{scratch}/vol.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/vol.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { activate = "commander.open" },
+  { pick = "{scratch}/vol.img" },
+  { activate = "commander.right.open_image" },
+  { wait = "[R] opened" },
+  { pick = "{scratch}" },
+  { activate = "commander.left.open_folder" },
+  { wait = "[L] opened" },
+  # The TUI copies from the active pane; GTK has a Copy button per direction.
+  { key = "Tab", only = "tui" },
+  { focus = "HELLO.TXT" },
+  { activate = "commander.copy_to_left" },
+  { activate = "commander.left.apply" },
+  { wait_gone = "commander.staged", timeout_ms = 60000 },
+]
+
+[[case.step]]
+args = ["--version"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/HELLO.TXT"]]

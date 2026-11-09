@@ -1,0 +1,2 @@
+observed: killed
+expected: (unasserted)

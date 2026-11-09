@@ -1,0 +1,40 @@
+ Backup|Restore|Inspect|Convert|Build Disk|New Disk|Optical|Archives|Commander|Settings    [rev: Commander]
++ L: (empty) ----------------------------------------------++ R: (empty) ----------------------------------------------+    [rev: L: (empty)]
+|                                                          ||                                                          |
+| Could not read partitions: parsing partition table of /ho|| Empty pane.                                              |
+|                                                          ||                                                          |
+|                                                          || Ctrl+O   open a disk image or archive                    |
+|                                                          || Ctrl+D   open a host folder                              |
+|                                                          || Ctrl+B   open a backup folder                            |
+|                                                          || Alt+K    connect to an rb-cli serve daemon               |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
+|                                                          ||                                                          |
++----------------------------------------------------------++----------------------------------------------------------+
+ [L] open failed.
+ Tab  Pane    F6  Copy    F8  Delete    F10  Apply    Ctrl+O  Image    Ctrl+D  Folder    F9  Vie            user v0.1.0    [rev: Tab  F6  F8  F10  Ctrl+O  Ctrl+D  F9]

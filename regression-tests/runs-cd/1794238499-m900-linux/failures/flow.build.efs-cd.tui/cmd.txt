@@ -1,0 +1,16 @@
+# argv, one element per line
+/home/dani/repos/rusty-backup/target/release/rb-cli
+tab = "Build Disk"
+focus = "build.kind"
+choose = "CD-ROM image"
+activate = "build.next"
+pick = "{scratch}/efs.iso"
+activate = "build.save_as"
+activate = "build.next"
+expect = "STOP-HERE"
+
+# working directory
+/home/dani/repos/rusty-backup/regression-tests/scratch-cd/flow.build.efs-cd.tui
+
+# copy-paste form
+"/home/dani/repos/rusty-backup/target/release/rb-cli" "tab = "Build Disk"" "focus = "build.kind"" "choose = "CD-ROM image"" "activate = "build.next"" "pick = "{scratch}/efs.iso"" "activate = "build.save_as"" "activate = "build.next"" "expect = "STOP-HERE""

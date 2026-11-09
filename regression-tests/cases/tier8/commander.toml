@@ -41,3 +41,20 @@ ui = [
 args = ["get", "{scratch}/dst.img", "/HELLO.TXT", "{scratch}/back.txt"]
 expect_exit = 0
 files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.commander.open-zip"
+description = "Open a zip straight from Commander's Open, as its help says it can, and list the file inside (R-090)"
+level = "full"
+area = ["commander"]
+shells = ["tui", "gtk"]
+capabilities = ["commander.archive-browse"]
+timeout_ms = 120000
+
+[[case.step]]
+ui = [
+  { activate = "commander.open" },
+  { pick = "{cases}/tier8/data/zipdir/in.zip" },
+  { activate = "commander.left.open_image" },
+  { wait = "HELLO.TXT", timeout_ms = 15000 },
+]

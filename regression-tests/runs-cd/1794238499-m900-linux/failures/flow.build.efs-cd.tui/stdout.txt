@@ -1,0 +1,40 @@
+ Backup|Restore|Inspect|Convert|Build Disk|New Disk|Optical|Archives|Commander|Settings    [rev: Build Disk]
++ Build Disk  -  Disk -------------------------------------------------------------------------------------------------+    [rev: Build Disk  -  Disk]
+|1. Kind -> 2. Output -> [3. Disk] -> 4. Review -> 5. Build                                                            |
+|                                                                                                                      |
+|> Layout           < Classic Mac CD-ROM (HFS) >                                                                       |
+|  Volume name      rusty-backup                                                                                       |
+|  Size             < fixed size >                                                                                     |
+|  Size             600M  (600.0 MiB)                                                                                  |
+|  Fill from        (blank disc; Enter to choose a folder)                                                             |
+|  Unpack archives  [ ]  (n/a: Choose a folder to fill the disc from first.)                                           |
+|  Unpack every archive into the root [ ]  (n/a: Choose a folder to fill the disc from first.)                         |
+|  Decompress .gz files [ ]  (n/a: Choose a folder to fill the disc from first.)                                       |
+|  Copy files out of disk images [ ]  (n/a: Choose a folder to fill the disc from first.)                              |
+|  Replace files with the same name [ ]  (n/a: Choose a folder to fill the disc from first.)                           |
+|  Ignore this computer's permissions [ ]  (n/a: Choose a folder to fill the disc from first.)                         |
+|  macOS ._ files   < Use as resource forks >  (n/a: Choose a folder to fill the disc from first.)                     |
+|                                                                                                                      |
+|Press n for the next step.                                                                                            |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
+|                                                                                                                      |
++----------------------------------------------------------------------------------------------------------------------+
+ Up/Dn  Row    <-/->  Change    Enter  Edit    n  Next    b  Back    ?  Help                                user v0.1.0    [rev: Up/Dn  <-/->  Enter  n  b  ?]

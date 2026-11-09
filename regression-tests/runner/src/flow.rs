@@ -134,6 +134,8 @@ pub fn describe(op: &UiOp) -> String {
         ("activate", &op.activate),
         ("pick", &op.pick),
         ("wait", &op.wait),
+        ("wait_gone", &op.wait_gone),
+        ("wait_file", &op.wait_file),
         ("expect", &op.expect),
         ("expect_not", &op.expect_not),
     ];
@@ -158,6 +160,9 @@ pub struct Control {
     pub via: Option<String>,
     /// Which of several same-named controls (0 first); on the `via` dropdown when there is one.
     pub nth: Option<usize>,
+    /// This shell has no such step (GTK copies to a host folder at once; the TUI stages it).
+    #[serde(default)]
+    pub skip: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -281,6 +286,26 @@ impl UiSession {
             if op.only.as_deref().is_some_and(|o| o != "gtk") {
                 continue;
             }
+            if let Some(f) = &op.wait_file {
+                let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
+                if !wait_file(Path::new(&resolve(f)), limit) {
+                    let screen = self.gtk_driver.as_mut().map(|d| d.log()).unwrap_or_default();
+                    return Err(UiError::Fail(
+                        FailedAssertion {
+                            op: format!("ui {}", describe(op)),
+                            selector: None,
+                            expected: format!("{} written", resolve(f)),
+                            observed: "not there, or still growing".to_string(),
+                        },
+                        screen,
+                    ));
+                }
+                continue;
+            }
+            let target = control(&self.controls, "gtk", &resolve(op_target(op)));
+            if target.skip && !op_target(op).is_empty() {
+                continue;
+            }
             let msg = self.gtk_message(op, resolve);
             let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
             let d = self.gtk_driver.as_mut().expect("started above");
@@ -352,6 +377,9 @@ impl UiSession {
         } else if let Some(w) = &op.wait {
             put("op", "wait".into());
             put("arg", label(&ctl(self, w), w));
+        } else if let Some(w) = &op.wait_gone {
+            put("op", "wait_gone".into());
+            put("arg", label(&ctl(self, w), w));
         } else if let Some(e) = &op.expect {
             put("op", "expect".into());
             put("arg", label(&ctl(self, e), e));
@@ -417,6 +445,9 @@ impl UiSession {
         limit: Duration,
     ) -> Result<(), (String, String)> {
         let ctl = control(&self.controls, "tui", &resolve(op_target(op)));
+        if ctl.skip && !op_target(op).is_empty() {
+            return Ok(());
+        }
         let s = self.tui.as_mut().expect("started");
         let screen = |s: &crate::tui::Session| s.text();
         let label = ctl.label.clone().unwrap_or_default();
@@ -447,6 +478,11 @@ impl UiSession {
                 }
             }
             answer_prompt(s, &mut self.pending_pick)?;
+        } else if let Some(f) = &op.wait_file {
+            let f = resolve(f);
+            if !wait_file(Path::new(&f), limit) {
+                return Err((format!("{} written", f), screen(s)));
+            }
         } else if let Some(p) = &op.pick {
             self.pending_pick = Some(resolve(p));
         } else if let Some(k) = &op.key {
@@ -468,6 +504,11 @@ impl UiSession {
             if !s.wait_for(limit, |sc| sc.text().contains(w.as_str())) {
                 return Err((format!("screen shows '{}'", w), screen(s)));
             }
+        } else if op.wait_gone.is_some() {
+            let w = label.clone();
+            if !s.wait_for(limit, |sc| !sc.text().contains(w.as_str())) {
+                return Err((format!("screen without '{}'", w), screen(s)));
+            }
         } else if op.expect.is_some() {
             let e = label.clone();
             s.settle(Duration::from_millis(200), Duration::from_secs(5));
@@ -485,12 +526,33 @@ impl UiSession {
     }
 }
 
+/// Wait until `path` exists and its size holds for half a second.
+fn wait_file(path: &Path, limit: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut last: Option<u64> = None;
+    let mut since = std::time::Instant::now();
+    while start.elapsed() < limit {
+        let size = std::fs::metadata(path).ok().map(|m| m.len());
+        if size.is_some() && size == last {
+            if since.elapsed() >= Duration::from_millis(500) {
+                return true;
+            }
+        } else {
+            last = size;
+            since = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 /// The control an op names, if it names one.
 fn op_target(op: &UiOp) -> &str {
     op.focus
         .as_deref()
         .or(op.activate.as_deref())
         .or(op.wait.as_deref())
+        .or(op.wait_gone.as_deref())
         .or(op.expect.as_deref())
         .or(op.expect_not.as_deref())
         .unwrap_or("")

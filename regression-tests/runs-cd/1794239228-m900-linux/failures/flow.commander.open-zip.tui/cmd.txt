@@ -1,0 +1,12 @@
+# argv, one element per line
+/home/dani/repos/rusty-backup/target/release/rb-cli
+activate = "commander.open"
+pick = "{cases}/tier8/data/zipdir/in.zip"
+activate = "commander.left.open_image"
+wait = "HELLO.TXT"
+
+# working directory
+/home/dani/repos/rusty-backup/regression-tests/scratch-cd/flow.commander.open-zip.tui
+
+# copy-paste form
+"/home/dani/repos/rusty-backup/target/release/rb-cli" "activate = "commander.open"" "pick = "{cases}/tier8/data/zipdir/in.zip"" "activate = "commander.left.open_image"" "wait = "HELLO.TXT""

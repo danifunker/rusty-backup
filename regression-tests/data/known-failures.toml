@@ -69,3 +69,25 @@
 # every one was fixed or shipped by 2026-09-06, the last being F-017 (XFS
 # leaf and node-form directories). The 24 cases are unchanged — they always
 # asserted the behaviour we wanted, and XPASS is what said so.
+
+# --- R-089 / R-090 — found by the tier-8 front-end flows, 2026-11-09 ---------
+
+[[known]]
+id = "flow.files.inject.ufs.tui"
+finding = "R-089"
+note = "Commander's preflight says a fresh UFS1 volume has 0 B free"
+
+[[known]]
+id = "flow.files.inject.ufs.gtk"
+finding = "R-089"
+note = "Commander's preflight says a fresh UFS1 volume has 0 B free"
+
+[[known]]
+id = "flow.commander.open-zip.tui"
+finding = "R-090"
+note = "Commander's open takes a zip for a disk image"
+
+[[known]]
+id = "flow.commander.open-zip.gtk"
+finding = "R-090"
+note = "Commander's open takes a zip for a disk image"

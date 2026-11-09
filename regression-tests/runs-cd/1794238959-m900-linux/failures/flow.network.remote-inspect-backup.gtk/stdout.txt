@@ -1,0 +1,108 @@
+frame: Rusty Backup
+button: Copy Log
+button: Clear Log
+check box: Auto-scroll
+label: Copy Log
+label: Clear Log
+label: Auto-scroll
+label: Note: physical devices need root privileges to open, so Edit Mode and device backups will fail. Click "Unlock Physical Devices" in the top bar to restart as root. Disk image files are unaffected.
+button: Commander Mode
+page tab: Backup
+page tab: Restore
+page tab: Build Disk
+page tab: Inspect
+page tab: Convert
+page tab: Optical
+page tab: Archives
+button: Menu
+button: Unlock Physical Devices -- Restart with root privileges (pkexec) to read and write physical disk devices. Disk image files do not need this.
+label: Source:
+button: Remote image: disk.img
+button: Pick Another Image -- Browse the daemon for another image (no reconnect)
+button: Back Up Image... -- Pull a full backup of this remote image to a local folder
+button: Close Remote -- Disconnect from the remote daemon
+button: Disk layout RUSTY-BACKU [FAT]  1.4 MiB
+label: Commander Mode
+toggle button: Menu
+label: Unlock Physical Devices
+button: Minimize -- Minimize the window
+button: Maximize -- Maximize the window
+button: Close -- Close the window
+toggle button: Remote image: disk.img
+label: Pick Another Image
+label: Back Up Image...
+label: Close Remote
+table cell: Re-inspect
+table cell: Export Disk Image...
+table cell: Edit Partition Table...
+table cell: Add Partition... -- No free space available
+table cell: Expand Image... -- Only image files can be expanded - devices have fixed size.
+table cell: Make Bootable... -- Auto-detect what this Mac disk needs to boot (SCSI driver + DDR on a full APM disk, boot blocks, blessed System Folder) and apply only the missing pieces. A flat HFV is kept flat; you'll be asked for a donor disk only if boot blocks are missing.
+table cell: Resize Partitions...
+label: Partition Table: None (superfloppy)
+label: Alignment: Modern 1MB boundaries
+First LBA: 0
+button: Re-inspect
+button: Export Disk Image...
+button: Edit Partition Table...
+button: Add Partition... -- No free space available
+button: Expand Image... -- Only image files can be expanded - devices have fixed size.
+button: Make Bootable... -- Auto-detect what this Mac disk needs to boot (SCSI driver + DDR on a full APM disk, boot blocks, blessed System Folder) and apply only the missing pieces. A flat HFV is kept flat; you'll be asked for a donor disk only if boot blocks are missing.
+button: Resize Partitions...
+table row: # Type Volume Start LBA Size Min Size Defrag Min Block Size Boot
+label: Re-inspect
+label: Export Disk Image...
+label: Edit Partition Table...
+label: Add Partition...
+label: Expand Image...
+label: Make Bootable...
+label: Resize Partitions...
+label: Disk layout
+filler: #
+filler: Type
+filler: Volume
+filler: Start LBA
+filler: Size
+filler: Min Size
+filler: Defrag Min
+filler: Block Size
+filler: Boot
+table row: 1 FAT RUSTY-BACKU 0 1.4 MiB 17.0 KiB 9.0 KiB Browse Check -- Position in this list - the number `IMG@N` takes Smallest size achievable by trim alone (no data movement) Smallest size achievable by cloning into a packed target. Used when restoring with "Resize partitions to minimum size."
+label: Backup
+label: Restore
+label: Build Disk
+label: Inspect
+label: Convert
+label: Optical
+label: Archives
+label: Remote image: disk.img
+table cell: RUSTY-BACKU [FAT]  1.4 MiB
+table cell: 1 -- Position in this list - the number `IMG@N` takes
+table cell: FAT
+table cell: RUSTY-BACKU
+table cell: 0
+table cell: 1.4 MiB
+table cell: 17.0 KiB -- Smallest size achievable by trim alone (no data movement)
+table cell: 9.0 KiB -- Smallest size achievable by cloning into a packed target. Used when restoring with "Resize partitions to minimum size."
+table cell: Browse Check
+label: #
+label: Type
+label: Volume
+label: Start LBA
+label: Size
+label: Min Size
+label: Defrag Min
+label: Block Size
+label: Boot
+label: 1 -- Position in this list - the number `IMG@N` takes
+label: FAT
+label: RUSTY-BACKU
+label: 0
+label: 1.4 MiB
+label: 9.0 KiB -- Smallest size achievable by cloning into a packed target. Used when restoring with "Resize partitions to minimum size."
+label: RUSTY-BACKU [FAT]  1.4 MiB
+label: 17.0 KiB -- Smallest size achievable by trim alone (no data movement)
+button: Browse
+button: Check
+label: Browse
+label: Check

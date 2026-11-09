@@ -148,6 +148,11 @@ pub struct Step {
     #[serde(default)]
     pub ui: Vec<UiOp>,
 
+    /// Start this `rb-cli` and leave it running until the case ends (a `serve` daemon); when
+    /// its args name `{port}`, the next step waits until that port takes connections.
+    #[serde(default)]
+    pub background: bool,
+
     /// Expected process exit code. Values come from `src/cli/exit.rs`:
     /// 0 success, 1 generic failure, 2 usage error, 3 not found,
     /// 4 permission denied, 5 user declined.
@@ -222,6 +227,11 @@ pub struct UiOp {
     pub pick: Option<String>,
     /// Wait until the screen shows this.
     pub wait: Option<String>,
+    /// Wait until the screen no longer shows this (a staged count clearing, a dialog closing).
+    pub wait_gone: Option<String>,
+    /// Wait until this file exists and its size holds still: a job's output, read the same on
+    /// every shell (a GTK log line is not in its accessibility tree).
+    pub wait_file: Option<String>,
     /// The screen must show this now (after a short settle).
     pub expect: Option<String>,
     /// The screen must not show this.
@@ -245,6 +255,8 @@ impl UiOp {
             self.activate.is_some(),
             self.pick.is_some(),
             self.wait.is_some(),
+            self.wait_gone.is_some(),
+            self.wait_file.is_some(),
             self.expect.is_some(),
             self.expect_not.is_some(),
         ]
@@ -490,6 +502,8 @@ impl Step {
                 &mut op.activate,
                 &mut op.pick,
                 &mut op.wait,
+                &mut op.wait_gone,
+                &mut op.wait_file,
                 &mut op.expect,
                 &mut op.expect_not,
             ]

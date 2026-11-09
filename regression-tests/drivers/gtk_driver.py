@@ -266,27 +266,51 @@ def set_pick(path):
 
 
 def combo_value(n, choices=None):
-    """The value a combo row shows: a label inside it that is not the row's own title."""
+    """The value a combo row shows: a drop-down draws it in a list row; else the first other label.
+
+    Breadth first, so the shown value comes before the popover's rows; the row's title and
+    subtitle are labels too, which is why a label in a list row wins.
+    """
     title = name_of(n)
+    first = ""
     for c in nodes(n, limit=200):
         if c is n or not showing(c):
             continue
         nm = name_of(c)
-        # Breadth first: the shown value is shallower than the popover's rows.
-        if not nm or nm == title:
+        if not nm or nm == title or role_of(c) not in ("label", "text", "static"):
             continue
-        if (choices is None or nm in choices) and role_of(c) in ("label", "text", "static"):
+        if choices is not None and nm not in choices:
+            continue
+        if row_of(c) is not None:
             return nm
-    return ""
+        first = first or nm
+    return first
 
 
+
+
+def radio_named(value):
+    for c in nodes(APP):
+        if role_of(c) == "radio button" and showing(c) and (
+                name_of(c) == value or name_of(c).startswith(value)):
+            return c
+    return None
 
 
 def choose(n, value):
-    """Set a combo row, switch or spin to `value`."""
+    """Set a radio group, combo row, switch or spin to `value`."""
+    radio = radio_named(value)
+    if radio is not None:
+        if not has_state(radio, Atspi.StateType.CHECKED):
+            click(radio)
+        if not wait_until(lambda: has_state(radio, Atspi.StateType.CHECKED), 3):
+            raise Fail(f"radio {value!r} selected", visible_text())
+        return
+    if n is None:
+        raise Fail(f"a control to set to {value!r}", visible_text())
     role = role_of(n)
     if role in COMBO_ROLES:
-        if combo_value(n).casefold() == value.casefold():
+        if combo_value(n).casefold().startswith(value.casefold()):
             return
         click(n)
         time.sleep(0.5)
@@ -295,22 +319,36 @@ def choose(n, value):
         end = time.time() + 5
         while row is None and time.time() < end:
             for c in nodes(APP):
-                if c is not n and showing(c) and name_of(c).casefold() == want \
+                if c is not n and showing(c) and name_of(c).casefold().startswith(want) \
                         and not is_inside(c, n) and row_of(c) is not None:
                     row = row_of(c)
                     break
             time.sleep(0.2)
         if row is not None:
+            # The popover opens on the current value: count the rows between it and the target.
+            entries = popover_entries(row)
+            now = combo_value(n)
+            idx = [i for i, e in enumerate(entries) if e.casefold().startswith(want)]
+            cur = [i for i, e in enumerate(entries) if e == now]
+            if idx and cur:
+                step = idx[0] - cur[0]
+                for _ in range(abs(step)):
+                    xdo("key", "Down" if step > 0 else "Up")
+                    time.sleep(0.12)
+                xdo("key", "Return")
+                time.sleep(0.4)
+                if wait_until(lambda: combo_value(n).casefold().startswith(want), 3):
+                    return
             # A drop-down may move its value as the keyboard moves, so either sign means "there".
             here = lambda: (has_state(row, Atspi.StateType.FOCUSED)
                             or has_state(row, Atspi.StateType.SELECTED)
-                            or combo_value(n).casefold() == want)
+                            or combo_value(n).casefold().startswith(want))
             for direction in ("Down", "Up"):
                 for _ in range(30):
                     if here():
                         xdo("key", "Return")
                         time.sleep(0.4)
-                        if wait_until(lambda: combo_value(n).casefold() == want, 3):
+                        if wait_until(lambda: combo_value(n).casefold().startswith(want), 3):
                             return
                         break
                     xdo("key", direction)
@@ -322,6 +360,17 @@ def choose(n, value):
             activate(n)
         return
     raise Fail(f"{label_of(n)} to take a choice", visible_text())
+
+
+def popover_entries(row):
+    """The names of the rows in the list holding `row`, in order."""
+    lst = row.get_parent()
+    out = []
+    for i in range(lst.get_child_count() if lst else 0):
+        r = lst.get_child_at_index(i)
+        names = [name_of(c) for c in nodes(r, limit=20) if role_of(c) == "label" and name_of(c)]
+        out.append(names[0] if names else "")
+    return out
 
 
 def is_inside(c, n):
@@ -411,7 +460,7 @@ def run(op):
         if role_of(CURRENT) in ROW_ROLES and row_of(CURRENT) is None:
             click(CURRENT)  # select a row in a list or table; popover rows are walked instead
     elif kind == "choose":
-        choose(CURRENT or find(op["label"]), arg)
+        choose(CURRENT, arg)
     elif kind == "activate":
         nth = op.get("nth", 0)
         if op.get("via"):
@@ -439,6 +488,9 @@ def run(op):
     elif kind == "wait":
         if not wait_until(lambda: shows(arg), limit):
             raise Fail(f"the window shows {arg!r}", visible_text())
+    elif kind == "wait_gone":
+        if not wait_until(lambda: not shows(arg), limit):
+            raise Fail(f"the window without {arg!r}", visible_text())
     elif kind == "expect":
         if not wait_until(lambda: shows(arg), 2):
             raise Fail(f"the window shows {arg!r}", visible_text())

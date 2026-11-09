@@ -113,6 +113,24 @@ finding depends on a fixture, the fixture is named.
 
 ## Found during Phase 2 slice 29, 2026-11-04
 
+### R-090 — Commander's open treats a zip or tar as a disk image {#r-090}
+
+Commander's Open (`Ctrl+O` in the TUI, "Open File..." in GTK) sends a `.zip` or `.tar` down the
+disk-image path and fails with "Could not read partitions", though the TUI's own help line says it
+opens "a disk image or archive". `open_image` in `src/controller/browser/pane/source.rs` only takes
+Mac archives as archives (`is_mac_archive_path`); `commander_descend::classify` already calls ZIP and
+the tar family archives, which is why the same zip opens fine from a host folder. Found 2026-11-09
+by the tier-8 Commander flows; pinned by `flow.commander.open-zip.{tui,gtk}`.
+
+### R-089 — Commander says a fresh UFS volume has 0 B free {#r-089}
+
+Copying a 26-byte file into a new 16 MiB UFS1 volume (`rb-cli new volume ufs`) stops at Commander's
+pre-apply check: "Not enough space: needs about 512 B, 0 B free on UFS1", in both the TUI and GTK.
+`rb-cli put` writes the same file and `fsck` is clean, so the volume has room; the figure comes from
+`UfsFilesystem::free_space` (`crates/fs-unix/src/ufs.rs`), which sums each cylinder group's
+`cg_cs` counts, so either the formatter leaves those at zero or they are read wrong. Every other
+filesystem in the flow passes. Found 2026-11-09 by `flow.files.inject.ufs.{tui,gtk}`.
+
 ### R-088 — the CLI could exit before printing its log {#r-088}
 
 The log thread woke every 200 ms and nothing waited for it, so whatever came in the last wake was
