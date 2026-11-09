@@ -38,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
+use crate::alto::AltoWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
 use crate::expand_image::{self, ExpandImageWindow};
@@ -159,6 +160,8 @@ pub struct InspectScreen {
     check: HWND,
     expand: HWND,
     defragment: HWND,
+    resize_alto: HWND,
+    alto: RefCell<Option<Rc<AltoWindow>>>,
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
     expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     check_window: RefCell<Option<Rc<ReportWindow>>>,
@@ -259,6 +262,7 @@ impl InspectScreen {
         let check = ui::button(page, "Check", ids::ROW_CHECK);
         let expand = ui::button(page, "Expand/Export...", ids::ROW_EXPAND_HFS);
         let defragment = ui::button(page, "Defragment...", ids::ROW_DEFRAGMENT);
+        let resize_alto = ui::button(page, "Resize...", ids::ROW_RESIZE_ALTO);
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             ctrl: RefCell::new(InspectController::new(InspectServices {
                 jobs: JobRegistry::new(),
@@ -300,6 +304,8 @@ impl InspectScreen {
             check,
             expand,
             defragment,
+            resize_alto,
+            alto: RefCell::default(),
             hfs: RefCell::default(),
             expand_window: RefCell::default(),
             check_window: RefCell::default(),
@@ -325,8 +331,30 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let alto = self.alto.borrow().clone();
+        if let Some(d) = alto {
+            d.tick();
+            if !d.is_open() {
+                self.alto.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
+    }
+
+    /// Resize Alto Disk: a dialog with its own controller, on the open image file.
+    fn open_alto(&self) {
+        if self.alto.borrow().is_some() {
+            return;
+        }
+        let source = self.ctrl.borrow().alto_resize_source();
+        match source {
+            Ok(path) => {
+                let d = AltoWindow::open(self.owner, self.notify.clone(), self.host.clone(), path);
+                *self.alto.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
     }
 
     /// The app's device list; a change under the open device closes or re-inspects it.
@@ -587,6 +615,8 @@ impl InspectScreen {
         ui::set_enabled(self.expand, acts.browse && acts.expand_hfs && !locked);
         ui::set_visible(self.defragment, acts.browse && acts.defragment);
         ui::set_enabled(self.defragment, !locked);
+        ui::set_visible(self.resize_alto, acts.browse && acts.resize_alto);
+        ui::set_enabled(self.resize_alto, !locked);
     }
 
     /// Open, update or close the Check and CHD Info windows to match the controller.
@@ -846,6 +876,7 @@ impl InspectScreen {
             Node::button(self.check, 80),
             Node::button(self.expand, 130),
             Node::button(self.defragment, 110),
+            Node::button(self.resize_alto, 90),
             Node::Space(Size::Stretch(1)),
         ]));
         self.shape.set(self.shape_now());
@@ -953,6 +984,9 @@ impl Handler for InspectScreen {
                 InspectAction::ExpandHfs(index)
             } else if from == self.defragment {
                 InspectAction::Defragment(index)
+            } else if from == self.resize_alto {
+                self.open_alto();
+                return;
             } else {
                 return;
             }

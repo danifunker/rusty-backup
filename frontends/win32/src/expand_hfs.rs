@@ -99,7 +99,7 @@ impl ExpandHfsWindow {
             ids::TARGET_SIZE,
         );
         let out_label = ui::label(window, "Output file:");
-        let output = ui::label(window, "(not chosen)");
+        let output = ui::path_label(window, "(not chosen)");
         let save = ui::button(window, labels::SAVE_AS, ids::SAVE_AS);
         let phase = ui::label(window, "");
         let outcome = ui::label(window, "");

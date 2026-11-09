@@ -6,6 +6,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[cfg(windows)]
+mod alto;
+#[cfg(windows)]
 mod app;
 #[cfg(windows)]
 mod effects;

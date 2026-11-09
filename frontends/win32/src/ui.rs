@@ -128,6 +128,19 @@ pub fn label(parent: HWND, text: &str) -> HWND {
     )
 }
 
+/// A one-line label for a file path: a path too long to fit loses its middle, not its end.
+pub fn path_label(parent: HWND, text: &str) -> HWND {
+    // SS_PATHELLIPSIS: a path has no spaces to wrap at, so a wrapping label would hide it.
+    child(
+        parent,
+        w!("STATIC"),
+        text,
+        WINDOW_STYLE(0x8000),
+        WINDOW_EX_STYLE(0),
+        "",
+    )
+}
+
 #[allow(dead_code)] // the screens' text fields, from slice 1 on
 pub fn edit(parent: HWND, id: &str) -> HWND {
     child(
