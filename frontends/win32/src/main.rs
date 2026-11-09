@@ -63,7 +63,7 @@ fn main() {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetAncestor, GetMessageW, IsDialogMessageW, TranslateMessage, GA_ROOT,
-        MSG,
+        MSG, WM_KEYDOWN,
     };
 
     capture::init();
@@ -84,6 +84,11 @@ fn main() {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Tab moves between controls in the main window and in each modeless dialog.
             let root = GetAncestor(msg.hwnd, GA_ROOT);
+            let vk = msg.wParam.0 as u16;
+            // F1 to F24 in a window go to its screen's key map, as its other keys do not.
+            if msg.message == WM_KEYDOWN && (0x70..=0x87).contains(&vk) && panel::key(root, vk) {
+                continue;
+            }
             if app::window().is_some()
                 && !root.is_invalid()
                 && IsDialogMessageW(root, &msg).as_bool()

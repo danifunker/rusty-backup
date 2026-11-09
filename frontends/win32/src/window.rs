@@ -593,6 +593,10 @@ impl ModelWindow {
         });
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.window
+    }
+
     /// Where the window stands, for a rebuild to open in the same place.
     pub fn rect(&self) -> RECT {
         let mut r = RECT::default();

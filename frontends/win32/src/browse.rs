@@ -1000,7 +1000,15 @@ impl BrowseView {
                     view.window_event(kind, e);
                 }
             });
-            open.push(ModelWindow::open(owner, &p, rect, on_event));
+            let w = ModelWindow::open(owner, &p, rect, on_event);
+            let me = self.me.clone();
+            let keys: panel::KeyHook = Rc::new(move |vk| {
+                let view = me.upgrade();
+                let key = key_of(vk).filter(|k| matches!(k, Key::F(_)));
+                matches!((view, key), (Some(v), Some(k)) if v.key(k, mods()))
+            });
+            panel::set_keys(w.hwnd(), keys);
+            open.push(w);
         }
     }
 

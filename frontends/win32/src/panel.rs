@@ -33,8 +33,32 @@ pub trait Handler {
     fn close(&self);
 }
 
+/// A window's function keys: true when the key map took the virtual key.
+pub type KeyHook = Rc<dyn Fn(u16) -> bool>;
+
 thread_local! {
     static PANELS: RefCell<Vec<(isize, Weak<dyn Handler>)>> = const { RefCell::new(Vec::new()) };
+    static KEYS: RefCell<Vec<(isize, KeyHook)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Send `hwnd`'s function keys to `hook` first, as GTK forwards a window's keys to its screen.
+pub fn set_keys(hwnd: HWND, hook: KeyHook) {
+    KEYS.with(|k| {
+        let mut k = k.borrow_mut();
+        k.retain(|(h, _)| *h != hwnd.0 as isize);
+        k.push((hwnd.0 as isize, hook));
+    });
+}
+
+/// Offer virtual key `vk`, pressed in top-level window `root`, to its hook; true when taken.
+pub fn key(root: HWND, vk: u16) -> bool {
+    let hook = KEYS.with(|k| {
+        k.borrow()
+            .iter()
+            .find(|(h, _)| *h == root.0 as isize)
+            .map(|(_, f)| f.clone())
+    });
+    hook.is_some_and(|f| f(vk))
 }
 
 pub fn register(hwnd: HWND, handler: Weak<dyn Handler>) {
@@ -43,6 +67,7 @@ pub fn register(hwnd: HWND, handler: Weak<dyn Handler>) {
 
 pub fn unregister(hwnd: HWND) {
     PANELS.with(|p| p.borrow_mut().retain(|(h, _)| *h != hwnd.0 as isize));
+    KEYS.with(|k| k.borrow_mut().retain(|(h, _)| *h != hwnd.0 as isize));
 }
 
 fn handler(hwnd: HWND) -> Option<Rc<dyn Handler>> {

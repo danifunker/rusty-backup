@@ -170,9 +170,9 @@ in check-group mode with the bundled icons); the screens and slices below are un
    for a form's button), and a window whose key holds takes new text in place, so typing
    survives a refresh. The side panel gained the ProDOS name and QNX RS-to-LF options, Save /
    Browse Mac archive, Edit as text, Edit Metadata and Export as Mac archive. Esc closes any of
-   the shell's windows. `flow.browse.inspect-edit-text` passes. Not done: F1 inside a window
-   (the help window's footer names it), and drag and drop onto the listing (slice 3, with
-   Commander).
+   the shell's windows, and F1 to F24 in one go through the key map (`panel::set_keys`), as
+   GTK forwards them. `flow.browse.inspect-edit-text` passes. Drag and drop onto the listing
+   lands with slice 3.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
