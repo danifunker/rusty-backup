@@ -40,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
+use crate::expand_image::{self, ExpandImageWindow};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::report::{self, ReportWindow};
@@ -110,6 +111,7 @@ struct Shown {
     selected: Option<usize>,
     can_reinspect: bool,
     can_bootable: bool,
+    can_expand_image: bool,
     can_close: bool,
     has_chd: bool,
     can_convert: bool,
@@ -142,6 +144,7 @@ pub struct InspectScreen {
     convert_btn: HWND,
     bootable: HWND,
     chd: HWND,
+    expand_image: HWND,
     close: HWND,
     details: HWND,
     bar: HWND,
@@ -155,7 +158,9 @@ pub struct InspectScreen {
     calc_min: HWND,
     check: HWND,
     expand: HWND,
+    defragment: HWND,
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
+    expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     check_window: RefCell<Option<Rc<ReportWindow>>>,
     chd_window: RefCell<Option<Rc<ReportWindow>>>,
 }
@@ -196,6 +201,7 @@ impl InspectScreen {
         let convert_btn = ui::button(page, "Convert...", ids::CONVERT);
         let bootable = ui::button(page, "Make Bootable...", ids::MAKE_BOOTABLE);
         let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
+        let expand_image = ui::button(page, "Expand Image...", ids::EXPAND_IMAGE);
         let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
         let bar_target: Rc<RefCell<Weak<InspectScreen>>> = Rc::default();
@@ -252,6 +258,7 @@ impl InspectScreen {
         let calc_min = ui::button(page, "Calc min", ids::ROW_CALC_MIN);
         let check = ui::button(page, "Check", ids::ROW_CHECK);
         let expand = ui::button(page, "Expand/Export...", ids::ROW_EXPAND_HFS);
+        let defragment = ui::button(page, "Defragment...", ids::ROW_DEFRAGMENT);
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             ctrl: RefCell::new(InspectController::new(InspectServices {
                 jobs: JobRegistry::new(),
@@ -280,6 +287,7 @@ impl InspectScreen {
             convert_btn,
             bootable,
             chd,
+            expand_image,
             close,
             details,
             bar,
@@ -291,7 +299,9 @@ impl InspectScreen {
             calc_min,
             check,
             expand,
+            defragment,
             hfs: RefCell::default(),
+            expand_window: RefCell::default(),
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
         });
@@ -449,6 +459,7 @@ impl InspectScreen {
             selected: c.selected_partition(),
             can_reinspect: c.can_reinspect(),
             can_bootable: c.can_make_bootable(),
+            can_expand_image: c.can_expand_image(),
             can_close: c.can_close(),
             has_chd: c.chd_path().is_some(),
             can_convert: c.convert_source().is_some(),
@@ -481,6 +492,7 @@ impl InspectScreen {
         self.show_job(s.jobs.first());
         ui::set_enabled(self.reinspect, s.can_reinspect);
         ui::set_enabled(self.bootable, s.can_bootable);
+        ui::set_enabled(self.expand_image, s.can_expand_image);
         ui::set_visible(self.convert_btn, s.can_convert);
         ui::set_visible(self.chd, s.has_chd);
         ui::set_visible(self.close, s.can_close);
@@ -573,6 +585,8 @@ impl InspectScreen {
         ui::set_enabled(self.calc_min, can_calc && !locked);
         ui::set_enabled(self.check, acts.browse && acts.check && !locked);
         ui::set_enabled(self.expand, acts.browse && acts.expand_hfs && !locked);
+        ui::set_visible(self.defragment, acts.browse && acts.defragment);
+        ui::set_enabled(self.defragment, !locked);
     }
 
     /// Open, update or close the Check and CHD Info windows to match the controller.
@@ -811,6 +825,7 @@ impl InspectScreen {
             Node::button(self.convert_btn, 90),
             Node::button(self.bootable, 120),
             Node::button(self.chd, 80),
+            Node::button(self.expand_image, 120),
             Node::Space(Size::Stretch(1)),
             Node::button(self.close, 80),
         ])]);
@@ -830,6 +845,7 @@ impl InspectScreen {
             Node::button(self.calc_min, 80),
             Node::button(self.check, 80),
             Node::button(self.expand, 130),
+            Node::button(self.defragment, 110),
             Node::Space(Size::Stretch(1)),
         ]));
         self.shape.set(self.shape_now());
@@ -859,6 +875,40 @@ impl InspectScreen {
         }
     }
 
+    /// Expand Image's window: the view's own, previewing sizes through the controller.
+    fn open_expand_image(&self) {
+        if self.expand_window.borrow().is_some() {
+            return;
+        }
+        let me = self.me.clone();
+        let w = ExpandImageWindow::open(
+            self.owner,
+            Box::new(move |event| {
+                let Some(s) = me.upgrade() else { return };
+                match event {
+                    expand_image::Event::Preview(mib) => s.preview_expand(mib),
+                    expand_image::Event::Expand(bytes) => {
+                        s.expand_window.replace(None);
+                        s.apply(InspectAction::ExpandImage(bytes));
+                    }
+                    expand_image::Event::Close => {
+                        s.expand_window.replace(None);
+                    }
+                }
+            }),
+        );
+        *self.expand_window.borrow_mut() = Some(w);
+        self.preview_expand(0);
+    }
+
+    fn preview_expand(&self, mib: u32) {
+        let (current, new) = self.ctrl.borrow_mut().expand_image_preview(mib);
+        if let Some(w) = self.expand_window.borrow().as_ref() {
+            debug_assert_eq!(w.added(), mib);
+            w.show(current, new);
+        }
+    }
+
     fn row_index(&self) -> Option<usize> {
         self.rows.borrow().get(self.cursor.get()).map(|r| r.index)
     }
@@ -884,6 +934,9 @@ impl Handler for InspectScreen {
             InspectAction::MakeBootable
         } else if from == self.chd {
             InspectAction::ChdInfo
+        } else if from == self.expand_image {
+            self.open_expand_image();
+            return;
         } else if from == self.close {
             InspectAction::Close
         } else if from == self.convert_btn {
@@ -898,6 +951,8 @@ impl Handler for InspectScreen {
                 InspectAction::Check(index)
             } else if from == self.expand {
                 InspectAction::ExpandHfs(index)
+            } else if from == self.defragment {
+                InspectAction::Defragment(index)
             } else {
                 return;
             }

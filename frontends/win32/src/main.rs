@@ -12,6 +12,8 @@ mod effects;
 #[cfg(windows)]
 mod expand_hfs;
 #[cfg(windows)]
+mod expand_image;
+#[cfg(windows)]
 mod inspect;
 mod layout;
 #[cfg(windows)]
