@@ -297,6 +297,71 @@ impl InspectController {
     }
 }
 
+impl InspectController {
+    /// The facts above the partition list, one line each, as every shell shows them.
+    pub fn detail_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(m) = self.backup_summary() {
+            lines.push(format!("Backup Info: Source: {}", m.source));
+            lines.push(format!("Created: {}   Table: {}", m.created, m.table));
+            let mut mode = format!("Compression: {}   Checksum: {}", m.compression, m.checksum);
+            if m.sector_by_sector {
+                mode.push_str(" (sector-by-sector)");
+            }
+            lines.push(mode);
+            let alignment = format!("Alignment: {}", m.alignment);
+            lines.push(if m.min_restore_bytes > 0 {
+                format!(
+                    "Minimum Size: {}   {alignment}",
+                    format_size_exact(m.min_restore_bytes)
+                )
+            } else if m.source_size_bytes > 0 {
+                format!(
+                    "Source Size: {}   {alignment}",
+                    format_size(m.source_size_bytes)
+                )
+            } else {
+                alignment
+            });
+        }
+        if let Some(c) = self.clonezilla_summary() {
+            lines.push(format!("Clonezilla Image: Disk: {}", c.disk_name));
+            let mut size = format!("Source Size: {}", format_size_exact(c.source_size_bytes));
+            if let Some((cyl, heads, sectors)) = c.chs {
+                size.push_str(&format!("  CHS: {cyl} / {heads} / {sectors}"));
+            }
+            lines.push(size);
+            lines.extend(c.created.map(|d| format!("Created: {d}")));
+        }
+        let table = self.table_summary();
+        if let Some(t) = &table {
+            lines.push(if t.superfloppy {
+                "Partition Table: None (superfloppy)".to_string()
+            } else {
+                format!(
+                    "Partition Table: {} (disk signature: 0x{:08X})",
+                    t.type_name, t.disk_signature
+                )
+            });
+            if let Some(order) = t.byte_order {
+                lines.push(format!("Word order: {order} (16-bit words)"));
+            }
+        }
+        if let Some(a) = self.alignment().filter(|_| table.is_some()) {
+            lines.push(format!("Alignment: {}", a.kind));
+            let mut lba = format!("First LBA: {}", a.first_lba);
+            if a.heads > 0 {
+                lba.push_str(&format!(
+                    "  CHS Geometry: {} heads x {} sectors/track",
+                    a.heads, a.sectors_per_track
+                ));
+            }
+            lines.push(lba);
+        }
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

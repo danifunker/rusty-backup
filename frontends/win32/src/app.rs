@@ -154,6 +154,13 @@ pub fn start() {
     app.tick();
 }
 
+/// Run the controllers now, as a wake does; a screen asks after handing something to the app.
+pub fn tick() {
+    if let Some(app) = app() {
+        app.tick();
+    }
+}
+
 /// Add a screen's drained log lines to the log panel.
 pub fn append_log(lines: Vec<(LogLevel, String)>) {
     if lines.is_empty() {

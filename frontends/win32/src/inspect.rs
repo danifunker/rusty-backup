@@ -1,8 +1,10 @@
-//! The Inspect tab over `controller::inspect::InspectController`; `src/gui/inspect_tab.rs` is the reference.
+//! The Inspect screen over `controller::inspect::InspectController`; `src/gui/inspect_tab.rs` is the reference.
 //!
-//! Slice 1, first pass: the source row, the table summary, the partition list (a virtual list
-//! view) and the row tools that act on the selected row, with Expand HFS Volume. The partition
-//! bar, browse view, remote listing and the other tools and windows follow.
+//! Slice 1: the source (a split button whose menu lists recent files and devices, beside Open
+//! File and Open Backup Folder), the facts, the running jobs, the tools, the partition list (a
+//! virtual list view) with the tools that act on its selected row, and the Check and CHD Info
+//! windows. Still to come: the partition bar, Export, the table editor, Expand Image, Resize,
+//! Defragment, Alto resize, the remote listing (slice 7b) and browsing (slice 2).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -10,33 +12,37 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use rusty_backup::controller::app::{
-    unelevated_device_note, DiskDevice, Notify, RecentHandle, RecentMode,
+    unelevated_device_note, DiskDevice, Notify, Progress, RecentHandle, RecentMode, Snapshot,
 };
 use rusty_backup::controller::inspect::{
     format_size, ids, purpose, HostRequest, InspectAction, InspectController, InspectServices,
-    JobRegistry, MinCell, PartitionRow,
+    InspectSource, JobRegistry, MinCell, PartitionRow,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
-use windows::core::{w, PWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{w, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::Controls::{
-    LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVNI_SELECTED, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVSICF_NOSCROLL,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NMHDR, NMLISTVIEW, NMLVDISPINFOW,
+    BCN_DROPDOWN, BS_SPLITBUTTON, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT, LVCF_TEXT,
+    LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVNI_SELECTED, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
+    LVSICF_NOSCROLL, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW, NMLVDISPINFOW, PBM_SETMARQUEE, PBM_SETPOS,
+    PBM_SETRANGE32, PBS_MARQUEE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, BN_CLICKED, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetWindowLongPtrW, GetWindowRect, SendMessageW,
+    SetWindowLongPtrW, TrackPopupMenu, BN_CLICKED, GWL_STYLE, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    TPM_RETURNCMD, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
+use crate::report::{self, ReportWindow};
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -50,6 +56,11 @@ const COLUMNS: [(&str, i32, bool); 7] = [
     ("Min Size", 100, true),
     ("Block", 80, true),
 ];
+
+/// Recent files the source menu lists, as egui's picker does.
+const RECENT_ROWS: usize = 5;
+const MENU_RECENT: usize = 1000;
+const MENU_DEVICE: usize = 2000;
 
 fn cell(row: &PartitionRow, column: usize) -> String {
     match column {
@@ -65,6 +76,43 @@ fn cell(row: &PartitionRow, column: usize) -> String {
         },
         _ => row.block_size.clone(),
     }
+}
+
+/// A job's one-line summary (what runs, its phase, how far) and its percentage when known.
+fn job_line(s: &Snapshot) -> (String, Option<u32>) {
+    let pct = match &s.progress {
+        Progress::Determinate { done, total, .. } if *total > 0 => {
+            Some((done.saturating_mul(100) / total).min(100) as u32)
+        }
+        _ => None,
+    };
+    let mut line = s.label.clone();
+    if !s.phase.is_empty() {
+        line.push_str(": ");
+        line.push_str(&s.phase);
+    }
+    if let Some(p) = pct {
+        line.push_str(&format!(" ({p}%)"));
+    }
+    (line, pct)
+}
+
+/// Everything a refresh shows, read while the controller is borrowed.
+struct Shown {
+    source: String,
+    error: Option<String>,
+    flux: Option<String>,
+    jobs: Vec<Snapshot>,
+    details: Vec<String>,
+    has_table: bool,
+    rows: Vec<PartitionRow>,
+    can_reinspect: bool,
+    can_bootable: bool,
+    can_close: bool,
+    has_chd: bool,
+    can_convert: bool,
+    check: Option<report::Shown>,
+    chd: Option<String>,
 }
 
 pub struct InspectScreen {
@@ -84,16 +132,27 @@ pub struct InspectScreen {
     open_file: HWND,
     open_backup: HWND,
     note: HWND,
-    status: HWND,
+    flux: HWND,
     error: HWND,
+    job: HWND,
+    progress: HWND,
+    reinspect: HWND,
+    convert_btn: HWND,
+    bootable: HWND,
+    chd: HWND,
+    close: HWND,
     details: HWND,
     table: HWND,
     rows: RefCell<Vec<PartitionRow>>,
     /// The row the tools act on: the list's selection, else the first row (as the TUI's cursor).
     cursor: Cell<usize>,
     no_partitions: HWND,
+    calc_min: HWND,
+    check: HWND,
     expand: HWND,
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
+    check_window: RefCell<Option<Rc<ReportWindow>>>,
+    chd_window: RefCell<Option<Rc<ReportWindow>>>,
 }
 
 impl InspectScreen {
@@ -105,13 +164,34 @@ impl InspectScreen {
         host: EffectHost,
     ) -> Rc<Self> {
         let source_caption = ui::label(page, "Source:");
-        let source = ui::label(page, "");
-        ui::set_automation_id(source, ids::SOURCE);
+        let split = WINDOW_STYLE(BS_SPLITBUTTON as u32 | WS_TABSTOP.0);
+        let source = ui::child(
+            page,
+            w!("BUTTON"),
+            "",
+            split,
+            WINDOW_EX_STYLE(0),
+            ids::SOURCE,
+        );
         let open_file = ui::button(page, "Open File...", ids::OPEN_FILE);
         let open_backup = ui::button(page, "Open Backup Folder...", ids::OPEN_BACKUP);
         let note = ui::label(page, "");
-        let status = ui::label(page, "");
+        let flux = ui::label(page, "");
         let error = ui::label(page, "");
+        let job = ui::label(page, "");
+        let progress = ui::child(
+            page,
+            w!("msctls_progress32"),
+            "",
+            WINDOW_STYLE(0),
+            WINDOW_EX_STYLE(0),
+            "",
+        );
+        let reinspect = ui::button(page, "Re-inspect", ids::REINSPECT);
+        let convert_btn = ui::button(page, "Convert...", ids::CONVERT);
+        let bootable = ui::button(page, "Make Bootable...", ids::MAKE_BOOTABLE);
+        let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
+        let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
         let style = LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
         let table = ui::child(
@@ -154,6 +234,8 @@ impl InspectScreen {
             }
         }
         let no_partitions = ui::label(page, "No partitions found.");
+        let calc_min = ui::button(page, "Calc min", ids::ROW_CALC_MIN);
+        let check = ui::button(page, "Check", ids::ROW_CHECK);
         let expand = ui::button(page, "Expand/Export...", ids::ROW_EXPAND_HFS);
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             ctrl: RefCell::new(InspectController::new(InspectServices {
@@ -175,15 +257,26 @@ impl InspectScreen {
             open_file,
             open_backup,
             note,
-            status,
+            flux,
             error,
+            job,
+            progress,
+            reinspect,
+            convert_btn,
+            bootable,
+            chd,
+            close,
             details,
             table,
             rows: RefCell::default(),
             cursor: Cell::new(0),
             no_partitions,
+            calc_min,
+            check,
             expand,
             hfs: RefCell::default(),
+            check_window: RefCell::default(),
+            chd_window: RefCell::default(),
         });
         let weak: Weak<dyn Handler> = screen.me.clone();
         panel::register(page, weak);
@@ -243,12 +336,16 @@ impl InspectScreen {
         })
     }
 
+    fn remember(&self, path: &std::path::Path) {
+        self.recent
+            .remember(RecentMode::Inspect, &path.display().to_string());
+    }
+
     fn answered(&self, reply: Reply) {
         let action = match reply {
             Reply::Picked { purpose, path } => {
                 if let Some(image) = path.as_ref().filter(|_| purpose == purpose::OPEN_IMAGE) {
-                    self.recent
-                        .remember(RecentMode::Inspect, &image.display().to_string());
+                    self.remember(image);
                 }
                 InspectAction::Picked { purpose, path }
             }
@@ -272,7 +369,7 @@ impl InspectScreen {
             }
         }
         crate::app::append_log(log);
-        self.sync.run(|| self.refresh());
+        self.refresh();
     }
 
     /// Carry out `request`; what this shell cannot do yet says so. No `_` arm.
@@ -283,10 +380,10 @@ impl InspectScreen {
                 Some("Browsing arrives in slice 2 of the Win32 shell.".into())
             }
             HostRequest::OpenOptical(_) => {
-                Some("The Optical tab arrives in slice 6 of the Win32 shell.".into())
+                Some("The Optical screen arrives in slice 6 of the Win32 shell.".into())
             }
             HostRequest::OpenArchive(_) => {
-                Some("The Archives tab arrives in slice 6 of the Win32 shell.".into())
+                Some("The Archives screen arrives in slice 6 of the Win32 shell.".into())
             }
             HostRequest::BackupClosed => {
                 self.backup_closed.set(true);
@@ -305,45 +402,108 @@ impl InspectScreen {
         }
     }
 
-    /// Read the controller first and release it, then set the controls.
+    fn read(&self) -> Shown {
+        let devices = self.devices.borrow();
+        let c = self.ctrl.borrow();
+        let mut jobs = Vec::new();
+        jobs.extend(c.loading());
+        jobs.extend(c.export_job());
+        jobs.extend(c.tool_jobs());
+        Shown {
+            source: c.source_label(devices.as_slice()),
+            error: c.last_error().map(str::to_string),
+            flux: c.flux_faults().map(|f| {
+                format!(
+                    "Warning: flux decode: {}. Files using these sectors are damaged.",
+                    f.summary
+                )
+            }),
+            jobs,
+            details: c.detail_lines(),
+            has_table: c.table_summary().is_some(),
+            rows: c.rows(),
+            can_reinspect: c.can_reinspect(),
+            can_bootable: c.can_make_bootable(),
+            can_close: c.can_close(),
+            has_chd: c.chd_path().is_some(),
+            can_convert: c.convert_source().is_some(),
+            check: c.check_report().map(|r| report::Shown {
+                headline: r.headline(),
+                stats: r.check.stats_line.clone(),
+                lines: r.lines(),
+                toggle: r.has_debug().then_some(r.show_debug),
+                button: r.check.repairable,
+            }),
+            chd: c.chd_info_text().map(str::to_string),
+        }
+    }
+
+    /// Read the controller first and release it, then set the controls inside the guard.
     fn refresh(&self) {
-        let (source, error, loading, table, alignment, rows) = {
-            let devices = self.devices.borrow();
-            let c = self.ctrl.borrow();
-            (
-                c.source_label(devices.as_slice()),
-                c.last_error().map(str::to_string),
-                c.loading().map(|s| s.phase),
-                c.table_summary(),
-                c.alignment(),
-                c.rows(),
-            )
-        };
-        ui::set_text(self.source, &source);
+        let shown = self.read();
+        self.sync.run(|| self.show(shown));
+    }
+
+    fn show(&self, s: Shown) {
+        ui::set_text(self.source, &s.source);
         let note = InspectController::needs_elevation_note().then(unelevated_device_note);
         ui::set_text(self.note, note.unwrap_or(""));
-        ui::set_text(self.status, loading.as_deref().unwrap_or(""));
+        ui::set_text(self.flux, s.flux.as_deref().unwrap_or(""));
         ui::set_text(
             self.error,
-            &error.map(|e| format!("Error: {e}")).unwrap_or_default(),
+            &s.error.map(|e| format!("Error: {e}")).unwrap_or_default(),
         );
-        let mut details = String::new();
-        if let Some(t) = &table {
-            details.push_str(&format!("Partition table: {}", t.type_name));
-            if t.superfloppy {
-                details.push_str(" (superfloppy)");
+        self.show_job(s.jobs.first());
+        ui::set_enabled(self.reinspect, s.can_reinspect);
+        ui::set_enabled(self.bootable, s.can_bootable);
+        ui::set_visible(self.convert_btn, s.can_convert);
+        ui::set_visible(self.chd, s.has_chd);
+        ui::set_visible(self.close, s.can_close);
+        ui::set_text(self.details, &s.details.join("\r\n"));
+        ui::set_visible(self.no_partitions, s.has_table && s.rows.is_empty());
+        self.show_rows(s.rows);
+        self.show_windows(s.check, s.chd);
+    }
+
+    fn show_job(&self, job: Option<&Snapshot>) {
+        let (line, pct) = job.map(job_line).unwrap_or_default();
+        ui::set_text(self.job, &line);
+        ui::set_visible(self.progress, job.is_some());
+        // SAFETY: plain progress-bar messages; a marquee needs its style bit, set here.
+        unsafe {
+            let style = GetWindowLongPtrW(self.progress, GWL_STYLE) as u32;
+            let marquee = job.is_some() && pct.is_none();
+            let want = if marquee {
+                style | PBS_MARQUEE
+            } else {
+                style & !PBS_MARQUEE
+            };
+            if want != style {
+                SetWindowLongPtrW(self.progress, GWL_STYLE, want as isize);
             }
+            SendMessageW(
+                self.progress,
+                PBM_SETMARQUEE,
+                Some(WPARAM(marquee as usize)),
+                Some(LPARAM(30)),
+            );
+            SendMessageW(
+                self.progress,
+                PBM_SETRANGE32,
+                Some(WPARAM(0)),
+                Some(LPARAM(100)),
+            );
+            SendMessageW(
+                self.progress,
+                PBM_SETPOS,
+                Some(WPARAM(pct.unwrap_or(0) as usize)),
+                None,
+            );
         }
-        if let Some(a) = &alignment {
-            details.push_str(&format!(
-                "\r\nAlignment: {}, first LBA {}",
-                a.kind, a.first_lba
-            ));
-        }
-        ui::set_text(self.details, &details);
-        ui::set_visible(self.no_partitions, table.is_some() && rows.is_empty());
-        let changed = *self.rows.borrow() != rows;
-        if changed {
+    }
+
+    fn show_rows(&self, rows: Vec<PartitionRow>) {
+        if *self.rows.borrow() != rows {
             let count = rows.len();
             *self.rows.borrow_mut() = rows;
             // SAFETY: the virtual list reads its text back through LVN_GETDISPINFO.
@@ -370,11 +530,71 @@ impl InspectScreen {
         }
         let rows = self.rows.borrow();
         let row = rows.get(self.cursor.get());
-        let acts = row.map(|r| (r.actions, r.locked));
-        ui::set_enabled(
-            self.expand,
-            acts.is_some_and(|(a, locked)| a.browse && a.expand_hfs && !locked),
-        );
+        let (acts, locked) = row.map(|r| (r.actions, r.locked)).unwrap_or_default();
+        let can_calc = row.is_some_and(|r| matches!(r.min, MinCell::CanCalc));
+        ui::set_enabled(self.calc_min, can_calc && !locked);
+        ui::set_enabled(self.check, acts.browse && acts.check && !locked);
+        ui::set_enabled(self.expand, acts.browse && acts.expand_hfs && !locked);
+    }
+
+    /// Open, update or close the Check and CHD Info windows to match the controller.
+    fn show_windows(&self, check: Option<report::Shown>, chd: Option<String>) {
+        match check {
+            Some(shown) => self
+                .window_for(&self.check_window, "Filesystem Check Results", true)
+                .show(&shown),
+            None => {
+                self.check_window.replace(None);
+            }
+        }
+        match chd {
+            Some(text) => {
+                self.window_for(&self.chd_window, "CHD Info", false)
+                    .show(&report::Shown {
+                        headline: String::new(),
+                        stats: String::new(),
+                        lines: text.lines().map(str::to_string).collect(),
+                        toggle: None,
+                        button: false,
+                    })
+            }
+            None => {
+                self.chd_window.replace(None);
+            }
+        }
+    }
+
+    fn window_for(
+        &self,
+        slot: &RefCell<Option<Rc<ReportWindow>>>,
+        title: &str,
+        check: bool,
+    ) -> Rc<ReportWindow> {
+        if let Some(w) = slot.borrow().clone() {
+            return w;
+        }
+        let me = self.me.clone();
+        let on_event = Box::new(move |event: report::Event| {
+            let Some(s) = me.upgrade() else { return };
+            let action = match (check, event) {
+                (true, report::Event::Close) => InspectAction::CloseCheck,
+                (true, report::Event::Toggle(on)) => InspectAction::ShowCheckDebug(on),
+                (true, report::Event::Button) => InspectAction::Repair,
+                (false, _) => InspectAction::CloseChdInfo,
+            };
+            s.apply(action);
+        });
+        let (toggle, button) = if check {
+            (
+                Some(("Show debug messages", ids::CHECK_DEBUG)),
+                Some(("Repair", ids::CHECK_REPAIR)),
+            )
+        } else {
+            (None, None)
+        };
+        let w = ReportWindow::open(self.owner, title, toggle, button, on_event);
+        *slot.borrow_mut() = Some(w.clone());
+        w
     }
 
     fn selected(&self) -> Option<usize> {
@@ -393,9 +613,10 @@ impl InspectScreen {
 
     /// Select list row `i` as the shell's own change: the guard keeps it from echoing back.
     fn select(&self, i: usize) {
+        let both = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
         let item = LVITEMW {
-            stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
-            state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
+            stateMask: both,
+            state: both,
             ..Default::default()
         };
         self.sync.run(|| {
@@ -411,6 +632,64 @@ impl InspectScreen {
         });
     }
 
+    /// The source menu: recent files and devices; `None` when nothing was picked.
+    fn source_menu(&self) -> Option<InspectAction> {
+        let recent: Vec<String> = self
+            .recent
+            .list(RecentMode::Inspect)
+            .into_iter()
+            .take(RECENT_ROWS)
+            .collect();
+        let devices = self.devices.borrow().clone();
+        // SAFETY: a popup menu we create, track and destroy; each string outlives its append.
+        let picked = unsafe {
+            let menu = CreatePopupMenu().ok()?;
+            let add = |flags, id: usize, text: &str| {
+                let t = ui::wide(&ui::plain(text));
+                let _ = AppendMenuW(menu, flags, id, PCWSTR(t.as_ptr()));
+            };
+            add(MF_STRING | MF_GRAYED, 0, "Recent files");
+            if recent.is_empty() {
+                add(MF_STRING | MF_GRAYED, 0, "    (none yet)");
+            }
+            for (i, path) in recent.iter().enumerate() {
+                add(MF_STRING, MENU_RECENT + i, path);
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            add(MF_STRING | MF_GRAYED, 0, "Devices");
+            if devices.is_empty() {
+                add(
+                    MF_STRING | MF_GRAYED,
+                    0,
+                    "    (none listed; Show Physical Devices may find more)",
+                );
+            }
+            for (i, d) in devices.iter().enumerate() {
+                add(MF_STRING, MENU_DEVICE + i, &d.display_name());
+            }
+            let mut r = RECT::default();
+            let _ = GetWindowRect(self.source, &mut r);
+            let id = TrackPopupMenu(menu, TPM_RETURNCMD, r.left, r.bottom, None, self.page, None).0
+                as usize;
+            let _ = DestroyMenu(menu);
+            id
+        };
+        if (MENU_RECENT..MENU_RECENT + RECENT_ROWS).contains(&picked) {
+            let path = PathBuf::from(recent.get(picked - MENU_RECENT)?);
+            self.remember(&path);
+            Some(InspectAction::Open(InspectSource::ImageFile(path)))
+        } else if picked >= MENU_DEVICE {
+            let slot = picked - MENU_DEVICE;
+            let identity = devices.get(slot)?.identity();
+            Some(InspectAction::Open(InspectSource::Device {
+                slot,
+                identity,
+            }))
+        } else {
+            None
+        }
+    }
+
     fn layout(&self) {
         let (area, dpi) = panel::client(self.page);
         let line =
@@ -423,17 +702,35 @@ impl InspectScreen {
                         Size::Fixed(60),
                         Size::Fixed(layout::ROW - 8),
                     ),
-                    Node::leaf(self.source, Size::Stretch(1), Size::Fixed(layout::ROW - 8)),
+                    Node::leaf(self.source, Size::Stretch(1), Size::Fixed(layout::ROW)),
                     Node::button(self.open_file, 110),
                     Node::button(self.open_backup, 160),
                 ]),
-                line(self.note, 1),
-                line(self.status, 1),
+                line(self.note, 2),
+                line(self.flux, 1),
                 line(self.error, 1),
-                line(self.details, 2),
+                Node::row(vec![
+                    Node::leaf(self.job, Size::Stretch(2), Size::Fixed(layout::ROW - 8)),
+                    Node::leaf(
+                        self.progress,
+                        Size::Stretch(1),
+                        Size::Fixed(layout::ROW - 8),
+                    ),
+                ]),
+                Node::row(vec![
+                    Node::button(self.reinspect, 90),
+                    Node::button(self.convert_btn, 90),
+                    Node::button(self.bootable, 120),
+                    Node::button(self.chd, 80),
+                    Node::Space(Size::Stretch(1)),
+                    Node::button(self.close, 80),
+                ]),
+                line(self.details, 6),
                 Node::leaf(self.table, Size::Stretch(1), Size::Stretch(1)),
                 line(self.no_partitions, 1),
                 Node::row(vec![
+                    Node::button(self.calc_min, 80),
+                    Node::button(self.check, 80),
                     Node::button(self.expand, 130),
                     Node::Space(Size::Stretch(1)),
                 ]),
@@ -465,6 +762,10 @@ impl InspectScreen {
             *item.pszText.0.add(n) = 0;
         }
     }
+
+    fn row_index(&self) -> Option<usize> {
+        self.rows.borrow().get(self.cursor.get()).map(|r| r.index)
+    }
 }
 
 impl Handler for InspectScreen {
@@ -472,15 +773,38 @@ impl Handler for InspectScreen {
         if self.sync.active() || code != BN_CLICKED {
             return;
         }
-        let action = if from == self.open_file {
+        let action = if from == self.source {
+            match self.source_menu() {
+                Some(a) => a,
+                None => return,
+            }
+        } else if from == self.open_file {
             InspectAction::ChooseImage
         } else if from == self.open_backup {
             InspectAction::ChooseBackupFolder
-        } else if from == self.expand {
-            let Some(index) = self.rows.borrow().get(self.cursor.get()).map(|r| r.index) else {
+        } else if from == self.reinspect {
+            InspectAction::Reinspect
+        } else if from == self.bootable {
+            InspectAction::MakeBootable
+        } else if from == self.chd {
+            InspectAction::ChdInfo
+        } else if from == self.close {
+            InspectAction::Close
+        } else if from == self.convert_btn {
+            let src = self.ctrl.borrow().convert_source();
+            *self.convert.borrow_mut() = src;
+            crate::app::tick();
+            return;
+        } else if let Some(index) = self.row_index() {
+            if from == self.calc_min {
+                InspectAction::CalcMin(index)
+            } else if from == self.check {
+                InspectAction::Check(index)
+            } else if from == self.expand {
+                InspectAction::ExpandHfs(index)
+            } else {
                 return;
-            };
-            InspectAction::ExpandHfs(index)
+            }
         } else {
             return;
         };
@@ -488,6 +812,12 @@ impl Handler for InspectScreen {
     }
 
     fn notify(&self, hdr: &NMHDR, lp: LPARAM) -> Option<LRESULT> {
+        if hdr.hwndFrom == self.source && hdr.code == BCN_DROPDOWN {
+            if let Some(action) = self.source_menu() {
+                self.apply(action);
+            }
+            return Some(LRESULT(0));
+        }
         if hdr.hwndFrom != self.table {
             return None;
         }
