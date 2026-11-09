@@ -39,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::alto::AltoWindow;
+use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
 use crate::expand_image::{self, ExpandImageWindow};
@@ -119,6 +120,11 @@ struct Shown {
     can_export: bool,
     exporting: bool,
     export: Option<export::Shown>,
+    can_add_partition: bool,
+    editor: Option<(
+        rusty_backup::controller::partition_edit::TableEditView,
+        Option<String>,
+    )>,
     can_close: bool,
     has_chd: bool,
     can_convert: bool,
@@ -154,6 +160,9 @@ pub struct InspectScreen {
     expand_image: HWND,
     resize_btn: HWND,
     export_btn: HWND,
+    edit_table: HWND,
+    add_partition: HWND,
+    editor_window: RefCell<Option<Rc<EditorWindow>>>,
     cancel_export: HWND,
     export_window: RefCell<Option<Rc<ExportWindow>>>,
     resize: RefCell<Option<Rc<ResizeWindow>>>,
@@ -218,6 +227,8 @@ impl InspectScreen {
         let expand_image = ui::button(page, "Expand Image...", ids::EXPAND_IMAGE);
         let resize_btn = ui::button(page, "Resize Partitions...", ids::RESIZE);
         let export_btn = ui::button(page, "Export Disk Image...", ids::EXPORT);
+        let edit_table = ui::button(page, "Edit Partition Table...", ids::EDIT_TABLE);
+        let add_partition = ui::button(page, "Add Partition...", ids::ADD_PARTITION);
         let cancel_export = ui::button(page, "Cancel Export", ids::CANCEL_EXPORT);
         let close = ui::button(page, "Close", ids::CLOSE);
         let details = ui::label(page, "");
@@ -308,6 +319,9 @@ impl InspectScreen {
             expand_image,
             resize_btn,
             export_btn,
+            edit_table,
+            add_partition,
+            editor_window: RefCell::default(),
             cancel_export,
             export_window: RefCell::default(),
             resize: RefCell::default(),
@@ -369,6 +383,33 @@ impl InspectScreen {
         }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
+    }
+
+    /// The table editor follows the controller: open while it hands out a view.
+    fn show_editor(
+        &self,
+        shown: Option<(
+            rusty_backup::controller::partition_edit::TableEditView,
+            Option<String>,
+        )>,
+    ) {
+        let Some((view, target)) = shown else {
+            self.editor_window.replace(None);
+            return;
+        };
+        let existing = self.editor_window.borrow().clone();
+        let w = existing.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(InspectAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            let w = EditorWindow::open(self.owner, send);
+            *self.editor_window.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(&view, target.as_deref());
     }
 
     /// The Export window follows the controller: open while it says so, updated each refresh.
@@ -564,6 +605,8 @@ impl InspectScreen {
             can_export: c.can_export(),
             exporting: c.export_job().is_some(),
             export: export::Shown::read(&mut c),
+            can_add_partition: c.can_add_partition(),
+            editor: c.table_editor().map(|v| (v, c.table_write_target())),
             can_close: c.can_close(),
             has_chd: c.chd_path().is_some(),
             can_convert: c.convert_source().is_some(),
@@ -600,6 +643,9 @@ impl InspectScreen {
         ui::set_enabled(self.export_btn, s.can_export);
         ui::set_visible(self.cancel_export, s.exporting);
         self.show_export(s.export);
+        ui::set_enabled(self.edit_table, s.can_edit_table);
+        ui::set_enabled(self.add_partition, s.can_add_partition);
+        self.show_editor(s.editor);
         let resizing = self
             .resize
             .borrow()
@@ -867,6 +913,9 @@ impl InspectScreen {
             ui::shown(self.progress),
             ui::shown(self.bar),
             ui::shown(self.no_partitions),
+            ui::shown(self.convert_btn),
+            ui::shown(self.chd),
+            ui::shown(self.close),
         ];
         let mut v = ui::text(self.details).lines().count() as u32;
         for (i, b) in bits.iter().enumerate() {
@@ -937,17 +986,31 @@ impl InspectScreen {
                 Node::button(self.cancel_export, 110),
             ]));
         }
-        children.extend([Node::row(vec![
-            Node::button(self.reinspect, 90),
-            Node::button(self.convert_btn, 90),
-            Node::button(self.bootable, 120),
-            Node::button(self.chd, 80),
-            Node::button(self.expand_image, 120),
-            Node::button(self.resize_btn, 140),
-            Node::button(self.export_btn, 150),
-            Node::Space(Size::Stretch(1)),
-            Node::button(self.close, 80),
-        ])]);
+        // Two rows of tools: the source's, then the table's; a hidden one leaves no gap.
+        let tools = |list: &[(HWND, i32)]| {
+            list.iter()
+                .filter(|(h, _)| ui::shown(*h))
+                .map(|(h, w)| Node::button(*h, *w))
+                .collect::<Vec<_>>()
+        };
+        let mut source_tools = tools(&[
+            (self.reinspect, 90),
+            (self.export_btn, 150),
+            (self.convert_btn, 90),
+            (self.chd, 80),
+        ]);
+        source_tools.push(Node::Space(Size::Stretch(1)));
+        source_tools.extend(tools(&[(self.close, 80)]));
+        children.push(Node::row(source_tools));
+        let mut table_tools = tools(&[
+            (self.edit_table, 160),
+            (self.add_partition, 120),
+            (self.resize_btn, 140),
+            (self.expand_image, 120),
+            (self.bootable, 120),
+        ]);
+        table_tools.push(Node::Space(Size::Stretch(1)));
+        children.push(Node::row(table_tools));
         children.extend((lines(self.details) > 0).then(|| line(self.details, lines(self.details))));
         if ui::shown(self.bar) {
             children.push(Node::leaf(
@@ -1062,6 +1125,10 @@ impl Handler for InspectScreen {
             return;
         } else if from == self.export_btn {
             InspectAction::OpenExport
+        } else if from == self.edit_table {
+            InspectAction::EditTable
+        } else if from == self.add_partition {
+            InspectAction::AddPartition
         } else if from == self.cancel_export {
             InspectAction::CancelExport
         } else if from == self.close {

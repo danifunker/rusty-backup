@@ -12,6 +12,8 @@ mod app;
 #[cfg(windows)]
 mod chd;
 #[cfg(windows)]
+mod editor;
+#[cfg(windows)]
 mod effects;
 #[cfg(windows)]
 mod expand_hfs;
