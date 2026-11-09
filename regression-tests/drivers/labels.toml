@@ -1,0 +1,28 @@
+# What each controller id is called in each shell (FLOWS.md "Controls").
+#
+# A flow names a control by its controller id (`src/controller/*/mod.rs` `ids`); the driver
+# looks it up here. A value is the label, or a table:
+#   label = "..."   the visible label
+#   key   = "o"     activate it by this key (the TUI has keys where GTK has buttons)
+#   pick  = "..."   the button whose file dialog fills this field (GTK path rows)
+#   via   = "..."   open this first (the dropdown a menu entry lives in)
+# `wait` / `expect` names resolve here too, for messages each shell words its own way.
+#
+# Two shells naming one control differently is label drift; once labels come from the
+# controllers this table shrinks to nothing. AppKit and Win32 will use the id directly.
+
+[tui]
+"backup.open_image" = { key = "o" }
+"backup.destination" = "Output:"
+"backup.name" = "Name:"
+"backup.format" = "Format:"
+"backup.start" = "[ Start backup ]"
+"backup.done" = "Backup complete."
+
+[gtk]
+"backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
+"backup.destination" = { label = "Folder", pick = "Browse..." }
+"backup.name" = "Backup Name"
+"backup.format" = "Output Format"
+"backup.start" = "Start Backup"
+"backup.done" = "Backup finished."

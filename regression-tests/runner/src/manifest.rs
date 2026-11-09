@@ -216,6 +216,10 @@ pub struct UiOp {
     pub text: Option<String>,
     /// Clear the focused text field, then type this.
     pub fill: Option<String>,
+    /// Press this control (a button, or the TUI key the label table names).
+    pub activate: Option<String>,
+    /// Answer the next file or folder dialog with this path; put it before what opens one.
+    pub pick: Option<String>,
     /// Wait until the screen shows this.
     pub wait: Option<String>,
     /// The screen must show this now (after a short settle).
@@ -238,6 +242,8 @@ impl UiOp {
             self.keys.is_some(),
             self.text.is_some(),
             self.fill.is_some(),
+            self.activate.is_some(),
+            self.pick.is_some(),
             self.wait.is_some(),
             self.expect.is_some(),
             self.expect_not.is_some(),
@@ -481,6 +487,8 @@ impl Step {
                 &mut op.key,
                 &mut op.text,
                 &mut op.fill,
+                &mut op.activate,
+                &mut op.pick,
                 &mut op.wait,
                 &mut op.expect,
                 &mut op.expect_not,

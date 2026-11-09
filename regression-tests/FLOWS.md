@@ -22,7 +22,7 @@ least one flow that proves it. A capability with no flow is untested.
 rb-regress run --tiers 8                      # every flow on every shell with a driver
 rb-regress run --tiers 8 --level smoke        # the high-level set, minutes
 rb-regress run --area inspect --fs hfs        # after working on HFS in Inspect
-rb-regress run --shell tui                    # one front-end
+rb-regress run --shell gtk                    # one front-end
 rb-regress list --tiers 8 --level smoke       # what would run
 ```
 
@@ -37,60 +37,86 @@ tier = 8
 group = "flow.backup"
 
 [[case]]
-id = "flow.backup.zstd-roundtrip"
-description = "Back up a {fs} image to zstd from the Backup tab, restore it, compare"
+id = "flow.backup.image-zstd"
+description = "Back up a {fs} image to zstd from the Backup screen"
 level = "smoke"
-smoke_fs = ["fat16"]            # the other fs values run under full only
-area = ["backup", "restore"]
-fs = ["fat16", "hfs", "ext2"]   # one instance per value: id.fat16.tui, ...
-shells = ["tui"]                # one instance per shell
-capabilities = ["backup.run", "restore.full-disk"]
+smoke_fs = ["fat"]              # the other fs values run under full only
+area = ["backup"]
+fs = ["fat", "hfs"]             # one instance per value: id.fat.tui, ...
+shells = ["tui", "gtk"]         # one instance per shell
+capabilities = ["backup.run"]
 
 [[case.step]]                   # setup through rb-cli
-args = ["new", "hd", "{fs}", "--size", "32M", "{scratch}/src.img"]
+args = ["new", "floppy", "{fs}", "--size", "1440K", "{scratch}/src.img"]
 expect_exit = 0
 
 [[case.step]]                   # the front-end
 ui = [
   { tab = "Backup" },
-  { focus = "Source" },
-  { key = "Enter" },
-  { type = "{scratch}/src.img" },
-  { key = "Enter" },
-  { wait = "1 partition" },
-  { focus = "Format" },
-  { choose = "zstd" },
-  { key = "s", only = "tui" },
-  { wait = "Backup complete", timeout_ms = 120000 },
+  { pick = "{scratch}/src.img" },
+  { activate = "backup.open_image" },
+  { focus = "backup.destination" },
+  { fill = "{scratch}/bk" },
+  { focus = "backup.format" },
+  { choose = "Zstd" },
+  { activate = "backup.start" },
+  { wait = "backup.done", timeout_ms = 120000 },
 ]
 
 [[case.step]]                   # verify the output, never the screen alone
-args = ["inspect", "{scratch}/out/b"]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
 expect_exit = 0
 ```
 
 Placeholders: `{fs}` (the matrix value), plus the usual `{scratch}`,
 `{fixture}`, `{fixture_copy}`, `{cases}`.
 
+### Controls
+
+A flow names a control by its **controller id** (the `ids` module of the screen's
+controller, e.g. `backup.format`), never by what one shell happens to call it.
+Each driver looks the id up in [`drivers/labels.toml`](drivers/labels.toml):
+
+```toml
+[tui]
+"backup.open_image" = { key = "o" }          # the TUI opens it with a key
+"backup.format" = "Format:"
+[gtk]
+"backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
+"backup.destination" = { label = "Folder", pick = "Browse..." }
+"backup.format" = "Output Format"
+```
+
+An entry is a label, or a table with `label`, `key` (activate by key), `pick`
+(the button whose file dialog fills this field) and `via` (open this first, the
+dropdown an entry lives in). `wait` and `expect` names resolve here too, for
+messages each shell words its own way (`backup.done`). A name the table doesn't
+list is used as a literal label.
+
+**Every entry where two shells differ is label drift.** The table is the list of
+it; once labels and messages come from the controllers, entries disappear.
+AppKit and Win32 can use the id itself as the accessibility identifier and need
+no entries at all.
+
 ### UI ops
 
-Each op sets exactly one action. Controls are addressed by the **label the user
-sees**, so one flow serves every shell that labels a control the same way (a
-label that differs between shells is a parity bug in itself).
+Each op sets exactly one action.
 
-| Op | Meaning | TUI driver |
-|---|---|---|
-| `tab = "Backup"` | switch screen | Left / Right until the tab bar shows it in reverse video |
-| `focus = "Format"` | move to a control | Down, then Up, until the focused row (`> ` or reverse video) holds the label |
-| `choose = "zstd"` | set the focused control's value | Right, then Left, until the focused row holds the value |
-| `key = "Enter"` / `keys = [..]` | named keys: `Enter Tab Esc Up Down Left Right F1..F12 Ctrl+K` or one character | key bytes |
-| `type = "text"` | type text | bytes |
-| `fill = "text"` | clear the focused text field, then type | 512 Backspaces, then the bytes |
-| `wait = "text"` | wait for text, up to `timeout_ms` (default 30 s) | polls the screen |
-| `expect = "text"` / `expect_not` | the screen shows / does not show it now | after a short settle |
+| Op | Meaning | TUI driver | GTK driver |
+|---|---|---|---|
+| `tab = "Backup"` | switch screen | counts Left / Right from the tab bar | clicks the page tab |
+| `focus = "id"` | move to a control | Down, then Up, until the focused row (`> `) holds the label | finds the showing node with that name |
+| `choose = "Zstd"` | set the focused control's value | Right, then Left, until the row shows it | opens the combo and picks the entry (case-insensitive); `on` / `off` for a switch |
+| `activate = "id"` | press a control | its `key`, or focus it and Enter | `via` first, then the button's action; a popover entry by keyboard |
+| `pick = "path"` | answer the next file or folder dialog; put it **before** what opens one | fills the path prompt when it appears | writes `*<TAB>path` to the test-picks file |
+| `fill = "text"` | clear the focused field and type | 512 Backspaces, then the text | sets the entry's text; a `pick` field goes through its dialog |
+| `key = "Enter"` / `keys = [..]` | named keys: `Enter Tab Esc Up Down Left Right F1..F12 Ctrl+K` or one character | key bytes | xdotool; Enter on a focused button presses it |
+| `type = "text"` | type text | bytes | xdotool |
+| `wait = "text or id"` | wait up to `timeout_ms` (default 30 s) | polls the screen | polls node names, descriptions and entry text |
+| `expect` / `expect_not` | the screen shows / does not show it now | after a short settle | likewise |
 
-`only = "tui"` on an op runs it on that shell only: the escape hatch for a key
-that is the TUI's own (the GTK shell clicks a button instead). Keep these rare.
+`only = "tui"` on an op runs it on that shell only. Keep these rare: one is a
+sign the two shells don't offer the same thing.
 
 ### Rules
 
@@ -107,14 +133,18 @@ that is the TUI's own (the GTK shell clicks a button instead). Keep these rare.
 
 ## Shells and drivers
 
-| Shell | Driver | Status |
-|---|---|---|
-| `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | Linux, macOS. Windows needs ConPTY: skip-platform for now |
-| `gtk` | AT-SPI, from `scripts/gtk4-gui-suite.py` | planned |
-| `appkit` | Accessibility API (`accessibilityIdentifier`) | with the AppKit shell |
-| `win32` | UI Automation (`AutomationId`) | with the Win32 shell |
+| Shell | Driver | Needs | Status |
+|---|---|---|---|
+| `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS. Windows needs ConPTY: skip-platform for now. About 4 s a flow |
+| `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
+| `appkit` | Accessibility API (`accessibilityIdentifier`) | | with the AppKit shell |
+| `win32` | UI Automation (`AutomationId`) | | with the Win32 shell |
 
-A case whose shell has no driver here resolves to `skip-tool`.
+A case whose shell has no driver, or whose driver's tools are missing, resolves
+to `skip-tool` with the reason.
+
+Without sudo, Xvfb can be unpacked: `apt-get download xvfb` then
+`dpkg-deb -x xvfb_*.deb <dir>`, and put `<dir>/usr/bin` on `PATH`.
 
 ## Finding what to press
 
@@ -124,4 +154,14 @@ shown beside its row):
 
 ```bash
 rb-regress tui-shot Right Right Down type:/tmp/x.img Enter wait:partition
+```
+
+For GTK, the driver takes JSON ops on stdin, plus two that only help writing
+flows: `{"op":"text"}` prints every showing node, and
+`{"op":"ancestors","arg":"Label"}` prints a node's parents with their actions.
+
+```bash
+printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
+  dbus-run-session -- xvfb-run -a -s "-screen 0 1600x2300x24" \
+  python3 -I drivers/gtk_driver.py ../frontends/gtk4/target/release/rusty-backup-gtk /tmp/gtk-probe
 ```

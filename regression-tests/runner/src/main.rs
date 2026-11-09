@@ -13,6 +13,7 @@ mod envelope;
 mod exec;
 mod fixtures;
 mod flow;
+mod gtk;
 mod gitinfo;
 mod inventory;
 mod known;
@@ -39,6 +40,7 @@ struct Args {
     command: Command,
     cases_dir: PathBuf,
     rb_cli: PathBuf,
+    gtk: PathBuf,
     identify: bool,
     detect: bool,
     set_oracle: Option<String>,
@@ -139,6 +141,9 @@ fn parse_args() -> Result<Args, String> {
         command: Command::Help,
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
+        gtk: base
+            .join("..")
+            .join("frontends/gtk4/target/release/rusty-backup-gtk"),
         identify: false,
         detect: false,
         set_oracle: None,
@@ -224,6 +229,10 @@ fn parse_args() -> Result<Args, String> {
                         args.cases_dir = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--gtk" => {
+                        args.gtk = PathBuf::from(value()?);
+                        i += 1;
+                    }
                     "--rb-cli" => {
                         args.rb_cli = PathBuf::from(value()?);
                         i += 1;
@@ -303,6 +312,7 @@ fn parse_args() -> Result<Args, String> {
     // that becomes a program path or is handed to a subprocess must be
     // absolute before it gets there. See exec::absolutise.
     args.rb_cli = exec::absolutise(&args.rb_cli);
+    args.gtk = exec::absolutise(&args.gtk);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -374,6 +384,8 @@ OPTIONS:
                            print it with its version and refuse to start if it
                            is missing; they warn if it is not a release build or
                            is older than the sources in the tree.
+    --gtk <PATH>           GTK shell the gtk flows drive
+                           [default: <repo>/frontends/gtk4/target/release/rusty-backup-gtk]
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --sync                 (fixtures) copy the corpus from local.toml's
                            `corpus_source` into the fixture root first. Runs
@@ -1536,7 +1548,20 @@ fn run_case(
 
     let timeout = Duration::from_millis(case.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
-    let mut ui = flow::UiSession::new(case.shell.clone(), &args.rb_cli, &scratch);
+    let controls = if case.shell.is_some() {
+        match flow::load_controls(&regression_dir().join("drivers").join("labels.toml")) {
+            Ok(c) => c,
+            Err(e) => {
+                result.verdict = Verdict::Error;
+                result.skip_reason = Some(e);
+                result.duration_ms = started.elapsed().as_millis();
+                return result;
+            }
+        }
+    } else {
+        flow::Controls::new()
+    };
+    let mut ui = flow::UiSession::new(case.shell.clone(), &args.rb_cli, &args.gtk, &scratch, controls);
     for (idx, step) in steps.iter().enumerate() {
         if !step.ui.is_empty() {
             match ui.run(&step.ui, &resolve) {

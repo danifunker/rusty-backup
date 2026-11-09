@@ -10,7 +10,7 @@ id = "flow.backup.image-zstd"
 description = "Open a FAT floppy image on the Backup screen, back it up to zstd, restore it with rb-cli and read the file back"
 level = "smoke"
 area = ["backup"]
-shells = ["tui"]
+shells = ["tui", "gtk"]
 capabilities = ["backup.source-image", "backup.format", "backup.run"]
 timeout_ms = 180000
 
@@ -25,20 +25,17 @@ expect_exit = 0
 [[case.step]]
 ui = [
   { tab = "Backup" },
-  { key = "Enter" },
-  { wait = "Choose source image" },
-  { type = "{scratch}/src.img" },
-  { key = "Enter" },
-  { wait = "step 2/3" },
-  { focus = "Output:" },
+  { pick = "{scratch}/src.img" },
+  { activate = "backup.open_image" },
+  { wait = "FAT" },
+  { focus = "backup.destination" },
   { fill = "{scratch}/bk" },
-  { focus = "Name:" },
+  { focus = "backup.name" },
   { fill = "job" },
-  { focus = "Format:" },
+  { focus = "backup.format" },
   { choose = "Zstd" },
-  { focus = "[ Start backup ]" },
-  { key = "Enter" },
-  { wait = "complete", timeout_ms = 120000 },
+  { activate = "backup.start" },
+  { wait = "backup.done", timeout_ms = 120000 },
 ]
 
 [[case.step]]
