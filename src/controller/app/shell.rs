@@ -305,6 +305,8 @@ impl AppController {
         std::mem::take(&mut self.shell.elevation_prompt)
     }
 
+    // Only Linux relaunches here, so elsewhere the early return ends the body.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_return))]
     pub(super) fn confirm_elevation(&mut self, yes: bool) {
         if !yes {
             self.log.warn(
