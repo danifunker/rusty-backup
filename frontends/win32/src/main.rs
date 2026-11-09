@@ -31,6 +31,10 @@ mod export;
 mod inspect;
 mod layout;
 #[cfg(windows)]
+mod menu;
+#[cfg(windows)]
+mod pane_view;
+#[cfg(windows)]
 mod panel;
 #[cfg(windows)]
 mod partition_bar;

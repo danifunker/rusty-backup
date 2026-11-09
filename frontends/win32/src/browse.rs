@@ -16,135 +16,44 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
-    editor_window, extract_fork_modes, format_size, journal_window, tree_window,
-    BrowserPaneAction as P, CommanderAction as A, CommanderController, DisplayRow, EditBar,
-    ExportFormat, ExtractOptions, HeaderTools, JobRegistry, ListingStyle, MarkBar, ModeAction,
-    PaneProfile, PaneServices, PaneWindow, PanelActions, ResourceForkMode, RowMenuEntry, Side,
-    SidePanel, SortColumn, TreeText, ViewItemKind, VolumeLine, WindowKind, FOLLOW_DELAY,
+    editor_window, extract_fork_modes, journal_window, tree_window, BrowserPaneAction as P,
+    CommanderAction as A, CommanderController, DisplayRow, EditBar, ExportFormat, ExtractOptions,
+    HeaderTools, JobRegistry, MarkBar, ModeAction, PaneProfile, PaneServices, PaneWindow,
+    PanelActions, ResourceForkMode, Side, SidePanel, TreeText, VolumeLine, WindowKind,
+    FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Foundation::{POINT, RECT};
-use windows::Win32::UI::Controls::{
-    ImageList_Destroy, HIMAGELIST, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCFMT_RIGHT, LVCF_FMT,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVHT_ONITEMICON, LVHT_ONITEMSTATEICON,
-    LVIF_IMAGE, LVIF_INDENT, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED,
-    LVIS_STATEIMAGEMASK, LVITEMW, LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS,
-    LVM_SETCALLBACKMASK, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST,
-    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK, LVN_GETDISPINFOW,
-    LVN_ITEMCHANGED, LVN_KEYDOWN, LVSICF_NOSCROLL, LVSIL_SMALL, LVS_EX_CHECKBOXES,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NMTREEVIEWW,
-    NM_CLICK, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM,
-    TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT,
-    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM,
-    TVM_SETIMAGELIST, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVSIL_NORMAL, TVS_HASBUTTONS,
-    TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
-};
+use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1,
-    VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_SPACE, VK_TAB, VK_UP,
-};
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetAncestor, GetCursorPos, GetWindowRect, KillTimer,
-    PostMessageW, SendMessageW, SetTimer, TrackPopupMenu, CBN_SELCHANGE, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DLGC_WANTMESSAGE, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_READONLY, GA_ROOT, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_STRING, MSG, TPM_RETURNCMD,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_GETDLGCODE, WM_KEYDOWN, WS_EX_CLIENTEDGE,
-    WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+    GetAncestor, GetCursorPos, GetWindowRect, KillTimer, PostMessageW, SendMessageW, SetTimer,
+    CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, GA_ROOT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    WS_EX_CLIENTEDGE, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::browse_bars::{BarCmd, EditRow, MarkRow, PanelCmd, PanelTools, Tools, MAC_FORMATS};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
+use crate::menu::{track, MenuItem};
+use crate::pane_view::{key_of, mods, PaneEvent, PaneShown, PaneView, DEFERRED};
 use crate::panel::{self, Handler};
-use crate::row_icons;
 use crate::sync::SyncGuard;
 use crate::ui;
 use crate::window::{Event, ModelWindow};
-
-/// The listing's columns: title, width in DIPs, right-aligned, the sort they ask for.
-const COLUMNS: [(&str, i32, bool, Option<SortColumn>); 5] = [
-    ("Name", 260, false, Some(SortColumn::Name)),
-    ("Data", 90, true, Some(SortColumn::Size)),
-    ("Rsrc", 80, true, None),
-    ("Modified", 140, false, Some(SortColumn::Modified)),
-    ("Type", 90, false, Some(SortColumn::Type)),
-];
 
 /// The side panel's width and the folder tree's, in DIPs.
 const DETAIL_W: i32 = 330;
 const TREE_W: i32 = 200;
 
-/// A `WM_COMMAND` code the view posts to itself: run the folder-tree action a notification held.
-const DEFERRED: u32 = 0x7F00;
 /// Another: pop up the View menu the key map asked for.
 const VIEW_MENU: u32 = 0x7F01;
-
-/// One entry of a popup menu.
-enum MenuItem {
-    Item {
-        label: String,
-        enabled: bool,
-        checked: bool,
-        action: A,
-    },
-    Sub {
-        label: String,
-        items: Vec<(String, A)>,
-    },
-}
-
-/// Track a popup menu of `items` at screen point `(x, y)`; the action picked, if any.
-fn track(owner: HWND, items: Vec<MenuItem>, x: i32, y: i32) -> Option<A> {
-    let mut actions: Vec<A> = Vec::new();
-    // SAFETY: menus we create, track and destroy here; each label outlives its append.
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        for item in items {
-            match item {
-                MenuItem::Item {
-                    label,
-                    enabled,
-                    checked,
-                    action,
-                } => {
-                    actions.push(action);
-                    let mut flags = MF_STRING;
-                    if !enabled {
-                        flags |= MF_GRAYED;
-                    }
-                    if checked {
-                        flags |= MF_CHECKED;
-                    }
-                    let t = ui::wide(&ui::plain(&label));
-                    let _ = AppendMenuW(menu, flags, actions.len(), PCWSTR(t.as_ptr()));
-                }
-                MenuItem::Sub { label, items } => {
-                    let Ok(sub) = CreatePopupMenu() else { continue };
-                    for (l, a) in items {
-                        actions.push(a);
-                        let t = ui::wide(&ui::plain(&l));
-                        let _ = AppendMenuW(sub, MF_STRING, actions.len(), PCWSTR(t.as_ptr()));
-                    }
-                    let t = ui::wide(&ui::plain(&label));
-                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(t.as_ptr()));
-                }
-            }
-        }
-        let picked = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, None, owner, None);
-        let _ = DestroyMenu(menu);
-        let i = usize::try_from(picked.0).ok()?;
-        (i > 0).then(|| actions.swap_remove(i - 1))
-    }
-}
 
 fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
     let services = PaneServices {
@@ -158,30 +67,14 @@ fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
     ctl
 }
 
-/// One listing row as the list view draws it.
-#[derive(Clone, PartialEq)]
-struct Line {
-    cells: [String; 5],
-    marked: bool,
-    node_id: String,
-    icon: i32,
-    depth: i32,
-}
-
 /// Everything a refresh shows, read while the controller is borrowed.
 struct Shown {
+    pane: PaneShown,
     loaded: bool,
     volume: VolumeLine,
     message: String,
     export_volume: bool,
     job: Option<(Snapshot, bool)>,
-    rows: Option<Vec<DisplayRow>>,
-    lines: Vec<Line>,
-    rsrc: bool,
-    cursor: Option<usize>,
-    folders: Option<Vec<(usize, String, bool)>>,
-    folder_tree: bool,
-    folder_cursor: usize,
     panel_key: Option<(u64, bool)>,
     panel: Option<SidePanel>,
     result: Option<String>,
@@ -191,7 +84,6 @@ struct Shown {
     tools: HeaderTools,
     edit: EditBar,
     marks: MarkBar,
-    marked: Vec<bool>,
     windows: Vec<PaneWindow>,
     view_menu: bool,
 }
@@ -215,8 +107,7 @@ pub struct BrowseView {
     notice: HWND,
     notice_ok: HWND,
     message: HWND,
-    tree: HWND,
-    list: HWND,
+    pane: PaneView,
     name: HWND,
     facts: HWND,
     note: HWND,
@@ -243,15 +134,8 @@ pub struct BrowseView {
     editor: RefCell<Option<(TextDoc, Option<String>)>>,
     /// The user asked for the File Info window, beyond what the side panel shows.
     info_asked: Cell<bool>,
-    rows: RefCell<Vec<DisplayRow>>,
-    lines: RefCell<Vec<Line>>,
-    /// Listing positions shift by the `..` rows a tick-box listing leaves out.
-    skip: Cell<usize>,
-    folders: RefCell<Vec<(usize, String, bool)>>,
-    folder_items: RefCell<Vec<isize>>,
     panel_key: Cell<Option<(u64, bool)>>,
     label_prefix: RefCell<String>,
-    deferred: RefCell<Option<P>>,
     follow_timer: Cell<usize>,
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
     /// Which optional lines the last layout gave room to.
@@ -291,86 +175,6 @@ fn multiline(parent: HWND, id: &str) -> HWND {
     )
 }
 
-/// The controller's name for a key the list hands over; `None` for one it leaves to the list.
-fn key_of(vk: u16) -> Option<Key> {
-    let k = VIRTUAL_KEY(vk);
-    Some(match k {
-        VK_RETURN => Key::Enter,
-        VK_ESCAPE => Key::Escape,
-        VK_BACK => Key::Backspace,
-        VK_DELETE => Key::Delete,
-        VK_INSERT => Key::Insert,
-        VK_TAB => Key::Tab,
-        _ if (VK_F1.0..=VK_F24.0).contains(&vk) => Key::F((vk - VK_F1.0 + 1) as u8),
-        // Moving the selection is the list's own: its change moves the controller's cursor.
-        VK_LEFT => Key::Left,
-        VK_RIGHT => Key::Right,
-        VK_SPACE => Key::Space,
-        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END => return None,
-        _ => {
-            let c = char::from_u32(u32::from(vk)).filter(|c| c.is_ascii_alphanumeric())?;
-            Key::Char(c.to_ascii_lowercase())
-        }
-    })
-}
-
-/// The list asks the dialog loop for Enter and Escape, which `IsDialogMessage` would keep.
-unsafe extern "system" fn list_proc(
-    hwnd: HWND,
-    msg: u32,
-    wp: WPARAM,
-    lp: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    if msg == WM_GETDLGCODE && lp.0 != 0 {
-        // SAFETY: WM_GETDLGCODE's lParam, when set, is the MSG being dispatched.
-        let m = unsafe { &*(lp.0 as *const MSG) };
-        let key = VIRTUAL_KEY(m.wParam.0 as u16);
-        if m.message == WM_KEYDOWN && (key == VK_RETURN || key == VK_ESCAPE) {
-            return LRESULT(DLGC_WANTMESSAGE as isize);
-        }
-    }
-    // SAFETY: everything else goes on to the list.
-    unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
-}
-
-fn held(vk: VIRTUAL_KEY) -> bool {
-    // SAFETY: a plain query of the keyboard state.
-    unsafe { GetKeyState(i32::from(vk.0)) < 0 }
-}
-
-fn mods() -> Mods {
-    Mods {
-        ctrl: held(VK_CONTROL),
-        alt: held(VK_MENU),
-        shift: held(VK_SHIFT),
-        cmd: false,
-    }
-}
-
-fn line_of(row: &DisplayRow, name: String) -> Line {
-    Line {
-        marked: false,
-        cells: [
-            name,
-            match row.is_dir {
-                true => String::new(),
-                false => format_size(row.size),
-            },
-            match row.rsrc_size {
-                0 => String::new(),
-                n => format_size(n),
-            },
-            row.modified.clone(),
-            row.type_tag.clone(),
-        ],
-        node_id: row.node_id.clone(),
-        icon: row_icons::for_row(row),
-        depth: row.depth as i32,
-    }
-}
-
 impl BrowseView {
     pub fn build(page: HWND, notify: Arc<dyn Notify>, host: EffectHost) -> Rc<BrowseView> {
         let title = ui::label(page, "Filesystem Browser");
@@ -391,64 +195,7 @@ impl BrowseView {
         let notice = ui::label(page, "");
         let notice_ok = ui::button(page, "OK", "");
         let message = ui::label(page, "");
-        let tree_style =
-            TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS | WS_TABSTOP.0;
-        let tree = ui::child(
-            page,
-            w!("SysTreeView32"),
-            "",
-            WINDOW_STYLE(tree_style),
-            WS_EX_CLIENTEDGE,
-            ids::FOLDER_TREE,
-        );
-        let style = LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
-        let list = ui::child(
-            page,
-            w!("SysListView32"),
-            "",
-            WINDOW_STYLE(style),
-            WS_EX_CLIENTEDGE,
-            ids::LIST,
-        );
-        // SAFETY: plain list-view setup; each column title outlives its insert.
-        unsafe {
-            let _ = SetWindowSubclass(list, Some(list_proc), 1, 0);
-            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES;
-            // A virtual list asks for its tick boxes' state, which is the controller's marks.
-            SendMessageW(
-                list,
-                LVM_SETCALLBACKMASK,
-                Some(WPARAM(LVIS_STATEIMAGEMASK.0 as usize)),
-                None,
-            );
-            SendMessageW(
-                list,
-                LVM_SETEXTENDEDLISTVIEWSTYLE,
-                Some(WPARAM(ex as usize)),
-                Some(LPARAM(ex as isize)),
-            );
-            let dpi = GetDpiForWindow(page).max(96);
-            for (i, (title, width, right, _)) in COLUMNS.iter().enumerate() {
-                let mut t = ui::wide(title);
-                let col = LVCOLUMNW {
-                    mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT,
-                    fmt: if *right {
-                        LVCFMT_RIGHT
-                    } else {
-                        Default::default()
-                    },
-                    cx: layout::scale(*width, dpi),
-                    pszText: PWSTR(t.as_mut_ptr()),
-                    ..Default::default()
-                };
-                SendMessageW(
-                    list,
-                    LVM_INSERTCOLUMNW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&col as *const _ as isize)),
-                );
-            }
-        }
+        let pane = PaneView::build(page, Side::Left, ids::LIST, ids::FOLDER_TREE, false);
         let name = ui::label(page, "");
         let facts = ui::label(page, "");
         let note = ui::label(page, "");
@@ -504,8 +251,7 @@ impl BrowseView {
             notice,
             notice_ok,
             message,
-            tree,
-            list,
+            pane,
             name,
             facts,
             note,
@@ -528,14 +274,8 @@ impl BrowseView {
             journal: RefCell::default(),
             editor: RefCell::default(),
             info_asked: Cell::new(false),
-            rows: RefCell::default(),
-            lines: RefCell::default(),
-            skip: Cell::new(0),
-            folders: RefCell::default(),
-            folder_items: RefCell::default(),
             panel_key: Cell::new(None),
             label_prefix: RefCell::default(),
-            deferred: RefCell::default(),
             follow_timer: Cell::new(0),
             on_change: RefCell::default(),
             shape: Cell::new(u64::MAX),
@@ -603,10 +343,7 @@ impl BrowseView {
         self.active.set(true);
         self.after(fx);
         self.changed();
-        // SAFETY: focusing our own list.
-        unsafe {
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.list));
-        }
+        self.pane.focus();
     }
 
     /// The streamed backup's seekable cache is ready; the listing stays where it is.
@@ -781,38 +518,6 @@ impl BrowseView {
         let prefix = self.label_prefix.borrow();
         let ctl = self.ctrl.borrow();
         let pane = ctl.pane(Side::Left);
-        let all = pane.rows();
-        let rows = (*self.rows.borrow() != all).then(|| all.to_vec());
-        let boxes = pane.marks_with_boxes();
-        let skip = match boxes {
-            true => all.iter().take_while(|r| r.is_parent()).count(),
-            false => 0,
-        };
-        let marked: Vec<bool> = all
-            .iter()
-            .skip(skip)
-            .map(|r| pane.has_selection() && pane.row_selected(r))
-            .collect();
-        let lines = match &rows {
-            Some(rows) => rows
-                .iter()
-                .skip(skip)
-                .map(|r| line_of(r, pane.row_label(r, false).text))
-                .collect(),
-            None => Vec::new(),
-        };
-        let folders: Vec<(usize, String, bool)> = pane
-            .folder_tree()
-            .iter()
-            .map(|n| {
-                let name = match n.depth {
-                    0 => "/".to_string(),
-                    _ => n.entry.name.clone(),
-                };
-                (n.depth, name, n.expanded)
-            })
-            .collect();
-        let folders = (*self.folders.borrow() != folders).then_some(folders);
         let message = match (pane.opening(), pane.source_error()) {
             (Some(_), _) => "Reading the volume...".to_string(),
             (None, Some(err)) => err.to_string(),
@@ -836,13 +541,6 @@ impl BrowseView {
             message,
             export_volume: !ctl.edit_mode() && ctl.copy_job().is_none(),
             job: jobs.into_iter().next(),
-            rsrc: all.iter().any(|r| r.rsrc_size > 0),
-            rows,
-            lines,
-            cursor: pane.cursor_index().filter(|i| *i >= skip).map(|i| i - skip),
-            folders,
-            folder_tree: pane.listing_style() == ListingStyle::TreeAndList,
-            folder_cursor: pane.tree_cursor(),
             panel: detail
                 .filter(|_| self.panel_key.get() != panel_key)
                 .map(|d| d.side_panel(caps)),
@@ -854,7 +552,7 @@ impl BrowseView {
             tools: ctl.header_tools(Side::Left),
             edit: ctl.edit_bar(Side::Left),
             marks: ctl.mark_bar(Side::Left),
-            marked,
+            pane: self.pane.read(&ctl),
             windows: {
                 let mut w = ctl.pane_windows(Side::Left, self.debug.get());
                 if let Some(t) = &*self.tree_text.borrow() {
@@ -920,65 +618,13 @@ impl BrowseView {
         ui::set_visible(self.cancel, s.job.as_ref().is_some_and(|(_, c)| *c));
         ui::set_text(self.message, &s.message);
         ui::set_visible(self.message, !s.message.is_empty());
-        ui::set_visible(self.tree, s.folder_tree);
-        if let Some(folders) = s.folders {
-            self.show_folders(folders);
-        }
-        if s.folder_tree {
-            let items = self.folder_items.borrow();
-            if let Some(item) = items.get(s.folder_cursor) {
-                // SAFETY: an item of our own tree.
-                unsafe {
-                    SendMessageW(
-                        self.tree,
-                        TVM_SELECTITEM,
-                        Some(WPARAM(TVGN_CARET as usize)),
-                        Some(LPARAM(*item)),
-                    );
-                }
-            }
-        }
-        if let Some(rows) = s.rows {
-            self.show_rows(rows, s.lines, s.rsrc);
-        }
-        if let Some(i) = s.cursor {
-            self.select(i);
-        }
+        self.pane.show(s.pane);
         self.show_panel(s.panel_key, s.panel, s.result, s.actions);
         ui::set_text(self.status, &s.status);
         self.tools.show(&s.tools);
         self.edit_row.show(&s.edit);
         self.mark_row.show(&s.marks);
-        self.show_marks(s.marked);
         self.show_windows(s.windows);
-    }
-
-    /// Draw the tick boxes again where the marks changed.
-    fn show_marks(&self, marked: Vec<bool>) {
-        let (changed, count) = {
-            let mut lines = self.lines.borrow_mut();
-            let mut changed = false;
-            for (line, m) in lines.iter_mut().zip(marked) {
-                if line.marked != m {
-                    line.marked = m;
-                    changed = true;
-                }
-            }
-            (changed, lines.len())
-        };
-        // The list may ask for a row's text while it redraws, so the rows are not held here.
-        if changed {
-            let last = count.saturating_sub(1);
-            // SAFETY: the virtual list reads the marks back through LVN_GETDISPINFO.
-            unsafe {
-                SendMessageW(
-                    self.list,
-                    LVM_REDRAWITEMS,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(last as isize)),
-                );
-            }
-        }
     }
 
     /// Open, keep or close the controller's windows: one per kind, built again when it changes.
@@ -1095,15 +741,7 @@ impl BrowseView {
             .borrow()
             .view_menu()
             .into_iter()
-            .map(|v| MenuItem::Item {
-                label: match v.hint.is_empty() {
-                    true => v.label,
-                    false => format!("{}\t{}", v.label, v.hint),
-                },
-                enabled: v.enabled,
-                checked: v.checked && v.kind != ViewItemKind::Command,
-                action: v.action,
-            })
+            .map(MenuItem::view)
             .collect();
         if self.ctrl.borrow().view_menu_shown() {
             self.apply(A::ShowViewMenu(false));
@@ -1113,6 +751,48 @@ impl BrowseView {
         let _ = unsafe { GetWindowRect(self.tools.view, &mut r) };
         if let Some(a) = track(self.owner(), items, r.left, r.bottom) {
             self.apply(a);
+        }
+    }
+
+    /// What the user did in the listing, as actions on the controller.
+    fn pane_event(&self, event: PaneEvent) {
+        let pane = |a| A::Pane(Side::Left, a);
+        match event {
+            PaneEvent::Click { row, ctrl, shift } => {
+                let click = self
+                    .ctrl
+                    .borrow()
+                    .pane(Side::Left)
+                    .row_click(&row, ctrl, shift);
+                self.apply(A::Focus(Side::Left));
+                if let Some(action) = click {
+                    self.apply(pane(action));
+                }
+            }
+            PaneEvent::Mark(id) => self.apply(pane(P::Mark(id))),
+            PaneEvent::Toggle(id) => self.apply(pane(P::ToggleExpand(id))),
+            PaneEvent::Activate => {
+                let id = {
+                    let ctl = self.ctrl.borrow();
+                    let p = ctl.pane(Side::Left);
+                    p.cursor_index().map(|i| p.rows()[i].node_id.clone())
+                };
+                if let Some(id) = id {
+                    self.apply(pane(P::Activate(id)));
+                }
+            }
+            PaneEvent::Key(key, mods) => {
+                if matches!(
+                    self.ctrl.borrow().command_for(key, mods),
+                    Some(Command::PageUp | Command::PageDown)
+                ) {
+                    self.apply(A::SetPageRows(Side::Left, self.pane.page_rows()));
+                }
+                self.key(key, mods);
+            }
+            PaneEvent::Sort(col) => self.apply(pane(P::SortBy(col))),
+            PaneEvent::Menu(row) => self.row_menu(&row),
+            PaneEvent::Drag => {}
         }
     }
 
@@ -1128,19 +808,7 @@ impl BrowseView {
             .borrow()
             .row_menu(Side::Left, row)
             .into_iter()
-            .map(|e| match e {
-                RowMenuEntry::Item {
-                    label,
-                    action,
-                    enabled,
-                } => MenuItem::Item {
-                    label,
-                    enabled,
-                    checked: false,
-                    action,
-                },
-                RowMenuEntry::Submenu { label, items } => MenuItem::Sub { label, items },
-            })
+            .map(MenuItem::row)
             .collect();
         if items.is_empty() {
             return;
@@ -1153,153 +821,9 @@ impl BrowseView {
         }
     }
 
-    fn show_rows(&self, rows: Vec<DisplayRow>, lines: Vec<Line>, rsrc: bool) {
-        let skip = rows.len() - lines.len();
-        self.skip.set(skip);
-        *self.rows.borrow_mut() = rows;
-        let count = lines.len();
-        *self.lines.borrow_mut() = lines;
-        // SAFETY: the virtual list reads its text back through LVN_GETDISPINFO.
-        unsafe {
-            let dpi = GetDpiForWindow(self.page).max(96);
-            let width = if rsrc {
-                layout::scale(COLUMNS[2].1, dpi)
-            } else {
-                0
-            };
-            SendMessageW(
-                self.list,
-                LVM_SETCOLUMNWIDTH,
-                Some(WPARAM(2)),
-                Some(LPARAM(width as isize)),
-            );
-            SendMessageW(
-                self.list,
-                LVM_SETITEMCOUNT,
-                Some(WPARAM(count)),
-                Some(LPARAM(LVSICF_NOSCROLL as isize)),
-            );
-            let last = count.saturating_sub(1);
-            SendMessageW(
-                self.list,
-                LVM_REDRAWITEMS,
-                Some(WPARAM(0)),
-                Some(LPARAM(last as isize)),
-            );
-        }
-    }
-
     /// Give the list and the folder tree the row icons for the page's DPI and the theme.
     pub fn set_icons(&self) {
-        // SAFETY: each control takes its new image list; the one it gives back is freed.
-        unsafe {
-            let dpi = GetDpiForWindow(self.page).max(96);
-            let old = SendMessageW(
-                self.list,
-                LVM_SETIMAGELIST,
-                Some(WPARAM(LVSIL_SMALL as usize)),
-                Some(LPARAM(row_icons::image_list(dpi).0 as isize)),
-            );
-            if old.0 != 0 {
-                let _ = ImageList_Destroy(Some(HIMAGELIST(old.0 as _)));
-            }
-            let old = SendMessageW(
-                self.tree,
-                TVM_SETIMAGELIST,
-                Some(WPARAM(TVSIL_NORMAL as usize)),
-                Some(LPARAM(row_icons::image_list(dpi).0 as isize)),
-            );
-            if old.0 != 0 {
-                let _ = ImageList_Destroy(Some(HIMAGELIST(old.0 as _)));
-            }
-        }
-    }
-
-    /// Select the cursor's row in the list, inside the sync guard so no click comes back.
-    fn select(&self, i: usize) {
-        let on = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
-        let item = LVITEMW {
-            stateMask: on,
-            state: on,
-            ..Default::default()
-        };
-        // SAFETY: plain list-view messages with a local item.
-        unsafe {
-            SendMessageW(
-                self.list,
-                LVM_SETITEMSTATE,
-                Some(WPARAM(i)),
-                Some(LPARAM(&item as *const _ as isize)),
-            );
-            SendMessageW(
-                self.list,
-                LVM_ENSUREVISIBLE,
-                Some(WPARAM(i)),
-                Some(LPARAM(0)),
-            );
-        }
-    }
-
-    /// Build the folder tree again from the controller's flat list of visible folders.
-    fn show_folders(&self, folders: Vec<(usize, String, bool)>) {
-        let mut items: Vec<isize> = Vec::with_capacity(folders.len());
-        let mut parents: Vec<isize> = Vec::new();
-        // SAFETY: tree-view messages on our own tree; each text outlives its insert.
-        unsafe {
-            SendMessageW(self.tree, TVM_DELETEITEM, None, Some(LPARAM(TVI_ROOT.0)));
-            for (i, (depth, name, open)) in folders.iter().enumerate() {
-                let icon = match open {
-                    true => row_icons::FOLDER_OPEN,
-                    false => row_icons::FOLDER,
-                };
-                parents.truncate(*depth);
-                let parent = parents.last().copied().unwrap_or(TVI_ROOT.0);
-                let mut text = ui::wide(&ui::plain(name));
-                let insert = TVINSERTSTRUCTW {
-                    hParent: HTREEITEM(parent),
-                    hInsertAfter: TVI_LAST,
-                    Anonymous: TVINSERTSTRUCTW_0 {
-                        item: TVITEMW {
-                            mask: TVIF_TEXT
-                                | TVIF_PARAM
-                                | TVIF_CHILDREN
-                                | TVIF_IMAGE
-                                | TVIF_SELECTEDIMAGE,
-                            iImage: icon,
-                            iSelectedImage: icon,
-                            pszText: PWSTR(text.as_mut_ptr()),
-                            lParam: LPARAM(i as isize),
-                            cChildren: windows::Win32::UI::Controls::TVITEMEXW_CHILDREN(1),
-                            ..Default::default()
-                        },
-                    },
-                };
-                let item = SendMessageW(
-                    self.tree,
-                    TVM_INSERTITEMW,
-                    None,
-                    Some(LPARAM(&insert as *const _ as isize)),
-                )
-                .0;
-                items.push(item);
-                parents.push(item);
-            }
-            for (i, (_, _, expanded)) in folders.iter().enumerate() {
-                if *expanded {
-                    SendMessageW(
-                        self.tree,
-                        TVM_EXPAND,
-                        Some(WPARAM(TVE_EXPAND.0 as usize)),
-                        Some(LPARAM(items[i])),
-                    );
-                }
-            }
-            if let Some(first) = items.first() {
-                SendMessageW(self.tree, TVM_ENSUREVISIBLE, None, Some(LPARAM(*first)));
-            }
-        }
-        *self.folders.borrow_mut() = folders;
-        *self.folder_items.borrow_mut() = items;
+        self.pane.set_icons();
     }
 
     fn show_panel(
@@ -1357,7 +881,7 @@ impl BrowseView {
             self.cancel,
             self.notice,
             self.message,
-            self.tree,
+            self.pane.tree,
             self.extract,
             self.export,
             self.nested,
@@ -1481,10 +1005,18 @@ impl BrowseView {
             Size::Stretch(1),
         ));
         let mut body = Vec::new();
-        if ui::shown(self.tree) {
-            body.push(Node::leaf(self.tree, Size::Fixed(TREE_W), Size::Stretch(1)));
+        if ui::shown(self.pane.tree) {
+            body.push(Node::leaf(
+                self.pane.tree,
+                Size::Fixed(TREE_W),
+                Size::Stretch(1),
+            ));
         }
-        body.push(Node::leaf(self.list, Size::Stretch(1), Size::Stretch(1)));
+        body.push(Node::leaf(
+            self.pane.list,
+            Size::Stretch(1),
+            Size::Stretch(1),
+        ));
         body.push(Node::column(side));
         col.push(Node::row(body));
         let mut foot = vec![Node::leaf(
@@ -1501,186 +1033,12 @@ impl BrowseView {
             }
         }
     }
-
-    /// Fill a cell the virtual list asks for, from the rows last read.
-    fn display(&self, info: &mut NMLVDISPINFOW) {
-        let item = &mut info.item;
-        let lines = self.lines.borrow();
-        let Some(line) = usize::try_from(item.iItem).ok().and_then(|i| lines.get(i)) else {
-            return;
-        };
-        if item.iSubItem == 0 {
-            if item.mask.0 & LVIF_STATE.0 != 0 {
-                // State image 2 is a ticked box, 1 an empty one.
-                let image = if line.marked { 2u32 } else { 1 };
-                item.state = LIST_VIEW_ITEM_STATE_FLAGS(image << 12);
-                item.stateMask = LVIS_STATEIMAGEMASK;
-            }
-            if item.mask.0 & LVIF_IMAGE.0 != 0 {
-                item.iImage = line.icon;
-            }
-            // An indent is counted in icon widths, so a row inside a folder sits one icon in.
-            if item.mask.0 & LVIF_INDENT.0 != 0 {
-                item.iIndent = line.depth;
-            }
-        }
-        if item.mask.0 & LVIF_TEXT.0 == 0 || item.pszText.is_null() || item.cchTextMax <= 0 {
-            return;
-        }
-        let cell = line
-            .cells
-            .get(item.iSubItem as usize)
-            .map_or("", |c| c.as_str());
-        let text: Vec<u16> = ui::plain(cell).encode_utf16().collect();
-        let n = text.len().min(item.cchTextMax as usize - 1);
-        // SAFETY: the list gave us a buffer of cchTextMax characters.
-        unsafe {
-            std::ptr::copy_nonoverlapping(text.as_ptr(), item.pszText.0, n);
-            *item.pszText.0.add(n) = 0;
-        }
-    }
-
-    /// The listing row at list position `i`.
-    fn row_at(&self, i: usize) -> Option<DisplayRow> {
-        self.rows.borrow().get(i + self.skip.get()).cloned()
-    }
-
-    fn list_notify(&self, code: u32, lp: LPARAM) -> Option<LRESULT> {
-        match code {
-            LVN_GETDISPINFOW => {
-                // SAFETY: LVN_GETDISPINFOW comes with an NMLVDISPINFOW.
-                let info = unsafe { &mut *(lp.0 as *mut NMLVDISPINFOW) };
-                self.display(info);
-                Some(LRESULT(0))
-            }
-            LVN_ITEMCHANGED => {
-                // SAFETY: LVN_ITEMCHANGED comes with an NMLISTVIEW.
-                let nm = unsafe { &*(lp.0 as *const NMLISTVIEW) };
-                let now = nm.uNewState & LVIS_SELECTED.0 != 0;
-                let was = nm.uOldState & LVIS_SELECTED.0 != 0;
-                if self.sync.active() || nm.uChanged.0 & LVIF_STATE.0 == 0 || !now || was {
-                    return Some(LRESULT(0));
-                }
-                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
-                if let Some(row) = row {
-                    let m = mods();
-                    let click = {
-                        let ctl = self.ctrl.borrow();
-                        ctl.pane(Side::Left).row_click(&row, m.ctrl, m.shift)
-                    };
-                    self.apply(A::Focus(Side::Left));
-                    if let Some(action) = click {
-                        self.apply(A::Pane(Side::Left, action));
-                    }
-                }
-                Some(LRESULT(0))
-            }
-            NM_CLICK => {
-                // A click on an icon that is a +/- opens or shuts its row in place.
-                // SAFETY: NM_CLICK from a list view comes with an NMITEMACTIVATE.
-                let nm = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
-                let mut hit = LVHITTESTINFO {
-                    pt: nm.ptAction,
-                    ..Default::default()
-                };
-                // SAFETY: a hit test with a local struct.
-                unsafe {
-                    SendMessageW(
-                        self.list,
-                        LVM_SUBITEMHITTEST,
-                        None,
-                        Some(LPARAM(&mut hit as *mut _ as isize)),
-                    );
-                }
-                let on_icon = hit.flags.0 & LVHT_ONITEMICON.0 != 0 && hit.iSubItem == 0;
-                let on_box = hit.flags.0 & LVHT_ONITEMSTATEICON.0 != 0;
-                let row = usize::try_from(hit.iItem).ok().and_then(|i| self.row_at(i));
-                match row {
-                    Some(row) if on_box => {
-                        self.apply(A::Pane(Side::Left, P::Mark(row.node_id)));
-                    }
-                    Some(row) if on_icon && row.expandable => {
-                        self.apply(A::Pane(Side::Left, P::ToggleExpand(row.node_id)));
-                    }
-                    _ => {}
-                }
-                Some(LRESULT(0))
-            }
-            NM_RCLICK => {
-                // SAFETY: NM_RCLICK from a list view comes with an NMITEMACTIVATE.
-                let nm = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
-                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
-                if let Some(row) = row {
-                    self.row_menu(&row);
-                }
-                Some(LRESULT(0))
-            }
-            NM_DBLCLK => {
-                let id = {
-                    let ctl = self.ctrl.borrow();
-                    let pane = ctl.pane(Side::Left);
-                    pane.cursor_index().map(|i| pane.rows()[i].node_id.clone())
-                };
-                if let Some(id) = id {
-                    self.apply(A::Pane(Side::Left, P::Activate(id)));
-                }
-                Some(LRESULT(0))
-            }
-            LVN_KEYDOWN => {
-                // SAFETY: LVN_KEYDOWN comes with an NMLVKEYDOWN.
-                let nm = unsafe { &*(lp.0 as *const NMLVKEYDOWN) };
-                if let Some(key) = key_of(nm.wVKey) {
-                    self.key(key, mods());
-                }
-                Some(LRESULT(0))
-            }
-            LVN_COLUMNCLICK => {
-                // SAFETY: LVN_COLUMNCLICK comes with an NMLISTVIEW.
-                let nm = unsafe { &*(lp.0 as *const NMLISTVIEW) };
-                let sort = usize::try_from(nm.iSubItem)
-                    .ok()
-                    .and_then(|i| COLUMNS.get(i))
-                    .and_then(|c| c.3);
-                if let Some(col) = sort {
-                    self.apply(A::Pane(Side::Left, P::SortBy(col)));
-                }
-                Some(LRESULT(0))
-            }
-            _ => None,
-        }
-    }
-
-    fn tree_notify(&self, code: u32, lp: LPARAM) -> Option<LRESULT> {
-        if self.sync.active() {
-            return None;
-        }
-        // SAFETY: both notifications come with an NMTREEVIEWW.
-        let nm = unsafe { &*(lp.0 as *const NMTREEVIEWW) };
-        let action = match code {
-            TVN_SELCHANGEDW => P::FolderTreeClick(nm.itemNew.lParam.0 as usize),
-            TVN_ITEMEXPANDINGW => P::FolderTreeToggle(nm.itemNew.lParam.0 as usize),
-            _ => return None,
-        };
-        // The tree is built again for the answer, which it must not be while it notifies.
-        *self.deferred.borrow_mut() = Some(action);
-        // SAFETY: posting to our own page.
-        unsafe {
-            let _ = PostMessageW(
-                Some(self.page),
-                WM_COMMAND,
-                WPARAM((DEFERRED as usize) << 16),
-                LPARAM(self.tree.0 as isize),
-            );
-        }
-        Some(LRESULT((code == TVN_ITEMEXPANDINGW) as isize))
-    }
 }
 
 impl Handler for BrowseView {
     fn command(&self, from: HWND, code: u32) {
-        if code == DEFERRED {
-            let action = self.deferred.borrow_mut().take();
-            if let Some(action) = action {
+        if code == DEFERRED && from == self.pane.tree {
+            if let Some(action) = self.pane.take_deferred() {
                 self.apply(A::Focus(Side::Left));
                 self.apply(A::Pane(Side::Left, action));
             }
@@ -1789,13 +1147,11 @@ impl Handler for BrowseView {
     }
 
     fn notify(&self, hdr: &NMHDR, lp: LPARAM) -> Option<LRESULT> {
-        if hdr.hwndFrom == self.list {
-            self.list_notify(hdr.code, lp)
-        } else if hdr.hwndFrom == self.tree {
-            self.tree_notify(hdr.code, lp)
-        } else {
-            None
+        let (answer, event) = self.pane.notify(hdr, lp)?;
+        if let Some(event) = event {
+            self.pane_event(event);
         }
+        answer
     }
 
     fn resized(&self) {
