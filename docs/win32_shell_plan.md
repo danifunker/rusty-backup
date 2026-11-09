@@ -95,6 +95,10 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
 
 ## Order of work
 
+**Paused 2026-11-09 after slice 1's first pass:** the tabs may give way to "open a thing, then act
+on it" ([navigation_plan.md](navigation_plan.md)). The slices below wait for that decision; the
+skeleton's tab control is the only part it replaces.
+
 1. **Gate 0** (below): an AutomationId set by Dynamic Annotation is visible to Python UIA.
 2. **The TUI over ConPTY** in `runner/src/tui.rs`, then the tier 8 TUI flows on Windows. This is
    the Windows baseline: anything that fails here fails in the shared code, not in Win32.
