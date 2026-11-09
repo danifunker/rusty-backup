@@ -1,0 +1,61 @@
+# Tier 2 — GitHub issue #109: Apple Installer Tomes (type idcp / ircp, creator
+# kakc), the archives Apple's Installer reads. Format: docs/installer_tome.md.
+#
+# The fixtures are real Tomes, data fork only. CD SW Tome's Apple CD-ROM decodes
+# to the same 22 resources as the loose 5.3.2 copy on the 7.5.5 sample disk, and
+# five of its extensions match the installed copies except the Installer's vers 2
+# stamp; the pinned hashes below are those checked decodes.
+
+[meta]
+tier = 2
+group = "archive.read.installer-tome"
+description = "Real Installer Tomes list and extract, with forks byte-identical to known-good decodes."
+
+[[case]]
+id = "read.archive.tome.cd-setup-532"
+description = "Macintosh CD-ROM Setup 5.3.2's Tome lists 8 files and decodes InstaCompOne forks across 64 KiB blocks"
+fixture = "arc.tome.cd-setup-532"
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["Apple CD-ROM", "INIT psap", "AppleCD Audio Player Guide", "ISO 9660 File Access", "(Installer Tome)"]
+[[case.step]]
+args = ["archive", "extract", "--format", "raw", "{fixture}", "{scratch}/ex"]
+expect_exit = 0
+stderr_contains = ["8 files extracted"]
+file_sha256 = [
+    { path = "{scratch}/ex/Apple CD-ROM.rsrc", sha256 = "0ddfc373d0f98cfb6cb706a6850f86f2299b2a5370268d28a14c256af5139cd2" },
+    { path = "{scratch}/ex/AppleCD Audio Player Guide", sha256 = "324be1e09bebd55ba52d7cb333c763124e99c10400b9108d09ad105c3df56426" },
+    { path = "{scratch}/ex/AppleCD Audio Player Guide.rsrc", sha256 = "dafdc8a137232d294ca2ab5347d651f46c7b8c0ce0fdfbc4b3ed8cae37e5006c" },
+]
+
+[[case]]
+id = "read.archive.tome.nsi151-localization"
+description = "A 166-entry Tome of short InstaCompOne streams extracts every entry"
+fixture = "arc.tome.nsi151-localization"
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["EtherTalk000.RSRC", "rsrc RSED"]
+[[case.step]]
+args = ["archive", "extract", "--format", "raw", "{fixture}", "{scratch}/ex"]
+expect_exit = 0
+stderr_contains = ["166 files extracted"]
+file_sha256 = [{ path = "{scratch}/ex/EtherTalk000.RSRC.rsrc", sha256 = "c42f1347e981b869c70bf626c6b01b73a96e5a16570cf2b2d6849f1797971bbc" }]
+
+[[case]]
+id = "read.archive.tome.nsi151-network-ircp"
+description = "A Tome typed ircp opens by content, and A/ROSE's slash is renamed on extract"
+fixture = "arc.tome.nsi151-network-ircp"
+[[case.step]]
+args = ["archive", "list", "{fixture}"]
+expect_exit = 0
+stdout_contains = ["A/ROSE", "TokenTalk Parts"]
+[[case.step]]
+args = ["archive", "extract", "--format", "raw", "{fixture}", "{scratch}/ex"]
+expect_exit = 0
+stderr_contains = ["2 files extracted", "1 name(s) contain characters"]
+file_sha256 = [
+    { path = "{scratch}/ex/A_ROSE.rsrc", sha256 = "00fd449512349b834ead7b8662e601619612c53a96cf11aebb5246019ec0a432" },
+    { path = "{scratch}/ex/TokenTalk Parts.rsrc", sha256 = "c73194e9522d4aec65ff7d048b37584ee95565b8394183b12cda9b33a9a90cc5" },
+]
