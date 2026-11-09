@@ -9,7 +9,13 @@
 mod app;
 #[cfg(windows)]
 mod effects;
+#[cfg(windows)]
+mod expand_hfs;
+#[cfg(windows)]
+mod inspect;
 mod layout;
+#[cfg(windows)]
+mod panel;
 #[cfg(windows)]
 mod sync;
 #[cfg(windows)]
@@ -22,10 +28,12 @@ fn main() {
     use rusty_backup::controller::log::capture;
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Controls::{
-        InitCommonControlsEx, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX,
+        InitCommonControlsEx, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
+        INITCOMMONCONTROLSEX,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, IsDialogMessageW, TranslateMessage, MSG,
+        DispatchMessageW, GetAncestor, GetMessageW, IsDialogMessageW, TranslateMessage, GA_ROOT,
+        MSG,
     };
 
     capture::init();
@@ -34,7 +42,7 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES,
+            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES,
         };
         let _ = InitCommonControlsEx(&icc);
     }
@@ -43,10 +51,13 @@ fn main() {
     // SAFETY: the standard message loop; IsDialogMessage gives Tab its meaning between controls.
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if let Some(main) = app::window() {
-                if IsDialogMessageW(main, &msg).as_bool() {
-                    continue;
-                }
+            // Tab moves between controls in the main window and in each modeless dialog.
+            let root = GetAncestor(msg.hwnd, GA_ROOT);
+            if app::window().is_some()
+                && !root.is_invalid()
+                && IsDialogMessageW(root, &msg).as_bool()
+            {
+                continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);

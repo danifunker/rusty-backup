@@ -8,7 +8,7 @@ use rusty_backup::controller::app::{
     about, app_version, elevation_button_hover, elevation_button_label, elevation_confirm,
     elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate,
 };
-use rusty_backup::controller::log::capture;
+use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
+use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
 use crate::sync::SyncGuard;
 use crate::ui;
@@ -61,8 +62,9 @@ pub struct App {
     host: EffectHost,
     window: HWND,
     parts: Vec<(Part, HWND)>,
-    /// One page per tab, shown inside the tab control; the screens fill them in later slices.
+    /// One page per tab, shown inside the tab control; the screens not built yet hold a note.
     pages: Vec<(AppTab, HWND)>,
+    inspect: Rc<InspectScreen>,
     log_shown: Cell<usize>,
     sync: SyncGuard,
 }
@@ -145,6 +147,18 @@ pub fn start() {
         );
     }
     app.tick();
+}
+
+/// Add a screen's drained log lines to the log panel.
+pub fn append_log(lines: Vec<(LogLevel, String)>) {
+    if lines.is_empty() {
+        return;
+    }
+    if let Some(app) = app() {
+        app.ctrl.borrow_mut().log.extend_lines(lines);
+        let auto = app.ctrl.borrow().log_auto_scroll();
+        app.sync_log(auto);
+    }
 }
 
 /// The main window, for the message loop's dialog navigation.
@@ -265,19 +279,42 @@ impl App {
             let on = if ctrl.log_auto_scroll() { 1 } else { 0 };
             SendMessageW(auto, BM_SETCHECK, Some(WPARAM(on)), Some(LPARAM(0)));
         }
+        let host = EffectHost::new(window, status);
+        let mut inspect = None;
         let pages = AppTab::ALL
             .iter()
             .map(|t| {
-                let text = format!(
-                    "The {} screen arrives in a later slice of the Win32 shell.",
-                    t.label()
-                );
-                let page = ui::label(window, &text);
+                let page = match t {
+                    AppTab::Inspect => {
+                        let page = crate::panel::page(window);
+                        let screen = InspectScreen::build(
+                            window,
+                            page,
+                            ctrl.notify(),
+                            ctrl.recent_handle(),
+                            host.clone(),
+                        );
+                        inspect = Some(screen);
+                        page
+                    }
+                    AppTab::Backup
+                    | AppTab::Restore
+                    | AppTab::Build
+                    | AppTab::Convert
+                    | AppTab::Optical
+                    | AppTab::Archives => {
+                        let text = format!(
+                            "The {} screen arrives in a later slice of the Win32 shell.",
+                            t.label()
+                        );
+                        ui::label(window, &text)
+                    }
+                };
                 ui::set_visible(page, false);
                 (*t, page)
             })
             .collect();
-        let host = EffectHost::new(window, status);
+        let inspect = inspect.expect("the Inspect page");
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -286,6 +323,7 @@ impl App {
             window,
             parts,
             pages,
+            inspect,
             log_shown: Cell::new(0),
             sync: SyncGuard::default(),
         })
@@ -315,6 +353,16 @@ impl App {
         if self.ctrl.borrow_mut().take_elevation_prompt() {
             self.host
                 .run(vec![Effect::Confirm(elevation_confirm())], &reply());
+        }
+        let devices = self.ctrl.borrow().devices().to_vec();
+        self.inspect.set_devices(&devices);
+        self.inspect.tick();
+        if self.inspect.take_backup_closed() {
+            self.ctrl.borrow_mut().close_shared_backup();
+        }
+        if self.inspect.take_convert().is_some() {
+            let line = "The Convert tab arrives in slice 7c of the Win32 shell.";
+            append_log(vec![(LogLevel::Warning, line.into())]);
         }
         self.refresh();
     }
@@ -477,7 +525,7 @@ impl App {
             if hidden.contains(h) {
                 continue;
             }
-            move_to(*h, *r);
+            ui::move_to(*h, *r);
         }
         if let Some((_, r)) = placed.iter().find(|(h, _)| *h == p(Part::Tabs)) {
             let mut inner = RECT {
@@ -503,7 +551,7 @@ impl App {
                 h: (inner.bottom - inner.top - 2 * m).max(0),
             };
             for (_, h) in &self.pages {
-                move_to(*h, page);
+                ui::move_to(*h, page);
                 // SAFETY: pages sit above the tab control in z-order, so they draw over it.
                 let _ = unsafe {
                     SetWindowPos(
@@ -598,11 +646,6 @@ impl App {
 
 fn ui_visible(h: HWND) -> bool {
     ui::shown(h)
-}
-
-fn move_to(h: HWND, r: Rect) {
-    // SAFETY: moving our own child control.
-    let _ = unsafe { SetWindowPos(h, None, r.x, r.y, r.w, r.h, SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
 unsafe extern "system" fn refont(h: HWND, font: LPARAM) -> windows::core::BOOL {

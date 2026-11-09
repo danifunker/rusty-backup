@@ -176,6 +176,23 @@ pub fn set_visible(hwnd: HWND, on: bool) {
     }
 }
 
+/// Place a control at `r` in its parent's client area.
+pub fn move_to(hwnd: HWND, r: crate::layout::Rect) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    // SAFETY: moving our own control.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+}
+
 pub fn set_enabled(hwnd: HWND, on: bool) {
     // SAFETY: plain window calls.
     unsafe {

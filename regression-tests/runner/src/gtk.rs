@@ -109,15 +109,15 @@ impl Driver {
         let line = format!("{}\n", op);
         let stdin = match self.stdin.as_mut() {
             Some(s) => s,
-            None => return Err(("the GTK driver running".to_string(), "closed".to_string())),
+            None => return Err(("the driver running".to_string(), "closed".to_string())),
         };
         stdin
             .write_all(line.as_bytes())
             .and_then(|_| stdin.flush())
-            .map_err(|e| ("the GTK driver to take the op".to_string(), e.to_string()))?;
+            .map_err(|e| ("the driver to take the op".to_string(), e.to_string()))?;
         let r = self
             .reply(limit + Duration::from_secs(30))
-            .map_err(|e| ("an answer from the GTK driver".to_string(), e))?;
+            .map_err(|e| ("an answer from the driver".to_string(), e))?;
         if r.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(());
         }

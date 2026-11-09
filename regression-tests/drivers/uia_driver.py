@@ -149,7 +149,11 @@ def fill(e, text):
 
 def visible_text():
     out = []
-    for e in elements():
+    try:
+        all_elements = elements()
+    except (comtypes.COMError, ValueError) as e:
+        return f"(the window cannot be read: {e})"
+    for e in all_elements:
         if not showing(e):
             continue
         n, v = name_of(e), value_of(e)
@@ -286,11 +290,12 @@ def main():
         UIA = comtypes.client.CreateObject(U.CUIAutomation, interface=U.IUIAutomation)
         root = UIA.GetRootElement()
         end = time.time() + 60
-        while time.time() < end and WINDOW is None:
+        # FindFirst answers a NULL pointer, not None, while nothing matches.
+        while time.time() < end and not WINDOW:
             WINDOW = root.FindFirst(U.TreeScope_Children, cond(U.UIA_ProcessIdPropertyId, APP.pid))
-            if WINDOW is None:
+            if not WINDOW:
                 time.sleep(0.3)
-        if WINDOW is None:
+        if not WINDOW:
             reply({"ready": False, "why": "the Win32 shell's window never appeared"})
             return
         reply({"ready": True})
