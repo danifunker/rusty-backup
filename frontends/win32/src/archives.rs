@@ -222,6 +222,11 @@ impl ArchivesScreen {
         self.busy.set(busy);
     }
 
+    /// Settings cleared the recent files: the picker forgets its copy too.
+    pub fn forget_recents(&self) {
+        self.recent_files.borrow_mut().clear();
+    }
+
     /// Open `path` as the archive (Inspect's hand-off, or a drop).
     pub fn open_path(&self, path: PathBuf) {
         self.apply(ArchivesAction::Open(path));

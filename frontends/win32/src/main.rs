@@ -69,6 +69,8 @@ mod restore;
 #[cfg(windows)]
 mod row_icons;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod sync;
 #[cfg(windows)]
 mod theme;

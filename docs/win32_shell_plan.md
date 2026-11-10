@@ -245,8 +245,10 @@ in check-group mode with the bundled icons); the screens and slices below are un
    `flow.network.remote-inspect-backup` passes, so every tier-8 flow but the audio one runs on
    win32. The UIA driver now types into the window the user would be typing in (an open prompt
    rather than the main window) and maps characters through the keyboard layout, so `.` and
-   `:` are no longer Delete and nothing. Left in 7b: Settings, Backup's remote source,
-   Restore's remote target and Optical's remote daemons.
+   `:` are no longer Delete and nothing. Settings (`settings.rs`): the update check, the
+   Windows file associations and Clear Recent Files, which reaches every tab's picker;
+   `flow.settings.save-and-reopen` passes. Left in 7b: Backup's remote source, Restore's
+   remote target and Optical's remote daemons.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

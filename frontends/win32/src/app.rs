@@ -39,6 +39,7 @@ use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
 use crate::optical::OpticalScreen;
 use crate::restore::RestoreScreen;
+use crate::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::toolbar;
 
@@ -88,6 +89,7 @@ pub struct App {
     optical: Rc<OpticalScreen>,
     archives: Rc<ArchivesScreen>,
     convert: Rc<ConvertScreen>,
+    settings: RefCell<Option<Rc<SettingsWindow>>>,
     /// The Optical tab's disc browser, in its page's place while open.
     disc_page: HWND,
     /// The player's timer runs while a track plays.
@@ -249,7 +251,6 @@ impl App {
                 false,
             ),
         );
-        // Settings arrives in slice 7b; until then its button is shown but off.
         let _ = commander;
         add(
             Part::CloseBackup,
@@ -269,11 +270,10 @@ impl App {
         );
         ui::set_visible(elevate, gate == ElevationGate::NeedsElevation);
         let _ = elevation_button_hover();
-        let settings = add(
+        add(
             Part::Settings,
             ui::button(window, "Settings...", ids::SETTINGS),
         );
-        ui::set_enabled(settings, false);
         add(
             Part::About,
             ui::button(window, "About Rusty Backup", ids::ABOUT),
@@ -431,6 +431,7 @@ impl App {
             optical,
             archives,
             convert,
+            settings: RefCell::default(),
             disc_page,
             playing: Cell::new(false),
             commander: RefCell::default(),
@@ -510,6 +511,32 @@ impl App {
             self.convert.open(path);
         }
         self.refresh();
+    }
+
+    /// Settings, one window at a time; Clear Recent Files reaches every tab's picker.
+    fn open_settings(&self) {
+        let open = self.settings.borrow().as_ref().is_some_and(|w| w.is_open());
+        if open {
+            return;
+        }
+        let recent = self.ctrl.borrow().recent_handle();
+        let window = SettingsWindow::open(
+            self.window,
+            recent,
+            Box::new(|| {
+                if let Some(app) = app() {
+                    app.forget_recents();
+                }
+            }),
+        );
+        *self.settings.borrow_mut() = Some(window);
+    }
+
+    fn forget_recents(&self) {
+        self.backup.forget_recents();
+        self.restore.forget_recents();
+        self.optical.forget_recents();
+        self.archives.forget_recents();
     }
 
     /// One disk job at a time: each tab hears who else runs.
@@ -938,7 +965,8 @@ impl App {
                 self.apply(AppAction::SetLogAutoScroll(on));
             }
             Part::Commander => self.open_commander(),
-            Part::Settings | Part::BannerText | Part::Screens | Part::Status | Part::Log => {}
+            Part::Settings => self.open_settings(),
+            Part::BannerText | Part::Screens | Part::Status | Part::Log => {}
         }
     }
 

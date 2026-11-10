@@ -430,6 +430,11 @@ impl RestoreScreen {
         self.busy.set(busy);
     }
 
+    /// Settings cleared the recent files: the picker forgets its copy too.
+    pub fn forget_recents(&self) {
+        self.recent_files.borrow_mut().clear();
+    }
+
     pub fn is_running(&self) -> bool {
         let writing = self
             .writer
