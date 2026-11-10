@@ -188,6 +188,15 @@ in check-group mode with the bundled icons); the screens and slices below are un
    writable volume asks (copy it in, or open it here). On the browse view in Edit Mode they
    are staged. `flow.commander.*` and `flow.files.*` run on win32: 42 pass,
    R-089 and R-090 xfail as on the other shells. Not done: Compare (not built on any shell).
+   Slice 4 (Backup and Restore) under way (2026-11-09): `backup.rs` (source split button, the
+   partition rows, destination, name, format with the CHD control, sizing, split, checksum,
+   Start / Cancel) and `restore.rs` (the four modes, the backup folder or a partition image,
+   each mode's target, the new disk's table, the full-disk sizes with alignment and trailing
+   free space and its bars, the caveats, Restore / Cancel). A disk job on one tab locks Backup
+   and Restore. `flow.backup.image-zstd` and `flow.restore.folder-to-image` pass. Learned: UI
+   Automation's Select changes a drop-down list without `CBN_SELCHANGE`, so a screen also reads
+   the list on `CBN_CLOSEUP`. Not done: the VHD layout window, remote sources and targets (7b),
+   Write Image File's disk writer (7a), sharing the backup folder with Inspect.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

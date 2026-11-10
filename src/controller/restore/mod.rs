@@ -102,6 +102,8 @@ pub mod labels {
     pub const TARGET_KIND: &str = "Target";
     pub const TARGET_IMAGE: &str = "Image File";
     pub const START: &str = "Restore";
+    /// The confirmation's go-ahead button.
+    pub const CONFIRM: &str = "I understand, proceed";
     pub const DONE: &str = "Restore complete.";
     /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
     pub const TABLE: &[(&str, &str)] = &[
@@ -109,6 +111,7 @@ pub mod labels {
         (ids::TARGET_KIND, TARGET_KIND),
         (ids::TARGET_IMAGE, TARGET_IMAGE),
         (ids::START, START),
+        (super::purpose::RESTORE, CONFIRM),
         ("restore.done", DONE),
     ];
 }

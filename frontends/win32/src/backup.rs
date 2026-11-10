@@ -370,6 +370,10 @@ impl BackupScreen {
         self.busy.set(busy);
     }
 
+    pub fn is_running(&self) -> bool {
+        self.ctrl.borrow().is_running()
+    }
+
     fn apply(&self, action: BackupAction) {
         let effects = self.ctrl.borrow_mut().apply(action);
         self.after(effects);

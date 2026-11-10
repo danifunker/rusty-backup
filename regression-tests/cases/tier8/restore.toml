@@ -10,7 +10,7 @@ id = "flow.restore.folder-to-image"
 description = "Restore a zstd backup folder to a new image file from the Restore screen and read the file back"
 level = "smoke"
 area = ["restore"]
-shells = ["tui", "gtk"]
+shells = ["tui", "gtk", "win32"]
 capabilities = ["restore.backup-folder", "restore.target-image", "restore.run"]
 timeout_ms = 180000
 

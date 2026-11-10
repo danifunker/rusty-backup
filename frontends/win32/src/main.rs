@@ -47,6 +47,8 @@ mod report;
 #[cfg(windows)]
 mod resize;
 #[cfg(windows)]
+mod restore;
+#[cfg(windows)]
 mod row_icons;
 #[cfg(windows)]
 mod sync;

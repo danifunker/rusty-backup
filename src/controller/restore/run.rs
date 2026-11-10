@@ -67,7 +67,7 @@ impl RestoreController {
             purpose: purpose::RESTORE,
             title: "Confirm Restore".to_string(),
             message,
-            confirm_label: "I understand, proceed".to_string(),
+            confirm_label: super::labels::CONFIRM.to_string(),
             destructive: true,
         })]
     }
