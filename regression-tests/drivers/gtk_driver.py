@@ -295,8 +295,10 @@ def combo_value(n, choices=None):
 
 
 def radio_named(value):
+    # A grouped GTK 4 check button is a radio, but some AT-SPI versions report it as a check box.
+    roles = ("radio button",) if value in ("on", "off") else ("radio button", "check box")
     for c in nodes(APP):
-        if role_of(c) == "radio button" and showing(c) and (
+        if role_of(c) in roles and showing(c) and (
                 name_of(c) == value or name_of(c).startswith(value)):
             return c
     return None
