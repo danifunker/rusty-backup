@@ -22,9 +22,9 @@ seekable-zstd, remote, tui, crypto, yaml` (root `Cargo.toml`).
 <!-- matrix:begin -->
 | Target | CI target | World | Ships today | Planned shell | Toolchain | Features | Limits |
 |---|---|---|---|---|---|---|---|
-| Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli, Inno installer | Win32 (Phase 5) | stable | default | |
-| Windows Win32 shell (x64) | win32 | modern | not shipped: `rusty-backup-win32` (`frontends/win32/`) builds in CI as an artifact, slice by slice | Win32 (Phase 5) | stable | shell features | Windows 10 1809+; x64 only so far (i686 and ARM64 later); the UIA flows run in CI with Python and comtypes |
-| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli | Win32 (Phase 5) | stable | default | |
+| Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli + the Win32 shell (`rusty-backup-win32.exe`, a preview), Inno installer | Win32 (Phase 5) | stable | default | |
+| Windows Win32 shell (x64) | win32 | modern | checks only: clippy, layout tests and the UIA flows for `frontends/win32/`; the exe ships from the windows and windows-arm64 targets | Win32 (Phase 5) | stable | shell features | Windows 10 1809+; the UIA flows run in CI with Python and comtypes |
+| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli + the Win32 shell (preview) | Win32 (Phase 5) | stable | default | |
 | macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default | |
 | Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default | |
 | Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default | x64 builds in docker/linux-packages-focal.Dockerfile (Ubuntu 20.04, glibc 2.31) on the libchdman glibc 2.31 prebuilt; arm64 builds on the 24.04 runner and needs glibc 2.39 |

@@ -258,6 +258,15 @@ in check-group mode with the bundled icons); the screens and slices below are un
    the list (`flow.network.optical-add-remote`). With it slice 7b is complete: 57 win32 flows
    pass, 2 known xfail. Left: slice 9 (packaging) and the Win32 column of
    `docs/capabilities.md`.
+   Slice 9, packaging (2026-11-10): the windows (x86, x64) and windows-arm64 jobs build
+   `frontends/win32` for their target and ship `rusty-backup-win32.exe` in the release ZIP
+   beside `rusty-backup.exe`; the Inno installer installs it when present, with a "Rusty Backup
+   (Win32 preview)" Start-menu entry. The self-updater replaces whichever GUI is running and
+   refreshes the other one beside it. File associations stay with `rusty-backup.exe`. Not
+   checked locally: the CI packaging itself (no push yet), the installer (no ISCC here) and an
+   i686 link, which needs NASM here for aws-lc. The i686 type-check found ten
+   `Get/SetWindowLongPtrW` calls that assumed a 64-bit `isize` (it is `i32` there); they cast now.
+   57 win32 flows pass, 2 known xfail, after the change.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

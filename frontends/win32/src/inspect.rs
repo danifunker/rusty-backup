@@ -120,7 +120,7 @@ pub(crate) fn set_progress(progress: HWND, running: bool, pct: Option<u32>) {
             style & !PBS_MARQUEE
         };
         if want != style {
-            SetWindowLongPtrW(progress, GWL_STYLE, want as isize);
+            SetWindowLongPtrW(progress, GWL_STYLE, want as _);
         }
         SendMessageW(
             progress,

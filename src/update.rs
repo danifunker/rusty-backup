@@ -478,6 +478,10 @@ fn extract_zip_flat(
     Ok(())
 }
 
+/// The Windows GUIs a release ZIP carries: the egui app, then the native Win32 shell.
+#[cfg(any(feature = "gui", feature = "tui-update"))]
+const GUI_EXES: [&str; 2] = ["rusty-backup.exe", "rusty-backup-win32.exe"];
+
 /// Download the matched release ZIP, extract it, and replace the running
 /// executable in place. On success the caller should prompt the user and then
 /// call [`restart_app`] to relaunch into the new version.
@@ -499,12 +503,27 @@ pub fn download_and_apply_update(
     let staging = tempfile::Builder::new().prefix("rb-update-").tempdir()?;
     extract_zip_flat(&zip_bytes, staging.path())?;
 
-    let new_exe = staging.path().join("rusty-backup.exe");
+    // The release ships two GUIs side by side: replace the one running, refresh the other.
+    let running = std::env::current_exe()?;
+    let name = match running.file_name().and_then(|n| n.to_str()) {
+        Some(n) if GUI_EXES.contains(&n) => n.to_string(),
+        _ => GUI_EXES[0].to_string(),
+    };
+    let new_exe = staging.path().join(&name);
     if !new_exe.exists() {
-        return Err("update archive did not contain rusty-backup.exe".into());
+        return Err(format!("update archive did not contain {name}").into());
     }
 
     replace_running_exe(&new_exe)?;
+    if let Some(dir) = running.parent() {
+        for other in GUI_EXES.iter().filter(|n| **n != name) {
+            let (from, to) = (staging.path().join(other), dir.join(other));
+            // Best-effort: only an installed copy is refreshed, and a running one stays as it is.
+            if from.exists() && to.exists() {
+                let _ = fs::copy(&from, &to);
+            }
+        }
+    }
 
     // Best-effort: refresh a side-by-side rb-cli.exe if the release shipped one
     // and we have a writable install dir. rb-cli is not running, so a plain

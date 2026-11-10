@@ -16,6 +16,9 @@ self-updater (`self_replace`) can overwrite the running exe later. A
   the self-updater's `current_exe()` resolves to).
 - `{app}\bin\rb-cli.exe` — the CLI, in a subdir so only it lands on PATH.
 - `{app}\icon.ico`.
+- `{app}usty-backup-win32.exe` — the native Win32 shell (a preview), when the build dir has
+  it; its Start-menu entry is "Rusty Backup (Win32 preview)". File associations still point at
+  `rusty-backup.exe`, and the self-updater refreshes this exe beside whichever GUI runs it.
 
 ## Tasks (user-facing checkboxes)
 

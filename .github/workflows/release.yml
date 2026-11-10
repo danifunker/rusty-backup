@@ -240,14 +240,30 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile), shipped beside
+      # the egui app as rusty-backup-win32.exe in the ZIP and the installer.
+      - name: Cache Win32 shell build
+        uses: actions/cache@v5
+        with:
+          path: frontends/win32/target
+          key: ${{ runner.os }}-${{ matrix.target }}-win32-shell-${{ hashFiles('frontends/win32/Cargo.lock') }}
+
+      - name: Build the Win32 shell
+        working-directory: frontends/win32
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the Win32 shell
+        shell: bash
+        run: cp "frontends/win32/target/${{ matrix.target }}/release/rusty-backup-win32.exe" "target/${{ matrix.target }}/release/"
+
       - name: Package
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe
           fi
       
       - name: Upload artifact
@@ -272,7 +288,7 @@ jobs:
 
       # Per-user Inno Setup installer (Setup.exe). Installs to %LocalAppData%
       # so the in-app self-updater can replace the running exe without admin.
-      # Source dir has both rusty-backup.exe and rb-cli.exe from the Build step.
+      # Source dir has rusty-backup.exe and rb-cli.exe from Build, and rusty-backup-win32.exe staged.
       # See installer/rusty-backup.iss + docs/windows_self_update.md.
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -1343,14 +1359,30 @@ jobs:
       - name: Build (GUI + rb-cli, default features)
         run: cargo build --release --target aarch64-pc-windows-msvc
 
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile), shipped beside
+      # the egui app as rusty-backup-win32.exe in the ZIP and the installer.
+      - name: Cache Win32 shell build
+        uses: actions/cache@v5
+        with:
+          path: frontends/win32/target
+          key: ${{ runner.os }}-aarch64-pc-windows-msvc-win32-shell-${{ hashFiles('frontends/win32/Cargo.lock') }}
+
+      - name: Build the Win32 shell
+        working-directory: frontends/win32
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
+      - name: Stage the Win32 shell
+        shell: bash
+        run: cp "frontends/win32/target/aarch64-pc-windows-msvc/release/rusty-backup-win32.exe" "target/aarch64-pc-windows-msvc/release/"
+
       - name: Package app
         shell: bash
         run: |
           cd target/aarch64-pc-windows-msvc/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe
           fi
 
       - name: Upload app artifact

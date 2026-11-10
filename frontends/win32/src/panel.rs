@@ -168,7 +168,7 @@ pub fn page(parent: HWND) -> HWND {
     }
     .expect("a page window");
     // SAFETY: tagging our own window.
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, PAGE) };
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, PAGE as _) };
     hwnd
 }
 
@@ -207,7 +207,7 @@ pub fn dialog(owner: HWND, title: &str, w: i32, h: i32) -> HWND {
 /// `hwnd` is a tab's page (painted as a screen's body), not a dialog.
 pub fn is_page(hwnd: HWND) -> bool {
     // SAFETY: a plain read of our own tag.
-    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PAGE }
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as isize == PAGE }
 }
 
 /// The panel's client area, for its layout.
@@ -235,7 +235,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         // Esc in a window arrives as IDCANCEL from no control: a close request, as the X is.
         (WM_COMMAND, Some(h)) if lp.0 == 0 && wp.0 & 0xffff == 2 => {
             // SAFETY: GWLP_USERDATA is ours.
-            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != PAGE {
+            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as isize != PAGE {
                 h.close();
             }
             LRESULT(0)
@@ -266,7 +266,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         // SAFETY: GWLP_USERDATA is ours; a page paints as a screen's body, a dialog as a window.
         (WM_ERASEBKGND, _) => unsafe {
-            let page = GetWindowLongPtrW(hwnd, GWLP_USERDATA) == PAGE;
+            let page = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as isize == PAGE;
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
             let brush = if page {
@@ -279,7 +279,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         },
         // SAFETY: GWLP_USERDATA is ours.
         (msg, _) if theme::ctl_color(msg, wp, lp, false).is_some() => {
-            let page = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == PAGE;
+            let page = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as isize == PAGE;
             theme::ctl_color(msg, wp, lp, page).unwrap_or_default()
         }
         // SAFETY: everything else gets the default handling.
