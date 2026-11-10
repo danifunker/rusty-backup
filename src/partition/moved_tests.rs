@@ -235,3 +235,118 @@ mod solaris_x86 {
         );
     }
 }
+
+mod bsd_dedicated {
+    //! FreeBSD/alpha "dangerously dedicated": the label at byte 64 inside slice a, which starts at 0.
+    use crate::partition::PartitionTable;
+    use fs_unix::ufs_format::{create_blank_ufs1, Ufs1FormatParams};
+    use std::io::Cursor;
+
+    const MIB: usize = 1024 * 1024;
+    const SLICE: usize = 4 * MIB;
+
+    fn ufs(label: &str) -> Vec<u8> {
+        let params = Ufs1FormatParams {
+            size_bytes: SLICE as u64,
+            label: Some(label.to_string()),
+            ..Default::default()
+        };
+        create_blank_ufs1(&params).expect("format")
+    }
+
+    /// Slots a (FFS at 0), b (swap), c (raw), e (FFS), little-endian, label at byte 64.
+    fn disk() -> Vec<u8> {
+        let sectors = (3 * SLICE / 512) as u32;
+        let mut d = vec![0u8; 3 * SLICE];
+        d[..SLICE].copy_from_slice(&ufs("slice-a"));
+        d[2 * SLICE..].copy_from_slice(&ufs("slice-e"));
+        let l = 64;
+        let put32 = |d: &mut Vec<u8>, o: usize, v: u32| {
+            d[l + o..l + o + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        put32(&mut d, 0, part_tables::bsd::BSD_DISKMAGIC);
+        put32(&mut d, 132, part_tables::bsd::BSD_DISKMAGIC);
+        d[l + 8..l + 11].copy_from_slice(b"da0");
+        put32(&mut d, 40, 512);
+        put32(&mut d, 60, sectors);
+        d[l + 138..l + 140].copy_from_slice(&5u16.to_le_bytes());
+        let slot = (SLICE / 512) as u32;
+        let slots = [
+            (slot, 0, 7u8),
+            (slot, slot, 1),
+            (sectors, 0, 0),
+            (0, 0, 0),
+            (slot, 2 * slot, 7),
+        ];
+        for (i, (size, off, ty)) in slots.iter().enumerate() {
+            let p = 148 + i * 16;
+            put32(&mut d, p, *size);
+            put32(&mut d, p + 4, *off);
+            d[l + p + 12] = *ty;
+        }
+        let ck = (0..148 + 5 * 16).step_by(2).fold(0u16, |x, o| {
+            x ^ u16::from_le_bytes([d[l + o], d[l + o + 1]])
+        });
+        d[l + 136..l + 138].copy_from_slice(&ck.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn the_label_wins_over_the_ufs_at_sector_zero() {
+        let d = disk();
+        let pt = PartitionTable::detect(&mut Cursor::new(&d)).expect("detect");
+        assert!(matches!(pt, PartitionTable::Bsd(_)), "{}", pt.type_name());
+        let parts = pt.partitions();
+        let names: Vec<&str> = parts.iter().map(|p| p.type_name.as_str()).collect();
+        assert_eq!(names, ["BSD a (4.2BSD)", "BSD b (swap)", "BSD e (4.2BSD)"]);
+        for (at, label) in [(0, "slice-a"), (2, "slice-e")] {
+            let p = &parts[at];
+            let fs = crate::fs::open_filesystem_sized(
+                Cursor::new(d.clone()),
+                p.byte_offset(),
+                Some(p.size_bytes),
+                p.partition_type_byte,
+                p.partition_type_string.as_deref(),
+            );
+            let mut fs = fs.expect("open slice");
+            assert_eq!(fs.volume_label(), Some(label));
+            let root = fs.root().expect("root");
+            fs.list_directory(&root).expect("ls");
+        }
+    }
+
+    #[test]
+    fn a_bad_checksum_leaves_the_whole_disk_ufs() {
+        let mut d = disk();
+        d[64 + 136] ^= 1;
+        let pt = PartitionTable::detect(&mut Cursor::new(&d)).expect("detect");
+        assert!(!matches!(pt, PartitionTable::Bsd(_)));
+        assert!(
+            matches!(pt, PartitionTable::None { .. }),
+            "{}",
+            pt.type_name()
+        );
+    }
+
+    #[test]
+    fn the_swap_slice_raw_view_ends_with_the_slice() {
+        let d = disk();
+        let pt = PartitionTable::detect(&mut Cursor::new(&d)).expect("detect");
+        let p = &pt.partitions()[1];
+        let mut fs = crate::fs::open_filesystem_sized(
+            Cursor::new(d.clone()),
+            p.byte_offset(),
+            Some(p.size_bytes),
+            p.partition_type_byte,
+            p.partition_type_string.as_deref(),
+        )
+        .expect("carve view");
+        let root = fs.root().expect("root");
+        let whole = fs.list_directory(&root).expect("ls");
+        let whole = whole
+            .iter()
+            .find(|e| e.name == "whole-disk.img")
+            .expect("raw");
+        assert_eq!(whole.size, SLICE as u64);
+    }
+}

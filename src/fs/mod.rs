@@ -1980,9 +1980,10 @@ pub fn open_filesystem_full<R: Read + Seek + Send + 'static>(
                 // No filesystem recognized. Rather than erroring, fall back to
                 // the synthetic carve view so the user can still pull a raw
                 // copy and any recoverable text/JSON content off the image.
-                _ => Ok(Box::new(carve::CarveFilesystem::open(
+                _ => Ok(Box::new(carve::CarveFilesystem::open_sized(
                     reader,
                     partition_offset,
+                    partition_size,
                 )?)),
             }
         }
