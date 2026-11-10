@@ -61,6 +61,8 @@ jobs:
         run: scripts/check-boundaries.sh
       - name: Platform matrix matches the CI targets
         run: scripts/check-platform-matrix.py
+      - name: Capabilities table matches the tier 8 flows
+        run: scripts/check-capabilities.py
 
   generate-version:
     name: Generate Version
