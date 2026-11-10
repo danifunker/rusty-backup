@@ -9,18 +9,18 @@ use std::io;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
-/// Inno Setup writes the per-user uninstall entry under this key. The `_is1`
-/// suffix is Inno's convention; the GUID must match the `AppId` in
-/// `installer/rusty-backup.iss`.
-const UNINSTALL_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\
-{8F3A1C2E-5B7D-4E9A-9C1F-2D6B8A4E7F10}_is1";
+/// Inno's per-user uninstall entry for the running GUI (`_is1` is Inno's suffix on the `AppId`).
+fn uninstall_subkey() -> String {
+    let id = crate::os::windows_gui::WindowsGui::current().app_id();
+    format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{id}_is1")
+}
 
 /// True when this build was placed by the Inno installer (its ARP key exists),
 /// as opposed to a portable ZIP copy. Portable copies should not touch the
 /// installer-owned registry entries.
 pub fn is_installed() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    hkcu.open_subkey_with_flags(UNINSTALL_SUBKEY, KEY_READ)
+    hkcu.open_subkey_with_flags(uninstall_subkey(), KEY_READ)
         .is_ok()
 }
 
@@ -33,7 +33,7 @@ pub fn is_installed() -> bool {
 /// working across self-updates.
 pub fn refresh_arp_display_version(version: &str) -> io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = match hkcu.open_subkey_with_flags(UNINSTALL_SUBKEY, KEY_READ | KEY_WRITE) {
+    let key = match hkcu.open_subkey_with_flags(uninstall_subkey(), KEY_READ | KEY_WRITE) {
         Ok(k) => k,
         Err(_) => return Ok(()), // portable / not installed
     };

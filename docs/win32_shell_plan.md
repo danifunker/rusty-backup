@@ -263,7 +263,15 @@ in check-group mode with the bundled icons); the screens and slices below are un
    `frontends/win32` for their target and ship `rusty-backup-win32.exe` in the release ZIP
    beside `rusty-backup.exe`; the Inno installer installs it when present, with a "Rusty Backup
    (Win32 preview)" Start-menu entry. The self-updater replaces whichever GUI is running and
-   refreshes the other one beside it. File associations stay with `rusty-backup.exe`. Not
+   refreshes the other one beside it. File associations stay with `rusty-backup.exe`.
+   **Changed the same day (user's call): the Win32 shell ships as its own package**, since egui
+   goes at the end of this plan: `Rusty-Backup-Win32-windows-<arch>-<version>.zip` (x86, x64,
+   arm64) and `Rusty-Backup-Win32-Setup-windows-<arch>-<version>.exe` (x86, x64) from
+   `installer/rusty-backup-win32.iss`, with its own `AppId`, install folder, ProgId
+   (`RustyBackup.Win32.DiskImage`) and `--register-file-associations` (the hooks moved from egui's
+   `main.rs` to `os::file_assoc::launch_hooks`). `src/os/windows_gui.rs` keys all of it by the
+   running exe's name, and the updater takes that GUI's ZIP; the egui packages are egui-only
+   again. The updater also took the x64 ZIP on ARM64; it now takes `arm64`. Not
    checked locally: the CI packaging itself (no push yet), the installer (no ISCC here) and an
    i686 link, which needs NASM here for aws-lc. The i686 type-check found ten
    `Get/SetWindowLongPtrW` calls that assumed a 64-bit `isize` (it is `i32` there); they cast now.
@@ -371,4 +379,5 @@ against it on the Win7 VM if Gate 0 passed there. Tier 8 flows then gain a `win3
    (Gate 0 passed on Windows 11; Win7 not yet tried).
 2. ~~Python `comtypes` / `uiautomation` for the driver, or a Rust helper outside the 1.73 harness.~~
    Python with `comtypes` alone (Gate 0).
-3. Whether the Win32 preview shares the egui installer or gets its own until parity.
+3. ~~Whether the Win32 preview shares the egui installer or gets its own until parity.~~ Its own
+   installer and ZIP per arch (2026-11-10); egui is removed at the end of the plan.

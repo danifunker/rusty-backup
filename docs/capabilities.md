@@ -64,6 +64,10 @@ Every Win32 cell is **yes** (Phase 5's exit criterion). The other columns' dashe
     (platform_matrix.md, Optical row).
 - **Not started**
   - AppKit: the shell does not exist yet (Phase 3); its column is its checklist.
+- **GTK's own suite**: `scripts/gtk4-gui-suite.py` (AT-SPI, run in the `build-gtk4` CI job) is
+  not a tier 8 flow, so this table does not count it. It covers part of two GTK dashes: the
+  Inspect browse view's listing (`inspect.browse`) and the Convert tab's floppy batch and
+  Inspect hand-off (not `convert.disc`'s ISO to CHD), plus four Build Disk CD builds.
 - **No flow on that shell yet**: the flow was written with the Win32 shell and lists only
   `win32`. Whether GTK or the TUI has the screen is in platform_matrix.md's feature rows; where
   it does, the flow needs extending, not the shell:

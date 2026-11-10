@@ -102,6 +102,8 @@ fn main() {
         MSG, WM_KEYDOWN,
     };
 
+    // The installer's association flags exit here, before any window.
+    rusty_backup::controller::app::launch_hooks();
     capture::init();
     // SAFETY: COM and the common controls are set up once on the UI thread before any window.
     unsafe {

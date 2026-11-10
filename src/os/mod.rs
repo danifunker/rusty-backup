@@ -38,6 +38,8 @@ pub mod file_assoc;
 #[cfg(target_os = "windows")]
 pub mod win_install;
 
+pub mod windows_gui;
+
 pub mod wakelock;
 
 #[cfg(feature = "rust173-polyfill")]

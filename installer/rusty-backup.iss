@@ -7,7 +7,8 @@
 ; Build:
 ;   iscc /DMyAppVersion=2026-06-01-14-30 /DSourceDir=path\to\build installer\rusty-backup.iss
 ;
-; CI compiles it per arch, with the native Win32 shell staged beside the egui app.
+; CI compiles it per arch. The native Win32 shell has its own installer,
+; installer/rusty-backup-win32.iss.
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0-dev"
@@ -28,8 +29,6 @@
 #define MyAppURL "https://github.com/danifunker/rusty-backup"
 #define MyAppExeName "rusty-backup.exe"
 #define MyCliExeName "rb-cli.exe"
-; The native Win32 shell, installed beside the egui app when the build dir has it.
-#define MyWin32ExeName "rusty-backup-win32.exe"
 
 [Setup]
 ; Stable AppId so upgrades replace in place and the ARP entry is reused. Do
@@ -74,11 +73,9 @@ Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; a missing CLI should fail the installer build loudly, not ship a broken PATH.
 Source: "{#SourceDir}\{#MyCliExeName}"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#AssetsDir}\icon.ico"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#SourceDir}\{#MyWin32ExeName}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\{#MyAppName} (Win32 preview)"; Filename: "{app}\{#MyWin32ExeName}"; Check: Win32ShellInstalled
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
@@ -95,12 +92,6 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--unregister-file-associations";
 [Code]
 const
   EnvironmentKey = 'Environment';
-
-// The Win32 shell's shortcut only when its exe was installed.
-function Win32ShellInstalled(): Boolean;
-begin
-  Result := FileExists(ExpandConstant('{app}\{#MyWin32ExeName}'));
-end;
 
 function BinPath(): String;
 begin

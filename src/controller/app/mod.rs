@@ -32,6 +32,9 @@ pub use crate::model::job::Notify;
 pub use crate::model::job::{Progress, Snapshot};
 pub use crate::model::rate_tracker::RateTracker;
 pub use crate::model::size_mode::SizeMode;
+/// The installer's association flags and the post-update ARP refresh, for a Windows GUI's `main`.
+#[cfg(windows)]
+pub use crate::os::file_assoc::launch_hooks;
 pub use disk_core::display::format_size;
 
 /// The CHD codec and profile choices the shared CHD options control offers.

@@ -242,8 +242,8 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # The native Win32 shell (frontends/win32, its own workspace and lockfile), shipped beside
-      # the egui app as rusty-backup-win32.exe in the ZIP and the installer.
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
+      # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
       - name: Cache Win32 shell build
         uses: actions/cache@v5
         with:
@@ -263,16 +263,23 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe ../../../assets/icons/icon.ico
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe
+            7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
           fi
+          7z a ../../../Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup-win32.exe
       
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload Win32 shell artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
       - name: Stage CLI binary
         shell: bash
@@ -291,6 +298,7 @@ jobs:
       # Per-user Inno Setup installer (Setup.exe). Installs to %LocalAppData%
       # so the in-app self-updater can replace the running exe without admin.
       # Source dir has rusty-backup.exe and rb-cli.exe from Build, and rusty-backup-win32.exe staged.
+      # One installer per GUI: rusty-backup.iss (egui) and rusty-backup-win32.iss (the Win32 shell).
       # See installer/rusty-backup.iss + docs/windows_self_update.md.
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -304,12 +312,21 @@ jobs:
           $base = "Rusty-Backup-Setup-windows-${{ matrix.arch }}-$version"
           & $iscc "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup.iss
           if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+          $base = "Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-$version"
+          & $iscc "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup-win32.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (Win32 shell) failed with exit code $LASTEXITCODE" }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: installer\Output\Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload Win32 shell installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
 
   build-macos:
     name: Build macOS
@@ -1361,8 +1378,8 @@ jobs:
       - name: Build (GUI + rb-cli, default features)
         run: cargo build --release --target aarch64-pc-windows-msvc
 
-      # The native Win32 shell (frontends/win32, its own workspace and lockfile), shipped beside
-      # the egui app as rusty-backup-win32.exe in the ZIP and the installer.
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
+      # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
       - name: Cache Win32 shell build
         uses: actions/cache@v5
         with:
@@ -1382,16 +1399,23 @@ jobs:
         run: |
           cd target/aarch64-pc-windows-msvc/release
           if [ -f "../../../assets/icons/icon.ico" ]; then
-            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe ../../../assets/icons/icon.ico
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
           else
-            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe rusty-backup-win32.exe
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
           fi
+          7z a ../../../Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup-win32.exe
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload Win32 shell artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
 
       - name: Stage CLI binary
         shell: bash
@@ -2943,6 +2967,9 @@ jobs:
           for f in \
             "Rusty-Backup-Setup-windows-x64-${VER}.exe" "Rusty-Backup-windows-x64-${VER}.zip" \
             "Rusty-Backup-Setup-windows-x86-${VER}.exe" "Rusty-Backup-windows-x86-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe" "Rusty-Backup-Win32-windows-x64-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe" "Rusty-Backup-Win32-windows-x86-${VER}.zip" \
+            "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
             "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
             "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
             "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
@@ -2985,6 +3012,9 @@ jobs:
           | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
           | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
           | **Windows 11** | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
+          | **Windows 11 / 10**, native Win32 preview | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x64-${VER}.zip) | _(as above)_ |
+          | **Windows 10**, native Win32 preview | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x86-${VER}.zip) | _(as above)_ |
+          | **Windows 11**, native Win32 preview | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | _(as above)_ |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
           | **Linux** (Ubuntu 20.04+ / Debian 11+) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |

@@ -164,6 +164,8 @@ struct GithubAsset {
 fn windows_arch_tag() -> &'static str {
     if cfg!(target_arch = "x86") {
         "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
     } else {
         "x64"
     }
@@ -395,19 +397,21 @@ pub fn check_for_updates(
 
     let is_outdated = release_is_newer(&latest_version, current);
 
-    // Match the GUI ZIP + CLI asset for this arch so the GUI can offer an
+    // Match this GUI's ZIP + CLI asset for this arch so the GUI can offer an
     // in-app update. Naming is set by .github/workflows/release.yml:
-    //   Rusty-Backup-windows-<arch>-<version>.zip
+    //   Rusty-Backup-windows-<arch>-<version>.zip        (egui)
+    //   Rusty-Backup-Win32-windows-<arch>-<version>.zip  (the Win32 shell)
     //   Rusty-Backup-CLI-windows-<arch>-<version>.exe
     let arch_pat = format!("windows-{}-", windows_arch_tag());
+    let zip = format!(
+        "{}-{}-",
+        crate::os::windows_gui::WindowsGui::current().zip_prefix(),
+        windows_arch_tag()
+    );
     let asset_url = release
         .assets
         .iter()
-        .find(|a| {
-            a.name.starts_with("Rusty-Backup-windows")
-                && a.name.contains(&arch_pat)
-                && a.name.to_ascii_lowercase().ends_with(".zip")
-        })
+        .find(|a| a.name.starts_with(&zip) && a.name.to_ascii_lowercase().ends_with(".zip"))
         .map(|a| a.browser_download_url.clone());
     let cli_asset_url = release
         .assets
@@ -478,10 +482,6 @@ fn extract_zip_flat(
     Ok(())
 }
 
-/// The Windows GUIs a release ZIP carries: the egui app, then the native Win32 shell.
-#[cfg(any(feature = "gui", feature = "tui-update"))]
-const GUI_EXES: [&str; 2] = ["rusty-backup.exe", "rusty-backup-win32.exe"];
-
 /// Download the matched release ZIP, extract it, and replace the running
 /// executable in place. On success the caller should prompt the user and then
 /// call [`restart_app`] to relaunch into the new version.
@@ -503,27 +503,14 @@ pub fn download_and_apply_update(
     let staging = tempfile::Builder::new().prefix("rb-update-").tempdir()?;
     extract_zip_flat(&zip_bytes, staging.path())?;
 
-    // The release ships two GUIs side by side: replace the one running, refresh the other.
-    let running = std::env::current_exe()?;
-    let name = match running.file_name().and_then(|n| n.to_str()) {
-        Some(n) if GUI_EXES.contains(&n) => n.to_string(),
-        _ => GUI_EXES[0].to_string(),
-    };
-    let new_exe = staging.path().join(&name);
+    // Each GUI ships in its own ZIP, which the check above matched to the running one.
+    let name = crate::os::windows_gui::WindowsGui::current().exe_name();
+    let new_exe = staging.path().join(name);
     if !new_exe.exists() {
         return Err(format!("update archive did not contain {name}").into());
     }
 
     replace_running_exe(&new_exe)?;
-    if let Some(dir) = running.parent() {
-        for other in GUI_EXES.iter().filter(|n| **n != name) {
-            let (from, to) = (staging.path().join(other), dir.join(other));
-            // Best-effort: only an installed copy is refreshed, and a running one stays as it is.
-            if from.exists() && to.exists() {
-                let _ = fs::copy(&from, &to);
-            }
-        }
-    }
 
     // Best-effort: refresh a side-by-side rb-cli.exe if the release shipped one
     // and we have a writable install dir. rb-cli is not running, so a plain
