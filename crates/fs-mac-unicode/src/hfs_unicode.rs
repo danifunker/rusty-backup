@@ -698,3 +698,91 @@ pub fn decompose_str(name: &str) -> Vec<u16> {
     }
     out
 }
+
+/// Reverse of [`decompose`]: (base, combining mark) -> precomposed unit.
+/// Built once from the decomposition table, so no extra normalization crate
+/// is needed. Singleton decompositions (e.g. U+212B ANGSTROM SIGN) have no
+/// pair and are left alone.
+fn compose_pairs() -> &'static std::collections::HashMap<(u16, u16), u16> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static PAIRS: OnceLock<HashMap<(u16, u16), u16>> = OnceLock::new();
+    PAIRS.get_or_init(|| {
+        let mut map = HashMap::new();
+        let mut buf = [0u16; 3];
+        // Two-unit decompositions first, so the three-unit ones (a + ring +
+        // acute, Hangul LVT) can chain through their two-unit prefix.
+        for len in 2..=3usize {
+            for uc in 0..=u16::MAX {
+                let seq = decompose(uc, &mut buf);
+                if seq.len() != len {
+                    continue;
+                }
+                if len == 2 {
+                    map.entry((seq[0], seq[1])).or_insert(uc);
+                } else if let Some(&head) = map.get(&(seq[0], seq[1])) {
+                    map.entry((head, seq[2])).or_insert(uc);
+                }
+            }
+        }
+        map
+    })
+}
+
+/// Canonically compose a name (NFC-style), using Apple's decomposition table
+/// in reverse. HFS+ stores names decomposed, so a name read from an HFS+
+/// volume has `U` + U+0308 where classic Mac Roman has the single byte 0x86.
+/// Compose before encoding to Mac Roman, or every combining mark is lost.
+pub fn compose_str(name: &str) -> String {
+    let pairs = compose_pairs();
+    let mut out: Vec<char> = Vec::with_capacity(name.len());
+    for ch in name.chars() {
+        if let (Some(&last), true) = (out.last(), (ch as u32) <= 0xFFFF) {
+            if (last as u32) <= 0xFFFF {
+                if let Some(&c) = pairs.get(&(last as u16, ch as u16)) {
+                    if let Some(c) = char::from_u32(c as u32) {
+                        *out.last_mut().unwrap() = c;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out.into_iter().collect()
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+
+    #[test]
+    fn composes_latin_marks() {
+        assert_eq!(compose_str("U\u{0308}bersetzung"), "\u{00DC}bersetzung");
+        assert_eq!(compose_str("A\u{030A}ngels"), "\u{00C5}ngels");
+        assert_eq!(compose_str("e\u{0301}"), "\u{00E9}");
+    }
+
+    #[test]
+    fn leaves_composed_and_ascii_alone() {
+        assert_eq!(
+            compose_str("plain \u{00DC} text \u{2122}"),
+            "plain \u{00DC} text \u{2122}"
+        );
+    }
+
+    #[test]
+    fn compose_inverts_decompose_for_latin1() {
+        for c in ('\u{00C0}'..='\u{00FF}').filter(|c| *c != '\u{00D7}' && *c != '\u{00F7}') {
+            let s = c.to_string();
+            let d = String::from_utf16(&decompose_str(&s)).unwrap();
+            assert_eq!(compose_str(&d), s, "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn chains_three_unit_decompositions() {
+        // a + ring + acute -> U+01FB
+        assert_eq!(compose_str("a\u{030A}\u{0301}"), "\u{01FB}");
+    }
+}
