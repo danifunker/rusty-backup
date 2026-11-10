@@ -194,9 +194,13 @@ in check-group mode with the bundled icons); the screens and slices below are un
    each mode's target, the new disk's table, the full-disk sizes with alignment and trailing
    free space and its bars, the caveats, Restore / Cancel). A disk job on one tab locks Backup
    and Restore. `flow.backup.image-zstd` and `flow.restore.folder-to-image` pass. Learned: UI
-   Automation's Select changes a drop-down list without `CBN_SELCHANGE`, so a screen also reads
-   the list on `CBN_CLOSEUP`. Not done: the VHD layout window, remote sources and targets (7b),
-   sharing the backup folder with Inspect.
+   Automation's Select changes a drop-down list without `CBN_SELCHANGE`, so `panel.rs` delivers
+   one when a list closes on a new selection with none since it opened (and drops the late real
+   one). Until then every combo a flow chose on was silently ignored; the zstd backup flow passed
+   only because zstd is the default. The VHD options window is `backup_vhd.rs`;
+   `flow.backup.image-vhd` found that a whole-disk VHD of a FAT floppy put an MBR over its boot
+   sector (the exporter took the boot sector's 55 AA for a table), now fixed in the engine. Not
+   done: remote sources and targets (7b), sharing the backup folder with Inspect.
    Slice 7a's disk writer done (2026-11-10): `disk_write.rs`, the Physical Disk Export window,
    which Export's "Physical Disk Export..." and Restore's Write Image File open: the target disk
    or an image file, the region on a partitioned disk, the synthesized table, Write with the

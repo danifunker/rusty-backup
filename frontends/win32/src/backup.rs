@@ -4,7 +4,7 @@
 //! Image, Close Drive and Load partition info), the partition table with Include, Calc min and
 //! Compact, the destination, name, output format with the shared CHD control, the sizing and
 //! split options, the checksum, and Start / Cancel with the progress line and the outcome.
-//! Still to come: the VHD layout window and remote sources (slice 7b).
+//! The VHD options window is `backup_vhd.rs`. Still to come: remote sources (slice 7b).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_NUMBER, GA_ROOT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::backup_vhd::{VhdShown, VhdWindow};
 use crate::chd::{ChdControl, ChdIds};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
@@ -245,6 +246,7 @@ pub struct BackupScreen {
     cancel: HWND,
     why: HWND,
     shape: RefCell<Vec<bool>>,
+    vhd: RefCell<Option<Rc<VhdWindow>>>,
 }
 
 impl BackupScreen {
@@ -352,6 +354,7 @@ impl BackupScreen {
             cancel: ui::button(page, "Cancel", ids::CANCEL),
             why: ui::cell_label(page, ""),
             shape: RefCell::default(),
+            vhd: RefCell::default(),
         });
         let weak: Weak<dyn Handler> = screen.me.clone();
         panel::register(page, weak);
@@ -414,6 +417,7 @@ impl BackupScreen {
             }
         }
         crate::app::append_log(log);
+        self.show_vhd();
         // Off screen nothing needs it, and a job wakes this many times a second.
         if ui::shown(self.page) {
             self.refresh();
@@ -434,6 +438,44 @@ impl BackupScreen {
             let (options, custom) = self.chd.choice();
             ChdChoice { options, custom }
         })
+    }
+
+    /// The VHD options window follows the controller: open while it says so, rebuilt for new rows.
+    fn show_vhd(&self) {
+        let shown = {
+            let ctrl = self.ctrl.borrow();
+            ctrl.vhd_open().then(|| VhdShown {
+                whole_disk: ctrl.vhd_whole_disk(),
+                rows: ctrl
+                    .vhd_rows()
+                    .iter()
+                    .map(|r| (r.clone(), ctrl.min_phase(r.index)))
+                    .collect(),
+                can_start: !ctrl.is_running() && self.busy.get().is_none(),
+            })
+        };
+        let Some(shown) = shown else {
+            self.vhd.replace(None);
+            return;
+        };
+        let rows: Vec<usize> = shown.rows.iter().map(|(r, _)| r.index).collect();
+        let held = self.vhd.borrow().clone().filter(|w| w.indices() == rows);
+        let w = held.unwrap_or_else(|| {
+            self.vhd.replace(None);
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(BackupAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            // SAFETY: a plain query of our own window.
+            let owner = unsafe { GetAncestor(self.page, GA_ROOT) };
+            let list: Vec<_> = shown.rows.iter().map(|(r, _)| r.clone()).collect();
+            let w = VhdWindow::open(owner, send, &list);
+            *self.vhd.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(shown);
     }
 
     /// Start's whole rule: asked again at the click, not only when the button was last drawn.

@@ -20,8 +20,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, SendMessageW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, CBN_CLOSEUP,
-    CBN_SELCHANGE, EN_CHANGE, ES_NUMBER, SW_SHOW, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP,
+    DestroyWindow, SendMessageW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, CBN_SELCHANGE,
+    EN_CHANGE, ES_NUMBER, SW_SHOW, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
 use crate::combo::Combo;
@@ -676,8 +676,7 @@ impl Handler for DiskWriteWindow {
             return;
         }
         let action = match code {
-            // UI Automation's Select changes a list without CBN_SELCHANGE; its close-up still comes.
-            CBN_SELCHANGE | CBN_CLOSEUP => self.selected(from),
+            CBN_SELCHANGE => self.selected(from),
             EN_CHANGE => self.changed(from),
             BN_CLICKED => self.clicked(from),
             _ => None,

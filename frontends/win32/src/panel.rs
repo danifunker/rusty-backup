@@ -3,6 +3,9 @@
 //! Win32 sends a control's notifications to its parent, so each panel's handler gets the
 //! `WM_COMMAND` and `WM_NOTIFY` of its own controls, its size changes, and a close request it may
 //! refuse (a running write keeps a dialog up).
+//!
+//! UI Automation's Select changes an open drop-down list's selection without `CBN_SELCHANGE`, so a
+//! list that closes on a new selection with no notification since it opened gets one here.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -39,6 +42,48 @@ pub type KeyHook = Rc<dyn Fn(u16) -> bool>;
 thread_local! {
     static PANELS: RefCell<Vec<(isize, Weak<dyn Handler>)>> = const { RefCell::new(Vec::new()) };
     static KEYS: RefCell<Vec<(isize, KeyHook)>> = const { RefCell::new(Vec::new()) };
+    /// Each open drop-down list and its selection when it opened.
+    static DROPPED: RefCell<Vec<(isize, isize)>> = const { RefCell::new(Vec::new()) };
+    /// Each list whose change was delivered at close-up, so a late real one is not sent twice.
+    static SENT: RefCell<Vec<(isize, isize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A combo box notification, with the `CBN_SELCHANGE` a silent selection change still owes.
+fn combo_codes(from: HWND, code: u32) -> Vec<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE, CB_GETCURSEL,
+    };
+    // SAFETY: a plain combo query on the control that sent the notification.
+    let current = || unsafe { SendMessageW(from, CB_GETCURSEL, None, None).0 };
+    let key = from.0 as isize;
+    if code == CBN_SELCHANGE {
+        let late = SENT.with(|s| {
+            let mut s = s.borrow_mut();
+            let at = s.iter().position(|(h, _)| *h == key);
+            at.map(|i| s.remove(i).1) == Some(current())
+        });
+        if late {
+            return Vec::new();
+        }
+    }
+    DROPPED.with(|d| {
+        let mut d = d.borrow_mut();
+        let held = d.iter().position(|(h, _)| *h == key).map(|i| d.remove(i).1);
+        match code {
+            CBN_DROPDOWN => {
+                SENT.with(|s| s.borrow_mut().retain(|(h, _)| *h != key));
+                d.push((key, current()));
+            }
+            CBN_CLOSEUP if held.is_some_and(|was| was != current()) => {
+                SENT.with(|s| s.borrow_mut().push((key, current())));
+                return vec![CBN_SELCHANGE, code];
+            }
+            CBN_CLOSEUP | CBN_SELCHANGE => {}
+            // Anything else leaves an open list's record as it was.
+            _ => d.extend(held.map(|was| (key, was))),
+        }
+        vec![code]
+    })
 }
 
 /// Send `hwnd`'s function keys to `hook` first, as GTK forwards a window's keys to its screen.
@@ -196,7 +241,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             LRESULT(0)
         }
         (WM_COMMAND, Some(h)) => {
-            h.command(HWND(lp.0 as _), ((wp.0 >> 16) & 0xffff) as u32);
+            let from = HWND(lp.0 as _);
+            for code in combo_codes(from, ((wp.0 >> 16) & 0xffff) as u32) {
+                h.command(from, code);
+            }
             LRESULT(0)
         }
         (WM_NOTIFY, Some(h)) => {

@@ -12,6 +12,8 @@ mod app;
 #[cfg(windows)]
 mod backup;
 #[cfg(windows)]
+mod backup_vhd;
+#[cfg(windows)]
 mod browse;
 #[cfg(windows)]
 mod browse_bars;
