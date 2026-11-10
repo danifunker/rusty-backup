@@ -123,6 +123,11 @@ pub enum HdCommand {
     /// yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM
     /// partition over 16 MiB is promoted to BGM, which is what TOS needs.
     Atari(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// FreeBSD/Alpha disk: a 4.4BSD label in sector 0 (byte 64) with partitions you size, which
+    /// FreeBSD 4.x / 5.x installs onto; `--format` makes the 4.2BSD ones UFS1.
+    #[command(name = "bsd-alpha")]
+    BsdAlpha(super::new_bsd_alpha_hd::BsdAlphaHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -489,6 +494,7 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             HdCommand::Atari(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Atari(args),
             ),
+            HdCommand::BsdAlpha(args) => super::new_bsd_alpha_hd::run(args),
         },
     }
 }

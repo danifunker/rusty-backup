@@ -1,0 +1,57 @@
+# Tier 1 — self-fixturing.
+#
+# A FreeBSD/Alpha disk built from scratch by `new hd bsd-alpha`: the 4.4BSD
+# label sits at byte 64 of sector 0, inside partition `a`, which starts at
+# sector 0 around it. The trap is that the label and `a`'s UFS share the
+# first 8 KiB: a writer that formats `a` over the label, or a reader that
+# takes the UFS at LBA 0 for the whole disk, still produces something that
+# opens. So the case lists every slice, writes a file through one of them,
+# reads it back and fscks it, which only works if the offsets are right.
+# docs/bsd_alpha_disks.md has the layout.
+
+[meta]
+tier = 1
+group = "partition.bsd-alpha"
+description = "Build a FreeBSD/Alpha disk with its label and UFS slices, and use a slice."
+
+[[case]]
+id = "partition.bsd-alpha.build-format-and-use"
+description = "new hd bsd-alpha --format lists a/b/e as BSD slices, and e takes a file and passes fsck"
+[[case.step]]
+args = [
+  "new", "hd", "bsd-alpha", "{scratch}/alpha.img", "--size", "32M",
+  "a:8M:4.2BSD:/", "b:4M:swap", "e:rest:4.2BSD:/usr", "--format",
+]
+expect_exit = 0
+[[case.step]]
+args = ["inspect", "{scratch}/alpha.img", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partition_table", value = "BSD" },
+  { path = "partitions.0.type_name", value = "BSD a (4.2BSD)" },
+  { path = "partitions.0.start_lba", value = 0 },
+  { path = "partitions.1.type_name", value = "BSD b (swap)" },
+  { path = "partitions.2.type_name", value = "BSD e (4.2BSD)" },
+]
+[[case.step]]
+args = ["put", "{scratch}/alpha.img@3", "{cases}/tier8/data/hello.txt", "/hello.txt"]
+expect_exit = 0
+[[case.step]]
+args = ["get", "{scratch}/alpha.img@3", "/hello.txt", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+[[case.step]]
+args = ["fsck", "{scratch}/alpha.img@3", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+[[case.step]]
+args = ["ls", "{scratch}/alpha.img@1", "/"]
+expect_exit = 0
+
+[[case]]
+id = "partition.bsd-alpha.refuses-slot-c"
+description = "Slot c is the whole disk, so a partition may not take it"
+[[case.step]]
+args = ["new", "hd", "bsd-alpha", "{scratch}/c.img", "--size", "16M", "c:8M:4.2BSD"]
+expect_exit = 1
+stderr_contains = ["slot c is the whole disk"]

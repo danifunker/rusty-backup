@@ -1129,6 +1129,27 @@ Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
 - `--force` — Overwrite `image` if it already exists
 
+### `new hd bsd-alpha`
+
+FreeBSD/Alpha disk: a 4.4BSD label in sector 0 (byte 64) with partitions you size, which FreeBSD 4.x / 5.x installs onto; `--format` makes the 4.2BSD ones UFS1
+
+```
+Usage: bsd-alpha [OPTIONS] --size <SIZE> <IMAGE> <PARTITIONS>...
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+- `<PARTITIONS>` — Partitions in disk order, `LETTER:SIZE[:FSTYPE[:MOUNT]]` (letter a-h but not c; `rest` once; fstype `4.2BSD`, `swap` or `unused`). MOUNT is a note: `/etc/fstab` holds mount points
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--format` — Format each 4.2BSD partition as little-endian UFS1, 16 KiB blocks / 2 KiB fragments
+- `--bootblock` — FreeBSD/Alpha's `/boot/boot1`, written from sector 1 (at most 7680 bytes); sector 0 then points the SRM console at it
+- `--align` — Alignment for partition starts. Default 1 MiB
+- `--force` — Overwrite `image` if it already exists
+
 ### `new hd gpt`
 
 GPT (UEFI, modern macOS / Linux) disk with partitions you size and type yourself
