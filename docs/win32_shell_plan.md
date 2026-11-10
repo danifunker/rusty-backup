@@ -204,7 +204,7 @@ in check-group mode with the bundled icons); the screens and slices below are un
    linker (the engine's build script already links the icon and version resource, so a second
    resource collides), and CI target `win32`. Commander and Settings are shown but off until
    slices 3 and 7b. `drivers/uia_driver.py` + `runner/src/uia.rs` drive it; the stand-in flow
-   `win32-shell.toml` passes. `AppTab::ALL` / `label()` give every shell the tab titles.
+   `win32-shell.toml` passed (retired in slice 4, once real screens had flows). `AppTab::ALL` / `label()` give every shell the tab titles.
    Learned: `IsWindowVisible` is false for every child until the main window shows, so the shell
    reads the `WS_VISIBLE` bit (`ui::shown`); sizes come from `GetDpiForSystem` before a window
    exists.
