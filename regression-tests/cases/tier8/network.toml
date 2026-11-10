@@ -10,7 +10,7 @@ id = "flow.network.remote-inspect-backup"
 description = "Connect to an rb-cli serve daemon from Inspect, open the image it serves, back it up to a local folder, then restore that with rb-cli and read the file back"
 level = "smoke"
 area = ["network", "inspect", "backup"]
-shells = ["tui", "gtk"]
+shells = ["tui", "gtk", "win32"]
 capabilities = ["inspect.remote-open", "inspect.remote-backup"]
 timeout_ms = 240000
 

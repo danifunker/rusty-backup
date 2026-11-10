@@ -4,7 +4,7 @@
 //! File and Open Backup Folder), the facts, the running jobs, the tools, the partition list (a
 //! virtual list view) with the tools that act on its selected row, and the Check and CHD Info
 //! windows, the partition bar, Export, the table editor, Expand Image, Resize, Defragment, Alto
-//! resize, and browsing ([`crate::browse`], slice 2). Still to come: the remote listing (slice 7b).
+//! resize, browsing ([`crate::browse`], slice 2), and the remote picker ([`crate::remote_pick`]).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -19,6 +19,9 @@ use rusty_backup::controller::inspect::{
     InspectSource, JobRegistry, LayoutSegment, MinCell, PartitionRow,
 };
 use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::remote_pick::{
+    hints as remote_hints, ids as remote_ids, RemotePickAction,
+};
 use rusty_backup::controller::{Controller, Effect};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -138,6 +141,9 @@ pub(crate) fn set_progress(progress: HWND, running: bool, pct: Option<u32>) {
 /// Everything a refresh shows, read while the controller is borrowed.
 struct Shown {
     source: String,
+    /// The image open over a daemon, and whether its backup runs.
+    remote: Option<rusty_backup::controller::remote_pick::RemoteImage>,
+    remote_backing_up: bool,
     error: Option<String>,
     flux: Option<String>,
     jobs: Vec<Snapshot>,
@@ -185,6 +191,13 @@ pub struct InspectScreen {
     source: HWND,
     open_file: HWND,
     open_backup: HWND,
+    connect: HWND,
+    pick_another: HWND,
+    backup_remote: HWND,
+    backing_up: HWND,
+    close_remote: HWND,
+    remote_pick: Rc<crate::remote_pick::RemotePage>,
+    remote_page: HWND,
     note: HWND,
     flux: HWND,
     error: HWND,
@@ -234,6 +247,7 @@ impl InspectScreen {
         owner: HWND,
         page: HWND,
         browse_page: HWND,
+        remote_page: HWND,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
@@ -250,6 +264,13 @@ impl InspectScreen {
         );
         let open_file = ui::button(page, "Open File...", ids::OPEN_FILE);
         let open_backup = ui::button(page, "Open Backup Folder...", ids::OPEN_BACKUP);
+        let connect = ui::button(page, "Connect to Remote...", ids::CONNECT_REMOTE);
+        let pick_another = ui::button(page, "Pick Another Image", remote_ids::PICK_ANOTHER);
+        let backup_remote = ui::button(page, "Back Up Image...", remote_ids::BACKUP);
+        let backing_up = ui::cell_label(page, remote_hints::BACKING_UP);
+        let close_remote = ui::button(page, "Close Remote", remote_ids::CLOSE);
+        let remote_pick =
+            crate::remote_pick::RemotePage::build(remote_page, notify.clone(), host.clone());
         let note = ui::label(page, "");
         let flux = ui::label(page, "");
         let error = ui::label(page, "");
@@ -353,6 +374,13 @@ impl InspectScreen {
             source,
             open_file,
             open_backup,
+            connect,
+            pick_another,
+            backup_remote,
+            backing_up,
+            close_remote,
+            remote_pick,
+            remote_page,
             note,
             flux,
             error,
@@ -399,6 +427,12 @@ impl InspectScreen {
         screen.browse.on_change(Rc::new(move || {
             if let Some(s) = target.upgrade() {
                 s.show_page();
+            }
+        }));
+        let target = screen.me.clone();
+        screen.remote_pick.on_change(Rc::new(move || {
+            if let Some(s) = target.upgrade() {
+                s.remote_changed();
             }
         }));
         let weak: Weak<dyn Handler> = screen.me.clone();
@@ -461,20 +495,37 @@ impl InspectScreen {
         self.browse.drop_paths(paths)
     }
 
-    /// The browse view is open, in the screen's place.
-    pub fn browsing(&self) -> bool {
-        self.browse.is_active()
-    }
-
     /// Show the browse view while it is open, the screen otherwise; only while the tab is up.
     fn show_page(&self) {
-        let here = ui::shown(self.page) || ui::shown(self.browse_page);
+        let here =
+            ui::shown(self.page) || ui::shown(self.browse_page) || ui::shown(self.remote_page);
+        self.set_shown(here);
+    }
+
+    /// The tab is up (or not): show the browse view, the remote listing or the screen.
+    pub fn set_shown(&self, here: bool) {
         let browsing = self.browse.is_active();
-        ui::set_visible(self.page, here && !browsing);
+        let picking = !browsing && self.remote_pick.is_active();
+        ui::set_visible(self.page, here && !browsing && !picking);
         ui::set_visible(self.browse_page, here && browsing);
+        ui::set_visible(self.remote_page, here && picking);
+    }
+
+    /// The remote picker changed: log its lines, open a picked image, redraw.
+    fn remote_changed(&self) {
+        let (lines, picked) = self.remote_pick.take();
+        let log = lines
+            .into_iter()
+            .map(|l| (LogLevel::Info, format!("Remote: {l}")));
+        crate::app::append_log(log.collect());
+        if let Some(conn) = picked {
+            self.apply(InspectAction::Load(InspectSource::Remote { conn }));
+        }
+        self.show_page();
     }
 
     pub fn tick(&self) {
+        self.remote_pick.tick();
         self.browse.tick();
         let writer = self.writer.borrow().clone();
         if let Some(d) = writer {
@@ -772,6 +823,8 @@ impl InspectScreen {
         jobs.extend(c.tool_jobs());
         Shown {
             source: c.source_label(devices.as_slice()),
+            remote: c.remote().cloned(),
+            remote_backing_up: c.remote_backup_running(),
             error: c.last_error().map(str::to_string),
             flux: c.flux_faults().map(|f| {
                 format!(
@@ -816,6 +869,13 @@ impl InspectScreen {
 
     fn show(&self, s: Shown) {
         ui::set_text(self.source, &s.source);
+        let open = s.remote.is_some();
+        for h in [self.pick_another, self.backup_remote, self.close_remote] {
+            ui::set_visible(h, open);
+        }
+        ui::set_enabled(self.backup_remote, !s.remote_backing_up);
+        ui::set_enabled(self.close_remote, !s.remote_backing_up);
+        ui::set_visible(self.backing_up, open && s.remote_backing_up);
         let note = InspectController::needs_elevation_note().then(unelevated_device_note);
         ui::set_text(self.note, note.unwrap_or(""));
         ui::set_text(self.flux, s.flux.as_deref().unwrap_or(""));
@@ -1064,6 +1124,8 @@ impl InspectScreen {
     fn shape_now(&self) -> u32 {
         let has = |h: HWND| !ui::text(h).is_empty();
         let bits = [
+            ui::shown(self.pick_another),
+            ui::shown(self.backing_up),
             has(self.note),
             has(self.flux),
             has(self.error),
@@ -1110,6 +1172,7 @@ impl InspectScreen {
                 Node::leaf(self.source, Size::Stretch(1), Size::Fixed(layout::ROW)),
                 Node::button(self.open_file, 110),
                 Node::button(self.open_backup, 160),
+                Node::button(self.connect, 160),
             ])]),
             layout::MARGIN,
         );
@@ -1120,6 +1183,22 @@ impl InspectScreen {
         let Node::Column { children, .. } = child.as_mut() else {
             unreachable!()
         };
+        if ui::shown(self.pick_another) {
+            let mut bar = vec![
+                Node::button(self.pick_another, 150),
+                Node::button(self.backup_remote, 130),
+                Node::button(self.close_remote, 110),
+            ];
+            if ui::shown(self.backing_up) {
+                bar.push(Node::leaf(
+                    self.backing_up,
+                    Size::Fixed(120),
+                    Size::Fixed(layout::ROW),
+                ));
+            }
+            bar.push(Node::Space(Size::Stretch(1)));
+            children.push(Node::row(bar));
+        }
         let lines = |h: HWND| {
             let t = ui::text(h);
             if t.is_empty() {
@@ -1267,6 +1346,21 @@ impl Handler for InspectScreen {
             }
         } else if from == self.open_file {
             InspectAction::ChooseImage
+        } else if from == self.connect {
+            self.remote_pick.apply(RemotePickAction::Connect);
+            self.show_page();
+            return;
+        } else if from == self.pick_another {
+            let image = self.ctrl.borrow().remote().cloned();
+            if let Some(image) = image {
+                self.remote_pick.apply(RemotePickAction::BrowseOn(image));
+                self.show_page();
+            }
+            return;
+        } else if from == self.backup_remote {
+            InspectAction::BackupRemote
+        } else if from == self.close_remote {
+            InspectAction::Unload { quiet: true }
         } else if from == self.open_backup {
             InspectAction::ChooseBackupFolder
         } else if from == self.reinspect {

@@ -238,6 +238,15 @@ in check-group mode with the bundled icons); the screens and slices below are un
    `share_backup`, and Close Backup closes it on both (`flow.restore.share-with-inspect`). A
    tab's page is shown before the screens tick, so a screen changed while hidden is drawn
    fresh when its tab comes up.
+   Slice 7b, Inspect's remote picker (2026-11-10): Connect to Remote... asks for the daemon's
+   address, and `remote_pick.rs` lists its folders on a page of its own in Inspect's place
+   (Enter or a double-click opens a folder or an image); Pick Another Image, Back Up Image...
+   and Close Remote sit under the source row while an image is open over a daemon.
+   `flow.network.remote-inspect-backup` passes, so every tier-8 flow but the audio one runs on
+   win32. The UIA driver now types into the window the user would be typing in (an open prompt
+   rather than the main window) and maps characters through the keyboard layout, so `.` and
+   `:` are no longer Delete and nothing. Left in 7b: Settings, Backup's remote source,
+   Restore's remote target and Optical's remote daemons.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

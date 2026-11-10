@@ -204,12 +204,22 @@ VK.update({f"F{i}": 0x6F + i for i in range(1, 13)})
 
 def press(name):
     user32 = ctypes.windll.user32
-    user32.SetForegroundWindow(WINDOW.CurrentNativeWindowHandle)
+    # Keys go to the window the user would be typing in: an open prompt or dialog, else the main one.
+    main = WINDOW.CurrentNativeWindowHandle
+    user32.SetForegroundWindow(user32.GetLastActivePopup(main) or main)
     mods = []
     while "+" in name and len(name) > 1:
         m, name = name.split("+", 1)
         mods.append({"Ctrl": 0x11, "Shift": 0x10, "Alt": 0x12}[m])
-    vk = VK.get(name) or (ord(name.upper()) if len(name) == 1 else None)
+    vk = VK.get(name)
+    if vk is None and len(name) == 1:
+        # The layout's own key for a character, with the Shift it needs (`.`, `:`, capitals).
+        scan = user32.VkKeyScanW(ord(name))
+        if scan == -1 or scan == 0xFFFF:
+            raise Fail(f"a key for {name!r} on this keyboard layout")
+        vk = scan & 0xFF
+        if (scan >> 8) & 1 and 0x10 not in mods:
+            mods.append(0x10)
     if vk is None:
         raise Fail(f"a known key, not {name!r}")
     for m in mods:

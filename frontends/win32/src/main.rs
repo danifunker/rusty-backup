@@ -59,6 +59,8 @@ mod panel;
 #[cfg(windows)]
 mod partition_bar;
 #[cfg(windows)]
+mod remote_pick;
+#[cfg(windows)]
 mod report;
 #[cfg(windows)]
 mod resize;

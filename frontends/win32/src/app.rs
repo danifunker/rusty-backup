@@ -79,6 +79,8 @@ pub struct App {
     pages: Vec<(AppTab, HWND)>,
     /// The Inspect tab's browse view, shown in its page's place while it is open.
     browse_page: HWND,
+    /// Inspect's remote listing, in its page's place while it is up.
+    remote_page: HWND,
     inspect: Rc<InspectScreen>,
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
@@ -329,6 +331,8 @@ impl App {
         ui::set_visible(disc_page, false);
         let browse_page = crate::panel::page(window);
         ui::set_visible(browse_page, false);
+        let remote_page = crate::panel::page(window);
+        ui::set_visible(remote_page, false);
         let pages = AppTab::ALL
             .iter()
             .map(|t| {
@@ -339,6 +343,7 @@ impl App {
                             window,
                             page,
                             browse_page,
+                            remote_page,
                             ctrl.notify(),
                             ctrl.recent_handle(),
                             host.clone(),
@@ -418,6 +423,7 @@ impl App {
             parts,
             pages,
             browse_page,
+            remote_page,
             inspect,
             backup,
             restore,
@@ -590,6 +596,7 @@ impl App {
             .collect();
         covered.extend(self.pages.iter().map(|(_, h)| (*h, ui_visible(*h))));
         covered.push((self.browse_page, ui_visible(self.browse_page)));
+        covered.push((self.remote_page, ui_visible(self.remote_page)));
         covered.push((self.disc_page, ui_visible(self.disc_page)));
         for (h, _) in &covered {
             ui::set_visible(*h, false);
@@ -726,14 +733,14 @@ impl App {
                     None,
                 );
             }
-            let browsing = self.inspect.browsing();
             let disc = self.optical.browsing();
             for (t, page) in &self.pages {
-                let covered =
-                    (browsing && *t == AppTab::Inspect) || (disc && *t == AppTab::Optical);
-                ui::set_visible(*page, *t == tab && !covered);
+                match t {
+                    // Inspect shows its own page, browse view or remote listing.
+                    AppTab::Inspect => self.inspect.set_shown(tab == AppTab::Inspect),
+                    _ => ui::set_visible(*page, *t == tab && !(disc && *t == AppTab::Optical)),
+                }
             }
-            ui::set_visible(self.browse_page, browsing && tab == AppTab::Inspect);
             ui::set_visible(self.disc_page, disc && tab == AppTab::Optical);
         });
         if banner_was != banner.is_some() {
@@ -879,6 +886,7 @@ impl App {
                 ui::move_to(*h, *r);
             }
             ui::move_to(self.browse_page, *r);
+            ui::move_to(self.remote_page, *r);
             ui::move_to(self.disc_page, *r);
         }
     }

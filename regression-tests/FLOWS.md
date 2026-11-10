@@ -230,7 +230,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck; UFS inject is R-089, xfail |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
-| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |
+| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk, win32 | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32 | against `rb-cli optical extract` |
 | `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | win32 | a file out of the CHD against the same file out of the ISO |
 | `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | win32 | against `rb-cli archive extract` |
