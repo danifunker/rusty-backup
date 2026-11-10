@@ -24,8 +24,8 @@ use disk_core::display::format_size;
 
 #[derive(Debug, Args)]
 pub struct InspectArgs {
-    /// Image path. `inspect` always reads the whole disk — there is no
-    /// `@N` form. For per-partition detail use `show fs-info IMG@N`.
+    /// Image path or `rb://host:port/path`. `inspect` always reads the whole disk — there is
+    /// no `@N` form. For per-partition detail use `show fs-info IMG@N`.
     pub image: PathBuf,
 
     /// Output format.
@@ -85,12 +85,8 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // mis-read the wrapped bytes as the partition table.
     // A missing image is NOT_FOUND. The check used to live here and nowhere
     // else, which is what R-036 was; it is now in resolve::require_source_exists.
-    crate::cli::resolve::require_source_exists(&args.image)?;
-    let mut reader = crate::model::source_reader::open_peeled_read_with_entry(
-        &args.image,
-        pw_bytes,
-        args.inside.as_deref(),
-    )?;
+    let remote = is_remote(&args.image);
+    let mut reader = open_source(&args, pw_bytes)?;
     // A signature-less filesystem has no partition table either, so detection
     // fails before the forced type could be applied. `ls` already treats
     // --fs-type as "raw filesystem at byte 0"; do the same here rather than
@@ -142,12 +138,12 @@ pub fn run(args: InspectArgs) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let chd_report = if ext == "chd" {
+    let chd_report = if ext == "chd" && !remote {
         Some(crate::rbformats::chd::format_chd_info(&args.image)?)
     } else {
         None
     };
-    let gho_report = if ext == "gho" || ext == "ghs" {
+    let gho_report = if (ext == "gho" || ext == "ghs") && !remote {
         dsk_ghost::gho::format_gho_info(&args.image).ok()
     } else {
         None
@@ -168,6 +164,42 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // Assertions run last, so the report is on stdout either way: a failing
     // check should show what it found, not just that it failed.
     check_expectations(&args, &pt, &partitions)
+}
+
+/// The image is an `rb://` reference, read over the wire rather than opened as a file.
+fn is_remote(image: &std::path::Path) -> bool {
+    #[cfg(feature = "remote")]
+    {
+        crate::remote::RemoteRef::parse(&image.to_string_lossy()).is_some()
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = image;
+        false
+    }
+}
+
+/// The whole disk as one reader: a local image peeled of its wrappers, or an `rb://` image's bytes.
+fn open_source(
+    args: &InspectArgs,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn crate::rbformats::ReadSeek>> {
+    #[cfg(feature = "remote")]
+    if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.to_string_lossy()) {
+        use anyhow::Context as _;
+        // The table is parsed here, so the daemon's own (possibly older) detection never decides.
+        let conn = crate::remote::connection::RemoteConnection::connect_shared(&rref.addr())
+            .with_context(|| format!("connecting to {}", rref.addr()))?;
+        return Ok(Box::new(crate::remote::RemoteBlockReader::open(
+            conn, &rref.path,
+        )?));
+    }
+    crate::cli::resolve::require_source_exists(&args.image)?;
+    crate::model::source_reader::open_peeled_read_with_entry(
+        &args.image,
+        password,
+        args.inside.as_deref(),
+    )
 }
 
 /// Apply `--expect-layout` / `--expect-fs`.

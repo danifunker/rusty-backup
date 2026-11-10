@@ -892,7 +892,7 @@ Usage: inspect [OPTIONS] <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image path. `inspect` always reads the whole disk — there is no `@N` form. For per-partition detail use `show fs-info IMG@N`
+- `<IMAGE>` — Image path or `rb://host:port/path`. `inspect` always reads the whole disk — there is no `@N` form. For per-partition detail use `show fs-info IMG@N`
 
 **Options**
 
