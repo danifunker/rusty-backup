@@ -212,6 +212,16 @@ in check-group mode with the bundled icons); the screens and slices below are un
    the catalog's Pick..., name, boot, content, image, moves, the RDB handlers and the Mac driver)
    and one Options group per formatted target. `flow.build.efs-cd` and the new
    `flow.build.mbr-fat` pass. The UIA driver's `choose` now waits for an opened list's items.
+   Slice 6 (Optical and Archives) done (2026-11-10): `optical.rs` (drive or image source with
+   its recent list, the detected disc, Browse Contents, Close Disc, CHD Info, the CD-DA player
+   window with a timer while a track plays, the rip form with the CHD control, Start / Cancel)
+   and `archives.rs` (the archive with its recent list, the entries with tick boxes, the fork
+   format, Extract All / Selected, Mount to Inspect). The disc browser is `BrowseView` in disc
+   mode on its own page. Inspect's hand-offs to both tabs work. Extract All got its own id
+   (`browse.extract_all`), which GTK shared with the side panel's Extract; and the browse
+   view's follow timer is keyed by its id, as a second view had taken the first one's timer.
+   `flow.optical.*` and the new `flow.archives.sit-extract-all` pass. The player is not driven
+   by a flow on win32: it would play out loud.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

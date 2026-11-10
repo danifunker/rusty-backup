@@ -231,6 +231,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |
-| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk | against `rb-cli optical extract` |
-| `audio.toml` | play a CD-DA track | gtk (no TUI player by design) | the position advances |
+| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32 | against `rb-cli optical extract` |
+| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | win32 | against `rb-cli archive extract` |
+| `audio.toml` | play a CD-DA track | gtk (no TUI player by design; win32 has the player but no silent audio sink to play into) | the position advances |
 | `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | win32 | the TUI and GTK can join once their extract-to-folder step is checked |

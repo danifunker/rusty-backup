@@ -174,6 +174,10 @@ pub struct InspectScreen {
     devices: RefCell<Vec<DiskDevice>>,
     backup_closed: Cell<bool>,
     convert: RefCell<Option<PathBuf>>,
+    /// An optical image Inspect hands to the Optical tab.
+    optical: RefCell<Option<PathBuf>>,
+    /// A Mac archive Inspect hands to the Archives tab.
+    archive: RefCell<Option<PathBuf>>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
     page: HWND,
@@ -327,7 +331,7 @@ impl InspectScreen {
         let expand = ui::button(page, "Expand/Export...", ids::ROW_EXPAND_HFS);
         let defragment = ui::button(page, "Defragment...", ids::ROW_DEFRAGMENT);
         let resize_alto = ui::button(page, "Resize...", ids::ROW_RESIZE_ALTO);
-        let browse = BrowseView::build(browse_page, notify.clone(), host.clone());
+        let browse = BrowseView::build(browse_page, notify.clone(), host.clone(), false);
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             ctrl: RefCell::new(InspectController::new(InspectServices {
                 jobs: JobRegistry::new(),
@@ -340,6 +344,8 @@ impl InspectScreen {
             devices: RefCell::default(),
             backup_closed: Cell::new(false),
             convert: RefCell::default(),
+            optical: RefCell::default(),
+            archive: RefCell::default(),
             sync: SyncGuard::default(),
             me: me.clone(),
             page,
@@ -619,6 +625,16 @@ impl InspectScreen {
         self.convert.borrow_mut().take()
     }
 
+    /// The optical image Inspect asked the Optical tab to open, once.
+    pub fn take_optical(&self) -> Option<PathBuf> {
+        self.optical.borrow_mut().take()
+    }
+
+    /// The Mac archive Inspect asked the Archives tab to open, once.
+    pub fn take_archive(&self) -> Option<PathBuf> {
+        self.archive.borrow_mut().take()
+    }
+
     fn reply(&self) -> ReplyFn {
         let me = self.me.clone();
         Rc::new(move |reply| {
@@ -683,11 +699,13 @@ impl InspectScreen {
                 self.browse.open_request(*open);
                 None
             }
-            HostRequest::OpenOptical(_) => {
-                Some("The Optical screen arrives in slice 6 of the Win32 shell.".into())
+            HostRequest::OpenOptical(path) => {
+                *self.optical.borrow_mut() = Some(path);
+                None
             }
-            HostRequest::OpenArchive(_) => {
-                Some("The Archives screen arrives in slice 6 of the Win32 shell.".into())
+            HostRequest::OpenArchive(path) => {
+                *self.archive.borrow_mut() = Some(path);
+                None
             }
             HostRequest::BackupClosed => {
                 self.backup_closed.set(true);

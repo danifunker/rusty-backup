@@ -32,7 +32,7 @@ ui = [
   { activate = "inspect.row.browse" },
   { wait = "HELLO.TXT" },
   { pick = "{scratch}" },
-  { activate = "browse.extract" },
+  { activate = "browse.extract_all" },
   { wait_file = "{scratch}/rusty-backup/HELLO.TXT", timeout_ms = 30000 },
   { activate = "browse.close" },
   { wait = "Calc min" },

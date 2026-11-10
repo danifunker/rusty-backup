@@ -29,12 +29,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::archives::ArchivesScreen;
 use crate::backup::BackupScreen;
 use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
+use crate::optical::OpticalScreen;
 use crate::restore::RestoreScreen;
 use crate::sync::SyncGuard;
 use crate::toolbar;
@@ -80,6 +82,12 @@ pub struct App {
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
     build: Rc<BuildScreen>,
+    optical: Rc<OpticalScreen>,
+    archives: Rc<ArchivesScreen>,
+    /// The Optical tab's disc browser, in its page's place while open.
+    disc_page: HWND,
+    /// The player's timer runs while a track plays.
+    playing: Cell<bool>,
     /// Commander, while it is open, on its own page over the whole window.
     commander: RefCell<Option<(Rc<CommanderScreen>, HWND)>>,
     /// What was showing when Commander opened, put back when it closes.
@@ -306,6 +314,10 @@ impl App {
         let mut backup = None;
         let mut restore = None;
         let mut build = None;
+        let mut optical = None;
+        let mut archives = None;
+        let disc_page = crate::panel::page(window);
+        ui::set_visible(disc_page, false);
         let browse_page = crate::panel::page(window);
         ui::set_visible(browse_page, false);
         let pages = AppTab::ALL
@@ -350,7 +362,28 @@ impl App {
                         build = Some(BuildScreen::build(page, ctrl.notify(), host.clone()));
                         page
                     }
-                    AppTab::Convert | AppTab::Optical | AppTab::Archives => {
+                    AppTab::Optical => {
+                        let page = crate::panel::page(window);
+                        optical = Some(OpticalScreen::build(
+                            page,
+                            disc_page,
+                            ctrl.notify(),
+                            ctrl.recent_handle(),
+                            host.clone(),
+                        ));
+                        page
+                    }
+                    AppTab::Archives => {
+                        let page = crate::panel::page(window);
+                        archives = Some(ArchivesScreen::build(
+                            page,
+                            ctrl.notify(),
+                            ctrl.recent_handle(),
+                            host.clone(),
+                        ));
+                        page
+                    }
+                    AppTab::Convert => {
                         let text = format!(
                             "The {} screen arrives in a later slice of the Win32 shell.",
                             t.label()
@@ -366,6 +399,8 @@ impl App {
         let backup = backup.expect("the Backup page");
         let restore = restore.expect("the Restore page");
         let build = build.expect("the Build Disk page");
+        let optical = optical.expect("the Optical page");
+        let archives = archives.expect("the Archives page");
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -379,6 +414,10 @@ impl App {
             backup,
             restore,
             build,
+            optical,
+            archives,
+            disc_page,
+            playing: Cell::new(false),
             commander: RefCell::default(),
             covered: RefCell::default(),
             log_shown: Cell::new(0),
@@ -421,6 +460,21 @@ impl App {
         self.backup.tick();
         self.restore.tick();
         self.build.tick();
+        self.optical.tick();
+        self.archives.tick();
+        if let Some(path) = self.inspect.take_archive() {
+            self.apply(AppAction::SelectTab(AppTab::Archives));
+            self.archives.open_path(path);
+        }
+        if let Some(path) = self.archives.take_mount() {
+            self.apply(AppAction::SelectTab(AppTab::Inspect));
+            self.inspect.open_image(path);
+        }
+        if let Some(path) = self.inspect.take_optical() {
+            self.apply(AppAction::SelectTab(AppTab::Optical));
+            self.optical.open_image(path);
+        }
+        self.player_timer();
         if let Some(path) = self.build.take_open_inspect() {
             self.apply(AppAction::SelectTab(AppTab::Inspect));
             self.inspect.open_image(path);
@@ -432,7 +486,8 @@ impl App {
         if self.inspect.take_backup_closed() {
             self.ctrl.borrow_mut().close_shared_backup();
         }
-        if self.inspect.take_convert().is_some() {
+        let convert = [self.inspect.take_convert(), self.optical.take_convert()];
+        if convert.iter().any(Option::is_some) {
             let line = "The Convert tab arrives in slice 7c of the Win32 shell.";
             append_log(vec![(LogLevel::Warning, line.into())]);
         }
@@ -445,9 +500,34 @@ impl App {
         let backup = self.backup.is_running().then_some("Backup");
         let restore = self.restore.is_running().then_some("Restore");
         let build = self.build.is_running().then_some("Build Disk");
-        self.backup.set_busy(inspect.or(restore).or(build));
-        self.restore.set_busy(inspect.or(backup).or(build));
-        self.build.set_busy(inspect.or(backup).or(restore));
+        let optical = self.optical.is_running().then_some("Optical");
+        self.archives
+            .set_busy(inspect.or(backup).or(restore).or(build).or(optical));
+        self.backup
+            .set_busy(inspect.or(restore).or(build).or(optical));
+        self.restore
+            .set_busy(inspect.or(backup).or(build).or(optical));
+        self.build
+            .set_busy(inspect.or(backup).or(restore).or(optical));
+        self.optical
+            .set_busy(inspect.or(backup).or(restore).or(build));
+    }
+
+    /// A playing track moves with no job to wake the shell, so a timer ticks while it plays.
+    fn player_timer(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+        let on = self.optical.playing();
+        if self.playing.replace(on) == on {
+            return;
+        }
+        // SAFETY: a timer on our own window, its WM_TIMER handled in `wndproc`.
+        unsafe {
+            if on {
+                SetTimer(Some(self.window), PLAYER_TIMER, 250, None);
+            } else {
+                let _ = KillTimer(Some(self.window), PLAYER_TIMER);
+            }
+        }
     }
 
     /// Open Commander over the whole window; the app's own controls hide until it closes.
@@ -462,6 +542,7 @@ impl App {
             .collect();
         covered.extend(self.pages.iter().map(|(_, h)| (*h, ui_visible(*h))));
         covered.push((self.browse_page, ui_visible(self.browse_page)));
+        covered.push((self.disc_page, ui_visible(self.disc_page)));
         for (h, _) in &covered {
             ui::set_visible(*h, false);
         }
@@ -549,10 +630,14 @@ impl App {
                 );
             }
             let browsing = self.inspect.browsing();
+            let disc = self.optical.browsing();
             for (t, page) in &self.pages {
-                ui::set_visible(*page, *t == tab && !(browsing && *t == AppTab::Inspect));
+                let covered =
+                    (browsing && *t == AppTab::Inspect) || (disc && *t == AppTab::Optical);
+                ui::set_visible(*page, *t == tab && !covered);
             }
             ui::set_visible(self.browse_page, browsing && tab == AppTab::Inspect);
+            ui::set_visible(self.disc_page, disc && tab == AppTab::Optical);
         });
         if banner_was != banner.is_some() {
             self.relayout();
@@ -697,6 +782,7 @@ impl App {
                 ui::move_to(*h, *r);
             }
             ui::move_to(self.browse_page, *r);
+            ui::move_to(self.disc_page, *r);
         }
     }
 
@@ -816,6 +902,9 @@ unsafe extern "system" fn refont(h: HWND, font: LPARAM) -> windows::core::BOOL {
     true.into()
 }
 
+/// The timer that ticks the CD-DA player while a track plays.
+const PLAYER_TIMER: usize = 0x5250;
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let Some(app) = app() else {
         // SAFETY: before the app exists (WM_CREATE and friends) the default handling is right.
@@ -823,6 +912,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     };
     match msg {
         WM_APP_JOB => app.tick(),
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wp.0 == PLAYER_TIMER => app.tick(),
         WM_COMMAND => app.command(
             HWND(lp.0 as _),
             (wp.0 & 0xffff) as u32,

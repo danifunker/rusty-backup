@@ -55,14 +55,18 @@ const TREE_W: i32 = 200;
 /// Another: pop up the View menu the key map asked for.
 const VIEW_MENU: u32 = 0x7F01;
 
-fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
+/// The pane's controller: Inspect's browse profile, or the Optical tab's disc browser.
+fn new_controller(notify: &Arc<dyn Notify>, disc: bool) -> CommanderController {
     let services = PaneServices {
         jobs: JobRegistry::new(),
         notify: Arc::clone(notify),
         recent: Box::new(CommanderRecent(UserConfig)),
     };
     let (keymap, problems) = KeyMap::load(KeyMap::user_file().as_deref());
-    let mut ctl = CommanderController::single(services, keymap, PaneProfile::inspect());
+    let mut ctl = match disc {
+        true => rusty_backup::controller::optical::disc_browser(services, keymap),
+        false => CommanderController::single(services, keymap, PaneProfile::inspect()),
+    };
     ctl.report_keymap_problems(problems);
     ctl
 }
@@ -91,6 +95,8 @@ struct Shown {
 pub struct BrowseView {
     ctrl: RefCell<CommanderController>,
     notify: Arc<dyn Notify>,
+    /// The Optical tab's disc browser rather than Inspect's.
+    disc: bool,
     host: EffectHost,
     sync: SyncGuard,
     me: Weak<BrowseView>,
@@ -145,14 +151,19 @@ pub struct BrowseView {
 }
 
 thread_local! {
-    /// The view the follow timer wakes; a timer callback has no context of its own.
-    static FOLLOW: RefCell<Weak<BrowseView>> = const { RefCell::new(Weak::new()) };
+    /// Each running follow timer and the view it wakes; a timer callback has no context of its own.
+    static FOLLOW: RefCell<Vec<(usize, Weak<BrowseView>)>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe extern "system" fn follow_fired(_: HWND, _: u32, id: usize, _: u32) {
     // SAFETY: the timer is ours and one-shot.
     let _ = unsafe { KillTimer(None, id) };
-    if let Some(view) = FOLLOW.with(|f| f.borrow().upgrade()) {
+    let view = FOLLOW.with(|f| {
+        let mut f = f.borrow_mut();
+        let at = f.iter().position(|(t, _)| *t == id);
+        at.and_then(|i| f.remove(i).1.upgrade())
+    });
+    if let Some(view) = view {
         view.follow_timer.set(0);
         view.tick();
     }
@@ -176,10 +187,15 @@ fn multiline(parent: HWND, id: &str) -> HWND {
 }
 
 impl BrowseView {
-    pub fn build(page: HWND, notify: Arc<dyn Notify>, host: EffectHost) -> Rc<BrowseView> {
+    pub fn build(
+        page: HWND,
+        notify: Arc<dyn Notify>,
+        host: EffectHost,
+        disc: bool,
+    ) -> Rc<BrowseView> {
         let title = ui::label(page, "Filesystem Browser");
         let volume = ui::label(page, "");
-        let extract_all = ui::button(page, "Extract All...", ids::EXTRACT);
+        let extract_all = ui::button(page, "Extract All...", ids::EXTRACT_ALL);
         let export_volume = ui::button(page, "Export to .tar.gz...", ids::EXPORT_VOLUME);
         let close = ui::button(page, "Close", ids::CLOSE);
         let job = ui::label(page, "");
@@ -233,8 +249,9 @@ impl BrowseView {
         let edit_row = EditRow::build(page);
         let mark_row = MarkRow::build(page);
         let view = Rc::new_cyclic(|me: &Weak<BrowseView>| BrowseView {
-            ctrl: RefCell::new(new_controller(&notify)),
+            ctrl: RefCell::new(new_controller(&notify, disc)),
             notify,
+            disc,
             host,
             sync: SyncGuard::default(),
             me: me.clone(),
@@ -281,7 +298,6 @@ impl BrowseView {
             shape: Cell::new(u64::MAX),
             facts_rows: Cell::new(1),
         });
-        FOLLOW.with(|f| *f.borrow_mut() = view.me.clone());
         view.set_icons();
         let weak: Weak<dyn Handler> = view.me.clone();
         panel::register(page, weak);
@@ -355,6 +371,16 @@ impl BrowseView {
         self.pane.focus();
     }
 
+    /// Open the Optical tab's disc in the disc browser.
+    pub fn open_disc(&self, src: rusty_backup::controller::optical::DiscSource) {
+        self.close();
+        let fx = self.ctrl.borrow_mut().open_disc(src);
+        self.active.set(true);
+        self.after(fx);
+        self.changed();
+        self.pane.focus();
+    }
+
     /// The streamed backup's seekable cache is ready; the listing stays where it is.
     pub fn upgrade_seekable(&self, path: PathBuf) {
         if self.active.get() {
@@ -366,7 +392,7 @@ impl BrowseView {
         if !self.active.replace(false) {
             return;
         }
-        let fresh = new_controller(&self.notify);
+        let fresh = new_controller(&self.notify, self.disc);
         // The old pane's readers go before its CHD diff or archive temp is removed.
         self.ctrl.replace(fresh).close_inspect();
         self.label_prefix.borrow_mut().clear();
@@ -601,6 +627,7 @@ impl BrowseView {
             let ms = FOLLOW_DELAY.as_millis() as u32;
             // SAFETY: a one-shot thread timer; its callback finds the view through FOLLOW.
             let id = unsafe { SetTimer(None, 0, ms, Some(follow_fired)) };
+            FOLLOW.with(|f| f.borrow_mut().push((id, self.me.clone())));
             self.follow_timer.set(id);
         }
     }

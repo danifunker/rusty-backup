@@ -1,0 +1,41 @@
+# Tier 8: the Archives screen, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.archives"
+description = "Open a classic Mac archive on the Archives screen, extract it, and compare with rb-cli's own extract."
+
+[[case]]
+id = "flow.archives.sit-extract-all"
+description = "Take the StuffIt archive off the ISO fixture, open it on the Archives screen, extract every entry as raw forks and compare both forks with rb-cli archive extract"
+level = "smoke"
+area = ["archives"]
+shells = ["win32"]
+fixture = "optical.iso9660.joliet.cd"
+capabilities = ["archives.open", "archives.extract"]
+timeout_ms = 300000
+
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/iso"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Archives" },
+  { pick = "{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT" },
+  { activate = "archives.browse" },
+  { wait = "files in archive", timeout_ms = 60000 },
+  { focus = "archives.format" },
+  { choose = "Raw" },
+  { pick = "{scratch}/ui" },
+  { activate = "archives.extract_all" },
+  { wait = "Extracted", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["archive", "extract", "--format", "raw", "{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT", "{scratch}/ref"]
+expect_exit = 0
+files_identical = [
+  ["{scratch}/ref/Civ II Gold 1.1.1 Update", "{scratch}/ui/Civ II Gold 1.1.1 Update"],
+  ["{scratch}/ref/Civ II Gold 1.1.1 Update.rsrc", "{scratch}/ui/Civ II Gold 1.1.1 Update.rsrc"],
+]

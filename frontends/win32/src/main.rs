@@ -10,6 +10,8 @@ mod alto;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod archives;
+#[cfg(windows)]
 mod backup;
 #[cfg(windows)]
 mod backup_vhd;
@@ -46,6 +48,8 @@ mod inspect;
 mod layout;
 #[cfg(windows)]
 mod menu;
+#[cfg(windows)]
+mod optical;
 #[cfg(windows)]
 mod pane_view;
 #[cfg(windows)]
