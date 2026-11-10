@@ -443,14 +443,10 @@ impl App {
     }
 
     /// Files dropped from Explorer: Commander opens the first, a browse view in Edit Mode stages them.
-    fn dropped(&self, paths: Vec<std::path::PathBuf>) {
+    fn dropped(&self, paths: Vec<std::path::PathBuf>, at: windows::Win32::Foundation::POINT) {
         let commander = self.commander.borrow().as_ref().map(|(c, _)| c.clone());
         match commander {
-            Some(c) => {
-                if let Some(path) = paths.into_iter().next() {
-                    c.drop_path(path);
-                }
-            }
+            Some(c) => c.drop_paths(paths, at),
             None => {
                 if !self.inspect.drop_paths(paths) {
                     let line = "Drop files on Commander, or on a browsed volume in Edit Mode.";
@@ -844,9 +840,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         &buf[..len],
                     )));
                 }
+            }
+            // The drop point, in screen pixels, says which of Commander's panes it landed on.
+            let mut at = windows::Win32::Foundation::POINT::default();
+            // SAFETY: the same drop handle, released once read.
+            unsafe {
+                let _ = windows::Win32::UI::Shell::DragQueryPoint(drop, &mut at);
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut at);
                 windows::Win32::UI::Shell::DragFinish(drop);
             }
-            app.dropped(paths);
+            app.dropped(paths, at);
         }
         WM_DESTROY => {
             APP.with(|a| a.borrow_mut().take());

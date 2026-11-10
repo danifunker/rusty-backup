@@ -171,8 +171,20 @@ in check-group mode with the bundled icons); the screens and slices below are un
    survives a refresh. The side panel gained the ProDOS name and QNX RS-to-LF options, Save /
    Browse Mac archive, Edit as text, Edit Metadata and Export as Mac archive. Esc closes any of
    the shell's windows, and F1 to F24 in one go through the key map (`panel::set_keys`), as
-   GTK forwards them. `flow.browse.inspect-edit-text` passes. Drag and drop onto the listing
-   lands with slice 3.
+   GTK forwards them. `flow.browse.inspect-edit-text` passes.
+   Slice 3 (Commander) done (2026-11-09): the listing became `pane_view.rs`, which the browse
+   view and Commander's two sides share; it reports `PaneEvent`s and each screen turns them
+   into actions. `commander.rs` takes over the window from the toolbar: each side's source
+   button and menu, File / Folder / Backup / Remote, Close, partitions, New Folder, Apply /
+   Discard / Edits, title and free space, the path as link crumbs, the unlock row and the job
+   line; the copy column; View, Log, Close; quick view. The controller added `side_bars`,
+   `copy_column`, `side_windows` / `screen_windows` and the rename notice and partition
+   windows. A tick-box pane (Inspect) shows its cursor as the list's selection, a click-marking
+   one (Commander) its marks, with its cursor as focus. A row dragged onto the other pane
+   copies (a captured drag, as GTK tracks the pointer). A file dropped from Explorer opens in
+   the pane under the pointer, and one dropped between the panes asks which; on the browse
+   view in Edit Mode it is staged. `flow.commander.*` and `flow.files.*` run on win32: 42 pass,
+   R-089 and R-090 xfail as on the other shells. Not done: Compare (not built on any shell).
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

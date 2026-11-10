@@ -375,6 +375,11 @@ fn choose(owner: HWND, spec: &ChoiceSpec) -> usize {
     task_dialog(owner, &spec.title, &spec.message, &labels, false, false).unwrap_or(spec.dismiss)
 }
 
+/// A question the shell asks itself (not the controller): the button picked, `None` for Cancel.
+pub fn ask(owner: HWND, title: &str, message: &str, buttons: &[String]) -> Option<usize> {
+    task_dialog(owner, title, message, buttons, false, true)
+}
+
 /// An information box with OK, for the About window and other plain notes.
 pub fn note(owner: HWND, title: &str, message: &str) {
     task_dialog(owner, title, message, &["OK".to_string()], false, false);

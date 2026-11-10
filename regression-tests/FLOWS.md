@@ -165,7 +165,7 @@ sign the two shells don't offer the same thing.
 | `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS, and Windows 10 1809+ over ConPTY (`RUSTY_BACKUP_CONFIG_DIR` keeps its config in the scratch home there). About 4 s a flow on Linux, 5 s on Windows |
 | `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
 | `appkit` | `drivers/ax_driver.py`: PyObjC over AX, controls found by `AXIdentifier` (the controller id), so no `labels.toml` section | the AX (TCC) permission | planned: [docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md) |
-| `win32` | `drivers/uia_driver.py` over UI Automation, run by `runner/src/uia.rs` (`--win32 <exe>`, default `frontends/win32/target/release/rusty-backup-win32.exe`): controls found by `AutomationId`, the controller id, else by name; scratch config and picks file as for the other shells | Python with `comtypes` | Windows, CI target `win32`. The flows that list `win32` run on it as the screens land ([docs/win32_shell_plan.md](../docs/win32_shell_plan.md)) |
+| `win32` | `drivers/uia_driver.py` over UI Automation, run by `runner/src/uia.rs` (`--win32 <exe>`, default `frontends/win32/target/release/rusty-backup-win32.exe`): controls found by `AutomationId`, the controller id, else by name; scratch config and picks file as for the other shells | Python with `comtypes` | Windows, CI target `win32`. The flows that list `win32` run on it as the screens land; its `labels.toml` section holds only behaviour drift (a copy into a host folder needs no Apply) ([docs/win32_shell_plan.md](../docs/win32_shell_plan.md)) |
 
 A case whose shell has no driver, or whose driver's tools are missing, resolves
 to `skip-tool` with the reason.
@@ -225,8 +225,8 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 |---|---|---|---|
 | `backup.toml` | a FAT image to zstd from the Backup screen | tui, gtk | restore + byte-compare |
 | `restore.toml` | a backup folder to a new image file | tui, gtk | byte-compare |
-| `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, xfail) | tui, gtk | byte-compare |
-| `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk | byte-compare + fsck; UFS inject is R-089, xfail |
+| `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, xfail) | tui, gtk, win32 | byte-compare |
+| `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck; UFS inject is R-089, xfail |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk | tui, gtk | byte-compare out of the ISO |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |

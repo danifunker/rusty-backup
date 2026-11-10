@@ -784,9 +784,56 @@ impl CommanderScreen {
         self.ctrl.borrow().has_staged_edits()
     }
 
-    /// A path dropped from Explorer opens in the active pane.
-    pub fn drop_path(&self, path: PathBuf) {
+    /// Files dropped from Explorer at screen point `at`: the first opens in the pane under it.
+    /// A drop between the panes asks which one it is for.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>, at: POINT) {
+        let Some(path) = paths.first().cloned() else {
+            return;
+        };
+        let side = match self.side_at(at) {
+            Some(side) => side,
+            None => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let more = match paths.len() {
+                    1 => String::new(),
+                    n => format!(
+                        " Only the first of the {n} dropped items opens; a pane shows one source."
+                    ),
+                };
+                let message = format!("Which pane should open \"{name}\"?{more}");
+                let buttons = [
+                    "Open in left pane".to_string(),
+                    "Open in right pane".to_string(),
+                ];
+                match crate::effects::ask(self.owner(), "Open dropped item", &message, &buttons) {
+                    Some(0) => Side::Left,
+                    Some(1) => Side::Right,
+                    _ => return,
+                }
+            }
+        };
+        self.apply(A::Focus(side));
         self.apply(A::OpenDropped(path));
+    }
+
+    /// The side whose bars or listing hold screen point `at`.
+    fn side_at(&self, at: POINT) -> Option<Side> {
+        SIDES.into_iter().find(|side| {
+            let view = &self.sides[idx(*side)];
+            let top = rect_of(view.source);
+            let bottom = rect_of(view.pane.list);
+            let area = RECT {
+                left: top.left,
+                top: top.top,
+                right: bottom.right,
+                bottom: bottom.bottom,
+            };
+            // SAFETY: a plain point-in-rectangle test.
+            unsafe { PtInRect(&area, at).as_bool() }
+        })
     }
 
     /// The window is closing with edits staged: ask the controller, which may quit after.
