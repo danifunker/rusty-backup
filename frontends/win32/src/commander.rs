@@ -272,7 +272,8 @@ impl SideView {
         if let Some(i) = b.part {
             select(self.partition, i);
         }
-        ui::set_visible(self.partition, b.loaded && b.parts.len() > 1);
+        // Shown whenever the source has partitions, so one that fails to open can be left.
+        ui::set_visible(self.partition, !b.parts.is_empty());
         ui::set_text(self.no_parts, b.no_parts);
         ui::set_visible(
             self.no_parts,

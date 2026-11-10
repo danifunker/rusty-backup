@@ -3353,6 +3353,13 @@ pub fn is_browsable_scheme_slice(type_name: &str) -> bool {
             None => false,
         };
     }
+    // A BSD disklabel row, "BSD a (4.2BSD)": its fstype is the role, and swap or RAID holds no files.
+    if type_name.starts_with("BSD ") {
+        return match paren_role {
+            Some(r) => !matches!(r, "swap" | "unused" | "unknown" | "RAID" | "boot"),
+            None => false,
+        };
+    }
     if let Some(rest) = type_name.strip_prefix("SGI ") {
         // "SGI BSD" (volume header) and "SGI swap" (disk label) both lead
         // with the deciding word.
@@ -4045,6 +4052,9 @@ mod tests {
         assert!(partition_is_browsable(0, None, "exFAT")); // superfloppy hint
                                                            // FAT-name fallback for older backups with no type byte.
         assert!(partition_is_browsable(0x00, None, "FAT16 (no type byte)"));
+        // A BSD disklabel's FFS partition opens; its swap does not (a NetBSD/alpha system disk).
+        assert!(partition_is_browsable(0, None, "BSD a (4.2BSD)"));
+        assert!(!partition_is_browsable(0, None, "BSD b (swap)"));
     }
 
     #[test]
