@@ -956,6 +956,12 @@ pub fn run_worker(req: &ProvisionRequest, status: Arc<Mutex<PhysicalWriteStatus>
         progress_cb(done);
     }
 
+    // A BSD label copies each formatted UFS's geometry, so it is finished once they exist.
+    if req.kind == TableKind::Bsd && req.head.is_none() {
+        let file = target.inner_mut().context("flushing before the label")?;
+        provision::finish_bsd_label(file, &req.partitions, req.target_size_bytes)
+            .context("finishing the BSD label")?;
+    }
     target.flush().context("flushing target after build")?;
     target.sync_all().context("syncing the target")?;
     log_cb("Disk build complete");

@@ -350,3 +350,117 @@ mod bsd_dedicated {
         assert_eq!(whole.size, SLICE as u64);
     }
 }
+
+mod bsd_alpha_build {
+    //! `new hd bsd-alpha`'s build: the label, its two checksums and the UFS it describes.
+    use crate::model::disk_builder::RowFormat;
+    use crate::model::format::FsKind;
+    use crate::model::provision_runner::{run_worker, MacDriver, ProvisionRequest};
+    use crate::partition::provision::{place, Geometry, PartSpec};
+    use crate::partition::type_catalog::TableKind;
+    use crate::partition::PartitionTable;
+    use std::sync::{Arc, Mutex};
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn spec(size: Option<u64>, fstype: &str, letter: &str) -> PartSpec {
+        PartSpec {
+            size,
+            type_text: Some(fstype.to_string()),
+            name: Some(letter.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_formatted_alpha_disk_carries_both_checksums_and_its_ufs_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha.img");
+        // Small: the whole disk is read back, and the 32-bit CI leg has little address space.
+        let disk = 24 * MIB;
+        let specs = [
+            spec(Some(8 * MIB), "4.2BSD", "a"),
+            spec(Some(4 * MIB), "swap", "b"),
+            spec(None, "4.2BSD", "e"),
+        ];
+        let placed = place(&specs, TableKind::Bsd, disk, MIB, Geometry::default()).unwrap();
+        assert_eq!(
+            placed[0].start_lba, 0,
+            "a starts at sector 0, around the label"
+        );
+        let mut ufs = RowFormat::new(FsKind::Ufs);
+        ufs.opts.block_size = Some(16 * 1024);
+        let formats = vec![Some(ufs.clone()), None, Some(ufs)];
+        let req = ProvisionRequest {
+            target_path: path.clone(),
+            target_size_bytes: disk,
+            kind: TableKind::Bsd,
+            geometry: Geometry::default(),
+            sources: vec![None; placed.len()],
+            partitions: placed.clone(),
+            formats,
+            full_write: false,
+            rdb_handlers: Vec::new(),
+            mac_driver: MacDriver::Off,
+            head: None,
+            donor: None,
+            copies: Vec::new(),
+        };
+        let status = Arc::new(Mutex::new(
+            crate::model::physical_write_runner::PhysicalWriteStatus {
+                finished: false,
+                error: None,
+                log_messages: Vec::new(),
+                current_bytes: 0,
+                total_bytes: 0,
+                cancel_requested: false,
+            },
+        ));
+        run_worker(&req, status).expect("build");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut sector = [0u8; 512];
+        sector.copy_from_slice(&bytes[..512]);
+        assert_eq!(&sector[..64], &[0u8; 64]);
+        let stored = u64::from_le_bytes(sector[504..512].try_into().unwrap());
+        assert_eq!(stored, part_tables::bsd::alpha_srm_checksum(&sector));
+        let label = &sector[64..64 + 148 + 8 * 16];
+        let xor = (0..label.len()).step_by(2).fold(0u16, |x, o| {
+            x ^ u16::from_le_bytes([label[o], label[o + 1]])
+        });
+        assert_eq!(xor, 0, "the label XORs to zero");
+
+        // Slot a takes fsize / frag / cpg from the UFS superblock 8 KiB into it.
+        let sb = 8192;
+        let le = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let a = 64 + 148;
+        assert_eq!(le(a + 8), le(sb + 0x34), "p_fsize");
+        assert_eq!(u32::from(bytes[a + 13]), le(sb + 0x38), "p_frag");
+        assert_eq!(le(sb + 0x34), 2048);
+        let cpg = u16::from_le_bytes([bytes[a + 14], bytes[a + 15]]);
+        assert_eq!(u32::from(cpg), le(sb + 0xB4), "p_cpg");
+
+        let pt = PartitionTable::detect(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let names: Vec<String> = pt
+            .partitions()
+            .iter()
+            .map(|p| p.type_name.clone())
+            .collect();
+        assert_eq!(names, ["BSD a (4.2BSD)", "BSD b (swap)", "BSD e (4.2BSD)"]);
+        for p in pt
+            .partitions()
+            .iter()
+            .filter(|p| p.type_name.contains("4.2BSD"))
+        {
+            let mut fs = crate::fs::open_filesystem_sized(
+                std::io::Cursor::new(bytes.clone()),
+                p.byte_offset(),
+                Some(p.size_bytes),
+                p.partition_type_byte,
+                p.partition_type_string.as_deref(),
+            )
+            .expect("UFS opens");
+            let root = fs.root().unwrap();
+            assert!(fs.list_directory(&root).unwrap().is_empty());
+        }
+    }
+}

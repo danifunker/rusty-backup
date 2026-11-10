@@ -94,6 +94,27 @@ impl BsdPartition {
     }
 }
 
+/// The `p_fstype` a name stands for: `disklabel`'s own names, a number, or `ufs` / `ffs`.
+pub fn fstype_from_text(text: &str) -> Option<u8> {
+    let t = text.trim();
+    if let Ok(n) = t.parse::<u8>() {
+        return Some(n);
+    }
+    if t.eq_ignore_ascii_case("ufs") || t.eq_ignore_ascii_case("ffs") {
+        return Some(FS_BSDFFS);
+    }
+    (0..=u8::MAX).find(|&n| {
+        let p = BsdPartition {
+            letter: 'a',
+            offset: 0,
+            size: 0,
+            fstype: n,
+        };
+        let name = p.fstype_name();
+        name != "unknown" && name.eq_ignore_ascii_case(t)
+    })
+}
+
 impl BsdDiskLabel {
     /// Find and parse a BSD label at any of the known offsets, either byte order.
     pub fn detect<R: Read + Seek>(reader: &mut R) -> Option<Self> {
