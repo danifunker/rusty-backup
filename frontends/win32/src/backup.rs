@@ -4,7 +4,7 @@
 //! Image, Close Drive and Load partition info), the partition table with Include, Calc min and
 //! Compact, the destination, name, output format with the shared CHD control, the sizing and
 //! split options, the checksum, and Start / Cancel with the progress line and the outcome.
-//! The VHD options window is `backup_vhd.rs`. Still to come: remote sources (slice 7b).
+//! The VHD options window is `backup_vhd.rs`, the Remote Drive window `backup_remote.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_NUMBER, GA_ROOT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::backup_remote::{RemoteShown, RemoteWindow};
 use crate::backup_vhd::{VhdShown, VhdWindow};
 use crate::chd::{ChdControl, ChdIds};
 use crate::effects::{EffectHost, Reply, ReplyFn};
@@ -209,6 +210,7 @@ pub struct BackupScreen {
     source_caption: HWND,
     source: HWND,
     open_image: HWND,
+    remote_open: HWND,
     close: HWND,
     clear_remote: HWND,
     scan: HWND,
@@ -247,6 +249,7 @@ pub struct BackupScreen {
     why: HWND,
     shape: RefCell<Vec<bool>>,
     vhd: RefCell<Option<Rc<VhdWindow>>>,
+    remote: RefCell<Option<Rc<RemoteWindow>>>,
 }
 
 impl BackupScreen {
@@ -317,6 +320,7 @@ impl BackupScreen {
             source_caption: ui::cell_label(page, "Source:"),
             source,
             open_image: ui::button(page, "Open Image File...", ids::OPEN_IMAGE),
+            remote_open: ui::button(page, "Remote Drive...", ids::REMOTE_OPEN),
             close: ui::button(page, "Close Drive", ids::CLOSE_SOURCE),
             clear_remote: ui::button(page, "Disconnect", ids::CLEAR_REMOTE),
             scan: ui::button(page, "Load partition info", ids::LOAD_PARTITIONS),
@@ -355,6 +359,7 @@ impl BackupScreen {
             why: ui::cell_label(page, ""),
             shape: RefCell::default(),
             vhd: RefCell::default(),
+            remote: RefCell::default(),
         });
         let weak: Weak<dyn Handler> = screen.me.clone();
         panel::register(page, weak);
@@ -423,6 +428,7 @@ impl BackupScreen {
         }
         crate::app::append_log(log);
         self.show_vhd();
+        self.show_remote();
         // Off screen nothing needs it, and a job wakes this many times a second.
         if ui::shown(self.page) {
             self.refresh();
@@ -443,6 +449,38 @@ impl BackupScreen {
             let (options, custom) = self.chd.choice();
             ChdChoice { options, custom }
         })
+    }
+
+    /// The Remote Drive window follows the controller: open while it says so.
+    fn show_remote(&self) {
+        let shown = {
+            let ctrl = self.ctrl.borrow();
+            ctrl.remote_dialog_open().then(|| RemoteShown {
+                address: ctrl.remote_address().to_string(),
+                busy: ctrl.remote_busy(),
+                error: ctrl.remote_error().map(str::to_string),
+                drives: ctrl.remote_listed().then(|| ctrl.remote_drives()),
+            })
+        };
+        let Some(shown) = shown else {
+            self.remote.replace(None);
+            return;
+        };
+        let held = self.remote.borrow().clone();
+        let w = held.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(BackupAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            // SAFETY: a plain query of our own window.
+            let owner = unsafe { GetAncestor(self.page, GA_ROOT) };
+            let w = RemoteWindow::open(owner, send);
+            *self.remote.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(shown);
     }
 
     /// The VHD options window follows the controller: open while it says so, rebuilt for new rows.
@@ -511,6 +549,7 @@ impl BackupScreen {
         entries.extend(devices.iter().map(|d| (d.display_name(), true)));
         entries.push((String::new(), false));
         entries.push(("Open Image File...".into(), true));
+        entries.push(("Remote Drive...".into(), true));
         let mut r = windows::Win32::Foundation::RECT::default();
         // SAFETY: plain queries of our own windows.
         let (owner, picked) = unsafe {
@@ -537,8 +576,10 @@ impl BackupScreen {
                 slot: i - devices_at,
                 device: device.clone(),
             }
-        } else if i == entries.len() - 1 {
+        } else if i == entries.len() - 2 {
             BackupAction::PickImage
+        } else if i == entries.len() - 1 {
+            BackupAction::RemoteOpen
         } else {
             return;
         };
@@ -721,6 +762,7 @@ impl BackupScreen {
         let mut v = vec![
             self.source,
             self.open_image,
+            self.remote_open,
             self.close,
             self.scan,
             self.all,
@@ -807,6 +849,7 @@ impl BackupScreen {
             fixed(self.source_caption, 60),
             Node::leaf(self.source, Size::Stretch(1), row_h),
             Node::button(self.open_image, 130),
+            Node::button(self.remote_open, 115),
         ];
         source.extend(
             [(self.close, 95), (self.clear_remote, 90), (self.scan, 140)]
@@ -982,6 +1025,8 @@ impl Handler for BackupScreen {
             return;
         } else if from == self.open_image {
             BackupAction::PickImage
+        } else if from == self.remote_open {
+            BackupAction::RemoteOpen
         } else if from == self.close {
             BackupAction::CloseSource
         } else if from == self.clear_remote {

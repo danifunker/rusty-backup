@@ -14,6 +14,8 @@ mod archives;
 #[cfg(windows)]
 mod backup;
 #[cfg(windows)]
+mod backup_remote;
+#[cfg(windows)]
 mod backup_vhd;
 #[cfg(windows)]
 mod browse;

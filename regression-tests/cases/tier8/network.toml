@@ -51,3 +51,29 @@ expect_exit = 0
 args = ["get", "{scratch}/out.img", "/HELLO.TXT", "{scratch}/back.txt"]
 expect_exit = 0
 files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.network.backup-remote-connect"
+description = "Connect to an rb-cli serve daemon from Backup's Remote Drive window and see its drive list (a daemon without elevation lists none)"
+level = "smoke"
+area = ["network", "backup"]
+shells = ["win32"]
+capabilities = ["backup.remote-source"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}", "--read-only"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { activate = "backup.remote_open" },
+  { wait = "Remote Drive" },
+  { focus = "backup.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "backup.remote_connect" },
+  { wait = "No physical drives reported", timeout_ms = 30000 },
+  { activate = "backup.remote_close" },
+  { wait_gone = "No physical drives reported" },
+]
