@@ -439,6 +439,25 @@ impl RestoreScreen {
         self.ctrl.borrow().is_running() || writing
     }
 
+    /// The backup folder open here, for the share with Inspect.
+    pub fn loaded_backup(&self) -> Option<PathBuf> {
+        self.ctrl.borrow().backup_folder().map(Path::to_path_buf)
+    }
+
+    /// Nothing is open, so a shared backup may be adopted.
+    pub fn is_empty(&self) -> bool {
+        let ctrl = self.ctrl.borrow();
+        !ctrl.has_backup() && !ctrl.has_other_source()
+    }
+
+    pub fn load_backup(&self, folder: &Path) {
+        self.apply(RestoreAction::OpenBackup(folder.to_path_buf()));
+    }
+
+    pub fn clear_backup(&self) {
+        self.apply(RestoreAction::ClearBackup);
+    }
+
     pub fn apply(&self, action: RestoreAction) {
         let effects = self.ctrl.borrow_mut().apply(action);
         self.after(effects);

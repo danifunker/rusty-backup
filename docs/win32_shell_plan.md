@@ -234,6 +234,10 @@ in check-group mode with the bundled icons); the screens and slices below are un
    file named on the command line (Explorer's Open With) opens in Inspect. Drops cannot be
    driven by a flow; the command-line open was checked by hand. About and the icon came with
    slice 0. Left: registering the file associations, which the installer (slice 9) does.
+   Inspect and Restore share the open backup folder through the app controller's
+   `share_backup`, and Close Backup closes it on both (`flow.restore.share-with-inspect`). A
+   tab's page is shown before the screens tick, so a screen changed while hidden is drawn
+   fresh when its tab comes up.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

@@ -459,6 +459,8 @@ impl App {
             self.host
                 .run(vec![Effect::Confirm(elevation_confirm())], &reply());
         }
+        // The tab on screen first: a screen redraws only while its page is shown.
+        self.refresh();
         let devices = self.ctrl.borrow().devices().to_vec();
         self.inspect.set_devices(&devices);
         self.inspect.tick();
@@ -492,9 +494,7 @@ impl App {
         if let Some(c) = commander {
             c.tick();
         }
-        if self.inspect.take_backup_closed() {
-            self.ctrl.borrow_mut().close_shared_backup();
-        }
+        self.share_backup();
         self.convert.tick();
         for path in [self.inspect.take_convert(), self.optical.take_convert()]
             .into_iter()
@@ -531,6 +531,34 @@ impl App {
         self.optical.set_busy(elsewhere("Optical"));
         self.convert.set_busy(elsewhere("Convert"));
         self.archives.set_busy(elsewhere("Archives"));
+    }
+
+    /// Restore and Inspect share a backup folder: the tab on screen publishes or adopts it.
+    fn share_backup(&self) {
+        use rusty_backup::controller::app::ShareStep;
+        if self.inspect.take_backup_closed() {
+            self.ctrl.borrow_mut().close_shared_backup();
+            self.restore.clear_backup();
+        }
+        let tab = self.ctrl.borrow().active_tab();
+        let (loaded, empty) = match tab {
+            AppTab::Restore => (self.restore.loaded_backup(), self.restore.is_empty()),
+            AppTab::Inspect => (self.inspect.loaded_backup(), self.inspect.is_empty()),
+            AppTab::Backup
+            | AppTab::Build
+            | AppTab::Optical
+            | AppTab::Archives
+            | AppTab::Convert => return,
+        };
+        let step = self.ctrl.borrow_mut().share_backup(loaded, empty);
+        match (step, tab) {
+            (ShareStep::Publish(folder), AppTab::Restore)
+            | (ShareStep::Adopt(folder), AppTab::Inspect) => self.inspect.load_backup(&folder),
+            (ShareStep::Publish(folder), _) | (ShareStep::Adopt(folder), _) => {
+                self.restore.load_backup(&folder)
+            }
+            (ShareStep::Nothing, _) => {}
+        }
     }
 
     /// A playing track moves with no job to wake the shell, so a timer ticks while it plays.
@@ -871,7 +899,11 @@ impl App {
         };
         match part {
             Part::CloseBackup => {
+                // It closes on both tabs.
                 self.ctrl.borrow_mut().close_shared_backup();
+                self.restore.clear_backup();
+                self.inspect.clear_backup();
+                append_log(vec![(LogLevel::Info, "Backup closed".to_string())]);
                 self.refresh();
             }
             Part::Refresh => self.apply(AppAction::RefreshDevices),

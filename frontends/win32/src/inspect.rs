@@ -417,6 +417,34 @@ impl InspectScreen {
         self.browse.set_icons();
     }
 
+    /// The backup folder open here, for the share with Restore.
+    pub fn loaded_backup(&self) -> Option<PathBuf> {
+        self.ctrl.borrow().backup_folder().map(PathBuf::from)
+    }
+
+    /// Nothing is open, so a shared backup may be adopted.
+    pub fn is_empty(&self) -> bool {
+        let ctrl = self.ctrl.borrow();
+        ctrl.backup_folder().is_none() && !ctrl.has_local_source()
+    }
+
+    /// Open the shared backup folder.
+    pub fn load_backup(&self, folder: &std::path::Path) {
+        if self.ctrl.borrow().backup_folder() != Some(folder) {
+            self.apply(InspectAction::Load(InspectSource::Backup {
+                folder: folder.to_path_buf(),
+            }));
+        }
+    }
+
+    /// Close Backup from elsewhere: the app already dropped the shared folder.
+    pub fn clear_backup(&self) {
+        if self.ctrl.borrow().backup_folder().is_some() {
+            self.apply(InspectAction::Unload { quiet: true });
+            self.backup_closed.set(false);
+        }
+    }
+
     /// Whether a remote session is open, and whether a local source is: where a drop may go.
     pub fn drop_state(&self) -> (bool, bool) {
         let ctrl = self.ctrl.borrow();
