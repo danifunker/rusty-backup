@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::backup::BackupScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -74,6 +75,7 @@ pub struct App {
     /// The Inspect tab's browse view, shown in its page's place while it is open.
     browse_page: HWND,
     inspect: Rc<InspectScreen>,
+    backup: Rc<BackupScreen>,
     /// Commander, while it is open, on its own page over the whole window.
     commander: RefCell<Option<(Rc<CommanderScreen>, HWND)>>,
     /// What was showing when Commander opened, put back when it closes.
@@ -297,6 +299,7 @@ impl App {
         }
         let host = EffectHost::new(window, status);
         let mut inspect = None;
+        let mut backup = None;
         let browse_page = crate::panel::page(window);
         ui::set_visible(browse_page, false);
         let pages = AppTab::ALL
@@ -316,8 +319,17 @@ impl App {
                         inspect = Some(screen);
                         page
                     }
-                    AppTab::Backup
-                    | AppTab::Restore
+                    AppTab::Backup => {
+                        let page = crate::panel::page(window);
+                        backup = Some(BackupScreen::build(
+                            page,
+                            ctrl.notify(),
+                            ctrl.recent_handle(),
+                            host.clone(),
+                        ));
+                        page
+                    }
+                    AppTab::Restore
                     | AppTab::Build
                     | AppTab::Convert
                     | AppTab::Optical
@@ -334,6 +346,7 @@ impl App {
             })
             .collect();
         let inspect = inspect.expect("the Inspect page");
+        let backup = backup.expect("the Backup page");
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -344,6 +357,7 @@ impl App {
             pages,
             browse_page,
             inspect,
+            backup,
             commander: RefCell::default(),
             covered: RefCell::default(),
             log_shown: Cell::new(0),
@@ -379,6 +393,9 @@ impl App {
         let devices = self.ctrl.borrow().devices().to_vec();
         self.inspect.set_devices(&devices);
         self.inspect.tick();
+        self.backup.set_devices(&devices);
+        self.backup.set_busy(self.inspect.running_job());
+        self.backup.tick();
         let commander = self.commander.borrow().as_ref().map(|(c, _)| c.clone());
         if let Some(c) = commander {
             c.tick();

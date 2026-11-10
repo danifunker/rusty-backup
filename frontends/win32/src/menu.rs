@@ -99,3 +99,35 @@ pub fn track(owner: HWND, items: Vec<MenuItem>, x: i32, y: i32) -> Option<A> {
         (i > 0).then(|| actions.swap_remove(i - 1))
     }
 }
+
+/// A popup menu of plain `entries` (label, enabled; an empty label is a separator) at `(x, y)`:
+/// the index picked, if any.
+pub fn choose(owner: HWND, entries: &[(String, bool)], x: i32, y: i32) -> Option<usize> {
+    // SAFETY: a menu we create, track and destroy here; each label outlives its append.
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for (i, (label, enabled)) in entries.iter().enumerate() {
+            if label.is_empty() {
+                let _ = AppendMenuW(
+                    menu,
+                    windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR,
+                    0,
+                    PCWSTR::null(),
+                );
+                continue;
+            }
+            let flags = if *enabled {
+                MF_STRING
+            } else {
+                MF_STRING | MF_GRAYED
+            };
+            let t = ui::wide(&ui::plain(label));
+            let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(t.as_ptr()));
+        }
+        let picked = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, None, owner, None);
+        let _ = DestroyMenu(menu);
+        usize::try_from(picked.0)
+            .ok()
+            .and_then(|i| i.checked_sub(1))
+    }
+}

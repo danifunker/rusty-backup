@@ -223,7 +223,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 
 | File | Flows | Shells | Checks |
 |---|---|---|---|
-| `backup.toml` | a FAT image to zstd from the Backup screen | tui, gtk | restore + byte-compare |
+| `backup.toml` | a FAT image to zstd from the Backup screen | tui, gtk, win32 | restore + byte-compare |
 | `restore.toml` | a backup folder to a new image file | tui, gtk | byte-compare |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, xfail) | tui, gtk, win32 | byte-compare |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck; UFS inject is R-089, xfail |
