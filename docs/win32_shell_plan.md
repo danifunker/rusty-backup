@@ -267,6 +267,8 @@ in check-group mode with the bundled icons); the screens and slices below are un
    i686 link, which needs NASM here for aws-lc. The i686 type-check found ten
    `Get/SetWindowLongPtrW` calls that assumed a 64-bit `isize` (it is `i32` there); they cast now.
    57 win32 flows pass, 2 known xfail, after the change.
+   `flow.audio.cdda-play` runs on win32 too (the player plays to the default output device), so
+   every tier 8 flow with a GUI player now has a win32 run: 58 pass, 2 known xfail.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
