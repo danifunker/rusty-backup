@@ -162,6 +162,11 @@ def find(label, wait=20.0, pred=None, nth=0):
 
 
 def shows(text):
+    """True when any of the ` || `-separated alternatives is showing."""
+    return any(shows_one(w) for w in text.split(" || "))
+
+
+def shows_one(text):
     for n in nodes(APP):
         if not showing(n):
             continue

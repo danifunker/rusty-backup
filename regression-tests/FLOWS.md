@@ -126,7 +126,7 @@ Each op sets exactly one action.
 | `fill = "text"` | clear the focused field and type | 512 Backspaces, then the text | sets the entry's text; a `pick` field goes through its dialog |
 | `key = "Enter"` / `keys = [..]` | named keys: `Enter Tab Esc Up Down Left Right F1..F12 Ctrl+K` or one character | key bytes | xdotool; Enter on a focused button presses it |
 | `type = "text"` | type text | bytes | xdotool |
-| `wait = "text or id"` | wait up to `timeout_ms` (default 30 s) | polls the screen | polls node names, descriptions and entry text |
+| `wait = "text or id"` | wait up to `timeout_ms` (default 30 s); `"A \|\| B"` waits for either (an outcome that differs by host, such as an elevated CI runner) | polls the screen | polls node names, descriptions and entry text |
 | `wait_gone = "text or id"` | wait until it is no longer shown (a staged count clearing) | polls the screen | likewise |
 | `wait_file = "path"` | wait until the file exists and its size holds for half a second | the runner, the same for every shell | likewise |
 | `expect` / `expect_not` | the screen shows / does not show it now | after a short settle | likewise |

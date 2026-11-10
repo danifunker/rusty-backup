@@ -54,7 +54,7 @@ files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
 
 [[case]]
 id = "flow.network.backup-remote-connect"
-description = "Connect to an rb-cli serve daemon from Backup's Remote Drive window and see its drive list (a daemon without elevation lists none)"
+description = "Connect to an rb-cli serve daemon from Backup's Remote Drive window and see its drive list (none from an unelevated daemon, the host's from an elevated one)"
 level = "smoke"
 area = ["network", "backup"]
 shells = ["win32"]
@@ -73,9 +73,10 @@ ui = [
   { focus = "backup.remote_address" },
   { fill = "127.0.0.1:{port}" },
   { activate = "backup.remote_connect" },
-  { wait = "No physical drives reported", timeout_ms = 30000 },
+  # An unelevated daemon lists no drives; CI's elevated runner lists its own.
+  { wait = "No physical drives reported || Pick a drive to back up", timeout_ms = 30000 },
   { activate = "backup.remote_close" },
-  { wait_gone = "No physical drives reported" },
+  { wait_gone = "No physical drives reported || Pick a drive to back up" },
 ]
 
 [[case]]

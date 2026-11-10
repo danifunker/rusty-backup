@@ -181,8 +181,10 @@ def visible_text():
 
 
 def shows(text):
+    """True when any of the ` || `-separated alternatives is showing."""
+    wants = text.split(" || ")
     for e in elements():
-        if showing(e) and (text in name_of(e) or text in value_of(e)):
+        if showing(e) and any(w in name_of(e) or w in value_of(e) for w in wants):
             return True
     return False
 

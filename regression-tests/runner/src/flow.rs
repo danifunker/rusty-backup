@@ -588,29 +588,34 @@ impl UiSession {
             fill_field(s, &resolve(t))?;
         } else if op.wait.is_some() {
             let w = label.clone();
-            if !s.wait_for(limit, |sc| sc.text().contains(w.as_str())) {
+            if !s.wait_for(limit, |sc| shows(&sc.text(), &w)) {
                 return Err((format!("screen shows '{}'", w), screen(s)));
             }
         } else if op.wait_gone.is_some() {
             let w = label.clone();
-            if !s.wait_for(limit, |sc| !sc.text().contains(w.as_str())) {
+            if !s.wait_for(limit, |sc| !shows(&sc.text(), &w)) {
                 return Err((format!("screen without '{}'", w), screen(s)));
             }
         } else if op.expect.is_some() {
             let e = label.clone();
             s.settle(Duration::from_millis(200), Duration::from_secs(5));
-            if !s.text().contains(e.as_str()) {
+            if !shows(&s.text(), &e) {
                 return Err((format!("screen shows '{}'", e), screen(s)));
             }
         } else if op.expect_not.is_some() {
             let e = label.clone();
             s.settle(Duration::from_millis(200), Duration::from_secs(5));
-            if s.text().contains(e.as_str()) {
+            if shows(&s.text(), &e) {
                 return Err((format!("screen without '{}'", e), screen(s)));
             }
         }
         Ok(())
     }
+}
+
+/// Whether the screen holds the text, or any of its ` || `-separated alternatives.
+fn shows(screen: &str, want: &str) -> bool {
+    want.split(" || ").any(|w| screen.contains(w))
 }
 
 /// Wait until `path` exists and its size holds for half a second.
