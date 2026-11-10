@@ -109,6 +109,10 @@ def activate(e):
             call(p)
             time.sleep(0.2)
             return
+    # A one-button toolbar (Win32's Commander) carries the id; its button takes the action.
+    kids = e.FindAll(U.TreeScope_Children, UIA.CreateTrueCondition())
+    if kids and kids.Length == 1:
+        return activate(kids.GetElement(0))
     raise Fail(f"{name_of(e)!r} to take an action", visible_text())
 
 
@@ -225,6 +229,11 @@ def run(op):
         time.sleep(0.2)
     elif kind == "focus":
         CURRENT = find(ident, arg, nth=op.get("nth", 0))
+        # A list row takes the cursor by selection, as a click gives it; focus alone moves nothing.
+        item = pattern(CURRENT, U.UIA_SelectionItemPatternId, U.IUIAutomationSelectionItemPattern)
+        if item:
+            item.Select()
+            time.sleep(0.2)
         try:
             CURRENT.SetFocus()
         except comtypes.COMError:

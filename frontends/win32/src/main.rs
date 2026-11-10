@@ -16,6 +16,8 @@ mod browse_bars;
 #[cfg(windows)]
 mod chd;
 #[cfg(windows)]
+mod commander;
+#[cfg(windows)]
 mod darkdraw;
 #[cfg(windows)]
 mod editor;

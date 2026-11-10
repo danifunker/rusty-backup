@@ -24,11 +24,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BM_SETCHECK, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE,
     ES_READONLY, HMENU, IDC_ARROW, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_STYLE,
     WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NOTIFY,
-    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_NOTIFY, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VSCROLL,
 };
 
+use crate::commander::CommanderScreen;
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
@@ -73,6 +74,10 @@ pub struct App {
     /// The Inspect tab's browse view, shown in its page's place while it is open.
     browse_page: HWND,
     inspect: Rc<InspectScreen>,
+    /// Commander, while it is open, on its own page over the whole window.
+    commander: RefCell<Option<(Rc<CommanderScreen>, HWND)>>,
+    /// What was showing when Commander opened, put back when it closes.
+    covered: RefCell<Vec<(HWND, bool)>>,
     log_shown: Cell<usize>,
     sync: SyncGuard,
 }
@@ -145,6 +150,8 @@ pub fn start() {
     };
     wake.set_window(window);
     crate::theme::title_bar(window);
+    // SAFETY: our own window takes files dropped from Explorer.
+    unsafe { windows::Win32::UI::Shell::DragAcceptFiles(window, true) };
     let app = App::build(window, wake);
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     app.relayout();
@@ -174,6 +181,13 @@ pub fn append_log(lines: Vec<(LogLevel, String)>) {
         app.ctrl.borrow_mut().log.extend_lines(lines);
         let auto = app.ctrl.borrow().log_auto_scroll();
         app.sync_log(auto);
+    }
+}
+
+/// Commander's controller left its screen: close it once the action in hand is done.
+fn close_commander() {
+    if let Some(app) = app() {
+        app.close_commander();
     }
 }
 
@@ -211,8 +225,8 @@ impl App {
                 false,
             ),
         );
-        // Commander arrives in slice 3 and Settings in 7b; until then their buttons are shown but off.
-        toolbar::enable(commander, COMMANDER_CMD, false);
+        // Settings arrives in slice 7b; until then its button is shown but off.
+        let _ = commander;
         add(
             Part::CloseBackup,
             ui::button(window, "Close Backup", ids::CLOSE_BACKUP),
@@ -330,6 +344,8 @@ impl App {
             pages,
             browse_page,
             inspect,
+            commander: RefCell::default(),
+            covered: RefCell::default(),
             log_shown: Cell::new(0),
             sync: SyncGuard::default(),
         })
@@ -363,6 +379,10 @@ impl App {
         let devices = self.ctrl.borrow().devices().to_vec();
         self.inspect.set_devices(&devices);
         self.inspect.tick();
+        let commander = self.commander.borrow().as_ref().map(|(c, _)| c.clone());
+        if let Some(c) = commander {
+            c.tick();
+        }
         if self.inspect.take_backup_closed() {
             self.ctrl.borrow_mut().close_shared_backup();
         }
@@ -373,8 +393,78 @@ impl App {
         self.refresh();
     }
 
+    /// Open Commander over the whole window; the app's own controls hide until it closes.
+    fn open_commander(&self) {
+        if self.commander.borrow().is_some() {
+            return;
+        }
+        let mut covered: Vec<(HWND, bool)> = self
+            .parts
+            .iter()
+            .map(|(_, h)| (*h, ui_visible(*h)))
+            .collect();
+        covered.extend(self.pages.iter().map(|(_, h)| (*h, ui_visible(*h))));
+        covered.push((self.browse_page, ui_visible(self.browse_page)));
+        for (h, _) in &covered {
+            ui::set_visible(*h, false);
+        }
+        *self.covered.borrow_mut() = covered;
+        let page = crate::panel::page(self.window);
+        let notify = self.ctrl.borrow().notify();
+        let jobs = rusty_backup::controller::commander::JobRegistry::new();
+        let on_close: Rc<dyn Fn()> = Rc::new(close_commander);
+        let screen = CommanderScreen::build(page, &jobs, &notify, self.host.clone(), on_close);
+        *self.commander.borrow_mut() = Some((screen, page));
+        self.relayout();
+        ui::set_visible(page, true);
+    }
+
+    fn close_commander(&self) {
+        let Some((_, page)) = self.commander.borrow_mut().take() else {
+            return;
+        };
+        crate::panel::unregister(page);
+        ui::set_visible(page, false);
+        // The page goes once the action in hand is done; Commander may still be on the stack.
+        // SAFETY: posting to our own page, which no longer has a handler.
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(page),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        for (h, on) in self.covered.borrow_mut().drain(..) {
+            ui::set_visible(h, on);
+        }
+        self.refresh();
+        self.relayout();
+    }
+
+    /// Files dropped from Explorer: Commander opens the first, a browse view in Edit Mode stages them.
+    fn dropped(&self, paths: Vec<std::path::PathBuf>) {
+        let commander = self.commander.borrow().as_ref().map(|(c, _)| c.clone());
+        match commander {
+            Some(c) => {
+                if let Some(path) = paths.into_iter().next() {
+                    c.drop_path(path);
+                }
+            }
+            None => {
+                if !self.inspect.drop_paths(paths) {
+                    let line = "Drop files on Commander, or on a browsed volume in Edit Mode.";
+                    append_log(vec![(LogLevel::Info, line.into())]);
+                }
+            }
+        }
+    }
+
     /// Read the controller first and release it, then set controls inside the guard.
     fn refresh(&self) {
+        if self.commander.borrow().is_some() {
+            return;
+        }
         let (tab, shared, banner, auto) = {
             let c = self.ctrl.borrow();
             (
@@ -471,6 +561,16 @@ impl App {
             let _ = GetClientRect(self.window, &mut rc);
             GetDpiForWindow(self.window).max(96)
         };
+        if let Some((_, page)) = &*self.commander.borrow() {
+            let all = Rect {
+                x: 0,
+                y: 0,
+                w: rc.right,
+                h: rc.bottom,
+            };
+            ui::move_to(*page, all);
+            return;
+        }
         let banner = ui_visible(self.part(Part::BannerText));
         let p = |x: Part| self.part(x);
         let bar = toolbar::height(p(Part::Screens), dpi);
@@ -589,12 +689,8 @@ impl App {
                 let on = unsafe { SendMessageW(from, BM_GETCHECK, None, None).0 } == 1;
                 self.apply(AppAction::SetLogAutoScroll(on));
             }
-            Part::Commander
-            | Part::Settings
-            | Part::BannerText
-            | Part::Screens
-            | Part::Status
-            | Part::Log => {}
+            Part::Commander => self.open_commander(),
+            Part::Settings | Part::BannerText | Part::Screens | Part::Status | Part::Log => {}
         }
     }
 
@@ -626,6 +722,9 @@ impl App {
         toolbar::set_icons(self.part(Part::Screens), names, dpi);
         toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
         self.inspect.theme_changed();
+        if let Some((c, _)) = &*self.commander.borrow() {
+            c.set_icons();
+        }
         true
     }
 
@@ -648,6 +747,9 @@ impl App {
         toolbar::set_icons(self.part(Part::Screens), names, dpi);
         toolbar::set_icons(self.part(Part::Commander), ["commander"].into_iter(), dpi);
         self.inspect.theme_changed();
+        if let Some((c, _)) = &*self.commander.borrow() {
+            c.set_icons();
+        }
         self.relayout();
     }
 }
@@ -720,8 +822,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             info.ptMinTrackSize.y = layout::scale(460, dpi);
         }
         WM_CLOSE => {
+            let commander = app.commander.borrow().as_ref().map(|(c, _)| c.clone());
+            if let Some(c) = commander.filter(|c| c.has_staged_edits()) {
+                c.hold_quit();
+                return LRESULT(0);
+            }
             // SAFETY: closing our own window.
             let _ = unsafe { DestroyWindow(hwnd) };
+        }
+        WM_DROPFILES => {
+            let drop = windows::Win32::UI::Shell::HDROP(wp.0 as _);
+            let mut paths = Vec::new();
+            // SAFETY: the drop handle Windows gave us, read and released here.
+            unsafe {
+                let n = windows::Win32::UI::Shell::DragQueryFileW(drop, u32::MAX, None);
+                for i in 0..n {
+                    let len = windows::Win32::UI::Shell::DragQueryFileW(drop, i, None) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    windows::Win32::UI::Shell::DragQueryFileW(drop, i, Some(&mut buf));
+                    paths.push(std::path::PathBuf::from(String::from_utf16_lossy(
+                        &buf[..len],
+                    )));
+                }
+                windows::Win32::UI::Shell::DragFinish(drop);
+            }
+            app.dropped(paths);
         }
         WM_DESTROY => {
             APP.with(|a| a.borrow_mut().take());

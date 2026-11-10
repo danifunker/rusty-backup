@@ -307,6 +307,15 @@ impl BrowseView {
         }
     }
 
+    /// Files dropped from Explorer: staged into the open volume while editing.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>) -> bool {
+        if !self.active.get() || !self.ctrl.borrow().edit_mode() {
+            return false;
+        }
+        self.apply(A::Pane(Side::Left, P::AddPicked(paths)));
+        true
+    }
+
     pub fn has_unsaved_edits(&self) -> bool {
         self.active.get() && self.ctrl.borrow().has_unsaved_edits()
     }
@@ -792,7 +801,7 @@ impl BrowseView {
             }
             PaneEvent::Sort(col) => self.apply(pane(P::SortBy(col))),
             PaneEvent::Menu(row) => self.row_menu(&row),
-            PaneEvent::Drag => {}
+            PaneEvent::Drag | PaneEvent::Focused => {}
         }
     }
 

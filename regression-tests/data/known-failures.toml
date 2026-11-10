@@ -83,11 +83,21 @@ finding = "R-089"
 note = "Commander's preflight says a fresh UFS1 volume has 0 B free"
 
 [[known]]
+id = "flow.files.inject.ufs.win32"
+finding = "R-089"
+note = "Commander's preflight says a fresh UFS1 volume has 0 B free"
+
+[[known]]
 id = "flow.commander.open-zip.tui"
 finding = "R-090"
 note = "Commander's open takes a zip for a disk image"
 
 [[known]]
 id = "flow.commander.open-zip.gtk"
+finding = "R-090"
+note = "Commander's open takes a zip for a disk image"
+
+[[known]]
+id = "flow.commander.open-zip.win32"
 finding = "R-090"
 note = "Commander's open takes a zip for a disk image"

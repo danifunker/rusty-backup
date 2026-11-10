@@ -4,6 +4,8 @@
 //!
 //! The view sends nothing itself: [`PaneView::notify`] says what the user did as a
 //! [`PaneEvent`], and the screen that owns it turns that into actions on its controller.
+//! A pane that marks with tick boxes (Inspect) shows its cursor as the list's selection; one
+//! that marks by clicking (Commander) shows its marks as the selection and its cursor as focus.
 
 use std::cell::{Cell, RefCell};
 
@@ -23,12 +25,12 @@ use windows::Win32::UI::Controls::{
     LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SUBITEMHITTEST, LVN_BEGINDRAG,
     LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVSICF_NOSCROLL, LVSIL_SMALL,
     LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW,
-    NMLVKEYDOWN, NMTREEVIEWW, NM_CLICK, NM_DBLCLK, NM_RCLICK, TVE_EXPAND, TVGN_CARET,
-    TVIF_CHILDREN, TVIF_IMAGE, TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND,
-    TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETIMAGELIST, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW,
-    TVSIL_NORMAL, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    LVS_SHOWSELALWAYS, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVDISPINFOW, NMLVKEYDOWN, NMTREEVIEWW,
+    NM_CLICK, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, TVE_EXPAND, TVGN_CARET, TVIF_CHILDREN, TVIF_IMAGE,
+    TVIF_PARAM, TVIF_SELECTEDIMAGE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW,
+    TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW,
+    TVM_SELECTITEM, TVM_SETIMAGELIST, TVN_ITEMEXPANDINGW, TVN_SELCHANGEDW, TVSIL_NORMAL,
+    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -79,6 +81,8 @@ pub enum PaneEvent {
     Menu(DisplayRow),
     /// A row was dragged off the list.
     Drag,
+    /// The list took the keyboard focus: its pane is the one keys act on.
+    Focused,
 }
 
 /// One listing row as the list view draws it.
@@ -101,6 +105,7 @@ pub struct PaneShown {
     folder_tree: bool,
     folder_cursor: usize,
     marked: Vec<bool>,
+    boxes: bool,
 }
 
 pub struct PaneView {
@@ -116,6 +121,10 @@ pub struct PaneView {
     folders: RefCell<Vec<(usize, String, bool)>>,
     folder_items: RefCell<Vec<isize>>,
     deferred: RefCell<Option<P>>,
+    /// The pane marks with tick boxes; until the first read, no.
+    boxes: Cell<bool>,
+    /// The marks and cursor last shown, so a refresh only touches what moved.
+    shown_marks: RefCell<(Vec<bool>, Option<usize>)>,
 }
 
 /// The controller's name for a key the list hands over; `None` for one it leaves to the list.
@@ -213,7 +222,7 @@ impl PaneView {
             WS_EX_CLIENTEDGE,
             tree_id,
         );
-        let style = LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
+        let style = LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | WS_TABSTOP.0;
         let list = ui::child(
             parent,
             w!("SysListView32"),
@@ -225,14 +234,7 @@ impl PaneView {
         // SAFETY: plain list-view setup; each column title outlives its insert.
         unsafe {
             let _ = SetWindowSubclass(list, Some(list_proc), 1, usize::from(tab_keys));
-            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES;
-            // A virtual list asks for its tick boxes' state, which is the controller's marks.
-            SendMessageW(
-                list,
-                LVM_SETCALLBACKMASK,
-                Some(WPARAM(LVIS_STATEIMAGEMASK.0 as usize)),
-                None,
-            );
+            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
             SendMessageW(
                 list,
                 LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -273,8 +275,15 @@ impl PaneView {
             folders: RefCell::default(),
             folder_items: RefCell::default(),
             deferred: RefCell::default(),
+            boxes: Cell::new(false),
+            shown_marks: RefCell::default(),
         };
         view.set_icons();
+        // Rsrc stays narrow until a listing has resource forks.
+        // SAFETY: a plain list-view message.
+        unsafe {
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, Some(WPARAM(2)), Some(LPARAM(0)));
+        }
         view
     }
 
@@ -320,11 +329,15 @@ impl PaneView {
             folder_tree: pane.listing_style() == ListingStyle::TreeAndList,
             folder_cursor: pane.tree_cursor(),
             marked,
+            boxes: pane.marks_with_boxes(),
         }
     }
 
     pub fn show(&self, s: PaneShown) {
         self.sync.run(|| {
+            if self.boxes.replace(s.boxes) != s.boxes {
+                self.set_boxes(s.boxes);
+            }
             ui::set_visible(self.tree, s.folder_tree);
             if let Some(folders) = s.folders {
                 self.show_folders(folders);
@@ -346,8 +359,13 @@ impl PaneView {
             if let Some(rows) = s.rows {
                 self.show_rows(rows, s.lines, s.rsrc);
             }
-            if let Some(i) = s.cursor {
-                self.select(i);
+            let moved = {
+                let held = self.shown_marks.borrow();
+                held.0 != s.marked || held.1 != s.cursor || s.boxes
+            };
+            if moved {
+                self.show_selection(&s.marked, s.cursor, s.boxes);
+                *self.shown_marks.borrow_mut() = (s.marked.clone(), s.cursor);
             }
             self.show_marks(s.marked);
         });
@@ -462,15 +480,35 @@ impl PaneView {
         }
     }
 
-    /// Select the cursor's row in the list, inside the sync guard so no click comes back.
-    fn select(&self, i: usize) {
-        let on = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    /// Turn the tick boxes on for a pane that marks with them, off for one that marks by clicking.
+    fn set_boxes(&self, on: bool) {
+        let ex = LVS_EX_CHECKBOXES;
+        // SAFETY: plain list-view messages.
+        unsafe {
+            SendMessageW(
+                self.list,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                Some(WPARAM(ex as usize)),
+                Some(LPARAM(if on { ex as isize } else { 0 })),
+            );
+            // A virtual list asks for its tick boxes' state, which is the controller's marks.
+            let mask = if on {
+                LVIS_STATEIMAGEMASK.0 as usize
+            } else {
+                0
+            };
+            SendMessageW(self.list, LVM_SETCALLBACKMASK, Some(WPARAM(mask)), None);
+        }
+    }
+
+    /// Set row `i`'s (or every row's, for `usize::MAX`) `flags` in `mask`.
+    fn set_state(&self, i: usize, mask: u32, flags: u32) {
         let item = LVITEMW {
-            stateMask: on,
-            state: on,
+            stateMask: LIST_VIEW_ITEM_STATE_FLAGS(mask),
+            state: LIST_VIEW_ITEM_STATE_FLAGS(flags),
             ..Default::default()
         };
-        // SAFETY: plain list-view messages with a local item.
+        // SAFETY: a plain list-view message with a local item.
         unsafe {
             SendMessageW(
                 self.list,
@@ -478,12 +516,32 @@ impl PaneView {
                 Some(WPARAM(i)),
                 Some(LPARAM(&item as *const _ as isize)),
             );
-            SendMessageW(
-                self.list,
-                LVM_ENSUREVISIBLE,
-                Some(WPARAM(i)),
-                Some(LPARAM(0)),
-            );
+        }
+    }
+
+    /// Show the cursor and the marks, inside the sync guard so no click comes back.
+    fn show_selection(&self, marked: &[bool], cursor: Option<usize>, boxes: bool) {
+        let (sel, focus) = (LVIS_SELECTED.0, LVIS_FOCUSED.0);
+        self.set_state(usize::MAX, sel | focus, 0);
+        if !boxes {
+            for (i, m) in marked.iter().enumerate() {
+                if *m {
+                    self.set_state(i, sel, sel);
+                }
+            }
+        }
+        if let Some(i) = cursor {
+            let flags = if boxes { sel | focus } else { focus };
+            self.set_state(i, sel | focus, flags);
+            // SAFETY: a plain list-view message.
+            unsafe {
+                SendMessageW(
+                    self.list,
+                    LVM_ENSUREVISIBLE,
+                    Some(WPARAM(i)),
+                    Some(LPARAM(0)),
+                );
+            }
         }
     }
 
@@ -621,12 +679,15 @@ impl PaneView {
                 if self.sync.active() || nm.uChanged.0 & LVIF_STATE.0 == 0 || !now || was {
                     return (done, None);
                 }
-                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
                 let m = mods();
+                if m.ctrl || m.shift {
+                    return (done, None);
+                }
+                let row = usize::try_from(nm.iItem).ok().and_then(|i| self.row_at(i));
                 let event = row.map(|row| PaneEvent::Click {
                     row,
-                    ctrl: m.ctrl,
-                    shift: m.shift,
+                    ctrl: false,
+                    shift: false,
                 });
                 (done, event)
             }
@@ -650,9 +711,15 @@ impl PaneView {
                 let on_icon = hit.flags.0 & LVHT_ONITEMICON.0 != 0 && hit.iSubItem == 0;
                 let on_box = hit.flags.0 & LVHT_ONITEMSTATEICON.0 != 0;
                 let row = usize::try_from(hit.iItem).ok().and_then(|i| self.row_at(i));
+                let m = mods();
                 let event = match row {
                     Some(row) if on_box => Some(PaneEvent::Mark(row.node_id)),
                     Some(row) if on_icon && row.expandable => Some(PaneEvent::Toggle(row.node_id)),
+                    Some(row) if m.ctrl || m.shift => Some(PaneEvent::Click {
+                        row,
+                        ctrl: m.ctrl,
+                        shift: m.shift,
+                    }),
                     _ => None,
                 };
                 (done, event)
@@ -679,6 +746,7 @@ impl PaneView {
                 (done, sort.map(PaneEvent::Sort))
             }
             LVN_BEGINDRAG => (done, Some(PaneEvent::Drag)),
+            NM_SETFOCUS => (None, Some(PaneEvent::Focused)),
             _ => (None, None),
         }
     }

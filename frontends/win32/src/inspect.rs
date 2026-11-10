@@ -408,6 +408,11 @@ impl InspectScreen {
         self.browse.set_icons();
     }
 
+    /// Files dropped from Explorer, staged into the browsed volume while it is in Edit Mode.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>) -> bool {
+        self.browse.drop_paths(paths)
+    }
+
     /// The browse view is open, in the screen's place.
     pub fn browsing(&self) -> bool {
         self.browse.is_active()

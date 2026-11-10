@@ -34,6 +34,8 @@ thread_local! {
     static DARK: Cell<bool> = const { Cell::new(false) };
     /// Labels drawn in a tone's colour rather than the text colour.
     static TONES: RefCell<Vec<(isize, Tone)>> = const { RefCell::new(Vec::new()) };
+    /// Labels drawn as links: a path's crumbs.
+    static LINKS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
     /// The brushes of the current mode: window, panel, field.
     static BRUSHES: RefCell<Option<[isize; 3]>> = const { RefCell::new(None) };
 }
@@ -358,7 +360,25 @@ pub fn set_tone(hwnd: HWND, tone: Option<Tone>) {
     });
 }
 
+/// Draw label `hwnd` in the link colour, or stop doing so when it goes.
+pub fn set_link(hwnd: HWND, on: bool) {
+    LINKS.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|h| *h != hwnd.0 as isize);
+        if on {
+            l.push(hwnd.0 as isize);
+        }
+    });
+}
+
 fn tone_color(hwnd: HWND) -> Option<COLORREF> {
+    if LINKS.with(|l| l.borrow().contains(&(hwnd.0 as isize))) {
+        return Some(if dark() {
+            rgb(0x6c, 0xb8, 0xff)
+        } else {
+            rgb(0x00, 0x5f, 0xb8)
+        });
+    }
     let tone = TONES.with(|t| {
         t.borrow()
             .iter()

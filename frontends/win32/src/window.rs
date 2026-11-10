@@ -10,7 +10,8 @@ use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
 use rusty_backup::controller::commander::{
-    field_action, submit, CommanderAction as A, FieldId, PaneWindow, Part, Press, Tone, WindowKind,
+    field_action, submit, CommanderAction as A, FieldId, PaneWindow, Part, Press, Side, Tone,
+    WindowKind,
 };
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -97,6 +98,7 @@ enum Built {
 pub struct ModelWindow {
     window: HWND,
     pub kind: WindowKind,
+    pub side: Option<Side>,
     pub key: String,
     built: Vec<Built>,
     heights: Vec<i32>,
@@ -499,6 +501,7 @@ impl ModelWindow {
         let me = Rc::new(ModelWindow {
             window,
             kind: w.kind,
+            side: w.side,
             key: w.key.clone(),
             built,
             heights,

@@ -22,7 +22,7 @@ use crate::controller::commander::{
 };
 use crate::controller::commander::{
     import_prompt, journal_txn_blocks, ArchiveSave, ArchiveViewer, ForkFormat, ImportChoice,
-    LineEnding, MacArchiveKind, TarChoice, TarPreview, TextShape,
+    LineEnding, MacArchiveKind, RenameNotice, TarChoice, TarPreview, TextShape,
 };
 
 /// How a line reads: a plain line, or one that warns, reports a failure or a success.
@@ -246,11 +246,15 @@ pub enum WindowKind {
     Password,
     Budget,
     Editor,
+    RenameNotice,
+    Partitions,
 }
 
 #[derive(Debug, Clone)]
 pub struct PaneWindow {
     pub kind: WindowKind,
+    /// The pane a window belongs to; `None` for the screen's own.
+    pub side: Option<Side>,
     /// Changes whenever the window's content does, so a view knows to build it again.
     pub key: String,
     pub title: String,
@@ -271,8 +275,15 @@ fn text(line: String) -> Part {
 }
 
 impl CommanderController {
-    /// The windows the browse view over `side` has open now; `debug` is the Check report's toggle.
+    /// Every window open now for a one-pane view over `side`: the pane's and the screen's.
     pub fn pane_windows(&self, side: Side, debug: bool) -> Vec<PaneWindow> {
+        let mut out = self.side_windows(side, debug);
+        out.extend(self.screen_windows());
+        out
+    }
+
+    /// The windows of the pane on `side`; in a two-pane screen their titles name the side.
+    pub fn side_windows(&self, side: Side, debug: bool) -> Vec<PaneWindow> {
         let pane = self.pane(side);
         let mut out = Vec::new();
         if let Some(p) = pane.apply_review() {
@@ -306,21 +317,42 @@ impl CommanderController {
         if let Some(f) = pane.metadata_form() {
             out.push(metadata_window(side, f));
         }
-        if pane.needs_password() && self.is_single() {
-            out.push(password_window(pane.volume().fs_type == "APFS"));
-        }
-        if let Some(form) = self.size_budget() {
-            out.push(budget_window(form));
-        }
         if let Some(r) = pane.tool_report() {
             let repairable = !self.has_archive_flow();
             out.push(tool_window(side, r, repairable, self.edit_mode(), debug));
+        }
+        let tag = match self.is_single() {
+            true => String::new(),
+            false => format!(" ({})", side.label()),
+        };
+        for w in &mut out {
+            w.side = Some(side);
+            w.title.push_str(&tag);
+        }
+        out
+    }
+
+    /// The windows of the screen itself, whichever pane asked for them.
+    pub fn screen_windows(&self) -> Vec<PaneWindow> {
+        let pane = self.pane(self.active());
+        let mut out = Vec::new();
+        if let Some(n) = self.rename_notice() {
+            out.push(rename_notice_window(n));
+        }
+        if let Some(side) = self.partitions_shown() {
+            let p = self.pane(side);
+            out.push(partitions_window(
+                side,
+                &p.partition_labels(),
+                p.selected_partition(),
+            ));
         }
         if self.unsaved_shown() {
             out.push(unsaved_window(pane.queue.len(), pane.staged_summary()));
         }
         if let Some(info) = self.chd_info() {
             out.push(PaneWindow {
+                side: None,
                 kind: WindowKind::ChdInfo,
                 key: info.to_string(),
                 title: "CHD Info".into(),
@@ -341,6 +373,7 @@ impl CommanderController {
                 ));
             }
             out.push(PaneWindow {
+                side: None,
                 kind: WindowKind::Skipped,
                 key: r.summary.clone(),
                 title: r.title.clone(),
@@ -361,17 +394,12 @@ impl CommanderController {
                 .map(|(label, chord)| format!("{label:width$}  {chord}"))
                 .collect();
             out.push(PaneWindow {
+                side: None,
                 kind: WindowKind::Help,
                 key: "help".into(),
                 title: "Keyboard shortcuts".into(),
                 size: (460, 480),
-                parts: vec![
-                    Part::Block(lines.join(
-                        "
-",
-                    )),
-                    text(self.key_help_footer()),
-                ],
+                parts: vec![Part::Block(lines.join("\n")), text(self.key_help_footer())],
                 buttons: Vec::new(),
                 dismiss: Some(vec![A::ShowHelp(false)]),
             });
@@ -379,35 +407,23 @@ impl CommanderController {
         if let Some(c) = self.checksums() {
             out.push(checksums_window(c));
         }
+        // A two-pane screen asks for a password inside the pane.
+        let left = self.pane(Side::Left);
+        if left.needs_password() && self.is_single() {
+            out.push(password_window(left.volume().fs_type == "APFS"));
+        }
+        if let Some(form) = self.size_budget() {
+            out.push(budget_window(form));
+        }
         if let Some(d) = self.detail() {
-            let p = d.side_panel(self.browse_caps());
-            let mut lines = vec![p.name.clone(), String::new()];
-            lines.extend(p.facts);
-            lines.extend(p.note);
-            lines.extend(p.budget);
-            if !d.xattrs.is_empty() {
-                lines.push(String::new());
-                lines.push("Extended attributes:".into());
-                lines.extend(
-                    d.xattrs
-                        .iter()
-                        .map(|x| format!("  {} = {}", x.name, x.value_display())),
-                );
-            }
-            let preview = p.preview.text();
-            if !preview.is_empty() {
-                lines.push(String::new());
-                lines.push(preview.to_string());
-            }
+            let text = d.info_text(self.browse_caps());
             out.push(PaneWindow {
+                side: None,
                 kind: WindowKind::FileInfo,
                 key: format!("{}{}", d.serial, d.loading),
                 title: format!("File Info: {}", d.entry.name),
                 size: (620, 560),
-                parts: vec![Part::Block(lines.join(
-                    "
-",
-                ))],
+                parts: vec![Part::Block(text)],
                 buttons: Vec::new(),
                 dismiss: Some(vec![A::CloseDetail]),
             });
@@ -423,10 +439,10 @@ fn log_window(lines: &[String]) -> PaneWindow {
             "No operations yet. Applied edits, host copies / exports, and immediate host              deletes / renames / new folders are recorded here."
                 .into(),
         ),
-        false => Part::Block(lines.join("
-")),
+        false => Part::Block(lines.join("\n")),
     });
     PaneWindow {
+        side: None,
         kind: WindowKind::Log,
         key: format!("{lines:?}"),
         title: "Session log".into(),
@@ -475,6 +491,7 @@ fn checksums_window(c: &Checksums) -> PaneWindow {
         });
     }
     PaneWindow {
+        side: None,
         kind: WindowKind::Checksums,
         key: format!(
             "{}{:?}{}{}",
@@ -551,6 +568,7 @@ fn review_window(side: Side, p: &ApplyPreflight) -> PaneWindow {
     };
     let cancel = vec![pane(side, P::DismissReview)];
     PaneWindow {
+        side: None,
         kind: WindowKind::Review,
         key: "review".into(),
         title: "Before applying".into(),
@@ -607,6 +625,7 @@ fn report_window(side: Side, r: &ApplyReport, still: usize) -> PaneWindow {
     }
     buttons.push(WindowButton::send("Close", close.clone()));
     PaneWindow {
+        side: None,
         kind: WindowKind::Report,
         key: format!("{}/{}/{still}/{}", r.applied, r.total, r.failed.len()),
         title: "Apply report".into(),
@@ -619,6 +638,7 @@ fn report_window(side: Side, r: &ApplyReport, still: usize) -> PaneWindow {
 
 fn edits_window(side: Side, lines: &[String], busy: bool) -> PaneWindow {
     PaneWindow {
+        side: None,
         kind: WindowKind::Edits,
         key: format!("{lines:?}{busy}"),
         title: "Pending edits".into(),
@@ -656,6 +676,7 @@ fn errors_window(side: Side, rows: &[(String, String)], fs: &str) -> PaneWindow 
         .collect();
     let ok = vec![pane(side, P::DismissStagingErrors)];
     PaneWindow {
+        side: None,
         kind: WindowKind::StagingErrors,
         key: format!("{rows:?}"),
         title: "Could not add some files".into(),
@@ -687,6 +708,7 @@ fn tool_window(
     let key = format!("{r:?}{repairable}{edit}{debug}");
     let Some(check) = &r.check else {
         return PaneWindow {
+            side: None,
             kind: WindowKind::Tool,
             key,
             title,
@@ -769,6 +791,7 @@ fn tool_window(
         });
     }
     PaneWindow {
+        side: None,
         kind: WindowKind::Tool,
         key,
         title,
@@ -784,6 +807,7 @@ fn unsaved_window(n: usize, lines: Vec<String>) -> PaneWindow {
     let mut parts = vec![text(format!("You have {n} unsaved edit(s)."))];
     parts.extend(lines.iter().map(|l| text(l.clone())));
     PaneWindow {
+        side: None,
         kind: WindowKind::Unsaved,
         key: format!("{n}{lines:?}"),
         title: "Unsaved Changes".into(),
@@ -800,6 +824,7 @@ fn unsaved_window(n: usize, lines: Vec<String>) -> PaneWindow {
 
 fn conflict_window(names: &[String]) -> PaneWindow {
     PaneWindow {
+        side: None,
         kind: WindowKind::Conflict,
         key: format!("{names:?}"),
         title: "Files already exist".into(),
@@ -833,6 +858,7 @@ pub fn tree_window(tree: &TreeText, plain: bool) -> PaneWindow {
     }
     parts.push(Part::Block(tree.text.clone()));
     PaneWindow {
+        side: None,
         kind: WindowKind::Tree,
         key: format!("{}{}", tree.ids, tree.text.len()),
         title: "Tree View".into(),
@@ -879,6 +905,7 @@ pub fn journal_window(detail: &JournalDetail) -> PaneWindow {
         },
     });
     PaneWindow {
+        side: None,
         kind: WindowKind::Journal,
         key: format!("{}", parts.len()),
         title: "HFS+ Journal".into(),
@@ -910,6 +937,7 @@ fn fork_select(side: Side, current: ForkFormat, viewer: bool, label: &str) -> Pa
 fn tar_window(side: Side, name: &str) -> PaneWindow {
     let choose = |c| vec![pane(side, P::ChooseTar(c))];
     PaneWindow {
+        side: None,
         kind: WindowKind::Tar,
         key: name.to_string(),
         title: "Tar archive".into(),
@@ -948,6 +976,7 @@ fn tar_preview_window(side: Side, p: &TarPreview, fs: &str) -> PaneWindow {
     )));
     let answer = |yes| vec![pane(side, P::ConfirmTarImport(yes))];
     PaneWindow {
+        side: None,
         kind: WindowKind::TarPreview,
         key: "preview".into(),
         title: "Import archive - some content can't be kept".into(),
@@ -974,6 +1003,7 @@ fn import_window(side: Side, name: &str, kind: MacArchiveKind) -> PaneWindow {
     buttons.push(WindowButton::send("Add as-is", choose(ImportChoice::AsIs)));
     buttons.push(WindowButton::send("Cancel", choose(ImportChoice::Cancel)));
     PaneWindow {
+        side: None,
         kind: WindowKind::Import,
         key: format!("{name}{}", kind.label()),
         title: prompt.title.into(),
@@ -987,6 +1017,7 @@ fn import_window(side: Side, name: &str, kind: MacArchiveKind) -> PaneWindow {
 fn archive_save_window(side: Side, p: &ArchiveSave) -> PaneWindow {
     let cancel = vec![pane(side, P::CancelSaveArchive)];
     PaneWindow {
+        side: None,
         kind: WindowKind::ArchiveSave,
         key: p.entry_name.clone(),
         title: "Save Mac archive".into(),
@@ -1047,6 +1078,7 @@ fn archive_viewer_window(side: Side, w: &ArchiveViewer) -> PaneWindow {
     let close = vec![pane(side, P::CloseArchive)];
     let marked = w.marked_files();
     PaneWindow {
+        side: None,
         kind: WindowKind::ArchiveViewer,
         key: w.entry_name.clone(),
         title: format!("Archive: {} ({})", w.entry_name, w.kind.label()),
@@ -1153,6 +1185,7 @@ fn metadata_window(side: Side, form: &MetadataForm) -> PaneWindow {
     }
     let cancel = vec![pane(side, P::CancelMetadata)];
     PaneWindow {
+        side: None,
         kind: WindowKind::Metadata,
         key: e.path.clone(),
         title: "Edit Metadata".into(),
@@ -1190,6 +1223,7 @@ fn password_window(apfs: bool) -> PaneWindow {
     });
     let close = vec![A::Mode(ModeAction::RequestClose)];
     PaneWindow {
+        side: None,
         kind: WindowKind::Password,
         key: apfs.to_string(),
         title: if apfs { "Passphrase" } else { "Password" }.into(),
@@ -1282,6 +1316,7 @@ fn budget_window(form: &BudgetForm) -> PaneWindow {
     }
     let cancel = budget(BudgetAction::Cancel);
     PaneWindow {
+        side: None,
         kind: WindowKind::Budget,
         key: format!("budget{}", form.over_capacity()),
         title: "SquashFS size budget".into(),
@@ -1336,6 +1371,7 @@ pub fn editor_window(doc: &TextDoc, error: Option<&str>) -> PaneWindow {
     });
     parts.push(Part::Text(error.unwrap_or("").to_string(), Tone::Error));
     PaneWindow {
+        side: None,
         kind: WindowKind::Editor,
         key: format!("{}/{}", doc.folder, doc.name),
         title: format!("Edit  {}", doc.name),
@@ -1355,5 +1391,60 @@ pub fn editor_window(doc: &TextDoc, error: Option<&str>) -> PaneWindow {
             WindowButton::send("Cancel", Vec::new()),
         ],
         dismiss: None,
+    }
+}
+
+fn rename_notice_window(notice: &RenameNotice) -> PaneWindow {
+    let mut parts = Vec::new();
+    for (head, lines) in [notice.renamed(), notice.dropped()].into_iter().flatten() {
+        parts.push(text(head));
+        parts.push(Part::List(lines));
+    }
+    parts.push(text(RenameNotice::TIP.to_string()));
+    PaneWindow {
+        side: None,
+        kind: WindowKind::RenameNotice,
+        key: format!("{notice:?}"),
+        title: notice.title(),
+        size: (520, 0),
+        parts,
+        buttons: vec![
+            WindowButton::send("OK", vec![A::RenameNoticeOk]),
+            WindowButton {
+                label: "Undo copy".into(),
+                press: Press::Send(vec![A::RenameNoticeUndo]),
+                enabled: true,
+                hint: Some("Remove this copy from the staged edits".into()),
+            },
+        ],
+        dismiss: Some(vec![A::RenameNoticeOk]),
+    }
+}
+
+fn partitions_window(side: Side, labels: &[String], selected: Option<usize>) -> PaneWindow {
+    let lines = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| match selected == Some(i) {
+            true => format!("{l}  (open)"),
+            false => l.clone(),
+        })
+        .collect();
+    PaneWindow {
+        side: None,
+        kind: WindowKind::Partitions,
+        key: format!("{side:?}{labels:?}{selected:?}"),
+        title: format!("Choose partition ({})", side.label()),
+        size: (420, 300),
+        parts: vec![Part::Items {
+            lines,
+            button: "Open".into(),
+            actions: (0..labels.len())
+                .map(|i| vec![pane(side, P::SelectPartition(i))])
+                .collect(),
+            enabled: true,
+        }],
+        buttons: Vec::new(),
+        dismiss: Some(vec![A::ShowPartitions(false)]),
     }
 }

@@ -9,8 +9,8 @@ use windows::Win32::UI::Controls::{
     ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, BTNS_BUTTON, BTNS_CHECK,
     BTNS_GROUP, CCS_NODIVIDER, CCS_NOPARENTALIGN, CCS_NORESIZE, HIMAGELIST, ILC_COLOR32, TBBUTTON,
     TBSTATE_ENABLED, TBSTYLE_FLAT, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_BUTTONSTRUCTSIZE,
-    TB_CHECKBUTTON, TB_ENABLEBUTTON, TB_GETBUTTONSIZE, TB_ISBUTTONCHECKED, TB_SETBUTTONWIDTH,
-    TB_SETIMAGELIST, TB_SETMAXTEXTROWS,
+    TB_CHECKBUTTON, TB_GETBUTTONSIZE, TB_ISBUTTONCHECKED, TB_SETBUTTONWIDTH, TB_SETIMAGELIST,
+    TB_SETMAXTEXTROWS,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -253,17 +253,5 @@ pub fn check(tb: HWND, cmd: i32) {
                 Some(LPARAM(1)),
             );
         }
-    }
-}
-
-pub fn enable(tb: HWND, cmd: i32, on: bool) {
-    // SAFETY: a plain toolbar message.
-    unsafe {
-        SendMessageW(
-            tb,
-            TB_ENABLEBUTTON,
-            Some(WPARAM(cmd as usize)),
-            Some(LPARAM(on as isize)),
-        );
     }
 }

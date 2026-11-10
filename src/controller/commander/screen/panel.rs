@@ -5,7 +5,10 @@
 //! view reads them here rather than writing them again.
 
 use super::windows::Tone;
-use super::{BrowseCaps, CommanderController, ExportFormat, FileDetail, Side, MAX_PREVIEW_SIZE};
+use super::{
+    BrowseCaps, CommanderController, ExportFormat, FileDetail, ResourceForkMode, Side,
+    MAX_PREVIEW_SIZE,
+};
 use crate::controller::commander::{
     detect_content_type, entry_facts, extract_applies, hex_dump, is_known_prodos_type,
     preview_bytes, FileContent, MIN_NESTED_IMAGE_BYTES, PRODOS_UNKNOWN_TYPE_NOTE,
@@ -75,6 +78,30 @@ pub struct PanelActions {
 }
 
 impl FileDetail {
+    /// File Info as one block of text: the facts, extended attributes and the preview.
+    pub fn info_text(&self, caps: BrowseCaps) -> String {
+        let p = self.side_panel(caps);
+        let mut lines = vec![p.name.clone(), String::new()];
+        lines.extend(p.facts);
+        lines.extend(p.note);
+        lines.extend(p.budget);
+        if !self.xattrs.is_empty() {
+            lines.push(String::new());
+            lines.push("Extended attributes:".into());
+            lines.extend(
+                self.xattrs
+                    .iter()
+                    .map(|x| format!("  {} = {}", x.name, x.value_display())),
+            );
+        }
+        let preview = p.preview.text();
+        if !preview.is_empty() {
+            lines.push(String::new());
+            lines.push(preview.to_string());
+        }
+        lines.join("\n")
+    }
+
     /// The side panel's text.
     pub fn side_panel(&self, caps: BrowseCaps) -> SidePanel {
         let entry = &self.entry;
@@ -358,6 +385,119 @@ impl CommanderController {
                 .iter()
                 .position(|f| *f == format)
                 .unwrap_or(0),
+        }
+    }
+}
+
+/// One Commander side's bars: its source, volume and path rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SideBars {
+    /// The source button's text, and the recent sources its menu lists.
+    pub source: String,
+    pub recent: Vec<String>,
+    /// A remote image is open: whether it can close (nothing staged).
+    pub close_image: Option<bool>,
+    pub can_close: bool,
+    /// The pane stages edits for Apply, and how many it holds.
+    pub stages: bool,
+    pub staged: usize,
+    pub apply_label: String,
+    pub edits_label: String,
+    pub apply_enabled: bool,
+    pub edits_open: bool,
+    pub loaded: bool,
+    /// The partitions of an image, the one open, and what to say when there are none.
+    pub parts: Vec<String>,
+    pub part: Option<usize>,
+    pub no_parts: &'static str,
+    pub new_folder: bool,
+    pub title: String,
+    pub free: Option<String>,
+    pub read_only: bool,
+    /// The path: a prefix, then crumbs; a crumb with a target goes there when clicked.
+    pub prefix: String,
+    pub crumbs: Vec<(String, Option<String>)>,
+    /// The source is locked: `Some(true)` for an APFS volume, which takes a passphrase.
+    pub locked: Option<bool>,
+    pub active: bool,
+}
+
+/// The column between Commander's panes: copy each way, delete, and the export settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyColumn {
+    pub copy_left: bool,
+    pub copy_right: bool,
+    pub copy_left_hint: String,
+    pub copy_right_hint: String,
+    pub delete: bool,
+    pub delete_hint: String,
+    pub keep_dates: bool,
+    /// Indexes into `ExportFormat::ALL` and `ResourceForkMode::ALL`.
+    pub format: usize,
+    pub fork: usize,
+    /// The fork mode applies: the export writes loose files.
+    pub loose: bool,
+}
+
+impl CommanderController {
+    pub fn side_bars(&self, side: Side) -> SideBars {
+        let pane = self.pane(side);
+        let v = pane.volume();
+        let host = pane.listing.is_host();
+        let loaded = pane.listing.is_loaded();
+        let staged = pane.queue.len();
+        SideBars {
+            source: pane.source_label(),
+            recent: pane.recent().to_vec(),
+            close_image: pane.is_remote_image().then(|| pane.queue.is_empty()),
+            can_close: pane.source_path().is_some() || loaded,
+            stages: pane.stages_edits(),
+            staged,
+            apply_label: format!("Apply ({staged})"),
+            edits_label: format!("Edits ({staged})"),
+            apply_enabled: staged > 0 && !pane.is_busy(),
+            edits_open: pane.edits_shown(),
+            loaded,
+            parts: match host {
+                true => Vec::new(),
+                false => pane.partition_labels(),
+            },
+            part: pane.selected_partition(),
+            no_parts: pane.no_partitions_label(),
+            new_folder: pane.can_new_folder(),
+            title: pane.volume_title(),
+            free: (!host).then(|| {
+                let free = v.total_size.saturating_sub(v.used_size);
+                format!("free: {}", format_size(free))
+            }),
+            read_only: !host && pane.is_read_only(),
+            prefix: pane.path_prefix(),
+            crumbs: pane.path_crumbs(),
+            locked: pane.needs_password().then(|| v.fs_type == "APFS"),
+            active: self.active() == side,
+        }
+    }
+
+    pub fn copy_column(&self) -> CopyColumn {
+        let format = self.export_format();
+        let mode = self.export_fork_mode();
+        CopyColumn {
+            copy_left: self.can_copy(Side::Left),
+            copy_right: self.can_copy(Side::Right),
+            copy_left_hint: self.copy_hint(Side::Right),
+            copy_right_hint: self.copy_hint(Side::Left),
+            delete: self.can_delete(),
+            delete_hint: self.delete_hint(),
+            keep_dates: self.keep_dates(),
+            format: ExportFormat::ALL
+                .iter()
+                .position(|f| *f == format)
+                .unwrap_or(0),
+            fork: ResourceForkMode::ALL
+                .iter()
+                .position(|m| *m == mode)
+                .unwrap_or(0),
+            loose: format == ExportFormat::LooseFiles,
         }
     }
 }

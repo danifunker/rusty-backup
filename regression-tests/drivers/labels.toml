@@ -13,7 +13,7 @@
 #
 # Every label entry is drift from the controllers' words (D8). The TUI keeps only its keys;
 # `[gtk]` empties once GTK reads the controller labels (a Linux session). Win32 finds
-# controls by AutomationId and needs no section.
+# controls by AutomationId; its section holds only behaviour drift and outcome words.
 
 [all]
 
@@ -79,3 +79,7 @@
 "expand_hfs.target_size" = "Target size (MiB):"
 "expand_hfs.save_as" = "Save As..."
 "expand_hfs.expand" = "Expand"
+
+[win32]
+"commander.left.apply" = { skip = true }
+"commander.staged" = "Apply (1)"

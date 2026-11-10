@@ -154,6 +154,42 @@ pub fn cell_label(parent: HWND, text: &str) -> HWND {
     )
 }
 
+/// A label that reports clicks (`SS_NOTIFY`), centred on its row: a path crumb.
+pub fn link_label(parent: HWND, text: &str) -> HWND {
+    // SS_NOTIFY (0x100) sends STN_CLICKED, which is BN_CLICKED's code; SS_CENTERIMAGE centres it.
+    child(
+        parent,
+        w!("STATIC"),
+        text,
+        WINDOW_STYLE(0x300),
+        WINDOW_EX_STYLE(0),
+        "",
+    )
+}
+
+/// How wide `hwnd`'s text is in its own font, in DIPs.
+pub fn text_dips(hwnd: HWND) -> i32 {
+    let w = wide(&text(hwnd));
+    let n = w.len().saturating_sub(1);
+    // SAFETY: a screen DC borrowed for one measurement and released; the font is the control's.
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let dc = windows::Win32::Graphics::Gdi::GetDC(Some(hwnd));
+        let font = SendMessageW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WM_GETFONT,
+            None,
+            None,
+        );
+        let old = windows::Win32::Graphics::Gdi::SelectObject(dc, HGDIOBJ(font.0 as _));
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(dc, &w[..n], &mut size);
+        windows::Win32::Graphics::Gdi::SelectObject(dc, old);
+        windows::Win32::Graphics::Gdi::ReleaseDC(Some(hwnd), dc);
+        (size.cx * 96 + dpi - 1) / dpi
+    }
+}
+
 pub fn edit(parent: HWND, id: &str) -> HWND {
     child(
         parent,
