@@ -4840,7 +4840,7 @@ checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
 
 [[package]]
 name = "part-tables"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "byteorder",
  "crc32fast",

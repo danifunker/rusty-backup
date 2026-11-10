@@ -15,8 +15,10 @@
 //! covering sector 0 to `d_secperunit`) is an alias, not a volume, and is
 //! excluded from the browsable list the same way the Sun label's slot 2 is.
 //!
-//! Read + browse + whole-disk backup only. Editing and resizing on restore are
-//! not implemented yet (see `docs/stubs.md`).
+//! Read + browse + whole-disk backup; [`BsdLabelSpec`] writes a fresh label (FreeBSD/Alpha's
+//! little-endian one at byte 64 of sector 0, see `docs/bsd_alpha_disks.md`), with the
+//! Alpha SRM boot-sector checksum and boot-block descriptor. Editing an existing label and
+//! resizing on restore are not implemented yet (see `docs/stubs.md`).
 
 #[cfg(feature = "rust173-polyfill")]
 use disk_core::rust173::IntIsMultipleOf as _;
@@ -201,10 +203,187 @@ impl BsdDiskLabel {
     }
 }
 
+/// `p_fstype` of a 4.2BSD fast filesystem.
+pub const FS_BSDFFS: u8 = 7;
+/// `p_fstype` of a swap partition.
+pub const FS_SWAP: u8 = 1;
+/// `d_type` of a SCSI disk (`DTYPE_SCSI`).
+const DTYPE_SCSI: u16 = 4;
+/// Where FreeBSD/Alpha keeps its label: `LABELSECTOR 0`, `LABELOFFSET 64`.
+pub const ALPHA_LABEL_OFFSET: usize = 64;
+/// The Alpha SRM boot-block descriptor: block count, start LBA, flags (one quadword each).
+const SRM_DESCRIPTOR: usize = 480;
+/// The Alpha SRM boot-sector checksum: the sum of the 63 quadwords ahead of it.
+const SRM_CHECKSUM: usize = 504;
+
+/// One slot of a label to write, its sizes in sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BsdSlotSpec {
+    pub size: u32,
+    pub offset: u32,
+    pub fstype: u8,
+    /// `p_fsize`, `p_frag` and `p_cpg`; zero where the slot holds no FFS.
+    pub fsize: u32,
+    pub frag: u8,
+    pub cpg: u16,
+}
+
+/// A little-endian 4.4BSD label to write, as FreeBSD/Alpha's `disklabel` lays it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BsdLabelSpec {
+    pub sectors_per_unit: u32,
+    pub sectors_per_track: u32,
+    pub tracks_per_cylinder: u32,
+    /// Slots `a` upward; `c` is the whole-disk alias the caller fills in.
+    pub slots: [BsdSlotSpec; 8],
+}
+
+impl BsdLabelSpec {
+    /// The label's bytes, `d_checksum` set so the label XORs to zero.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let npart = self.slots.len();
+        let mut b = vec![0u8; HEADER_LEN + npart * PART_LEN];
+        let put16 =
+            |b: &mut Vec<u8>, o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let spc = self.sectors_per_track * self.tracks_per_cylinder;
+        put32(&mut b, 0, BSD_DISKMAGIC);
+        put16(&mut b, 4, DTYPE_SCSI);
+        b[8..11].copy_from_slice(b"da0");
+        put32(&mut b, 40, 512);
+        put32(&mut b, 44, self.sectors_per_track);
+        put32(&mut b, 48, self.tracks_per_cylinder);
+        put32(&mut b, 52, self.sectors_per_unit / spc.max(1));
+        put32(&mut b, 56, spc);
+        put32(&mut b, 60, self.sectors_per_unit);
+        put16(&mut b, 72, 3600);
+        put16(&mut b, 74, 1);
+        put32(&mut b, 132, BSD_DISKMAGIC);
+        put16(&mut b, 138, npart as u16);
+        put32(&mut b, 140, 8192);
+        put32(&mut b, 144, 8192);
+        for (i, s) in self.slots.iter().enumerate() {
+            let p = HEADER_LEN + i * PART_LEN;
+            put32(&mut b, p, s.size);
+            put32(&mut b, p + 4, s.offset);
+            put32(&mut b, p + 8, s.fsize);
+            b[p + 12] = s.fstype;
+            b[p + 13] = s.frag;
+            put16(&mut b, p + 14, s.cpg);
+        }
+        let ck = (0..b.len())
+            .step_by(2)
+            .fold(0u16, |x, o| x ^ u16::from_le_bytes([b[o], b[o + 1]]));
+        put16(&mut b, 136, ck);
+        b
+    }
+
+    /// Sector 0 of a FreeBSD/Alpha disk: zeros, this label at byte 64, the SRM checksum.
+    pub fn alpha_sector0(&self) -> [u8; 512] {
+        let mut sector = [0u8; 512];
+        let label = self.to_bytes();
+        sector[ALPHA_LABEL_OFFSET..ALPHA_LABEL_OFFSET + label.len()].copy_from_slice(&label);
+        set_alpha_srm_checksum(&mut sector);
+        sector
+    }
+}
+
+/// The Alpha SRM console's boot-sector checksum: the sum of the first 63 quadwords.
+pub fn alpha_srm_checksum(sector: &[u8; 512]) -> u64 {
+    (0..SRM_CHECKSUM)
+        .step_by(8)
+        .map(|o| {
+            let mut q = [0u8; 8];
+            q.copy_from_slice(&sector[o..o + 8]);
+            u64::from_le_bytes(q)
+        })
+        .fold(0u64, u64::wrapping_add)
+}
+
+/// Store the SRM checksum at byte 504; anything that changes sector 0 calls this after.
+pub fn set_alpha_srm_checksum(sector: &mut [u8; 512]) {
+    let sum = alpha_srm_checksum(sector);
+    sector[SRM_CHECKSUM..SRM_CHECKSUM + 8].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// Point the SRM console at `blocks` sectors of boot code from `start`, as `disklabel -B` does.
+pub fn set_alpha_boot_descriptor(sector: &mut [u8; 512], blocks: u64, start: u64) {
+    for (i, v) in [blocks, start, 0].iter().enumerate() {
+        let o = SRM_DESCRIPTOR + i * 8;
+        sector[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    set_alpha_srm_checksum(sector);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The label FreeBSD 4.6's sysinstall wrote on a 2 GiB disk (a/b/e/f/g), as read off it.
+    fn freebsd46_spec() -> BsdLabelSpec {
+        let ffs = |size, offset, cpg| BsdSlotSpec {
+            size,
+            offset,
+            fstype: FS_BSDFFS,
+            fsize: 2048,
+            frag: 8,
+            cpg,
+        };
+        let mut slots = [BsdSlotSpec::default(); 8];
+        slots[0] = ffs(262_144, 0, 94);
+        slots[1] = BsdSlotSpec {
+            size: 516_288,
+            offset: 262_144,
+            fstype: FS_SWAP,
+            ..Default::default()
+        };
+        slots[2] = BsdSlotSpec {
+            size: 4_194_304,
+            ..Default::default()
+        };
+        slots[4] = ffs(524_288, 778_432, 94);
+        slots[5] = ffs(524_288, 1_302_720, 94);
+        slots[6] = ffs(2_367_296, 1_827_008, 90);
+        BsdLabelSpec {
+            sectors_per_unit: 4_194_304,
+            sectors_per_track: 63,
+            tracks_per_cylinder: 255,
+            slots,
+        }
+    }
+
+    #[test]
+    fn alpha_writes_the_46_reference() {
+        let sector = freebsd46_spec().alpha_sector0();
+        assert_eq!(&sector[..64], &[0u8; 64]);
+        // Values read off the reference disk: 261 cylinders, checksum 0x4d28.
+        assert_eq!(&sector[64 + 52..64 + 56], &261u32.to_le_bytes());
+        assert_eq!(&sector[64 + 136..64 + 138], &0x4d28u16.to_le_bytes());
+        let stored = u64::from_le_bytes(sector[504..512].try_into().unwrap());
+        assert_eq!(stored, alpha_srm_checksum(&sector));
+        let mut disk = sector.to_vec();
+        disk.resize(4096, 0);
+        let label = BsdDiskLabel::detect(&mut Cursor::new(disk)).expect("label");
+        assert!(!label.big_endian);
+        assert_eq!(label.label_offset, 64);
+        let found: Vec<char> = label
+            .browsable_partitions()
+            .map(|(_, p)| p.letter)
+            .collect();
+        assert_eq!(found, ['a', 'b', 'e', 'f', 'g']);
+    }
+
+    #[test]
+    fn the_boot_descriptor_keeps_the_checksum() {
+        let mut sector = freebsd46_spec().alpha_sector0();
+        set_alpha_boot_descriptor(&mut sector, 15, 1);
+        assert_eq!(&sector[480..488], &15u64.to_le_bytes());
+        assert_eq!(&sector[488..496], &1u64.to_le_bytes());
+        let stored = u64::from_le_bytes(sector[504..512].try_into().unwrap());
+        assert_eq!(stored, alpha_srm_checksum(&sector));
+    }
 
     /// hp300-shaped disk: LIF header at 0, big-endian label at 1024, slots a (FFS), b (swap), c (raw).
     fn hp300_disk() -> Vec<u8> {
