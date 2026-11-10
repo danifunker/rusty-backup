@@ -1,0 +1,40 @@
+# Tier 8: the Convert tab, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.convert"
+description = "Convert an image on the Convert tab, then prove the output with rb-cli."
+
+[[case]]
+id = "flow.convert.iso-to-chd"
+description = "Convert the ISO fixture to a CD CHD on the Convert tab, then extract a file from the CHD and compare it with the same file from the ISO"
+level = "smoke"
+area = ["convert", "optical"]
+shells = ["win32"]
+fixture = "optical.iso9660.joliet.cd"
+capabilities = ["convert.disc", "optical.chd"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Convert" },
+  { pick = "{fixture}" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.disc.format" },
+  { choose = "CD CHD" },
+  { pick = "{scratch}/disc.chd" },
+  { activate = "convert.output" },
+  { wait = "disc.chd" },
+  { activate = "convert.start" },
+  { wait = "Converted 1 file", timeout_ms = 240000 },
+]
+
+[[case.step]]
+args = ["optical", "extract", "{scratch}/disc.chd", "--to", "{scratch}/chd"]
+expect_exit = 0
+
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/iso"]
+expect_exit = 0
+files_identical = [["{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT", "{scratch}/chd/CIV_II_GOLD_111_UPDATE.SIT"]]

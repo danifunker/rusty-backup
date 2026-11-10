@@ -222,6 +222,12 @@ in check-group mode with the bundled icons); the screens and slices below are un
    view's follow timer is keyed by its id, as a second view had taken the first one's timer.
    `flow.optical.*` and the new `flow.archives.sit-extract-all` pass. The player is not driven
    by a flow on win32: it would play out loud.
+   Slice 7c (Convert) done (2026-11-10): `convert.rs`, the source (an image or a folder,
+   with subfolders), the output, a format and extension per kind found, the CHD options of each
+   profile in use, the hard-disk size and floppy refit choices, the file list with tick boxes,
+   and Convert / Cancel behind the controller's Skip / Overwrite / Back. Inspect's and Optical's
+   Convert... open it. The tabs' one-disk-job lock is now a table in `app.rs`.
+   `flow.convert.iso-to-chd` passes.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

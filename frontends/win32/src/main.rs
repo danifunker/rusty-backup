@@ -30,6 +30,8 @@ mod combo;
 #[cfg(windows)]
 mod commander;
 #[cfg(windows)]
+mod convert;
+#[cfg(windows)]
 mod darkdraw;
 #[cfg(windows)]
 mod disk_write;

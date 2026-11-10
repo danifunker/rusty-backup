@@ -33,6 +33,7 @@ use crate::archives::ArchivesScreen;
 use crate::backup::BackupScreen;
 use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
+use crate::convert::ConvertScreen;
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Rect, Size};
@@ -84,6 +85,7 @@ pub struct App {
     build: Rc<BuildScreen>,
     optical: Rc<OpticalScreen>,
     archives: Rc<ArchivesScreen>,
+    convert: Rc<ConvertScreen>,
     /// The Optical tab's disc browser, in its page's place while open.
     disc_page: HWND,
     /// The player's timer runs while a track plays.
@@ -316,6 +318,7 @@ impl App {
         let mut build = None;
         let mut optical = None;
         let mut archives = None;
+        let mut convert = None;
         let disc_page = crate::panel::page(window);
         ui::set_visible(disc_page, false);
         let browse_page = crate::panel::page(window);
@@ -384,11 +387,9 @@ impl App {
                         page
                     }
                     AppTab::Convert => {
-                        let text = format!(
-                            "The {} screen arrives in a later slice of the Win32 shell.",
-                            t.label()
-                        );
-                        ui::label(window, &text)
+                        let page = crate::panel::page(window);
+                        convert = Some(ConvertScreen::build(page, ctrl.notify(), host.clone()));
+                        page
                     }
                 };
                 ui::set_visible(page, false);
@@ -401,6 +402,7 @@ impl App {
         let build = build.expect("the Build Disk page");
         let optical = optical.expect("the Optical page");
         let archives = archives.expect("the Archives page");
+        let convert = convert.expect("the Convert page");
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -416,6 +418,7 @@ impl App {
             build,
             optical,
             archives,
+            convert,
             disc_page,
             playing: Cell::new(false),
             commander: RefCell::default(),
@@ -486,31 +489,42 @@ impl App {
         if self.inspect.take_backup_closed() {
             self.ctrl.borrow_mut().close_shared_backup();
         }
-        let convert = [self.inspect.take_convert(), self.optical.take_convert()];
-        if convert.iter().any(Option::is_some) {
-            let line = "The Convert tab arrives in slice 7c of the Win32 shell.";
-            append_log(vec![(LogLevel::Warning, line.into())]);
+        self.convert.tick();
+        for path in [self.inspect.take_convert(), self.optical.take_convert()]
+            .into_iter()
+            .flatten()
+        {
+            self.apply(AppAction::SelectTab(AppTab::Convert));
+            self.convert.open(path);
         }
         self.refresh();
     }
 
     /// One disk job at a time: each tab hears who else runs.
     fn lock_tabs(&self) {
-        let inspect = self.inspect.running_job();
-        let backup = self.backup.is_running().then_some("Backup");
-        let restore = self.restore.is_running().then_some("Restore");
-        let build = self.build.is_running().then_some("Build Disk");
-        let optical = self.optical.is_running().then_some("Optical");
-        self.archives
-            .set_busy(inspect.or(backup).or(restore).or(build).or(optical));
-        self.backup
-            .set_busy(inspect.or(restore).or(build).or(optical));
-        self.restore
-            .set_busy(inspect.or(backup).or(build).or(optical));
-        self.build
-            .set_busy(inspect.or(backup).or(restore).or(optical));
-        self.optical
-            .set_busy(inspect.or(backup).or(restore).or(build));
+        let running = [
+            ("Inspect", self.inspect.running_job()),
+            ("Backup", self.backup.is_running().then_some("Backup")),
+            ("Restore", self.restore.is_running().then_some("Restore")),
+            (
+                "Build Disk",
+                self.build.is_running().then_some("Build Disk"),
+            ),
+            ("Optical", self.optical.is_running().then_some("Optical")),
+            ("Convert", self.convert.is_running().then_some("Convert")),
+        ];
+        let elsewhere = |me: &str| {
+            running
+                .iter()
+                .find(|(t, r)| *t != me && r.is_some())
+                .and_then(|(_, r)| *r)
+        };
+        self.backup.set_busy(elsewhere("Backup"));
+        self.restore.set_busy(elsewhere("Restore"));
+        self.build.set_busy(elsewhere("Build Disk"));
+        self.optical.set_busy(elsewhere("Optical"));
+        self.convert.set_busy(elsewhere("Convert"));
+        self.archives.set_busy(elsewhere("Archives"));
     }
 
     /// A playing track moves with no job to wake the shell, so a timer ticks while it plays.
