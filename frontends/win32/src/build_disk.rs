@@ -578,7 +578,7 @@ impl BuildScreen {
 
     fn show_review(&self, ctrl: &BuildDiskController, on: bool) {
         let lines = ctrl.review_lines().join("\r\n");
-        set_line(self.review, Some(lines.as_str()).filter(|_| on), None);
+        set_line(self.review, on.then_some(lines.as_str()), None);
         let warnings = ctrl.warnings();
         let tone = warnings
             .iter()

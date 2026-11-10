@@ -518,10 +518,8 @@ impl DiskWriteWindow {
                 Node::button(self.pick_image, 110),
             ]));
         }
-        for h in [self.image] {
-            if ui::shown(h) {
-                col.push(line(h, 1));
-            }
+        if ui::shown(self.image) {
+            col.push(line(self.image, 1));
         }
         if ui::shown(self.region.h) {
             col.push(Node::row(vec![

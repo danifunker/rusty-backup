@@ -499,16 +499,14 @@ impl SideView {
             let secret = ui::text(self.password);
             ui::set_text(self.password, "");
             pane(P::SubmitPassword(secret))
-        } else if let Some(target) = self
-            .crumbs
-            .borrow()
-            .iter()
-            .find(|(h, _)| *h == from)
-            .and_then(|(_, t)| t.clone())
-        {
-            pane(P::NavigateTo(target))
         } else {
-            return None;
+            let target = self
+                .crumbs
+                .borrow()
+                .iter()
+                .find(|(h, _)| *h == from)
+                .and_then(|(_, t)| t.clone())?;
+            pane(P::NavigateTo(target))
         };
         Some(vec![A::Focus(self.side), a])
     }

@@ -216,18 +216,14 @@ impl RowsStep {
         }
         match &view.layout {
             Ok(bar) => {
-                set_line(
-                    self.caption,
-                    Some(bar.caption.as_str()).filter(|_| on),
-                    None,
-                );
+                set_line(self.caption, on.then_some(bar.caption.as_str()), None);
                 set_line(self.error, None, None);
                 partition_bar::show(self.bar, bar.layout_segments(), None);
             }
             Err(e) => {
                 set_line(self.caption, None, None);
                 let tone = rusty_backup::controller::commander::Tone::Error;
-                set_line(self.error, Some(e.as_str()).filter(|_| on), Some(tone));
+                set_line(self.error, on.then_some(e.as_str()), Some(tone));
             }
         }
         ui::set_visible(self.bar, on && view.layout.is_ok());
