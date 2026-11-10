@@ -181,9 +181,12 @@ in check-group mode with the bundled icons); the screens and slices below are un
    `copy_column`, `side_windows` / `screen_windows` and the rename notice and partition
    windows. A tick-box pane (Inspect) shows its cursor as the list's selection, a click-marking
    one (Commander) its marks, with its cursor as focus. A row dragged onto the other pane
-   copies (a captured drag, as GTK tracks the pointer). A file dropped from Explorer opens in
-   the pane under the pointer, and one dropped between the panes asks which; on the browse
-   view in Edit Mode it is staged. `flow.commander.*` and `flow.files.*` run on win32: 42 pass,
+   copies (a captured drag, as GTK tracks the pointer). Files dropped from Explorer go to the
+   pane under the pointer (a drop between the panes asks which), and the controller's
+   `drop_plan` says what that pane does: an empty, host-folder or read-only pane opens the
+   first item; a writable volume takes them as a staged copy; only a single disk image on a
+   writable volume asks (copy it in, or open it here). On the browse view in Edit Mode they
+   are staged. `flow.commander.*` and `flow.files.*` run on win32: 42 pass,
    R-089 and R-090 xfail as on the other shells. Not done: Compare (not built on any shell).
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the

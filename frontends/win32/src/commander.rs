@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::commander::{
-    ids, BrowserPaneAction as P, CommanderAction as A, CommanderController, CopyColumn,
+    ids, BrowserPaneAction as P, CommanderAction as A, CommanderController, CopyColumn, DropPlan,
     ExportFormat, JobRegistry, PaneServices, PaneWindow, ResourceForkMode, Side, SideBars,
     FOLLOW_DELAY,
 };
@@ -784,39 +784,57 @@ impl CommanderScreen {
         self.ctrl.borrow().has_staged_edits()
     }
 
-    /// Files dropped from Explorer at screen point `at`: the first opens in the pane under it.
-    /// A drop between the panes asks which one it is for.
+    /// Files dropped from Explorer at screen point `at`, for the pane under it; a drop between
+    /// the panes asks which. What the pane then does is the controller's `drop_plan`.
     pub fn drop_paths(&self, paths: Vec<PathBuf>, at: POINT) {
-        let Some(path) = paths.first().cloned() else {
+        let Some(first) = paths.first() else {
             return;
         };
         let side = match self.side_at(at) {
             Some(side) => side,
             None => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                let more = match paths.len() {
-                    1 => String::new(),
-                    n => format!(
-                        " Only the first of the {n} dropped items opens; a pane shows one source."
+                let what = match paths.len() {
+                    1 => format!(
+                        "\"{}\"",
+                        first.file_name().map_or_else(
+                            || first.display().to_string(),
+                            |n| n.to_string_lossy().into_owned()
+                        )
                     ),
+                    n => format!("these {n} items"),
                 };
-                let message = format!("Which pane should open \"{name}\"?{more}");
-                let buttons = [
-                    "Open in left pane".to_string(),
-                    "Open in right pane".to_string(),
-                ];
-                match crate::effects::ask(self.owner(), "Open dropped item", &message, &buttons) {
+                let message = format!("Which pane should take {what}?");
+                let buttons = ["Left pane".to_string(), "Right pane".to_string()];
+                match crate::effects::ask(self.owner(), "Dropped files", &message, &buttons) {
                     Some(0) => Side::Left,
                     Some(1) => Side::Right,
                     _ => return,
                 }
             }
         };
-        self.apply(A::Focus(side));
-        self.apply(A::OpenDropped(path));
+        let plan = self.ctrl.borrow().drop_plan(side, &paths);
+        let actions = match plan {
+            None => return,
+            Some(DropPlan::Do(actions)) => actions,
+            Some(DropPlan::Ask {
+                title,
+                question,
+                choices,
+            }) => {
+                let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
+                let Some(i) = crate::effects::ask(self.owner(), &title, &question, &labels) else {
+                    return;
+                };
+                choices
+                    .into_iter()
+                    .nth(i)
+                    .map(|(_, a)| a)
+                    .unwrap_or_default()
+            }
+        };
+        for a in actions {
+            self.apply(a);
+        }
     }
 
     /// The side whose bars or listing hold screen point `at`.

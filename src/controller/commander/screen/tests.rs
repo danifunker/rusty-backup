@@ -945,3 +945,46 @@ fn a_live_field_sends_only_what_parses() {
     assert!(field_action(FieldId::BudgetHeadroom, "0").is_none());
     assert!(field_action(FieldId::Password, "x").is_none());
 }
+
+#[test]
+fn a_drop_opens_in_an_empty_pane_copies_into_a_volume_and_asks_only_for_an_image() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let text = std::path::PathBuf::from("C:/somewhere/NOTES.TXT");
+    let disk = std::path::PathBuf::from("C:/somewhere/game.hfv");
+    let opens = |plan: Option<DropPlan>, side: Side| match plan {
+        Some(DropPlan::Do(a)) => {
+            matches!(a.as_slice(), [A::Focus(s), A::OpenDropped(_)] if *s == side)
+        }
+        _ => false,
+    };
+    assert!(opens(
+        ctl.drop_plan(Side::Right, std::slice::from_ref(&disk)),
+        Side::Right
+    ));
+    match ctl.drop_plan(Side::Left, std::slice::from_ref(&text)) {
+        Some(DropPlan::Do(a)) => {
+            assert!(
+                matches!(a.as_slice(), [A::Focus(Side::Left), A::Pane(Side::Left, P::AddPicked(p))] if p == std::slice::from_ref(&text))
+            )
+        }
+        other => panic!("a plain file copies in: {other:?}"),
+    }
+    match ctl.drop_plan(Side::Left, std::slice::from_ref(&disk)) {
+        Some(DropPlan::Ask { choices, .. }) => {
+            assert_eq!(choices.len(), 2);
+            assert!(matches!(
+                choices[0].1.as_slice(),
+                [_, A::Pane(_, P::AddPicked(_))]
+            ));
+            assert!(matches!(choices[1].1.as_slice(), [_, A::OpenDropped(_)]));
+        }
+        other => panic!("an image on a volume asks: {other:?}"),
+    }
+    assert!(matches!(
+        ctl.drop_plan(Side::Left, &[disk, text]),
+        Some(DropPlan::Do(_))
+    ));
+    assert!(ctl.drop_plan(Side::Left, &[]).is_none());
+}
