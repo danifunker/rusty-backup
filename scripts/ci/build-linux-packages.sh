@@ -13,8 +13,8 @@ pkgver="${version//-/.}"
 bin="target/${target}/release"
 mkdir -p out
 
-cargo test --workspace --release --target "$target"
-cargo build --release --target "$target"
+cargo test --workspace --release --target "$target" --features gui
+cargo build --release --target "$target" --features gui
 
 # -o: cargo-deb only mirrors into target/<triple>/debian as a deprecated back-compat copy.
 cargo deb --target "$target" --no-build --deb-version "$pkgver" -o "out/${name}.deb"

@@ -230,17 +230,17 @@ jobs:
         if: matrix.arch == 'x86'
         env:
           RUST_TEST_THREADS: 1
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Test
         if: matrix.arch != 'x86'
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features gui
 
       # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
       # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
@@ -387,15 +387,15 @@ jobs:
       # exercises the same (little-endian, 64-bit) logic on real hardware.
       - name: Test
         if: ${{ matrix.arch == 'arm64' }}
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
         run: |
           # Build main app
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} --features gui
       
       - name: Import signing certificate
         if: ${{ env.HAS_SIGNING_CERT == 'true' }}
@@ -689,13 +689,13 @@ jobs:
       # Tests run upfront in the Arch build container (native target). Failure
       # fails the job and blocks the release.
       - name: Test
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features gui
 
       - name: Install debloated runtime packages
         run: |
@@ -1376,7 +1376,7 @@ jobs:
       # Default features (GUI + chd + optical + native-zstd/zlib + remote) — one
       # build produces both rusty-backup.exe and rb-cli.exe, like build-windows.
       - name: Build (GUI + rb-cli, default features)
-        run: cargo build --release --target aarch64-pc-windows-msvc
+        run: cargo build --release --target aarch64-pc-windows-msvc --features gui
 
       # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
       # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
@@ -1585,7 +1585,7 @@ jobs:
           key: ${{ runner.os }}-riscv64gc-gui-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (default features = GUI + CHD + optical + audio)
-        run: cargo build --release --target riscv64gc-unknown-linux-gnu
+        run: cargo build --release --target riscv64gc-unknown-linux-gnu --features gui
 
       - name: Strip + verify ELF
         run: |

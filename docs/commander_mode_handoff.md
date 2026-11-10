@@ -346,7 +346,7 @@ the H2 commit lands with this doc update.)
 cargo run --example commander_mock --features mock_gui
 
 # The real app — click "Commander Mode" in the tab bar:
-cargo run        # default features include `gui`
+cargo run --features gui
 
 # The checks the pre-commit hook enforces (must be clean):
 cargo fmt --all

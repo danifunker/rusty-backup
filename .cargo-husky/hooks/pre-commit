@@ -37,8 +37,8 @@ if [ -z "$staged_rust" ]; then
 fi
 
 # --- 2. Type-check + lint (warnings denied) --------------------------------
-echo "pre-commit: cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets -- -D warnings
+echo "pre-commit: cargo clippy --all-targets --features gui -- -D warnings"
+cargo clippy --all-targets --features gui -- -D warnings
 
 # --- 2b. Lint the regression harness ----------------------------------------
 # regression-tests/runner is its OWN crate, not a member of the root
