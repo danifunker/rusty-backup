@@ -975,6 +975,74 @@ mod tests {
         );
     }
 
+    /// HFS+ catalogs hold names decomposed (`U` + U+0308). Copying one to a
+    /// classic HFS volume must compose them to Mac Roman, not turn each
+    /// combining mark into `_` (`zur U_bersetzung`).
+    #[test]
+    fn copy_hfsplus_nfd_names_to_hfs_are_composed() {
+        use fs_mac::hfs::{create_blank_hfs, HfsFilesystem};
+        use fs_mac::hfsplus::{create_blank_hfsplus, HfsPlusFilesystem};
+        use std::io::Cursor;
+
+        let mut src = HfsPlusFilesystem::open(
+            Cursor::new(create_blank_hfsplus(8 * 1024 * 1024, 512, "Src", false)),
+            0,
+        )
+        .unwrap();
+        let sroot = src.root().unwrap();
+        let body = b"x";
+        // HFS+ stores these decomposed whichever form is passed in.
+        for name in ["zur \u{00DC}bersetzung", "\u{2022}\u{00C5}ngels\u{2022}"] {
+            src.create_file(
+                &sroot,
+                name,
+                &mut Cursor::new(body.as_slice()),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+        let entries = src.list_directory(&sroot).unwrap();
+        assert!(
+            entries.iter().any(|e| e.name.contains('\u{0308}')),
+            "source should hand back decomposed names: {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        let mut dst = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Dst").unwrap()),
+            0,
+        )
+        .unwrap();
+        let droot = dst.root().unwrap();
+        let mut stats = CopyStats::default();
+        for e in &entries {
+            copy_into(
+                &mut src,
+                e,
+                &mut dst,
+                &droot,
+                &e.name,
+                &CopyOptions::default(),
+                &mut stats,
+                &|_| {},
+            )
+            .unwrap();
+        }
+        let mut names: Vec<String> = dst
+            .list_directory(&droot)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["zur \u{00DC}bersetzung", "\u{2022}\u{00C5}ngels\u{2022}"]
+        );
+        assert_eq!(stats.renamed, 0);
+    }
+
     /// `cp --preserve-times` from HFS to HFS keeps the raw catalog create,
     /// modify and backup dates of files and folders exactly, so a pack built
     /// by copying stays byte-faithful to its source. Without the option the

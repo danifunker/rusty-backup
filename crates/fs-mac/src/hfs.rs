@@ -41,7 +41,24 @@ static MAC_ROMAN_TABLE: [char; 128] = [
 
 /// Convert a UTF-8 string to Mac Roman bytes.
 /// Returns Err if any character cannot be represented in Mac Roman.
+///
+/// A name that doesn't encode as given is retried canonically composed (NFC):
+/// HFS+ catalogs store names decomposed, so `Ü` arrives as `U` + U+0308, and
+/// encoding that mark on its own fails.
 pub fn utf8_to_mac_roman(s: &str) -> Result<Vec<u8>, FilesystemError> {
+    match encode_mac_roman(s) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            let composed = fs_mac_unicode::hfs_unicode::compose_str(s);
+            if composed == s {
+                return Err(e);
+            }
+            encode_mac_roman(&composed).map_err(|_| e)
+        }
+    }
+}
+
+fn encode_mac_roman(s: &str) -> Result<Vec<u8>, FilesystemError> {
     let mut result = Vec::with_capacity(s.len());
     for ch in s.chars() {
         if (ch as u32) < 0x80 {
@@ -5083,6 +5100,49 @@ mod tests {
         let mac = utf8_to_mac_roman(text).unwrap();
         assert_eq!(mac, &[0x80]);
         assert_eq!(mac_roman_to_utf8(&mac), text);
+    }
+
+    /// HFS+ hands out decomposed names (`U` + U+0308); the encoder must compose
+    /// them instead of failing on the bare combining mark.
+    #[test]
+    fn test_utf8_to_mac_roman_composes_nfd() {
+        let nfd = "zur U\u{0308}bersetzung \u{2022}A\u{030A}ngels\u{2022} e\u{0301}";
+        let nfc = "zur \u{00DC}bersetzung \u{2022}\u{00C5}ngels\u{2022} \u{00E9}";
+        let mac = utf8_to_mac_roman(nfd).unwrap();
+        assert_eq!(mac, utf8_to_mac_roman(nfc).unwrap());
+        assert_eq!(mac_roman_to_utf8(&mac), nfc);
+        // A mark with no Mac Roman form is still rejected.
+        assert!(utf8_to_mac_roman("x\u{0301}\u{4E2D}").is_err());
+    }
+
+    /// The path `rb-cli cp` takes from an HFS+ source: the decomposed name
+    /// must validate and be written composed, never legalised into `U_bersetzung`.
+    #[test]
+    fn test_hfs_create_file_with_nfd_name_is_composed() {
+        use std::io::Cursor;
+        let mut fs = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Dst").unwrap()),
+            0,
+        )
+        .unwrap();
+        let root = fs.root().unwrap();
+        let nfd = "zur U\u{0308}bersetzung";
+        assert!(fs.validate_name(nfd).is_ok());
+        fs.create_file(
+            &root,
+            nfd,
+            &mut Cursor::new(b"x".as_slice()),
+            1,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["zur \u{00DC}bersetzung".to_string()]);
     }
 
     #[test]
