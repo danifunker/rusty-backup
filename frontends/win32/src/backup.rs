@@ -377,7 +377,7 @@ impl BackupScreen {
         self.ctrl.borrow().is_running()
     }
 
-    fn apply(&self, action: BackupAction) {
+    pub fn apply(&self, action: BackupAction) {
         let effects = self.ctrl.borrow_mut().apply(action);
         self.after(effects);
     }

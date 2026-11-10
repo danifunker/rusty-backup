@@ -228,6 +228,12 @@ in check-group mode with the bundled icons); the screens and slices below are un
    and Convert / Cancel behind the controller's Skip / Overwrite / Back. Inspect's and Optical's
    Convert... open it. The tabs' one-disk-job lock is now a table in `app.rs`.
    `flow.convert.iso-to-chd` passes.
+   Slice 8, drops and file open (2026-11-10): a file dropped on a tab goes where the app
+   controller's `route_drop` sends it (Inspect, Optical, Archives, Restore, Backup or Convert,
+   switching tabs), after Inspect's open volume in Edit Mode has had the chance to take it; a
+   file named on the command line (Explorer's Open With) opens in Inspect. Drops cannot be
+   driven by a flow; the command-line open was checked by hand. About and the icon came with
+   slice 0. Left: registering the file associations, which the installer (slice 9) does.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

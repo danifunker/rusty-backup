@@ -417,6 +417,12 @@ impl InspectScreen {
         self.browse.set_icons();
     }
 
+    /// Whether a remote session is open, and whether a local source is: where a drop may go.
+    pub fn drop_state(&self) -> (bool, bool) {
+        let ctrl = self.ctrl.borrow();
+        (ctrl.is_remote(), ctrl.has_local_source())
+    }
+
     /// Open an image another screen hands over (Build Disk's "Open in Inspect").
     pub fn open_image(&self, path: PathBuf) {
         self.apply(InspectAction::Open(InspectSource::ImageFile(path)));

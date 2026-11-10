@@ -179,6 +179,12 @@ pub fn start() {
         );
     }
     app.tick();
+    // A file named on the command line (Explorer's Open With) opens in Inspect, as in GTK.
+    let named = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    if let Some(path) = named.filter(|p| p.exists()) {
+        app.apply(AppAction::SelectTab(AppTab::Inspect));
+        app.inspect.open_image(path);
+    }
 }
 
 /// Run the controllers now, as a wake does; a screen asks after handing something to the app.
@@ -600,12 +606,61 @@ impl App {
         match commander {
             Some(c) => c.drop_paths(paths, at),
             None => {
-                if !self.inspect.drop_paths(paths) {
-                    let line = "Drop files on Commander, or on a browsed volume in Edit Mode.";
-                    append_log(vec![(LogLevel::Info, line.into())]);
-                }
+                self.drop_on_tab(paths);
             }
         }
+    }
+
+    /// A drop on the window: Inspect's open volume takes it in Edit Mode, else the route says.
+    fn drop_on_tab(&self, paths: Vec<std::path::PathBuf>) {
+        use rusty_backup::controller::app::{DropRoute, DropTargets};
+        let Some(first) = paths.first().cloned() else {
+            return;
+        };
+        let tab = self.ctrl.borrow().active_tab();
+        if tab == AppTab::Inspect && self.inspect.drop_paths(paths) {
+            return;
+        }
+        let (inspect_remote, inspect_loaded) = self.inspect.drop_state();
+        let targets = DropTargets {
+            inspect_remote,
+            inspect_loaded,
+            optical_browsing: self.optical.browsing(),
+        };
+        let route = self.ctrl.borrow_mut().route_drop(first, targets);
+        let tab = match route {
+            DropRoute::Inspect(path) => {
+                self.inspect.open_image(path);
+                AppTab::Inspect
+            }
+            DropRoute::Optical(path) => {
+                self.optical.open_image(path);
+                AppTab::Optical
+            }
+            DropRoute::Archives(path) => {
+                self.archives.open_path(path);
+                AppTab::Archives
+            }
+            DropRoute::Restore(path) => {
+                self.restore
+                    .apply(rusty_backup::controller::restore::RestoreAction::OpenDropped(path));
+                AppTab::Restore
+            }
+            DropRoute::Backup(path) => {
+                self.backup
+                    .apply(rusty_backup::controller::backup::BackupAction::OpenImage {
+                        path,
+                        rename: false,
+                    });
+                AppTab::Backup
+            }
+            DropRoute::Convert(path) => {
+                self.convert.open(path);
+                AppTab::Convert
+            }
+            DropRoute::Ignore => return,
+        };
+        self.apply(AppAction::SelectTab(tab));
     }
 
     /// Read the controller first and release it, then set controls inside the guard.
