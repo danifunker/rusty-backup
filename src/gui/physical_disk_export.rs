@@ -358,7 +358,7 @@ impl PhysicalDiskExport {
         }
         match self.ctl.result() {
             Some(Ok(_)) => {
-                ui.label("Write complete.");
+                ui.label(rusty_backup::controller::disk_write::labels::DONE);
             }
             Some(Err(e)) => {
                 ui.colored_label(super::theme::danger(ui.visuals()), format!("Error: {e}"));

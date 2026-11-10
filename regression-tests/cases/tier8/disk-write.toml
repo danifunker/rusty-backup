@@ -1,0 +1,57 @@
+# Tier 8: the disk writer (Physical Disk Export), end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.disk_write"
+description = "Write an image through the disk writer window, then prove the result with rb-cli."
+
+[[case]]
+id = "flow.disk_write.image-file"
+description = "Write a FAT floppy image to an image file from Restore's Write Image File, with Synthesize partition table ticked, and read its file back"
+level = "smoke"
+area = ["restore"]
+shells = ["win32"]
+capabilities = ["restore.write-image"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Restore" },
+  { focus = "restore.mode" },
+  { choose = "Write Image File" },
+  { pick = "{scratch}/src.img" },
+  { activate = "restore.write_image" },
+  { wait = "Decoded size" },
+  { activate = "restore.write_target" },
+  { wait = "Physical Disk Export" },
+  { wait = "superfloppy" },
+  { pick = "{scratch}/out.img" },
+  { activate = "disk_write.target_image" },
+  { wait = "Target image" },
+  { focus = "disk_write.synthesize" },
+  { choose = "on" },
+  { wait = "Partition type" },
+  { activate = "disk_write.write" },
+  { activate = "disk_write.overwrite_file" },
+  { wait = "disk_write.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/out.img", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partition_table", value = "MBR" },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/out.img@1", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]

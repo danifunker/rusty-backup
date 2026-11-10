@@ -142,7 +142,7 @@ in check-group mode with the bundled icons); the screens and slices below are un
    bar, the partition list and its row tools (Calc min, Check, Expand/Export, Defragment, Alto
    Resize), and the windows: Check results and CHD Info, Expand Image, Export Disk Image (with the
    shared `ChdControl`), Resize Partitions, the partition-table editor, Expand HFS and Resize Alto
-   Disk. Left: Physical Disk Export (the disk writer, slice 7a) and the remote listing (7b). The facts, the Check report, the export notes and the editor bars'
+   Disk, and Physical Disk Export (slice 7a). Left: the remote listing (7b). The facts, the Check report, the export notes and the editor bars'
    segments moved into the controller on the way.
    Slice 2 (browsing) first pass (2026-11-09): Inspect's Browse opens `browse.rs` in the
    Inspect page's place: the volume line, Extract All, Export to .tar.gz, Close, the job line
@@ -196,7 +196,12 @@ in check-group mode with the bundled icons); the screens and slices below are un
    and Restore. `flow.backup.image-zstd` and `flow.restore.folder-to-image` pass. Learned: UI
    Automation's Select changes a drop-down list without `CBN_SELCHANGE`, so a screen also reads
    the list on `CBN_CLOSEUP`. Not done: the VHD layout window, remote sources and targets (7b),
-   Write Image File's disk writer (7a), sharing the backup folder with Inspect.
+   sharing the backup folder with Inspect.
+   Slice 7a's disk writer done (2026-11-10): `disk_write.rs`, the Physical Disk Export window,
+   which Export's "Physical Disk Export..." and Restore's Write Image File open: the target disk
+   or an image file, the region on a partitioned disk, the synthesized table, Write with the
+   controller's own question, and the run. `disk_write::labels` holds its confirm button and
+   outcome. `flow.disk_write.image-file` passes. With it slice 7a is complete.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

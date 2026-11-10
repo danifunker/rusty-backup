@@ -1,7 +1,6 @@
 //! Export Disk Image over the Inspect controller's export settings; egui's `show_export_popup` is
 //! the reference. The window is open while `InspectController::export_open()` says so.
-//!
-//! Physical Disk Export waits for the disk writer window (slice 7a); its button is not shown yet.
+//! Physical Disk Export hands the image to the disk writer window (`disk_write.rs`).
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -41,6 +40,7 @@ pub struct Shown {
     after: Vec<LayoutSegment>,
     after_caption: String,
     notes: Vec<String>,
+    can_physical: bool,
 }
 
 impl Shown {
@@ -57,6 +57,7 @@ impl Shown {
         let layout = c.export_layout();
         let after_caption = after_caption(&layout);
         let notes = c.export_notes().lines();
+        let can_physical = c.can_export_physical();
         let s = c.export_settings_mut();
         Some(Shown {
             formats,
@@ -69,6 +70,7 @@ impl Shown {
             after: layout.after,
             after_caption,
             notes,
+            can_physical,
         })
     }
 }
@@ -86,6 +88,8 @@ struct SizeRow {
 pub struct ExportWindow {
     window: HWND,
     send: Rc<dyn Fn(InspectAction)>,
+    /// Physical Disk Export: the screen hands the image to the disk writer.
+    physical_send: Rc<dyn Fn()>,
     sync: SyncGuard,
     me: Weak<ExportWindow>,
     intro: HWND,
@@ -104,6 +108,7 @@ pub struct ExportWindow {
     shape: std::cell::Cell<(usize, usize)>,
     notes: HWND,
     start: HWND,
+    physical: HWND,
     cancel: HWND,
 }
 
@@ -124,7 +129,7 @@ fn set_check(h: HWND, on: bool) {
 
 impl ExportWindow {
     /// The window; `send` delivers its edits to the Inspect controller.
-    pub fn open(owner: HWND, send: Rc<dyn Fn(InspectAction)>) -> Rc<Self> {
+    pub fn open(owner: HWND, send: Rc<dyn Fn(InspectAction)>, physical: Rc<dyn Fn()>) -> Rc<Self> {
         let window = panel::dialog(owner, "Export Disk Image", 640, 700);
         let intro = ui::label(window, EXPORT_INTRO);
         let current_caption = ui::label(window, "Current:");
@@ -167,11 +172,13 @@ impl ExportWindow {
         let sizes_title = ui::label(window, "Partition Sizes:");
         let notes = ui::label(window, "");
         let start = ui::button(window, "Export...", ids::EXPORT_START);
+        let physical_button = ui::button(window, "Physical Disk Export...", ids::EXPORT_PHYSICAL);
         let cancel = ui::button(window, "Cancel", ids::EXPORT_CLOSE);
         partition_bar::set_options(current, 1.0, false);
         let me = Rc::new_cyclic(|me: &Weak<ExportWindow>| ExportWindow {
             window,
             send,
+            physical_send: physical,
             sync: SyncGuard::default(),
             me: me.clone(),
             intro,
@@ -189,6 +196,7 @@ impl ExportWindow {
             shape: std::cell::Cell::new((usize::MAX, 0)),
             notes,
             start,
+            physical: physical_button,
             cancel,
         });
         let weak: Weak<dyn Handler> = me.me.clone();
@@ -227,6 +235,7 @@ impl ExportWindow {
             partition_bar::show(self.current, s.current, None);
             partition_bar::show(self.after, s.after, None);
             ui::set_text(self.after_caption, &s.after_caption);
+            ui::set_enabled(self.physical, s.can_physical);
             let reshaped = self.show_sizes(&s.configs);
             let mut notes = s.notes;
             notes.extend(refusal.map(str::to_string));
@@ -369,6 +378,7 @@ impl ExportWindow {
         }
         rows.push(Node::leaf(self.notes, Size::Stretch(1), Size::Stretch(1)));
         rows.push(Node::row(vec![
+            Node::button(self.physical, 170),
             Node::Space(Size::Stretch(1)),
             Node::button(self.cancel, 90),
             Node::button(self.start, 90),
@@ -422,6 +432,9 @@ impl Handler for ExportWindow {
                 return;
             }
             InspectAction::StartExport(self.chd.choice().0)
+        } else if code == BN_CLICKED && from == self.physical {
+            (self.physical_send)();
+            return;
         } else if code == BN_CLICKED && from == self.cancel {
             InspectAction::CloseExport
         } else {

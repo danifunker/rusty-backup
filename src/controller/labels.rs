@@ -10,6 +10,7 @@ pub fn table() -> Vec<(&'static str, &'static str)> {
         super::restore::labels::TABLE,
         super::expand_hfs::labels::TABLE,
         super::build_disk::labels::TABLE,
+        super::disk_write::labels::TABLE,
     ];
     #[cfg(feature = "optical")]
     parts.push(super::optical::labels::TABLE);

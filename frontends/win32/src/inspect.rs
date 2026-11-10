@@ -40,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::alto::AltoWindow;
 use crate::browse::BrowseView;
+use crate::disk_write::DiskWriteWindow;
 use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
@@ -198,6 +199,7 @@ pub struct InspectScreen {
     cancel_export: HWND,
     export_window: RefCell<Option<Rc<ExportWindow>>>,
     resize: RefCell<Option<Rc<ResizeWindow>>>,
+    writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     close: HWND,
     details: HWND,
     bar: HWND,
@@ -363,6 +365,7 @@ impl InspectScreen {
             cancel_export,
             export_window: RefCell::default(),
             resize: RefCell::default(),
+            writer: RefCell::default(),
             close,
             details,
             bar,
@@ -428,6 +431,13 @@ impl InspectScreen {
 
     pub fn tick(&self) {
         self.browse.tick();
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.tick();
+            if !d.is_open() {
+                self.writer.replace(None);
+            }
+        }
         let hfs = self.hfs.borrow().clone();
         if let Some(d) = hfs {
             d.tick();
@@ -497,11 +507,37 @@ impl InspectScreen {
                     s.apply(a);
                 }
             });
-            let w = ExportWindow::open(self.owner, send);
+            let me = self.me.clone();
+            let physical: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = me.upgrade() {
+                    s.open_physical();
+                }
+            });
+            let w = ExportWindow::open(self.owner, send, physical);
             *self.export_window.borrow_mut() = Some(w.clone());
             w
         });
         w.show(shown);
+    }
+
+    /// Export's Physical Disk Export: the image goes to the disk writer's window.
+    fn open_physical(&self) {
+        let busy = self.writer.borrow().as_ref().is_some_and(|d| d.is_open());
+        let Some(open) = self.ctrl.borrow().physical_source() else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        self.apply(InspectAction::CloseExport);
+        let d = DiskWriteWindow::open(
+            self.owner,
+            self.notify.clone(),
+            self.host.clone(),
+            &self.devices.borrow(),
+            open,
+        );
+        *self.writer.borrow_mut() = Some(d);
     }
 
     /// Resize Partitions: a dialog with its own controller, on the table read here.
@@ -537,6 +573,10 @@ impl InspectScreen {
         if let Some(d) = resize {
             d.set_devices(devices);
         }
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.set_devices(devices);
+        }
         *self.devices.borrow_mut() = devices.to_vec();
     }
 
@@ -554,6 +594,13 @@ impl InspectScreen {
             Some("Inspect: Resize")
         } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
             Some("Inspect: Expand HFS")
+        } else if self
+            .writer
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_writing())
+        {
+            Some("Inspect: Physical Disk Export")
         } else {
             None
         }

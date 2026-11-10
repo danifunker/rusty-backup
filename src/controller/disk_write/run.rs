@@ -135,7 +135,7 @@ impl DiskWriteController {
             purpose: purpose::OVERWRITE_FILE,
             title: "Confirm Write".to_string(),
             message,
-            confirm_label: "Write".to_string(),
+            confirm_label: super::labels::CONFIRM.to_string(),
             destructive: true,
         })]
     }

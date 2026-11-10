@@ -4,8 +4,8 @@
 //! partition image, each mode's target (a device, an image file or a scanned partition), the new
 //! disk's table, the full-disk sizes with alignment and trailing free space, the caveats, and
 //! Restore / Cancel with the progress line and the outcome. Start only ever sends `Start`: the
-//! write begins on the controller's own `Confirm`. Still to come: remote targets (slice 7b) and
-//! Write Image File's disk writer (slice 7a), which this screen reports in the log.
+//! write begins on the controller's own `Confirm`. Write Image File opens the disk writer
+//! window. Still to come: remote targets (slice 7b).
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -31,11 +31,12 @@ use windows::Win32::UI::Controls::{BCN_DROPDOWN, BS_SPLITBUTTON, NMHDR};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GetAncestor, GetWindowRect, SendMessageW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
-    CBN_CLOSEUP, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
-    CB_SETCURSEL, EN_CHANGE, ES_NUMBER, GA_ROOT, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_CLIENTEDGE,
-    WS_TABSTOP, WS_VSCROLL,
+    CBN_CLOSEUP, CBN_SELCHANGE, EN_CHANGE, ES_NUMBER, GA_ROOT, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WS_EX_CLIENTEDGE, WS_TABSTOP,
 };
 
+use crate::combo::Combo;
+use crate::disk_write::DiskWriteWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
@@ -116,59 +117,6 @@ fn set_check(h: HWND, on: bool) {
 fn number(parent: HWND, id: &str) -> HWND {
     let style = WINDOW_STYLE(ES_NUMBER as u32 | WS_TABSTOP.0);
     ui::child(parent, w!("EDIT"), "", style, WS_EX_CLIENTEDGE, id)
-}
-
-/// A drop-down list whose items the screen replaces only when they change.
-struct Combo {
-    h: HWND,
-    items: RefCell<Vec<String>>,
-}
-
-impl Combo {
-    fn build(parent: HWND, id: &str, items: &[&str]) -> Combo {
-        let style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0);
-        let h = ui::child(parent, w!("COMBOBOX"), "", style, WINDOW_EX_STYLE(0), id);
-        let c = Combo {
-            h,
-            items: RefCell::default(),
-        };
-        c.set_items(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        c
-    }
-
-    fn set_items(&self, items: &[String]) {
-        if *self.items.borrow() == items {
-            return;
-        }
-        // SAFETY: plain combo messages; the combo copies each string.
-        unsafe {
-            SendMessageW(self.h, CB_RESETCONTENT, None, None);
-            for item in items {
-                let t = ui::wide(item);
-                SendMessageW(
-                    self.h,
-                    CB_ADDSTRING,
-                    None,
-                    Some(LPARAM(t.as_ptr() as isize)),
-                );
-            }
-        }
-        *self.items.borrow_mut() = items.to_vec();
-    }
-
-    fn select(&self, i: usize) {
-        // SAFETY: plain combo messages; CB_SETCURSEL sends no CBN_SELCHANGE.
-        unsafe {
-            if SendMessageW(self.h, CB_GETCURSEL, None, None).0 != i as isize {
-                SendMessageW(self.h, CB_SETCURSEL, Some(WPARAM(i)), None);
-            }
-        }
-    }
-
-    fn picked(&self) -> Option<usize> {
-        // SAFETY: a plain combo query.
-        usize::try_from(unsafe { SendMessageW(self.h, CB_GETCURSEL, None, None).0 }).ok()
-    }
 }
 
 /// One partition's row in the full-disk size table.
@@ -260,6 +208,9 @@ struct Shown {
 pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
     host: EffectHost,
+    /// Write Image File's window, kept while open so a running write keeps its controller.
+    writer: RefCell<Option<Rc<DiskWriteWindow>>>,
+    notify: Arc<dyn Notify>,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
     devices: RefCell<Vec<DiskDevice>>,
@@ -378,9 +329,11 @@ impl RestoreScreen {
         let screen = Rc::new_cyclic(|me: &Weak<RestoreScreen>| RestoreScreen {
             ctrl: RefCell::new(RestoreController::new(RestoreServices {
                 jobs: JobRegistry::new(),
-                notify,
+                notify: notify.clone(),
             })),
             host,
+            writer: RefCell::default(),
+            notify,
             recent_files: RefCell::new(recent.list(RecentMode::Restore)),
             recent,
             devices: RefCell::default(),
@@ -465,6 +418,10 @@ impl RestoreScreen {
     /// The app's device list; a target's row is reconciled before anything shows it.
     pub fn set_devices(&self, devices: &[DiskDevice]) {
         self.ctrl.borrow_mut().reconcile_devices(devices);
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.set_devices(devices);
+        }
         *self.devices.borrow_mut() = devices.to_vec();
     }
 
@@ -474,7 +431,12 @@ impl RestoreScreen {
     }
 
     pub fn is_running(&self) -> bool {
-        self.ctrl.borrow().is_running()
+        let writing = self
+            .writer
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_writing());
+        self.ctrl.borrow().is_running() || writing
     }
 
     pub fn apply(&self, action: RestoreAction) {
@@ -483,6 +445,13 @@ impl RestoreScreen {
     }
 
     pub fn tick(&self) {
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.tick();
+            if !d.is_open() {
+                self.writer.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -529,11 +498,7 @@ impl RestoreScreen {
         for request in requests {
             match request {
                 HostRequest::RememberRecent(path) => self.remember(&path),
-                HostRequest::WriteImage(_) => {
-                    let line =
-                        "Write Image File's disk writer arrives in slice 7a of the Win32 shell.";
-                    crate::app::append_log(vec![(LogLevel::Warning, line.into())]);
-                }
+                HostRequest::WriteImage(open) => self.open_writer(open),
             }
         }
         crate::app::append_log(log);
@@ -541,6 +506,23 @@ impl RestoreScreen {
         if ui::shown(self.page) {
             self.refresh();
         }
+    }
+
+    /// Write Image File: the image goes to the disk writer's window, one at a time.
+    fn open_writer(&self, open: rusty_backup::controller::restore::WriteOpen) {
+        if self.writer.borrow().as_ref().is_some_and(|d| d.is_open()) {
+            return;
+        }
+        // SAFETY: a plain query of our own window.
+        let owner = unsafe { GetAncestor(self.page, GA_ROOT) };
+        let d = DiskWriteWindow::open(
+            owner,
+            self.notify.clone(),
+            self.host.clone(),
+            &self.devices.borrow(),
+            open,
+        );
+        *self.writer.borrow_mut() = Some(d);
     }
 
     fn remember(&self, path: &Path) {

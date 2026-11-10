@@ -58,6 +58,19 @@ pub mod ids {
     pub const CLOSE: &str = "disk_write.close";
 }
 
+/// What every shell calls each control and outcome (D8).
+pub mod labels {
+    use super::purpose;
+    /// The image-file question's go-ahead button.
+    pub const CONFIRM: &str = "Write";
+    pub const DONE: &str = "Write complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (purpose::OVERWRITE_FILE, CONFIRM),
+        ("disk_write.done", DONE),
+    ];
+}
+
 /// User intents.
 pub enum DiskWriteAction {
     /// Another screen hands over its image; the window opens.
