@@ -131,8 +131,9 @@ in check-group mode with the bundled icons); the screens and slices below are un
      remain for ripping a drive.
    - **Left for the Linux session:** the staged host copy (only GTK copies at once, so the change
      and `commander.left.apply`'s `skip` are GTK's), GTK reading the labels and the picks helper.
-   - **Needs the user:** `docs/capabilities.md` (each new row needs an OK). R-089 and R-090 are
-     still open.
+   - **Done 2026-11-10:** `docs/capabilities.md` exists, generated from the flows' capability tags
+     and checked in CI (`scripts/check-capabilities.py`); every Win32 cell is yes. R-089 and
+     R-090 are fixed.
 4. **Audit R14 and R15** (`os/windows.rs`), before slice 1 opens devices. Already shipped
    (45be254, b060025, 2026-09-03); nothing left here.
 5. **Slices 0a, 0, then 9's driver early**: the UIA driver comes right after the skeleton, so

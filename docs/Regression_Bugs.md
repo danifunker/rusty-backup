@@ -115,6 +115,9 @@ finding depends on a fixture, the fixture is named.
 
 ### R-090 — Commander's open treats a zip or tar as a disk image {#r-090}
 
+**Fixed 2026-11-10:** `open_image` takes ZIP and tar names (`is_host_archive_name`, shared with
+`classify`) to `open_archive`, as a host folder does.
+
 Commander's Open (`Ctrl+O` in the TUI, "Open File..." in GTK) sends a `.zip` or `.tar` down the
 disk-image path and fails with "Could not read partitions", though the TUI's own help line says it
 opens "a disk image or archive". `open_image` in `src/controller/browser/pane/source.rs` only takes
@@ -123,6 +126,10 @@ the tar family archives, which is why the same zip opens fine from a host folder
 by the tier-8 Commander flows; pinned by `flow.commander.open-zip.{tui,gtk}`.
 
 ### R-089 — Commander says a fresh UFS volume has 0 B free {#r-089}
+
+**Fixed 2026-11-10 (fs-unix 0.2.3):** the cause was `used_size`, a placeholder that returned the
+whole volume; the preflight takes free as total minus used. It now reads the superblock's
+`fs_cstotal` at open and follows every `update_cg_cs`. `free_space` was right all along.
 
 Copying a 26-byte file into a new 16 MiB UFS1 volume (`rb-cli new volume ufs`) stops at Commander's
 pre-apply check: "Not enough space: needs about 512 B, 0 B free on UFS1", in both the TUI and GTK.

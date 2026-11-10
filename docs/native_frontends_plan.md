@@ -229,10 +229,10 @@ list of drift. Before AppKit or Win32 starts:
      does; GTK's immediate copy changes to match, and `commander.left.apply`'s `skip` goes.
    - Converting a disc happens **in the Convert tab**: the Optical screen's Convert... hands the
      image over, as egui and GTK do; the TUI's in-place convert on its Optical screen goes.
-4. **`docs/capabilities.md` exists**, one row per capability, a column per shell, each row naming
+4. **Done 2026-11-10: `docs/capabilities.md` exists**, one row per capability, a column per shell, each row naming
    the flows that prove it; a new row needs the user's OK. The AppKit and Win32
    columns start empty: they are the new shells' checklists.
-5. **Two bugs the flows found are fixed or consciously left:** R-089 (Commander says a fresh UFS
+5. **Done 2026-11-10, both fixed: two bugs the flows found are fixed or consciously left:** R-089 (Commander says a fresh UFS
    volume has 0 B free) and R-090 (Commander's open takes a zip for a disk image). Both are in the
    shared controller or engine, so every new shell would inherit them.
 

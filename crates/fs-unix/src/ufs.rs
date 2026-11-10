@@ -197,6 +197,12 @@ const CSUM_ENTRY_SIZE: u64 = 16;
 /// fragment out of a free block moves `frag - n` fragments into `nffree` and
 /// takes one off `nbfree` — it never simply debits `nffree`. Comparing the
 /// bitmap either side of a change gets this right for any run.
+/// Solaris's dynamic-layout UFS1 keeps other data at 1008; only FreeBSD's carries the 64-bit totals (R-074).
+fn has_cstotal64(version: UfsVersion, layout: CgLayout, sb: &[u8]) -> bool {
+    version == UfsVersion::Ufs2
+        || (layout == CgLayout::Modern && sb[OFF_OLD_FLAGS] & FS_FLAGS_UPDATED != 0)
+}
+
 fn cs_delta_for(before: &[u8], after: &[u8], frag: u64, start: u64, count: u64) -> (i32, i32) {
     let free = |bm: &[u8], b: u64| {
         bm.get((b / 8) as usize)
@@ -419,6 +425,8 @@ pub struct UfsFilesystem<R> {
     rot43: [u64; 3],
     /// `(fs_cpg, fs_nrpos)` when a dynamic-layout UFS1 (Solaris) keeps live `cg_btot` / `cg_b` tables.
     rot_dyn: Option<(u64, u64)>,
+    /// Free fragments per the superblock's `fs_cstotal`, kept in step by `update_cg_cs`.
+    free_frags: u64,
     /// `fs_metackhash` (UFS2 only) and the sizes its hashes cover.
     metackhash: u32,
     sbsize: usize,
@@ -658,6 +666,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             cg_layout: CgLayout::Modern,
             rot43: [0; 3],
             rot_dyn: None,
+            free_frags: 0,
             metackhash: 0,
             sbsize: 0,
             cgsize: 0,
@@ -692,6 +701,14 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             fs.rot43 = [geo(OFF_NSPF_43), geo(OFF_NSECT_43), geo(OFF_SPC_43)];
             fs.rot_dyn = Some((geo(OFF_CPG), geo(OFF_NRPOS)));
         }
+        let (nbfree, nffree) = if has_cstotal64(fs.version, fs.cg_layout, &sb) {
+            let t = |i: usize| read_i64(&sb, OFF_CSTOTAL64 + i * 8, endian).max(0) as u64;
+            (t(1), t(3))
+        } else {
+            let t = |i: usize| read_i32(&sb, OFF_CSTOTAL_OLD + i * 4, endian).max(0) as u64;
+            (t(1), t(3))
+        };
+        fs.free_frags = (nbfree * fs.frag as u64 + nffree).min(fs.total_frags);
         // HP's superblock is 4.3BSD-shaped: offset 0x528 is `fs_postbl`, not `fs_maxsymlinklen`.
         if fs.is_hpux_hfs() {
             fs.old_dirent_fmt = true;
@@ -1969,6 +1986,9 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         self.reader.write_all(&buf)?;
         self.rehash_cg(cg_byte)?;
         self.propagate_cs(cg, &buf, d_ndir, d_nbfree, d_nifree, d_nffree)?;
+        let d_frags = i64::from(d_nbfree) * self.frag as i64 + i64::from(d_nffree);
+        self.free_frags =
+            (self.free_frags as i64 + d_frags).clamp(0, self.total_frags as i64) as u64;
         Ok(())
     }
 
@@ -1998,9 +2018,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         let mut sb = vec![0u8; SB_READ_SIZE];
         self.reader.read_exact(&mut sb)?;
         let deltas = [d_ndir, d_nbfree, d_nifree, d_nffree];
-        // Solaris's dynamic-layout UFS1 keeps other data at 1008; only FreeBSD's carries the 64-bit totals (R-074).
-        let has_cstotal64 = self.version == UfsVersion::Ufs2
-            || (self.cg_layout == CgLayout::Modern && sb[OFF_OLD_FLAGS] & FS_FLAGS_UPDATED != 0);
+        let has_cstotal64 = has_cstotal64(self.version, self.cg_layout, &sb);
         for (i, d) in deltas.iter().enumerate() {
             let off = OFF_CSTOTAL_OLD + i * 4;
             let cur = read_i32(&sb, off, endian);
@@ -3957,11 +3975,8 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
     }
 
     fn used_size(&self) -> u64 {
-        // Tier A places no upper bound on used space; the cheap "total
-        // minus free-summary" read from `fs_old_cstotal` / `fs_cstotal`
-        // is a follow-up under U.2 (alongside the bitmap walk that
-        // drives `last_data_byte`).
-        self.total_size()
+        // Total minus the superblock's free summary; Commander's preflight read 0 B free before (R-089).
+        self.total_size() - self.free_frags * self.fsize
     }
 
     fn fsck(&mut self) -> Option<Result<disk_core::fsck::FsckResult, FilesystemError>> {
@@ -5782,6 +5797,41 @@ mod tests {
             "fsck: {:?}",
             result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
+    }
+
+    /// R-089: Commander's preflight read 0 B free on a fresh 16 MiB UFS1 volume.
+    #[test]
+    fn fresh_ufs1_reports_free_space() {
+        use disk_core::filesystem::EditableFilesystem;
+        let params = crate::ufs_format::Ufs1FormatParams {
+            size_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut img = crate::ufs_format::create_blank_ufs1(&params).unwrap();
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let free = fs.total_size() - fs.used_size();
+        assert!(
+            free > 12 * 1024 * 1024,
+            "a fresh 16 MiB volume reports {free} B free"
+        );
+        assert_eq!(free, fs.free_space().unwrap());
+        let root = fs.root().unwrap();
+        let data = vec![1u8; 100 * 1024];
+        let opts = disk_core::filesystem::CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "f.bin",
+            &mut data.as_slice(),
+            data.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        let after = fs.total_size() - fs.used_size();
+        assert!(
+            after + 100 * 1024 <= free,
+            "{after} B free after writing 100 KiB to {free}"
+        );
+        assert_eq!(after, fs.free_space().unwrap());
     }
 
     /// free_space sums per-CG nffree counts × fsize.

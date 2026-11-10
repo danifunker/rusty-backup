@@ -22,7 +22,9 @@ use crate::controller::{ConfirmSpec, Effect, PickSpec};
 use crate::fs::partition_is_browsable;
 use crate::model::browse_session::{looks_like_password_error, BrowseOpenStatus, BrowseSession};
 use crate::model::cache_runner;
-use crate::model::commander_descend::{classify, open_archive, DescendKind, ReopenRecipe};
+use crate::model::commander_descend::{
+    classify, is_host_archive_name, open_archive, DescendKind, ReopenRecipe,
+};
 use crate::model::commander_ops::StageSource;
 use crate::model::commander_source::{
     self, BackupPartitionOpen, PartcloneCacheStore, PartcloneLookup, ResolvedBackup,
@@ -1141,15 +1143,15 @@ fn open_host(dir: PathBuf) -> anyhow::Result<Opened> {
 }
 
 fn open_image(path: &Path, ctx: &JobCtx) -> anyhow::Result<Opened> {
-    // A Mac archive is no disk image: it opens read-only as an ArchiveFilesystem.
-    if is_mac_archive_path(path) {
+    // An archive is no disk image: it opens read-only, as it does from a host folder (R-090).
+    let name = path.file_name().and_then(|n| n.to_str());
+    if is_mac_archive_path(path) || name.is_some_and(is_host_archive_name) {
         ctx.set_phase("Reading archive...");
         let fs = open_archive(path, file_label(path))
             .map_err(|e| anyhow!("Could not open archive: {e:#}"))?;
         return Ok(Opened::Archive(load(fs, "archive")?));
     }
     // A hybrid disc hides its ISO side from the partition table, so optical images list filesystems.
-    let name = path.file_name().and_then(|n| n.to_str());
     if name.and_then(classify) == Some(DescendKind::Optical) {
         ctx.set_phase("Reading disc...");
         let src = DiscSource {
