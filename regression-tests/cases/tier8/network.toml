@@ -77,3 +77,54 @@ ui = [
   { activate = "backup.remote_close" },
   { wait_gone = "No physical drives reported" },
 ]
+
+[[case]]
+id = "flow.network.restore-to-remote-image"
+description = "Restore a backup folder from the Restore screen into an image file on an rb-cli serve daemon, then read the file back out of it"
+level = "smoke"
+area = ["network", "restore"]
+shells = ["win32"]
+capabilities = ["restore.remote-target", "restore.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Restore" },
+  { pick = "{scratch}/bk/job" },
+  { activate = "restore.backup_folder" },
+  { wait = "1 partition" },
+  { focus = "restore.remote_target" },
+  { choose = "on" },
+  { focus = "restore.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "restore.remote_connect" },
+  { wait = "or image file", timeout_ms = 30000 },
+  { focus = "restore.remote_image_name" },
+  { fill = "restored.img" },
+  { activate = "restore.remote_use_image" },
+  { wait = "Selected target" },
+  { activate = "restore.start" },
+  { activate = "restore.confirm" },
+  { wait = "restore.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/restored.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]

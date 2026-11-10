@@ -250,8 +250,10 @@ in check-group mode with the bundled icons); the screens and slices below are un
    `flow.settings.save-and-reopen` passes. Backup's remote source: Remote Drive... (a button
    and a source-menu entry) opens `backup_remote.rs`, the daemon's address and the physical
    drives it lists; `flow.network.backup-remote-connect` connects to an unelevated daemon,
-   which lists none, so picking a drive is checked by hand. Left in 7b: Restore's remote
-   target and Optical's remote daemons.
+   which lists none, so picking a drive is checked by hand. Restore's remote target
+   (`restore_remote.rs`): the switch, the daemon's address, its drives or an image name, in
+   place of the local target rows; `flow.network.restore-to-remote-image` restores into an
+   image on a writable local daemon and reads it back. Left in 7b: Optical's remote daemons.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

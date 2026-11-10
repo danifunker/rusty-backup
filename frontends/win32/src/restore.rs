@@ -5,7 +5,7 @@
 //! disk's table, the full-disk sizes with alignment and trailing free space, the caveats, and
 //! Restore / Cancel with the progress line and the outcome. Start only ever sends `Start`: the
 //! write begins on the controller's own `Confirm`. Write Image File opens the disk writer
-//! window. Still to come: remote targets (slice 7b).
+//! window. A full-disk restore can also go to a daemon (`restore_remote.rs`).
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::partition_bar;
+use crate::restore_remote::RemoteTarget;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -245,6 +246,7 @@ pub struct RestoreScreen {
     scan: HWND,
     target_image: HWND,
     save_as: HWND,
+    remote: RemoteTarget,
     warning: HWND,
     readout: HWND,
     part_caption: HWND,
@@ -367,6 +369,7 @@ impl RestoreScreen {
             scan: ui::button(page, "Scan Target", ids::SCAN_TARGET),
             target_image: ui::edit(page, ids::TARGET_IMAGE),
             save_as: ui::button(page, "Save As...", ids::PICK_TARGET_IMAGE),
+            remote: RemoteTarget::build(page),
             warning: ui::label(page, ""),
             readout: ui::label(page, ""),
             part_caption: ui::cell_label(page, "Target Partition:"),
@@ -801,7 +804,10 @@ impl RestoreScreen {
     fn show_target(&self, s: &Shown) {
         let slot = slot_of(s.mode);
         let single = slot == Some(TargetSlot::SinglePartition);
-        let on = slot.is_some();
+        self.remote
+            .show(&self.ctrl.borrow(), s.mode == RestoreMode::FullDisk);
+        // A daemon target replaces the local device and image rows.
+        let on = slot.is_some() && !self.remote.active();
         ui::set_visible(self.kind_caption, on);
         ui::set_visible(self.kind.h, on && !single);
         self.kind.select(usize::from(!s.is_device));
@@ -1029,7 +1035,8 @@ impl RestoreScreen {
 
     /// The controls a running restore or another tab's job locks.
     fn form_controls(&self) -> Vec<HWND> {
-        let mut v = vec![
+        let mut v = self.remote.controls().to_vec();
+        v.extend([
             self.mode.h,
             self.folder,
             self.pick_image,
@@ -1053,7 +1060,7 @@ impl RestoreScreen {
             self.align.h,
             self.custom,
             self.mac_driver,
-        ];
+        ]);
         for c in self.cells.borrow().iter() {
             v.push(c.mode.h);
         }
@@ -1062,6 +1069,7 @@ impl RestoreScreen {
 
     /// What decides the layout: the controls shown, the size rows and each note's line count.
     fn shape_now(&self) -> Vec<usize> {
+        let remote = self.remote.shape();
         let all = [
             self.busy_note,
             self.job,
@@ -1104,6 +1112,7 @@ impl RestoreScreen {
         for h in [self.notes, self.caveats, self.readout, self.summary] {
             shape.push(ui::text(h).lines().count());
         }
+        shape.extend(remote);
         shape
     }
 
@@ -1173,6 +1182,7 @@ impl RestoreScreen {
                 Node::Space(Size::Stretch(1)),
             ]));
         }
+        col.extend(self.remote.nodes(caption));
         if ui::shown(self.kind_caption) {
             let mut row = vec![fixed(self.kind_caption, caption)];
             if ui::shown(self.kind.h) {
@@ -1455,6 +1465,10 @@ impl Handler for RestoreScreen {
         if self.sync.active() {
             return;
         }
+        if let Some(a) = self.remote.command(from, code) {
+            self.apply(a);
+            return;
+        }
         let action = match code {
             EN_CHANGE => self.changed(from),
             CBN_SELCHANGE => self.selected(from),
@@ -1467,6 +1481,10 @@ impl Handler for RestoreScreen {
     }
 
     fn notify(&self, hdr: &NMHDR, _lp: LPARAM) -> Option<LRESULT> {
+        if let Some(a) = self.remote.notify(hdr).filter(|_| !self.sync.active()) {
+            self.apply(a);
+            return Some(LRESULT(0));
+        }
         if hdr.hwndFrom == self.folder && hdr.code == BCN_DROPDOWN {
             self.folder_menu();
             return Some(LRESULT(0));

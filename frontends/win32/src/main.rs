@@ -69,6 +69,8 @@ mod resize;
 #[cfg(windows)]
 mod restore;
 #[cfg(windows)]
+mod restore_remote;
+#[cfg(windows)]
 mod row_icons;
 #[cfg(windows)]
 mod settings;
