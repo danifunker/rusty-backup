@@ -55,6 +55,8 @@ mod menu;
 #[cfg(windows)]
 mod optical;
 #[cfg(windows)]
+mod optical_remote;
+#[cfg(windows)]
 mod pane_view;
 #[cfg(windows)]
 mod panel;

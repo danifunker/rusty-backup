@@ -3,8 +3,8 @@
 //! The source (a drive, or an image with its recent list), the detected disc and its tools
 //! (Browse Contents, Close Disc, CHD Info, Audio Tracks), the rip's output form, and Start /
 //! Cancel. An image converts in the Convert tab, so image mode offers Convert... instead. The disc
-//! browser is a `BrowseView` in disc mode on its own page, shown in the screen's place. Remote
-//! drives arrive with slice 7b.
+//! browser is a `BrowseView` in disc mode on its own page, shown in the screen's place. Add
+//! remote daemon (`optical_remote.rs`) adds a daemon's drives to the drive list.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -38,6 +38,7 @@ use crate::chd::{ChdControl, ChdIds};
 use crate::combo::Combo;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
+use crate::optical_remote::{AddRemoteShown, AddRemoteWindow};
 use crate::panel::{self, Handler};
 use crate::sync::SyncGuard;
 use crate::ui;
@@ -319,6 +320,8 @@ pub struct OpticalScreen {
     drive: Combo,
     refresh: HWND,
     eject: HWND,
+    add_remote: HWND,
+    add_remote_window: RefCell<Option<Rc<AddRemoteWindow>>>,
     drive_note: HWND,
     image_caption: HWND,
     image: HWND,
@@ -408,6 +411,8 @@ impl OpticalScreen {
             drive: Combo::build(page, ids::DRIVE, &[]),
             refresh: ui::button(page, "Refresh", ids::REFRESH),
             eject: ui::button(page, "Eject", ids::EJECT),
+            add_remote: ui::button(page, "Add remote daemon...", ids::ADD_REMOTE),
+            add_remote_window: RefCell::default(),
             drive_note: ui::label(page, ""),
             image_caption: ui::cell_label(page, "Image:"),
             image,
@@ -565,8 +570,32 @@ impl OpticalScreen {
         unsafe { GetAncestor(self.page, GA_ROOT) }
     }
 
-    /// CHD Info and the player follow the controller: open while it says so.
+    /// CHD Info, Add remote daemon and the player follow the controller: open while it says so.
     fn show_windows(&self) {
+        let remote = {
+            let c = self.ctrl.borrow();
+            c.add_remote_open().then(|| {
+                let shown = AddRemoteShown {
+                    connecting: c.remote_connecting().is_some(),
+                    error: c.add_remote_error().map(str::to_string),
+                };
+                (shown, c.recent_daemons().to_vec())
+            })
+        };
+        match remote {
+            None => {
+                self.add_remote_window.replace(None);
+            }
+            Some((shown, recent)) => {
+                let held = self.add_remote_window.borrow().clone();
+                let w = held.unwrap_or_else(|| {
+                    let w = AddRemoteWindow::open(self.owner(), &recent, self.send());
+                    *self.add_remote_window.borrow_mut() = Some(w.clone());
+                    w
+                });
+                w.show(shown);
+            }
+        }
         let info = self.ctrl.borrow().chd_info().map(str::to_string);
         match info {
             None => {
@@ -693,7 +722,13 @@ impl OpticalScreen {
         let image_mode = ctrl.source_mode() == SourceMode::ImageFile;
         set_check(self.drive_mode, !image_mode);
         set_check(self.image_mode, image_mode);
-        for h in [self.drive_caption, self.drive.h, self.refresh, self.eject] {
+        for h in [
+            self.drive_caption,
+            self.drive.h,
+            self.refresh,
+            self.eject,
+            self.add_remote,
+        ] {
             ui::set_visible(h, !image_mode);
         }
         let mut drives = vec![if ctrl.scanning_drives() {
@@ -903,6 +938,7 @@ impl OpticalScreen {
                 stretch(self.drive.h),
                 Node::button(self.refresh, 80),
                 Node::button(self.eject, 70),
+                Node::button(self.add_remote, 160),
             ]));
         }
         if shown(self.drive_note) {
@@ -1026,6 +1062,8 @@ impl Handler for OpticalScreen {
             OpticalAction::RefreshDrives
         } else if from == self.eject {
             OpticalAction::Eject
+        } else if from == self.add_remote {
+            OpticalAction::OpenAddRemote
         } else if from == self.image {
             self.image_menu();
             return;

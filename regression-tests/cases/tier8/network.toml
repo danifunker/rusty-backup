@@ -128,3 +128,28 @@ ui = [
 args = ["get", "{scratch}/restored.img", "/HELLO.TXT", "{scratch}/back.txt"]
 expect_exit = 0
 files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.network.optical-add-remote"
+description = "Add an rb-cli serve daemon from the Optical screen: the window closes once it connects and the daemon's drives join the drive list"
+level = "smoke"
+area = ["network", "optical"]
+shells = ["win32"]
+capabilities = ["optical.remote-drive"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}", "--read-only"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { activate = "optical.source_drive" },
+  { activate = "optical.add_remote" },
+  { wait = "Daemon address" },
+  { focus = "optical.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "optical.remote_connect" },
+  { wait_gone = "Daemon address", timeout_ms = 30000 },
+]

@@ -253,7 +253,11 @@ in check-group mode with the bundled icons); the screens and slices below are un
    which lists none, so picking a drive is checked by hand. Restore's remote target
    (`restore_remote.rs`): the switch, the daemon's address, its drives or an image name, in
    place of the local target rows; `flow.network.restore-to-remote-image` restores into an
-   image on a writable local daemon and reads it back. Left in 7b: Optical's remote daemons.
+   image on a writable local daemon and reads it back. Optical's Add remote daemon
+   (`optical_remote.rs`, on the drive row) connects and closes, and the daemon's drives join
+   the list (`flow.network.optical-add-remote`). With it slice 7b is complete: 57 win32 flows
+   pass, 2 known xfail. Left: slice 9 (packaging) and the Win32 column of
+   `docs/capabilities.md`.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and
