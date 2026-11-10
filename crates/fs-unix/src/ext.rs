@@ -138,6 +138,8 @@ pub(crate) struct ExtGroup {
 /// The inode fields the checker needs to decide in-use status and trace blocks.
 pub(crate) struct FsckInode {
     pub(crate) mode: u32,
+    pub(crate) links_count: u16,
+    pub(crate) dtime: u32,
     pub(crate) size: u64,
     pub(crate) flags: u32,
     pub(crate) block: [u8; 60],
@@ -150,8 +152,8 @@ struct InodeData {
     gid: u32,
     size: u64,
     mtime: i64,
-    #[allow(dead_code)]
     links_count: u16,
+    dtime: u32,
     flags: u32,
     block: [u8; 60], // raw i_block area (15 * 4 bytes)
 }
@@ -422,6 +424,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let uid_lo = u16::from_le_bytes([buf[0x02], buf[0x03]]) as u32;
         let size_lo = le32(&buf, 0x04) as u64;
         let mtime = le32(&buf, 0x10) as i64;
+        let dtime = le32(&buf, 0x14);
         let links_count = u16::from_le_bytes([buf[0x1A], buf[0x1B]]);
         let flags = le32(&buf, 0x20);
         let gid_lo = u16::from_le_bytes([buf[0x18], buf[0x19]]) as u32;
@@ -461,6 +464,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             size,
             mtime,
             links_count,
+            dtime,
             flags,
             block,
         })
@@ -831,6 +835,8 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let ino = self.read_inode(inum)?;
         Ok(FsckInode {
             mode: ino.mode,
+            links_count: ino.links_count,
+            dtime: ino.dtime,
             size: ino.size,
             flags: ino.flags,
             block: ino.block,
