@@ -229,7 +229,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, xfail) | tui, gtk, win32 | byte-compare |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck; UFS inject is R-089, xfail |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
-| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk | tui, gtk | byte-compare out of the ISO |
+| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally | tui, gtk | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk | against `rb-cli optical extract` |
 | `audio.toml` | play a CD-DA track | gtk (no TUI player by design) | the position advances |

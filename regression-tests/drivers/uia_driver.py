@@ -129,15 +129,23 @@ def choose(e, value):
     if exp:
         exp.Expand()
         time.sleep(0.3)
-    items = e.FindAll(U.TreeScope_Descendants, cond(U.UIA_ControlTypePropertyId, U.UIA_ListItemControlTypeId))
-    for i in range(items.Length):
-        it = items.GetElement(i)
-        if name_of(it).lower() == want or want in name_of(it).lower():
-            pattern(it, U.UIA_SelectionItemPatternId, U.IUIAutomationSelectionItemPattern).Select()
-            if exp:
-                exp.Collapse()
-            time.sleep(0.2)
-            return
+    # An opened list can take a moment to reach the UIA tree, so look again for a while.
+    end = time.time() + 3
+    while True:
+        items = e.FindAll(U.TreeScope_Descendants, cond(U.UIA_ControlTypePropertyId, U.UIA_ListItemControlTypeId))
+        for i in range(items.Length):
+            it = items.GetElement(i)
+            if name_of(it).lower() == want or want in name_of(it).lower():
+                pattern(it, U.UIA_SelectionItemPatternId, U.IUIAutomationSelectionItemPattern).Select()
+                if exp:
+                    exp.Collapse()
+                time.sleep(0.2)
+                return
+        if time.time() >= end:
+            break
+        time.sleep(0.2)
+    if exp:
+        exp.Collapse()
     raise Fail(f"a choice {value!r} on {name_of(e)!r}", visible_text())
 
 

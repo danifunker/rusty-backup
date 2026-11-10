@@ -411,6 +411,11 @@ impl InspectScreen {
         self.browse.set_icons();
     }
 
+    /// Open an image another screen hands over (Build Disk's "Open in Inspect").
+    pub fn open_image(&self, path: PathBuf) {
+        self.apply(InspectAction::Open(InspectSource::ImageFile(path)));
+    }
+
     /// Files dropped from Explorer, staged into the browsed volume while it is in Edit Mode.
     pub fn drop_paths(&self, paths: Vec<PathBuf>) -> bool {
         self.browse.drop_paths(paths)

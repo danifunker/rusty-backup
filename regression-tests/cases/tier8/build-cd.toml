@@ -3,14 +3,14 @@
 [meta]
 tier = 8
 group = "flow.build.cd"
-description = "Build a CD-ROM image from a host folder, then prove it with rb-cli."
+description = "Build disks and CD-ROM images on the Build Disk screen, then prove them with rb-cli."
 
 [[case]]
 id = "flow.build.efs-cd"
 description = "Build an IRIX EFS CD-ROM image filled from a host folder on the Build Disk screen, then read the file back from it with rb-cli"
 level = "smoke"
 area = ["build-disk", "optical"]
-shells = ["tui", "gtk"]
+shells = ["tui", "gtk", "win32"]
 capabilities = ["build.cd-efs", "build.cd-from-folder"]
 timeout_ms = 300000
 
@@ -45,3 +45,49 @@ stdout_contains = ["HELLO.TXT"]
 args = ["get", "{scratch}/efs.iso", "/HELLO.TXT", "{scratch}/back.txt"]
 expect_exit = 0
 files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.build.mbr-fat"
+description = "Build a 32 MiB MBR image with one FAT partition and a typed label on the Build Disk screen, walking the Partitions and Options steps, then check the table and the label with rb-cli"
+level = "smoke"
+area = ["build-disk"]
+shells = ["win32"]
+capabilities = ["build.partitioned", "build.format"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "Format: FAT12" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.label.0" },
+  { fill = "WIN32" },
+  { activate = "build_disk.next" },
+  { wait = "WIN32" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.build_another", timeout_ms = 240000 },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/mbr.img", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partition_table", value = "MBR" },
+]
+
+[[case.step]]
+args = ["ls", "{scratch}/mbr.img@1", "/"]
+expect_exit = 0
+
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/mbr.img@1"]
+expect_exit = 0
+stdout_contains = ["WIN32"]

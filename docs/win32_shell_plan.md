@@ -206,6 +206,12 @@ in check-group mode with the bundled icons); the screens and slices below are un
    or an image file, the region on a partitioned disk, the synthesized table, Write with the
    controller's own question, and the run. `disk_write::labels` holds its confirm button and
    outcome. `flow.disk_write.image-file` passes. With it slice 7a is complete.
+   Slice 5 (Build Disk) done (2026-11-10): `build_disk.rs` walks the controller's steps (Kind,
+   Output, Disk with the table, volume, preset and CD fields, Review with the typed device name,
+   Build with Open in Inspect), and `build_rows.rs` draws the Partitions rows (size, type with
+   the catalog's Pick..., name, boot, content, image, moves, the RDB handlers and the Mac driver)
+   and one Options group per formatted target. `flow.build.efs-cd` and the new
+   `flow.build.mbr-fat` pass. The UIA driver's `choose` now waits for an opened list's items.
    Slice 0 and the driver done (2026-11-09): the window, top bar, tab control with a page per
    tab, update banner, status line and log, the effect host (common file dialog after the
    scripted pick, Task Dialogs for Confirm and Choose, a small prompt window for AskText and

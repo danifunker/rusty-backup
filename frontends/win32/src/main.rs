@@ -18,6 +18,10 @@ mod browse;
 #[cfg(windows)]
 mod browse_bars;
 #[cfg(windows)]
+mod build_disk;
+#[cfg(windows)]
+mod build_rows;
+#[cfg(windows)]
 mod chd;
 #[cfg(windows)]
 mod combo;

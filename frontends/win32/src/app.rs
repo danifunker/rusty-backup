@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::backup::BackupScreen;
+use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{note, EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -78,6 +79,7 @@ pub struct App {
     inspect: Rc<InspectScreen>,
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
+    build: Rc<BuildScreen>,
     /// Commander, while it is open, on its own page over the whole window.
     commander: RefCell<Option<(Rc<CommanderScreen>, HWND)>>,
     /// What was showing when Commander opened, put back when it closes.
@@ -303,6 +305,7 @@ impl App {
         let mut inspect = None;
         let mut backup = None;
         let mut restore = None;
+        let mut build = None;
         let browse_page = crate::panel::page(window);
         ui::set_visible(browse_page, false);
         let pages = AppTab::ALL
@@ -342,7 +345,12 @@ impl App {
                         ));
                         page
                     }
-                    AppTab::Build | AppTab::Convert | AppTab::Optical | AppTab::Archives => {
+                    AppTab::Build => {
+                        let page = crate::panel::page(window);
+                        build = Some(BuildScreen::build(page, ctrl.notify(), host.clone()));
+                        page
+                    }
+                    AppTab::Convert | AppTab::Optical | AppTab::Archives => {
                         let text = format!(
                             "The {} screen arrives in a later slice of the Win32 shell.",
                             t.label()
@@ -357,6 +365,7 @@ impl App {
         let inspect = inspect.expect("the Inspect page");
         let backup = backup.expect("the Backup page");
         let restore = restore.expect("the Restore page");
+        let build = build.expect("the Build Disk page");
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -369,6 +378,7 @@ impl App {
             inspect,
             backup,
             restore,
+            build,
             commander: RefCell::default(),
             covered: RefCell::default(),
             log_shown: Cell::new(0),
@@ -406,9 +416,15 @@ impl App {
         self.inspect.tick();
         self.backup.set_devices(&devices);
         self.restore.set_devices(&devices);
+        self.build.set_devices(&devices);
         self.lock_tabs();
         self.backup.tick();
         self.restore.tick();
+        self.build.tick();
+        if let Some(path) = self.build.take_open_inspect() {
+            self.apply(AppAction::SelectTab(AppTab::Inspect));
+            self.inspect.open_image(path);
+        }
         let commander = self.commander.borrow().as_ref().map(|(c, _)| c.clone());
         if let Some(c) = commander {
             c.tick();
@@ -428,8 +444,10 @@ impl App {
         let inspect = self.inspect.running_job();
         let backup = self.backup.is_running().then_some("Backup");
         let restore = self.restore.is_running().then_some("Restore");
-        self.backup.set_busy(inspect.or(restore));
-        self.restore.set_busy(inspect.or(backup));
+        let build = self.build.is_running().then_some("Build Disk");
+        self.backup.set_busy(inspect.or(restore).or(build));
+        self.restore.set_busy(inspect.or(backup).or(build));
+        self.build.set_busy(inspect.or(backup).or(restore));
     }
 
     /// Open Commander over the whole window; the app's own controls hide until it closes.
