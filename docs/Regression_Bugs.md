@@ -19,6 +19,16 @@ finding depends on a fixture, the fixture is named.
 
 | ID | Severity | Area | Finding |
 |----|----------|------|---------|
+| ~~[R-100](#r-100)~~ | ~~Low~~ **FIXED** | `frontends/win32/src/effects.rs` | ~~A question opened from a list change held UI Automation~~ — questions open on their own message, 2026-11-11 |
+| ~~[R-099](#r-099)~~ | ~~Low~~ **FIXED** | `src/os/file_assoc.rs` | ~~"Open with" named the Win32 GUI by the shared `FileDescription`~~ — `FriendlyAppName` registered per GUI, 2026-11-11 |
+| ~~[R-098](#r-098)~~ | ~~Low~~ **FIXED** | `frontends/win32/src/report.rs` | ~~Check results cut off the stats line~~ — the line wraps, 2026-11-11 |
+| ~~[R-097](#r-097)~~ | ~~Low~~ **FIXED** | `src/model/disk_builder.rs` | ~~Build Disk's Review did not name the NTFS version~~ — `describe` names it, 2026-11-11 |
+| ~~[R-096](#r-096)~~ | ~~**Medium**~~ **FIXED** | `frontends/win32/src/build_disk.rs` | ~~"Open in Inspect" did nothing until another event~~ — the click wakes the app loop, 2026-11-11 |
+| ~~[R-095](#r-095)~~ | ~~**Medium**~~ **FIXED** | `frontends/win32/src/panel.rs` | ~~Pages did not scroll, so a short window hid controls~~ — pages scroll, 2026-11-11 |
+| ~~[R-094](#r-094)~~ | ~~**Medium**~~ **FIXED** | `frontends/win32/src/ui.rs` | ~~Moved controls left old pixels behind~~ — `SWP_NOCOPYBITS`, 2026-11-11 |
+| ~~[R-093](#r-093)~~ | ~~Low~~ **FIXED** | `crates/fs-pc/src/ntfs.rs` | ~~NTFS listings had no date~~ — the display string is set, 2026-11-11 |
+| ~~[R-092](#r-092)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-pc/src/ntfs.rs` | ~~NTFS reported 0 B used~~ — `$Bitmap` counted at open, 2026-11-11 |
+| ~~[R-091](#r-091)~~ | ~~**Medium**~~ **FIXED** | `crates/fs-pc/src/ntfs_fsck.rs` | ~~NTFS 1.2 fsck skipped records 16 to 23~~ — counts from `first_user_record`, 2026-11-11 |
 | ~~[R-088](#r-088)~~ | ~~**Medium**~~ **FIXED** | `src/cli/verbs/{restore,backup}.rs` | ~~`rb-cli restore` and `backup` could exit with log lines unprinted, final warnings included~~ — the verb waits for its log thread, 2026-11-06 |
 | ~~[R-087](#r-087)~~ | ~~**Medium**~~ **FIXED** | `src/fs/make_bootable.rs` | ~~`make-bootable` called a disk bootable when its DDR named a driver with no code behind it~~ — it looks for the code and installs the driver when there is none, 2026-11-06 |
 | ~~[R-086](#r-086)~~ | ~~**High**~~ **FIXED** | `src/backup` (`apm_extras`), `src/restore` | ~~A Mac disk restored from a zstd or raw backup, or from a CHD at a new size, came back with its driver partition zeroed, so it could not start up~~ — the driver is kept in `apm-extras.bin`, CHD restores copy it, and a backup that lost it gets the bundled driver, 2026-11-06 |
@@ -108,6 +118,75 @@ finding depends on a fixture, the fixture is named.
 | [R-011](#r-011) | **Partial** | `src/rbformats/containers/g64.rs` | Copy-protected G64 dumps: read-only refusal fixed; decode of non-standard GCR unverified (no fixture) |
 | ~~R-001~~ | ~~Doc~~ **FIXED** | `README.md` | ~~Partition-table list missing AHDI and X68000~~ — X68k and DSD rows added, guarded by a parity test, 2026-08-09 |
 | ~~R-002~~ | ~~Doc~~ **FIXED** | `src/fs/README.md` | ~~Capability table stale — ext listed as "planned"~~ — table deleted for a pointer at the live dispatch, 2026-08-09 |
+
+---
+
+## Found by the x86 Win32 smoke test, 2026-11-11
+
+Driven over VNC on a 32-bit Windows 10 VM (1024 x 573), with the CI build of `a4915d8b`. None is
+specific to x86. All fixed the same day. The NTFS version question also went, for an entry per version in the
+filesystem list.
+
+### R-100 — a Win32 question opened from a list's change held the automation call {#r-100}
+
+The NTFS version question opened its Task Dialog inside the combo's `CBN_SELCHANGE`, so the flow
+driver's UI Automation `Select()` waited on the dialog and the flow stalled. The question is gone
+(NTFS is listed once per version), and the effect host now opens every Confirm / Choose / text
+prompt on a message of its own (`WM_APP_QUESTION`), so no other question can do the same.
+
+### R-099 — "Open with" names the Win32 GUI by the shared version resource {#r-099}
+
+The chooser listed the app as "Backup and restore vintage computer hard disk images", the engine
+build script's `FileDescription`, which every binary shares. `register_file_associations` now writes
+`FriendlyAppName` (`WindowsGui::app_name`) on the ProgId's open verb and under
+`Applications\<exe>`, and unregistering removes it.
+
+### R-098 — Win32 Check results cut off the stats line {#r-098}
+
+The dialog gave the stats one row, so a long NTFS line lost its end at the right edge. The row count
+now follows the text's measured width, and `show` lays the dialog out again.
+
+### R-097 — Build Disk's Review did not name the NTFS version {#r-097}
+
+The version decides which Windows mounts the volume, yet Review read only `NTFS "label"`.
+`RowFormat::describe` now says `NTFS 1.2` or `NTFS 3.1`, in every shell and the CLI. Pinned by
+`build_disk_ntfs_version.toml` (`review`) and `flow.build.mbr-ntfs12`.
+
+### R-096 — Win32 "Open in Inspect" waited for the next event {#r-096}
+
+The button stored the request but returned no action, so the app loop that takes it did not run
+until something else woke it (in the VM, a click on the Inspect tab). It now wakes the loop. Pinned
+by `flow.build.mbr-ntfs12`, which waits for an Inspect-only control after the click.
+
+### R-095 — Win32 pages did not scroll {#r-095}
+
+A page taller than the window lost its bottom rows: at 573 px Restore's Restore button was out of
+reach, worse when maximised. `panel::scroll_area` shows a vertical scroll bar when the layout's
+`min_height` exceeds the page, and the page procedure scrolls on the bar and the wheel.
+
+### R-094 — Win32 controls left their old pixels behind when the layout moved them {#r-094}
+
+After a source loaded (Backup) or a dialog closed (Inspect), rows drew over each other until the
+window repainted. `SetWindowPos` copied each moved control's old bits; `ui::move_to` passes
+`SWP_NOCOPYBITS` and skips controls already in place.
+
+### R-093 — NTFS listings had no date {#r-093}
+
+The NTFS driver set `modified_unix` but never the `modified` string the browser shows, so every NTFS
+entry's Modified column was blank. Fixed in fs-pc 0.1.6 (`set_modified`).
+
+### R-092 — NTFS reported 0 B used {#r-092}
+
+`used_size` returned a field that only `ensure_used_bytes` filled, and nothing called it, so Inspect,
+`show fs-info` and the browser header said 0 B used. `open` now counts `$Bitmap`, streamed through a
+bit-counting writer rather than read whole. Fixed in fs-pc 0.1.6.
+
+### R-091 — NTFS 1.2 fsck skipped records 16 to 23 {#r-091}
+
+fsck counted user files from record 24, the 3.x layout. NT 4.0 and our 1.2 formatter start them at
+16, so a new folder counted as none and the NT4 fixtures were short (1456 files / 81 dirs on the Alpha
+disk). It uses `first_user_record` now. Fixed in fs-pc 0.1.6; pinned by
+`ntfs_12_user_records_are_counted_sized_and_dated` and the NT4 cases' counts.
 
 ---
 

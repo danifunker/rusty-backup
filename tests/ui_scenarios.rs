@@ -1031,9 +1031,25 @@ impl BuildDiskTarget {
 impl Target for BuildDiskTarget {
     fn act(&mut self, action: &str, arg: Option<&Value>) -> Result<Vec<Effect>, String> {
         use rusty_backup::controller::build_disk::{
-            purpose, BuildDiskAction as A, DiskDevice, DiskKind, FsKind, TableKind,
+            purpose, BuildDiskAction as A, DiskDevice, DiskKind, FsChoice, FsKind, TableKind,
         };
         use rusty_backup::controller::partition_edit::BuildAction;
+        // A filesystem id, or `ntfs:1.2` for one NTFS entry of the list.
+        let fs_choice = |id: &str| -> Result<FsChoice, String> {
+            let (kind, version) = match id.split_once(':') {
+                Some((k, v)) => (k, Some(v)),
+                None => (id, None),
+            };
+            let kind = FsKind::from_id(kind).ok_or_else(|| format!("no fs {kind:?}"))?;
+            let all = FsChoice::all();
+            match version {
+                None => Ok(kind.into()),
+                Some(v) => all
+                    .into_iter()
+                    .find(|c| c.kind == kind && c.ntfs.is_some_and(|n| n.label() == v))
+                    .ok_or_else(|| format!("no {id:?} in the list")),
+            }
+        };
         let row_arg = |arg: Option<&Value>| -> Result<(usize, String), String> {
             let (r, t) = arg_str(arg)?.split_once(':').ok_or("wants `row:value`")?;
             Ok((r.parse().map_err(|_| "bad row".to_string())?, t.to_string()))
@@ -1105,13 +1121,11 @@ impl Target for BuildDiskTarget {
                 let (row, id) = row_arg(arg)?;
                 let fs = match id.as_str() {
                     "empty" => None,
-                    id => Some(FsKind::from_id(id).ok_or_else(|| format!("no fs {id:?}"))?),
+                    id => Some(fs_choice(id)?),
                 };
                 A::SetRowFs { row, fs }
             }
-            "VolumeFs" => A::SetVolumeFs(
-                FsKind::from_id(arg_str(arg)?).ok_or_else(|| "no such fs".to_string())?,
-            ),
+            "VolumeFs" => A::SetVolumeFs(fs_choice(arg_str(arg)?)?),
             "Label" => {
                 let t = self
                     .ctl
@@ -1152,11 +1166,6 @@ impl Target for BuildDiskTarget {
                 }
             }
             "TypeDevicePath" => A::SetConfirmText(self.ctl.confirm_expected().unwrap_or_default()),
-            // The answer to the "which NTFS version" question, by button index.
-            "ChooseNtfsVersion" => A::Chose {
-                purpose: purpose::NTFS_VERSION,
-                choice: arg.and_then(Value::as_integer).ok_or("an index")? as usize,
-            },
             other => return Err(format!("BuildDiskController has no action {other:?}")),
         };
         Ok(self.ctl.apply(a))
@@ -1197,6 +1206,14 @@ impl Target for BuildDiskTarget {
                 None => String::new(),
             }),
             "opens" => Value::Integer(self.opens()),
+            // The Review line naming the volume or the first partition's contents.
+            "review" => Value::String(
+                self.ctl
+                    .review_lines()
+                    .into_iter()
+                    .find(|l| l.starts_with("One ") || l.starts_with("Partition 1:"))
+                    .unwrap_or_default(),
+            ),
             // The first formatted target's NTFS version, "" when it is not NTFS.
             "ntfs_version" => Value::String(
                 self.ctl

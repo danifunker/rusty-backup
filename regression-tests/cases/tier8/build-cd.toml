@@ -91,3 +91,50 @@ expect_exit = 0
 args = ["show", "fs-info", "{scratch}/mbr.img@1"]
 expect_exit = 0
 stdout_contains = ["WIN32"]
+
+[[case]]
+id = "flow.build.mbr-ntfs12"
+description = "Build an MBR image with an NTFS 1.2 partition from its own entry in the filesystem list (Review names the version), open it with Open in Inspect, then check the version, the used size and fsck's count of a new folder with rb-cli"
+level = "full"
+area = ["build-disk", "inspect"]
+shells = ["gtk", "win32"]
+capabilities = ["build.partitioned", "build.format", "build.open-inspect"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/nt4.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "64M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  # Each NTFS version is its own entry; picking it is the whole choice.
+  { choose = "NTFS 1.2 (Windows NT 3.5 to 4.0)" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.next" },
+  { wait = "NTFS 1.2" },
+  { activate = "build_disk.create" },
+  { wait = "Open in Inspect", timeout_ms = 240000 },
+  { activate = "build_disk.open_inspect" },
+  # Only the Inspect page shows it, so the tab switched without another click.
+  { wait = "Re-inspect" },
+]
+
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/nt4.img@1"]
+expect_exit = 0
+stdout_contains = ["NTFS 1.2"]
+stdout_matches = ['Used:\s+[1-9]']
+
+[[case.step]]
+args = ["mkdir", "{scratch}/nt4.img@1", "/TESTDIR"]
+expect_exit = 0
+
+[[case.step]]
+args = ["fsck", "{scratch}/nt4.img@1"]
+expect_exit = 0
+stdout_contains = ["0 files / 1 dirs checked"]

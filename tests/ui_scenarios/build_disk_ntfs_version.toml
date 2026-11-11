@@ -1,6 +1,6 @@
-# Picking NTFS asks which Windows will use the volume, since NT 3.5 to 4.0 mount only NTFS 1.2;
-# the answer sets the volume's version, the Options step can still change it, and it builds.
-name = "Build Disk: an NTFS volume asks for its version"
+# NTFS is listed once per version, since NT 3.5 to 4.0 mount only NTFS 1.2: picking an entry is the
+# whole choice, with no question; plain NTFS is 3.1, and the 1.2 entry builds a 1.2 volume.
+name = "Build Disk: each NTFS entry builds its version"
 vm = "build_disk"
 
 [[step]]
@@ -10,12 +10,12 @@ arg = "volume"
 [[step]]
 action = "VolumeFs"
 arg = "ntfs"
-effects = ["Choose"]
+effects = []
 expect = { ntfs_version = "3.1" }
 
 [[step]]
-action = "ChooseNtfsVersion"
-arg = 1
+action = "VolumeFs"
+arg = "ntfs:1.2"
 effects = []
 expect = { ntfs_version = "1.2" }
 
@@ -41,7 +41,7 @@ expect = { step = "Options" }
 
 [[step]]
 action = "Next"
-expect = { step = "Review" }
+expect = { step = "Review", review = 'One NTFS 1.2 "rusty-backup" volume' }
 
 [[step]]
 action = "Next"

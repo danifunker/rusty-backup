@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use rusty_backup::controller::build_disk::{
     cpm_presets, format_size, geometries, hints, ids, parse_size_field, BuildDiskAction,
-    BuildDiskController, FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, RowContent,
+    BuildDiskController, FormatTarget, FsChoice, FsKind, FsOption, MacDriver, OptionEdit, RowContent,
     TableKind, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use rusty_backup::controller::partition_edit::{type_choices, type_note, BuildAction};
@@ -33,7 +33,7 @@ type HandlerList = (Vec<(String, PathBuf)>, Vec<String>);
 enum Choice {
     Copy,
     Empty,
-    Fs(FsKind),
+    Fs(FsChoice),
     /// A source image is poured in; picked with Image..., not from the list.
     Image,
 }
@@ -85,7 +85,7 @@ impl RowCells {
             .map(|c| match c {
                 Choice::Copy => hints::ROW_COPY.to_string(),
                 Choice::Empty => "Empty".to_string(),
-                Choice::Fs(k) => k.display_name().to_string(),
+                Choice::Fs(k) => k.label(),
                 Choice::Image => "Image file".to_string(),
             })
             .collect();
@@ -189,7 +189,7 @@ impl RowsStep {
             v.push(Choice::Copy);
         }
         v.push(Choice::Empty);
-        v.extend(ctrl.filesystems().iter().map(|k| Choice::Fs(*k)));
+        v.extend(ctrl.filesystems().into_iter().map(Choice::Fs));
         v.push(Choice::Image);
         v
     }
@@ -256,7 +256,7 @@ impl RowsStep {
                 _ => "-".to_string(),
             };
             ui::set_text(cells.start, &start);
-            let choice = match (ctrl.row_content(i), ctrl.row_fs(i)) {
+            let choice = match (ctrl.row_content(i), ctrl.row_fs_choice(i)) {
                 (RowContent::Copy, _) => Choice::Copy,
                 (RowContent::Format, Some(k)) => Choice::Fs(k),
                 (RowContent::Image, _) => Choice::Image,

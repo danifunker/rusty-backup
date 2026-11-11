@@ -18,7 +18,7 @@ use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, labels, parse_size_field, purpose,
     BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdSidecars, DiskKind, FormatOptions,
-    FsKind, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
+    FsChoice, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
     AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
@@ -119,7 +119,7 @@ impl Default for BuildDiskState {
 enum Content {
     Copy,
     Empty,
-    Fs(FsKind),
+    Fs(FsChoice),
     Image,
 }
 
@@ -130,7 +130,7 @@ fn contents(can_copy: bool) -> Vec<Content> {
         v.push(Content::Copy);
     }
     v.push(Content::Empty);
-    v.extend(FsKind::ALL.iter().map(|k| Content::Fs(*k)));
+    v.extend(FsChoice::all().into_iter().map(Content::Fs));
     v.push(Content::Image);
     v
 }
@@ -447,7 +447,7 @@ impl BuildDiskState {
                 self.act(BuildDiskAction::Table(BuildAction::SetKind(k)));
             }
             Row::VolumeFs => {
-                let k = cycle(&FsKind::ALL, c.volume_fs(), forward);
+                let k = cycle(FsChoice::all().as_slice(), c.volume_fs_choice(), forward);
                 self.act(BuildDiskAction::SetVolumeFs(k));
             }
             Row::Preset => {
@@ -510,7 +510,7 @@ impl BuildDiskState {
                     RowContent::Image => Content::Image,
                     RowContent::Empty => Content::Empty,
                     RowContent::Copy => Content::Copy,
-                    RowContent::Format => c.row_fs(i).map_or(Content::Empty, Content::Fs),
+                    RowContent::Format => c.row_fs_choice(i).map_or(Content::Empty, Content::Fs),
                 };
                 match cycle(contents(c.row_can_copy(i)).as_slice(), cur, forward) {
                     Content::Copy => self.act(BuildDiskAction::SetRowCopy(i)),
@@ -939,7 +939,7 @@ impl App {
                         .unwrap_or_else(|| "fixed size".to_string());
                     (
                         "Filesystem".into(),
-                        format!("< {} >  {range}", c.volume_fs().display_name()),
+                        format!("< {} >  {range}", c.volume_fs_choice().label()),
                     )
                 }
                 Row::Preset => ("Preset".into(), format!("< {} >", c.preset().kind.label())),
@@ -1027,7 +1027,7 @@ impl App {
                         RowContent::Copy => "< Copy from the donor >".into(),
                         RowContent::Format => format!(
                             "< {} >",
-                            c.row_fs(*p).map(|k| k.display_name()).unwrap_or("?")
+                            c.row_fs_choice(*p).map_or("?".into(), |k| k.label())
                         ),
                         RowContent::Image => {
                             let r = v.rows.get(*p);
@@ -1221,6 +1221,7 @@ fn tick(label: &str, on: bool) -> (String, String) {
 mod tests {
     use super::super::{App, TabId, TABS};
     use super::*;
+    use crate::controller::build_disk::FsKind;
     use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(app: &mut App, code: KeyCode) {

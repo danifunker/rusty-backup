@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
     BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
-    FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
+    FormatTarget, FsChoice, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
     AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
@@ -472,7 +472,7 @@ impl BuildDiskTab {
                 self.size_row(ui, None);
             }
             DiskKind::Volume => {
-                let fs = self.ctl.volume_fs();
+                let fs = self.ctl.volume_fs_choice();
                 ui.horizontal(|ui| {
                     ui.label("Filesystem:");
                     if let Some(k) = fs_combo(ui, ids::VOLUME_FS, Some(fs), false) {
@@ -662,7 +662,7 @@ impl BuildDiskTab {
                     }
                     ui.horizontal(|ui| {
                         let content = self.ctl.row_content(i);
-                        let fs = self.ctl.row_fs(i);
+                        let fs = self.ctl.row_fs_choice(i);
                         let id = format!("{}_{i}", ids::ROW_CONTENT);
                         if self.ctl.row_can_copy(i) {
                             let copying = content == RowContent::Copy;
@@ -890,12 +890,12 @@ impl BuildDiskTab {
 fn fs_combo(
     ui: &mut egui::Ui,
     id: &str,
-    current: Option<FsKind>,
+    current: Option<FsChoice>,
     empty: bool,
-) -> Option<Option<FsKind>> {
+) -> Option<Option<FsChoice>> {
     let text = match current {
-        Some(k) => k.display_name(),
-        None => "Empty",
+        Some(k) => k.label(),
+        None => "Empty".to_string(),
     };
     let mut out = None;
     egui::ComboBox::from_id_salt(id)
@@ -906,11 +906,8 @@ fn fs_combo(
             if empty && ui.selectable_label(current.is_none(), "Empty").clicked() {
                 out = Some(None);
             }
-            for k in FsKind::ALL {
-                if ui
-                    .selectable_label(current == Some(k), k.display_name())
-                    .clicked()
-                {
+            for k in FsChoice::all() {
+                if ui.selectable_label(current == Some(k), k.label()).clicked() {
                     out = Some(Some(k));
                 }
             }
@@ -1100,7 +1097,7 @@ fn help(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_backup::controller::build_disk::purpose;
+    use rusty_backup::controller::build_disk::{purpose, FsKind};
     use rusty_backup::controller::log::LogStore;
 
     /// Renders every step headlessly: egui panics on a Grid whose rows disagree on cell count or
@@ -1118,13 +1115,13 @@ mod tests {
             tab.act(BuildDiskAction::Table(BuildAction::AddRow));
             tab.act(BuildDiskAction::SetRowFs {
                 row: 0,
-                fs: Some(FsKind::Ufs),
+                fs: Some(FsKind::Ufs.into()),
             });
             tab.act(BuildDiskAction::SetRowFs {
                 row: 1,
-                fs: Some(FsKind::Ntfs),
+                fs: Some(FsKind::Ntfs.into()),
             });
-            tab.act(BuildDiskAction::SetVolumeFs(FsKind::Cpm));
+            tab.act(BuildDiskAction::SetVolumeFs(FsKind::Cpm.into()));
             let mut log = LogStore::default();
             let mut progress = ProgressState::default();
             for _ in 0..8 {

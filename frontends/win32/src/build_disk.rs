@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{busy_elsewhere_notice, no_devices_hint, DiskDevice, Notify};
 use rusty_backup::controller::build_disk::{
     containers, hints, ids, labels, BuildDiskAction, BuildDiskController, CdLayout, CdOption,
-    CdSidecars, CdView, DiskKind, ExportFormat, FsKind, PresetKind, PresetView, Step, CD_AUTO_SIZE,
+    CdSidecars, CdView, DiskKind, ExportFormat, FsChoice, PresetKind, PresetView, Step, CD_AUTO_SIZE,
 };
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -123,7 +123,8 @@ struct DiskStep {
 
 impl DiskStep {
     fn build(page: HWND) -> DiskStep {
-        let fs_names: Vec<&str> = FsKind::ALL.iter().map(|k| k.display_name()).collect();
+        let fs_labels: Vec<String> = FsChoice::all().iter().map(|k| k.label()).collect();
+        let fs_names: Vec<&str> = fs_labels.iter().map(String::as_str).collect();
         let presets: Vec<&str> = PresetKind::ALL.iter().map(|p| p.label()).collect();
         let layouts: Vec<&str> = CdLayout::ALL.iter().map(|l| l.label()).collect();
         DiskStep {
@@ -182,6 +183,7 @@ pub struct BuildScreen {
     me: Weak<BuildScreen>,
     page: HWND,
     open_inspect: RefCell<Option<PathBuf>>,
+    notify: Arc<dyn Notify>,
     busy_note: HWND,
     step_line: HWND,
     kind_caption: HWND,
@@ -233,7 +235,7 @@ impl BuildScreen {
             "",
         );
         let screen = Rc::new_cyclic(|me: &Weak<BuildScreen>| BuildScreen {
-            ctrl: RefCell::new(BuildDiskController::new(notify)),
+            ctrl: RefCell::new(BuildDiskController::new(notify.clone())),
             host,
             devices: RefCell::default(),
             busy: Cell::new(None),
@@ -241,6 +243,7 @@ impl BuildScreen {
             me: me.clone(),
             page,
             open_inspect: RefCell::default(),
+            notify,
             busy_note: ui::label(page, ""),
             step_line: ui::cell_label(page, ""),
             kind_caption: ui::cell_label(page, &format!("{}:", labels::KIND)),
@@ -478,7 +481,7 @@ impl BuildScreen {
         for h in [d.volume_caption, d.volume.h] {
             ui::set_visible(h, vol);
         }
-        let at = FsKind::ALL.iter().position(|k| *k == ctrl.volume_fs());
+        let at = ctrl.volume_fs_choice().index_in(&FsChoice::all());
         d.volume.select(at.unwrap_or(0));
 
         // The size is set here unless a device fixes it (Output) or the preset sizes itself.
@@ -852,7 +855,7 @@ impl BuildScreen {
         }
         col.push(Node::row(foot));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        for (h, r) in layout::layout(&tree, area, dpi) {
+        for (h, r) in layout::layout(&tree, panel::scroll_area(self.page, &tree, area, dpi), dpi) {
             if ui::shown(h) {
                 ui::move_to(h, r);
             }
@@ -901,7 +904,7 @@ impl BuildScreen {
         }
         if from == d.volume.h {
             return Some(BuildDiskAction::SetVolumeFs(
-                *FsKind::ALL.get(d.volume.picked()?)?,
+                *FsChoice::all().get(d.volume.picked()?)?,
             ));
         }
         if from == d.preset.h {
@@ -996,6 +999,8 @@ impl BuildScreen {
             BuildDiskAction::BuildAnother
         } else if from == self.open {
             *self.open_inspect.borrow_mut() = self.ctrl.borrow().built_image().map(PathBuf::from);
+            // No action reaches the app loop from here, so wake it to take the request.
+            self.notify.wake();
             return None;
         } else {
             return None;

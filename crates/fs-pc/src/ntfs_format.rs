@@ -282,7 +282,7 @@ impl NtfsVersion {
     pub fn readers(self) -> &'static str {
         match self {
             NtfsVersion::V1_2 => "Windows NT 3.5, 3.51 and 4.0, and every later Windows",
-            NtfsVersion::V3_1 => "Windows XP and later (and NT 4.0 SP4 or later, read-write)",
+            NtfsVersion::V3_1 => "Windows 2000 and later (and NT 4.0 SP4 or later, read-write)",
         }
     }
 

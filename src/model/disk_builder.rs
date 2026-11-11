@@ -173,10 +173,18 @@ impl RowFormat {
 
     /// The filesystem and, when it has one, its label: `FAT12 / FAT16 / FAT32 "DOS"`.
     pub fn describe(&self) -> String {
+        // The NTFS version decides which Windows can mount it, so the review names it.
+        let name = match self.kind {
+            FsKind::Ntfs => format!(
+                "NTFS {}",
+                self.opts.ntfs_version.unwrap_or_default().label()
+            ),
+            _ => self.kind.display_name().to_string(),
+        };
         if self.kind.caps().label_max == 0 {
-            self.kind.display_name().to_string()
+            name
         } else {
-            format!("{} {:?}", self.kind.display_name(), self.opts.label)
+            format!("{name} {:?}", self.opts.label)
         }
     }
 

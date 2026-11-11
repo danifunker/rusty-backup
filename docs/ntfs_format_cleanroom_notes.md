@@ -133,8 +133,8 @@ matrix.
 
 `create_ntfs_version(.., NtfsVersion::V1_2)` writes the on-disk version NT 3.5 to 4.0 (before SP4)
 mount; they refuse major version 3 with STATUS_WRONG_VOLUME. `rb-cli new volume ntfs
---ntfs-version 1.2`, `rb-cli build --ntfs-version 1.2` and Build Disk (which asks when NTFS is
-picked) reach it, and the defragmenting clone keeps a source volume's version. Default output is
+--ntfs-version 1.2`, `rb-cli build --ntfs-version 1.2` and Build Disk (whose filesystem list has an
+"NTFS 1.2 (Windows NT 3.5 to 4.0)" entry) reach it, and the defragmenting clone keeps a source volume's version. Default output is
 still 3.1, byte for byte as before.
 
 ### License discipline

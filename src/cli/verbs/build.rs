@@ -349,7 +349,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             };
             c.apply(A::SetRowFs {
                 row,
-                fs: Some(fs_named(fs.as_str())?),
+                fs: Some(fs_named(fs.as_str())?.into()),
             });
             if let Some(label) = label {
                 if let Some(t) = c.format_targets().into_iter().find(|t| t.row == Some(row)) {
@@ -386,7 +386,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 bail!("--partition / --format / --fill need --table");
             }
             act(&mut c, A::SetKind(DiskKind::Volume));
-            act(&mut c, A::SetVolumeFs(fs_named(fs)?));
+            act(&mut c, A::SetVolumeFs(fs_named(fs)?.into()));
             if args.label.is_some() || args.geometry.is_some() {
                 let mut opts = c.format_targets()[0].opts.clone();
                 if let Some(label) = &args.label {
@@ -514,7 +514,7 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
         let typed_type = typed[row].then(|| c.table_view().rows[row].type_text.clone());
         c.apply(A::SetRowFs {
             row,
-            fs: Some(fs_named(fs.as_str())?),
+            fs: Some(fs_named(fs.as_str())?.into()),
         });
         // A type the spec named wins over the one the filesystem suggests.
         if let Some(t) = typed_type {
