@@ -352,6 +352,21 @@ def choose(n, value):
         click(n)
         time.sleep(0.5)
         want = value.casefold()
+        # A searchable list opens with its search box focused: typing narrows it, the first
+        # Down enters the list at the first match, and Enter takes it.
+        search = any(role_of(c) in ("text", "entry") and has_state(c, Atspi.StateType.FOCUSED)
+                     and not is_inside(c, n) for c in nodes(APP))
+        debug("choose", repr(value), "search box:", search)
+        if search:
+            xdo("type", "--delay", "40", value)
+            time.sleep(0.6)
+            xdo("key", "Down")
+            time.sleep(0.15)
+            xdo("key", "Return")
+            time.sleep(0.4)
+            if wait_until(lambda: chosen(n).casefold().startswith(want), 3):
+                return
+            raise Fail(f"{name_of(n)!r} set to {value!r}", visible_text())
         row = None
         end = time.time() + 5
         while row is None and time.time() < end:
@@ -362,18 +377,6 @@ def choose(n, value):
                     break
             time.sleep(0.2)
         debug("choose", repr(value), "combo", repr(name_of(n)), "row found:", row is not None)
-        if row is None:
-            # A long list renders only the rows in view; its search box narrows it to the entry.
-            xdo("type", "--delay", "40", value)
-            time.sleep(0.6)
-            end = time.time() + 3
-            while row is None and time.time() < end:
-                for c in nodes(APP):
-                    if c is not n and showing(c) and name_of(c).casefold().startswith(want)                             and not is_inside(c, n) and row_of(c) is not None:
-                        row = row_of(c)
-                        break
-                time.sleep(0.2)
-            debug("typed", repr(value), "row found:", row is not None)
         if row is not None:
             # Where the popover's focus starts differs between GTK versions: go to the top, count down.
             entries = popover_entries(row)
