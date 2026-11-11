@@ -2967,7 +2967,8 @@ jobs:
           # Downloader assets (no extension / *.sh) are named explicitly so they
           # ship as standalone, un-versioned release assets the database can hit
           # via `releases/latest/download/`.
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" -o -name "rb-cli-mini-armv7" -o -name "rb-daemon.sh" \) -exec cp {} release-files/ \;
+          # The Win32 preview is CI's bare test exe; the release ships the Win32 zips and installers.
+          find artifacts -type f -not -path "*Win32-preview*" \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" -o -name "rb-cli-mini-armv7" -o -name "rb-daemon.sh" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       # Build a download-picker table from the (fixed) build matrix. Links
