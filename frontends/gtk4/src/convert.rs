@@ -70,6 +70,7 @@ struct Shown {
     run: Option<Snapshot>,
     running: bool,
     problem: Option<String>,
+    outcome: Option<(String, bool)>,
     start_label: String,
     strip: Option<(f32, String)>,
 }
@@ -110,6 +111,7 @@ pub struct ConvertScreen {
     start: gtk::Button,
     cancel: gtk::Button,
     problem: gtk::Label,
+    outcome: gtk::Label,
     run_jobs: JobList,
     strip: gtk::Revealer,
     strip_bar: gtk::ProgressBar,
@@ -245,6 +247,8 @@ impl ConvertScreen {
         actions.append(&cancel);
         actions.append(&problem);
         content.append(&actions);
+        let outcome = line();
+        content.append(&outcome);
         content.append(run_jobs.root());
 
         let strip_bar = gtk::ProgressBar::builder()
@@ -325,6 +329,7 @@ impl ConvertScreen {
                 start,
                 cancel,
                 problem,
+                outcome,
                 run_jobs,
                 strip,
                 strip_bar,
@@ -543,6 +548,7 @@ impl ConvertScreen {
                 .get()
                 .map(busy_elsewhere_notice)
                 .or_else(|| c.start_problem()),
+            outcome: c.outcome(),
             start_label: c.start_label(),
             strip: c.strip(),
         }
@@ -649,6 +655,13 @@ impl ConvertScreen {
         }
         self.cancel.set_visible(s.running);
         set_line(&self.problem, s.problem.as_deref().filter(|_| !s.running));
+        let (outcome, error) = s.outcome.clone().unzip();
+        set_line(&self.outcome, outcome.as_deref());
+        if error == Some(true) {
+            self.outcome.add_css_class("error");
+        } else {
+            self.outcome.remove_css_class("error");
+        }
         let runs: Vec<(Snapshot, bool)> = s.run.iter().map(|j| (j.clone(), true)).collect();
         self.run_jobs.show(&runs);
     }

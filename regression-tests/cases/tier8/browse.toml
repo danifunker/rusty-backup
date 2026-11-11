@@ -10,7 +10,7 @@ id = "flow.browse.inspect-extract-all"
 description = "Open a classic HFS floppy on Inspect, browse its partition, Extract All into a host folder, and compare the file with the one rb-cli put in"
 level = "smoke"
 area = ["inspect", "browse"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.extract"]
 timeout_ms = 120000
 
@@ -35,7 +35,8 @@ ui = [
   { activate = "browse.extract_all" },
   { wait_file = "{scratch}/rusty-backup/HELLO.TXT", timeout_ms = 30000 },
   { activate = "browse.close" },
-  { wait = "Calc min" },
+  # Back on the partition table: Win32's "Calc min" column, GTK's "Min Size".
+  { wait = "Calc min || Min Size" },
 ]
 
 [[case.step]]
@@ -49,7 +50,7 @@ id = "flow.browse.inspect-new-folder"
 description = "Browse a FAT floppy from Inspect, turn on Edit Mode, stage a new folder through the name prompt, apply it, and list the image with rb-cli"
 level = "smoke"
 area = ["inspect", "browse", "files"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.new-folder"]
 timeout_ms = 120000
 
@@ -70,7 +71,9 @@ ui = [
   { activate = "browse.new_folder" },
   { focus = "prompt.text" },
   { fill = "NEWDIR" },
-  { activate = "prompt.ok" },
+  { activate = "prompt.ok", only = "win32" },
+  # GTK's prompt buttons carry the prompt's own word, not an id.
+  { activate = "Create", only = "gtk" },
   { wait = "Apply Edits (1)" },
   { activate = "browse.apply" },
   { wait_gone = "Apply Edits (1)" },
@@ -86,7 +89,7 @@ id = "flow.browse.inspect-edit-text"
 description = "Browse a FAT floppy from Inspect, open its only file in the text editor, replace the text, save and apply, and compare the file rb-cli reads back"
 level = "smoke"
 area = ["inspect", "browse", "files"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.edit-text"]
 timeout_ms = 120000
 

@@ -543,19 +543,12 @@ impl ConvertScreen {
             .as_ref()
             .map(|(f, _)| (f.clamp(0.0, 1.0) * 100.0) as u32);
         crate::inspect::set_progress(self.run_progress, run.is_some(), pct);
-        let outcome = match c.last_result().filter(|_| !running) {
-            Some(Ok(r)) => Some((
-                format!(
-                    "Converted {} file(s); {} failed, {} skipped.",
-                    r.succeeded, r.failed, r.skipped
-                ),
-                (r.failed > 0).then_some(Tone::Error),
-            )),
-            Some(Err(e)) => Some((e.clone(), Some(Tone::Error))),
-            None => None,
-        };
-        let (text, tone) = outcome.unzip();
-        set_line(self.outcome, text.as_deref(), tone.flatten());
+        let (text, error) = c.outcome().unzip();
+        set_line(
+            self.outcome,
+            text.as_deref(),
+            error.filter(|e| *e).map(|_| Tone::Error),
+        );
         let free = !running && self.busy.get().is_none();
         for h in [
             self.pick_file,

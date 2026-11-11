@@ -51,7 +51,7 @@ id = "flow.restore.share-with-inspect"
 description = "A backup folder opened on Restore shows in Inspect too, and the top bar's Close Backup closes it on both tabs"
 level = "smoke"
 area = ["restore", "inspect"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["restore.backup-folder", "inspect.open-backup"]
 timeout_ms = 120000
 

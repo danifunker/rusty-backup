@@ -262,6 +262,22 @@ pub fn add_controller_labels(controls: &mut Controls, rb_cli: &Path) {
 
 /// Resolve `name` for `shell`: a listed controller id, or a literal label.
 fn control(controls: &Controls, shell: &str, name: &str) -> Control {
+    let listed = |id: &str| {
+        controls
+            .get(shell)
+            .and_then(|m| m.get(id))
+            .or_else(|| controls.get("all").and_then(|m| m.get(id)))
+            .or_else(|| controls.get("controller").and_then(|m| m.get(id)))
+            .cloned()
+    };
+    // `build_disk.label.0` is the first of `build_disk.label`'s copies, unless listed on its own.
+    if listed(name).is_none() {
+        if let Some((base, n)) = name.rsplit_once('.') {
+            if let (Ok(n), Some(c)) = (n.parse::<usize>(), listed(base)) {
+                return Control { nth: Some(n), ..c };
+            }
+        }
+    }
     controls
         .get(shell)
         .and_then(|m| m.get(name))
@@ -794,6 +810,23 @@ mod tests {
         ));
         assert!(!names(" Warning+ Expand HFS Volume ----", "Expand"));
         assert!(!names("Target size (MiB):  8", "Target"));
+    }
+
+    #[test]
+    fn a_numbered_id_is_its_base_ids_nth_copy() {
+        let mut gtk = std::collections::BTreeMap::new();
+        gtk.insert(
+            "build_disk.label".to_string(),
+            super::Control {
+                label: Some("Label".into()),
+                ..Default::default()
+            },
+        );
+        let mut controls = super::Controls::new();
+        controls.insert("gtk".into(), gtk);
+        let c = super::control(&controls, "gtk", "build_disk.label.2");
+        assert_eq!((c.label.as_deref(), c.nth), (Some("Label"), Some(2)));
+        assert!(super::control(&controls, "gtk", "file.2.txt").literal);
     }
 
     #[test]

@@ -57,7 +57,7 @@ id = "flow.network.backup-remote-connect"
 description = "Connect to an rb-cli serve daemon from Backup's Remote Drive window and see its drive list (none from an unelevated daemon, the host's from an elevated one)"
 level = "smoke"
 area = ["network", "backup"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["backup.remote-source"]
 timeout_ms = 120000
 
@@ -84,7 +84,7 @@ id = "flow.network.restore-to-remote-image"
 description = "Restore a backup folder from the Restore screen into an image file on an rb-cli serve daemon, then read the file back out of it"
 level = "smoke"
 area = ["network", "restore"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["restore.remote-target", "restore.run"]
 timeout_ms = 180000
 
@@ -135,7 +135,7 @@ id = "flow.network.optical-add-remote"
 description = "Add an rb-cli serve daemon from the Optical screen: the window closes once it connects and the daemon's drives join the drive list"
 level = "smoke"
 area = ["network", "optical"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["optical.remote-drive"]
 timeout_ms = 120000
 

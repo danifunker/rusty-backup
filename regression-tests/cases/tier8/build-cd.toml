@@ -51,7 +51,7 @@ id = "flow.build.mbr-fat"
 description = "Build a 32 MiB MBR image with one FAT partition and a typed label on the Build Disk screen, walking the Partitions and Options steps, then check the table and the label with rb-cli"
 level = "smoke"
 area = ["build-disk"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["build.partitioned", "build.format"]
 timeout_ms = 300000
 
@@ -66,7 +66,7 @@ ui = [
   { fill = "32M" },
   { activate = "build_disk.next" },
   { focus = "build_disk.row_content.0" },
-  { choose = "Format: FAT12" },
+  { choose = "FAT12" },
   { activate = "build_disk.next" },
   { focus = "build_disk.label.0" },
   { fill = "WIN32" },

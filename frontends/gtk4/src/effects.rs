@@ -212,6 +212,9 @@ impl EffectHost {
             .text(plain(&spec.initial).as_ref())
             .activates_default(true)
             .build();
+        entry.update_property(&[gtk::accessible::Property::Label(
+            plain(&spec.prompt).as_ref(),
+        )]);
         let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
         error.add_css_class("error");
         error.set_text(&plain(spec.error.as_deref().unwrap_or("")));

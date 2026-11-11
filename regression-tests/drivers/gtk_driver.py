@@ -22,6 +22,16 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
 
+DEBUG = bool(os.environ.get("RB_DRIVER_DEBUG"))
+
+
+def debug(*parts):
+    """Append a trace line to the file RB_DRIVER_DEBUG names, when it is set."""
+    if DEBUG:
+        with open(os.environ["RB_DRIVER_DEBUG"], "a") as f:
+            print(*parts, file=f)
+
+
 BUTTON_ROLES = ("push button", "button")
 COMBO_ROLES = ("combo box",)
 ENTRY_ROLES = ("text", "entry", "password text", "spin button")
@@ -51,6 +61,16 @@ def nodes(root, limit=40000):
         except Exception:
             pass
     return out
+
+
+def text_of(n):
+    """A node's text, or ""; the static form works where get_text_iface() returns the node itself."""
+    try:
+        if n.get_text_iface() is None:
+            return ""
+        return Atspi.Text.get_text(n, 0, Atspi.Text.get_character_count(n)) or ""
+    except Exception:
+        return ""
 
 
 def has_state(n, state):
@@ -97,13 +117,7 @@ def visible_text():
             desc = n.get_description() or ""
         except Exception:
             desc = ""
-        text = ""
-        try:
-            t = n.get_text_iface()
-            if t is not None and role in ENTRY_ROLES:
-                text = t.get_text(0, t.get_character_count())
-        except Exception:
-            pass
+        text = text_of(n) if role in ENTRY_ROLES else ""
         if name or desc or text:
             lines.append(f"{role}: {name}" + (f" -- {desc}" if desc else "")
                          + (f" [{text}]" if text else ""))
@@ -134,6 +148,14 @@ def rank(n):
     return 2
 
 
+def is_title_button(n):
+    """A window's own Close / Minimize / Maximize: no flow means these, and "Close" would quit."""
+    try:
+        return (n.get_description() or "").endswith(" the window")
+    except Exception:
+        return False
+
+
 def find(label, wait=20.0, pred=None, nth=0):
     """The `nth` showing node named `label` (trailing ':' ignored), a control before a mere label."""
     want = label.rstrip(":").strip()
@@ -141,7 +163,7 @@ def find(label, wait=20.0, pred=None, nth=0):
     while True:
         controls, best = [], None
         for n in nodes(APP):
-            if not named(n, want) or not showing(n):
+            if not named(n, want) or not showing(n) or is_title_button(n):
                 continue
             if pred is not None and not pred(n):
                 continue
@@ -173,8 +195,7 @@ def shows_one(text):
         try:
             if text in name_of(n) or text in (n.get_description() or ""):
                 return True
-            t = n.get_text_iface()
-            if t is not None and text in t.get_text(0, t.get_character_count()):
+            if text in text_of(n):
                 return True
         except Exception:
             continue
@@ -220,10 +241,19 @@ def label_of(n):
     return f"{role_of(n)} {name_of(n)!r}"
 
 
-def activate(n):
+def activate(n, want=None):
     """A button's action; a list row (a popover entry) by focus and Return; else a real click."""
     if role_of(n) in BUTTON_ROLES and has_action(n):
         n.get_action_iface().do_action(0)
+        time.sleep(0.4)
+        return
+    # A table cell can hold several buttons (Browse beside Check): its centre is not this one.
+    want = want or name_of(n)
+    inner = [c for c in nodes(n, limit=40) if c is not n and role_of(c) in BUTTON_ROLES
+             and name_of(c) == want and has_action(c)]
+    debug("activate", label_of(n), "inner buttons:", len(inner))
+    if inner:
+        inner[0].get_action_iface().do_action(0)
         time.sleep(0.4)
         return
     row = row_of(n)
@@ -331,21 +361,23 @@ def choose(n, value):
                     row = row_of(c)
                     break
             time.sleep(0.2)
+        debug("choose", repr(value), "combo", repr(name_of(n)), "row found:", row is not None)
         if row is not None:
-            # The popover opens on the current value: count the rows between it and the target.
+            # Where the popover's focus starts differs between GTK versions: go to the top, count down.
             entries = popover_entries(row)
-            now = combo_value(n)
+            debug("entries", entries, "now", repr(combo_value(n)))
             idx = [i for i, e in enumerate(entries) if e.casefold().startswith(want)]
-            cur = [i for i, e in enumerate(entries) if e == now]
-            if idx and cur:
-                step = idx[0] - cur[0]
-                for _ in range(abs(step)):
-                    xdo("key", "Down" if step > 0 else "Up")
+            if idx:
+                xdo("key", "Home")
+                time.sleep(0.12)
+                for _ in range(idx[0]):
+                    xdo("key", "Down")
                     time.sleep(0.12)
                 xdo("key", "Return")
                 time.sleep(0.4)
-                if wait_until(lambda: combo_value(n).casefold().startswith(want), 3):
+                if wait_until(lambda: chosen(n).casefold().startswith(want), 3):
                     return
+                debug("after Home and", idx[0], "Down the value reads", repr(chosen(n)))
             # A drop-down may move its value as the keyboard moves, so either sign means "there".
             here = lambda: (has_state(row, Atspi.StateType.FOCUSED)
                             or has_state(row, Atspi.StateType.SELECTED)
@@ -367,6 +399,11 @@ def choose(n, value):
             activate(n)
         return
     raise Fail(f"{label_of(n)} to take a choice", visible_text())
+
+
+def chosen(n):
+    """A combo's value: a combo row's value label, or a bare drop-down's own name (which is it)."""
+    return combo_value(n) or name_of(n)
 
 
 def popover_entries(row):
@@ -475,7 +512,7 @@ def run(op):
             click(find(op["via"], nth=nth))
             time.sleep(0.4)
             nth = 0
-        activate(find(arg, nth=nth))
+        activate(find(arg, nth=nth), arg)
     elif kind == "pick":
         set_pick(arg)
     elif kind == "key":

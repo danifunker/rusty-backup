@@ -10,7 +10,7 @@ id = "flow.disk_write.image-file"
 description = "Write a FAT floppy image to an image file from Restore's Write Image File, with Synthesize partition table ticked, and read its file back"
 level = "smoke"
 area = ["restore"]
-shells = ["win32"]
+shells = ["gtk", "win32"]
 capabilities = ["restore.write-image"]
 timeout_ms = 180000
 

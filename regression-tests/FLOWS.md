@@ -173,6 +173,23 @@ to `skip-tool` with the reason.
 Without sudo, Xvfb can be unpacked: `apt-get download xvfb` then
 `dpkg-deb -x xvfb_*.deb <dir>`, and put `<dir>/usr/bin` on `PATH`.
 
+### GTK flows under WSL
+
+The GTK flows run on a Windows machine through WSL (Ubuntu 24.04), with no root. Clone the
+repo inside WSL (building from `/mnt/c` is very slow), then:
+
+1. `scripts/wsl-gtk-env.sh` unpacks the AT-SPI typelib, Xvfb, xauth, xkbcomp and xdotool
+   into `~/gtkenv` (GTK 4 dev packages, `python3-gi` and dbus must already be installed).
+2. Build `rb-cli`, `regression-tests/runner` and `frontends/gtk4` (`--release`).
+3. `RB_FIXTURE_ROOT=/mnt/<drive>/... scripts/wsl-gtk-run.sh
+   regression-tests/runner/target/release/rb-regress run --shell gtk --tiers 8`.
+
+`wsl-gtk-run.sh` runs the command in a user namespace: Xvfb runs `xkbcomp` from a fixed
+`/usr/bin` and needs a writable `/tmp/.X11-unix` (WSLg mounts it read-only), so it overlays
+`~/gtkenv`'s tools on `/usr/bin` and mounts a private `/tmp/.X11-unix`. WSL has no sound
+device, and ALSA's null sink does not keep time there, so `flow.audio.cdda-play` fails under
+WSL only: the track drains at once.
+
 ### What the GTK driver works around
 
 Each of these failed silently until it was handled; keep them in mind before
@@ -195,6 +212,21 @@ Each of these failed silently until it was handled; keep them in mind before
   a click to commit typed text can land on its "-" button (8 MiB came out 7).
 - The AT-SPI bus launcher's daemon outlives a plain kill: every child runs in
   its own process group.
+- Where a drop-down's popover starts its focus differs between GTK versions: a
+  choice presses Home and counts Down from the top. A bare `GtkDropDown` is
+  named by its value (it ignores an accessible label), so it is found by its
+  default and its value read from its name.
+- A window's own Close / Minimize / Maximize ("... the window") are never a
+  flow's control: "Close" would quit the app.
+- With AT-SPI 2.52, `get_text_iface()` returns the node itself, so an entry's
+  text is read with the static `Atspi.Text.get_text`; the old call raised and
+  every typed value looked empty.
+- A table cell can hold several buttons (Browse beside Check), named all
+  together: activate presses the one inside with the wanted name, as a click on
+  the cell's centre lands on its neighbour.
+- A grouped GTK 4 check button is a radio, but AT-SPI 2.52 reports it as a
+  check box; `choose` takes either (but `on` / `off` only switch).
+- `RB_DRIVER_DEBUG=<file>` appends a trace of choices and activations there.
 
 ## Finding what to press
 
@@ -223,17 +255,17 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 
 | File | Flows | Shells | Checks |
 |---|---|---|---|
-| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (win32) | tui, gtk, win32 | restore + byte-compare; the .vhd read back |
-| `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (win32) | tui, gtk, win32 | byte-compare |
-| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | win32 | inspect + byte-compare; GTK and the TUI can join |
+| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32 | restore + byte-compare; the .vhd read back |
+| `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (gtk, win32) | tui, gtk, win32 | byte-compare |
+| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32 | inspect + byte-compare; the TUI can join |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32 | byte-compare |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
-| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
-| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (win32) | tui, gtk, win32 | restore + byte-compare |
+| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
+| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32) | tui, gtk, win32 | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32 | against `rb-cli optical extract` |
-| `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry) | win32 | the reopened form |
-| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | win32 | a file out of the CHD against the same file out of the ISO |
-| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | win32 | against `rb-cli archive extract` |
-| `audio.toml` | play a CD-DA track | gtk (no TUI player by design; win32 has the player but no silent audio sink to play into) | the position advances |
-| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | win32 | the TUI and GTK can join once their extract-to-folder step is checked |
+| `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry) | gtk, win32 | the reopened form |
+| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32 | a file out of the CHD against the same file out of the ISO |
+| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32 | against `rb-cli archive extract` |
+| `audio.toml` | play a CD-DA track | gtk, win32 (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
+| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32 | the TUI can join once its extract-to-folder step is checked |

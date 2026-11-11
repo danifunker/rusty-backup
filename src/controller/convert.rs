@@ -524,6 +524,23 @@ impl ConvertController {
         self.result.as_ref()
     }
 
+    /// The finished run's one-line outcome, and whether it is an error; `None` while running.
+    pub fn outcome(&self) -> Option<(String, bool)> {
+        if self.is_running() {
+            return None;
+        }
+        Some(match self.result.as_ref()? {
+            Ok(r) => (
+                format!(
+                    "Converted {} file(s); {} failed, {} skipped.",
+                    r.succeeded, r.failed, r.skipped
+                ),
+                r.failed > 0,
+            ),
+            Err(e) => (e.clone(), true),
+        })
+    }
+
     /// Log lines since the last call, for the shell's log panel.
     pub fn take_log(&mut self) -> Vec<(LogLevel, String)> {
         std::mem::take(&mut self.log)

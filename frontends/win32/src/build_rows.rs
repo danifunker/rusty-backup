@@ -85,7 +85,7 @@ impl RowCells {
             .map(|c| match c {
                 Choice::Copy => hints::ROW_COPY.to_string(),
                 Choice::Empty => "Empty".to_string(),
-                Choice::Fs(k) => format!("Format: {}", k.display_name()),
+                Choice::Fs(k) => k.display_name().to_string(),
                 Choice::Image => "Image file".to_string(),
             })
             .collect();
