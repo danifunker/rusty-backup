@@ -149,6 +149,39 @@ impl<T> Node<T> {
         }
     }
 
+    /// The tree without the controls `keep` turns down: a pair goes with its field, and a row or
+    /// column left with only spaces goes too, so hidden controls take no room.
+    pub fn prune(self, keep: &dyn Fn(&T) -> bool) -> Option<Node<T>> {
+        let solid = |n: &Node<T>| !matches!(n, Node::Space(_));
+        match self {
+            Node::Leaf { ref id, .. } => keep(id).then_some(self),
+            Node::Space(_) => Some(self),
+            Node::Row { children, gap } => {
+                let children: Vec<_> = children.into_iter().filter_map(|c| c.prune(keep)).collect();
+                children.iter().any(solid).then_some(Node::Row { children, gap })
+            }
+            Node::Column { children, gap } => {
+                let children: Vec<_> = children.into_iter().filter_map(|c| c.prune(keep)).collect();
+                children.iter().any(solid).then_some(Node::Column { children, gap })
+            }
+            Node::Pair {
+                label,
+                field,
+                label_width,
+                height,
+            } => field.prune(keep).map(|field| Node::Pair {
+                label,
+                field: Box::new(field),
+                label_width,
+                height,
+            }),
+            Node::Inset { child, margin } => child.prune(keep).map(|child| Node::Inset {
+                child: Box::new(child),
+                margin,
+            }),
+        }
+    }
+
     /// What the node asks of a column's main axis (its height).
     fn height(&self) -> Size {
         match self {
@@ -451,6 +484,21 @@ mod tests {
             MARGIN,
         );
         assert_eq!(n.min_height(), ROW + 3 * ROW + ROW + 3 * GAP + 2 * MARGIN);
+    }
+
+    #[test]
+    fn pruning_drops_hidden_controls_and_the_rows_they_leave_empty() {
+        let n = Node::column(vec![
+            Node::button(1, 75),
+            Node::row(vec![Node::button(2, 75), Node::Space(Size::Stretch(1))]),
+            Node::pair(3, 80, Node::field(4)),
+            Node::Space(Size::Stretch(1)),
+            Node::button(5, 75),
+        ]);
+        let shown = n.prune(&|id| *id != 2 && *id != 4).unwrap();
+        assert_eq!(shown.min_height(), 2 * ROW + 2 * GAP);
+        let out = layout(&shown, r(0, 0, 200, 200), 96);
+        assert_eq!(out, vec![(1, r(0, 0, 75, 23)), (5, r(0, 177, 75, 23))]);
     }
 
     #[test]

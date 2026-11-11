@@ -855,7 +855,7 @@ impl BuildScreen {
         }
         col.push(Node::row(foot));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        for (h, r) in layout::layout(&tree, panel::scroll_area(self.page, &tree, area, dpi), dpi) {
+        for (h, r) in panel::place(self.page, tree, area, dpi) {
             if ui::shown(h) {
                 ui::move_to(h, r);
             }

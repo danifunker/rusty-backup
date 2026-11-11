@@ -162,7 +162,8 @@ by `flow.build.mbr-ntfs12`, which waits for an Inspect-only control after the cl
 
 A page taller than the window lost its bottom rows: at 573 px Restore's Restore button was out of
 reach, worse when maximised. `panel::scroll_area` shows a vertical scroll bar when the layout's
-`min_height` exceeds the page, and the page procedure scrolls on the bar and the wheel.
+`min_height` exceeds the page, and the page procedure scrolls on the bar and the wheel. `panel::place`
+lays out only the showing controls, so another step's hidden rows leave no gap above the buttons.
 
 ### R-094 — Win32 controls left their old pixels behind when the layout moved them {#r-094}
 

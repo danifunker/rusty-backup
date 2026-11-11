@@ -230,50 +230,49 @@ pub fn client(hwnd: HWND) -> (Rect, u32) {
     )
 }
 
-/// Where `tree` goes in `area`: the area itself while every showing control fits, else a taller
-/// area moved up by the panel's scroll position, with the vertical scroll bar shown to reach the rest.
-pub fn scroll_area(hwnd: HWND, tree: &layout::Node<HWND>, area: Rect, dpi: u32) -> Rect {
+/// Lay `tree`'s showing controls out in `area`; when they need more height than it has, in a
+/// taller area moved up by the panel's scroll position, with the vertical scroll bar shown.
+pub fn place(
+    hwnd: HWND,
+    tree: layout::Node<HWND>,
+    area: Rect,
+    dpi: u32,
+) -> Vec<(HWND, Rect)> {
     use windows::Win32::UI::Controls::{SetScrollInfo, ShowScrollBar};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetScrollPos, SCROLLINFO, SB_VERT, SIF_PAGE, SIF_RANGE,
     };
-    // Laid out at its full height, the lowest showing control is how tall the page must be; the
-    // hidden controls of other steps sit below it and take nothing on screen.
-    let full = Rect {
-        h: layout::scale(tree.min_height(), dpi),
-        ..area
+    // Hidden controls (another step's, a closed section's) take no room, on screen or in the measure.
+    let Some(tree) = tree.prune(&|h| crate::ui::shown(*h)) else {
+        return Vec::new();
     };
-    let need = layout::layout(tree, full, dpi)
-        .iter()
-        .filter(|(h, _)| crate::ui::shown(*h))
-        .map(|(_, r)| r.y + r.h)
-        .max()
-        .unwrap_or(0)
-        + layout::scale(layout::MARGIN, dpi);
+    let need = layout::scale(tree.min_height(), dpi);
     // SAFETY: scroll bar calls on our own window.
-    unsafe {
+    let area = unsafe {
         if need <= area.h {
             let _ = ShowScrollBar(hwnd, SB_VERT, false);
-            return area;
+            area
+        } else {
+            let si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE,
+                nMin: 0,
+                nMax: need - 1,
+                nPage: area.h.max(0) as u32,
+                ..Default::default()
+            };
+            SetScrollInfo(hwnd, SB_VERT, &si, true);
+            let _ = ShowScrollBar(hwnd, SB_VERT, true);
+            let pos = GetScrollPos(hwnd, SB_VERT);
+            Rect {
+                x: area.x,
+                y: area.y - pos,
+                w: area.w,
+                h: need,
+            }
         }
-        let si = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_RANGE | SIF_PAGE,
-            nMin: 0,
-            nMax: need - 1,
-            nPage: area.h.max(0) as u32,
-            ..Default::default()
-        };
-        SetScrollInfo(hwnd, SB_VERT, &si, true);
-        let _ = ShowScrollBar(hwnd, SB_VERT, true);
-        let pos = GetScrollPos(hwnd, SB_VERT);
-        Rect {
-            x: area.x,
-            y: area.y - pos,
-            w: area.w,
-            h: need,
-        }
-    }
+    };
+    layout::layout(&tree, area, dpi)
 }
 
 /// Move the panel's scroll position for a `WM_VSCROLL` (`code`) or a wheel turn (`wheel`); true
