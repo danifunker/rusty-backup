@@ -1499,7 +1499,18 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
           # glib is pinned to one exact version in the next step rather than to a
           # pocket: see the comment there.
-          sudo apt-get update
+          # apt-get update exits 0 when every fetch fails, so check the riscv64 lists
+          # loaded and retry: a mirror or DNS outage otherwise surfaces as "no glib".
+          for try in 1 2 3 4 5; do
+            sudo apt-get update -o Acquire::Retries=3 || true
+            if apt-cache madison libglib2.0-dev:riscv64 | grep -q riscv64; then break; fi
+            if [ "$try" = 5 ]; then
+              echo "::error::ports.ubuntu.com gave no riscv64 package lists after 5 tries: a mirror or DNS outage"
+              exit 1
+            fi
+            echo "riscv64 package lists missing (try $try); retrying in $((try * 30))s"
+            sleep $((try * 30))
+          done
 
       - name: Install riscv64 cross toolchain + GTK/GL sysroot
         run: |
@@ -2165,7 +2176,18 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
           # glib is pinned to one exact version in the next step rather than to a
           # pocket: see the comment there.
-          sudo apt-get update
+          # apt-get update exits 0 when every fetch fails, so check the riscv64 lists
+          # loaded and retry: a mirror or DNS outage otherwise surfaces as "no glib".
+          for try in 1 2 3 4 5; do
+            sudo apt-get update -o Acquire::Retries=3 || true
+            if apt-cache madison libglib2.0-dev:riscv64 | grep -q riscv64; then break; fi
+            if [ "$try" = 5 ]; then
+              echo "::error::ports.ubuntu.com gave no riscv64 package lists after 5 tries: a mirror or DNS outage"
+              exit 1
+            fi
+            echo "riscv64 package lists missing (try $try); retrying in $((try * 30))s"
+            sleep $((try * 30))
+          done
 
       - name: Install riscv64 cross toolchain + GTK4/libadwaita sysroot
         run: |
