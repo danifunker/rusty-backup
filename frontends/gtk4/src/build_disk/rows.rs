@@ -263,6 +263,9 @@ impl RowCells {
         let names: Vec<String> = list.iter().map(|c| label_of(*c)).collect();
         let labels: Vec<&str> = names.iter().map(String::as_str).collect();
         let content = gtk::DropDown::from_strings(&labels);
+        // Forty-odd filesystems: typing filters the list.
+        content.set_expression(Some(crate::form::string_search()));
+        content.set_enable_search(true);
         content.set_widget_name(&format!("{}.{i}", ids::ROW_CONTENT));
         if can_copy {
             content.set_tooltip_text(Some(hints::ROW_COPY));

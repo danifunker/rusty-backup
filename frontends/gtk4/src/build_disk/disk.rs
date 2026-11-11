@@ -407,6 +407,8 @@ impl DiskStep {
         let names: Vec<String> = FsChoice::all().iter().map(|k| k.label()).collect();
         let labels: Vec<&str> = names.iter().map(String::as_str).collect();
         let volume = combo("Filesystem", ids::VOLUME_FS, &labels);
+        volume.set_expression(Some(crate::form::string_search()));
+        volume.set_enable_search(true);
         let s = send.clone();
         volume.connect_selected_notify(move |r| {
             if let Some(k) = FsChoice::all().get(r.selected() as usize) {

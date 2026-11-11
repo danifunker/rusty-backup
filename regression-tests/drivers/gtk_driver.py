@@ -363,30 +363,17 @@ def choose(n, value):
             time.sleep(0.2)
         debug("choose", repr(value), "combo", repr(name_of(n)), "row found:", row is not None)
         if row is None:
-            # A long list renders only the rows in view, and AT-SPI does not follow the focus
-            # inside it, so try each depth: Home, Down k times, Enter, and read the value.
-            # A pick can rebuild the row (a new type), so find the control afresh by its place
-            # among the combos: GTK names a combo by its value, which each try changes.
-            combos = lambda: [c for c in nodes(APP) if role_of(c) in COMBO_ROLES and showing(c)]
-            place = next((i for i, c in enumerate(combos()) if c == n), None)
-            for k in range(80):
-                if k:
-                    now = combos()
-                    if place is not None and place < len(now):
-                        n = now[place]
-                    click(n)
-                    time.sleep(0.5)
-                xdo("key", "Home")
-                time.sleep(0.12)
-                for _ in range(k):
-                    xdo("key", "Down")
-                    time.sleep(0.05)
-                xdo("key", "Return")
-                time.sleep(0.4)
-                debug("probe", k, repr(chosen(n)), repr(combo_value(n)))
-                if chosen(n).casefold().startswith(want):
-                    return
-            raise Fail(f"{name_of(n)!r} set to {value!r}", visible_text())
+            # A long list renders only the rows in view; its search box narrows it to the entry.
+            xdo("type", "--delay", "40", value)
+            time.sleep(0.6)
+            end = time.time() + 3
+            while row is None and time.time() < end:
+                for c in nodes(APP):
+                    if c is not n and showing(c) and name_of(c).casefold().startswith(want)                             and not is_inside(c, n) and row_of(c) is not None:
+                        row = row_of(c)
+                        break
+                time.sleep(0.2)
+            debug("typed", repr(value), "row found:", row is not None)
         if row is not None:
             # Where the popover's focus starts differs between GTK versions: go to the top, count down.
             entries = popover_entries(row)
