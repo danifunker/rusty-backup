@@ -363,25 +363,23 @@ def choose(n, value):
             time.sleep(0.2)
         debug("choose", repr(value), "combo", repr(name_of(n)), "row found:", row is not None)
         if row is None:
-            # A long list renders only the rows in view; walk down from the top until the focused one is it.
-            def focused_is_it():
-                for c in nodes(APP):
-                    r = row_of(c) if showing(c) and name_of(c).casefold().startswith(want) else None
-                    if r is not None and not is_inside(c, n) and (
-                            has_state(r, Atspi.StateType.FOCUSED) or has_state(r, Atspi.StateType.SELECTED)):
-                        return True
-                return False
-            xdo("key", "Home")
-            time.sleep(0.12)
-            for _ in range(120):
-                if focused_is_it():
-                    xdo("key", "Return")
-                    time.sleep(0.4)
-                    if wait_until(lambda: chosen(n).casefold().startswith(want), 3):
-                        return
-                    break
-                xdo("key", "Down")
+            # A long list renders only the rows in view, and AT-SPI does not follow the focus
+            # inside it, so try each depth: Home, Down k times, Enter, and read the value.
+            for k in range(80):
+                if k:
+                    click(n)
+                    time.sleep(0.5)
+                xdo("key", "Home")
                 time.sleep(0.12)
+                for _ in range(k):
+                    xdo("key", "Down")
+                    time.sleep(0.05)
+                xdo("key", "Return")
+                time.sleep(0.4)
+                debug("probe", k, repr(chosen(n)), repr(combo_value(n)))
+                if chosen(n).casefold().startswith(want):
+                    return
+            raise Fail(f"{name_of(n)!r} set to {value!r}", visible_text())
         if row is not None:
             # Where the popover's focus starts differs between GTK versions: go to the top, count down.
             entries = popover_entries(row)

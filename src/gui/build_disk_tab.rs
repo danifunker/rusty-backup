@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
+    containers, cpm_presets, format_size, geometries, hints, ids, labels, parse_size_field,
     BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
     FormatTarget, FsChoice, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
     AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
@@ -875,7 +875,7 @@ impl BuildDiskTab {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if let Some(img) = self.ctl.built_image() {
-                if ui.button("Open in Inspect").clicked() {
+                if ui.button(labels::OPEN_INSPECT).clicked() {
                     self.open_inspect = Some(img.to_path_buf());
                 }
             }

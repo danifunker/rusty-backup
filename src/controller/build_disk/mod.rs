@@ -196,6 +196,7 @@ pub mod labels {
     pub const NEXT: &str = "Next";
     pub const CREATE: &str = "Create Disk";
     pub const BUILD_ANOTHER: &str = "Build Another";
+    pub const OPEN_INSPECT: &str = "Open in Inspect";
     pub const PICK_IMAGE: &str = "Save As...";
     pub const CD_LAYOUT: &str = "Layout";
     pub const CD_AUTO_SIZE: &str = "Size to the folder";
@@ -207,6 +208,7 @@ pub mod labels {
         (ids::NEXT, NEXT),
         (ids::CREATE, CREATE),
         (ids::BUILD_ANOTHER, BUILD_ANOTHER),
+        (ids::OPEN_INSPECT, OPEN_INSPECT),
         (ids::PICK_IMAGE, PICK_IMAGE),
         (ids::CD_LAYOUT, CD_LAYOUT),
         (ids::CD_AUTO_SIZE, CD_AUTO_SIZE),

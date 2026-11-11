@@ -118,7 +118,7 @@ ui = [
   { activate = "build_disk.next" },
   { wait = "NTFS 1.2" },
   { activate = "build_disk.create" },
-  { wait = "Open in Inspect", timeout_ms = 240000 },
+  { wait = "build_disk.open_inspect", timeout_ms = 240000 },
   { activate = "build_disk.open_inspect" },
   # Only the Inspect page shows it, so the tab switched without another click.
   { wait = "Re-inspect" },

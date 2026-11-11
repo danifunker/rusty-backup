@@ -272,7 +272,7 @@ impl BuildScreen {
             job_progress: progress,
             cancel: ui::button(page, "Cancel", ids::CANCEL),
             outcome: ui::label(page, ""),
-            open: ui::button(page, "Open in Inspect", ids::OPEN_INSPECT),
+            open: ui::button(page, labels::OPEN_INSPECT, ids::OPEN_INSPECT),
             another: ui::button(page, labels::BUILD_ANOTHER, ids::BUILD_ANOTHER),
             blocked: ui::cell_label(page, ""),
             back: ui::button(page, "Back", ids::BACK),
