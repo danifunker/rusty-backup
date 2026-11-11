@@ -135,7 +135,7 @@ impl<T> Node<T> {
             Node::Space(Size::Fixed(v)) => *v,
             Node::Space(Size::Stretch(_)) => 0,
             Node::Row { children, .. } => {
-                children.iter().map(Node::min_height).max().unwrap_or(0)
+                across(children).map(Node::min_height).max().unwrap_or(0)
             }
             Node::Column { children, gap } => {
                 let n = children.len() as i32;
@@ -484,6 +484,14 @@ mod tests {
             MARGIN,
         );
         assert_eq!(n.min_height(), ROW + 3 * ROW + ROW + 3 * GAP + 2 * MARGIN);
+    }
+
+    #[test]
+    fn an_indenting_space_does_not_make_its_row_tall() {
+        let indented = Node::row(vec![Node::Space(Size::Fixed(120)), Node::button(1, 75)]);
+        assert_eq!(indented.min_height(), ROW);
+        let n = Node::column(vec![indented, Node::Space(Size::Fixed(10))]);
+        assert_eq!(n.min_height(), ROW + GAP + 10);
     }
 
     #[test]
