@@ -298,11 +298,11 @@ impl BuildDiskScreen {
                 Reply::Picked { purpose, path } => {
                     screen.apply(BuildDiskAction::Picked { purpose, path })
                 }
-                // The wizard only ever asks for a file.
-                Reply::Confirmed { .. }
-                | Reply::Answered { .. }
-                | Reply::Chose { .. }
-                | Reply::CloseScreen => {}
+                // The wizard asks for files, and which NTFS version a new NTFS target gets.
+                Reply::Chose { purpose, choice } => {
+                    screen.apply(BuildDiskAction::Chose { purpose, choice })
+                }
+                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
             }
         })
     }

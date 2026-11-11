@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use rusty_backup::controller::build_disk::{
     cpm_presets, format_size, geometries, hints, ids, parse_size_field, BuildDiskAction,
     BuildDiskController, FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, RowContent,
-    TableKind, AFFS_VARIANTS, SECTOR_SIZES,
+    TableKind, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use rusty_backup::controller::partition_edit::{type_choices, type_note, BuildAction};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -676,6 +676,13 @@ fn build_field(page: HWND, t: &FormatTarget, opt: FsOption, id: &str) -> Option<
                 .map(|s| (format!("{s} bytes"), OptionEdit::SectorSize(*s)))
                 .collect(),
         ),
+        FsOption::NtfsVersion => pick(
+            "NTFS version",
+            NTFS_VERSIONS
+                .iter()
+                .map(|(v, n)| (n.to_string(), OptionEdit::NtfsVersion(*v)))
+                .collect(),
+        ),
         FsOption::BtreeSizes | FsOption::MinCatalog => None,
     }
 }
@@ -688,6 +695,7 @@ fn picked_index(t: &FormatTarget, edits: &[OptionEdit]) -> usize {
         OptionEdit::CpmPreset(p) => o.cpm_preset.as_deref() == Some(p.as_str()),
         OptionEdit::Geometry(g) => o.geometry.as_deref() == Some(g.as_str()),
         OptionEdit::SectorSize(s) => o.sector_size.unwrap_or(512) == *s,
+        OptionEdit::NtfsVersion(v) => o.ntfs_version.unwrap_or_default() == *v,
         _ => false,
     });
     at.unwrap_or(0)

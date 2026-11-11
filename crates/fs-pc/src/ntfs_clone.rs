@@ -19,7 +19,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use crate::ntfs::NtfsFilesystem;
-use crate::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+use crate::ntfs_format::{create_ntfs_version, NtfsFormatParams, NtfsGeometry, NtfsVersion};
 use disk_core::entry::FileEntry;
 use disk_core::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
@@ -157,9 +157,13 @@ where
         source.bytes_per_sector() as u32,
     )?;
 
+    // Keep the source's version: an NT 4.0 volume cloned to 3.1 no longer mounts on NT 4.0.
+    let (major, minor) = source.ntfs_version();
+    let version = NtfsVersion::from_major_minor(major, minor).unwrap_or_default();
     log_cb(&format!(
-        "NTFS clone: formatting blank {} MiB target volume (cluster {}, sector {})",
+        "NTFS clone: formatting blank {} MiB NTFS {} target volume (cluster {}, sector {})",
         target_size / (1024 * 1024),
+        version.label(),
         geometry.cluster_size(),
         geometry.bytes_per_sector,
     ));
@@ -169,7 +173,7 @@ where
             "create tempfile for NTFS clone: {e}"
         )))
     })?;
-    create_ntfs(
+    create_ntfs_version(
         &mut tmp,
         &NtfsFormatParams {
             total_size: target_size,
@@ -177,6 +181,7 @@ where
             mft_records_hint: mft_records,
             label,
         },
+        version,
     )?;
     tmp.seek(SeekFrom::Start(0))?;
 
@@ -201,7 +206,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ntfs_format::ntfs_min_packed_size;
+    use crate::ntfs_format::{create_ntfs, ntfs_min_packed_size};
     use std::io::Cursor;
 
     fn blank(size: u64, cluster: u32, sector: u32) -> Cursor<Vec<u8>> {
@@ -297,6 +302,41 @@ mod tests {
                 dst.read_file(n, n.size as usize).unwrap(),
                 vec![1, 2, 3, 4, 5, 6, 7, 8],
                 "{label}"
+            );
+        }
+    }
+
+    /// Cloning an NT 4.0 volume to 3.1 made a disk NT 4.0 could no longer mount.
+    #[test]
+    fn clone_keeps_the_source_ntfs_version() {
+        for version in [NtfsVersion::V1_2, NtfsVersion::V3_1] {
+            let mut img = Cursor::new(Vec::<u8>::new());
+            let params = NtfsFormatParams {
+                total_size: 32 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(512, 512).unwrap(),
+                mft_records_hint: 128,
+                label: Some("SRC".to_string()),
+            };
+            create_ntfs_version(&mut img, &params, version).unwrap();
+            img.seek(SeekFrom::Start(0)).unwrap();
+            let mut src = NtfsFilesystem::open(img, 0).unwrap();
+            let root = src.root().unwrap();
+            write_file(&mut src, &root, "BOOT.INI", b"[boot loader]");
+            EditableFilesystem::sync_metadata(&mut src).unwrap();
+
+            let size = ntfs_min_packed_size(src.used_size(), 64, 512);
+            let mut out = Cursor::new(Vec::<u8>::new());
+            stream_defragmented_ntfs(&mut src, size, &mut out, &mut |_| {}, &mut |_| {}).unwrap();
+            out.seek(SeekFrom::Start(0)).unwrap();
+            let mut dst = NtfsFilesystem::open(out, 0).unwrap();
+            assert_eq!(dst.ntfs_version(), version.major_minor(), "{version:?}");
+            let report = crate::ntfs_fsck::fsck_ntfs(&mut dst).unwrap();
+            assert!(report.errors.is_empty(), "{version:?}: {:?}", report.errors);
+            let droot = dst.root().unwrap();
+            let e = dst.list_directory(&droot).unwrap().remove(0);
+            assert_eq!(
+                dst.read_file(&e, e.size as usize).unwrap(),
+                b"[boot loader]"
             );
         }
     }

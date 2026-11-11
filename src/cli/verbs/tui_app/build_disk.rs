@@ -19,9 +19,10 @@ use crate::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, labels, parse_size_field, purpose,
     BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdSidecars, DiskKind, FormatOptions,
     FsKind, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
-    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
+    AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
+use crate::controller::ChoiceSpec;
 use crate::controller::{Controller as _, Effect};
 
 pub(super) const HINTS_BUILD_DISK: &[KeyHint] = &[
@@ -91,6 +92,8 @@ pub(super) struct BuildDiskState {
     pub(super) device_pick: bool,
     pub(super) device_sel: usize,
     pub(super) status: Option<String>,
+    /// A question the controller asked (which NTFS version), answered by its keys.
+    pub(super) question: Option<ChoiceSpec>,
     log: Vec<String>,
 }
 
@@ -104,6 +107,7 @@ impl Default for BuildDiskState {
             device_pick: false,
             device_sel: 0,
             status: None,
+            question: None,
             log: Vec::new(),
         }
     }
@@ -161,10 +165,10 @@ impl BuildDiskState {
                 Effect::PickFolder(spec) => {
                     self.picker = Some((spec.purpose, FilePicker::new(PickKind::Dir, spec.title)));
                 }
+                Effect::Choose(spec) => self.question = Some(spec),
                 Effect::Confirm(_)
                 | Effect::AskPassword(_)
                 | Effect::AskText(_)
-                | Effect::Choose(_)
                 | Effect::OpenUrl(_)
                 | Effect::CopyToClipboard(_)
                 | Effect::CloseScreen
@@ -562,6 +566,11 @@ impl BuildDiskState {
                         let s = cycle(&SECTOR_SIZES, o.sector_size.unwrap_or(512), forward);
                         OptionEdit::SectorSize(s).apply(&mut o);
                     }
+                    FsOption::NtfsVersion => {
+                        let all: Vec<_> = NTFS_VERSIONS.iter().map(|v| v.0).collect();
+                        let v = cycle(&all, o.ntfs_version.unwrap_or_default(), forward);
+                        OptionEdit::NtfsVersion(v).apply(&mut o);
+                    }
                     _ => return false,
                 }
                 self.set_opts(r, o);
@@ -577,6 +586,19 @@ impl App {
     pub(super) fn handle_build_disk_key(&mut self, code: KeyCode) -> bool {
         let devices = self.shell.devices().to_vec();
         let s = self.build_disk.get_or_insert_with(BuildDiskState::default);
+        if let Some(q) = &s.question {
+            let choice = match code {
+                KeyCode::Esc => Some(q.dismiss),
+                KeyCode::Char(k) => q.choices.iter().position(|c| c.key == k),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                let purpose = q.purpose;
+                s.question = None;
+                s.act(BuildDiskAction::Chose { purpose, choice });
+            }
+            return true;
+        }
         if let Some((which, picker)) = s.picker.as_mut() {
             let which = *which;
             match picker.handle_key(code) {
@@ -1092,6 +1114,14 @@ impl App {
                             "  Sector size".into(),
                             format!("< {} >", x.sector_size.unwrap_or(512)),
                         ),
+                        FsOption::NtfsVersion => {
+                            let v = x.ntfs_version.unwrap_or_default();
+                            let label = NTFS_VERSIONS.iter().find(|n| n.0 == v).map(|n| n.1);
+                            (
+                                "  NTFS version".into(),
+                                format!("< {} >", label.unwrap_or("?")),
+                            )
+                        }
                         FsOption::BtreeSizes | FsOption::MinCatalog => continue,
                     }
                 }
@@ -1134,6 +1164,22 @@ impl App {
         }
         if let Some(st) = &s.status {
             lines.push(Line::styled(st.clone(), pal.warn()));
+        }
+        if let Some(q) = &s.question {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(q.title.clone(), pal.accent()));
+            for l in q.message.lines() {
+                lines.push(Line::styled(format!("  {l}"), pal.warn()));
+            }
+            let keys: Vec<String> = q
+                .choices
+                .iter()
+                .map(|c| format!("{} {}", c.key, c.label))
+                .collect();
+            lines.push(Line::styled(
+                format!("  {}", keys.join("   ")),
+                pal.accent(),
+            ));
         }
         for l in &s.log {
             lines.push(Line::styled(l.clone(), pal.dim()));

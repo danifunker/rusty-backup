@@ -11,7 +11,7 @@ use rusty_backup::controller::build_disk::{
     containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
     BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
     FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
-    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
+    AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -85,10 +85,10 @@ impl BuildDiskTab {
                 Reply::Picked { purpose, path } => {
                     self.act(BuildDiskAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. }
-                | Reply::Answered { .. }
-                | Reply::Chose { .. }
-                | Reply::CloseScreen => {}
+                Reply::Chose { purpose, choice } => {
+                    self.act(BuildDiskAction::Chose { purpose, choice })
+                }
+                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
             }
         }
         if !self.pending_fx.is_empty() {
@@ -1061,6 +1061,23 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                                     .clicked()
                                 {
                                     OptionEdit::SectorSize(s).apply(&mut o);
+                                }
+                            }
+                        });
+                }
+                FsOption::NtfsVersion => {
+                    ui.label("NTFS version:");
+                    let now = o.ntfs_version.unwrap_or_default();
+                    let shown = NTFS_VERSIONS
+                        .iter()
+                        .find(|v| v.0 == now)
+                        .map_or("?", |v| v.1);
+                    egui::ComboBox::from_id_salt(("bd_ntfsv", key))
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (v, label) in NTFS_VERSIONS {
+                                if ui.selectable_label(now == v, label).clicked() {
+                                    OptionEdit::NtfsVersion(v).apply(&mut o);
                                 }
                             }
                         });

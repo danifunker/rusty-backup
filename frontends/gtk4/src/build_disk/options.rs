@@ -6,7 +6,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use rusty_backup::controller::build_disk::{
     cpm_presets, geometries, hints, ids, parse_size_field, BuildDiskAction, FormatTarget, FsKind,
-    FsOption, OptionEdit, AFFS_VARIANTS, SECTOR_SIZES,
+    FsOption, OptionEdit, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES,
 };
 
 use super::ActionFn;
@@ -162,6 +162,19 @@ fn field(
                 s.map(|s| OptionEdit::SectorSize(*s))
             };
             pick("Sector size", &labels, read, Rc::new(make))
+        }
+        FsOption::NtfsVersion => {
+            let labels: Vec<&str> = NTFS_VERSIONS.iter().map(|v| v.1).collect();
+            let all: Vec<_> = NTFS_VERSIONS.iter().map(|v| v.0).collect();
+            let read = |t: &FormatTarget| {
+                let all: Vec<_> = NTFS_VERSIONS.iter().map(|v| v.0).collect();
+                opts_index(
+                    all.as_slice(),
+                    Some(t.opts.ntfs_version.unwrap_or_default()),
+                )
+            };
+            let make = move |i: u32| all.get(i as usize).map(|v| OptionEdit::NtfsVersion(*v));
+            pick("NTFS version", &labels, read, Rc::new(make))
         }
         // `FormatTarget::fields` leaves these to the CLI.
         FsOption::BtreeSizes | FsOption::MinCatalog => Field::Switch(switch("", id), |_| false),

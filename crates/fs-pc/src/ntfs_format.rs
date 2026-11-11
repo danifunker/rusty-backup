@@ -21,8 +21,9 @@ use disk_core::rust173::IntIsMultipleOf as _;
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::ntfs_tables::{
-    ATTRDEF, ROOT_SECDESC, SECURE_SDH_IDXROOT, SECURE_SDS, SECURE_SII_IDXROOT, SEC_DESC_100,
-    UPCASE, UPCASE_INFO,
+    ATTRDEF, NT4_ATTRDEF, NT4_SD_METAFILE, NT4_SD_METAFILE_RW, NT4_SD_ROOT, NT4_UPCASE,
+    ROOT_SECDESC, SECURE_SDH_IDXROOT, SECURE_SDS, SECURE_SII_IDXROOT, SEC_DESC_100, UPCASE,
+    UPCASE_INFO,
 };
 use disk_core::filesystem::FilesystemError;
 
@@ -240,6 +241,89 @@ impl NtfsGeometry {
     }
 }
 
+/// The on-disk NTFS version a volume is formatted as. Windows NT 3.5 / 3.51 / 4.0 (before SP4)
+/// mount only major version 1; Windows 2000 and later read both and upgrade 1.2 on first mount.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NtfsVersion {
+    /// NTFS 1.2: Windows NT 3.5, 3.51 and 4.0.
+    V1_2,
+    /// NTFS 3.1: Windows XP and later (what Windows 2000 SP and up write).
+    #[default]
+    V3_1,
+}
+
+impl NtfsVersion {
+    /// `$VOLUME_INFORMATION` major and minor version.
+    pub fn major_minor(self) -> (u8, u8) {
+        match self {
+            NtfsVersion::V1_2 => (1, 2),
+            NtfsVersion::V3_1 => (3, 1),
+        }
+    }
+
+    /// The version a volume reports (`major.minor`), when this formatter can write it.
+    pub fn from_major_minor(major: u8, minor: u8) -> Option<Self> {
+        match (major, minor) {
+            (1, _) => Some(NtfsVersion::V1_2),
+            (3, _) => Some(NtfsVersion::V3_1),
+            _ => None,
+        }
+    }
+
+    /// "1.2" / "3.1".
+    pub fn label(self) -> &'static str {
+        match self {
+            NtfsVersion::V1_2 => "1.2",
+            NtfsVersion::V3_1 => "3.1",
+        }
+    }
+
+    /// The Windows versions that mount it, for help text and prompts.
+    pub fn readers(self) -> &'static str {
+        match self {
+            NtfsVersion::V1_2 => "Windows NT 3.5, 3.51 and 4.0, and every later Windows",
+            NtfsVersion::V3_1 => "Windows XP and later (and NT 4.0 SP4 or later, read-write)",
+        }
+    }
+
+    /// Why NT can't use `geo` for this version, if it can't: 1.2 is 512-byte sectors only, and
+    /// clusters over 4 KiB lose NT 4.0's compression.
+    pub fn geometry_problem(self, geo: &NtfsGeometry) -> Option<String> {
+        if self != NtfsVersion::V1_2 {
+            return None;
+        }
+        if geo.bytes_per_sector != 512 {
+            return Some(format!(
+                "NTFS 1.2 uses 512-byte sectors; {} was asked for",
+                geo.bytes_per_sector
+            ));
+        }
+        if geo.cluster_size() > 4096 {
+            return Some(format!(
+                "NTFS 1.2 clusters over 4 KiB ({} B) lose NT 4.0's compression",
+                geo.cluster_size()
+            ));
+        }
+        None
+    }
+
+    /// Where a `FILE` record's update sequence array starts: 1.2 has no record-number field.
+    fn usa_offset(self) -> u16 {
+        match self {
+            NtfsVersion::V1_2 => 0x2A,
+            NtfsVersion::V3_1 => 0x30,
+        }
+    }
+
+    /// Records the formatter marks in use in the MFT bitmap (NT 4.0 puts user files at 16).
+    fn reserved_records(self) -> u64 {
+        match self {
+            NtfsVersion::V1_2 => 16,
+            NtfsVersion::V3_1 => 24,
+        }
+    }
+}
+
 /// Parameters for [`create_ntfs`].
 pub struct NtfsFormatParams {
     /// Total volume size in bytes; must be a multiple of the cluster size.
@@ -401,6 +485,24 @@ fn std_info(file_attrs: u32, security_id: u32) -> Vec<u8> {
     v
 }
 
+/// `$STANDARD_INFORMATION` value (48-byte NTFS 1.2 form: times and attributes, no security id).
+fn std_info_v12(file_attrs: u32) -> Vec<u8> {
+    let mut v = vec![0u8; 48];
+    for i in 0..4 {
+        wu64(&mut v, i * 8, TS);
+    }
+    wu32(&mut v, 0x20, file_attrs);
+    v
+}
+
+/// [`file_name_value`] with the allocated and real sizes filled in, as NT 4.0 writes them.
+fn file_name_value_sized(name: &str, file_attrs: u32, alloc: u64, real: u64) -> Vec<u8> {
+    let mut v = file_name_value(name, file_attrs);
+    wu64(&mut v, 0x28, alloc);
+    wu64(&mut v, 0x30, real);
+    v
+}
+
 /// `$FILE_NAME` value naming `name` (parent = root, namespace WIN32_AND_DOS).
 fn file_name_value(name: &str, file_attrs: u32) -> Vec<u8> {
     let nu: Vec<u16> = name.encode_utf16().collect();
@@ -429,11 +531,10 @@ fn volume_name_value(label: &str) -> Vec<u8> {
     v
 }
 
-/// `$VOLUME_INFORMATION` value (NTFS version 3.1, flags 0).
-fn volume_info_value() -> Vec<u8> {
+/// `$VOLUME_INFORMATION` value: the version, flags 0 (clean).
+fn volume_info_value(version: NtfsVersion) -> Vec<u8> {
     let mut v = vec![0u8; 12];
-    v[8] = 3; // major version
-    v[9] = 1; // minor version
+    (v[8], v[9]) = version.major_minor();
     v
 }
 
@@ -498,21 +599,35 @@ fn mft_ref(rec_no: u64) -> u64 {
 
 /// Assemble an in-use system `FILE` record from its attributes.
 fn build_record(rec_no: u64, mft_flags: u16, geo: &NtfsGeometry, attrs: &[Vec<u8>]) -> Vec<u8> {
+    build_record_as(NtfsVersion::V3_1, rec_no, mft_flags, 1, geo, attrs)
+}
+
+/// [`build_record`] for `version`, with its hard-link count (0 for NT's reserved records).
+fn build_record_as(
+    version: NtfsVersion,
+    rec_no: u64,
+    mft_flags: u16,
+    links: u16,
+    geo: &NtfsGeometry,
+    attrs: &[Vec<u8>],
+) -> Vec<u8> {
     let rs = geo.mft_record_size as usize;
     let mut r = vec![0u8; rs];
     r[0..4].copy_from_slice(b"FILE");
-    let usa_off = 0x30u16;
+    let usa_off = version.usa_offset();
     let usa_count = geo.usa_count(geo.mft_record_size);
     wu16(&mut r, 4, usa_off);
     wu16(&mut r, 6, usa_count);
     wu16(&mut r, 0x10, rec_no.max(1) as u16); // sequence number
-    wu16(&mut r, 0x12, 1); // hard link count
+    wu16(&mut r, 0x12, links);
     let attrs_off = align8(usa_off as usize + usa_count as usize * 2);
     wu16(&mut r, 0x14, attrs_off as u16);
     wu16(&mut r, 0x16, mft_flags);
     wu32(&mut r, 0x1C, rs as u32); // allocated size
     wu16(&mut r, 0x28, attrs.len() as u16); // next attribute instance
-    wu32(&mut r, 0x2C, rec_no as u32); // MFT record number (NTFS 3.1)
+    if version == NtfsVersion::V3_1 {
+        wu32(&mut r, 0x2C, rec_no as u32); // MFT record number (3.x header only)
+    }
     let mut o = attrs_off;
     for a in attrs {
         r[o..o + a.len()].copy_from_slice(a);
@@ -526,11 +641,11 @@ fn build_record(rec_no: u64, mft_flags: u16, geo: &NtfsGeometry, attrs: &[Vec<u8
 }
 
 /// A blank, unused (`sequence 0`) `FILE` record.
-fn blank_record(rec_no: u64, geo: &NtfsGeometry) -> Vec<u8> {
+fn blank_record(version: NtfsVersion, rec_no: u64, geo: &NtfsGeometry) -> Vec<u8> {
     let rs = geo.mft_record_size as usize;
     let mut r = vec![0u8; rs];
     r[0..4].copy_from_slice(b"FILE");
-    let usa_off = 0x30u16;
+    let usa_off = version.usa_offset();
     let usa_count = geo.usa_count(geo.mft_record_size);
     wu16(&mut r, 4, usa_off);
     wu16(&mut r, 6, usa_count);
@@ -539,7 +654,9 @@ fn blank_record(rec_no: u64, geo: &NtfsGeometry) -> Vec<u8> {
     wu16(&mut r, 0x14, attrs_off as u16);
     wu16(&mut r, 0x16, 0); // not in use
     wu32(&mut r, 0x1C, rs as u32);
-    wu32(&mut r, 0x2C, rec_no as u32);
+    if version == NtfsVersion::V3_1 {
+        wu32(&mut r, 0x2C, rec_no as u32);
+    }
     wu32(&mut r, attrs_off, 0xFFFF_FFFF);
     wu32(&mut r, 0x18, align8(attrs_off + 4) as u32);
     fixup_write(&mut r);
@@ -658,8 +775,59 @@ pub fn create_ntfs<W: Write + Seek>(
     target: &mut W,
     params: &NtfsFormatParams,
 ) -> Result<(), FilesystemError> {
+    create_ntfs_version(target, params, NtfsVersion::V3_1)
+}
+
+/// Where each metadata structure sits; shared by both versions' record builders.
+#[derive(Clone, Copy)]
+struct Layout {
+    cluster: u64,
+    tc: u64,
+    isize: u64,
+    boot_c: u64,
+    mftbm_c: u64,
+    mftbm_lcn: u64,
+    mftbm_real: u64,
+    mft_c: u64,
+    mft_lcn: u64,
+    mft_real: u64,
+    mftmirr_c: u64,
+    mftmirr_lcn: u64,
+    mftmirr_real: u64,
+    log_c: u64,
+    log_lcn: u64,
+    log_size: u64,
+    bm_c: u64,
+    bm_lcn: u64,
+    clusterbm_real: u64,
+    attrdef_c: u64,
+    attrdef_lcn: u64,
+    upcase_c: u64,
+    upcase_lcn: u64,
+    sds_c: u64,
+    sds_lcn: u64,
+    rootsd_c: u64,
+    rootsd_lcn: u64,
+    rootidx_c: u64,
+    rootidx_lcn: u64,
+}
+
+/// The system files' records and the root directory's listing of them `(record, name, is_dir)`.
+type SystemRecords = (Vec<Vec<u8>>, Vec<(u64, &'static str, bool)>);
+
+/// [`create_ntfs`] as `version`: 3.1 for Windows XP and later, 1.2 for Windows NT 3.5 to 4.0.
+pub fn create_ntfs_version<W: Write + Seek>(
+    target: &mut W,
+    params: &NtfsFormatParams,
+    version: NtfsVersion,
+) -> Result<(), FilesystemError> {
     let geo = params.geometry;
     geo.validate()?;
+    if version == NtfsVersion::V1_2 && geo.bytes_per_sector != 512 {
+        return Err(FilesystemError::InvalidData(
+            "NTFS 1.2 volumes use 512-byte sectors".into(),
+        ));
+    }
     let cluster = geo.cluster_size();
     let total_size = params.total_size;
     if !total_size.is_multiple_of(cluster) {
@@ -675,6 +843,12 @@ pub fn create_ntfs<W: Write + Seek>(
     let tc = total_size / cluster; // total clusters
     let total_sectors = tc * spc - 1; // last sector holds the backup boot
 
+    // 1.2 has no $Secure stream and keeps the root's descriptor resident.
+    let (attrdef, upcase, sds, rootsd): (&[u8], &[u8], &[u8], &[u8]) = match version {
+        NtfsVersion::V3_1 => (ATTRDEF, UPCASE, SECURE_SDS, ROOT_SECDESC),
+        NtfsVersion::V1_2 => (NT4_ATTRDEF, NT4_UPCASE, &[], &[]),
+    };
+
     // ---- Contiguous metadata layout ----
     let boot_c = cdiv(8192, cluster);
     let mftbm_real = cdiv(mft_records, 8);
@@ -687,10 +861,10 @@ pub fn create_ntfs<W: Write + Seek>(
     let log_c = log_size / cluster;
     let clusterbm_real = cdiv(tc, 8);
     let bm_c = cdiv(clusterbm_real, cluster).max(1);
-    let attrdef_c = cdiv(ATTRDEF.len() as u64, cluster);
-    let upcase_c = cdiv(UPCASE.len() as u64, cluster);
-    let sds_c = cdiv(SECURE_SDS.len() as u64, cluster);
-    let rootsd_c = cdiv(ROOT_SECDESC.len() as u64, cluster);
+    let attrdef_c = cdiv(attrdef.len() as u64, cluster);
+    let upcase_c = cdiv(upcase.len() as u64, cluster);
+    let sds_c = cdiv(sds.len() as u64, cluster);
+    let rootsd_c = cdiv(rootsd.len() as u64, cluster);
     let rootidx_c = cdiv(isize, cluster);
 
     let mut lcn = boot_c;
@@ -699,16 +873,37 @@ pub fn create_ntfs<W: Write + Seek>(
         lcn += n;
         at
     };
-    let mftbm_lcn = take(mftbm_c);
-    let mft_lcn = take(mft_c);
-    let mftmirr_lcn = take(mftmirr_c);
-    let log_lcn = take(log_c);
-    let bm_lcn = take(bm_c);
-    let attrdef_lcn = take(attrdef_c);
-    let upcase_lcn = take(upcase_c);
-    let sds_lcn = take(sds_c);
-    let rootsd_lcn = take(rootsd_c);
-    let rootidx_lcn = take(rootidx_c);
+    let l = Layout {
+        cluster,
+        tc,
+        isize,
+        boot_c,
+        mftbm_c,
+        mftbm_lcn: take(mftbm_c),
+        mftbm_real,
+        mft_c,
+        mft_lcn: take(mft_c),
+        mft_real,
+        mftmirr_c,
+        mftmirr_lcn: take(mftmirr_c),
+        mftmirr_real,
+        log_c,
+        log_lcn: take(log_c),
+        log_size,
+        bm_c,
+        bm_lcn: take(bm_c),
+        clusterbm_real,
+        attrdef_c,
+        attrdef_lcn: take(attrdef_c),
+        upcase_c,
+        upcase_lcn: take(upcase_c),
+        sds_c,
+        sds_lcn: take(sds_c),
+        rootsd_c,
+        rootsd_lcn: take(rootsd_c),
+        rootidx_c,
+        rootidx_lcn: take(rootidx_c),
+    };
     let end_meta = lcn;
     if end_meta >= tc {
         return Err(FilesystemError::DiskFull(format!(
@@ -716,9 +911,340 @@ pub fn create_ntfs<W: Write + Seek>(
         )));
     }
 
+    let label = params.label.as_deref();
+    let (mut recs, listing) = match version {
+        NtfsVersion::V3_1 => system_records_v31(&geo, &l, label),
+        NtfsVersion::V1_2 => system_records_v12(&geo, &l, label),
+    };
+    // The rest: reserved, then free (sequence 0).
+    for n in recs.len() as u64..mft_records {
+        recs.push(blank_record(version, n, &geo));
+    }
+    let sys_flags = FA_HIDDEN | FA_SYSTEM;
+    let root_entries: Vec<(u64, Vec<u8>)> = listing
+        .iter()
+        .map(|&(n, name, is_dir)| {
+            let attrs = sys_flags | if is_dir { FA_DIR_INDEX } else { 0 };
+            (mft_ref(n), file_name_value(name, attrs))
+        })
+        .collect();
+    let root_indx = build_root_index_block(&geo, &root_entries);
+
+    // ---- Cluster allocation bitmap (bit set = in use) ----
+    let mut bm = vec![0u8; clusterbm_real as usize];
+    for c in 0..end_meta {
+        bm[(c / 8) as usize] |= 1 << (c % 8);
+    }
+    // The last cluster holds the backup boot sector; keep the allocator off it.
+    bm[((tc - 1) / 8) as usize] |= 1 << ((tc - 1) % 8);
+    for c in tc..(bm.len() as u64 * 8) {
+        bm[(c / 8) as usize] |= 1 << (c % 8);
+    }
+
+    // ---- MFT record bitmap (the reserved system records) ----
+    let mut mftbm = vec![0u8; mftbm_real as usize];
+    for i in 0..version.reserved_records() {
+        mftbm[(i / 8) as usize] |= 1 << (i % 8);
+    }
+    for c in mft_records..(mftbm.len() as u64 * 8) {
+        mftbm[(c / 8) as usize] |= 1 << (c % 8);
+    }
+
+    // ---- Boot sector ----
+    let serial = total_size.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (params.label.as_deref().unwrap_or("").len() as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ 0x4E54_4653_4E54_4653;
+    let boot = build_boot(&geo, total_sectors, l.mft_lcn, l.mftmirr_lcn, serial);
+
+    // ---- Emit ----
+    let put = |target: &mut W, lcn0: u64, data: &[u8]| -> Result<(), FilesystemError> {
+        target.seek(SeekFrom::Start(lcn0 * cluster))?;
+        target.write_all(data)?;
+        Ok(())
+    };
+    // Pre-size so trailing free space reads back as zero.
+    target.seek(SeekFrom::Start(total_size - 1))?;
+    target.write_all(&[0u8])?;
+
+    put(target, 0, &boot)?;
+    put(target, l.mftbm_lcn, &mftbm)?;
+    let mut mft_data = Vec::with_capacity(recs.len() * rs as usize);
+    for r in &recs {
+        mft_data.extend_from_slice(r);
+    }
+    put(target, l.mft_lcn, &mft_data)?;
+    let mut mirror = Vec::with_capacity(4 * rs as usize);
+    for r in recs.iter().take(4) {
+        mirror.extend_from_slice(r);
+    }
+    put(target, l.mftmirr_lcn, &mirror)?;
+    // $LogFile: 0xFF-filled, which Windows and ntfs-3g take as a log to initialise.
+    let logfile = vec![0xFFu8; log_size as usize];
+    put(target, l.log_lcn, &logfile)?;
+    put(target, l.bm_lcn, &bm)?;
+    put(target, l.attrdef_lcn, attrdef)?;
+    put(target, l.upcase_lcn, upcase)?;
+    put(target, l.sds_lcn, sds)?;
+    put(target, l.rootsd_lcn, rootsd)?;
+    put(target, l.rootidx_lcn, &root_indx)?;
+    // Backup boot sector at the very last sector.
+    target.seek(SeekFrom::Start(total_sectors * bps))?;
+    target.write_all(&boot)?;
+    target.flush()?;
+    Ok(())
+}
+
+/// The NTFS 1.2 system records 0-15 as NT 4.0 lays them out (docs/ntfs_format_cleanroom_notes.md):
+/// every metafile carries its own descriptor, 9 is `$Quota`, 11-15 are reserved and unnamed.
+fn system_records_v12(geo: &NtfsGeometry, l: &Layout, label: Option<&str>) -> SystemRecords {
+    let v = NtfsVersion::V1_2;
+    let sys = FA_HIDDEN | FA_SYSTEM;
+    let si = || resident_attr(0x10, "", &std_info_v12(sys), 0, false);
+    let fname = |name: &str, alloc: u64, real: u64| {
+        resident_attr(
+            0x30,
+            "",
+            &file_name_value_sized(name, sys, alloc, real),
+            1,
+            true,
+        )
+    };
+    let sd = |desc: &[u8]| resident_attr(0x50, "", desc, 2, false);
+    let data = |c: u64, at: u64, real: u64, instance: u16| {
+        nonresident_attr(
+            0x80,
+            "",
+            &runlist(c, Some(at)),
+            c - 1,
+            c * l.cluster,
+            real,
+            instance,
+            0,
+        )
+    };
+    let file = |n: u64, attrs: &[Vec<u8>]| build_record_as(v, n, 0x01, 1, geo, attrs);
+    let mut recs = Vec::with_capacity(16);
+
+    // 0: $MFT
+    let mft_alloc = l.mft_c * l.cluster;
+    recs.push(file(
+        0,
+        &[
+            si(),
+            fname("$MFT", mft_alloc, l.mft_real),
+            sd(NT4_SD_METAFILE),
+            data(l.mft_c, l.mft_lcn, l.mft_real, 3),
+            nonresident_attr(
+                0xB0,
+                "",
+                &runlist(l.mftbm_c, Some(l.mftbm_lcn)),
+                l.mftbm_c - 1,
+                l.mftbm_c * l.cluster,
+                l.mftbm_real,
+                4,
+                0,
+            ),
+        ],
+    ));
+    // 1: $MFTMirr
+    let mirr_alloc = l.mftmirr_c * l.cluster;
+    recs.push(file(
+        1,
+        &[
+            si(),
+            fname("$MFTMirr", mirr_alloc, l.mftmirr_real),
+            sd(NT4_SD_METAFILE),
+            data(l.mftmirr_c, l.mftmirr_lcn, l.mftmirr_real, 3),
+        ],
+    ));
+    // 2: $LogFile
+    recs.push(file(
+        2,
+        &[
+            si(),
+            fname("$LogFile", l.log_size, l.log_size),
+            sd(NT4_SD_METAFILE),
+            data(l.log_c, l.log_lcn, l.log_size, 3),
+        ],
+    ));
+    // 3: $Volume
+    recs.push(file(
+        3,
+        &[
+            si(),
+            fname("$Volume", 0, 0),
+            sd(NT4_SD_METAFILE_RW),
+            resident_attr(0x60, "", &volume_name_value(label.unwrap_or("")), 3, false),
+            resident_attr(0x70, "", &volume_info_value(v), 4, false),
+            resident_attr(0x80, "", &[], 5, false),
+        ],
+    ));
+    // 4: $AttrDef
+    let attrdef_real = NT4_ATTRDEF.len() as u64;
+    recs.push(file(
+        4,
+        &[
+            si(),
+            fname("$AttrDef", l.attrdef_c * l.cluster, attrdef_real),
+            sd(NT4_SD_METAFILE),
+            data(l.attrdef_c, l.attrdef_lcn, attrdef_real, 3),
+        ],
+    ));
+    // 5: . (root directory); its index entries live in the $INDEX_ALLOCATION block.
+    recs.push(build_record_as(
+        v,
+        5,
+        0x03, // in use | directory
+        1,
+        geo,
+        &[
+            si(),
+            resident_attr(0x30, "", &file_name_value(".", sys | FA_DIR_INDEX), 1, true),
+            sd(NT4_SD_ROOT),
+            resident_attr(0x90, "$I30", &root_index_root(geo), 3, false),
+            nonresident_attr(
+                0xA0,
+                "$I30",
+                &runlist(l.rootidx_c, Some(l.rootidx_lcn)),
+                l.rootidx_c - 1,
+                l.rootidx_c * l.cluster,
+                l.isize,
+                4,
+                0,
+            ),
+            resident_attr(0xB0, "$I30", &[1, 0, 0, 0, 0, 0, 0, 0], 5, false),
+        ],
+    ));
+    // 6: $Bitmap
+    let bm_alloc = l.bm_c * l.cluster;
+    recs.push(file(
+        6,
+        &[
+            si(),
+            fname("$Bitmap", bm_alloc, l.clusterbm_real),
+            sd(NT4_SD_METAFILE),
+            data(l.bm_c, l.bm_lcn, l.clusterbm_real, 3),
+        ],
+    ));
+    // 7: $Boot
+    recs.push(file(
+        7,
+        &[
+            si(),
+            fname("$Boot", l.boot_c * l.cluster, 8192),
+            sd(NT4_SD_METAFILE),
+            data(l.boot_c, 0, 8192, 3),
+        ],
+    ));
+    // 8: $BadClus (sparse $Bad spanning the whole volume)
+    recs.push(file(
+        8,
+        &[
+            si(),
+            fname("$BadClus", 0, 0),
+            sd(NT4_SD_METAFILE),
+            resident_attr(0x80, "", &[], 3, false),
+            nonresident_attr(
+                0x80,
+                "$Bad",
+                &runlist(l.tc, None),
+                l.tc - 1,
+                l.tc * l.cluster,
+                l.tc * l.cluster,
+                4,
+                0,
+            ),
+        ],
+    ));
+    // 9: $Quota (empty on NT 4.0)
+    recs.push(file(
+        9,
+        &[
+            si(),
+            fname("$Quota", 0, 0),
+            sd(NT4_SD_METAFILE_RW),
+            resident_attr(0x80, "", &[], 3, false),
+        ],
+    ));
+    // 10: $UpCase (no $Info stream before NTFS 3)
+    let upcase_real = NT4_UPCASE.len() as u64;
+    recs.push(file(
+        10,
+        &[
+            si(),
+            fname("$UpCase", l.upcase_c * l.cluster, upcase_real),
+            sd(NT4_SD_METAFILE),
+            data(l.upcase_c, l.upcase_lcn, upcase_real, 3),
+        ],
+    ));
+    // 11-15: reserved; in use with no name and no links, as NT 4.0 formats them.
+    for n in 11..16 {
+        recs.push(build_record_as(
+            v,
+            n,
+            0x01,
+            0,
+            geo,
+            &[
+                si(),
+                resident_attr(0x50, "", NT4_SD_METAFILE_RW, 1, false),
+                resident_attr(0x80, "", &[], 2, false),
+            ],
+        ));
+    }
+    let listing = vec![
+        (4, "$AttrDef", false),
+        (8, "$BadClus", false),
+        (6, "$Bitmap", false),
+        (7, "$Boot", false),
+        (2, "$LogFile", false),
+        (0, "$MFT", false),
+        (1, "$MFTMirr", false),
+        (9, "$Quota", false),
+        (10, "$UpCase", false),
+        (3, "$Volume", false),
+        (5, ".", true),
+    ];
+    (recs, listing)
+}
+
+/// The NTFS 3.1 system records 0-11 ($Secure, $Extend) and the root listing.
+fn system_records_v31(geo: &NtfsGeometry, l: &Layout, label: Option<&str>) -> SystemRecords {
+    let geo = *geo;
+    let Layout {
+        cluster,
+        tc,
+        isize,
+        boot_c,
+        mftbm_c,
+        mftbm_lcn,
+        mftbm_real,
+        mft_c,
+        mft_lcn,
+        mft_real,
+        mftmirr_c,
+        mftmirr_lcn,
+        mftmirr_real,
+        log_c,
+        log_lcn,
+        log_size,
+        bm_c,
+        bm_lcn,
+        clusterbm_real,
+        attrdef_c,
+        attrdef_lcn,
+        upcase_c,
+        upcase_lcn,
+        sds_c,
+        sds_lcn,
+        rootsd_c,
+        rootsd_lcn,
+        rootidx_c,
+        rootidx_lcn,
+    } = *l;
     // ---- System MFT records 0..11 ----
     let sys_flags = FA_HIDDEN | FA_SYSTEM; // 0x06
-    let mut recs: Vec<Vec<u8>> = Vec::with_capacity(mft_records as usize);
+    let mut recs: Vec<Vec<u8>> = Vec::with_capacity(16);
 
     // 0: $MFT
     recs.push(build_record(
@@ -792,7 +1318,7 @@ pub fn create_ntfs<W: Write + Seek>(
     ));
     // 3: $Volume
     {
-        let label = params.label.as_deref().unwrap_or("");
+        let label = label.unwrap_or("");
         recs.push(build_record(
             3,
             0x01,
@@ -802,7 +1328,7 @@ pub fn create_ntfs<W: Write + Seek>(
                 resident_attr(0x30, "", &file_name_value("$Volume", sys_flags), 1, true),
                 resident_attr(0x50, "", SEC_DESC_100, 2, false),
                 resident_attr(0x60, "", &volume_name_value(label), 3, false),
-                resident_attr(0x70, "", &volume_info_value(), 4, false),
+                resident_attr(0x70, "", &volume_info_value(NtfsVersion::V3_1), 4, false),
                 resident_attr(0x80, "", &[], 5, false),
             ],
         ));
@@ -993,14 +1519,7 @@ pub fn create_ntfs<W: Write + Seek>(
             resident_attr(0x90, "$I30", &empty_index_root(&geo), 2, false),
         ],
     ));
-    // 12..mft_records: blank (records 12..23 are reserved, 24.. are free).
-    for n in 12..mft_records {
-        recs.push(blank_record(n, &geo));
-    }
-
-    // Build the root index entries once more for emission (kept simple/explicit).
-    let mut root_entries: Vec<(u64, Vec<u8>)> = Vec::new();
-    let listing: [(u64, &str, bool); 12] = [
+    let listing = vec![
         (4, "$AttrDef", false),
         (8, "$BadClus", false),
         (6, "$Bitmap", false),
@@ -1014,74 +1533,7 @@ pub fn create_ntfs<W: Write + Seek>(
         (3, "$Volume", false),
         (5, ".", true),
     ];
-    for (n, name, is_dir) in listing {
-        let attrs = sys_flags | if is_dir { FA_DIR_INDEX } else { 0 };
-        root_entries.push((mft_ref(n), file_name_value(name, attrs)));
-    }
-    let root_indx = build_root_index_block(&geo, &root_entries);
-
-    // ---- Cluster allocation bitmap (bit set = in use) ----
-    let mut bm = vec![0u8; clusterbm_real as usize];
-    for c in 0..end_meta {
-        bm[(c / 8) as usize] |= 1 << (c % 8);
-    }
-    // The last cluster holds the backup boot sector; keep the allocator off it.
-    bm[((tc - 1) / 8) as usize] |= 1 << ((tc - 1) % 8);
-    for c in tc..(bm.len() as u64 * 8) {
-        bm[(c / 8) as usize] |= 1 << (c % 8);
-    }
-
-    // ---- MFT record bitmap (records 0..23 reserved) ----
-    let mut mftbm = vec![0u8; mftbm_real as usize];
-    for i in 0..24u64 {
-        mftbm[(i / 8) as usize] |= 1 << (i % 8);
-    }
-    for c in mft_records..(mftbm.len() as u64 * 8) {
-        mftbm[(c / 8) as usize] |= 1 << (c % 8);
-    }
-
-    // ---- Boot sector ----
-    let serial = total_size.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (params.label.as_deref().unwrap_or("").len() as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-        ^ 0x4E54_4653_4E54_4653;
-    let boot = build_boot(&geo, total_sectors, mft_lcn, mftmirr_lcn, serial);
-
-    // ---- Emit ----
-    let put = |target: &mut W, lcn0: u64, data: &[u8]| -> Result<(), FilesystemError> {
-        target.seek(SeekFrom::Start(lcn0 * cluster))?;
-        target.write_all(data)?;
-        Ok(())
-    };
-    // Pre-size so trailing free space reads back as zero.
-    target.seek(SeekFrom::Start(total_size - 1))?;
-    target.write_all(&[0u8])?;
-
-    put(target, 0, &boot)?;
-    put(target, mftbm_lcn, &mftbm)?;
-    let mut mft_data = Vec::with_capacity(recs.len() * rs as usize);
-    for r in &recs {
-        mft_data.extend_from_slice(r);
-    }
-    put(target, mft_lcn, &mft_data)?;
-    let mut mirror = Vec::with_capacity(4 * rs as usize);
-    for r in recs.iter().take(4) {
-        mirror.extend_from_slice(r);
-    }
-    put(target, mftmirr_lcn, &mirror)?;
-    // $LogFile: 0xFF-filled (ntfs-3g treats it as needing restart and resets it).
-    let logfile = vec![0xFFu8; log_size as usize];
-    put(target, log_lcn, &logfile)?;
-    put(target, bm_lcn, &bm)?;
-    put(target, attrdef_lcn, ATTRDEF)?;
-    put(target, upcase_lcn, UPCASE)?;
-    put(target, sds_lcn, SECURE_SDS)?;
-    put(target, rootsd_lcn, ROOT_SECDESC)?;
-    put(target, rootidx_lcn, &root_indx)?;
-    // Backup boot sector at the very last sector.
-    target.seek(SeekFrom::Start(total_sectors * bps))?;
-    target.write_all(&boot)?;
-    target.flush()?;
-    Ok(())
+    (recs, listing)
 }
 
 /// Back-compat shim: format with the legacy fixed geometry (512-byte sectors,
@@ -1108,7 +1560,9 @@ pub fn create_blank_ntfs<W: Write + Seek>(
 mod tests {
     use super::*;
     use crate::ntfs::NtfsFilesystem;
-    use disk_core::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use disk_core::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -1182,6 +1636,196 @@ mod tests {
             .find(|e| e.name == "data.bin")
             .expect("file present after sync");
         assert_eq!(fs.read_file(f, f.size as usize).unwrap(), data);
+    }
+
+    fn format_as(size: u64, cluster: u32, version: NtfsVersion) -> Cursor<Vec<u8>> {
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        create_ntfs_version(
+            &mut cur,
+            &NtfsFormatParams {
+                total_size: size,
+                geometry: NtfsGeometry::with_cluster_size(cluster, 512).unwrap(),
+                mft_records_hint: 128,
+                label: Some("NT4".to_string()),
+            },
+            version,
+        )
+        .expect("format");
+        cur.seek(SeekFrom::Start(0)).unwrap();
+        cur
+    }
+
+    /// Each in-use MFT record, read straight off the image: (number, fixup-array offset,
+    /// `$STANDARD_INFORMATION` length if it has one). Independent of our reader.
+    fn raw_records(img: &[u8]) -> Vec<(u64, u16, Option<u32>)> {
+        let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let cluster = u16_at(img, 0x0B) as u64 * img[0x0D] as u64;
+        let mft = u64::from_le_bytes(img[0x30..0x38].try_into().unwrap()) * cluster;
+        let mut out = Vec::new();
+        for n in 0..128u64 {
+            let at = (mft + n * 1024) as usize;
+            let mut r = img[at..at + 1024].to_vec();
+            if &r[0..4] != b"FILE" || u16_at(&r, 0x16) & 1 == 0 {
+                continue;
+            }
+            let (usa, cnt) = (u16_at(&r, 4) as usize, u16_at(&r, 6) as usize);
+            for i in 1..cnt {
+                let (end, saved) = (i * 512 - 2, usa + 2 * i);
+                r.copy_within(saved..saved + 2, end);
+            }
+            let mut o = u16_at(&r, 0x14) as usize;
+            let mut si = None;
+            while u32_at(&r, o) != 0xFFFF_FFFF {
+                if u32_at(&r, o) == 0x10 {
+                    si = Some(u32_at(&r, o + 0x10));
+                }
+                o += u32_at(&r, o + 4) as usize;
+            }
+            out.push((n, usa as u16, si));
+        }
+        out
+    }
+
+    #[test]
+    fn ntfs_12_matches_nt4_and_round_trips_at_each_nt4_cluster() {
+        for cluster in [512u32, 1024, 2048, 4096] {
+            let cur = format_as(16 * 1024 * 1024, cluster, NtfsVersion::V1_2);
+            let mut fs = NtfsFilesystem::open(cur, 0)
+                .unwrap_or_else(|e| panic!("open 1.2 cluster={cluster}: {e:?}"));
+            assert_eq!(fs.ntfs_version(), (1, 2), "cluster={cluster}");
+            let root = fs.root().unwrap();
+            assert!(fs.list_directory(&root).unwrap().is_empty());
+            let dir = fs
+                .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+                .unwrap();
+            let body = vec![0xA5u8; 70_000];
+            let opts = CreateFileOptions::default();
+            fs.create_file(
+                &dir,
+                "BIG.BIN",
+                &mut Cursor::new(body.clone()),
+                70_000,
+                &opts,
+            )
+            .unwrap_or_else(|e| panic!("create_file cluster={cluster}: {e:?}"));
+            fs.create_file(
+                &root,
+                "SMALL.TXT",
+                &mut Cursor::new(b"hi".to_vec()),
+                2,
+                &opts,
+            )
+            .unwrap();
+            EditableFilesystem::sync_metadata(&mut fs).unwrap();
+
+            let img = fs.into_reader().into_inner();
+            let mut fs = NtfsFilesystem::open(Cursor::new(img.clone()), 0).unwrap();
+            assert_eq!(fs.ntfs_version(), (1, 2), "still 1.2 after writes");
+            let root = fs.root().unwrap();
+            let names: Vec<String> = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert!(names.contains(&"SUB".to_string()) && names.contains(&"SMALL.TXT".to_string()));
+            let sub = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "SUB");
+            let big = fs.list_directory(&sub.unwrap()).unwrap().remove(0);
+            assert_eq!(fs.read_file(&big, big.size as usize).unwrap(), body);
+
+            let recs = raw_records(&img);
+            assert!(
+                recs.len() >= 19,
+                "16 system records plus three new ones: {recs:?}"
+            );
+            for (n, usa, si) in recs {
+                assert_eq!(
+                    usa, 0x2A,
+                    "record {n}: the 1.2 header puts the fixups at 0x2A"
+                );
+                if !(11..16).contains(&n) {
+                    assert_eq!(si, Some(48), "record {n}: a 48-byte $STANDARD_INFORMATION");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ntfs_12_system_files_are_nt4s() {
+        let cur = format_as(16 * 1024 * 1024, 512, NtfsVersion::V1_2);
+        let img = cur.into_inner();
+        let recs = raw_records(&img);
+        let numbers: Vec<u64> = recs.iter().map(|r| r.0).collect();
+        assert_eq!(
+            numbers,
+            (0..16).collect::<Vec<_>>(),
+            "records 0-15 in use, as on NT 4.0"
+        );
+        let mut fs = NtfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        // The system files hide from listings; no $Secure and no $Extend before NTFS 3.
+        let all = fs.list_directory(&root).unwrap();
+        assert!(all
+            .iter()
+            .all(|e| e.name != "$Secure" && e.name != "$Extend"));
+    }
+
+    #[test]
+    fn ntfs_12_refuses_other_sector_sizes_and_flags_big_clusters() {
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        let params = NtfsFormatParams {
+            total_size: 16 * 1024 * 1024,
+            geometry: NtfsGeometry::with_cluster_size(4096, 4096).unwrap(),
+            mft_records_hint: 128,
+            label: None,
+        };
+        assert!(create_ntfs_version(&mut cur, &params, NtfsVersion::V1_2).is_err());
+        let big = NtfsGeometry::with_cluster_size(8192, 512).unwrap();
+        assert!(NtfsVersion::V1_2.geometry_problem(&big).is_some());
+        assert!(NtfsVersion::V3_1.geometry_problem(&big).is_none());
+        let fine = NtfsGeometry::with_cluster_size(4096, 512).unwrap();
+        assert!(NtfsVersion::V1_2.geometry_problem(&fine).is_none());
+    }
+
+    #[test]
+    fn ntfs_12_formats_a_sparse_4_gib_volume() {
+        let size = 4 * 1024 * 1024 * 1024u64;
+        let mut f = tempfile::tempfile().unwrap();
+        f.set_len(size).unwrap();
+        let geometry = NtfsGeometry::for_volume_size(size);
+        assert_eq!(
+            geometry.cluster_size(),
+            4096,
+            "NT 4.0's default above 2 GiB"
+        );
+        let params = NtfsFormatParams {
+            total_size: size,
+            geometry,
+            mft_records_hint: 1024,
+            label: Some("BIG".into()),
+        };
+        create_ntfs_version(&mut f, &params, NtfsVersion::V1_2).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut fs = NtfsFilesystem::open(f, 0).unwrap();
+        assert_eq!(fs.ntfs_version(), (1, 2));
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A.TXT", &mut Cursor::new(b"abc".to_vec()), 3, &opts)
+            .unwrap();
+        EditableFilesystem::sync_metadata(&mut fs).unwrap();
+        let e = fs.list_directory(&root).unwrap().remove(0);
+        assert_eq!(fs.read_file(&e, 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn default_31_is_still_31() {
+        let fs = NtfsFilesystem::open(format_as(8 * 1024 * 1024, 4096, NtfsVersion::V3_1), 0);
+        assert_eq!(fs.unwrap().ntfs_version(), (3, 1));
     }
 
     #[test]

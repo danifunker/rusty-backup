@@ -189,6 +189,85 @@ fn a_fat_volume_builds_into_an_image_file() {
     open_fs(&img, 0);
 }
 
+/// PINT's SD card: a FAT boot partition and an NTFS data partition NT 4.0 can mount.
+#[test]
+fn picking_ntfs_asks_which_windows_and_builds_that_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("pint.img");
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetSize("64M".into()));
+    image_output(&mut c, &img);
+    let size = |row, text: &str| BuildAction::SetRowSize {
+        row,
+        text: text.into(),
+    };
+    act(&mut c, BuildDiskAction::Table(size(0, "24M")));
+    act(&mut c, BuildDiskAction::Table(BuildAction::AddRow));
+    let fat = Some(FsKind::Fat);
+    assert!(act(&mut c, BuildDiskAction::SetRowFs { row: 0, fs: fat }).is_empty());
+    let ntfs = Some(FsKind::Ntfs);
+    let fx = act(&mut c, BuildDiskAction::SetRowFs { row: 1, fs: ntfs });
+    let [Effect::Choose(q)] = fx.as_slice() else {
+        panic!("picking NTFS asks which version: {fx:?}");
+    };
+    assert_eq!(q.purpose, purpose::NTFS_VERSION);
+    assert!(q.message.contains("NT 3.5") && q.message.contains("XP"));
+    let nt4 = NTFS_VERSIONS
+        .iter()
+        .position(|v| v.0 == NtfsVersion::V1_2)
+        .unwrap();
+    act(
+        &mut c,
+        BuildDiskAction::Chose {
+            purpose: q.purpose,
+            choice: nt4,
+        },
+    );
+    let t = c
+        .format_targets()
+        .into_iter()
+        .find(|t| t.row == Some(1))
+        .unwrap();
+    assert_eq!(t.opts.ntfs_version, Some(NtfsVersion::V1_2));
+    assert!(
+        t.fields().contains(&FsOption::NtfsVersion),
+        "the row can still change it"
+    );
+
+    walk_to(&mut c, Step::Review);
+    act(&mut c, BuildDiskAction::Next);
+    c.wait();
+    let log = c.take_log();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{log:?}");
+    let f = std::fs::File::open(&img).unwrap();
+    let mut r = std::io::BufReader::new(f);
+    let table = crate::partition::PartitionTable::detect(&mut r).expect("table");
+    let ntfs_part = &table.partitions()[1];
+    let f = std::fs::File::open(&img).unwrap();
+    let vol = fs_pc::ntfs::NtfsFilesystem::open(f, ntfs_part.start_lba * 512).unwrap();
+    assert_eq!(vol.ntfs_version(), (1, 2));
+}
+
+/// Closing the question keeps the newer version, which every Windows from XP mounts.
+#[test]
+fn dismissing_the_ntfs_question_keeps_3_1() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
+    let fx = act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Ntfs));
+    let [Effect::Choose(q)] = fx.as_slice() else {
+        panic!("{fx:?}");
+    };
+    act(
+        &mut c,
+        BuildDiskAction::Chose {
+            purpose: q.purpose,
+            choice: q.dismiss,
+        },
+    );
+    let t = &c.format_targets()[0];
+    assert_eq!(t.opts.ntfs_version.unwrap_or_default(), NtfsVersion::V3_1);
+}
+
 #[test]
 fn a_partitioned_disk_formats_each_row() {
     let dir = tempfile::tempdir().unwrap();

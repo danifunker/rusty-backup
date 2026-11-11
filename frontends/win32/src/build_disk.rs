@@ -319,11 +319,9 @@ impl BuildScreen {
             };
             let action = match reply {
                 Reply::Picked { purpose, path } => BuildDiskAction::Picked { purpose, path },
-                // Build Disk asks only for files and folders; a device is confirmed by typing.
-                Reply::Confirmed { .. }
-                | Reply::Answered { .. }
-                | Reply::Chose { .. }
-                | Reply::CloseScreen => return,
+                // Which NTFS version a new NTFS target gets; a device is confirmed by typing.
+                Reply::Chose { purpose, choice } => BuildDiskAction::Chose { purpose, choice },
+                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => return,
             };
             s.apply(action);
         })

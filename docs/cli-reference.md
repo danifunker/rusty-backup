@@ -465,6 +465,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
 - `--label` — With no `--table`: the volume label
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
+- `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
 - `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw
 - `--force` — Overwrite an existing image file
 - `--yes` — Required to build on a device; everything on it is erased
@@ -1433,6 +1434,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--bytes-per-inode` — EFS and UFS: inode density in bytes per inode (smaller = more inodes). UFS defaults to one inode per 4 fragments, as `newfs -i` does
 - `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset
 - `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512
+- `--ntfs-version` — NTFS only: on-disk version. `1.2` (alias `nt4`) mounts on Windows NT 3.5 / 3.51 / 4.0 and every later Windows; `3.1` (alias `xp`, the default) needs Windows XP or later
 
 ### `optical`
 

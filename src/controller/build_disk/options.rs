@@ -1,6 +1,6 @@
 //! The Options step's rules, so every view edits a filesystem's options the same way.
 
-use super::{FormatOptions, FormatTarget, FsOption};
+use super::{FormatOptions, FormatTarget, FsOption, NtfsVersion};
 
 /// The AFFS DosType variants, by the byte `FormatOptions::affs_variant` holds.
 pub const AFFS_VARIANTS: [(u8, &str); 8] = [
@@ -12,6 +12,12 @@ pub const AFFS_VARIANTS: [(u8, &str); 8] = [
     (5, "FFS dir cache (DOS\\5)"),
     (6, "OFS long names (DOS\\6)"),
     (7, "FFS long names (DOS\\7)"),
+];
+
+/// The NTFS versions on offer, newest first, with the Windows that mount each.
+pub const NTFS_VERSIONS: [(NtfsVersion, &str); 2] = [
+    (NtfsVersion::V3_1, "3.1 (Windows XP and later)"),
+    (NtfsVersion::V1_2, "1.2 (Windows NT 3.5 to 4.0)"),
 ];
 
 /// The NTFS sector sizes on offer; 512 is the default, stored as `None`.
@@ -32,6 +38,7 @@ pub enum OptionEdit {
     BytesPerInode(Option<u64>),
     ClusterSize(Option<u64>),
     SectorSize(u32),
+    NtfsVersion(NtfsVersion),
 }
 
 fn clamp32(v: Option<u64>) -> Option<u32> {
@@ -64,6 +71,13 @@ impl OptionEdit {
             }
             OptionEdit::ClusterSize(v) => o.cluster_bytes = clamp32(v),
             OptionEdit::SectorSize(s) => o.sector_size = (s != 512).then_some(s),
+            // 1.2 is 512-byte sectors only, so picking it takes the sector size back to 512.
+            OptionEdit::NtfsVersion(v) => {
+                o.ntfs_version = Some(v);
+                if v == NtfsVersion::V1_2 {
+                    o.sector_size = None;
+                }
+            }
         }
     }
 }

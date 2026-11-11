@@ -1152,6 +1152,11 @@ impl Target for BuildDiskTarget {
                 }
             }
             "TypeDevicePath" => A::SetConfirmText(self.ctl.confirm_expected().unwrap_or_default()),
+            // The answer to the "which NTFS version" question, by button index.
+            "ChooseNtfsVersion" => A::Chose {
+                purpose: purpose::NTFS_VERSION,
+                choice: arg.and_then(Value::as_integer).ok_or("an index")? as usize,
+            },
             other => return Err(format!("BuildDiskController has no action {other:?}")),
         };
         Ok(self.ctl.apply(a))
@@ -1192,6 +1197,15 @@ impl Target for BuildDiskTarget {
                 None => String::new(),
             }),
             "opens" => Value::Integer(self.opens()),
+            // The first formatted target's NTFS version, "" when it is not NTFS.
+            "ntfs_version" => Value::String(
+                self.ctl
+                    .format_targets()
+                    .into_iter()
+                    .find(|t| t.fs == rusty_backup::controller::build_disk::FsKind::Ntfs)
+                    .map(|t| t.opts.ntfs_version.unwrap_or_default().label().to_string())
+                    .unwrap_or_default(),
+            ),
             "tail_zero" => Value::Boolean(
                 self.out
                     .as_ref()

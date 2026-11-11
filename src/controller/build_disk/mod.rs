@@ -12,19 +12,19 @@ mod options;
 #[cfg(test)]
 mod tests;
 
-pub use options::{OptionEdit, AFFS_VARIANTS, SECTOR_SIZES};
+pub use options::{OptionEdit, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::controller::log::LogLevel;
 use crate::controller::partition_edit::{self, BuildAction, BuildView};
-use crate::controller::{job_outcome, Controller, Effect, PickSpec};
+use crate::controller::{job_outcome, Choice, ChoiceSpec, Controller, Effect, PickSpec};
 use crate::model::disk_builder::{DiskBuilder, RowFormat};
 use crate::model::job::{Job, Notify, Snapshot};
 
 pub use crate::device::DiskDevice;
-pub use crate::model::format::{geometries, FormatOptions, FsCaps, FsKind, FsOption};
+pub use crate::model::format::{geometries, FormatOptions, FsCaps, FsKind, FsOption, NtfsVersion};
 pub use crate::model::job::NoNotify;
 pub use crate::partition::type_catalog::TableKind;
 pub use crate::rbformats::export::ExportFormat;
@@ -125,6 +125,7 @@ pub mod purpose {
     pub const SYSTEM_DISK: &str = "build_disk.system_disk";
     pub const DONOR: &str = "build_disk.donor";
     pub const CD_FOLDER: &str = "build_disk.cd_folder";
+    pub const NTFS_VERSION: &str = "build_disk.ntfs_version";
 }
 
 /// Stable widget ids, shared by every shell's accessibility identifiers.
@@ -623,6 +624,11 @@ pub enum BuildDiskAction {
         purpose: &'static str,
         path: Option<PathBuf>,
     },
+    /// The answer to a `Choose` (which NTFS version a new NTFS target gets).
+    Chose {
+        purpose: &'static str,
+        choice: usize,
+    },
     Create,
     Cancel,
     /// Back to the start, keeping the choices but the output file, which the last build wrote.
@@ -657,6 +663,8 @@ pub struct BuildDiskController {
     image: Option<PathBuf>,
     container: ExportFormat,
     confirm_text: String,
+    /// The target an open "which NTFS version" question is about: a row, or `None` for the volume.
+    ntfs_question: Option<Option<usize>>,
     /// RDB filesystem handlers to embed, and the DosType a handler pick is for.
     handlers: Vec<(String, PathBuf)>,
     handler_for: Option<String>,
@@ -698,6 +706,7 @@ impl BuildDiskController {
             image: None,
             container: ExportFormat::Raw,
             confirm_text: String::new(),
+            ntfs_question: None,
             handlers: Vec::new(),
             handler_for: None,
             mac_driver: MacDriver::Bundled,
@@ -1604,6 +1613,52 @@ impl BuildDiskController {
             .is_some_and(|t| t == r.type_text.trim())
     }
 
+    /// Which Windows reads an NTFS volume decides its version, so ask rather than default.
+    fn ask_ntfs_version(&mut self, row: Option<usize>) -> Vec<Effect> {
+        self.ntfs_question = Some(row);
+        let message = NTFS_VERSIONS
+            .iter()
+            .map(|(v, _)| format!("NTFS {}: {}.", v.label(), v.readers()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let choices = NTFS_VERSIONS
+            .iter()
+            .zip(['3', '1'])
+            .map(|((_, label), key)| Choice {
+                label: format!("NTFS {label}"),
+                key,
+            })
+            .collect();
+        vec![Effect::Choose(ChoiceSpec {
+            purpose: purpose::NTFS_VERSION,
+            title: "Which Windows will use this NTFS volume?".into(),
+            message,
+            choices,
+            dismiss: 0,
+        })]
+    }
+
+    /// The answer to [`Self::ask_ntfs_version`], for the target it was asked about.
+    fn chose_ntfs_version(&mut self, choice: usize) {
+        let Some(row) = self.ntfs_question.take() else {
+            return;
+        };
+        let Some((version, _)) = NTFS_VERSIONS.get(choice) else {
+            return;
+        };
+        let format = match row {
+            Some(row) => self
+                .builder
+                .rows
+                .get_mut(row)
+                .and_then(|r| r.format.as_mut()),
+            None => Some(&mut self.volume),
+        };
+        if let Some(f) = format.filter(|f| f.kind == FsKind::Ntfs) {
+            OptionEdit::NtfsVersion(*version).apply(&mut f.opts);
+        }
+    }
+
     fn set_row_fs(&mut self, row: usize, fs: Option<FsKind>) {
         let kind = self.builder.kind;
         let size = self.planned_sizes().get(row).copied().unwrap_or(0);
@@ -1901,7 +1956,12 @@ impl Controller for BuildDiskController {
             BuildDiskAction::PickOutputImage => return self.pick_output(),
             BuildDiskAction::SetSize(t) => self.size_text = t,
             BuildDiskAction::Table(a) => return self.table_edit(a),
-            BuildDiskAction::SetRowFs { row, fs } => self.set_row_fs(row, fs),
+            BuildDiskAction::SetRowFs { row, fs } => {
+                self.set_row_fs(row, fs);
+                if fs == Some(FsKind::Ntfs) {
+                    return self.ask_ntfs_version(Some(row));
+                }
+            }
             BuildDiskAction::SetRowOptions { row, opts } => {
                 if let Some(f) = self
                     .builder
@@ -1917,6 +1977,14 @@ impl Controller for BuildDiskController {
                 self.volume = RowFormat::new(fs);
                 if let Some(label) = label {
                     self.volume.opts.label = label;
+                }
+                if fs == FsKind::Ntfs {
+                    return self.ask_ntfs_version(None);
+                }
+            }
+            BuildDiskAction::Chose { purpose, choice } => {
+                if purpose == purpose::NTFS_VERSION {
+                    self.chose_ntfs_version(choice);
                 }
             }
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
