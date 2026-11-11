@@ -14,21 +14,24 @@ disagree. A row with CI target `-` is built outside CI.
   `rb-cli-sol9/`), with frozen dependencies. Engine, model and view-model code
   must build here: see CLAUDE.md § "Engine code must compile on Rust 1.73".
 
-**Features:** `default` is `gui, chd, optical, audio, native-zlib, native-zstd,
-seekable-zstd, remote, tui, crypto, yaml` (root `Cargo.toml`).
+**Features:** `default` is `chd, optical, audio, native-zlib, native-zstd,
+seekable-zstd, remote, tui, tui-update, crypto, yaml` (root `Cargo.toml`): what rb-cli ships.
+The egui app is `default + gui`; `gui` left `default` on 2026-11-10 so a plain `cargo build`
+of rb-cli pulls no GUI dependencies.
 
 ## Targets
 
 <!-- matrix:begin -->
 | Target | CI target | World | Ships today | Planned shell | Toolchain | Features | Limits |
 |---|---|---|---|---|---|---|---|
-| Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli, Inno installer | Win32 (Phase 5) | stable | default | |
-| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli | Win32 (Phase 5) | stable | default | |
-| macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default | |
-| Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default | |
-| Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default | x64 builds in docker/linux-packages-focal.Dockerfile (Ubuntu 20.04, glibc 2.31) on the libchdman glibc 2.31 prebuilt; arm64 builds on the 24.04 runner and needs glibc 2.39 |
+| Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli, Inno installer; the Win32 shell (`rusty-backup-win32.exe`, a preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
+| Windows Win32 shell (x64) | win32 | modern | checks only: clippy, layout tests and the UIA flows for `frontends/win32/`; the exe ships from the windows and windows-arm64 targets | Win32 (Phase 5) | stable | shell features | Windows 10 1809+; the UIA flows run in CI with Python and comtypes |
+| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli; the Win32 shell (preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
+| macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default + gui | |
+| Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default + gui | |
+| Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default + gui | x64 builds in docker/linux-packages-focal.Dockerfile (Ubuntu 20.04, glibc 2.31) on the libchdman glibc 2.31 prebuilt; arm64 builds on the 24.04 runner and needs glibc 2.39 |
 | Linux GTK4 shell (x64, arm64: AppImage, deb, rpm, Arch; riscv64: deb, rpm, tar) | gtk4 | modern | `rusty-backup-gtk` (`frontends/gtk4/`), in releases as a preview beside egui: packages built natively on x64 / arm64, cross-built for riscv64, and an AppImage that bundles GTK4 and libadwaita | GTK4 (Phase 4) | stable (gtk4-rs needs >= 1.92) | shell features | the packages need GTK >= 4.14 and libadwaita >= 1.5 (the AppImage does not); links ALSA (libasound) for the CD-DA player; the GUI suite and the AppImage smoke run on x64 only; riscv64 is build-only |
-| Linux riscv64 GUI | riscv64 | modern | egui GUI + rb-cli, deb + rpm | GTK4 (Phase 4) | stable | default | |
+| Linux riscv64 GUI | riscv64 | modern | egui GUI + rb-cli, deb + rpm | GTK4 (Phase 4) | stable | default + gui | |
 | Linux static musl x64, arm64, i586, i686, ppc64, ppc32 | musl | modern | rb-cli + TUI | TUI | stable; i586 pinned 1.98.1; ppc32 nightly + build-std; ppc via cargo-zigbuild | pure-zstd, remote, tui; x64 and arm64 add chd | no GUI, no optical (opticaldiscs and cd-da-reader don't build for musl), no crypto; CHD only on x64 and arm64 (libchdman-rs has no other musl archive) |
 | Linux glibc ppc64, ppc, riscv64 (extra-arch) | extra-arch | modern | rb-cli + TUI | TUI | stable | pure-zstd, remote, tui | no GUI, no CHD, no optical, no crypto |
 | MiSTer armv7 | mister | modern | rb-cli-mini + TUI, MiSTer Downloader db | TUI | stable | chd, pure-zstd, remote, optical, tui | no GUI; framebuffer console, no GL |
@@ -49,11 +52,14 @@ for wasm32) is a CI target too; the check script knows it.
 |---|---|---|
 | egui | `src/gui/` | the modern GUI rows, until Phase 7 retires it |
 | TUI | `src/cli/verbs/tui*` (ratatui) | every rb-cli row |
-| GTK4 + libadwaita | `frontends/gtk4/` (in progress, not shipped; CI target `gtk4` compiles it) | Linux modern, Phase 4 |
-| AppKit, Win32 | `frontends/{appkit,win32}/` (not yet) | Phases 3, 5 |
+| GTK4 + libadwaita | `frontends/gtk4/` (shipped as a preview beside egui since 2026-11-08; CI target `gtk4`) | Linux modern, Phase 4 |
+| AppKit | `frontends/appkit/` (not yet; [appkit_shell_plan.md](appkit_shell_plan.md)) | macOS modern, Phase 3 |
+| Win32 | `frontends/win32/` (the skeleton, slice 0; CI target `win32`; [win32_shell_plan.md](win32_shell_plan.md)) | Windows modern, Phase 5 |
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 
-Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`).
+Every shell renders `src/controller` view-models only (`scripts/check-boundaries.sh`), and every
+shell with a flow driver runs the tier 8 front-end flows (`regression-tests/FLOWS.md`): today the
+TUI (Linux, macOS) and GTK4.
 
 ## Screens on the shared controllers
 

@@ -18,7 +18,7 @@ echo "Building for macOS ($ARCH)..."
 
 # Build main app
 echo "Building main application..."
-cargo build --release --target "$TARGET"
+cargo build --release --target "$TARGET" --features gui
 
 # Create app bundle
 APP_NAME="Rusty Backup"

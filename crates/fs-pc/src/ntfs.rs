@@ -499,6 +499,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         // Read volume label from $Volume
         fs.label = fs.read_volume_label();
+        fs.ensure_used_bytes();
 
         Ok(fs)
     }
@@ -507,6 +508,20 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
     /// the defragmenting clone to drain the freshly repacked tempfile.
     pub(crate) fn into_reader(self) -> R {
         self.reader
+    }
+
+    /// The `$VOLUME_INFORMATION` version as `(major, minor)`; `(0, 0)` when unreadable.
+    pub fn ntfs_version(&self) -> (u8, u8) {
+        self.ntfs_version
+    }
+
+    /// The first MFT record the allocator hands out: NT 4.0 puts user files from 16.
+    pub(crate) fn first_user_record(&self) -> usize {
+        if self.ntfs_version.0 == 1 {
+            16
+        } else {
+            24
+        }
     }
 
     /// Number of MFT records the source `$MFT` can address (its `$DATA`
@@ -869,9 +884,15 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
-                let bitmap = self.read_attribute_data(attr, None)?;
-                let used_clusters = count_set_bits(&bitmap);
-                return Ok(used_clusters * self.cluster_size);
+                // Bits past the cluster count are the end-of-volume mark, not data.
+                let volume_clusters =
+                    self.total_sectors * self.bytes_per_sector / self.cluster_size;
+                let mut counter = BitCounter {
+                    set: 0,
+                    bits_left: volume_clusters,
+                };
+                self.write_attribute_data_to(attr, &mut counter, u64::MAX)?;
+                return Ok(counter.set * self.cluster_size);
             }
         }
 
@@ -1227,7 +1248,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         } else {
             FileEntry::new_file(name, path, real_size, file_mft_ref)
         };
-        fe.modified_unix = modified_unix;
+        set_modified(&mut fe, modified_unix);
         Some(fe)
     }
 
@@ -1551,8 +1572,39 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
 }
 
 /// Count set bits in a byte slice.
+/// Sets both the numeric mtime and the display string the browser shows.
+fn set_modified(fe: &mut FileEntry, unix: Option<u64>) {
+    fe.modified_unix = unix;
+    fe.modified = unix.map(|t| disk_core::unix_common::inode::format_unix_timestamp(t as i64));
+}
+
 fn count_set_bits(data: &[u8]) -> u64 {
     data.iter().map(|&b| b.count_ones() as u64).sum()
+}
+
+/// A `Write` sink that counts set bits in the first `bits_left` bits it is fed.
+struct BitCounter {
+    set: u64,
+    bits_left: u64,
+}
+
+impl std::io::Write for BitCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for &b in buf {
+            if self.bits_left == 0 {
+                break;
+            }
+            let take = self.bits_left.min(8) as u32;
+            let mask = if take == 8 { 0xFF } else { (1u8 << take) - 1 };
+            self.set += (b & mask).count_ones() as u64;
+            self.bits_left -= take as u64;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -2096,20 +2148,31 @@ fn build_nonresident_attr(attr_type: u32, runs: &[(u64, u64)], real_size: u64) -
     attr
 }
 
-/// Assemble a complete MFT record from attribute blobs.
+/// Where a `FILE` record's update sequence array starts: NTFS 1.x headers have no
+/// record-number field, so theirs starts at 0x2A (as NT 4.0 writes it), 3.x at 0x30.
+fn usa_offset(ntfs_major: u8) -> u16 {
+    if ntfs_major == 1 {
+        0x2A
+    } else {
+        0x30
+    }
+}
+
+/// Assemble a complete MFT record from attribute blobs, with `ntfs_major`'s header.
 fn assemble_mft_record(
     attrs: &[Vec<u8>],
     flags: u16,
     record_size: u32,
     record_num: u64,
     seq: u16,
+    ntfs_major: u8,
 ) -> Vec<u8> {
     let mut record = vec![0u8; record_size as usize];
+    let usa = usa_offset(ntfs_major);
 
     // FILE magic
     record[0..4].copy_from_slice(b"FILE");
-    // Fixup offset = 0x30
-    record[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
+    record[0x04..0x06].copy_from_slice(&usa.to_le_bytes());
     // One USN entry per 512-byte NTFS block (1024-byte record -> 3 entries).
     let fixup_count = (record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
     record[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
@@ -2117,8 +2180,8 @@ fn assemble_mft_record(
     record[0x10..0x12].copy_from_slice(&seq.max(1).to_le_bytes());
     // Hard link count = 1 (offset 0x12..0x14)
     record[0x12..0x14].copy_from_slice(&1u16.to_le_bytes());
-    // First attribute offset = 0x38 (after fixup array)
-    let first_attr = 0x30 + fixup_count as usize * 2;
+    // First attribute offset: after the fixup array, 8-aligned (0x30 on 1.x, 0x38 on 3.x).
+    let first_attr = usa as usize + fixup_count as usize * 2;
     let first_attr_aligned = (first_attr + 7) & !7;
     record[0x14..0x16].copy_from_slice(&(first_attr_aligned as u16).to_le_bytes());
     // Flags
@@ -2128,7 +2191,9 @@ fn assemble_mft_record(
     // Next attribute ID (offset 0x28) — count of attrs
     record[0x28..0x2A].copy_from_slice(&(attrs.len() as u16).to_le_bytes());
     // NTFS 3.1 records carry their own index here; chkdsk rejects the record without it.
-    record[0x2C..0x30].copy_from_slice(&(record_num as u32).to_le_bytes());
+    if ntfs_major != 1 {
+        record[0x2C..0x30].copy_from_slice(&(record_num as u32).to_le_bytes());
+    }
 
     // Write attributes
     let mut pos = first_attr_aligned;
@@ -2153,7 +2218,7 @@ fn assemble_mft_record(
     record[0x18..0x1C].copy_from_slice(&(pos as u32).to_le_bytes());
 
     // Initialize fixup array with default USN
-    let fixup_off = 0x30usize;
+    let fixup_off = usa as usize;
     record[fixup_off] = 0x01; // USN = 1
     record[fixup_off + 1] = 0x00;
     // Fixup entries (slots) — will be filled by prepare_fixup
@@ -2351,9 +2416,9 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
     fn allocate_mft_record(&mut self) -> Result<(u64, u16), FilesystemError> {
         let mut bitmap = self.read_mft_bitmap()?;
 
-        // Find first free bit starting from record 24 (skip system metafiles)
-        for byte_idx in 3..bitmap.len() {
-            // byte 3 = records 24-31
+        // First free record past the system metafiles: 16 on NTFS 1.x (as NT 4.0), else 24.
+        let first_byte = self.first_user_record() / 8;
+        for byte_idx in first_byte..bitmap.len() {
             if bitmap[byte_idx] != 0xFF {
                 for bit in 0..8u8 {
                     if bitmap[byte_idx] & (1 << bit) == 0 {
@@ -2370,21 +2435,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                             .filter(|&s| s != 0)
                             .unwrap_or(1);
 
-                        // Initialize blank MFT record
-                        let mut blank = vec![0u8; self.mft_record_size as usize];
-                        blank[0..4].copy_from_slice(b"FILE");
-                        blank[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
-                        let fixup_count =
-                            (self.mft_record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
-                        blank[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
-                        blank[0x10..0x12].copy_from_slice(&seq.to_le_bytes());
-                        let first_attr = (0x30 + fixup_count as usize * 2 + 7) & !7;
-                        blank[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
-                        blank[0x18..0x1C].copy_from_slice(&((first_attr + 4) as u32).to_le_bytes()); // used size
-                        blank[0x1C..0x20].copy_from_slice(&self.mft_record_size.to_le_bytes());
-                        // End marker
-                        blank[first_attr..first_attr + 4].copy_from_slice(&ATTR_END.to_le_bytes());
-
+                        let mut blank = self.blank_mft_record(seq);
                         self.write_mft_record(record_num, &mut blank)?;
                         return Ok((record_num, seq));
                     }
@@ -2395,7 +2446,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         // The MFT is full: grow it and hand out the first new record (F-012).
         self.grow_mft()?;
         let mut bitmap = self.read_mft_bitmap()?;
-        for byte_idx in 3..bitmap.len() {
+        for byte_idx in self.first_user_record() / 8..bitmap.len() {
             if bitmap[byte_idx] == 0xFF {
                 continue;
             }
@@ -2415,12 +2466,13 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
     /// A fresh FILE record with sequence `seq`, not in use, holding only the end marker.
     fn blank_mft_record(&self, seq: u16) -> Vec<u8> {
         let mut blank = vec![0u8; self.mft_record_size as usize];
+        let usa = usa_offset(self.ntfs_version.0);
         blank[0..4].copy_from_slice(b"FILE");
-        blank[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
+        blank[0x04..0x06].copy_from_slice(&usa.to_le_bytes());
         let fixup_count = (self.mft_record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
         blank[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
         blank[0x10..0x12].copy_from_slice(&seq.to_le_bytes());
-        let first_attr = (0x30 + fixup_count as usize * 2 + 7) & !7;
+        let first_attr = (usa as usize + fixup_count as usize * 2 + 7) & !7;
         blank[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
         blank[0x18..0x1C].copy_from_slice(&((first_attr + 4) as u32).to_le_bytes());
         blank[0x1C..0x20].copy_from_slice(&self.mft_record_size.to_le_bytes());
@@ -4533,6 +4585,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             self.mft_record_size,
             record_num,
             record_seq,
+            self.ntfs_version.0,
         );
         self.write_mft_record(record_num, &mut record)?;
 
@@ -4547,7 +4600,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_file(name.to_string(), path, data_len, record_num);
-        fe.modified_unix = disk_core::times::filetime_to_unix(stamp);
+        set_modified(&mut fe, disk_core::times::filetime_to_unix(stamp));
         Ok(fe)
     }
 
@@ -4618,6 +4671,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
             self.mft_record_size,
             record_num,
             record_seq,
+            self.ntfs_version.0,
         );
         self.write_mft_record(record_num, &mut record)?;
 
@@ -4632,7 +4686,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_directory(name.to_string(), path, record_num);
-        fe.modified_unix = disk_core::times::filetime_to_unix(stamp);
+        set_modified(&mut fe, disk_core::times::filetime_to_unix(stamp));
         Ok(fe)
     }
 
@@ -5616,6 +5670,89 @@ mod tests {
             "after shrink: {:?}",
             report.errors
         );
+    }
+
+    /// PINT grows its NT 4.0 data partition after writing the card: a 1.2 volume must grow too.
+    #[test]
+    fn resize_grows_an_ntfs_12_volume() {
+        use crate::ntfs_format::{
+            create_ntfs_version, NtfsFormatParams, NtfsGeometry, NtfsVersion,
+        };
+        for cluster in [512u32, 4096] {
+            let mut cur = Cursor::new(Vec::<u8>::new());
+            let params = NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(cluster, 512).unwrap(),
+                mft_records_hint: 128,
+                label: Some("PINT".into()),
+            };
+            create_ntfs_version(&mut cur, &params, NtfsVersion::V1_2).unwrap();
+            let mut img = cur.into_inner();
+            let new_len = 48 * 1024 * 1024u64;
+            img.resize(new_len as usize, 0);
+            let mut cur = Cursor::new(img);
+            assert!(resize_ntfs_in_place(&mut cur, 0, new_len / 512, &mut |_| {}).unwrap());
+            let mut fs = NtfsFilesystem::open(Cursor::new(cur.into_inner()), 0).unwrap();
+            assert_eq!(fs.ntfs_version(), (1, 2), "cluster {cluster}");
+            assert_eq!(fs.total_size(), new_len - 512, "cluster {cluster}");
+            let report = crate::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(
+                report.errors.is_empty(),
+                "cluster {cluster}: {:?}",
+                report.errors
+            );
+            let root = fs.root().unwrap();
+            let body = vec![7u8; 30 * 1024 * 1024];
+            let opts = CreateFileOptions::default();
+            fs.create_file(&root, "FILL.BIN", &mut Cursor::new(body), 30 << 20, &opts)
+                .unwrap_or_else(|e| {
+                    panic!("cluster {cluster}: the grown space takes a file: {e:?}")
+                });
+        }
+    }
+
+    /// R-091: on NTFS 1.2 user files start at record 16, and fsck, the used size and the
+    /// listing's date all have to see them.
+    #[test]
+    fn ntfs_12_user_records_are_counted_sized_and_dated() {
+        use crate::ntfs_format::{
+            create_ntfs_version, NtfsFormatParams, NtfsGeometry, NtfsVersion,
+        };
+        for version in [NtfsVersion::V1_2, NtfsVersion::V3_1] {
+            let mut cur = Cursor::new(Vec::<u8>::new());
+            let params = NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(512, 512).unwrap(),
+                mft_records_hint: 128,
+                label: Some("COUNT".into()),
+            };
+            create_ntfs_version(&mut cur, &params, version).unwrap();
+            let mut fs = NtfsFilesystem::open(Cursor::new(cur.into_inner()), 0).unwrap();
+            let root = fs.root().unwrap();
+            let dir = fs
+                .create_directory(&root, "TESTDIR", &CreateDirectoryOptions::default())
+                .unwrap();
+            let opts = CreateFileOptions::default();
+            fs.create_file(&dir, "A.TXT", &mut Cursor::new(b"hi".to_vec()), 2, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+            let free = fs.free_space().unwrap();
+            let img = fs.into_reader().into_inner();
+
+            let mut fs = NtfsFilesystem::open(Cursor::new(img), 0).unwrap();
+            let report = crate::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(report.errors.is_empty(), "{version:?}: {:?}", report.errors);
+            assert_eq!(report.stats.directories_checked, 1, "{version:?}");
+            assert_eq!(report.stats.files_checked, 1, "{version:?}");
+            assert_eq!(fs.used_size(), fs.total_size() - free, "{version:?}");
+            let root = fs.root().unwrap();
+            let listed = fs.list_directory(&root).unwrap();
+            let d = listed.iter().find(|e| e.name == "TESTDIR").unwrap();
+            assert!(
+                d.modified.is_some(),
+                "{version:?}: the browser's date column"
+            );
+        }
     }
 
     /// Resize used to patch only the boot sectors, so a grown volume kept the

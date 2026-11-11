@@ -244,7 +244,10 @@ impl rb_fsexporter::Host for FolderHost<'_, '_> {
                     .with_context(|| format!("compressing '{}'", entry.name))
                     .map(|()| entry.size),
             ),
-            f => Some(Err(anyhow::anyhow!("{:?} is not a folder-output format", f))),
+            f => Some(Err(anyhow::anyhow!(
+                "{:?} is not a folder-output format",
+                f
+            ))),
         }
     }
 }

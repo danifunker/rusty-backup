@@ -57,6 +57,21 @@ pub(super) static SECURE_SII_IDXROOT: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
 ];
 
+// NTFS 1.2 (Windows NT 3.5 / 3.51 / 4.0) tables, observed byte for byte on volumes NT 4.0 itself
+// wrote; provenance and the references are in docs/ntfs_format_cleanroom_notes.md § "NTFS 1.2".
+
+/// NT 4.0's `$AttrDef` (36000 bytes; identical on all three references).
+pub(super) static NT4_ATTRDEF: &[u8] = include_bytes!("ntfs_template/nt4_attrdef.bin");
+/// NT 4.0's `$UpCase` (131072 bytes; NT writes the running build's table, two of three agree).
+pub(super) static NT4_UPCASE: &[u8] = include_bytes!("ntfs_template/nt4_upcase.bin");
+/// Resident descriptor on $MFT, $MFTMirr, $LogFile, $AttrDef, $Bitmap, $Boot, $BadClus, $UpCase.
+pub(super) static NT4_SD_METAFILE: &[u8] = include_bytes!("ntfs_template/nt4_sd_metafile.bin");
+/// Resident descriptor on $Volume, $Quota and the reserved records 11-15.
+pub(super) static NT4_SD_METAFILE_RW: &[u8] =
+    include_bytes!("ntfs_template/nt4_sd_metafile_rw.bin");
+/// Resident root-directory descriptor: Everyone, full control.
+pub(super) static NT4_SD_ROOT: &[u8] = include_bytes!("ntfs_template/nt4_sd_root.bin");
+
 /// `$UpCase:$Info` resident $DATA value (CRC of the $UpCase table).
 pub(super) static UPCASE_INFO: &[u8] = &[
     0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x69, 0x1b, 0x6b, 0x77, 0x7e, 0xdc, 0xda,

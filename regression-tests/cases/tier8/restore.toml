@@ -1,0 +1,78 @@
+# Tier 8: the Restore screen, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.restore"
+description = "Restore from the Restore screen, then prove the result with rb-cli."
+
+[[case]]
+id = "flow.restore.folder-to-image"
+description = "Restore a zstd backup folder to a new image file from the Restore screen and read the file back"
+level = "smoke"
+area = ["restore"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["restore.backup-folder", "restore.target-image", "restore.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Restore" },
+  { pick = "{scratch}/bk/job" },
+  { activate = "restore.backup_folder" },
+  { wait = "1 partition" },
+  { focus = "restore.target_kind" },
+  { choose = "Save as image file" },
+  { focus = "restore.target_image" },
+  { fill = "{scratch}/out.img" },
+  { activate = "restore.start" },
+  { activate = "restore.confirm" },
+  { wait = "restore.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/out.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.restore.share-with-inspect"
+description = "A backup folder opened on Restore shows in Inspect too, and the top bar's Close Backup closes it on both tabs"
+level = "smoke"
+area = ["restore", "inspect"]
+shells = ["gtk", "win32"]
+capabilities = ["restore.backup-folder", "inspect.open-backup"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Restore" },
+  { pick = "{scratch}/bk/job" },
+  { activate = "restore.backup_folder" },
+  { wait = "1 partition" },
+  { tab = "Inspect" },
+  { wait = "Backup: " },
+  { activate = "app.close_backup" },
+  { wait = "Select a device or image..." },
+  { tab = "Restore" },
+  { wait = "No folder selected" },
+]

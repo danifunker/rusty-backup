@@ -1,0 +1,88 @@
+# Tier 8: the Backup screen, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.backup"
+description = "Back up from the Backup screen, then prove the backup with rb-cli."
+
+[[case]]
+id = "flow.backup.image-zstd"
+description = "Open a FAT floppy image on the Backup screen, back it up to zstd, restore it with rb-cli and read the file back"
+level = "smoke"
+area = ["backup"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["backup.source-image", "backup.format", "backup.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { pick = "{scratch}/src.img" },
+  { activate = "backup.open_image" },
+  { wait = "FAT" },
+  { focus = "backup.destination" },
+  { fill = "{scratch}/bk" },
+  { focus = "backup.name" },
+  { fill = "job" },
+  { focus = "backup.format" },
+  { choose = "Zstd" },
+  { activate = "backup.start" },
+  { wait = "backup.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["restore", "{scratch}/bk/job", "{scratch}/out.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["get", "{scratch}/out.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.backup.image-vhd"
+description = "Back a FAT floppy image up to one whole-disk VHD through the VHD options window and read the file back out of the .vhd"
+level = "smoke"
+area = ["backup"]
+shells = ["gtk", "win32"]
+capabilities = ["backup.source-image", "backup.format", "backup.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { pick = "{scratch}/src.img" },
+  { activate = "backup.open_image" },
+  { wait = "FAT" },
+  { focus = "backup.destination" },
+  { fill = "{scratch}" },
+  { focus = "backup.name" },
+  { fill = "job" },
+  { focus = "backup.format" },
+  { choose = "VHD" },
+  { activate = "backup.start" },
+  { wait = "VHD Backup Options" },
+  { activate = "backup.vhd_start" },
+  { wait = "backup.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/job.vhd", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]

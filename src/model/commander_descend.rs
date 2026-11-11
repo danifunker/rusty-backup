@@ -48,17 +48,18 @@ const OPTICAL_EXTS: &[&str] = &[
 /// Classify a filename as descendable, by extension only (no I/O). The actual
 /// open confirms by content; this just decides whether to offer the affordance.
 /// Mac-archive extensions win over disk-image ones (a `.sit.hqx` is an archive).
+/// A ZIP or tar-family name: it browses its files rather than being taken for a zip-wrapped disk image.
+pub fn is_host_archive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".zip", ".tar", ".tgz", ".tar.gz", ".tar.zst"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
 pub fn classify(name: &str) -> Option<DescendKind> {
     let lower = name.to_ascii_lowercase();
-    // Host archives (ZIP / tar family) — checked before the disk-image
-    // extensions so a `.zip` browses its files rather than being treated as a
-    // zip-wrapped disk image.
-    if lower.ends_with(".zip")
-        || lower.ends_with(".tar")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tar.zst")
-    {
+    // Checked before the disk-image extensions.
+    if is_host_archive_name(name) {
         return Some(DescendKind::Archive);
     }
     let ext = name.rsplit_once('.').map(|(_, e)| e)?;

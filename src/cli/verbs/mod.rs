@@ -38,6 +38,7 @@ pub mod menu;
 pub mod mkdir;
 pub mod mv;
 pub mod new;
+pub mod new_bsd_alpha_hd;
 pub mod new_mac_cdrom;
 pub mod new_next_cdrom;
 pub mod new_partitioned_hd;

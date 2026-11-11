@@ -164,6 +164,8 @@ struct GithubAsset {
 fn windows_arch_tag() -> &'static str {
     if cfg!(target_arch = "x86") {
         "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
     } else {
         "x64"
     }
@@ -197,6 +199,10 @@ impl UpdateConfig {
         // Unit tests must never write the real user's config.json (recent lists, CHD choice).
         if cfg!(test) {
             return Some(std::env::temp_dir().join("rusty-backup-test-config"));
+        }
+        // Flows point every shell at a scratch config; `dirs` ignores HOME and APPDATA on Windows.
+        if let Some(dir) = std::env::var_os("RUSTY_BACKUP_CONFIG_DIR").filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir));
         }
         #[cfg(target_os = "linux")]
         let config_dir = crate::os::linux::real_user_home().map(|h| h.join(".config"));
@@ -391,19 +397,21 @@ pub fn check_for_updates(
 
     let is_outdated = release_is_newer(&latest_version, current);
 
-    // Match the GUI ZIP + CLI asset for this arch so the GUI can offer an
+    // Match this GUI's ZIP + CLI asset for this arch so the GUI can offer an
     // in-app update. Naming is set by .github/workflows/release.yml:
-    //   Rusty-Backup-windows-<arch>-<version>.zip
+    //   Rusty-Backup-windows-<arch>-<version>.zip        (egui)
+    //   Rusty-Backup-Win32-windows-<arch>-<version>.zip  (the Win32 shell)
     //   Rusty-Backup-CLI-windows-<arch>-<version>.exe
     let arch_pat = format!("windows-{}-", windows_arch_tag());
+    let zip = format!(
+        "{}-{}-",
+        crate::os::windows_gui::WindowsGui::current().zip_prefix(),
+        windows_arch_tag()
+    );
     let asset_url = release
         .assets
         .iter()
-        .find(|a| {
-            a.name.starts_with("Rusty-Backup-windows")
-                && a.name.contains(&arch_pat)
-                && a.name.to_ascii_lowercase().ends_with(".zip")
-        })
+        .find(|a| a.name.starts_with(&zip) && a.name.to_ascii_lowercase().ends_with(".zip"))
         .map(|a| a.browser_download_url.clone());
     let cli_asset_url = release
         .assets
@@ -495,9 +503,11 @@ pub fn download_and_apply_update(
     let staging = tempfile::Builder::new().prefix("rb-update-").tempdir()?;
     extract_zip_flat(&zip_bytes, staging.path())?;
 
-    let new_exe = staging.path().join("rusty-backup.exe");
+    // Each GUI ships in its own ZIP, which the check above matched to the running one.
+    let name = crate::os::windows_gui::WindowsGui::current().exe_name();
+    let new_exe = staging.path().join(name);
     if !new_exe.exists() {
-        return Err("update archive did not contain rusty-backup.exe".into());
+        return Err(format!("update archive did not contain {name}").into());
     }
 
     replace_running_exe(&new_exe)?;

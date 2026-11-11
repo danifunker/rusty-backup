@@ -1,0 +1,53 @@
+# Tier 2 — two more NTFS 1.2 volumes written by real NT 4.0: Alpha Workstation and PowerPC.
+#
+# They are the reference the NTFS 1.2 formatter was checked against (see
+# docs/ntfs_format_cleanroom_notes.md), so a reader or fsck regression on 1.2 shows here first.
+
+[meta]
+tier = 2
+group = "fs.read.ntfs.nt4"
+description = "List, walk, fsck and extract NT 4.0 NTFS 1.2 system volumes from Alpha and PowerPC installs."
+
+[[case]]
+id = "read.ntfs.nt4-alpha-wks"
+description = "Alpha NT4 Workstation: WINNT lists, the volume walks, fsck is clean, the kernel extracts"
+fixture = "fs.ntfs.nt4-alpha-wks.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_matches = ["DIR\\s+\\d+\\s+WINNT", "FILE\\s+145752064\\s+pagefile.sys"]
+[[case.step]]
+args = ["du", "{fixture}@3", "/"]
+expect_exit = 0
+stdout_matches = ["\\s1457\\s+85\\s+/\\n"]
+[[case.step]]
+args = ["fsck", "{fixture}@3"]
+expect_exit = 0
+stdout_matches = ["1457 files / 84 dirs checked"]
+[[case.step]]
+args = ["get", "{fixture}@3", "/WINNT/system32/NTOSKRNL.EXE", "{scratch}/ex/"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/NTOSKRNL.EXE", sha256 = "c70d3a08cdcec180f6ccc4af948a9efd5ed04f74eb79638a6d4ad4a7a1dc6cb8" }]
+
+[[case]]
+id = "read.ntfs.nt4-ppc"
+description = "PowerPC NT4: 512-byte clusters and a 13-run MFT list, walk, fsck clean and extract"
+fixture = "fs.ntfs.nt4-ppc.hd"
+timeout_ms = 600000
+[[case.step]]
+args = ["ls", "{fixture}@5", "/"]
+expect_exit = 0
+stdout_matches = ["DIR\\s+\\d+\\s+WINNT", "FILE\\s+130023424\\s+pagefile.sys"]
+[[case.step]]
+args = ["du", "{fixture}@5", "/"]
+expect_exit = 0
+stdout_matches = ["\\s1603\\s+85\\s+/\\n"]
+[[case.step]]
+args = ["fsck", "{fixture}@5"]
+expect_exit = 0
+stdout_matches = ["1603 files / 84 dirs checked"]
+[[case.step]]
+args = ["get", "{fixture}@5", "/WINNT/system32/NTOSKRNL.EXE", "{scratch}/ex/"]
+expect_exit = 0
+file_sha256 = [{ path = "{scratch}/ex/NTOSKRNL.EXE", sha256 = "c71ecfa6f8d91525e006d675b4ae90c787ccb34ed84f901c7b80c8c03aa94cb4" }]

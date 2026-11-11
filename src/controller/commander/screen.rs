@@ -52,8 +52,20 @@ mod copy;
 mod detail;
 mod extract;
 pub use extract::{extract_applies, extract_fork_modes, ExtractApplies, ProdosExportMode};
+mod drop;
 mod follow;
 mod modes;
+pub use drop::DropPlan;
+mod panel;
+pub use panel::{
+    CopyColumn, EditBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SideBars, SidePanel,
+    VolumeLine,
+};
+mod windows;
+pub use windows::{
+    editor_window, field_action, journal_window, submit, tree_window, FieldId, Form, PaneWindow,
+    Part, Press, Tone, WindowButton, WindowKind,
+};
 #[cfg(test)]
 mod tests;
 

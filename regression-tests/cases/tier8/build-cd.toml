@@ -1,0 +1,140 @@
+# Tier 8: building CD-ROM images on the Build Disk screen, end to end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.build.cd"
+description = "Build disks and CD-ROM images on the Build Disk screen, then prove them with rb-cli."
+
+[[case]]
+id = "flow.build.efs-cd"
+description = "Build an IRIX EFS CD-ROM image filled from a host folder on the Build Disk screen, then read the file back from it with rb-cli"
+level = "smoke"
+area = ["build-disk", "optical"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["build.cd-efs", "build.cd-from-folder"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { focus = "build_disk.kind" },
+  { choose = "CD-ROM image" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/efs.iso" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.cd_layout" },
+  { choose = "IRIX EFS" },
+  { focus = "build_disk.cd_auto_size" },
+  { choose = "on" },
+  { pick = "{cases}/tier8/data/inject" },
+  { activate = "build_disk.cd_folder" },
+  { wait = "inject" },
+  { activate = "build_disk.next" },
+  { wait = "IRIX EFS CD-ROM" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.build_another", timeout_ms = 240000 },
+]
+
+[[case.step]]
+args = ["ls", "{scratch}/efs.iso", "/"]
+expect_exit = 0
+stdout_contains = ["HELLO.TXT"]
+
+[[case.step]]
+args = ["get", "{scratch}/efs.iso", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.build.mbr-fat"
+description = "Build a 32 MiB MBR image with one FAT partition and a typed label on the Build Disk screen, walking the Partitions and Options steps, then check the table and the label with rb-cli"
+level = "smoke"
+area = ["build-disk"]
+shells = ["gtk", "win32"]
+capabilities = ["build.partitioned", "build.format"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "FAT12" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.label.0" },
+  { fill = "WIN32" },
+  { activate = "build_disk.next" },
+  { wait = "WIN32" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.build_another", timeout_ms = 240000 },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/mbr.img", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partition_table", value = "MBR" },
+]
+
+[[case.step]]
+args = ["ls", "{scratch}/mbr.img@1", "/"]
+expect_exit = 0
+
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/mbr.img@1"]
+expect_exit = 0
+stdout_contains = ["WIN32"]
+
+[[case]]
+id = "flow.build.mbr-ntfs12"
+description = "Build an MBR image with an NTFS 1.2 partition from its own entry in the filesystem list (Review names the version), open it with Open in Inspect, then check the version, the used size and fsck's count of a new folder with rb-cli"
+level = "full"
+area = ["build-disk", "inspect"]
+shells = ["gtk", "win32"]
+capabilities = ["build.partitioned", "build.format", "build.open-inspect"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/nt4.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "64M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  # Each NTFS version is its own entry; picking it is the whole choice.
+  { choose = "NTFS 1.2 (Windows NT 3.5 to 4.0)" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.next" },
+  { wait = "NTFS 1.2" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.open_inspect", timeout_ms = 240000 },
+  { activate = "build_disk.open_inspect" },
+  # Only the Inspect page shows it, so the tab switched without another click.
+  { wait = "Re-inspect" },
+]
+
+[[case.step]]
+args = ["show", "fs-info", "{scratch}/nt4.img@1"]
+expect_exit = 0
+stdout_contains = ["NTFS 1.2"]
+stdout_matches = ['Used:\s+[1-9]']
+
+[[case.step]]
+args = ["mkdir", "{scratch}/nt4.img@1", "/TESTDIR"]
+expect_exit = 0
+
+[[case.step]]
+args = ["fsck", "{scratch}/nt4.img@1"]
+expect_exit = 0
+stdout_contains = ["0 files / 1 dirs checked"]

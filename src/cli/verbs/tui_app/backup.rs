@@ -27,7 +27,7 @@ use crate::controller::app::chd::{
 };
 use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 use crate::controller::backup::{
-    format_size, BackupAction, BackupController, BackupServices, ChecksumType, CompactCell,
+    format_size, labels, BackupAction, BackupController, BackupServices, ChecksumType, CompactCell,
     CompressionType, HostRequest, JobRegistry, MinCell, NoNotify, SizeMode, SPLIT_MIB_MAX,
     SPLIT_MIB_MIN,
 };
@@ -230,7 +230,7 @@ impl BackupState {
                 .then(|| ("Cancel requested...".to_string(), true));
         }
         match self.ctl.last_result()? {
-            Ok(()) => Some(("Backup complete.".to_string(), false)),
+            Ok(()) => Some((labels::DONE.to_string(), false)),
             Err(e) => Some((e.clone(), true)),
         }
     }
@@ -1131,6 +1131,11 @@ impl App {
         }
 
         let check = |on: bool| if on { "[x]" } else { "[ ]" };
+        let (dest, name, format) = (
+            format!("{}:", labels::DESTINATION),
+            format!("{}:", labels::NAME),
+            format!("{}:", labels::FORMAT),
+        );
         for f in b.fields() {
             if matches!(f, Field::Partition(_)) {
                 continue;
@@ -1147,16 +1152,16 @@ impl App {
             let (label, value): (&str, String) = match f {
                 Field::Partition(_) => continue,
                 Field::Output => (
-                    "Output:",
+                    dest.as_str(),
                     if b.out_dir.is_empty() && b.focus != f {
                         "(output folder; Tab browses)".to_string()
                     } else {
                         b.out_dir.clone()
                     },
                 ),
-                Field::Name => ("Name:", b.ctl.name().to_string()),
+                Field::Name => (name.as_str(), b.ctl.name().to_string()),
                 Field::Format => (
-                    "Format:",
+                    format.as_str(),
                     format!("< {} >", BACKUP_FORMATS[b.format_index()].0),
                 ),
                 Field::ChdMode | Field::ChdHunk | Field::ChdCodec(_) => self.chd_row(b, f),
@@ -1231,14 +1236,14 @@ impl App {
                     }
                     let why = b.ctl.validate().err().unwrap_or_default();
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{m}[ Start backup ]"), style),
+                        Span::styled(format!("{m}[ {} ]", labels::START), style),
                         Span::styled(format!("  {why}"), self.palette.dim()),
                     ]));
                     continue;
                 }
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{m}{label:<11}"), style),
+                Span::styled(format!("{m}{label:<15}"), style),
                 Span::raw(value),
                 cursor,
             ]));

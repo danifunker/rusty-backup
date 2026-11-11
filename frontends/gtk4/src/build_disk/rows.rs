@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use adw::prelude::*;
 use rusty_backup::controller::build_disk::{
-    format_size, hints, ids, BuildDiskAction, BuildDiskController, FsKind, MacDriver, RowContent,
+    format_size, hints, ids, BuildDiskAction, BuildDiskController, FsChoice, MacDriver, RowContent,
     TableKind,
 };
 use rusty_backup::controller::inspect::{LayoutSegment, SegmentKind};
@@ -25,21 +25,21 @@ use crate::widgets::{plain, set_text};
 enum Choice {
     Copy,
     Empty,
-    Fs(FsKind),
+    Fs(FsChoice),
 }
 
 /// Copy where the row has a donor, Empty, then every filesystem.
 fn choices(can_copy: bool) -> Vec<Choice> {
     let copy = can_copy.then_some(Choice::Copy);
-    let fs = FsKind::ALL.iter().map(|k| Choice::Fs(*k));
+    let fs = FsChoice::all().into_iter().map(Choice::Fs);
     copy.into_iter().chain([Choice::Empty]).chain(fs).collect()
 }
 
-fn label_of(c: Choice) -> &'static str {
+fn label_of(c: Choice) -> String {
     match c {
-        Choice::Copy => "Copy",
-        Choice::Empty => "Empty",
-        Choice::Fs(k) => k.display_name(),
+        Choice::Copy => "Copy".into(),
+        Choice::Empty => "Empty".into(),
+        Choice::Fs(k) => k.label(),
     }
 }
 
@@ -60,7 +60,7 @@ fn segments(list: &[BarSegment]) -> Vec<LayoutSegment> {
 /// A row's content, read beside its view.
 struct RowState {
     content: RowContent,
-    fs: Option<FsKind>,
+    fs: Option<FsChoice>,
     can_copy: bool,
 }
 
@@ -81,7 +81,7 @@ impl RowsShown {
         let view = ctrl.table_view();
         let rows = (0..view.rows.len()).map(|i| RowState {
             content: ctrl.row_content(i),
-            fs: ctrl.row_fs(i),
+            fs: ctrl.row_fs_choice(i),
             can_copy: ctrl.row_can_copy(i),
         });
         let rows = rows.collect();
@@ -260,8 +260,12 @@ impl RowCells {
 
         let can_copy = shape.copies.get(i).copied().unwrap_or(false);
         let list = choices(can_copy);
-        let labels: Vec<&str> = list.iter().map(|c| label_of(*c)).collect();
+        let names: Vec<String> = list.iter().map(|c| label_of(*c)).collect();
+        let labels: Vec<&str> = names.iter().map(String::as_str).collect();
         let content = gtk::DropDown::from_strings(&labels);
+        // Forty-odd filesystems: typing filters the list.
+        content.set_expression(Some(crate::form::string_search()));
+        content.set_enable_search(true);
         content.set_widget_name(&format!("{}.{i}", ids::ROW_CONTENT));
         if can_copy {
             content.set_tooltip_text(Some(hints::ROW_COPY));

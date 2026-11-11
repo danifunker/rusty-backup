@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusty_backup::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, hints, ids, parse_size_field,
+    containers, cpm_presets, format_size, geometries, hints, ids, labels, parse_size_field,
     BuildDiskAction, BuildDiskController, CdLayout, CdSidecars, DiskKind, FormatOptions,
-    FormatTarget, FsKind, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
-    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
+    FormatTarget, FsChoice, FsOption, MacDriver, OptionEdit, PresetKind, RowContent, Step,
+    AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::partition_edit::BuildAction;
@@ -85,10 +85,10 @@ impl BuildDiskTab {
                 Reply::Picked { purpose, path } => {
                     self.act(BuildDiskAction::Picked { purpose, path })
                 }
-                Reply::Confirmed { .. }
-                | Reply::Answered { .. }
-                | Reply::Chose { .. }
-                | Reply::CloseScreen => {}
+                Reply::Chose { purpose, choice } => {
+                    self.act(BuildDiskAction::Chose { purpose, choice })
+                }
+                Reply::Confirmed { .. } | Reply::Answered { .. } | Reply::CloseScreen => {}
             }
         }
         if !self.pending_fx.is_empty() {
@@ -472,7 +472,7 @@ impl BuildDiskTab {
                 self.size_row(ui, None);
             }
             DiskKind::Volume => {
-                let fs = self.ctl.volume_fs();
+                let fs = self.ctl.volume_fs_choice();
                 ui.horizontal(|ui| {
                     ui.label("Filesystem:");
                     if let Some(k) = fs_combo(ui, ids::VOLUME_FS, Some(fs), false) {
@@ -662,7 +662,7 @@ impl BuildDiskTab {
                     }
                     ui.horizontal(|ui| {
                         let content = self.ctl.row_content(i);
-                        let fs = self.ctl.row_fs(i);
+                        let fs = self.ctl.row_fs_choice(i);
                         let id = format!("{}_{i}", ids::ROW_CONTENT);
                         if self.ctl.row_can_copy(i) {
                             let copying = content == RowContent::Copy;
@@ -875,7 +875,7 @@ impl BuildDiskTab {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if let Some(img) = self.ctl.built_image() {
-                if ui.button("Open in Inspect").clicked() {
+                if ui.button(labels::OPEN_INSPECT).clicked() {
                     self.open_inspect = Some(img.to_path_buf());
                 }
             }
@@ -890,12 +890,12 @@ impl BuildDiskTab {
 fn fs_combo(
     ui: &mut egui::Ui,
     id: &str,
-    current: Option<FsKind>,
+    current: Option<FsChoice>,
     empty: bool,
-) -> Option<Option<FsKind>> {
+) -> Option<Option<FsChoice>> {
     let text = match current {
-        Some(k) => k.display_name(),
-        None => "Empty",
+        Some(k) => k.label(),
+        None => "Empty".to_string(),
     };
     let mut out = None;
     egui::ComboBox::from_id_salt(id)
@@ -906,11 +906,8 @@ fn fs_combo(
             if empty && ui.selectable_label(current.is_none(), "Empty").clicked() {
                 out = Some(None);
             }
-            for k in FsKind::ALL {
-                if ui
-                    .selectable_label(current == Some(k), k.display_name())
-                    .clicked()
-                {
+            for k in FsChoice::all() {
+                if ui.selectable_label(current == Some(k), k.label()).clicked() {
                     out = Some(Some(k));
                 }
             }
@@ -1065,6 +1062,23 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                             }
                         });
                 }
+                FsOption::NtfsVersion => {
+                    ui.label("NTFS version:");
+                    let now = o.ntfs_version.unwrap_or_default();
+                    let shown = NTFS_VERSIONS
+                        .iter()
+                        .find(|v| v.0 == now)
+                        .map_or("?", |v| v.1);
+                    egui::ComboBox::from_id_salt(("bd_ntfsv", key))
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (v, label) in NTFS_VERSIONS {
+                                if ui.selectable_label(now == v, label).clicked() {
+                                    OptionEdit::NtfsVersion(v).apply(&mut o);
+                                }
+                            }
+                        });
+                }
                 FsOption::BtreeSizes | FsOption::MinCatalog => continue,
             }
             ui.end_row();
@@ -1083,7 +1097,7 @@ fn help(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_backup::controller::build_disk::purpose;
+    use rusty_backup::controller::build_disk::{purpose, FsKind};
     use rusty_backup::controller::log::LogStore;
 
     /// Renders every step headlessly: egui panics on a Grid whose rows disagree on cell count or
@@ -1101,13 +1115,13 @@ mod tests {
             tab.act(BuildDiskAction::Table(BuildAction::AddRow));
             tab.act(BuildDiskAction::SetRowFs {
                 row: 0,
-                fs: Some(FsKind::Ufs),
+                fs: Some(FsKind::Ufs.into()),
             });
             tab.act(BuildDiskAction::SetRowFs {
                 row: 1,
-                fs: Some(FsKind::Ntfs),
+                fs: Some(FsKind::Ntfs.into()),
             });
-            tab.act(BuildDiskAction::SetVolumeFs(FsKind::Cpm));
+            tab.act(BuildDiskAction::SetVolumeFs(FsKind::Cpm.into()));
             let mut log = LogStore::default();
             let mut progress = ProgressState::default();
             for _ in 0..8 {

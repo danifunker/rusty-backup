@@ -1,0 +1,49 @@
+# NTFS is listed once per version, since NT 3.5 to 4.0 mount only NTFS 1.2: picking an entry is the
+# whole choice, with no question; plain NTFS is 3.1, and the 1.2 entry builds a 1.2 volume.
+name = "Build Disk: each NTFS entry builds its version"
+vm = "build_disk"
+
+[[step]]
+action = "SetKind"
+arg = "volume"
+
+[[step]]
+action = "VolumeFs"
+arg = "ntfs"
+effects = []
+expect = { ntfs_version = "3.1" }
+
+[[step]]
+action = "VolumeFs"
+arg = "ntfs:1.2"
+effects = []
+expect = { ntfs_version = "1.2" }
+
+[[step]]
+action = "Next"
+
+[[step]]
+action = "OutputImage"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Disk" }
+
+[[step]]
+action = "SetSize"
+arg = "32M"
+expect = { blocked = "" }
+
+[[step]]
+action = "Next"
+expect = { step = "Options" }
+
+[[step]]
+action = "Next"
+expect = { step = "Review", review = 'One NTFS 1.2 "rusty-backup" volume' }
+
+[[step]]
+action = "Next"
+settle = true
+expect = { result = "ok", opens = 1, ntfs_version = "1.2" }

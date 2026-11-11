@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new hd bsd-alpha</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <a href="new-hd.html">hd</a> &raquo; <span>bsd-alpha</span></nav>
+<h1><code>rb-cli new hd bsd-alpha</code></h1>
+<p>FreeBSD/Alpha disk: a 4.4BSD label in sector 0 (byte 64) with partitions you size, which FreeBSD 4.x / 5.x installs onto; `--format` makes the 4.2BSD ones UFS1</p>
+<h2>Usage</h2>
+<pre><code>Usage: bsd-alpha [OPTIONS] --size &lt;SIZE&gt; &lt;IMAGE&gt; &lt;PARTITIONS&gt;...</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create</dd>
+<dt><code>&lt;PARTITIONS&gt;</code></dt>
+<dd>Partitions in disk order, `LETTER:SIZE[:FSTYPE[:MOUNT]]` (letter a-h but not c; `rest` once; fstype `4.2BSD`, `swap` or `unused`). MOUNT is a note: `/etc/fstab` holds mount points</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Total disk size (accepts `K`/`M`/`G` suffixes)</dd>
+<dt><code>--format</code></dt>
+<dd>Format each 4.2BSD partition as little-endian UFS1, 16 KiB blocks / 2 KiB fragments</dd>
+<dt><code>--bootblock</code></dt>
+<dd>FreeBSD/Alpha's `/boot/boot1`, written from sector 1 (at most 7680 bytes); sector 0 then points the SRM console at it</dd>
+<dt><code>--align</code></dt>
+<dd>Alignment for partition starts. Default 1 MiB</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite `image` if it already exists</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

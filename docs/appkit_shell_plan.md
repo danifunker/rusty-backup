@@ -1,0 +1,148 @@
+# AppKit shell plan (macOS)
+
+Phase 3 of [native_frontends_plan.md](native_frontends_plan.md). Drafted 2026-11-09 from what the
+GTK4 shell ([gtk4_shell_plan.md](gtk4_shell_plan.md)) and the tier 8 flows
+([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started: second, after
+the Win32 shell (main plan D7), which settles Phase 2b and the driver pattern first.
+
+The shell is `frontends/appkit/`: AppKit through `objc2` / `objc2-app-kit` 0.3 (the versions the
+engine already links for IOKit and DiskArbitration), a pure view over `rusty_backup::controller`,
+built on stable Rust with its own lockfile. Minimum macOS 10.13, the same as the egui `.app`. It
+ships as a second app beside egui, marked preview, until it reaches parity (exit criteria below);
+then Phase 7 drops egui from the macOS release.
+
+The 10.7 vintage shell is Phase 6 and is not this plan; whatever is learned here about the AX
+driver and the slices carries over to it.
+
+## Before slice 0
+
+These land first, in the shared code, because they decide how much this shell has to invent.
+They are listed once for both new shells in
+[native_frontends_plan.md](native_frontends_plan.md) § Phase 2b.
+
+- Labels and result messages come from the controllers, so this shell's `drivers/labels.toml`
+  section starts empty and stays empty.
+- The scripted-pick hook (`RUSTY_BACKUP_TEST_PICKS`) is a shared helper the shell calls.
+- The behaviour drift the GTK flows found is settled (staged vs immediate host copy, convert on
+  the Optical screen), so this shell copies one answer, not two.
+- `docs/capabilities.md` exists, with an empty AppKit column to fill.
+
+## Rules for every slice
+
+The GTK plan's rules are the starting point; most are about retained-mode toolkits, not GTK.
+
+- CONTRIBUTING.md § Architecture policy is binding; `scripts/check-boundaries.sh` adds
+  `frontends/appkit` at 0 engine references. Logic a second view would need moves **down** into
+  the controller and still passes the 1.73 floor.
+- `src/gui/<screen>.rs` and `frontends/gtk4/src/<screen>/` are the references for what a screen
+  does; the controller is the contract. Match every `Action` and `Effect` with no `_` arm.
+- **Every actionable view gets its controller id as its accessibility identifier**
+  (`setAccessibilityIdentifier(ids::X)`). AX exposes it as `AXIdentifier`, so the flow driver
+  finds controls by id and never by label. This is the one big improvement over GTK 4.14, which
+  keeps widget names off AT-SPI.
+- Every caption-and-field pair is linked (`setAccessibilityTitleUIElement` or a labelled control),
+  so no field is unnamed. GTK's Expand HFS size spin was not, and a screen reader could not name it.
+- No Unicode glyphs in strings. SF Symbols are fine: they are images. Comments are one line, two at
+  most.
+
+### The retained-mode pattern, in AppKit terms
+
+- Each screen is a struct of views with `build()`, `apply(action)` + `tick()`, and `refresh()`.
+- `refresh()` reads everything from the controller first and releases the borrow, then sets views
+  inside the screen's sync guard. AppKit's target-action does not fire on a programmatic set, but
+  delegates, bindings and `NSTableView` selection notifications do; every handler returns early
+  while the guard is active.
+- Only set a view when its value changed: a blind `setStringValue` moves the caret mid-typing, and
+  `reloadData` loses selection and scroll. Reload rows in place (`reloadDataForRowIndexes`).
+- Lists are view-based `NSTableView` / `NSOutlineView` over the controller's rows, with a data
+  source that reads the controller's snapshot; never one view per row in a stack view.
+- No polling timers. `Notify::wake` is `dispatch_async` to the main queue, coalesced; a readout
+  that moves with no job (a playing CD-DA track) re-arms a one-shot timer only while it moves.
+- `wake` may arrive from the main thread (a `Job::cancel`), so it always queues and never runs the
+  tick inline: the GTK shell had to move from `MainContext::invoke` to `idle_add_once` for this.
+- Names read off a disk can hold NUL. Everything from a volume goes through one `plain()` helper
+  before it reaches an `NSString`.
+- Start asks twice: enabled from `may_start`, and the click asks `may_start` again. A destructive
+  start writes only on the answer to the controller's own `Confirm`, shown with the controller's
+  `write_target()` name.
+- A dialog with a controller of its own (Resize, Expand HFS, Alto, the disk writer) is a struct the
+  host holds and ticks. Its window refuses a close the controller has not agreed to
+  (`windowShouldClose:`), so a running write keeps it up.
+- A sheet or alert is an `Effect` fulfilled by the effect host, never a modal loop the controller
+  waits in.
+- Off-screen tabs skip their refresh and redraw when selected; the tick still runs.
+
+### macOS specifics
+
+- **Privilege.** Keep authopen and the descriptor cache (`macos_authopen_descriptor_cache`); jobs
+  carry the descriptor. The open audit findings R6 (a locked card's EACCES read as "needs
+  privilege") and R11 (an authopen cancel reported as a failure) are fixed in the engine before
+  slice 1 needs them.
+- **Keys.** `Primary` in `controller::keys` is Cmd; Commander's F-keys need fn on a laptop, so every
+  command also has its menu item (the menu bar is where Mac users look).
+- **Menus.** The menu bar carries the commands the GTK shell puts in its header menu, plus Edit's
+  standard items so text fields get copy and paste.
+- **Drag and drop.** Drop routing goes through `AppController::route_drop` as in GTK. A drag *out*
+  to Finder is a file promise (`NSFilePromiseProvider`); GTK never built its drag out.
+- **Packaging.** A second `.app` in the same DMG job, signed and notarized with the egui one; the
+  bundle id differs so both can be installed.
+
+## Slices
+
+The GTK slices, in the same order; each is done when its tier 8 flows pass on `appkit`.
+
+| # | Slice | Proved by |
+|---|---|---|
+| 0 | Skeleton: window, tab view, log, effect host, `Notify`, authopen, menu bar, CI target | the app starts under the driver |
+| 1 | Inspect: source picker, partition bar (custom `NSView`), partition table, tools | `flow.inspect.hfs-*` (with slice 7a) |
+| 2 | Browse view on `BrowserPaneController` (`NSOutlineView`), file detail, journal | `flow.optical.*` (with slice 6) |
+| 3 | Commander: two panes, key map, drag and drop, staged edits | `flow.commander.*`, `flow.files.*` |
+| 4 | Backup and Restore | `flow.backup.*`, `flow.restore.*`, `flow.network.*` |
+| 5 | Build Disk wizard | `flow.build.*` |
+| 6 | Optical (with the CD-DA player) and Archives | `flow.optical.*`, `flow.audio.*` |
+| 7a | Volume dialogs: Resize, Expand HFS, Alto, partition editor, disk writer, Expand Image | `flow.inspect.hfs-*` |
+| 7b | Metadata editor, Export, remote, settings, update banner | `flow.network.*` |
+| 7c | Convert tab | a convert flow (to write; there is none yet) |
+| 8 | Drop routing, file open (`application:openURLs:`), hand-offs, About, icon | manual: drops cannot be driven yet |
+| 9 | The AX driver in rb-regress, the DMG beside egui | every tier 8 flow with `shells` gaining `appkit` |
+
+## The flow driver: `drivers/ax_driver.py`
+
+Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` back), run by a
+`runner/src/ax.rs` client, so every flow file only gains `"appkit"` in its `shells`.
+
+- **Language.** Python with PyObjC (`ApplicationServices` for `AXUIElement`), mirroring
+  `gtk_driver.py`. If PyObjC is a problem on the runners, a small Swift helper speaking the same
+  protocol is the fallback.
+- **Finding controls.** By `AXIdentifier`, which is the controller id. No `labels.toml` section;
+  `[all]` messages still apply.
+- **Acting.** `AXPress` for buttons, menu items and pop-up items; `AXValue` set for text fields,
+  steppers and sliders; `AXSelectedRows` for table rows. No synthetic mouse clicks, so none of the
+  GTK driver's coordinate and popover workarounds should be needed. If one is, write it down the
+  way FLOWS.md does for GTK.
+- **Pickers.** The shell's effect host calls the shared scripted-pick helper, so `NSOpenPanel` is
+  never driven.
+- **Audio.** The app's output goes to a null device in flows; find the macOS equivalent of the GTK
+  driver's ALSA null sink (an aggregate device, or a test switch in the audio player) before
+  `flow.audio.*` runs on a Mac with speakers.
+- **The TUI on macOS** already works: `runner/src/tui.rs` is a Unix pty. Add a macOS runner leg to
+  run `--shell tui` too.
+
+**Gate 0, before slice 9 depends on it:** the process driving AX needs the Accessibility (TCC)
+permission. Locally that is one grant to the terminal or Python. On GitHub's macOS runners, check
+whether it is already granted (UI-testing images often are); if not, the AX flows run on a
+self-hosted Mac (`dani-dev.local`) and CI keeps the build plus `--shell tui`.
+
+## Exit criteria
+
+- Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the
+  other shells' (the same bugs, not new ones).
+- The AppKit column of `docs/capabilities.md` has no unexplained gap.
+- The old Phase 2 open item, a GUI smoke on macOS, is covered by the flows rather than by hand.
+
+## Open questions
+
+1. PyObjC or a Swift helper for the driver; and whether GitHub's macOS runners grant AX (Gate 0).
+2. App name and bundle id of the preview app beside egui (main plan § 11, item 5).
+3. How the 10.7 vintage shell (Phase 6) shares slices with this one: forked like the Win32 pair,
+   or this package built against older bindings.

@@ -18,6 +18,8 @@ pub const BOOT_BLOCKS: &str = "browse.boot_blocks";
 pub const PRODOS_LOCK: &str = "browse.prodos_lock";
 pub const PRODOS_UNLOCK: &str = "browse.prodos_unlock";
 pub const EXTRACT: &str = "browse.extract";
+/// The browse view's Extract All, distinct from the side panel's Extract.
+pub const EXTRACT_ALL: &str = "browse.extract_all";
 pub const EXPORT_ENTRY: &str = "browse.export_entry";
 pub const EXPORT_VOLUME: &str = "browse.export_volume";
 pub const EXPORT_MARKED: &str = "browse.export_marked";

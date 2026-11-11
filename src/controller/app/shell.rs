@@ -24,6 +24,45 @@ pub enum AppTab {
     Archives,
 }
 
+impl AppTab {
+    /// The tabs in the order every window shell shows them (D8).
+    pub const ALL: [AppTab; 7] = [
+        AppTab::Backup,
+        AppTab::Restore,
+        AppTab::Build,
+        AppTab::Inspect,
+        AppTab::Convert,
+        AppTab::Optical,
+        AppTab::Archives,
+    ];
+
+    /// The tab's title.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppTab::Backup => "Backup",
+            AppTab::Restore => "Restore",
+            AppTab::Build => "Build Disk",
+            AppTab::Inspect => "Inspect",
+            AppTab::Convert => "Convert",
+            AppTab::Optical => "Optical",
+            AppTab::Archives => "Archives",
+        }
+    }
+
+    /// The screen's toolbar icon, a file stem in `assets/icons/toolbar/` (D9).
+    pub fn icon(self) -> &'static str {
+        match self {
+            AppTab::Backup => "backup",
+            AppTab::Restore => "restore",
+            AppTab::Build => "build",
+            AppTab::Inspect => "inspect",
+            AppTab::Convert => "convert",
+            AppTab::Optical => "disc",
+            AppTab::Archives => "archive",
+        }
+    }
+}
+
 /// What the tabs a drop may go to are doing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DropTargets {
@@ -305,6 +344,8 @@ impl AppController {
         std::mem::take(&mut self.shell.elevation_prompt)
     }
 
+    // Only Linux relaunches here, so elsewhere the early return ends the body.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_return))]
     pub(super) fn confirm_elevation(&mut self, yes: bool) {
         if !yes {
             self.log.warn(

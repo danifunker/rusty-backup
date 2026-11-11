@@ -123,6 +123,11 @@ pub enum HdCommand {
     /// yourself. Types are the 3-character tags GEM / BGM / RAW; a GEM
     /// partition over 16 MiB is promoted to BGM, which is what TOS needs.
     Atari(super::new_partitioned_hd::PartitionedHdArgs),
+
+    /// FreeBSD/Alpha disk: a 4.4BSD label in sector 0 (byte 64) with partitions you size, which
+    /// FreeBSD 4.x / 5.x installs onto; `--format` makes the 4.2BSD ones UFS1.
+    #[command(name = "bsd-alpha")]
+    BsdAlpha(super::new_bsd_alpha_hd::BsdAlphaHdArgs),
 }
 
 /// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
@@ -197,7 +202,7 @@ pub enum VolumeFs {
     Hfv,
     /// FAT12 / FAT16 / FAT32, auto-selected by size.
     Fat,
-    /// NTFS (Windows NT / 2000 / XP). Tune with --cluster-size / --sector-size.
+    /// NTFS (Windows NT / 2000 / XP). Tune with --ntfs-version / --cluster-size / --sector-size.
     Ntfs,
     /// HPFS (OS/2). A bare volume with an empty root directory.
     Hpfs,
@@ -419,6 +424,29 @@ pub struct VolumeArgs {
     /// NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512.
     #[arg(long = "sector-size")]
     pub sector_size: Option<u32>,
+
+    /// NTFS only: on-disk version. `1.2` (alias `nt4`) mounts on Windows NT 3.5 / 3.51 / 4.0
+    /// and every later Windows; `3.1` (alias `xp`, the default) needs Windows XP or later.
+    #[arg(long = "ntfs-version", value_enum)]
+    pub ntfs_version: Option<NtfsVersionArg>,
+}
+
+/// `--ntfs-version` values.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum NtfsVersionArg {
+    #[value(name = "1.2", alias = "nt4", alias = "nt35")]
+    V1_2,
+    #[value(name = "3.1", alias = "xp")]
+    V3_1,
+}
+
+impl NtfsVersionArg {
+    pub fn version(self) -> crate::model::format::NtfsVersion {
+        match self {
+            NtfsVersionArg::V1_2 => crate::model::format::NtfsVersion::V1_2,
+            NtfsVersionArg::V3_1 => crate::model::format::NtfsVersion::V3_1,
+        }
+    }
 }
 
 impl VolumeArgs {
@@ -436,6 +464,7 @@ impl VolumeArgs {
             bytes_per_inode: self.bytes_per_inode,
             cluster_bytes: parse_opt_size(self.cluster_size.as_deref(), "--cluster-size")?,
             sector_size: self.sector_size,
+            ntfs_version: self.ntfs_version.map(NtfsVersionArg::version),
             ..FormatOptions::default()
         };
         format_cli(
@@ -489,6 +518,7 @@ pub fn run(cmd: NewCommand) -> Result<()> {
             HdCommand::Atari(args) => super::new_partitioned_hd::run(
                 super::new_partitioned_hd::PartitionedHdCommand::Atari(args),
             ),
+            HdCommand::BsdAlpha(args) => super::new_bsd_alpha_hd::run(args),
         },
     }
 }

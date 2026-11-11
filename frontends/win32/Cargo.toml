@@ -1,0 +1,45 @@
+# The Win32 shell (docs/native_frontends_plan.md Phase 5, docs/win32_shell_plan.md).
+# Its own workspace root and lockfile, like frontends/gtk4: stable Rust, not the engine's 1.73 floor.
+[package]
+name = "rusty-backup-win32"
+version = "0.1.0"
+description = "Rusty Backup, the Win32 front end: back up, restore and inspect vintage disk images"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+[[bin]]
+name = "rusty-backup-win32"
+path = "src/main.rs"
+
+[dependencies]
+rusty-backup = { path = "../..", default-features = false, features = [
+    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "remote", "tui-update", "crypto", "yaml", "audio",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"

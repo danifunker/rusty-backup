@@ -20,6 +20,7 @@
 #   scripts/ntfs-oracle.sh cell <mib> <cluster> <sector>
 #                                               # format + ntfsfix one geometry
 #   scripts/ntfs-oracle.sh matrix               # full geometry matrix
+#   scripts/ntfs-oracle.sh matrix12             # NTFS 1.2 (Windows NT 3.5 / 4.0) matrix
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,9 +28,9 @@ TMP="${TMPDIR:-/tmp}/ntfs-oracle.$$"
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 
-make_ours() { # img mib [cluster] [sector] [label]
+make_ours() { # img mib [cluster] [sector] [label] [version]
   cargo run -q --manifest-path "$ROOT/Cargo.toml" --example make_blank_ntfs -- \
-    "$1" "$2" "${5:-RBNTFS}" "${3:-4096}" "${4:-512}"
+    "$1" "$2" "${5:-RBNTFS}" "${3:-4096}" "${4:-512}" "${6:-3.1}"
 }
 
 cmd=${1:-help}
@@ -81,6 +82,28 @@ case "$cmd" in
     img="$TMP/odd.img"; make_ours "$img" 137 4096 512 RBODD >/dev/null 2>&1
     if ntfsfix -n "$img" >"$TMP/log" 2>&1; then echo "PASS  137MiB (odd) cluster=4096 sector=512"
     else echo "FAIL  137MiB (odd)"; sed 's/^/    /' "$TMP/log"; fail=1; fi
+    [ "$fail" = 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
+    ;;
+  matrix12)
+    # NT 4.0's cluster sizes on 512-byte sectors; ntfs-3g must accept each and read version 1.2.
+    fail=0
+    for clu in 512 1024 2048 4096; do
+      for mib in 8 100 1024; do
+        img="$TMP/v12_${clu}_${mib}.img"
+        make_ours "$img" "$mib" "$clu" 512 NT4MTX 1.2 >/dev/null 2>&1 || { echo "FAIL(format) 1.2 c=$clu ${mib}MiB"; fail=1; continue; }
+        if ! ntfsfix -n "$img" >"$TMP/log" 2>&1; then
+          echo "FAIL  1.2 ${mib}MiB cluster=$clu"; sed 's/^/    /' "$TMP/log"; fail=1; continue
+        fi
+        # Captured first: grep -q would close the pipe early and pipefail would count the SIGPIPE.
+        info=$(ntfsinfo -m "$img" 2>/dev/null || true)
+        if printf '%s
+' "$info" | grep -Eq "Volume Version: +1\.2"; then
+          echo "PASS  1.2 ${mib}MiB cluster=$clu"
+        else
+          echo "FAIL  1.2 ${mib}MiB cluster=$clu: ntfsinfo does not report version 1.2"; fail=1
+        fi
+      done
+    done
     [ "$fail" = 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
     ;;
   *) sed -n '2,30p' "$0"; exit 1;;

@@ -465,6 +465,7 @@ Usage: build [OPTIONS] <TARGET>
 - `--system-disk` — `--preset x68k`: a Human68k system floppy cloned into partition 1
 - `--label` — With no `--table`: the volume label
 - `--geometry` — With no `--table`: the fixed geometry of a floppy format, e.g. `d71` for a 1571 disk (`cbm`), `80` tracks (`dfs`, `rsdos`), `80ds` (`dragondos`). The default is the format's first
+- `--ntfs-version` — The on-disk version of every NTFS volume or partition this builds: `1.2` (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default)
 - `--container` — Container to encode an image target into: raw, vhd, vhd-dynamic, qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the target's extension names (`.chd`, `.vhd`, ...), else raw
 - `--force` — Overwrite an existing image file
 - `--yes` — Required to build on a device; everything on it is erased
@@ -892,7 +893,7 @@ Usage: inspect [OPTIONS] <IMAGE>
 
 **Arguments**
 
-- `<IMAGE>` — Image path. `inspect` always reads the whole disk — there is no `@N` form. For per-partition detail use `show fs-info IMG@N`
+- `<IMAGE>` — Image path or `rb://host:port/path`. `inspect` always reads the whole disk — there is no `@N` form. For per-partition detail use `show fs-info IMG@N`
 
 **Options**
 
@@ -1127,6 +1128,27 @@ Usage: atari [OPTIONS] --size <SIZE> --partition <PARTITIONS> <IMAGE>
 - `--fill` — Pour an image into a partition as it is created: `N=PATH`, 1-based, repeatable. Any format the engine can read is decoded on the way in
 - `--filesystem` — Embed an Amiga filesystem handler in the RDB, `DOSTYPE=PATH`, repeatable. PATH is the handler's AmigaDOS load file (`L:SmartFilesystem`, `L:PFS3`). A DosType with no ROM handler needs this to mount unaided: the strap loads it from the RDB. RDB only
 - `--align` — Alignment for partition starts. Default 1 MiB; use 63s for DOS-era cylinder alignment on vintage machines
+- `--force` — Overwrite `image` if it already exists
+
+### `new hd bsd-alpha`
+
+FreeBSD/Alpha disk: a 4.4BSD label in sector 0 (byte 64) with partitions you size, which FreeBSD 4.x / 5.x installs onto; `--format` makes the 4.2BSD ones UFS1
+
+```
+Usage: bsd-alpha [OPTIONS] --size <SIZE> <IMAGE> <PARTITIONS>...
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create
+- `<PARTITIONS>` — Partitions in disk order, `LETTER:SIZE[:FSTYPE[:MOUNT]]` (letter a-h but not c; `rest` once; fstype `4.2BSD`, `swap` or `unused`). MOUNT is a note: `/etc/fstab` holds mount points
+
+**Options**
+
+- `--size` — Total disk size (accepts `K`/`M`/`G` suffixes)
+- `--format` — Format each 4.2BSD partition as little-endian UFS1, 16 KiB blocks / 2 KiB fragments
+- `--bootblock` — FreeBSD/Alpha's `/boot/boot1`, written from sector 1 (at most 7680 bytes); sector 0 then points the SRM console at it
+- `--align` — Alignment for partition starts. Default 1 MiB
 - `--force` — Overwrite `image` if it already exists
 
 ### `new hd gpt`
@@ -1412,6 +1434,7 @@ Usage: volume [OPTIONS] <FS> <IMAGE>
 - `--bytes-per-inode` — EFS and UFS: inode density in bytes per inode (smaller = more inodes). UFS defaults to one inode per 4 fragments, as `newfs -i` does
 - `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset
 - `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512
+- `--ntfs-version` — NTFS only: on-disk version. `1.2` (alias `nt4`) mounts on Windows NT 3.5 / 3.51 / 4.0 and every later Windows; `3.1` (alias `xp`, the default) needs Windows XP or later
 
 ### `optical`
 
@@ -2331,6 +2354,14 @@ Launch the full-screen terminal UI (preview): a menu-driven ratatui app that run
 
 ```
 Usage: tui
+```
+
+### `ui-labels`
+
+Every controller's control labels as `id<TAB>label` lines, for the flow drivers (FLOWS.md)
+
+```
+Usage: ui-labels
 ```
 
 ### `untar`

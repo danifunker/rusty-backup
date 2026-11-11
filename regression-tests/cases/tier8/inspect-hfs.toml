@@ -1,0 +1,109 @@
+# Tier 8: HFS volume tools on the Inspect screen, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.inspect.hfs"
+description = "Grow and shrink classic HFS volumes from Inspect, then prove the result with rb-cli."
+
+[[case]]
+id = "flow.inspect.hfs-expand"
+description = "Expand a 1.4 MB classic HFS volume to an 8 MiB flat HFV with Inspect's Expand HFS Volume, then check its size, its file and fsck"
+level = "smoke"
+area = ["inspect"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["inspect.open-image", "inspect.expand-hfs"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "1440K", "{scratch}/h.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/h.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/h.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "HFS" },
+  { activate = "inspect.row.expand_hfs" },
+  { wait = "Expand HFS Volume" },
+  { focus = "expand_hfs.target_size" },
+  { fill = "8" },
+  { pick = "{scratch}/big.hfv" },
+  { activate = "expand_hfs.save_as" },
+  { activate = "expand_hfs.expand" },
+  { wait = "expand_hfs.done", timeout_ms = 120000 },
+]
+
+# 8 MiB less the 1 KiB a classic HFS volume leaves past its last allocation block.
+[[case.step]]
+args = ["inspect", "{scratch}/big.hfv", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partitions.0.type_name", value = "HFS" },
+  { path = "partitions.0.size_bytes", value = 8387584 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/big.hfv", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case.step]]
+args = ["fsck", "{scratch}/big.hfv", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+
+[[case]]
+id = "flow.inspect.hfs-shrink"
+description = "Shrink a 32 MiB classic HFS volume to an 8 MiB flat HFV with Inspect's Expand HFS Volume (it clones into any size the data fits), then check its size, its file and fsck"
+level = "full"
+area = ["inspect"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["inspect.open-image", "inspect.expand-hfs"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "volume", "hfs", "--size", "32M", "{scratch}/h.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/h.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/h.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "HFS" },
+  { activate = "inspect.row.expand_hfs" },
+  { wait = "Expand HFS Volume" },
+  { focus = "expand_hfs.target_size" },
+  { fill = "8" },
+  { pick = "{scratch}/small.hfv" },
+  { activate = "expand_hfs.save_as" },
+  { activate = "expand_hfs.expand" },
+  { wait = "expand_hfs.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/small.hfv", "--format", "json"]
+expect_exit = 0
+json_equals = [
+  { path = "partitions.0.type_name", value = "HFS" },
+  { path = "partitions.0.size_bytes", value = 8387584 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/small.hfv", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case.step]]
+args = ["fsck", "{scratch}/small.hfv", "--format", "json"]
+expect_exit = 0
+fsck_clean = true

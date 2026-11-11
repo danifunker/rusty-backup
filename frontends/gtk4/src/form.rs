@@ -88,6 +88,15 @@ pub fn combo(title: &str, id: &str, labels: &[&str]) -> adw::ComboRow {
     row
 }
 
+/// The expression a string list's search matches on: typing in a long list's popup filters it.
+pub fn string_search() -> gtk::PropertyExpression {
+    gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<&gtk::Expression>,
+        "string",
+    )
+}
+
 pub fn switch(title: &str, id: &str) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder().title(title).build();
     row.set_widget_name(id);

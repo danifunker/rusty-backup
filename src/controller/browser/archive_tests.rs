@@ -317,3 +317,66 @@ fn prodos_lock_stages_the_access_byte_of_the_cursor_entry_once() {
         "{staged:?}"
     );
 }
+
+#[test]
+fn the_archive_windows_tick_entries_and_pick_the_fork_format_through_their_actions() {
+    use crate::controller::commander::{Part, Press, WindowKind};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctl = archive_volume(dir.path());
+    let read = A::ReadArchive {
+        path: "/ARC.SIT".into(),
+        purpose: ArchiveUse::Browse,
+    };
+    pane(&mut ctl, read);
+    settle(&mut ctl);
+    let viewer = |ctl: &CommanderController| {
+        let w = ctl.pane_windows(Side::Left, false);
+        w.into_iter()
+            .find(|w| w.kind == WindowKind::ArchiveViewer)
+            .unwrap()
+    };
+    let w = viewer(&ctl);
+    let Some(Part::Checklist { ticked, send, .. }) = w.parts.get(1) else {
+        panic!("the entries are a tick-box list: {:?}", w.parts);
+    };
+    let file = ticked.iter().position(|t| t.is_some()).unwrap();
+    let was = ticked[file].unwrap();
+    for a in send[file].clone() {
+        ctl.apply(a);
+    }
+    let w = viewer(&ctl);
+    let Some(Part::Checklist { ticked, .. }) = w.parts.get(1) else {
+        panic!("{:?}", w.parts);
+    };
+    // Tick it back, so at least one entry is marked for Extract Selected.
+    let send_again = |w: &crate::controller::commander::PaneWindow, i: usize| match w.parts.get(1) {
+        Some(Part::Checklist { send, .. }) => send[i].clone(),
+        _ => Vec::new(),
+    };
+    assert_eq!(ticked[file], Some(!was));
+    for a in send_again(&w, file) {
+        ctl.apply(a);
+    }
+    let w = viewer(&ctl);
+    let extract = w
+        .buttons
+        .iter()
+        .find(|b| b.label.starts_with("Extract Selected"))
+        .unwrap();
+    assert!(extract.enabled, "{}", extract.label);
+    assert!(matches!(extract.press, Press::Send(_)));
+    let Some(Part::Select { options, send, .. }) = w.parts.get(2) else {
+        panic!("the fork format is a drop-down: {:?}", w.parts);
+    };
+    let raw = options
+        .iter()
+        .position(|o| o == ForkFormat::Raw.label())
+        .unwrap();
+    for a in send[raw].clone() {
+        ctl.apply(a);
+    }
+    assert_eq!(
+        ctl.pane(Side::Left).archive_viewer().unwrap().format,
+        ForkFormat::Raw
+    );
+}

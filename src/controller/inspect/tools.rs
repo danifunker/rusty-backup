@@ -117,6 +117,52 @@ pub struct CheckReport {
     pub show_debug: bool,
 }
 
+impl CheckReport {
+    /// The window's first line: clean, or how many errors.
+    pub fn headline(&self) -> String {
+        if self.check.clean {
+            "Filesystem is clean.".to_string()
+        } else {
+            format!("{} error(s) found.", self.check.errors.len())
+        }
+    }
+
+    /// The window's body under the statistics line, the debug warnings only when asked for.
+    pub fn lines(&self) -> Vec<String> {
+        let check = &self.check;
+        let mut text = Vec::new();
+        if !check.errors.is_empty() {
+            text.push("Errors:".to_string());
+            text.extend(check.errors.iter().cloned());
+        }
+        for (parent, entries) in &check.orphans {
+            text.push(format!("Missing parent ID {parent}:"));
+            text.extend(entries.iter().map(|e| format!("    {e}")));
+        }
+        let shown: Vec<&String> = check
+            .warnings
+            .iter()
+            .filter(|(_, debug)| !debug || self.show_debug)
+            .map(|(line, _)| line)
+            .collect();
+        if !shown.is_empty() {
+            text.push("Warnings:".to_string());
+            text.extend(shown.into_iter().cloned());
+        }
+        if let Some(repair) = &self.repair {
+            text.push("Repair Report:".to_string());
+            text.extend(repair.applied.iter().map(|f| format!("  {f}")));
+            text.extend(repair.failed.iter().map(|f| format!("  {f}")));
+        }
+        text
+    }
+
+    /// Some warnings are debug-level, so the window offers "Show debug messages".
+    pub fn has_debug(&self) -> bool {
+        self.check.warnings.iter().any(|(_, debug)| *debug)
+    }
+}
+
 /// What the Resize Partitions dialog starts from.
 pub struct ResizePlan {
     pub table: PartitionTable,

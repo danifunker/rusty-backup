@@ -32,6 +32,8 @@ pub enum TableKind {
     Atari,
     /// Sharp X68000. Entries carry a name, not a type code.
     X68k,
+    /// FreeBSD/Alpha's 4.4BSD disklabel in sector 0. Entries carry an `fstype` name.
+    Bsd,
     /// Tables whose type field the editor does not expose a catalog for.
     Other,
 }
@@ -51,6 +53,7 @@ impl TableKind {
             TableKind::SolarisX86 => "Solaris-x86",
             TableKind::Atari => "AHDI",
             TableKind::X68k => "X68000",
+            TableKind::Bsd => "BSD-Alpha",
             TableKind::Other => "Unknown",
         }
     }
@@ -71,6 +74,7 @@ impl TableKind {
             }
             TableKind::Atari => "AHDI 3-character type tag (GEM, BGM, XGM, RAW)",
             TableKind::X68k => "X68000 partition name (e.g. Human68k)",
+            TableKind::Bsd => "BSD partition fstype (4.2BSD, swap, unused)",
             TableKind::Other => "Partition type value",
         }
     }
@@ -119,9 +123,26 @@ pub fn choices(kind: TableKind) -> &'static [TypeChoice] {
         TableKind::Atari => ATARI_TYPES,
         // X68k entries are named, not typed, so there is nothing to offer.
         TableKind::X68k => &[],
+        TableKind::Bsd => BSD_TYPES,
         TableKind::Other => &[],
     }
 }
+
+/// The `fstype` names a FreeBSD/Alpha label's partitions carry, as `disklabel` prints them.
+const BSD_TYPES: &[TypeChoice] = &[
+    TypeChoice {
+        value: "4.2BSD",
+        label: "UFS (BSD fast filesystem)",
+    },
+    TypeChoice {
+        value: "swap",
+        label: "Swap",
+    },
+    TypeChoice {
+        value: "unused",
+        label: "Reserved, no filesystem",
+    },
+];
 
 /// Human name for `value` on `kind`, or `None` when it isn't in the catalog.
 /// Matching is forgiving: MBR accepts `0xAF` / `af` / `AF`, GPT and APM are
@@ -162,6 +183,9 @@ fn normalize(kind: TableKind, value: &str) -> String {
         },
         // NeXT `p_type` is a free-form 8-byte name, compared case-insensitively.
         TableKind::Next | TableKind::SgiDkLabel => trimmed.to_ascii_uppercase(),
+        TableKind::Bsd => part_tables::bsd::fstype_from_text(trimmed)
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
         TableKind::Rdb | TableKind::X68k | TableKind::Other => trimmed.to_string(),
     }
 }

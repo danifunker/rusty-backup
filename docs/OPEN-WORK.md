@@ -440,6 +440,36 @@ per-pane Tree view (§15.4, the R4 browse-view share); wildcard Find is deferred
 (M7, §15.5). Then M1 widget extraction + the M4 File Info window, the
 browsable-partition gate, and drag-to-load. Milestones in the plan doc §13.
 
+### 6.3 GTK shell — catch up with the Win32 shell (logged 2026-11-09)
+
+The Win32 shell (slices 2-3) moved logic into the controller that GTK still builds itself, and
+found usability gaps GTK shares. A Linux session should take these, then run the tier-8 flows:
+
+- **Partition chooser stays reachable.** `commander/pane.rs` `show_parts` hides the chooser
+  unless the volume is loaded, so picking a partition that fails to open (an MBR extended
+  container: "Extended has no browsable filesystem") leaves the user stuck. Show it whenever
+  `side_bars().parts` is non-empty, as Win32 does.
+- **Drops land on the pane under the pointer.** GTK's `drop_path` sends `OpenDropped` to the
+  active pane. Use `CommanderController::drop_plan(side, paths)`: open in an empty, host or
+  read-only pane, copy into a writable volume, ask only for a disk image on a volume; a drop
+  between the panes asks which pane.
+- **Read the shared view-models instead of building them:** `side_bars`, `copy_column`,
+  `header_tools`, `edit_bar`, `mark_bar`, `volume_line`, `panel_actions`, `FileDetail::side_panel`
+  / `info_text`, and every window as a `PaneWindow` (`side_windows`, `screen_windows`,
+  `tree_window`, `journal_window`, `editor_window`, with `field_action` / `submit` for fields).
+  Then GTK's `browser/dialogs.rs`, `bars.rs`, `detail.rs` and `commander/` shrink to drawing.
+- **Disk writer outcome:** `volume/disk_write.rs` writes "Write complete." itself; read
+  `controller::disk_write::labels::DONE`, then add `gtk` to `disk-write.toml`'s shells.
+- **Toolbar icons:** take `assets/icons/toolbar` and `assets/icons/rows` (the Build Disk hammer
+  and the row icons) so both shells look alike (D8, D9).
+
+Every shell (controller): the partition list offers an MBR extended container, which never
+opens; consider leaving containers out of `partition_labels`, or labelling them as such.
+
+Runner (Win32 flows): when the UIA driver gives no answer within 90 s, the runner stops the
+driver but the shell it started keeps running, and its locked exe then blocks the next release
+build. Start the shell in a job object (or have the runner kill the driver's process tree).
+
 ### 6.2 GUI — "New CD-ROM image" path
 
 The CD builders (`optical new sgi-efs` / `mac-hfs` / `mac-hfsplus` /

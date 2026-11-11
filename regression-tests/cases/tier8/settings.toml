@@ -1,0 +1,33 @@
+# Tier 8: the Settings window, end to end through a front-end (FLOWS.md).
+#
+# The file-association box is left alone: on Windows, Save registers or removes the
+# associations in the user's registry, which a test must not touch.
+
+[meta]
+tier = 8
+group = "flow.settings"
+description = "Change a setting, save it, and see it again in a fresh Settings window."
+
+[[case]]
+id = "flow.settings.save-and-reopen"
+description = "Set the update repository URL in Settings, save, close, reopen and find it there (config.json round trip)"
+level = "smoke"
+area = ["settings"]
+shells = ["gtk", "win32"]
+capabilities = ["settings.update-check"]
+timeout_ms = 60000
+
+[[case.step]]
+ui = [
+  { activate = "app.settings" },
+  { wait = "Update Check" },
+  { focus = "settings.repo_url" },
+  { fill = "https://github.com/example/flow-test" },
+  { activate = "settings.save" },
+  { wait = "Settings saved" },
+  { activate = "settings.cancel" },
+  { wait_gone = "Update Check" },
+  { activate = "app.settings" },
+  { wait = "https://github.com/example/flow-test" },
+  { activate = "settings.cancel" },
+]

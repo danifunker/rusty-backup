@@ -1677,6 +1677,8 @@ pub fn present_editor(doc: TextDoc, host: &EffectHost, save: SaveText) {
     }
     body.append(&note);
     let view = gtk::TextView::builder().monospace(true).build();
+    // Named for screen readers and the flow driver alike; the text view has no caption of its own.
+    view.update_property(&[gtk::accessible::Property::Label("Text")]);
     view.buffer().set_text(&plain(&doc.text));
     let scroll = gtk::ScrolledWindow::builder()
         .child(&view)

@@ -107,7 +107,7 @@ impl Header {
             });
         });
         let extract = gtk::Button::with_label("Extract All...");
-        extract.set_widget_name(ids::EXTRACT);
+        extract.set_widget_name(ids::EXTRACT_ALL);
         extract.connect_clicked(move |_| extract_all());
         let check = button("Check", ids::CHECK, send, pane(P::Fsck));
         let journal = button("Journal", ids::JOURNAL, send, pane(P::ShowJournal));

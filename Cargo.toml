@@ -10,9 +10,8 @@ repository = "https://github.com/dani/rusty-backup"
 resolver = "2"
 default-run = "rusty-backup"
 
-# Main GUI binary — requires the `gui` feature (off in --no-default-features
-# rb-cli-mini builds so the eframe / egui / rfd dep tree doesn't enter the
-# link line on slim/cross-compiled targets like armv7 MiSTer).
+# The egui GUI binary: only with `--features gui` (not in `default`), so a plain
+# `cargo build` / `cargo build --bin rb-cli` never pulls the eframe / egui / rfd tree.
 [[bin]]
 name = "rusty-backup"
 path = "src/main.rs"
@@ -70,10 +69,11 @@ path = "examples/commander_mock.rs"
 required-features = ["mock_gui"]
 
 [features]
-# The desktop release ships every feature on. The slim rb-cli-mini build is
-# `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
-# / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "seekable-zstd", "remote", "tui", "crypto", "yaml"]
+# Everything rb-cli ships with. The egui app is `--features gui` on top (CI's desktop
+# builds and `cargo run --features gui`); the native shells under frontends/ pick their own.
+# The slim rb-cli-mini build is `cargo build --bin rb-cli --no-default-features` (plus
+# `--features chd` / `optical` for one of those).
+default = ["chd", "optical", "audio", "native-zlib", "native-zstd", "seekable-zstd", "remote", "tui", "tui-update", "crypto", "yaml"]
 # Block-cipher decryption for encrypted inputs: APFS FileVault, encrypted DMG,
 # and the AES-CBC WinImage IMZ variant. Pulls the `aes` / `cbc` / `des` crates
 # (RustCrypto, edition 2024). ON BY DEFAULT — the desktop ships it. It's split
@@ -185,9 +185,9 @@ windows-legacy = []
 # extracted crate under crates/ (docs/crate_split_plan.md).
 rust173-polyfill = ["disk-core/rust173-polyfill", "fs-8bit/rust173-polyfill", "fs-cpm/rust173-polyfill", "fs-apple2/rust173-polyfill", "fs-qnx/rust173-polyfill", "fs-xerox/rust173-polyfill", "dsk-clonezilla/rust173-polyfill", "fs-amiga/rust173-polyfill", "fs-unix/rust173-polyfill", "fs-xfs/rust173-polyfill", "fs-squashfs/rust173-polyfill", "fs-pc/rust173-polyfill", "fs-hpfs/rust173-polyfill", "fs-apfs/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "fs-mac/rust173-polyfill", "part-tables/rust173-polyfill", "dsk-flux/rust173-polyfill", "dsk-apple/rust173-polyfill", "dsk-dmg/rust173-polyfill", "dsk-floppy/rust173-polyfill", "dsk-vm/rust173-polyfill", "dsk-ghost/rust173-polyfill", "fs-adfs/rust173-polyfill", "fs-tar/rust173-polyfill", "rb-fsexporter/rust173-polyfill", "arc-mac/rust173-polyfill", "dsk-imz/rust173-polyfill", "dsk-tape/rust173-polyfill", "qnx2fs/rust173-polyfill"]
 # In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
-# (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
-# MiSTer builds so they link no networking; desktop packagers opt in. When the
-# feature is absent, `rb-cli update` reports that updates weren't built in.
+# (rustls, no OpenSSL). In `default` (it replaced `gui` there, which used to bring
+# reqwest in); left OUT of the slim / appliance / MiSTer builds so they link no
+# networking. When absent, `rb-cli update` reports that updates weren't built in.
 tui-update = ["dep:reqwest"]
 
 [dependencies]

@@ -69,3 +69,6 @@
 # every one was fixed or shipped by 2026-09-06, the last being F-017 (XFS
 # leaf and node-form directories). The 24 cases are unchanged — they always
 # asserted the behaviour we wanted, and XPASS is what said so.
+
+# R-089 (UFS 0 B free) and R-090 (Open took a zip for a disk image), found by the
+# tier-8 flows on 2026-11-09, were both fixed on 2026-11-10; their six cases pass.

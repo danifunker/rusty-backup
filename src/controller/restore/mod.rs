@@ -95,6 +95,27 @@ pub mod ids {
     pub const REMOTE_IMAGE_NAME: &str = "restore.remote_image_name";
 }
 
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const BACKUP_FOLDER: &str = "Backup Folder";
+    pub const TARGET_KIND: &str = "Target";
+    pub const TARGET_IMAGE: &str = "Image File";
+    pub const START: &str = "Restore";
+    /// The confirmation's go-ahead button.
+    pub const CONFIRM: &str = "I understand, proceed";
+    pub const DONE: &str = "Restore complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (ids::BACKUP_FOLDER, BACKUP_FOLDER),
+        (ids::TARGET_KIND, TARGET_KIND),
+        (ids::TARGET_IMAGE, TARGET_IMAGE),
+        (ids::START, START),
+        (super::purpose::RESTORE, CONFIRM),
+        ("restore.done", DONE),
+    ];
+}
+
 /// The longer words a shell puts beside a control, so every shell says the same thing.
 pub mod hints {
     pub const CLOSE_TARGET: &str =

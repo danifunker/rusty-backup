@@ -61,6 +61,8 @@ jobs:
         run: scripts/check-boundaries.sh
       - name: Platform matrix matches the CI targets
         run: scripts/check-platform-matrix.py
+      - name: Capabilities table matches the tier 8 flows
+        run: scripts/check-capabilities.py
 
   generate-version:
     name: Generate Version
@@ -83,7 +85,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -106,6 +108,7 @@ jobs:
       musl: ${{ steps.p.outputs.musl }}
       crates-msrv: ${{ steps.p.outputs.crates-msrv }}
       gtk4: ${{ steps.p.outputs.gtk4 }}
+      win32: ${{ steps.p.outputs.win32 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -121,7 +124,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -227,17 +230,33 @@ jobs:
         if: matrix.arch == 'x86'
         env:
           RUST_TEST_THREADS: 1
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Test
         if: matrix.arch != 'x86'
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features gui
+
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
+      # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
+      - name: Cache Win32 shell build
+        uses: actions/cache@v5
+        with:
+          path: frontends/win32/target
+          key: ${{ runner.os }}-${{ matrix.target }}-win32-shell-${{ hashFiles('frontends/win32/Cargo.lock') }}
+
+      - name: Build the Win32 shell
+        working-directory: frontends/win32
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the Win32 shell
+        shell: bash
+        run: cp "frontends/win32/target/${{ matrix.target }}/release/rusty-backup-win32.exe" "target/${{ matrix.target }}/release/"
 
       - name: Package
         shell: bash
@@ -248,12 +267,19 @@ jobs:
           else
             7z a ../../../Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
           fi
+          7z a ../../../Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip rusty-backup-win32.exe
       
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload Win32 shell artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-Win32-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
 
       - name: Stage CLI binary
         shell: bash
@@ -271,7 +297,8 @@ jobs:
 
       # Per-user Inno Setup installer (Setup.exe). Installs to %LocalAppData%
       # so the in-app self-updater can replace the running exe without admin.
-      # Source dir has both rusty-backup.exe and rb-cli.exe from the Build step.
+      # Source dir has rusty-backup.exe and rb-cli.exe from Build, and rusty-backup-win32.exe staged.
+      # One installer per GUI: rusty-backup.iss (egui) and rusty-backup-win32.iss (the Win32 shell).
       # See installer/rusty-backup.iss + docs/windows_self_update.md.
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -285,12 +312,21 @@ jobs:
           $base = "Rusty-Backup-Setup-windows-${{ matrix.arch }}-$version"
           & $iscc "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup.iss
           if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+          $base = "Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-$version"
+          & $iscc "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup-win32.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (Win32 shell) failed with exit code $LASTEXITCODE" }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: installer\Output\Rusty-Backup-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload Win32 shell installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Win32-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
 
   build-macos:
     name: Build macOS
@@ -351,15 +387,15 @@ jobs:
       # exercises the same (little-endian, 64-bit) logic on real hardware.
       - name: Test
         if: ${{ matrix.arch == 'arm64' }}
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
         run: |
           # Build main app
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} --features gui
       
       - name: Import signing certificate
         if: ${{ env.HAS_SIGNING_CERT == 'true' }}
@@ -653,13 +689,13 @@ jobs:
       # Tests run upfront in the Arch build container (native target). Failure
       # fails the job and blocks the release.
       - name: Test
-        run: cargo test --workspace --release --target ${{ matrix.target }}
+        run: cargo test --workspace --release --target ${{ matrix.target }} --features gui
 
       - name: Check image-files-only build (no-physical-devices)
-        run: cargo check --release --target ${{ matrix.target }} --features no-physical-devices
+        run: cargo check --release --target ${{ matrix.target }} --features gui,no-physical-devices
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features gui
 
       - name: Install debloated runtime packages
         run: |
@@ -1340,7 +1376,23 @@ jobs:
       # Default features (GUI + chd + optical + native-zstd/zlib + remote) — one
       # build produces both rusty-backup.exe and rb-cli.exe, like build-windows.
       - name: Build (GUI + rb-cli, default features)
-        run: cargo build --release --target aarch64-pc-windows-msvc
+        run: cargo build --release --target aarch64-pc-windows-msvc --features gui
+
+      # The native Win32 shell (frontends/win32, its own workspace and lockfile): its own ZIP and
+      # installer (Rusty-Backup-Win32-*), separate from the egui ones until it replaces egui.
+      - name: Cache Win32 shell build
+        uses: actions/cache@v5
+        with:
+          path: frontends/win32/target
+          key: ${{ runner.os }}-aarch64-pc-windows-msvc-win32-shell-${{ hashFiles('frontends/win32/Cargo.lock') }}
+
+      - name: Build the Win32 shell
+        working-directory: frontends/win32
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
+      - name: Stage the Win32 shell
+        shell: bash
+        run: cp "frontends/win32/target/aarch64-pc-windows-msvc/release/rusty-backup-win32.exe" "target/aarch64-pc-windows-msvc/release/"
 
       - name: Package app
         shell: bash
@@ -1351,12 +1403,19 @@ jobs:
           else
             7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
           fi
+          7z a ../../../Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup-win32.exe
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v7
         with:
           name: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload Win32 shell artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-Win32-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
 
       - name: Stage CLI binary
         shell: bash
@@ -1371,6 +1430,35 @@ jobs:
         with:
           name: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}
           path: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
+
+      # The same per-user installers as x64/x86; /DArm64 makes them refuse non-ARM64 Windows.
+      - name: Build installers (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          $version = "${{ needs.generate-version.outputs.version }}"
+          $src = "$env:GITHUB_WORKSPACE\target\aarch64-pc-windows-msvc\release"
+          $assets = "$env:GITHUB_WORKSPACE\assets\icons"
+          $base = "Rusty-Backup-Setup-windows-arm64-$version"
+          & $iscc "/DArm64" "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+          $base = "Rusty-Backup-Win32-Setup-windows-arm64-$version"
+          & $iscc "/DArm64" "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup-win32.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (Win32 shell) failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload Win32 shell installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Win32-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}.exe
 
   # Full desktop GUI for Linux RISC-V 64 (riscv64gc-unknown-linux-gnu),
   # cross-compiled on x64. There is no GitHub-hosted riscv64 runner, so unlike
@@ -1440,7 +1528,18 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
           # glib is pinned to one exact version in the next step rather than to a
           # pocket: see the comment there.
-          sudo apt-get update
+          # apt-get update exits 0 when every fetch fails, so check the riscv64 lists
+          # loaded and retry: a mirror or DNS outage otherwise surfaces as "no glib".
+          for try in 1 2 3 4 5; do
+            sudo apt-get update -o Acquire::Retries=3 || true
+            if apt-cache madison libglib2.0-dev:riscv64 | grep -q riscv64; then break; fi
+            if [ "$try" = 5 ]; then
+              echo "::error::ports.ubuntu.com gave no riscv64 package lists after 5 tries: a mirror or DNS outage"
+              exit 1
+            fi
+            echo "riscv64 package lists missing (try $try); retrying in $((try * 30))s"
+            sleep $((try * 30))
+          done
 
       - name: Install riscv64 cross toolchain + GTK/GL sysroot
         run: |
@@ -1526,7 +1625,7 @@ jobs:
           key: ${{ runner.os }}-riscv64gc-gui-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (default features = GUI + CHD + optical + audio)
-        run: cargo build --release --target riscv64gc-unknown-linux-gnu
+        run: cargo build --release --target riscv64gc-unknown-linux-gnu --features gui
 
       - name: Strip + verify ELF
         run: |
@@ -1935,6 +2034,46 @@ jobs:
             crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
             crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
 
+  # The Win32 shell (docs/win32_shell_plan.md): not shipped yet; it must keep compiling, and its
+  # tier 8 flows run over UI Automation. The artifact is the bare exe until slice 9 packages it.
+  build-win32:
+    name: Build Win32 shell (x64)
+    needs: [generate-version, plan]
+    if: needs.plan.outputs.win32 == 'true'
+    runs-on: windows-latest
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        working-directory: frontends/win32
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Layout tests
+        working-directory: frontends/win32
+        run: cargo test --locked
+      - name: Build
+        working-directory: frontends/win32
+        run: cargo build --locked --release
+      - name: Build rb-cli and rb-regress
+        run: |
+          cargo build --locked --release --bin rb-cli
+          cargo build --locked --release --manifest-path regression-tests/runner/Cargo.toml
+      - name: Tier 8 flows over UI Automation
+        shell: bash
+        working-directory: regression-tests
+        run: |
+          python -m pip install comtypes
+          ./runner/target/release/rb-regress.exe run --tiers 8 --shell win32 --no-prompt
+      - name: Upload the exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-preview-x64-${{ needs.generate-version.outputs.version }}
+          path: frontends/win32/target/release/rusty-backup-win32.exe
+
   # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.
   build-gtk4:
@@ -2066,7 +2205,18 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
           # glib is pinned to one exact version in the next step rather than to a
           # pocket: see the comment there.
-          sudo apt-get update
+          # apt-get update exits 0 when every fetch fails, so check the riscv64 lists
+          # loaded and retry: a mirror or DNS outage otherwise surfaces as "no glib".
+          for try in 1 2 3 4 5; do
+            sudo apt-get update -o Acquire::Retries=3 || true
+            if apt-cache madison libglib2.0-dev:riscv64 | grep -q riscv64; then break; fi
+            if [ "$try" = 5 ]; then
+              echo "::error::ports.ubuntu.com gave no riscv64 package lists after 5 tries: a mirror or DNS outage"
+              exit 1
+            fi
+            echo "riscv64 package lists missing (try $try); retrying in $((try * 30))s"
+            sleep $((try * 30))
+          done
 
       - name: Install riscv64 cross toolchain + GTK4/libadwaita sysroot
         run: |
@@ -2846,7 +2996,8 @@ jobs:
           # Downloader assets (no extension / *.sh) are named explicitly so they
           # ship as standalone, un-versioned release assets the database can hit
           # via `releases/latest/download/`.
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" -o -name "rb-cli-mini-armv7" -o -name "rb-daemon.sh" \) -exec cp {} release-files/ \;
+          # The Win32 preview is CI's bare test exe; the release ships the Win32 zips and installers.
+          find artifacts -type f -not -path "*Win32-preview*" \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" -o -name "rb-cli-mini-armv7" -o -name "rb-daemon.sh" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       # Build a download-picker table from the (fixed) build matrix. Links
@@ -2868,12 +3019,16 @@ jobs:
           for f in \
             "Rusty-Backup-Setup-windows-x64-${VER}.exe" "Rusty-Backup-windows-x64-${VER}.zip" \
             "Rusty-Backup-Setup-windows-x86-${VER}.exe" "Rusty-Backup-windows-x86-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe" "Rusty-Backup-Win32-windows-x64-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe" "Rusty-Backup-Win32-windows-x86-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
             "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
             "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
             "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
             "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
             "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
-            "Rusty-Backup-windows-arm64-${VER}.zip" "Rusty-Backup-linux-riscv64-${VER}.tar.gz" \
+            "Rusty-Backup-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-windows-arm64-${VER}.zip" \
+            "Rusty-Backup-linux-riscv64-${VER}.tar.gz" \
             "Rusty-Backup-linux-riscv64-${VER}.deb" "Rusty-Backup-linux-riscv64-${VER}.rpm" \
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
@@ -2909,7 +3064,10 @@ jobs:
           |---|---|---|---|
           | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
           | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
-          | **Windows 11** | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
+          | **Windows 11** | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
+          | **Windows 11 / 10**, native Win32 preview | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x64-${VER}.zip) | _(as above)_ |
+          | **Windows 10**, native Win32 preview | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x86-${VER}.zip) | _(as above)_ |
+          | **Windows 11**, native Win32 preview | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | _(as above)_ |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
           | **Linux** (Ubuntu 20.04+ / Debian 11+) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |

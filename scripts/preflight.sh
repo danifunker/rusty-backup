@@ -29,7 +29,7 @@ run() {
 # CI's test step is --release, not a plain `cargo test`. Debug and release
 # differ in overflow checks and in which assertions are compiled.
 run "cargo test --release (what CI's Test step runs)" \
-    cargo test --release
+    cargo test --release --features gui
 
 # The MiSTer armv7 leg: optical on, native-zstd off. Anything touching zstd has
 # to go through crate::rbformats::zstd_compat or it breaks only here.

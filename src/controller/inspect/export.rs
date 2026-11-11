@@ -271,6 +271,28 @@ pub struct ExportNotes {
     pub sector_by_sector_warning: bool,
 }
 
+impl ExportNotes {
+    /// The notes under the Export form, one line each, as every shell shows them.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.pfs3_shrink.is_empty() {
+            out.push(PFS3_SHRINK_TITLE.to_string());
+            out.push(pfs3_affected(&self.pfs3_shrink));
+            out.extend(PFS3_SHRINK_LINES.iter().map(|l| l.to_string()));
+        }
+        if let Some(workflow) = self.chd_workflow {
+            out.push(workflow.to_string());
+            if let Some(estimate) = self.chd_estimate {
+                out.push(chd_estimate_line(estimate));
+            }
+            if self.sector_by_sector_warning {
+                out.push(SECTOR_BY_SECTOR_WARNING.to_string());
+            }
+        }
+        out
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ExportState {
     open: bool,

@@ -1,0 +1,132 @@
+# What each controller id is called in each shell (FLOWS.md "Controls").
+#
+# A flow names a control by its controller id (`src/controller/*` `ids`); the driver
+# looks it up here, then in the controllers' own labels (`rb-cli ui-labels`), then uses
+# the name as a literal label. A value is the label, or a table:
+#   label = "..."   the visible label
+#   key   = "o"     activate it by this key (the TUI has keys where GTK has buttons)
+#   pick  = "..."   the button whose file dialog fills this field (GTK path rows)
+#   via   = "..."   open this first (the dropdown a menu entry lives in)
+#   nth   = 1       the Nth same-named control (on the `via` dropdown when there is one)
+#   skip  = true    this shell has no such step: behaviour drift, listed like label drift
+# `wait` / `expect` names resolve here too; `<task>.done` is a controller's outcome message.
+#
+# Every label entry is drift from the controllers' words (D8). The TUI keeps only its keys;
+# `[gtk]` empties once GTK reads the controller labels (a Linux session). Win32 finds
+# controls by AutomationId; its section holds only behaviour drift and outcome words.
+
+[all]
+
+[tui]
+"backup.open_image" = { key = "o" }
+"restore.confirm" = { key = "y" }
+"app.commander" = { key = "9" }
+"commander.right.open_file" = { key = "Tab Ctrl+O" }
+"commander.left.open_folder" = { key = "Tab Ctrl+D" }
+"commander.copy_ltr" = { key = "F6" }
+"commander.right.apply" = { key = "Tab F10" }
+"commander.copy_rtl" = { key = "F6" }
+"commander.left.open_file" = { key = "Ctrl+O" }
+"commander.left.apply" = { key = "Tab F10" }
+"commander.staged" = "[1 staged]"
+"inspect.source.open_file" = { key = "o" }
+"inspect.source.connect_remote" = { key = "R" }
+"remote_pick.backup" = { key = "u" }
+"optical.browse_image" = { key = "o" }
+"optical.browse_contents" = { key = "b" }
+"browse.extract" = { key = "Ctrl+X" }
+"build_disk.next" = { key = "n" }
+"build_disk.create" = { key = "n" }
+"inspect.row.expand_hfs" = { key = "H" }
+
+[gtk]
+"backup.open_image" = { label = "Open File...", via = "Select a device or image..." }
+"backup.destination" = { label = "Folder", pick = "Browse..." }
+"backup.name" = "Backup Name"
+"backup.format" = "Output Format"
+"backup.start" = "Start Backup"
+"backup.done" = "Backup finished."
+"restore.backup_folder" = { label = "Open Backup Folder...", via = "No folder selected" }
+"restore.target_kind" = "Target"
+"restore.target_image" = { label = "Image File", pick = "Save As..." }
+"restore.start" = "Restore"
+"restore.confirm" = "I understand, proceed"
+"restore.done" = "Restore finished."
+"app.commander" = "Commander Mode"
+"commander.right.open_file" = { label = "Open File...", via = "Open image, backup, or folder...", nth = 1 }
+"commander.left.open_folder" = { label = "Open Local Folder...", via = "Open image, backup, or folder..." }
+"commander.copy_ltr" = "Copy"
+"commander.right.apply" = "Apply (1)"
+"commander.copy_rtl" = { label = "Copy", nth = 1 }
+"commander.left.open_file" = { label = "Open File...", via = "Open image, backup, or folder..." }
+"commander.left.apply" = { skip = true }
+"commander.staged" = "Apply (1)"
+"inspect.source.open_file" = { label = "Open File...", via = "Select a device or image..." }
+"inspect.source.connect_remote" = { label = "Connect to Remote...", via = "Select a device or image..." }
+"remote_pick.backup" = "Back Up Image..."
+"optical.browse_image" = { label = "Open File...", via = "No file selected" }
+"optical.browse_contents" = "Browse Contents"
+"browse.extract" = "Extract File..."
+"build_disk.kind" = { skip = true }
+"build_disk.next" = "Next"
+"build_disk.pick_image" = "Save As..."
+"build_disk.cd_layout" = "Layout"
+"build_disk.cd_auto_size" = "Size to the folder"
+"build_disk.cd_folder" = "Choose Folder..."
+"build_disk.create" = "Create Disk"
+"build_disk.build_another" = "Build Another"
+"inspect.row.expand_hfs" = "Expand/Export..."
+"expand_hfs.target_size" = "Target size (MiB):"
+"expand_hfs.save_as" = "Save As..."
+"expand_hfs.expand" = "Expand"
+
+"app.close_backup" = "Close Backup"
+"app.settings" = { label = "Settings...", via = "Menu" }
+"settings.repo_url" = "GitHub repository URL"
+"settings.save" = "Save"
+"settings.cancel" = "Cancel"
+"archives.browse" = { label = "Open File...", via = "(none selected)" }
+# A bare GTK drop-down is named by its value, so these two go by their defaults.
+"archives.format" = "BinHex (.hqx)"
+"archives.extract_all" = "Extract All..."
+"backup.remote_open" = { label = "Connect to Remote...", via = "Select a device or image..." }
+"backup.remote_address" = "Host"
+"backup.remote_connect" = "Connect"
+"backup.remote_close" = "Close"
+"backup.vhd_start" = "Start VHD Backup"
+"inspect.row.browse" = "Browse"
+"browse.extract_all" = "Extract All..."
+"browse.close" = "Close"
+"browse.edit_mode" = "Edit Mode"
+"browse.new_folder" = "New Folder..."
+"browse.edit_text" = "Edit as text..."
+"browse.apply" = "Apply Edits"
+"prompt.text" = "Name"
+"window.field.editortext" = "Text"
+"window.save" = "Save"
+"build_disk.size" = "Size"
+"build_disk.row_content" = "Empty"
+"build_disk.label" = "Label"
+"convert.source_file" = "Choose Image..."
+"convert.disc.format" = "Format"
+"convert.output" = "Choose..."
+"convert.start" = "Convert"
+"restore.mode" = "Mode"
+"restore.write_image" = "Choose..."
+"restore.write_target" = "Choose target and write..."
+"disk_write.synthesize" = "Synthesize partition table"
+"disk_write.target_image" = "Image file..."
+"disk_write.write" = "Write to disk..."
+"restore.remote_target" = "Restore to a remote machine"
+"restore.remote_address" = "Host"
+"restore.remote_connect" = "Connect"
+"restore.remote_image_name" = "or image file"
+"restore.remote_use_image" = "Use file"
+"optical.source_drive" = "Physical drive"
+"optical.add_remote" = "Add remote daemon..."
+"optical.remote_address" = "Daemon address (host:port):"
+"optical.remote_connect" = "Connect"
+
+[win32]
+"commander.left.apply" = { skip = true }
+"commander.staged" = "Apply (1)"

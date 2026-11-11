@@ -16,12 +16,13 @@ use ratatui::Frame;
 use super::table_edit::bar_line;
 use super::{hint, App, FilePicker, KeyHint, PickKind, PickResult};
 use crate::controller::build_disk::{
-    containers, cpm_presets, format_size, geometries, hints, parse_size_field, purpose,
+    containers, cpm_presets, format_size, geometries, hints, labels, parse_size_field, purpose,
     BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdSidecars, DiskKind, FormatOptions,
-    FsKind, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
-    AFFS_VARIANTS, CD_AUTO_SIZE, SECTOR_SIZES,
+    FsChoice, FsOption, MacDriver, NoNotify, OptionEdit, PresetKind, RowContent, Step, TableKind,
+    AFFS_VARIANTS, CD_AUTO_SIZE, NTFS_VERSIONS, SECTOR_SIZES,
 };
 use crate::controller::partition_edit::BuildAction;
+use crate::controller::ChoiceSpec;
 use crate::controller::{Controller as _, Effect};
 
 pub(super) const HINTS_BUILD_DISK: &[KeyHint] = &[
@@ -91,6 +92,8 @@ pub(super) struct BuildDiskState {
     pub(super) device_pick: bool,
     pub(super) device_sel: usize,
     pub(super) status: Option<String>,
+    /// A question the controller asked (which NTFS version), answered by its keys.
+    pub(super) question: Option<ChoiceSpec>,
     log: Vec<String>,
 }
 
@@ -104,6 +107,7 @@ impl Default for BuildDiskState {
             device_pick: false,
             device_sel: 0,
             status: None,
+            question: None,
             log: Vec::new(),
         }
     }
@@ -115,7 +119,7 @@ impl Default for BuildDiskState {
 enum Content {
     Copy,
     Empty,
-    Fs(FsKind),
+    Fs(FsChoice),
     Image,
 }
 
@@ -126,7 +130,7 @@ fn contents(can_copy: bool) -> Vec<Content> {
         v.push(Content::Copy);
     }
     v.push(Content::Empty);
-    v.extend(FsKind::ALL.iter().map(|k| Content::Fs(*k)));
+    v.extend(FsChoice::all().into_iter().map(Content::Fs));
     v.push(Content::Image);
     v
 }
@@ -161,10 +165,10 @@ impl BuildDiskState {
                 Effect::PickFolder(spec) => {
                     self.picker = Some((spec.purpose, FilePicker::new(PickKind::Dir, spec.title)));
                 }
+                Effect::Choose(spec) => self.question = Some(spec),
                 Effect::Confirm(_)
                 | Effect::AskPassword(_)
                 | Effect::AskText(_)
-                | Effect::Choose(_)
                 | Effect::OpenUrl(_)
                 | Effect::CopyToClipboard(_)
                 | Effect::CloseScreen
@@ -443,7 +447,7 @@ impl BuildDiskState {
                 self.act(BuildDiskAction::Table(BuildAction::SetKind(k)));
             }
             Row::VolumeFs => {
-                let k = cycle(&FsKind::ALL, c.volume_fs(), forward);
+                let k = cycle(FsChoice::all().as_slice(), c.volume_fs_choice(), forward);
                 self.act(BuildDiskAction::SetVolumeFs(k));
             }
             Row::Preset => {
@@ -506,7 +510,7 @@ impl BuildDiskState {
                     RowContent::Image => Content::Image,
                     RowContent::Empty => Content::Empty,
                     RowContent::Copy => Content::Copy,
-                    RowContent::Format => c.row_fs(i).map_or(Content::Empty, Content::Fs),
+                    RowContent::Format => c.row_fs_choice(i).map_or(Content::Empty, Content::Fs),
                 };
                 match cycle(contents(c.row_can_copy(i)).as_slice(), cur, forward) {
                     Content::Copy => self.act(BuildDiskAction::SetRowCopy(i)),
@@ -562,6 +566,11 @@ impl BuildDiskState {
                         let s = cycle(&SECTOR_SIZES, o.sector_size.unwrap_or(512), forward);
                         OptionEdit::SectorSize(s).apply(&mut o);
                     }
+                    FsOption::NtfsVersion => {
+                        let all: Vec<_> = NTFS_VERSIONS.iter().map(|v| v.0).collect();
+                        let v = cycle(&all, o.ntfs_version.unwrap_or_default(), forward);
+                        OptionEdit::NtfsVersion(v).apply(&mut o);
+                    }
                     _ => return false,
                 }
                 self.set_opts(r, o);
@@ -577,6 +586,19 @@ impl App {
     pub(super) fn handle_build_disk_key(&mut self, code: KeyCode) -> bool {
         let devices = self.shell.devices().to_vec();
         let s = self.build_disk.get_or_insert_with(BuildDiskState::default);
+        if let Some(q) = &s.question {
+            let choice = match code {
+                KeyCode::Esc => Some(q.dismiss),
+                KeyCode::Char(k) => q.choices.iter().position(|c| c.key == k),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                let purpose = q.purpose;
+                s.question = None;
+                s.act(BuildDiskAction::Chose { purpose, choice });
+            }
+            return true;
+        }
         if let Some((which, picker)) = s.picker.as_mut() {
             let which = *which;
             match picker.handle_key(code) {
@@ -746,7 +768,7 @@ impl App {
             return if s.ctl.is_running() {
                 vec![("Esc", "Cancel")]
             } else {
-                vec![("a", "Build another"), ("<-/->", "Tabs")]
+                vec![("a", labels::BUILD_ANOTHER), ("<-/->", "Tabs")]
             };
         }
         vec![
@@ -811,7 +833,7 @@ impl App {
                     lines.push(Line::raw(phase));
                 }
                 match c.outcome() {
-                    Some(Ok(())) => lines.push(Line::styled("Disk build complete.", pal.accent())),
+                    Some(Ok(())) => lines.push(Line::styled(labels::DONE, pal.accent())),
                     Some(Err(e)) => lines.push(Line::styled(format!("Error: {e}"), pal.warn())),
                     None => {}
                 }
@@ -844,7 +866,7 @@ impl App {
                 }
             }
             let (label, value): (String, String) = match row {
-                Row::Kind => ("Kind".into(), format!("< {} >", c.kind().label())),
+                Row::Kind => (labels::KIND.into(), format!("< {} >", c.kind().label())),
                 Row::OutputKind => (
                     "Output".into(),
                     if c.output_is_device() {
@@ -854,10 +876,14 @@ impl App {
                     },
                 ),
                 Row::OutputImage => (
-                    "Save as".into(),
-                    c.image()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(Enter to choose)".into()),
+                    "Image file".into(),
+                    format!(
+                        "{}  [{}]",
+                        c.image()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(Enter to choose)".into()),
+                        labels::PICK_IMAGE
+                    ),
                 ),
                 Row::Container => (
                     "Format".into(),
@@ -913,7 +939,7 @@ impl App {
                         .unwrap_or_else(|| "fixed size".to_string());
                     (
                         "Filesystem".into(),
-                        format!("< {} >  {range}", c.volume_fs().display_name()),
+                        format!("< {} >  {range}", c.volume_fs_choice().label()),
                     )
                 }
                 Row::Preset => ("Preset".into(), format!("< {} >", c.preset().kind.label())),
@@ -935,23 +961,30 @@ impl App {
                         .unwrap_or_else(|| "(none: seed files; Enter to choose)".into()),
                 ),
                 Row::SgiLabel => ("EFS label".into(), c.preset().sgi_label.clone()),
-                Row::CdLayout => ("Layout".into(), format!("< {} >", c.cd().layout.label())),
+                Row::CdLayout => (
+                    labels::CD_LAYOUT.into(),
+                    format!("< {} >", c.cd().layout.label()),
+                ),
                 Row::CdName => ("Volume name".into(), c.cd().name.clone()),
                 Row::CdAutoSize => (
-                    "Size".into(),
+                    labels::CD_AUTO_SIZE.into(),
                     if c.cd_auto_size() {
-                        "< sized to the folder >".into()
+                        "< on >".into()
                     } else {
-                        "< fixed size >".into()
+                        "< off >".into()
                     },
                 ),
                 Row::CdFolder => (
                     "Fill from".into(),
-                    c.cd()
-                        .from_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(blank disc; Enter to choose a folder)".into()),
+                    format!(
+                        "{}  [{}]",
+                        c.cd()
+                            .from_dir
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(blank disc)".into()),
+                        labels::CD_FOLDER
+                    ),
                 ),
                 Row::CdOpt(option) => {
                     let row = c.cd_options().into_iter().find(|r| r.option == *option);
@@ -994,7 +1027,7 @@ impl App {
                         RowContent::Copy => "< Copy from the donor >".into(),
                         RowContent::Format => format!(
                             "< {} >",
-                            c.row_fs(*p).map(|k| k.display_name()).unwrap_or("?")
+                            c.row_fs_choice(*p).map_or("?".into(), |k| k.label())
                         ),
                         RowContent::Image => {
                             let r = v.rows.get(*p);
@@ -1081,6 +1114,14 @@ impl App {
                             "  Sector size".into(),
                             format!("< {} >", x.sector_size.unwrap_or(512)),
                         ),
+                        FsOption::NtfsVersion => {
+                            let v = x.ntfs_version.unwrap_or_default();
+                            let label = NTFS_VERSIONS.iter().find(|n| n.0 == v).map(|n| n.1);
+                            (
+                                "  NTFS version".into(),
+                                format!("< {} >", label.unwrap_or("?")),
+                            )
+                        }
                         FsOption::BtreeSizes | FsOption::MinCatalog => continue,
                     }
                 }
@@ -1097,7 +1138,7 @@ impl App {
             } else {
                 ratatui::style::Style::default()
             };
-            lines.push(Line::styled(format!("{marker}{label:<16} {value}"), style));
+            lines.push(Line::styled(format!("{marker}{label:<18} {value}"), style));
             if sel {
                 if let Some(help) = row_help(c, row) {
                     lines.push(Line::styled(format!("    {help}"), pal.dim()));
@@ -1123,6 +1164,22 @@ impl App {
         }
         if let Some(st) = &s.status {
             lines.push(Line::styled(st.clone(), pal.warn()));
+        }
+        if let Some(q) = &s.question {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(q.title.clone(), pal.accent()));
+            for l in q.message.lines() {
+                lines.push(Line::styled(format!("  {l}"), pal.warn()));
+            }
+            let keys: Vec<String> = q
+                .choices
+                .iter()
+                .map(|c| format!("{} {}", c.key, c.label))
+                .collect();
+            lines.push(Line::styled(
+                format!("  {}", keys.join("   ")),
+                pal.accent(),
+            ));
         }
         for l in &s.log {
             lines.push(Line::styled(l.clone(), pal.dim()));
@@ -1164,6 +1221,7 @@ fn tick(label: &str, on: bool) -> (String, String) {
 mod tests {
     use super::super::{App, TabId, TABS};
     use super::*;
+    use crate::controller::build_disk::FsKind;
     use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(app: &mut App, code: KeyCode) {

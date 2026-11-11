@@ -37,13 +37,13 @@ pub enum Reply {
 pub type ReplyFn = Rc<dyn Fn(Reply)>;
 
 /// The GUI suite's answer to a picker, from `RUSTY_BACKUP_TEST_PICKS` (`purpose<TAB>path` lines).
-/// Read on every pick so the suite can change it between steps; an unlisted purpose cancels.
+/// Read on every pick so the suite can change it between steps; `*` answers any purpose, an unlisted one cancels.
 fn scripted_pick(purpose: &str) -> Option<Option<PathBuf>> {
     let file = std::env::var_os("RUSTY_BACKUP_TEST_PICKS")?;
     let text = std::fs::read_to_string(file).unwrap_or_default();
     let found = text.lines().find_map(|l| {
         let (p, path) = l.split_once('\t')?;
-        (p == purpose).then(|| PathBuf::from(path))
+        (p == purpose || p == "*").then(|| PathBuf::from(path))
     });
     Some(found)
 }
@@ -212,6 +212,9 @@ impl EffectHost {
             .text(plain(&spec.initial).as_ref())
             .activates_default(true)
             .build();
+        entry.update_property(&[gtk::accessible::Property::Label(
+            plain(&spec.prompt).as_ref(),
+        )]);
         let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
         error.add_css_class("error");
         error.set_text(&plain(spec.error.as_deref().unwrap_or("")));

@@ -18,8 +18,8 @@ cd "$(dirname "$0")/.."
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
-SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src)
-ENFORCED=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src)
+SHELLS=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src frontends/win32/src)
+ENFORCED=(src/gui src/cli/verbs/tui_app.rs src/cli/verbs/tui_app frontends/gtk4/src frontends/win32/src)
 # `update` owns config.json (recent files, settings); views reach it through controller::app (slice 22).
 ENGINE_MODS='fs|backup|restore|partition|rbformats|os|optical|remote|model|update'
 SPLIT_CRATES='disk_core|fs_[a-z0-9_]+|dsk_[a-z0-9_]+|part_tables|arc_mac|qnx2fs'
@@ -44,7 +44,14 @@ fi
 
 # --- enforced: views that reach the model only through src/controller ---------
 ENGINE_REF="\b(rusty_backup|crate)::(\{[^}]*)?\b($ENGINE_MODS)\b|\b($SPLIT_CRATES)::"
-if hits=$(grep -rnE "$ENGINE_REF" "${ENFORCED[@]}"); then
+# In frontends/* `crate::` is the shell's own crate (its own backup.rs, optical.rs), not the engine.
+FRONTEND_REF="\brusty_backup::(\{[^}]*)?\b($ENGINE_MODS)\b|\b($SPLIT_CRATES)::"
+engine_refs() {
+  { grep -rn$1E "$ENGINE_REF" "${@:2}" 2>/dev/null | grep -v '^frontends/' || true
+    grep -rn$1E "$FRONTEND_REF" "${@:2}" 2>/dev/null | grep '^frontends/' || true; }
+}
+hits=$(engine_refs "" "${ENFORCED[@]}")
+if [ -n "$hits" ]; then
   error "an enforced view references the engine/model; re-export it from src/controller:"
   echo "$hits"
 fi
@@ -53,7 +60,7 @@ fi
 count_in_shells() {
   grep -rnoE "$1" "${SHELLS[@]}" 2>/dev/null || true
 }
-engine=$(count_in_shells "\b(rusty_backup|crate)::($ENGINE_MODS)\b|\b($SPLIT_CRATES)::")
+engine=$(engine_refs o "${SHELLS[@]}")
 spawns=$(count_in_shells "thread::spawn")
 n_engine=$(printf '%s' "$engine" | grep -c . || true)
 n_spawn=$(printf '%s' "$spawns" | grep -c . || true)

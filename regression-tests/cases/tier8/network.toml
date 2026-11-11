@@ -1,0 +1,156 @@
+# Tier 8: working with an rb-cli serve daemon through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.network"
+description = "Inspect and back up an image a daemon serves, then prove the backup with rb-cli."
+
+[[case]]
+id = "flow.network.remote-inspect-backup"
+description = "Connect to an rb-cli serve daemon from Inspect, open the image it serves, back it up to a local folder, then restore that with rb-cli and read the file back"
+level = "smoke"
+area = ["network", "inspect", "backup"]
+shells = ["tui", "gtk", "win32"]
+capabilities = ["inspect.remote-open", "inspect.remote-backup"]
+timeout_ms = 240000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/disk.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/disk.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}", "--read-only"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { activate = "inspect.source.connect_remote" },
+  { wait = "Connect to remote" },
+  { type = "127.0.0.1:{port}" },
+  { key = "Enter" },
+  { wait = "disk.img" },
+  { focus = "disk.img" },
+  { key = "Enter" },
+  { wait = "FAT" },
+  { pick = "{scratch}" },
+  { activate = "remote_pick.backup" },
+  # The checksum file is the last thing a backup writes.
+  { wait_file = "{scratch}/disk-backup/partition-0.zst.sha256", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["restore", "{scratch}/disk-backup", "{scratch}/out.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["get", "{scratch}/out.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.network.backup-remote-connect"
+description = "Connect to an rb-cli serve daemon from Backup's Remote Drive window and see its drive list (none from an unelevated daemon, the host's from an elevated one)"
+level = "smoke"
+area = ["network", "backup"]
+shells = ["gtk", "win32"]
+capabilities = ["backup.remote-source"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}", "--read-only"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { activate = "backup.remote_open" },
+  { wait = "Remote Drive" },
+  { focus = "backup.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "backup.remote_connect" },
+  # An unelevated daemon lists no drives; CI's elevated runner lists its own.
+  { wait = "No physical drives reported || Pick a drive to back up", timeout_ms = 30000 },
+  { activate = "backup.remote_close" },
+  { wait_gone = "No physical drives reported || Pick a drive to back up" },
+]
+
+[[case]]
+id = "flow.network.restore-to-remote-image"
+description = "Restore a backup folder from the Restore screen into an image file on an rb-cli serve daemon, then read the file back out of it"
+level = "smoke"
+area = ["network", "restore"]
+shells = ["gtk", "win32"]
+capabilities = ["restore.remote-target", "restore.run"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Restore" },
+  { pick = "{scratch}/bk/job" },
+  { activate = "restore.backup_folder" },
+  { wait = "1 partition" },
+  { focus = "restore.remote_target" },
+  { choose = "on" },
+  { focus = "restore.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "restore.remote_connect" },
+  { wait = "or image file", timeout_ms = 30000 },
+  { focus = "restore.remote_image_name" },
+  { fill = "restored.img" },
+  { activate = "restore.remote_use_image" },
+  { wait = "Selected target" },
+  { activate = "restore.start" },
+  { activate = "restore.confirm" },
+  { wait = "restore.done", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/restored.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.network.optical-add-remote"
+description = "Add an rb-cli serve daemon from the Optical screen: the window closes once it connects and the daemon's drives join the drive list"
+level = "smoke"
+area = ["network", "optical"]
+shells = ["gtk", "win32"]
+capabilities = ["optical.remote-drive"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["serve", "--bind", "127.0.0.1:{port}", "--root", "{scratch}", "--read-only"]
+background = true
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { activate = "optical.source_drive" },
+  { activate = "optical.add_remote" },
+  { wait = "Daemon address" },
+  { focus = "optical.remote_address" },
+  { fill = "127.0.0.1:{port}" },
+  { activate = "optical.remote_connect" },
+  { wait_gone = "Daemon address", timeout_ms = 30000 },
+]

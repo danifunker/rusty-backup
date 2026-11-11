@@ -944,7 +944,7 @@ version = "0.1.0"
 
 [[package]]
 name = "fs-pc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "fs-unix"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "part-tables"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "byteorder",
  "crc32fast",

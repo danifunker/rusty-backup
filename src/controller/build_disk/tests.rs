@@ -70,7 +70,7 @@ fn a_rows_source_is_picked_then_measured_in_a_job_and_replaces_its_format() {
         &mut c,
         BuildDiskAction::SetRowFs {
             row: 0,
-            fs: Some(FsKind::Fat),
+            fs: Some(FsKind::Fat.into()),
         },
     );
     let fx = act(
@@ -105,7 +105,7 @@ fn partitioned_steps_gain_options_only_when_a_row_formats() {
         &mut c,
         BuildDiskAction::SetRowFs {
             row: 0,
-            fs: Some(FsKind::Fat),
+            fs: Some(FsKind::Fat.into()),
         },
     );
     assert!(c.steps().contains(&Step::Options));
@@ -148,7 +148,7 @@ fn next_is_blocked_with_a_reason_and_back_keeps_entries() {
 fn a_volume_size_outside_the_filesystem_limits_blocks_with_the_reason() {
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
-    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Prodos));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Prodos.into()));
     act(&mut c, BuildDiskAction::SetSize("64M".into()));
     image_output(&mut c, Path::new("/tmp/x.img"));
     walk_to(&mut c, Step::Disk);
@@ -162,7 +162,7 @@ fn a_volume_size_outside_the_filesystem_limits_blocks_with_the_reason() {
 fn a_bad_label_blocks_the_options_step() {
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
-    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat.into()));
     let mut o = c.format_targets()[0].opts.clone();
     o.label = "THIS LABEL IS FAR TOO LONG".into();
     act(&mut c, BuildDiskAction::SetVolumeOptions(o));
@@ -175,7 +175,7 @@ fn a_fat_volume_builds_into_an_image_file() {
     let img = dir.path().join("vol.img");
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
-    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat.into()));
     act(&mut c, BuildDiskAction::SetSize("16M".into()));
     image_output(&mut c, &img);
     walk_to(&mut c, Step::Review);
@@ -187,6 +187,89 @@ fn a_fat_volume_builds_into_an_image_file() {
     assert_eq!(c.built_image(), Some(img.as_path()));
     assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * MIB);
     open_fs(&img, 0);
+}
+
+/// PINT's SD card: a FAT boot partition and an NTFS data partition NT 4.0 can mount.
+#[test]
+fn picking_the_ntfs_1_2_entry_builds_that_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("pint.img");
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetSize("64M".into()));
+    image_output(&mut c, &img);
+    let size = |row, text: &str| BuildAction::SetRowSize {
+        row,
+        text: text.into(),
+    };
+    act(&mut c, BuildDiskAction::Table(size(0, "24M")));
+    act(&mut c, BuildDiskAction::Table(BuildAction::AddRow));
+    let fat = Some(FsKind::Fat.into());
+    assert!(act(&mut c, BuildDiskAction::SetRowFs { row: 0, fs: fat }).is_empty());
+    let nt4 = FsChoice::all()
+        .into_iter()
+        .find(|f| f.ntfs == Some(NtfsVersion::V1_2))
+        .expect("NTFS 1.2 is its own entry");
+    assert_eq!(nt4.label(), "NTFS 1.2 (Windows NT 3.5 to 4.0)");
+    let fx = act(
+        &mut c,
+        BuildDiskAction::SetRowFs {
+            row: 1,
+            fs: Some(nt4),
+        },
+    );
+    assert!(
+        fx.is_empty(),
+        "picking the entry is the whole choice: {fx:?}"
+    );
+    assert_eq!(c.row_fs_choice(1), Some(nt4));
+    let t = c
+        .format_targets()
+        .into_iter()
+        .find(|t| t.row == Some(1))
+        .unwrap();
+    assert_eq!(t.opts.ntfs_version, Some(NtfsVersion::V1_2));
+    assert!(
+        t.fields().contains(&FsOption::NtfsVersion),
+        "the row can still change it"
+    );
+
+    walk_to(&mut c, Step::Review);
+    act(&mut c, BuildDiskAction::Next);
+    c.wait();
+    let log = c.take_log();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{log:?}");
+    let f = std::fs::File::open(&img).unwrap();
+    let mut r = std::io::BufReader::new(f);
+    let table = crate::partition::PartitionTable::detect(&mut r).expect("table");
+    let ntfs_part = &table.partitions()[1];
+    let f = std::fs::File::open(&img).unwrap();
+    let vol = fs_pc::ntfs::NtfsFilesystem::open(f, ntfs_part.start_lba * 512).unwrap();
+    assert_eq!(vol.ntfs_version(), (1, 2));
+}
+
+/// Plain NTFS (the CLI's `--fs ntfs`) is the newer version, the list's first NTFS entry.
+#[test]
+fn plain_ntfs_is_3_1_and_listed_once_per_version() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
+    assert!(act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Ntfs.into())).is_empty());
+    let t = &c.format_targets()[0];
+    assert_eq!(t.opts.ntfs_version.unwrap_or_default(), NtfsVersion::V3_1);
+    let all = FsChoice::all();
+    let ntfs: Vec<String> = all
+        .iter()
+        .filter(|f| f.kind == FsKind::Ntfs)
+        .map(|f| f.label())
+        .collect();
+    assert_eq!(
+        ntfs,
+        [
+            "NTFS 3.1 (Windows 2000 and later)",
+            "NTFS 1.2 (Windows NT 3.5 to 4.0)"
+        ]
+    );
+    let at = c.volume_fs_choice().index_in(&all).unwrap();
+    assert_eq!(all[at].label(), ntfs[0]);
 }
 
 #[test]
@@ -208,14 +291,14 @@ fn a_partitioned_disk_formats_each_row() {
         &mut c,
         BuildDiskAction::SetRowFs {
             row: 0,
-            fs: Some(FsKind::Fat),
+            fs: Some(FsKind::Fat.into()),
         },
     );
     act(
         &mut c,
         BuildDiskAction::SetRowFs {
             row: 1,
-            fs: Some(FsKind::Ext),
+            fs: Some(FsKind::Ext.into()),
         },
     );
     assert_eq!(c.table_view().rows[0].type_text, "04", "FAT16 under 32 MiB");
@@ -243,7 +326,7 @@ fn a_device_build_needs_its_path_typed_and_writes_every_formatted_byte() {
     std::fs::write(&dev, vec![0xA5u8; 32 * MIB as usize]).unwrap();
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
-    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Fat.into()));
     act(&mut c, BuildDiskAction::SetOutputIsDevice(true));
     act(&mut c, BuildDiskAction::SelectDevice { row: 0, device });
     walk_to(&mut c, Step::Review);
@@ -388,7 +471,7 @@ fn option_edits_keep_the_rules() {
 fn the_btree_sizes_are_not_offered() {
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetKind(DiskKind::Volume));
-    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Hfs));
+    act(&mut c, BuildDiskAction::SetVolumeFs(FsKind::Hfs.into()));
     let t = c.format_targets().remove(0);
     assert!(t.caps.options.contains(&FsOption::BtreeSizes));
     assert!(!t.fields().contains(&FsOption::BtreeSizes));
@@ -400,7 +483,10 @@ fn the_btree_sizes_are_not_offered() {
 fn a_proposed_type_follows_but_a_typed_one_stays() {
     let mut c = ctl();
     act(&mut c, BuildDiskAction::SetSize("64M".to_string()));
-    let fs = |row, fs| BuildDiskAction::SetRowFs { row, fs: Some(fs) };
+    let fs = |row, fs: FsKind| BuildDiskAction::SetRowFs {
+        row,
+        fs: Some(fs.into()),
+    };
     act(&mut c, fs(0, FsKind::Fat));
     assert_eq!(c.table_view().rows[0].type_text, "06");
     act(&mut c, fs(0, FsKind::Ntfs));

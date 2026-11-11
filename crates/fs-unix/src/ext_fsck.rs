@@ -14,7 +14,9 @@
 //!   table. Reserved-GDT and journal blocks are owned by the reserved inodes and
 //!   picked up by the inode walk below.
 //! - **Inode-owned blocks** — every in-use inode (reserved inode `< s_first_ino`,
-//!   or `mode != 0`) is traced through its extents or indirect blocks, counting
+//!   or `mode != 0` and not deleted: a deleted inode keeps its mode, and on ext2
+//!   its block map, but has `links_count == 0` and a `dtime`) is traced through
+//!   its extents or indirect blocks, counting
 //!   both the data blocks and the metadata blocks that describe them.
 //!
 //! From that it flags block-bitmap and inode-bitmap divergence, wrong free-block
@@ -243,7 +245,9 @@ fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis,
             Err(_) => continue,
         };
         let reserved = inum < g.first_ino;
-        let in_use = reserved || ino.mode != 0;
+        // Linux keeps a deleted inode's mode (and on ext2 its block map); no links plus a dtime marks it free.
+        let deleted = ino.links_count == 0 && ino.dtime != 0;
+        let in_use = reserved || (ino.mode != 0 && !deleted);
         if !in_use {
             continue;
         }
@@ -747,6 +751,39 @@ mod tests {
             let r = run_fsck(&mut img);
             assert!(r.is_clean(), "{name}: reported errors {:?}", r.errors);
         }
+    }
+
+    #[test]
+    fn deleted_inode_with_mode_and_blocks_is_free() {
+        // ext2 deletion keeps i_mode and i_block; links_count 0 plus a dtime is what frees it.
+        let mut img = load("test_ext2.img.zst");
+        {
+            let mut fs = open(&mut img);
+            let (g, groups) = fs.fsck_geometry().unwrap();
+            let ibm = fs.read_inode_bitmap(0).unwrap();
+            let idx = (g.first_ino..g.inodes_per_group)
+                .find(|&i| ibm[(i / 8) as usize] & (1 << (i % 8)) == 0)
+                .expect("a free inode");
+            let bbm = fs.read_block_bitmap(0).unwrap();
+            let blk = (100u64..g.blocks_per_group as u64)
+                .find(|&b| bbm[(b / 8) as usize] & (1 << (b % 8)) == 0)
+                .expect("a free block")
+                + g.first_data_block as u64;
+            let mut raw = vec![0u8; g.inode_size as usize];
+            raw[0..2].copy_from_slice(&0o100644u16.to_le_bytes());
+            raw[0x04..0x08].copy_from_slice(&(g.block_size as u32).to_le_bytes());
+            raw[0x14..0x18].copy_from_slice(&1_600_000_000u32.to_le_bytes());
+            raw[0x28..0x2C].copy_from_slice(&(blk as u32).to_le_bytes());
+            let off = groups[0].inode_table * g.block_size + idx as u64 * g.inode_size as u64;
+            fs.write_raw(off, &raw).unwrap();
+            fs.flush_writer().unwrap();
+        }
+        let r = run_fsck(&mut img);
+        assert!(
+            r.is_clean(),
+            "a deleted inode counted as in use: {:?}",
+            r.errors
+        );
     }
 
     #[test]

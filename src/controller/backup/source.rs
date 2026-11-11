@@ -117,7 +117,8 @@ impl BackupController {
 
     pub(super) fn open_image(&mut self, path: PathBuf, rename: bool) {
         self.drop_remote_source();
-        self.requests.push(HostRequest::RememberRecent(path.clone()));
+        self.requests
+            .push(HostRequest::RememberRecent(path.clone()));
         // Backup needs a flat sector stream, so floppy containers are decoded too.
         if !crate::model::image_prep::needs_decoding(path.as_path(), true) {
             self.src.decode = None;
@@ -132,13 +133,11 @@ impl BackupController {
         let job = self.spawn("Decompress image", move |ctx| {
             ctx.set_can_cancel(false);
             ctx.set_phase(format!("Decompressing {name}..."));
-            Ok(
-                crate::model::image_prep::prepare_disk_image_path_reporting(
-                    worker_path.as_path(),
-                    true,
-                    &|done, total| ctx.set_bytes(done, total),
-                )?,
-            )
+            Ok(crate::model::image_prep::prepare_disk_image_path_reporting(
+                worker_path.as_path(),
+                true,
+                &|done, total| ctx.set_bytes(done, total),
+            )?)
         });
         self.src.decode = Some(Decode {
             original: path,
@@ -422,10 +421,7 @@ impl BackupController {
         let deferred = self.found.deferred.get(&index).copied();
         let offset = if remote {
             let fs_name = deferred.unwrap_or_else(|| {
-                crate::fs::fs_name_for(
-                    part.gate_type_byte(),
-                    part.partition_type_string.as_deref(),
-                )
+                crate::fs::fs_name_for(part.gate_type_byte(), part.partition_type_string.as_deref())
             });
             self.info(format!(
                 "Calculating minimum size for partition {} ({fs_name}) over the wire...",

@@ -93,10 +93,21 @@ pub const WRITABLE_TABLES: &[TableKind] = &[
     TableKind::Next,
     TableKind::SolarisX86,
     TableKind::Atari,
+    TableKind::Bsd,
 ];
 
 /// A `GEM` partition cannot exceed 16 MiB; past that TOS wants `BGM`.
 const AHDI_GEM_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// FreeBSD/Alpha's geometry: 255 heads of 63 sectors, as its `disklabel` reports a SCSI disk.
+const BSD_HEADS: u32 = 255;
+const BSD_SECTORS_PER_TRACK: u32 = 63;
+
+/// The UFS1 superblock's magic and the fields a BSD label copies from it (`fs_fsize`,
+/// `fs_frag`, `fs_cpg`), at their offsets inside the superblock.
+const UFS1_MAGIC: u32 = 0x0001_1954;
+const UFS1_SB: u64 = 8192;
+const UFS1_MAGIC_AT: usize = 0x55C;
 
 /// The slice a Sun label reserves for the whole-disk "backup" alias, which is
 /// conventionally slice 2 and overlaps every real slice.
@@ -142,6 +153,8 @@ pub fn slot_limit(kind: TableKind) -> Option<usize> {
         // Four primary slots. XGM extended chains parse, but we don't create
         // them — see docs/partition_table_writers_backlog.md.
         TableKind::Atari => Some(part_tables::atari::AHDI_NUM_SLOTS),
+        // Eight slots less `c`, the whole-disk alias.
+        TableKind::Bsd => Some(7),
         _ => None,
     }
 }
@@ -160,6 +173,7 @@ pub fn default_type(kind: TableKind) -> &'static str {
         TableKind::Sun | TableKind::SolarisX86 => "root",
         TableKind::Next => "4.3BSD",
         TableKind::Atari => "GEM",
+        TableKind::Bsd => "4.2BSD",
         _ => "83",
     }
 }
@@ -172,6 +186,8 @@ pub fn default_name(kind: TableKind, index: usize) -> String {
         // A NeXT entry's name is its `p_mountpt`, and both reference disks
         // leave that empty, so an invented one would be worse than none.
         TableKind::Next => String::new(),
+        // A BSD row's name is its slot letter: a, b, then d onward (`c` is the whole disk).
+        TableKind::Bsd => bsd_default_letter(index).to_string(),
         _ => format!("Partition {}", index + 1),
     }
 }
@@ -231,6 +247,8 @@ pub fn reserved_head(kind: TableKind, geometry: Geometry) -> u64 {
         // AHDI's root sector is sector 0; TOS tools conventionally leave
         // sector 1 free too.
         TableKind::Atari => 2 * SECTOR,
+        // The label sits in sector 0 inside partition `a`, whose first 8 KiB UFS leaves free.
+        TableKind::Bsd => 0,
         _ => SECTOR,
     }
 }
@@ -364,7 +382,11 @@ pub fn place(
         .filter_map(|s| s.size)
         .map(|n| round_up(n, gran))
         .sum();
-    let mut cursor = round_up(head.max(align), align);
+    // Only a BSD label keeps no head of its own: partition `a` starts at sector 0 around it.
+    let mut cursor = match head {
+        0 => 0,
+        _ => round_up(head.max(align), align),
+    };
     if cursor.saturating_add(fixed) > usable_end {
         bail!(
             "partitions total {} but only {} is usable on a {} disk of {}",
@@ -428,6 +450,113 @@ pub fn place(
     Ok(out)
 }
 
+/// The letter a BSD row without one gets: the `index`-th slot, skipping `c`.
+fn bsd_default_letter(index: usize) -> char {
+    let slot = if index >= 2 { index + 1 } else { index };
+    (b'a' + slot.min(7) as u8) as char
+}
+
+/// The label slot a row names, `a` to `h` but never `c`.
+fn bsd_slot(p: &Placed, row: usize) -> Result<usize> {
+    let name = p.name.trim().to_ascii_lowercase();
+    let slot = match name.as_bytes() {
+        [c @ b'a'..=b'h'] => usize::from(c - b'a'),
+        _ => bail!(
+            "partition {}: a BSD slot is a letter a to h, not '{}'",
+            row + 1,
+            p.name
+        ),
+    };
+    if slot == 2 {
+        bail!(
+            "partition {}: slot c is the whole disk; use another letter",
+            row + 1
+        );
+    }
+    Ok(slot)
+}
+
+/// The label for `placed`; `ffs` gives each 4.2BSD row's `(fsize, frag, cpg)`.
+fn bsd_spec(
+    placed: &[Placed],
+    disk_size: u64,
+    ffs: &dyn Fn(usize) -> (u32, u8, u16),
+) -> Result<part_tables::bsd::BsdLabelSpec> {
+    use part_tables::bsd::{fstype_from_text, BsdLabelSpec, BsdSlotSpec, FS_BSDFFS};
+    let sectors = u32::try_from(disk_size / SECTOR)
+        .map_err(|_| anyhow::anyhow!("a BSD label counts at most 2 TiB of sectors"))?;
+    let mut slots = [BsdSlotSpec::default(); 8];
+    slots[2] = BsdSlotSpec {
+        size: sectors,
+        ..Default::default()
+    };
+    let mut taken = [false; 8];
+    for (i, p) in placed.iter().enumerate() {
+        let slot = bsd_slot(p, i)?;
+        if std::mem::replace(&mut taken[slot], true) {
+            bail!("partition {}: slot {} is used twice", i + 1, p.name.trim());
+        }
+        let fstype = fstype_from_text(&p.type_text).ok_or_else(|| {
+            anyhow::anyhow!("partition {}: unknown fstype '{}'", i + 1, p.type_text)
+        })?;
+        let (fsize, frag, cpg) = if fstype == FS_BSDFFS {
+            ffs(i)
+        } else {
+            (0, 0, 0)
+        };
+        slots[slot] = BsdSlotSpec {
+            size: (p.size_bytes / SECTOR) as u32,
+            offset: p.start_lba as u32,
+            fstype,
+            fsize,
+            frag,
+            cpg,
+        };
+    }
+    Ok(BsdLabelSpec {
+        sectors_per_unit: sectors,
+        sectors_per_track: BSD_SECTORS_PER_TRACK,
+        tracks_per_cylinder: BSD_HEADS,
+        slots,
+    })
+}
+
+/// FreeBSD/Alpha's label in sector 0; an unformatted FFS slot says 2 KiB fragments, 8 per block.
+fn write_bsd<W: Write + Seek>(out: &mut W, placed: &[Placed], disk_size: u64) -> Result<()> {
+    let spec = bsd_spec(placed, disk_size, &|_| (2048, 8, 16))?;
+    out.seek(SeekFrom::Start(0))?;
+    out.write_all(&spec.alpha_sector0())?;
+    Ok(())
+}
+
+/// After formatting, the label takes each UFS's fsize / frag / cpg from its superblock and
+/// sector 0 its checksums again, keeping any boot-block descriptor already there.
+pub fn finish_bsd_label<F: Read + Write + Seek>(
+    file: &mut F,
+    placed: &[Placed],
+    disk_size: u64,
+) -> Result<()> {
+    let mut found = Vec::new();
+    for p in placed {
+        let mut sb = [0u8; 1536];
+        file.seek(SeekFrom::Start(p.start_byte() + UFS1_SB))?;
+        let read = file.read_exact(&mut sb).is_ok();
+        let le = |o: usize| u32::from_le_bytes([sb[o], sb[o + 1], sb[o + 2], sb[o + 3]]);
+        let ufs = read && le(UFS1_MAGIC_AT) == UFS1_MAGIC;
+        found.push(ufs.then(|| (le(0x34), le(0x38) as u8, le(0xB4) as u16)));
+    }
+    let spec = bsd_spec(placed, disk_size, &|i| found[i].unwrap_or((2048, 8, 16)))?;
+    let mut old = [0u8; 512];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut old)?;
+    let mut sector = spec.alpha_sector0();
+    sector[480..504].copy_from_slice(&old[480..504]);
+    part_tables::bsd::set_alpha_srm_checksum(&mut sector);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&sector)?;
+    Ok(())
+}
+
 fn round_up(v: u64, to: u64) -> u64 {
     if to == 0 {
         return v;
@@ -458,6 +587,7 @@ pub fn write_table<W: Write + Seek>(
         TableKind::Next => write_next(out, placed, disk_size, geometry),
         TableKind::SolarisX86 => write_solaris_x86(out, placed, disk_size, geometry),
         TableKind::Atari => write_ahdi(out, placed, disk_size),
+        TableKind::Bsd => write_bsd(out, placed, disk_size),
         _ => bail!("no table writer for {}", kind.label()),
     }
 }
@@ -1952,8 +2082,13 @@ mod tests {
             let mut reader = table_on_temp_disk(kind, &placed, disk, geometry);
             let table = PartitionTable::detect(&mut reader)
                 .unwrap_or_else(|e| panic!("{} reparse: {e:#}", kind.label()));
+            // A BSD label reads back as itself but stays `Other` to the editor, which cannot rewrite one.
+            let read_as = match &table {
+                PartitionTable::Bsd(_) => TableKind::Bsd,
+                t => type_catalog::kind_of(t),
+            };
             assert_eq!(
-                type_catalog::kind_of(&table),
+                read_as,
                 kind,
                 "{} round-tripped as a different table",
                 kind.label(),

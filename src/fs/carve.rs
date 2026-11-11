@@ -169,24 +169,43 @@ impl<R: Read + Seek + Send> CarveFilesystem<R> {
     /// [`full_scan_enabled`] is set, otherwise the first [`DEFAULT_SCAN_LIMIT`]
     /// bytes.
     pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_sized(reader, partition_offset, None)
+    }
+
+    /// As [`Self::open`], ending at `partition_size` when the table says how long the slice is.
+    pub fn open_sized(
+        reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         let limit = if full_scan_enabled() {
             None
         } else {
             Some(DEFAULT_SCAN_LIMIT)
         };
-        Self::open_with_limit(reader, partition_offset, limit)
+        Self::open_bounded(reader, partition_offset, partition_size, limit)
     }
 
     /// Open, scanning at most `scan_limit` bytes for text runs (`None` = whole
     /// image). `whole-disk.img` and `bootblock.bin` are unaffected — only the
     /// carved-text listing is bounded.
     pub fn open_with_limit(
-        mut reader: R,
+        reader: R,
         partition_offset: u64,
         scan_limit: Option<u64>,
     ) -> Result<Self, FilesystemError> {
+        Self::open_bounded(reader, partition_offset, None, scan_limit)
+    }
+
+    fn open_bounded(
+        mut reader: R,
+        partition_offset: u64,
+        partition_size: Option<u64>,
+        scan_limit: Option<u64>,
+    ) -> Result<Self, FilesystemError> {
         let end = reader.seek(SeekFrom::End(0))?;
-        let size = end.saturating_sub(partition_offset);
+        let rest = end.saturating_sub(partition_offset);
+        let size = partition_size.map_or(rest, |n| n.min(rest));
         let scanned = match scan_limit {
             Some(limit) => limit.min(size),
             None => size,

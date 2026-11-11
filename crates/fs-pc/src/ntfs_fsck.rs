@@ -124,6 +124,7 @@ fn analyze<R: Read + Seek + Send>(fs: &mut NtfsFilesystem<R>) -> Result<Analysis
     // `owner[lcn]` = MFT record that first claimed it, so cross-link surface
     // messages can name the other party.
     let cap = record_capacity(fs);
+    let first_user = fs.first_user_record() as u64;
     let total_clusters = g.total_clusters;
     let mut owner: HashMap<u64, u64> = HashMap::new();
     let mut attribute_list_seen = false;
@@ -139,8 +140,8 @@ fn analyze<R: Read + Seek + Send>(fs: &mut NtfsFilesystem<R>) -> Result<Analysis
 
         let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
         let is_dir = flags & 0x0002 != 0;
-        // Records 0..24 are metadata files, not user files.
-        if rec_num >= 24 {
+        // System records sit below the first user record: 16 on NTFS 1.x, 24 on 3.x.
+        if rec_num >= first_user {
             if is_dir {
                 a.dirs_checked += 1;
             } else {

@@ -222,10 +222,23 @@ struct FilePicker {
     sel: usize,
     /// While browsing in Dir mode: the name being typed for a new folder.
     new_folder: Option<String>,
+    /// The flow suite's answer (`controller::picks`), given on the [`SCRIPTED_PICK`] key.
+    scripted: Option<std::path::PathBuf>,
 }
+
+/// Set when a picker with a scripted answer opens; the run loop then sends it [`SCRIPTED_PICK`].
+static SCRIPTED_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The key no terminal sends, which makes a scripted picker confirm its answer.
+const SCRIPTED_PICK: KeyCode = KeyCode::Null;
 
 impl FilePicker {
     fn new(kind: PickKind, title: impl Into<String>) -> Self {
+        // Not every TUI picker comes from a controller's purpose, so only a `*` line answers.
+        let scripted = crate::controller::picks::scripted("").flatten();
+        if scripted.is_some() {
+            SCRIPTED_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         FilePicker {
             kind,
             title: title.into(),
@@ -238,6 +251,7 @@ impl FilePicker {
             entries: Vec::new(),
             sel: 0,
             new_folder: None,
+            scripted,
         }
     }
     fn with_recent(mut self, recent: Vec<String>) -> Self {
@@ -252,6 +266,12 @@ impl FilePicker {
 
     /// Feed a key. Returns `Some(Cancel/Confirm)` when the dialog is done.
     fn handle_key(&mut self, code: KeyCode) -> Option<PickResult> {
+        if code == SCRIPTED_PICK {
+            let path = self.scripted.take()?;
+            self.browse = false;
+            self.input = path.display().to_string();
+            return self.confirm_input();
+        }
         if self.browse {
             return self.browse_key(code);
         }
@@ -1260,6 +1280,10 @@ impl App {
     fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             terminal.draw(|frame| self.draw(frame))?;
+            if SCRIPTED_OPEN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.on_key(crossterm::event::KeyEvent::from(SCRIPTED_PICK));
+                continue;
+            }
             self.handle_events()?;
             if let Some(cmd) = self.pending_palette.take() {
                 self.run_palette(terminal, &cmd)?;
@@ -3757,7 +3781,10 @@ mod tests {
         assert!(app.handle_backup_key(KeyCode::Enter));
         assert!(app.progress.is_some());
         let b = run_backup_to_end(&mut app);
-        assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
+        assert_eq!(
+            b.result(),
+            Some((crate::controller::backup::labels::DONE.to_string(), false))
+        );
         let folder = out.path().join(b.ctl.name());
         assert!(folder.join("metadata.json").exists());
     }
@@ -3959,7 +3986,10 @@ mod tests {
         assert!(!app.backup.as_ref().unwrap().ctl.vhd_open());
         assert!(app.progress.is_some());
         let b = run_backup_to_end(&mut app);
-        assert_eq!(b.result(), Some(("Backup complete.".to_string(), false)));
+        assert_eq!(
+            b.result(),
+            Some((crate::controller::backup::labels::DONE.to_string(), false))
+        );
         assert!(out.path().join(b.ctl.name()).join("metadata.json").exists());
     }
 
@@ -3987,12 +4017,12 @@ mod tests {
         let mut app = backup_on_image(&img);
         let text = backup_screen(&app);
         assert!(
-            text.contains("Partitions") && text.contains("Output:"),
+            text.contains("Partitions") && text.contains("Destination:"),
             "{text}"
         );
         focus_on(&mut app, backup::Field::Start);
         let text = backup_screen(&app);
-        assert!(text.contains("[ Start backup ]"), "{text}");
+        assert!(text.contains("[ Start Backup ]"), "{text}");
         eprintln!("{text}");
         focus_on(&mut app, backup::Field::Format);
         while app.backup.as_ref().unwrap().ctl.options().compression != CompressionType::Vhd {
@@ -4223,7 +4253,10 @@ mod tests {
         app.handle_restore_key(KeyCode::Char('y'));
         assert!(app.progress.is_some());
         let (res, err) = restore_run_to_end(&mut app);
-        assert_eq!((res.as_str(), err), ("Restore complete.", false));
+        assert_eq!(
+            (res.as_str(), err),
+            (crate::controller::restore::labels::DONE, false)
+        );
         assert_eq!(std::fs::read(&out).unwrap(), bytes);
         app.handle_restore_key(KeyCode::Esc);
         assert_eq!(
@@ -4280,7 +4313,11 @@ mod tests {
         app.handle_restore_key(KeyCode::Char('s'));
         app.handle_restore_key(KeyCode::Char('y'));
         let (res, err) = restore_run_to_end(&mut app);
-        assert_eq!((res.as_str(), err), ("Restore complete.", false), "{res}");
+        assert_eq!(
+            (res.as_str(), err),
+            (crate::controller::restore::labels::DONE, false),
+            "{res}"
+        );
         let d = std::fs::read(&out).unwrap();
         assert_eq!(&d[510..512], &[0x55, 0xAA]);
         assert_eq!(d[0x1BE], 0x80);
@@ -4474,7 +4511,7 @@ mod tests {
         let (mut app, _, _) = restore_on_backup(dir.path());
         restore_focus(&mut app, Field::Start);
         let text = restore_screen(&app);
-        assert!(text.contains("[ Start restore ]"), "{text}");
+        assert!(text.contains("[ Restore ]"), "{text}");
         assert_eq!(app.key_context().0, "Restore");
         restore_focus(&mut app, Field::Mode);
         for mode in [

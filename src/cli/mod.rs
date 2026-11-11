@@ -368,6 +368,10 @@ pub enum Command {
     #[command(name = "install-completions")]
     InstallCompletions(verbs::completions::InstallArgs),
 
+    /// Every controller's control labels as `id<TAB>label` lines, for the flow drivers (FLOWS.md).
+    #[command(name = "ui-labels", hide = true)]
+    UiLabels,
+
     /// Unstable scratch namespace for low-level operations. Kept as a
     /// deprecated alias for the flat verbs above; grammar inside `api`
     /// is expected to churn — do not depend on it from durable scripts.
@@ -543,6 +547,12 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Tui => verbs::tui_app::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
+        Command::UiLabels => {
+            for (id, label) in crate::controller::labels::table() {
+                println!("{id}\t{label}");
+            }
+            Ok(())
+        }
         Command::Api { group } => api::run(group),
     }
 }

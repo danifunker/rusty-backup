@@ -573,8 +573,13 @@ pub fn export_whole_disk_vhd(
             reader
                 .read_exact(&mut sig)
                 .context("failed to read source sector 0")?;
+            // A FAT volume's boot sector ends in 55 AA too; only the table detector tells them apart.
+            let bare = matches!(
+                crate::partition::PartitionTable::detect(&mut reader),
+                Ok(crate::partition::PartitionTable::None { .. })
+            );
             reader.seek(SeekFrom::Start(0))?;
-            sig[510] == 0x55 && sig[511] == 0xAA
+            sig[510] == 0x55 && sig[511] == 0xAA && !bare
         } else {
             false
         };
@@ -1131,6 +1136,24 @@ mod tests {
     use crate::backup::CompressionType;
     use std::io::Cursor;
     use tempfile::TempDir;
+
+    /// A FAT floppy's boot sector ends in 55 AA but holds no table: the export copies it verbatim.
+    #[test]
+    fn a_fat_floppy_with_a_size_row_is_not_taken_for_an_mbr_disk() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("floppy.img");
+        let img = fs_pc::fat::create_blank_fat(1_474_560, Some("FLOPPY")).unwrap();
+        assert_eq!(&img[510..512], &[0x55, 0xAA]);
+        std::fs::write(&src, &img).unwrap();
+        let dest = dir.path().join("out.vhd");
+        let size = img.len() as u64;
+        let rows = [PartitionSizeOverride::size_only(0, 0, size, size)];
+        export_whole_disk_vhd(&src, None, None, &rows, &dest, |_| {}, || false, |_| {}).unwrap();
+        let out = std::fs::read(&dest).unwrap();
+        assert_eq!(out.len(), img.len() + 512);
+        assert!(out[..img.len()] == img[..], "the volume is copied verbatim");
+        assert_eq!(&out[img.len()..img.len() + 8], b"conectix");
+    }
 
     #[test]
     fn test_write_vhd() {

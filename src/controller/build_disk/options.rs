@@ -1,6 +1,6 @@
 //! The Options step's rules, so every view edits a filesystem's options the same way.
 
-use super::{FormatOptions, FormatTarget, FsOption};
+use super::{FormatOptions, FormatTarget, FsKind, FsOption, NtfsVersion};
 
 /// The AFFS DosType variants, by the byte `FormatOptions::affs_variant` holds.
 pub const AFFS_VARIANTS: [(u8, &str); 8] = [
@@ -13,6 +13,83 @@ pub const AFFS_VARIANTS: [(u8, &str); 8] = [
     (6, "OFS long names (DOS\\6)"),
     (7, "FFS long names (DOS\\7)"),
 ];
+
+/// The NTFS versions on offer, newest first, with the Windows that mount each.
+pub const NTFS_VERSIONS: [(NtfsVersion, &str); 2] = [
+    (NtfsVersion::V3_1, "3.1 (Windows 2000 and later)"),
+    (NtfsVersion::V1_2, "1.2 (Windows NT 3.5 to 4.0)"),
+];
+
+/// One entry of a filesystem list: NTFS is listed once per version, since the version decides
+/// which Windows mounts the volume, and picking it is picking the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsChoice {
+    pub kind: FsKind,
+    /// The NTFS version, `None` for every other filesystem (and for NTFS's default).
+    pub ntfs: Option<NtfsVersion>,
+}
+
+impl From<FsKind> for FsChoice {
+    fn from(kind: FsKind) -> Self {
+        FsChoice { kind, ntfs: None }
+    }
+}
+
+impl FsChoice {
+    /// Every choice, in [`FsKind::ALL`] order with NTFS once per version.
+    pub fn all() -> Vec<FsChoice> {
+        let mut v = Vec::new();
+        for kind in FsKind::ALL {
+            if kind == FsKind::Ntfs {
+                v.extend(NTFS_VERSIONS.iter().map(|(n, _)| FsChoice {
+                    kind,
+                    ntfs: Some(*n),
+                }));
+            } else {
+                v.push(kind.into());
+            }
+        }
+        v
+    }
+
+    /// What a list shows: `NTFS 1.2 (Windows NT 3.5 to 4.0)`, else the filesystem's name.
+    pub fn label(self) -> String {
+        match self.ntfs {
+            Some(n) if self.kind == FsKind::Ntfs => {
+                let readers = NTFS_VERSIONS.iter().find(|(v, _)| *v == n).map(|(_, l)| *l);
+                format!("NTFS {}", readers.unwrap_or(n.label()))
+            }
+            _ => self.kind.display_name().to_string(),
+        }
+    }
+
+    /// The choice a formatted target is, for selecting it in a list.
+    pub fn of(kind: FsKind, opts: &FormatOptions) -> FsChoice {
+        FsChoice {
+            kind,
+            ntfs: (kind == FsKind::Ntfs).then(|| opts.ntfs_version.unwrap_or_default()),
+        }
+    }
+
+    /// Its position in [`FsChoice::all`]; NTFS with no version is the default version's entry.
+    pub fn index_in(self, all: &[FsChoice]) -> Option<usize> {
+        let me = FsChoice::of(
+            self.kind,
+            &FormatOptions {
+                ntfs_version: self.ntfs,
+                ..FormatOptions::default()
+            },
+        );
+        all.iter().position(|c| *c == me)
+    }
+
+    /// Set a freshly chosen target's options to this choice (an NTFS version).
+    pub(crate) fn apply_to(self, f: &mut crate::model::disk_builder::RowFormat) {
+        if let (FsKind::Ntfs, Some(n)) = (self.kind, self.ntfs) {
+            OptionEdit::NtfsVersion(n).apply(&mut f.opts);
+        }
+    }
+}
 
 /// The NTFS sector sizes on offer; 512 is the default, stored as `None`.
 pub const SECTOR_SIZES: [u32; 4] = [512, 1024, 2048, 4096];
@@ -32,6 +109,7 @@ pub enum OptionEdit {
     BytesPerInode(Option<u64>),
     ClusterSize(Option<u64>),
     SectorSize(u32),
+    NtfsVersion(NtfsVersion),
 }
 
 fn clamp32(v: Option<u64>) -> Option<u32> {
@@ -64,6 +142,13 @@ impl OptionEdit {
             }
             OptionEdit::ClusterSize(v) => o.cluster_bytes = clamp32(v),
             OptionEdit::SectorSize(s) => o.sector_size = (s != 512).then_some(s),
+            // 1.2 is 512-byte sectors only, so picking it takes the sector size back to 512.
+            OptionEdit::NtfsVersion(v) => {
+                o.ntfs_version = Some(v);
+                if v == NtfsVersion::V1_2 {
+                    o.sector_size = None;
+                }
+            }
         }
     }
 }

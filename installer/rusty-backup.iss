@@ -7,8 +7,8 @@
 ; Build:
 ;   iscc /DMyAppVersion=2026-06-01-14-30 /DSourceDir=path\to\build installer\rusty-backup.iss
 ;
-; CI wiring (compile per arch, attach Setup.exe to the release) is Phase 7 and
-; is intentionally not done yet.
+; CI compiles it per arch. The native Win32 shell has its own installer,
+; installer/rusty-backup-win32.iss.
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0-dev"
@@ -57,6 +57,10 @@ SolidCompression=yes
 WizardStyle=modern
 ; Required so the PATH change is broadcast (WM_SETTINGCHANGE) without a reboot.
 ChangesEnvironment=yes
+#ifdef Arm64
+; An ARM64 build runs only on ARM64 Windows; refuse to install it anywhere else.
+ArchitecturesAllowed=arm64
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

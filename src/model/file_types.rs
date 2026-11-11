@@ -186,12 +186,6 @@ pub fn archives_picker_exts() -> Vec<&'static str> {
     out
 }
 
-/// ProgId registered under `HKCU\Software\Classes` for disk-image associations.
-pub const DISK_IMAGE_PROGID: &str = "RustyBackup.DiskImage";
-
-/// Friendly description shown in Explorer and the "Open with" list.
-pub const DISK_IMAGE_PROGID_DESC: &str = "Rusty Backup Disk Image";
-
 /// Lowercased, de-duplicated extensions for OS file-association registration.
 /// Registry keys are case-insensitive, so the uppercase picker variants
 /// collapse away here.

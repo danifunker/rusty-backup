@@ -825,3 +825,166 @@ fn a_closed_pane_names_nothing_and_a_host_pane_says_so() {
     assert_eq!(pane.path_prefix(), "host ");
     assert_eq!(pane.volume_title(), "local folder");
 }
+
+#[test]
+fn the_edit_bar_and_the_edits_window_follow_the_queue() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Delete);
+    let bar = ctl.edit_bar(Side::Left);
+    assert_eq!(bar.staged, 1);
+    assert_eq!(bar.apply_label, "Apply Edits (1)");
+    assert!(bar.deletable);
+    ctl.apply(A::Pane(Side::Left, P::ShowEdits(true)));
+    let windows = ctl.pane_windows(Side::Left, false);
+    let edits = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::Edits)
+        .unwrap();
+    let Part::Items { lines, actions, .. } = &edits.parts[1] else {
+        panic!(
+            "the edits are listed with their own button: {:?}",
+            edits.parts
+        );
+    };
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("1. "), "{lines:?}");
+    for a in actions[0].clone() {
+        ctl.apply(a);
+    }
+    assert!(ctl.pane(Side::Left).queue.is_empty());
+    assert_eq!(ctl.edit_bar(Side::Left).staged, 0);
+}
+
+#[test]
+fn the_mark_bar_counts_marked_rows() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    assert_eq!(ctl.mark_bar(Side::Left).count, 0);
+    let name = files(&ctl, Side::Left)[0].clone();
+    let id = ctl
+        .pane(Side::Left)
+        .rows()
+        .iter()
+        .find(|r| r.name == name)
+        .map(|r| r.node_id.clone())
+        .unwrap();
+    ctl.apply(A::Pane(Side::Left, P::Mark(id)));
+    let bar = ctl.mark_bar(Side::Left);
+    assert_eq!(bar.count, 1);
+    assert_eq!(bar.label, "1 selected");
+}
+
+#[test]
+fn the_checksum_window_copies_each_value() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    ctl.apply(A::Checksums(Side::Left));
+    settle(&mut ctl);
+    let windows = ctl.pane_windows(Side::Left, false);
+    let sums = windows
+        .iter()
+        .find(|w| w.kind == WindowKind::Checksums)
+        .unwrap();
+    let Some(Part::Items { lines, actions, .. }) = sums.parts.last() else {
+        panic!("one line per value: {:?}", sums.parts);
+    };
+    assert_eq!(lines.len(), HashAlgo::ALL.len(), "{lines:?}");
+    let fx = ctl.apply(actions[0][0].clone());
+    assert!(
+        matches!(fx.as_slice(), [Effect::CopyToClipboard(_)]),
+        "{fx:?}"
+    );
+}
+
+#[test]
+fn submit_reads_the_fields_and_the_picked_option() {
+    use crate::controller::browser::{LineEnding, TextShape};
+    use crate::model::text_edit::TextEncoding;
+    let shape = TextShape {
+        encoding: TextEncoding::Utf8,
+        ending: LineEnding::Lf,
+        mixed_endings: false,
+    };
+    let form = Form::Editor {
+        name: "A.TXT".into(),
+        folder: "/".into(),
+        shape,
+    };
+    let values = [(FieldId::EditorText, "one\ntwo".to_string())];
+    match submit(&form, &values, 1).as_slice() {
+        [A::Pane(Side::Left, P::SaveText { text, shape, .. })] => {
+            assert_eq!(text, "one\ntwo");
+            assert_eq!(shape.ending, LineEnding::CrLf);
+        }
+        other => panic!("{other:?}"),
+    }
+    let values = [(FieldId::Password, "secret".to_string())];
+    assert!(matches!(
+        submit(&Form::Password, &values, 0).as_slice(),
+        [A::Mode(ModeAction::Password(p))] if p == "secret"
+    ));
+}
+
+#[test]
+fn a_live_field_sends_only_what_parses() {
+    assert!(matches!(
+        field_action(FieldId::BudgetAbsolute, " 12 "),
+        Some(A::Mode(ModeAction::Budget(BudgetAction::SetAbsoluteMib(
+            12
+        ))))
+    ));
+    assert!(field_action(FieldId::BudgetHeadroom, "lots").is_none());
+    assert!(field_action(FieldId::BudgetHeadroom, "0").is_none());
+    assert!(field_action(FieldId::Password, "x").is_none());
+}
+
+#[test]
+fn a_drop_opens_in_an_empty_pane_copies_into_a_volume_and_asks_only_for_an_image() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let text = std::path::PathBuf::from("C:/somewhere/NOTES.TXT");
+    let disk = std::path::PathBuf::from("C:/somewhere/game.hfv");
+    let opens = |plan: Option<DropPlan>, side: Side| match plan {
+        Some(DropPlan::Do(a)) => {
+            matches!(a.as_slice(), [A::Focus(s), A::OpenDropped(_)] if *s == side)
+        }
+        _ => false,
+    };
+    assert!(opens(
+        ctl.drop_plan(Side::Right, std::slice::from_ref(&disk)),
+        Side::Right
+    ));
+    match ctl.drop_plan(Side::Left, std::slice::from_ref(&text)) {
+        Some(DropPlan::Do(a)) => {
+            assert!(
+                matches!(a.as_slice(), [A::Focus(Side::Left), A::Pane(Side::Left, P::AddPicked(p))] if p == std::slice::from_ref(&text))
+            )
+        }
+        other => panic!("a plain file copies in: {other:?}"),
+    }
+    match ctl.drop_plan(Side::Left, std::slice::from_ref(&disk)) {
+        Some(DropPlan::Ask { choices, .. }) => {
+            assert_eq!(choices.len(), 2);
+            assert!(matches!(
+                choices[0].1.as_slice(),
+                [_, A::Pane(_, P::AddPicked(_))]
+            ));
+            assert!(matches!(choices[1].1.as_slice(), [_, A::OpenDropped(_)]));
+        }
+        other => panic!("an image on a volume asks: {other:?}"),
+    }
+    assert!(matches!(
+        ctl.drop_plan(Side::Left, &[disk, text]),
+        Some(DropPlan::Do(_))
+    ));
+    assert!(ctl.drop_plan(Side::Left, &[]).is_none());
+}

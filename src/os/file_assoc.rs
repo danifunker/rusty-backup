@@ -15,7 +15,8 @@ use std::io;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
 use winreg::RegKey;
 
-use crate::model::file_types::{association_exts, DISK_IMAGE_PROGID, DISK_IMAGE_PROGID_DESC};
+use crate::model::file_types::association_exts;
+use crate::os::windows_gui::WindowsGui;
 
 /// Open (creating if needed) `HKCU\Software\Classes`.
 fn open_classes() -> io::Result<RegKey> {
@@ -33,19 +34,27 @@ pub fn register_file_associations() -> io::Result<()> {
 
     // ProgId: friendly description, icon, and the open command. Values are
     // passed as `&String` so winreg infers `ToRegValue for String` unambiguously.
-    let (progid, _) = classes.create_subkey(DISK_IMAGE_PROGID)?;
-    progid.set_value("", &DISK_IMAGE_PROGID_DESC.to_string())?;
+    // Each GUI has its own ProgId, so installing or removing one leaves the other's "Open with".
+    let gui = WindowsGui::current();
+    let (id, desc) = gui.progid();
+    let (progid, _) = classes.create_subkey(id)?;
+    progid.set_value("", &desc.to_string())?;
     let (icon, _) = progid.create_subkey("DefaultIcon")?;
     icon.set_value("", &format!("{exe_str},0"))?;
-    let (cmd, _) = progid.create_subkey("shell\\open\\command")?;
+    let (open, _) = progid.create_subkey("shell\\open")?;
+    open.set_value("FriendlyAppName", &gui.app_name().to_string())?;
+    let (cmd, _) = open.create_subkey("command")?;
     cmd.set_value("", &format!("\"{exe_str}\" \"%1\""))?;
+    // "How do you want to open this file?" names the app from here, not from the ProgId.
+    let (app, _) = classes.create_subkey(format!("Applications\\{}", gui.exe_name()))?;
+    app.set_value("FriendlyAppName", &gui.app_name().to_string())?;
 
     // Non-destructive per-extension registration: list our ProgId under each
     // extension's OpenWithProgids (an empty-string value-data marker). This
     // never overwrites whatever the user has set as their default handler.
     for ext in association_exts() {
         let (key, _) = classes.create_subkey(format!(".{ext}\\OpenWithProgids"))?;
-        key.set_value(DISK_IMAGE_PROGID, &String::new())?;
+        key.set_value(id, &String::new())?;
     }
 
     Ok(())
@@ -55,13 +64,52 @@ pub fn register_file_associations() -> io::Result<()> {
 /// Leaves any other handlers and the user's chosen defaults untouched.
 pub fn unregister_file_associations() -> io::Result<()> {
     let classes = open_classes()?;
-    let _ = classes.delete_subkey_all(DISK_IMAGE_PROGID);
+    let gui = WindowsGui::current();
+    let (id, _) = gui.progid();
+    let _ = classes.delete_subkey_all(id);
+    let _ = classes.delete_subkey_all(format!("Applications\\{}", gui.exe_name()));
     for ext in association_exts() {
         if let Ok(key) =
             classes.open_subkey_with_flags(format!(".{ext}\\OpenWithProgids"), KEY_WRITE)
         {
-            let _ = key.delete_value(DISK_IMAGE_PROGID);
+            let _ = key.delete_value(id);
         }
     }
     Ok(())
+}
+
+/// Launch hooks for an installed GUI, run before any window: the installer's and uninstaller's
+/// `--register-file-associations` / `--unregister-file-associations` (which exit), a refresh of
+/// associations registered by an older build, and the Add/Remove Programs version after an update.
+pub fn launch_hooks() {
+    use crate::update::UpdateConfig;
+
+    let version = env!("APP_VERSION");
+    let args: Vec<String> = std::env::args().collect();
+    let register = args.iter().any(|a| a == "--register-file-associations");
+    let unregister = args.iter().any(|a| a == "--unregister-file-associations");
+
+    let mut cfg = UpdateConfig::load();
+    if !register && !unregister {
+        if cfg.file_associations_enabled && cfg.assoc_registered_version.as_deref() != Some(version)
+        {
+            let _ = register_file_associations();
+            cfg.assoc_registered_version = Some(version.to_string());
+            let _ = cfg.save();
+        }
+        // self_replace bypasses the installer, so its DisplayVersion goes stale (no-op when portable).
+        let _ = crate::os::win_install::refresh_arp_display_version(version);
+        return;
+    }
+    if register {
+        let _ = register_file_associations();
+        cfg.file_associations_enabled = true;
+        cfg.assoc_registered_version = Some(version.to_string());
+    } else {
+        let _ = unregister_file_associations();
+        cfg.file_associations_enabled = false;
+        cfg.assoc_registered_version = None;
+    }
+    let _ = cfg.save();
+    std::process::exit(0);
 }

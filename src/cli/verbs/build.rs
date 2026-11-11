@@ -15,7 +15,7 @@ use clap::{Args, ValueEnum};
 use crate::cli::logging::log_stderr;
 use crate::controller::build_disk::{
     containers, purpose, BuildDiskAction as A, BuildDiskController, DiskKind, ExportFormat, FsKind,
-    MacDriver, NoNotify, PresetKind, Step, TableKind,
+    MacDriver, NoNotify, OptionEdit, PresetKind, Step, TableKind,
 };
 use crate::controller::partition_edit::BuildAction;
 use crate::controller::Controller as _;
@@ -214,6 +214,11 @@ pub struct BuildArgs {
     #[arg(long)]
     pub geometry: Option<String>,
 
+    /// The on-disk version of every NTFS volume or partition this builds: `1.2`
+    /// (alias `nt4`) for Windows NT 3.5 / 3.51 / 4.0, `3.1` (alias `xp`, the default).
+    #[arg(long = "ntfs-version", value_enum)]
+    pub ntfs_version: Option<crate::cli::verbs::new::NtfsVersionArg>,
+
     /// Container to encode an image target into: raw, vhd, vhd-dynamic,
     /// qcow2, vmdk, chd, 2mg, dc42, woz or moof. Defaults to the one the
     /// target's extension names (`.chd`, `.vhd`, ...), else raw.
@@ -344,7 +349,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             };
             c.apply(A::SetRowFs {
                 row,
-                fs: Some(fs_named(fs.as_str())?),
+                fs: Some(fs_named(fs.as_str())?.into()),
             });
             if let Some(label) = label {
                 if let Some(t) = c.format_targets().into_iter().find(|t| t.row == Some(row)) {
@@ -354,7 +359,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 }
             }
         }
-        return finish(c);
+        return finish(c, &args);
     }
     if let Some(p) = args.preset {
         act(&mut c, A::SetKind(DiskKind::Preset));
@@ -370,7 +375,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             view.sgi_label = label.clone();
         }
         act(&mut c, A::SetPreset(view));
-        return finish(c);
+        return finish(c, &args);
     }
     match args.table {
         None => {
@@ -381,7 +386,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 bail!("--partition / --format / --fill need --table");
             }
             act(&mut c, A::SetKind(DiskKind::Volume));
-            act(&mut c, A::SetVolumeFs(fs_named(fs)?));
+            act(&mut c, A::SetVolumeFs(fs_named(fs)?.into()));
             if args.label.is_some() || args.geometry.is_some() {
                 let mut opts = c.format_targets()[0].opts.clone();
                 if let Some(label) = &args.label {
@@ -408,14 +413,29 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
 
-    finish(c)
+    finish(c, &args)
 }
 
 /// Walk the steps the way a user would (the first refusal is the error), then build.
-fn finish(mut c: BuildDiskController) -> Result<()> {
+fn finish(mut c: BuildDiskController, args: &BuildArgs) -> Result<()> {
     let act = |c: &mut BuildDiskController, a: A| {
         c.apply(a);
     };
+    if let Some(v) = args.ntfs_version {
+        for t in c.format_targets() {
+            if t.fs != FsKind::Ntfs {
+                continue;
+            }
+            let opts = t.edited(OptionEdit::NtfsVersion(v.version()));
+            act(
+                &mut c,
+                match t.row {
+                    Some(row) => A::SetRowOptions { row, opts },
+                    None => A::SetVolumeOptions(opts),
+                },
+            );
+        }
+    }
     while c.step() != Step::Review {
         if let Some(why) = c.next_blocked() {
             bail!("{}: {why}", c.step().label());
@@ -494,7 +514,7 @@ fn set_rows(c: &mut BuildDiskController, args: &BuildArgs) -> Result<()> {
         let typed_type = typed[row].then(|| c.table_view().rows[row].type_text.clone());
         c.apply(A::SetRowFs {
             row,
-            fs: Some(fs_named(fs.as_str())?),
+            fs: Some(fs_named(fs.as_str())?.into()),
         });
         // A type the spec named wins over the one the filesystem suggests.
         if let Some(t) = typed_type {

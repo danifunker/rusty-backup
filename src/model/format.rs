@@ -15,6 +15,9 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+/// The on-disk NTFS version a format writes (1.2 for Windows NT 3.5 to 4.0, 3.1 for XP and later).
+pub use fs_pc::ntfs_format::NtfsVersion;
+
 /// The default volume label every `new` path shares.
 pub const DEFAULT_VOLUME_NAME: &str = "rusty-backup";
 
@@ -90,6 +93,8 @@ pub enum FsOption {
     BytesPerInode,
     ClusterSize,
     SectorSize,
+    /// NTFS 1.2 or 3.1.
+    NtfsVersion,
 }
 
 /// What a filesystem's formatter can do, for the wizard and the size checks.
@@ -326,7 +331,7 @@ impl FsKind {
             FsKind::Pfs3 => c(MIB, 2 * TIB, true, 30),
             FsKind::Sfs => c(32 * KIB, 2 * TIB, true, 30),
             FsKind::Ntfs => FsCaps {
-                options: &[ClusterSize, SectorSize],
+                options: &[NtfsVersion, ClusterSize, SectorSize],
                 ..c(2 * MIB, 16 * TIB, true, 32)
             },
             FsKind::Hpfs => c(MIB, 64 * GIB, true, 11),
@@ -437,6 +442,8 @@ pub struct FormatOptions {
     /// NTFS cluster and sector sizes.
     pub cluster_bytes: Option<u32>,
     pub sector_size: Option<u32>,
+    /// NTFS on-disk version; `None` is 3.1.
+    pub ntfs_version: Option<NtfsVersion>,
 }
 
 impl Default for FormatOptions {
@@ -457,6 +464,7 @@ impl Default for FormatOptions {
             bytes_per_inode: None,
             cluster_bytes: None,
             sector_size: None,
+            ntfs_version: None,
         }
     }
 }
@@ -486,6 +494,12 @@ pub fn check_options(kind: FsKind, opts: &FormatOptions) -> Result<()> {
     }
     if (opts.cluster_bytes.is_some() || opts.sector_size.is_some()) && kind != FsKind::Ntfs {
         bail!("the cluster and sector size options only apply to NTFS");
+    }
+    if opts.ntfs_version.is_some() && kind != FsKind::Ntfs {
+        bail!("the NTFS version option only applies to NTFS");
+    }
+    if opts.ntfs_version == Some(NtfsVersion::V1_2) && opts.sector_size.is_some_and(|s| s != 512) {
+        bail!("NTFS 1.2 (Windows NT 3.5 to 4.0) uses 512-byte sectors only");
     }
     if (opts.case_sensitive || opts.min_catalog.is_some()) && kind != FsKind::Hfsplus {
         bail!("the case-sensitive and minimum-catalog options only apply to HFS+");
@@ -1013,7 +1027,8 @@ pub fn sanitize_os9_volume_name(name: &str) -> String {
 }
 
 fn format_ntfs<W: Write + Seek>(w: &mut W, raw: u64, opts: &FormatOptions) -> Result<Formatted> {
-    use fs_pc::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
+    use fs_pc::ntfs_format::{create_ntfs_version, NtfsFormatParams, NtfsGeometry};
+    let version = opts.ntfs_version.unwrap_or_default();
     let sector = opts.sector_size.unwrap_or(512);
     // The auto cluster follows mkntfs's default-by-size table, floored to the sector size.
     let geometry = match opts.cluster_bytes {
@@ -1034,9 +1049,13 @@ fn format_ntfs<W: Write + Seek>(w: &mut W, raw: u64, opts: &FormatOptions) -> Re
             "NTFS size rounded down to {total} bytes (multiple of the {cluster}-byte cluster)"
         ));
     }
+    // An explicit cluster is the user's call; only the sector size is a hard NTFS 1.2 rule.
+    if let Some(problem) = version.geometry_problem(&geometry) {
+        notes.push(problem);
+    }
     // About one MFT record per 256 KiB, with a 128-record floor for headroom.
     let mft_records_hint = (total / (256 * KIB)).clamp(128, 1 << 20);
-    create_ntfs(
+    create_ntfs_version(
         w,
         &NtfsFormatParams {
             total_size: total,
@@ -1044,12 +1063,15 @@ fn format_ntfs<W: Write + Seek>(w: &mut W, raw: u64, opts: &FormatOptions) -> Re
             mft_records_hint,
             label: Some(opts.label.clone()),
         },
+        version,
     )?;
     Ok(Formatted {
         len: total,
         summary: format!(
-            "NTFS cluster={cluster} sector={}, volume {:?}",
-            geometry.bytes_per_sector, opts.label
+            "NTFS {} cluster={cluster} sector={}, volume {:?}",
+            version.label(),
+            geometry.bytes_per_sector,
+            opts.label
         ),
         notes,
     })

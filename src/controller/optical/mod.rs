@@ -88,6 +88,14 @@ pub mod ids {
     pub const CONVERT: &str = "optical.convert";
 }
 
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const CONVERT: &str = "Convert...";
+    /// Id to label, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[(ids::CONVERT, CONVERT)];
+}
+
 /// Tooltips every shell shows on the same controls.
 pub mod hints {
     pub const CONVERT: &str = "Change this image's format (CHD, BIN/CUE, ISO) in the Convert tab.";

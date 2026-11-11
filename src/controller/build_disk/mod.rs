@@ -12,7 +12,7 @@ mod options;
 #[cfg(test)]
 mod tests;
 
-pub use options::{OptionEdit, AFFS_VARIANTS, SECTOR_SIZES};
+pub use options::{FsChoice, OptionEdit, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use crate::model::disk_builder::{DiskBuilder, RowFormat};
 use crate::model::job::{Job, Notify, Snapshot};
 
 pub use crate::device::DiskDevice;
-pub use crate::model::format::{geometries, FormatOptions, FsCaps, FsKind, FsOption};
+pub use crate::model::format::{geometries, FormatOptions, FsCaps, FsKind, FsOption, NtfsVersion};
 pub use crate::model::job::NoNotify;
 pub use crate::partition::type_catalog::TableKind;
 pub use crate::rbformats::export::ExportFormat;
@@ -187,6 +187,34 @@ pub mod ids {
     pub const CD_FORCE: &str = "build_disk.cd_force";
     pub const CD_SIDECARS: &str = "build_disk.cd_sidecars";
     pub const OPTION: &str = "build_disk.option";
+}
+
+/// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
+pub mod labels {
+    use super::ids;
+    pub const KIND: &str = "Kind";
+    pub const NEXT: &str = "Next";
+    pub const CREATE: &str = "Create Disk";
+    pub const BUILD_ANOTHER: &str = "Build Another";
+    pub const OPEN_INSPECT: &str = "Open in Inspect";
+    pub const PICK_IMAGE: &str = "Save As...";
+    pub const CD_LAYOUT: &str = "Layout";
+    pub const CD_AUTO_SIZE: &str = "Size to the folder";
+    pub const CD_FOLDER: &str = "Choose Folder...";
+    pub const DONE: &str = "Disk build complete.";
+    /// Id to label, with `<task>.done` naming the outcome message, for drivers that find by label.
+    pub const TABLE: &[(&str, &str)] = &[
+        (ids::KIND, KIND),
+        (ids::NEXT, NEXT),
+        (ids::CREATE, CREATE),
+        (ids::BUILD_ANOTHER, BUILD_ANOTHER),
+        (ids::OPEN_INSPECT, OPEN_INSPECT),
+        (ids::PICK_IMAGE, PICK_IMAGE),
+        (ids::CD_LAYOUT, CD_LAYOUT),
+        (ids::CD_AUTO_SIZE, CD_AUTO_SIZE),
+        (ids::CD_FOLDER, CD_FOLDER),
+        ("build_disk.done", DONE),
+    ];
 }
 
 /// The text every view shows beside a control.
@@ -560,13 +588,13 @@ pub enum BuildDiskAction {
     /// A row formatted with `fs`, or `None` for empty.
     SetRowFs {
         row: usize,
-        fs: Option<FsKind>,
+        fs: Option<FsChoice>,
     },
     SetRowOptions {
         row: usize,
         opts: FormatOptions,
     },
-    SetVolumeFs(FsKind),
+    SetVolumeFs(FsChoice),
     SetVolumeOptions(FormatOptions),
     /// The preset and its fields, edited as one.
     SetPreset(PresetView),
@@ -596,6 +624,11 @@ pub enum BuildDiskAction {
     Picked {
         purpose: &'static str,
         path: Option<PathBuf>,
+    },
+    /// The answer to a `Choose`.
+    Chose {
+        purpose: &'static str,
+        choice: usize,
     },
     Create,
     Cancel,
@@ -854,6 +887,17 @@ impl BuildDiskController {
         self.volume.kind
     }
 
+    /// A row's entry in [`FsChoice::all`], `None` when it is not formatted.
+    pub fn row_fs_choice(&self, row: usize) -> Option<FsChoice> {
+        let f = self.builder.rows.get(row)?.format.as_ref()?;
+        Some(FsChoice::of(f.kind, &f.opts))
+    }
+
+    /// The volume's entry in [`FsChoice::all`].
+    pub fn volume_fs_choice(&self) -> FsChoice {
+        FsChoice::of(self.volume.kind, &self.volume.opts)
+    }
+
     pub fn preset(&self) -> &PresetView {
         &self.preset
     }
@@ -938,9 +982,9 @@ impl BuildDiskController {
             .is_some_and(|r| r.donor_part.is_some())
     }
 
-    /// The filesystems a volume or row can be formatted with, in a stable order.
-    pub fn filesystems(&self) -> &'static [FsKind] {
-        &FsKind::ALL
+    /// The filesystems a volume or row can be formatted with, in a stable order (NTFS per version).
+    pub fn filesystems(&self) -> Vec<FsChoice> {
+        FsChoice::all()
     }
 
     /// The source image of a row is being measured.
@@ -1875,7 +1919,17 @@ impl Controller for BuildDiskController {
             BuildDiskAction::PickOutputImage => return self.pick_output(),
             BuildDiskAction::SetSize(t) => self.size_text = t,
             BuildDiskAction::Table(a) => return self.table_edit(a),
-            BuildDiskAction::SetRowFs { row, fs } => self.set_row_fs(row, fs),
+            BuildDiskAction::SetRowFs { row, fs } => {
+                self.set_row_fs(row, fs.map(|c| c.kind));
+                let format = self
+                    .builder
+                    .rows
+                    .get_mut(row)
+                    .and_then(|r| r.format.as_mut());
+                if let (Some(f), Some(c)) = (format, fs) {
+                    c.apply_to(f);
+                }
+            }
             BuildDiskAction::SetRowOptions { row, opts } => {
                 if let Some(f) = self
                     .builder
@@ -1886,13 +1940,16 @@ impl Controller for BuildDiskController {
                     f.opts = opts;
                 }
             }
-            BuildDiskAction::SetVolumeFs(fs) => {
-                let label = typed_label(&self.volume, fs);
-                self.volume = RowFormat::new(fs);
+            BuildDiskAction::SetVolumeFs(choice) => {
+                let label = typed_label(&self.volume, choice.kind);
+                self.volume = RowFormat::new(choice.kind);
                 if let Some(label) = label {
                     self.volume.opts.label = label;
                 }
+                choice.apply_to(&mut self.volume);
             }
+            // Build Disk asks nothing with a Choose today; the answer has nowhere to go.
+            BuildDiskAction::Chose { .. } => {}
             BuildDiskAction::SetVolumeOptions(opts) => self.volume.opts = opts,
             BuildDiskAction::SetPreset(p) => self.preset = p,
             BuildDiskAction::SetCd(c) => {

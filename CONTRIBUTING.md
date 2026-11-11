@@ -26,10 +26,11 @@ The first `cargo build` installs a git pre-commit hook that runs `cargo fmt --al
 ### Build / run / test
 
 ```bash
-cargo build                    # Debug
+cargo build                    # Debug: rb-cli, no GUI deps
 cargo build --release          # Release
-cargo run                      # Run (debug)
-cargo run --release            # Run (release)
+cargo build --features gui     # Also the egui app (`gui` is not in `default`)
+cargo run --features gui       # Run the egui app (debug)
+cargo run --release --features gui  # Run the egui app (release)
 
 cargo test                     # All tests
 cargo test --lib               # Unit tests only

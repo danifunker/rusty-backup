@@ -33,8 +33,8 @@ use crate::controller::app::{RateTracker, RecentHandle, RecentMode};
 #[cfg(feature = "chd")]
 use crate::controller::optical::ChdProfile;
 use crate::controller::optical::{
-    purpose, ChdChoice, DiscSource, HostRequest, NoNotify, OpticalAction, OpticalController,
-    SourceMode, Task, CHD_NOT_BUILT,
+    hints, labels, purpose, ChdChoice, DiscSource, HostRequest, NoNotify, OpticalAction,
+    OpticalController, SourceMode, Task, CHD_NOT_BUILT,
 };
 use crate::controller::{Controller as _, Effect, PickSpec};
 
@@ -51,6 +51,8 @@ pub(super) enum ORow {
     Output,
     EjectAfter,
     Start,
+    /// An image's format changes in the Convert tab: this row hands it over.
+    Convert,
 }
 
 /// What a confirmed picker answers.
@@ -265,7 +267,7 @@ impl OpticalState {
         if !rows.contains(&self.focus) {
             self.focus = match self.focus {
                 ORow::Drive | ORow::Image => rows[1],
-                _ => ORow::Format,
+                _ => rows[2],
             };
         }
     }
@@ -292,6 +294,10 @@ impl OpticalState {
             SourceMode::PhysicalDrive => ORow::Drive,
             SourceMode::ImageFile => ORow::Image,
         });
+        if self.ctl.task() == Task::Convert {
+            rows.push(ORow::Convert);
+            return rows;
+        }
         rows.push(ORow::Format);
         if self.chd_shown() {
             rows.push(ORow::ChdMode);
@@ -360,7 +366,7 @@ impl OpticalState {
                 let on = !self.ctl.eject_after();
                 self.act(OpticalAction::SetEjectAfter(on));
             }
-            ORow::Image | ORow::Output | ORow::Start => return false,
+            ORow::Image | ORow::Output | ORow::Start | ORow::Convert => return false,
         }
         true
     }
@@ -424,8 +430,23 @@ impl OpticalState {
     }
 
     /// Press Start: the CHD options first, then the controller's own refusal.
+    /// Give the open image to the Convert tab, where a disc's format changes.
+    fn hand_to_convert(&mut self) {
+        match self.ctl.convert_source() {
+            Some(path) => self.convert = Some(path),
+            None if self.ctl.task() == Task::Convert => {
+                self.note = Some("Choose a disc image first.".into())
+            }
+            None => self.note = Some("Convert takes a disc image; a drive is ripped here.".into()),
+        }
+    }
+
     pub(super) fn start(&mut self) {
         self.note = None;
+        if self.ctl.task() == Task::Convert {
+            self.note = Some(hints::CONVERT_MOVED.to_string());
+            return;
+        }
         let chd = match self.chd_choice() {
             Ok(c) => c,
             Err(e) => {
@@ -528,6 +549,7 @@ impl OpticalState {
                 ORow::Image => self.act(OpticalAction::PickImage),
                 ORow::Output => self.act(OpticalAction::PickOutput),
                 ORow::Start => self.start(),
+                ORow::Convert => self.hand_to_convert(),
                 ORow::Source
                 | ORow::Drive
                 | ORow::Format
@@ -575,12 +597,7 @@ impl OpticalState {
                 }
             }
             KeyCode::Char('c') => self.act(OpticalAction::CloseDisc),
-            KeyCode::Char('C') => match self.ctl.convert_source() {
-                Some(path) => self.convert = Some(path),
-                None => {
-                    self.note = Some("Convert takes a disc image; a drive is ripped here.".into())
-                }
-            },
+            KeyCode::Char('C') => self.hand_to_convert(),
             KeyCode::Char('i') => {
                 if self.ctl.can_chd_info() {
                     self.act(OpticalAction::ChdInfo);
@@ -969,6 +986,24 @@ impl App {
                     }
                     lines.push(Line::from(spans));
                 }
+                ORow::Convert => {
+                    self.optical_disc_lines(o, lines);
+                    lines.push(Line::raw(""));
+                    if focused {
+                        focus_line = lines.len();
+                    }
+                    let style = if focused {
+                        pal.accent()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        pal.accent()
+                    };
+                    let marker = if focused { "> " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{marker}[ {} ]", labels::CONVERT), style),
+                        Span::styled(format!("   {}", hints::CONVERT_MOVED), pal.dim()),
+                    ]));
+                }
             }
         }
         if let Some(note) = &o.note {
@@ -1208,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn the_optical_screen_converts_an_image_to_bin_cue() {
+    fn the_optical_screen_hands_an_image_to_the_convert_tab() {
         let dir = tempfile::tempdir().unwrap();
         let iso = hybrid(dir.path());
         let mut app = optical_app();
@@ -1219,60 +1254,35 @@ mod tests {
         assert_eq!(ctl.disc().map(|d| d.format).as_deref(), Some("ISO image"));
         let recent = app.shell.recent(RecentMode::Optical);
         assert_eq!(recent, [iso.display().to_string()]);
-        let own = "The image is already ISO; choose another output format.";
-        assert_eq!(ctl.start_refusal().as_deref(), Some(own));
+        assert_eq!(o(&app).rows(), [ORow::Source, ORow::Image, ORow::Convert]);
 
-        // Start with the refused format only says why.
+        // Start does not convert here: an image's format changes in the Convert tab.
         press(&mut app, KeyCode::Char('s'));
-        assert_eq!(
-            o(&app).note.as_deref(),
-            Some(format!("Cannot start: {own}").as_str())
-        );
-        focus_to(&mut app, ORow::Format);
-        press(&mut app, KeyCode::Right);
-        assert_eq!(o(&app).ctl.output_format(), OutputFormat::BinCue);
-        focus_to(&mut app, ORow::Output);
-        let cue = dir.path().join("out.cue");
-        typing(&mut app, cue.display().to_string().as_str());
-        assert_eq!(o(&app).ctl.output(), Some(cue.as_path()));
-        focus_to(&mut app, ORow::Start);
+        assert_eq!(o(&app).note.as_deref(), Some(hints::CONVERT_MOVED));
+        assert!(app.progress.is_none());
+        focus_to(&mut app, ORow::Convert);
         press(&mut app, KeyCode::Enter);
-        assert!(app.progress.is_some(), "the bar shows while it runs");
         settle(&mut app);
-        let (text, err) = o(&app).result.clone().expect("a result");
-        assert_eq!((text.as_str(), err), ("Conversion complete.", false));
-        let bin = std::fs::metadata(cue.with_extension("bin")).unwrap().len();
-        assert!(bin > 0 && bin % 2352 == 0, "{bin}");
-        let done = app
-            .progress
-            .as_ref()
-            .and_then(|p| p.shared.lock().ok().map(|s| s.done));
-        assert_eq!(done, Some(true));
-        press(&mut app, KeyCode::Esc);
-        assert!(app.progress.is_none(), "Esc closes the finished bar");
-        assert!(app.optical.is_some() && !app.should_quit);
+        assert!(app.current() == TabId::Convert);
+        let c = app.convert.as_ref().expect("the Convert screen");
+        assert_eq!(c.ctl.source(), Some(iso.as_path()));
     }
 
     #[cfg(feature = "chd")]
     #[test]
-    fn the_optical_screen_converts_to_chd_and_shows_chd_info() {
+    fn the_optical_screen_shows_chd_info() {
         let dir = tempfile::tempdir().unwrap();
         let iso = hybrid(dir.path());
         let mut app = optical_app();
         open_image(&mut app, iso.as_path());
-        focus_to(&mut app, ORow::Format);
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
-        assert_eq!(o(&app).ctl.output_format(), OutputFormat::Chd);
-        assert!(o(&app).rows().contains(&ORow::ChdMode));
-        focus_to(&mut app, ORow::Output);
+        // The CHD comes from the controller's own convert, which no screen reaches any more.
         let chd = dir.path().join("out.chd");
-        typing(&mut app, chd.display().to_string().as_str());
-        focus_to(&mut app, ORow::Start);
-        press(&mut app, KeyCode::Enter);
+        let st = app.optical.as_mut().expect("the Optical screen");
+        st.act(OpticalAction::SetOutputFormat(OutputFormat::Chd));
+        st.set_output(chd.display().to_string());
+        let choice = st.chd_choice().expect("CHD defaults");
+        st.act(OpticalAction::Start(choice));
         settle(&mut app);
-        let (text, err) = o(&app).result.clone().expect("a result");
-        assert_eq!((text.as_str(), err), ("Conversion complete.", false));
         assert!(std::fs::metadata(&chd).unwrap().len() > 0);
 
         app.optical_open_image(chd.clone());
@@ -1564,7 +1574,7 @@ mod tests {
         open_image(&mut app, iso.as_path());
         let text = screen(&app);
         assert!(text.contains("Format: ISO image"), "{text}");
-        assert!(text.contains("Start Convert"), "{text}");
+        assert!(text.contains(labels::CONVERT), "{text}");
         press(&mut app, KeyCode::Char('?'));
         assert!(screen(&app).contains("Browse Contents"));
         press(&mut app, KeyCode::Esc);

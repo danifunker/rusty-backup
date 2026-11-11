@@ -140,8 +140,11 @@ impl BackupController {
                 .devices
                 .iter()
                 .map(|d| {
-                    let mut label =
-                        format!("{} ({})", d.path, disk_core::display::format_size(d.size_bytes));
+                    let mut label = format!(
+                        "{} ({})",
+                        d.path,
+                        disk_core::display::format_size(d.size_bytes)
+                    );
                     if !d.media.is_empty() {
                         label.push_str(format!(" - {}", d.media).as_str());
                     }
@@ -181,7 +184,11 @@ impl BackupController {
         if a.is_empty() {
             return;
         }
-        let addr = if a.contains(':') { a } else { format!("{a}:7341") };
+        let addr = if a.contains(':') {
+            a
+        } else {
+            format!("{a}:7341")
+        };
         self.remote.error = None;
         self.remote.addr = Some(addr.clone());
         self.remote.job = Some(self.spawn("Connecting", move |_| {
@@ -216,8 +223,7 @@ impl BackupController {
         self.remote.error = None;
         self.remote.job = Some(self.spawn("Loading the remote drive", move |_| {
             // Backup reads a physical drive on the daemon.
-            let info =
-                crate::model::backup_remote::load_remote_source(conn, path.as_str(), true)?;
+            let info = crate::model::backup_remote::load_remote_source(conn, path.as_str(), true)?;
             Ok(Outcome::Loaded(info))
         }));
     }
@@ -245,12 +251,7 @@ impl BackupController {
 
     #[cfg(feature = "remote")]
     pub(super) fn poll_remote(&mut self) {
-        let Some(done) = self
-            .remote
-            .job
-            .as_ref()
-            .and_then(super::source::finished)
-        else {
+        let Some(done) = self.remote.job.as_ref().and_then(super::source::finished) else {
             return;
         };
         self.remote.job = None;

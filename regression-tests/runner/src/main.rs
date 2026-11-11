@@ -12,6 +12,8 @@ mod consolidate;
 mod envelope;
 mod exec;
 mod fixtures;
+mod flow;
+mod gtk;
 mod gitinfo;
 mod inventory;
 mod known;
@@ -23,6 +25,8 @@ mod plan;
 mod produce;
 mod registry;
 mod report;
+mod tui;
+mod uia;
 mod verify;
 
 use report::{Bundle, CaseResult, RunIdentity, Verdict};
@@ -37,6 +41,8 @@ struct Args {
     command: Command,
     cases_dir: PathBuf,
     rb_cli: PathBuf,
+    gtk: PathBuf,
+    win32: PathBuf,
     identify: bool,
     detect: bool,
     set_oracle: Option<String>,
@@ -49,6 +55,10 @@ struct Args {
     report_root: PathBuf,
     tiers: BTreeSet<u8>,
     filter: Option<String>,
+    level: Option<String>,
+    areas: Vec<String>,
+    fs: Vec<String>,
+    shells: Vec<String>,
     allow_hardware: bool,
     keep_scratch: bool,
     require_clean: bool,
@@ -82,6 +92,8 @@ enum Command {
     Verify,
     /// Merge results from many hosts/runs and report how far a regression got.
     Consolidate(String),
+    /// Start the TUI, press keys, print the screen: how flows get written.
+    TuiShot(Vec<String>),
     Help,
 }
 
@@ -131,6 +143,12 @@ fn parse_args() -> Result<Args, String> {
         command: Command::Help,
         cases_dir: base.join("cases"),
         rb_cli: default_rb_cli(&base),
+        gtk: base
+            .join("..")
+            .join("frontends/gtk4/target/release/rusty-backup-gtk"),
+        win32: base
+            .join("..")
+            .join("frontends/win32/target/release/rusty-backup-win32.exe"),
         identify: false,
         detect: false,
         set_oracle: None,
@@ -143,6 +161,10 @@ fn parse_args() -> Result<Args, String> {
         report_root: base.join("runs"),
         tiers: BTreeSet::new(),
         filter: None,
+        level: None,
+        areas: Vec::new(),
+        fs: Vec::new(),
+        shells: Vec::new(),
         allow_hardware: false,
         keep_scratch: false,
         require_clean: false,
@@ -181,6 +203,10 @@ fn parse_args() -> Result<Args, String> {
                 args.command = Command::Consolidate(root);
             }
             "export" => args.command = Command::Export,
+            "tui-shot" => {
+                args.command = Command::TuiShot(raw[i + 1..].to_vec());
+                break;
+            }
             "query" => {
                 let q = raw.get(i + 1).cloned().unwrap_or_default();
                 args.command = Command::Query(q);
@@ -206,6 +232,14 @@ fn parse_args() -> Result<Args, String> {
                 match a {
                     "--cases" => {
                         args.cases_dir = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--gtk" => {
+                        args.gtk = PathBuf::from(value()?);
+                        i += 1;
+                    }
+                    "--win32" => {
+                        args.win32 = PathBuf::from(value()?);
                         i += 1;
                     }
                     "--rb-cli" => {
@@ -252,6 +286,26 @@ fn parse_args() -> Result<Args, String> {
                         args.db = Some(PathBuf::from(value()?));
                         i += 1;
                     }
+                    "--level" => {
+                        let v = value()?;
+                        if v != "smoke" && v != "full" {
+                            return Err(format!("--level takes smoke or full, not {}", v));
+                        }
+                        args.level = Some(v);
+                        i += 1;
+                    }
+                    "--area" => {
+                        args.areas.extend(value()?.split(',').map(str::to_string));
+                        i += 1;
+                    }
+                    "--fs" => {
+                        args.fs.extend(value()?.split(',').map(str::to_string));
+                        i += 1;
+                    }
+                    "--shell" => {
+                        args.shells.extend(value()?.split(',').map(str::to_string));
+                        i += 1;
+                    }
                     "--tiers" => {
                         args.tiers = parse_tiers(&value()?)?;
                         i += 1;
@@ -267,6 +321,8 @@ fn parse_args() -> Result<Args, String> {
     // that becomes a program path or is handed to a subprocess must be
     // absolute before it gets there. See exec::absolutise.
     args.rb_cli = exec::absolutise(&args.rb_cli);
+    args.gtk = exec::absolutise(&args.gtk);
+    args.win32 = exec::absolutise(&args.win32);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -327,6 +383,9 @@ COMMANDS:
     consolidate  Merge results from many hosts/runs; reports how far a regression got
     export       Write the normalised JSON snapshot of the registry
     query        Ask the registry a named question
+    tui-shot     Start `rb-cli tui`, run the ops that follow (key names,
+                 tab:NAME, type:TEXT, fill:TEXT, wait:TEXT) and print the screen after each;
+                 put --rb-cli before it. See FLOWS.md
 
 OPTIONS:
     --cases <DIR>          Case manifests           [default: regression-tests/cases]
@@ -335,6 +394,8 @@ OPTIONS:
                            print it with its version and refuse to start if it
                            is missing; they warn if it is not a release build or
                            is older than the sources in the tree.
+    --gtk <PATH>           GTK shell the gtk flows drive
+                           [default: <repo>/frontends/gtk4/target/release/rusty-backup-gtk]
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --sync                 (fixtures) copy the corpus from local.toml's
                            `corpus_source` into the fixture root first. Runs
@@ -353,6 +414,10 @@ OPTIONS:
                            verify writes <DIR>/<os>
     --tiers <SPEC>         e.g. 0-6, or 0,1,5       [default: all]
     --filter <SUBSTR>      Only cases whose ID contains SUBSTR
+    --level <smoke|full>   smoke: only cases tagged level = "smoke" [default: full]
+    --area <A[,B]>         Only cases tagged with one of these areas (FLOWS.md)
+    --fs <FS[,FS]>         Only matrix instances for these filesystems
+    --shell <SH[,SH]>      Only flow instances for these front-ends (tui)
     --allow-hardware       Permit cases that write to physical devices
     --keep-scratch         Keep scratch dirs for passing cases too
     --require-clean        Refuse to run on a dirty tree, so results can be
@@ -391,6 +456,7 @@ fn main() {
         Command::Parity(ref root) => cmd_parity(&args, root),
         Command::Verify => cmd_verify(&args),
         Command::Consolidate(ref root) => cmd_consolidate(&args, root),
+        Command::TuiShot(ref ops) => flow::cmd_tui_shot(&args.rb_cli, &args.scratch_root, ops),
     };
     std::process::exit(code);
 }
@@ -1078,7 +1144,7 @@ fn cmd_list(args: &Args) -> i32 {
     for (_, m) in &manifests {
         for c in &m.cases {
             let tier = c.tier.unwrap_or(m.meta.tier);
-            if !selected(args, &c.id, tier) {
+            if !selected(args, c, tier) {
                 continue;
             }
             if !c.platforms.is_empty() && !c.platforms.iter().any(|p| p == platform) {
@@ -1091,20 +1157,41 @@ fn cmd_list(args: &Args) -> i32 {
                 c.id,
                 c.description.as_deref().unwrap_or("")
             );
+            if c.level.is_some() || !c.area.is_empty() || !c.capabilities.is_empty() {
+                println!(
+                    "      level={} area={} capabilities={}",
+                    c.level.as_deref().unwrap_or("full"),
+                    c.area.join(","),
+                    c.capabilities.join(",")
+                );
+            }
         }
     }
     println!("\n{} case(s) selected on platform {}", n, platform);
     0
 }
 
-fn selected(args: &Args, id: &str, tier: u8) -> bool {
+fn selected(args: &Args, case: &manifest::Case, tier: u8) -> bool {
     if !args.tiers.is_empty() && !args.tiers.contains(&tier) {
         return false;
     }
     if let Some(f) = &args.filter {
-        if !id.contains(f.as_str()) {
+        if !case.id.contains(f.as_str()) {
             return false;
         }
+    }
+    // `--level smoke` keeps only smoke cases; `full` (the default) keeps everything.
+    if args.level.as_deref() == Some("smoke") && case.level.as_deref() != Some("smoke") {
+        return false;
+    }
+    if !args.areas.is_empty() && !case.area.iter().any(|a| args.areas.contains(a)) {
+        return false;
+    }
+    if !args.fs.is_empty() && !case.fs_value.as_ref().is_some_and(|f| args.fs.contains(f)) {
+        return false;
+    }
+    if !args.shells.is_empty() && !case.shell.as_ref().is_some_and(|s| args.shells.contains(s)) {
+        return false;
     }
     true
 }
@@ -1245,7 +1332,7 @@ fn cmd_run(args: &Args) -> i32 {
     for (_, m) in &manifests {
         for case in &m.cases {
             let tier = case.tier.unwrap_or(m.meta.tier);
-            if !selected(args, &case.id, tier) {
+            if !selected(args, case, tier) {
                 continue;
             }
             let mut result = run_case(
@@ -1452,6 +1539,12 @@ fn run_case(
         None
     };
 
+    // A free local port for a case's daemon; `{port}` in any step names it.
+    let port_s = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port().to_string())
+        .unwrap_or_else(|_| "17341".to_string());
+    let mut daemons = Background(Vec::new());
     let scratch_s = scratch.display().to_string();
     let fixture_s = fixture_path.as_ref().map(|p| p.display().to_string());
     let copy_s = fixture_copy.as_ref().map(|p| p.display().to_string());
@@ -1459,6 +1552,7 @@ fn run_case(
 
     let resolve = move |raw: &str| -> String {
         let mut s = raw.replace("{scratch}", &scratch_s);
+        s = s.replace("{port}", &port_s);
         s = s.replace("{cases}", &cases_s);
         if let Some(f) = &fixture_s {
             s = s.replace("{fixture}", f);
@@ -1471,8 +1565,77 @@ fn run_case(
 
     let timeout = Duration::from_millis(case.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
+    let controls = if case.shell.is_some() {
+        match flow::load_controls(&regression_dir().join("drivers").join("labels.toml")) {
+            Ok(mut c) => {
+                flow::add_controller_labels(&mut c, &args.rb_cli);
+                c
+            }
+            Err(e) => {
+                result.verdict = Verdict::Error;
+                result.skip_reason = Some(e);
+                result.duration_ms = started.elapsed().as_millis();
+                return result;
+            }
+        }
+    } else {
+        flow::Controls::new()
+    };
+    let mut ui = flow::UiSession::new(
+        case.shell.clone(),
+        &args.rb_cli,
+        &args.gtk,
+        &args.win32,
+        &scratch,
+        controls,
+    );
     for (idx, step) in steps.iter().enumerate() {
+        if !step.ui.is_empty() {
+            match ui.run(&step.ui, &resolve) {
+                Ok(()) => continue,
+                Err(flow::UiError::Skip(v, why)) => {
+                    skip(&mut result, v, why, started);
+                    return result;
+                }
+                Err(flow::UiError::Fail(failure, screen)) => {
+                    result.verdict = Verdict::Fail;
+                    result.failed_step = Some(idx);
+                    let ops: Vec<String> = step.ui.iter().map(flow::describe).collect();
+                    let failures = vec![failure];
+                    let _ = bundle.write_failure(
+                        &case.id,
+                        &args.rb_cli,
+                        &ops,
+                        &scratch,
+                        None,
+                        None,
+                        &screen,
+                        &ui.transcript(),
+                        &failures,
+                        case.fixture.as_deref().zip(fixture_path.as_deref()),
+                    );
+                    result.failed_assertions = failures;
+                    result.duration_ms = started.elapsed().as_millis();
+                    return result;
+                }
+            }
+        }
         let args_resolved: Vec<String> = step.args.iter().map(|a| resolve(a)).collect();
+
+        if step.background {
+            if let Err(e) = daemons.start(&args.rb_cli, &args_resolved, &scratch, idx) {
+                result.verdict = Verdict::Error;
+                result.failed_step = Some(idx);
+                result.skip_reason = Some(e);
+                result.duration_ms = started.elapsed().as_millis();
+                return result;
+            }
+            if step.args.iter().any(|a| a.contains("{port}")) {
+                let port: u16 = resolve("{port}").parse().unwrap_or(0);
+                daemons.wait_port(port, Duration::from_secs(15));
+            }
+            continue;
+        }
 
         let out = match exec::run_with_env(&args.rb_cli, &args_resolved, &scratch, timeout, &case.env) {
             Ok(o) => o,
@@ -1514,6 +1677,46 @@ fn run_case(
         let _ = fs::remove_dir_all(&scratch);
     }
     result
+}
+
+/// Processes a case started with `background = true`; killed when the case ends, however it ends.
+struct Background(Vec<std::process::Child>);
+
+impl Background {
+    fn start(&mut self, rb_cli: &Path, args: &[String], cwd: &Path, idx: usize) -> Result<(), String> {
+        let log = fs::File::create(cwd.join(format!("background-{}.log", idx)))
+            .map_err(|e| format!("background log: {}", e))?;
+        let err = log.try_clone().map_err(|e| e.to_string())?;
+        let child = std::process::Command::new(rb_cli)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(log)
+            .stderr(err)
+            .spawn()
+            .map_err(|e| format!("could not start {} in the background: {}", rb_cli.display(), e))?;
+        self.0.push(child);
+        Ok(())
+    }
+
+    fn wait_port(&self, port: u16, limit: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 /// The binary under test, as an absolute path into the repo's **release**

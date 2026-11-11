@@ -7,7 +7,7 @@ use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::build_disk::{
     format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdOptionRow,
-    CdSidecars, CdView, DiskKind, FsKind, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
+    CdSidecars, CdView, DiskKind, FsChoice, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
 };
 use rusty_backup::controller::partition_edit::{BuildAction, BuildView};
 
@@ -29,7 +29,7 @@ pub struct DiskShown {
     cd_options: Vec<CdOptionRow>,
     cd_sidecars: CdSidecars,
     cd_sidecars_unavailable: Option<&'static str>,
-    volume_fs: FsKind,
+    volume_fs: FsChoice,
     range: Option<String>,
     view: BuildView,
     donor: Option<String>,
@@ -50,7 +50,7 @@ impl DiskShown {
             cd_options: ctrl.cd_options(),
             cd_sidecars: ctrl.cd_sidecars(),
             cd_sidecars_unavailable: ctrl.cd_sidecars_unavailable(),
-            volume_fs: ctrl.volume_fs(),
+            volume_fs: ctrl.volume_fs_choice(),
             range: ctrl.volume_size_range(),
             view: ctrl.table_view(),
             donor: ctrl.donor().map(|(p, t)| format!("{t}: {}", p.display())),
@@ -404,11 +404,14 @@ impl DiskStep {
         let cd = CdRows::build(send);
 
         let volume_group = group("Volume");
-        let labels: Vec<&str> = FsKind::ALL.iter().map(|k| k.display_name()).collect();
+        let names: Vec<String> = FsChoice::all().iter().map(|k| k.label()).collect();
+        let labels: Vec<&str> = names.iter().map(String::as_str).collect();
         let volume = combo("Filesystem", ids::VOLUME_FS, &labels);
+        volume.set_expression(Some(crate::form::string_search()));
+        volume.set_enable_search(true);
         let s = send.clone();
         volume.connect_selected_notify(move |r| {
-            if let Some(k) = FsKind::ALL.get(r.selected() as usize) {
+            if let Some(k) = FsChoice::all().get(r.selected() as usize) {
                 s(BuildDiskAction::SetVolumeFs(*k));
             }
         });
@@ -565,7 +568,7 @@ impl DiskStep {
         self.volume_group.set_visible(s.kind == DiskKind::Volume);
 
         self.show_table(&s);
-        let at = FsKind::ALL.iter().position(|k| *k == s.volume_fs);
+        let at = s.volume_fs.index_in(&FsChoice::all());
         set_combo(&self.volume, at.unwrap_or(0) as u32);
         let fixed = s.range.is_none();
         set_line(&self.fixed, fixed.then_some(hints::FIXED_SIZE));

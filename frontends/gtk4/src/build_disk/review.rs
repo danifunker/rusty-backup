@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::app::Snapshot;
-use rusty_backup::controller::build_disk::{ids, BuildDiskAction, BuildDiskController, DiskKind};
+use rusty_backup::controller::build_disk::{ids, labels, BuildDiskAction, BuildDiskController, DiskKind};
 
 use super::ActionFn;
 use crate::form::{button, group, line, set_entry, set_line, Notes, Tone};
@@ -176,7 +176,7 @@ impl BuildStep {
         let s = send.clone();
         let jobs = JobList::new(ids::CANCEL, Rc::new(move || s(BuildDiskAction::Cancel)));
         let outcome = Notes::new();
-        let open = button("Open in Inspect", ids::OPEN_INSPECT);
+        let open = button(labels::OPEN_INSPECT, ids::OPEN_INSPECT);
         let built: Rc<RefCell<Option<PathBuf>>> = Default::default();
         let held = built.clone();
         open.connect_clicked(move |_| {

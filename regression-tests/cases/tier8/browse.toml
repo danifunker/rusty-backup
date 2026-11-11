@@ -1,0 +1,127 @@
+# Tier 8: the Inspect browse view, end to end through a front-end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.browse"
+description = "Browse a volume from Inspect, extract it through the UI, and compare with the file put in."
+
+[[case]]
+id = "flow.browse.inspect-extract-all"
+description = "Open a classic HFS floppy on Inspect, browse its partition, Extract All into a host folder, and compare the file with the one rb-cli put in"
+level = "smoke"
+area = ["inspect", "browse"]
+shells = ["gtk", "win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.extract"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "hfs", "--size", "1440K", "{scratch}/h.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/h.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# Extract All writes the volume into a folder named after its label.
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/h.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "HFS" },
+  { activate = "inspect.row.browse" },
+  { wait = "HELLO.TXT" },
+  { pick = "{scratch}" },
+  { activate = "browse.extract_all" },
+  { wait_file = "{scratch}/rusty-backup/HELLO.TXT", timeout_ms = 30000 },
+  { activate = "browse.close" },
+  # Back on the partition table: Win32's "Calc min" column, GTK's "Min Size".
+  { wait = "Calc min || Min Size" },
+]
+
+[[case.step]]
+args = ["fsck", "{scratch}/h.img", "--format", "json"]
+expect_exit = 0
+fsck_clean = true
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/rusty-backup/HELLO.TXT"]]
+
+[[case]]
+id = "flow.browse.inspect-new-folder"
+description = "Browse a FAT floppy from Inspect, turn on Edit Mode, stage a new folder through the name prompt, apply it, and list the image with rb-cli"
+level = "smoke"
+area = ["inspect", "browse", "files"]
+shells = ["gtk", "win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.new-folder"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/f.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "Filesystem Browser" },
+  { activate = "browse.edit_mode" },
+  { wait = "Edit Mode ON" },
+  { activate = "browse.new_folder" },
+  { focus = "prompt.text" },
+  { fill = "NEWDIR" },
+  { activate = "prompt.ok", only = "win32" },
+  # GTK's prompt buttons carry the prompt's own word, not an id.
+  { activate = "Create", only = "gtk" },
+  { wait = "Apply Edits (1)" },
+  { activate = "browse.apply" },
+  { wait_gone = "Apply Edits (1)" },
+]
+
+[[case.step]]
+args = ["ls", "{scratch}/f.img", "/"]
+expect_exit = 0
+stdout_contains = ["NEWDIR"]
+
+[[case]]
+id = "flow.browse.inspect-edit-text"
+description = "Browse a FAT floppy from Inspect, open its only file in the text editor, replace the text, save and apply, and compare the file rb-cli reads back"
+level = "smoke"
+area = ["inspect", "browse", "files"]
+shells = ["gtk", "win32"]
+capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.edit-text"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "{scratch}/t.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/t.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+# The only file is under the cursor when the listing opens.
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/t.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "HELLO.TXT" },
+  { activate = "browse.edit_mode" },
+  { wait = "Edit Mode ON" },
+  { activate = "browse.edit_text" },
+  { focus = "window.field.editortext" },
+  { fill = "edited by a flow" },
+  { activate = "window.save" },
+  { wait = "Apply Edits (1)" },
+  { activate = "browse.apply" },
+  { wait_gone = "Apply Edits (1)" },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/t.img", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/edited.txt", "{scratch}/back.txt"]]

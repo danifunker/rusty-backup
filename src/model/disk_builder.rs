@@ -173,10 +173,18 @@ impl RowFormat {
 
     /// The filesystem and, when it has one, its label: `FAT12 / FAT16 / FAT32 "DOS"`.
     pub fn describe(&self) -> String {
+        // The NTFS version decides which Windows can mount it, so the review names it.
+        let name = match self.kind {
+            FsKind::Ntfs => format!(
+                "NTFS {}",
+                self.opts.ntfs_version.unwrap_or_default().label()
+            ),
+            _ => self.kind.display_name().to_string(),
+        };
         if self.kind.caps().label_max == 0 {
-            self.kind.display_name().to_string()
+            name
         } else {
-            format!("{} {:?}", self.kind.display_name(), self.opts.label)
+            format!("{name} {:?}", self.opts.label)
         }
     }
 
@@ -265,6 +273,7 @@ pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64) -> Option<String> 
         (TableKind::Rdb, F::Sfs) => "SFS\\0",
         (TableKind::Rdb, F::Affs) => "DOS\\3",
         (TableKind::Next, F::Ufs43) => "4.3BSD",
+        (TableKind::Bsd, F::Ufs) => "4.2BSD",
         (TableKind::Atari, F::Fat) if size > 16 * 1024 * 1024 => "BGM",
         (TableKind::Atari, F::Fat) => "GEM",
         _ => return None,
