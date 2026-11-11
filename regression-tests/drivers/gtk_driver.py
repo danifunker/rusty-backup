@@ -39,8 +39,6 @@ PICKS = ""
 APP = None
 WINDOW = ""
 CURRENT = None
-# How the last `focus` found CURRENT, to find it again after the screen rebuilds it.
-REFIND = None
 
 
 class Fail(Exception):
@@ -367,10 +365,15 @@ def choose(n, value):
         if row is None:
             # A long list renders only the rows in view, and AT-SPI does not follow the focus
             # inside it, so try each depth: Home, Down k times, Enter, and read the value.
+            # A pick can rebuild the row (a new type), so find the control afresh by its place
+            # among the combos: GTK names a combo by its value, which each try changes.
+            combos = lambda: [c for c in nodes(APP) if role_of(c) in COMBO_ROLES and showing(c)]
+            place = next((i for i, c in enumerate(combos()) if c == n), None)
             for k in range(80):
                 if k:
-                    # A pick can rebuild the row (a new type), so find the control afresh.
-                    n = REFIND() if REFIND else n
+                    now = combos()
+                    if place is not None and place < len(now):
+                        n = now[place]
                     click(n)
                     time.sleep(0.5)
                 xdo("key", "Home")
@@ -514,17 +517,15 @@ def wait_until(pred, secs):
 
 
 def run(op):
-    global CURRENT, REFIND
+    global CURRENT
     kind, arg = op["op"], op.get("arg", "")
     limit = op.get("timeout_ms", 30000) / 1000.0
     if kind == "tab":
         activate(find(arg))
     elif kind == "focus":
-        def refind(arg=arg, nth=op.get("nth", 0)):
-            n = find(arg, nth=nth)
-            return field_beside(n) or n if role_of(n) == "label" else n
-        REFIND = refind
-        CURRENT = refind()
+        CURRENT = find(arg, nth=op.get("nth", 0))
+        if role_of(CURRENT) == "label":
+            CURRENT = field_beside(CURRENT) or CURRENT
         if role_of(CURRENT) in ROW_ROLES and row_of(CURRENT) is None:
             click(CURRENT)  # select a row in a list or table; popover rows are walked instead
     elif kind == "choose":
