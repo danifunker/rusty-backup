@@ -450,7 +450,7 @@ mod tests {
             ]),
             MARGIN,
         );
-        assert_eq!(n.min_height(), ROW + 3 * ROW + 0 + ROW + 3 * GAP + 2 * MARGIN);
+        assert_eq!(n.min_height(), ROW + 3 * ROW + ROW + 3 * GAP + 2 * MARGIN);
     }
 
     #[test]
