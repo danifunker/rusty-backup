@@ -26,7 +26,7 @@ of rb-cli pulls no GUI dependencies.
 |---|---|---|---|---|---|---|---|
 | Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli, Inno installer; the Win32 shell (`rusty-backup-win32.exe`, a preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
 | Windows Win32 shell (x64) | win32 | modern | checks only: clippy, layout tests and the UIA flows for `frontends/win32/`; the exe ships from the windows and windows-arm64 targets | Win32 (Phase 5) | stable | shell features | Windows 10 1809+; the UIA flows run in CI with Python and comtypes |
-| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli; the Win32 shell (preview) as its own ZIP | Win32 (Phase 5) | stable | default + gui | |
+| Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli; the Win32 shell (preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
 | macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default + gui | |
 | Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default + gui | |
 | Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default + gui | x64 builds in docker/linux-packages-focal.Dockerfile (Ubuntu 20.04, glibc 2.31) on the libchdman glibc 2.31 prebuilt; arm64 builds on the 24.04 runner and needs glibc 2.39 |

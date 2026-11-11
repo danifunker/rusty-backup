@@ -1431,6 +1431,35 @@ jobs:
           name: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}
           path: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
 
+      # The same per-user installers as x64/x86; /DArm64 makes them refuse non-ARM64 Windows.
+      - name: Build installers (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          $version = "${{ needs.generate-version.outputs.version }}"
+          $src = "$env:GITHUB_WORKSPACE\target\aarch64-pc-windows-msvc\release"
+          $assets = "$env:GITHUB_WORKSPACE\assets\icons"
+          $base = "Rusty-Backup-Setup-windows-arm64-$version"
+          & $iscc "/DArm64" "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+          $base = "Rusty-Backup-Win32-Setup-windows-arm64-$version"
+          & $iscc "/DArm64" "/DMyAppVersion=$version" "/DSourceDir=$src" "/DAssetsDir=$assets" "/F$base" installer\rusty-backup-win32.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc (Win32 shell) failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload Win32 shell installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-Win32-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\Rusty-Backup-Win32-Setup-windows-arm64-${{ needs.generate-version.outputs.version }}.exe
+
   # Full desktop GUI for Linux RISC-V 64 (riscv64gc-unknown-linux-gnu),
   # cross-compiled on x64. There is no GitHub-hosted riscv64 runner, so unlike
   # the x64/arm64 AppImage jobs this can't build/package natively: we cross-link
@@ -2992,13 +3021,14 @@ jobs:
             "Rusty-Backup-Setup-windows-x86-${VER}.exe" "Rusty-Backup-windows-x86-${VER}.zip" \
             "Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe" "Rusty-Backup-Win32-windows-x64-${VER}.zip" \
             "Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe" "Rusty-Backup-Win32-windows-x86-${VER}.zip" \
-            "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
+            "Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
             "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
             "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
             "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
             "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
             "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
-            "Rusty-Backup-windows-arm64-${VER}.zip" "Rusty-Backup-linux-riscv64-${VER}.tar.gz" \
+            "Rusty-Backup-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-windows-arm64-${VER}.zip" \
+            "Rusty-Backup-linux-riscv64-${VER}.tar.gz" \
             "Rusty-Backup-linux-riscv64-${VER}.deb" "Rusty-Backup-linux-riscv64-${VER}.rpm" \
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
@@ -3034,10 +3064,10 @@ jobs:
           |---|---|---|---|
           | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
           | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
-          | **Windows 11** | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
+          | **Windows 11** | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
           | **Windows 11 / 10**, native Win32 preview | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x64-${VER}.zip) | _(as above)_ |
           | **Windows 10**, native Win32 preview | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-x86-${VER}.zip) | _(as above)_ |
-          | **Windows 11**, native Win32 preview | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | _(as above)_ |
+          | **Windows 11**, native Win32 preview | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | _(as above)_ |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
           | **Linux** (Ubuntu 20.04+ / Debian 11+) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |

@@ -57,6 +57,10 @@ SolidCompression=yes
 WizardStyle=modern
 ; Required so the PATH change is broadcast (WM_SETTINGCHANGE) without a reboot.
 ChangesEnvironment=yes
+#ifdef Arm64
+; An ARM64 build runs only on ARM64 Windows; refuse to install it anywhere else.
+ArchitecturesAllowed=arm64
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
