@@ -436,6 +436,7 @@ Some formats simply have no small specimen and never will:
 | `fs.qnx2.icon4-st251.hd` | 57 MB | Real ICON 4.10.01 fileserver drive, 820 x 6 x 17 stored as 820 x 8 x 17: the head padding in every cylinder is the thing under test. |
 | `flux.scp.amiga-dd.floppy` | 26 MB | SCP flux of a whole floppy (`gw convert` of `fmt.adf.amiga-dd.floppy`); flux, not sectors, is the size. |
 | `flux.scp.icon-help410.floppy` | 26 MB | SCP flux of the whole ICON help diskette (`gw convert` of its KryoFlux set); same reason. |
+| `fs.ntfs.nt4-alpha-wks.hd` | 107 MB | Installed NT 4.0 Workstation (DEC Alpha) on NTFS 1.2: only real NT writes one, and it is the reference the NTFS 1.2 formatter is checked against (its root SD is `nt4_sd_root.bin`). |
 
 Anything added to the annex must carry a note like the above explaining why
 it could not be shrunk. The annex is a minimisation backlog, not a dumping
