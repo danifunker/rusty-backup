@@ -204,11 +204,36 @@ VK = {"Enter": 0x0D, "Tab": 0x09, "Esc": 0x1B, "Escape": 0x1B, "Up": 0x26, "Down
 VK.update({f"F{i}": 0x6F + i for i in range(1, 13)})
 
 
+def bring_forward(hwnd):
+    """Make `hwnd` the foreground window, or fail: keys sent while another window is in front land there.
+
+    Windows refuses SetForegroundWindow to a background process, so join the foreground thread's
+    input queue for the call, as a process allowed to switch would be.
+    """
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    me = kernel32.GetCurrentThreadId()
+    for _ in range(10):
+        front = user32.GetForegroundWindow()
+        if front == hwnd:
+            return
+        other = user32.GetWindowThreadProcessId(front, None)
+        joined = other and other != me and user32.AttachThreadInput(me, other, True)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        if joined:
+            user32.AttachThreadInput(me, other, False)
+        time.sleep(0.1)
+    title = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(user32.GetForegroundWindow(), title, 256)
+    # The taskbar holding the foreground after a click on it is the usual cause; click anywhere else.
+    raise Fail("the app's window in front to take keys", f"in front: {title.value!r}")
+
+
 def press(name):
     user32 = ctypes.windll.user32
     # Keys go to the window the user would be typing in: an open prompt or dialog, else the main one.
     main = WINDOW.CurrentNativeWindowHandle
-    user32.SetForegroundWindow(user32.GetLastActivePopup(main) or main)
+    bring_forward(user32.GetLastActivePopup(main) or main)
     mods = []
     while "+" in name and len(name) > 1:
         m, name = name.split("+", 1)
