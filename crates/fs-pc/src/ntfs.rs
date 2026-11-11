@@ -499,6 +499,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         // Read volume label from $Volume
         fs.label = fs.read_volume_label();
+        fs.ensure_used_bytes();
 
         Ok(fs)
     }
@@ -512,6 +513,15 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
     /// The `$VOLUME_INFORMATION` version as `(major, minor)`; `(0, 0)` when unreadable.
     pub fn ntfs_version(&self) -> (u8, u8) {
         self.ntfs_version
+    }
+
+    /// The first MFT record the allocator hands out: NT 4.0 puts user files from 16.
+    pub(crate) fn first_user_record(&self) -> usize {
+        if self.ntfs_version.0 == 1 {
+            16
+        } else {
+            24
+        }
     }
 
     /// Number of MFT records the source `$MFT` can address (its `$DATA`
@@ -874,9 +884,15 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
 
         for attr in &attrs {
             if attr.attr_type == ATTR_DATA {
-                let bitmap = self.read_attribute_data(attr, None)?;
-                let used_clusters = count_set_bits(&bitmap);
-                return Ok(used_clusters * self.cluster_size);
+                // Bits past the cluster count are the end-of-volume mark, not data.
+                let volume_clusters =
+                    self.total_sectors * self.bytes_per_sector / self.cluster_size;
+                let mut counter = BitCounter {
+                    set: 0,
+                    bits_left: volume_clusters,
+                };
+                self.write_attribute_data_to(attr, &mut counter, u64::MAX)?;
+                return Ok(counter.set * self.cluster_size);
             }
         }
 
@@ -1232,7 +1248,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         } else {
             FileEntry::new_file(name, path, real_size, file_mft_ref)
         };
-        fe.modified_unix = modified_unix;
+        set_modified(&mut fe, modified_unix);
         Some(fe)
     }
 
@@ -1556,8 +1572,39 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
 }
 
 /// Count set bits in a byte slice.
+/// Sets both the numeric mtime and the display string the browser shows.
+fn set_modified(fe: &mut FileEntry, unix: Option<u64>) {
+    fe.modified_unix = unix;
+    fe.modified = unix.map(|t| disk_core::unix_common::inode::format_unix_timestamp(t as i64));
+}
+
 fn count_set_bits(data: &[u8]) -> u64 {
     data.iter().map(|&b| b.count_ones() as u64).sum()
+}
+
+/// A `Write` sink that counts set bits in the first `bits_left` bits it is fed.
+struct BitCounter {
+    set: u64,
+    bits_left: u64,
+}
+
+impl std::io::Write for BitCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for &b in buf {
+            if self.bits_left == 0 {
+                break;
+            }
+            let take = self.bits_left.min(8) as u32;
+            let mask = if take == 8 { 0xFF } else { (1u8 << take) - 1 };
+            self.set += (b & mask).count_ones() as u64;
+            self.bits_left -= take as u64;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -2414,15 +2461,6 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         Err(FilesystemError::DiskFull(
             "no free MFT records available".into(),
         ))
-    }
-
-    /// The first MFT record the allocator hands out: NT 4.0 puts user files from 16.
-    fn first_user_record(&self) -> usize {
-        if self.ntfs_version.0 == 1 {
-            16
-        } else {
-            24
-        }
     }
 
     /// A fresh FILE record with sequence `seq`, not in use, holding only the end marker.
@@ -4562,7 +4600,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_file(name.to_string(), path, data_len, record_num);
-        fe.modified_unix = disk_core::times::filetime_to_unix(stamp);
+        set_modified(&mut fe, disk_core::times::filetime_to_unix(stamp));
         Ok(fe)
     }
 
@@ -4648,7 +4686,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_directory(name.to_string(), path, record_num);
-        fe.modified_unix = disk_core::times::filetime_to_unix(stamp);
+        set_modified(&mut fe, disk_core::times::filetime_to_unix(stamp));
         Ok(fe)
     }
 
@@ -5670,6 +5708,50 @@ mod tests {
                 .unwrap_or_else(|e| {
                     panic!("cluster {cluster}: the grown space takes a file: {e:?}")
                 });
+        }
+    }
+
+    /// R-091: on NTFS 1.2 user files start at record 16, and fsck, the used size and the
+    /// listing's date all have to see them.
+    #[test]
+    fn ntfs_12_user_records_are_counted_sized_and_dated() {
+        use crate::ntfs_format::{
+            create_ntfs_version, NtfsFormatParams, NtfsGeometry, NtfsVersion,
+        };
+        for version in [NtfsVersion::V1_2, NtfsVersion::V3_1] {
+            let mut cur = Cursor::new(Vec::<u8>::new());
+            let params = NtfsFormatParams {
+                total_size: 16 * 1024 * 1024,
+                geometry: NtfsGeometry::with_cluster_size(512, 512).unwrap(),
+                mft_records_hint: 128,
+                label: Some("COUNT".into()),
+            };
+            create_ntfs_version(&mut cur, &params, version).unwrap();
+            let mut fs = NtfsFilesystem::open(Cursor::new(cur.into_inner()), 0).unwrap();
+            let root = fs.root().unwrap();
+            let dir = fs
+                .create_directory(&root, "TESTDIR", &CreateDirectoryOptions::default())
+                .unwrap();
+            let opts = CreateFileOptions::default();
+            fs.create_file(&dir, "A.TXT", &mut Cursor::new(b"hi".to_vec()), 2, &opts)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+            let free = fs.free_space().unwrap();
+            let img = fs.into_reader().into_inner();
+
+            let mut fs = NtfsFilesystem::open(Cursor::new(img), 0).unwrap();
+            let report = crate::ntfs_fsck::fsck_ntfs(&mut fs).unwrap();
+            assert!(report.errors.is_empty(), "{version:?}: {:?}", report.errors);
+            assert_eq!(report.stats.directories_checked, 1, "{version:?}");
+            assert_eq!(report.stats.files_checked, 1, "{version:?}");
+            assert_eq!(fs.used_size(), fs.total_size() - free, "{version:?}");
+            let root = fs.root().unwrap();
+            let listed = fs.list_directory(&root).unwrap();
+            let d = listed.iter().find(|e| e.name == "TESTDIR").unwrap();
+            assert!(
+                d.modified.is_some(),
+                "{version:?}: the browser's date column"
+            );
         }
     }
 

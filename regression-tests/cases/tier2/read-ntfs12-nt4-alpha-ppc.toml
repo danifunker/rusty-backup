@@ -24,7 +24,7 @@ stdout_matches = ["\\s1457\\s+85\\s+/\\n"]
 [[case.step]]
 args = ["fsck", "{fixture}@3"]
 expect_exit = 0
-stdout_matches = ["1456 files / 81 dirs checked"]
+stdout_matches = ["1457 files / 84 dirs checked"]
 [[case.step]]
 args = ["get", "{fixture}@3", "/WINNT/system32/NTOSKRNL.EXE", "{scratch}/ex/"]
 expect_exit = 0
@@ -46,7 +46,7 @@ stdout_matches = ["\\s1603\\s+85\\s+/\\n"]
 [[case.step]]
 args = ["fsck", "{fixture}@5"]
 expect_exit = 0
-stdout_matches = ["1602 files / 81 dirs checked"]
+stdout_matches = ["1603 files / 84 dirs checked"]
 [[case.step]]
 args = ["get", "{fixture}@5", "/WINNT/system32/NTOSKRNL.EXE", "{scratch}/ex/"]
 expect_exit = 0
