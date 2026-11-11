@@ -240,19 +240,41 @@ pub fn set_visible(hwnd: HWND, on: bool) {
 
 /// Place a control at `r` in its parent's client area.
 pub fn move_to(hwnd: HWND, r: crate::layout::Rect) {
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
-    // SAFETY: moving our own control.
-    let _ = unsafe {
-        SetWindowPos(
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetParent, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
+    };
+    // SAFETY: reading and moving our own control.
+    unsafe {
+        let mut now = RECT::default();
+        if GetWindowRect(hwnd, &mut now).is_ok() {
+            let mut at = POINT {
+                x: now.left,
+                y: now.top,
+            };
+            if let Ok(parent) = GetParent(hwnd) {
+                let _ = ScreenToClient(parent, &mut at);
+            }
+            let same = at.x == r.x
+                && at.y == r.y
+                && now.right - now.left == r.w
+                && now.bottom - now.top == r.h;
+            if same {
+                return;
+            }
+        }
+        // NOCOPYBITS: a moved control repaints rather than carrying its old pixels along.
+        let _ = SetWindowPos(
             hwnd,
             None,
             r.x,
             r.y,
             r.w,
             r.h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-    };
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        );
+    }
 }
 
 pub fn set_enabled(hwnd: HWND, on: bool) {

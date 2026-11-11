@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use rusty_backup::controller::{
     picks, ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec,
@@ -82,7 +82,78 @@ struct Inner {
     /// Where a transient message shows (the status line under the tabs).
     status: HWND,
     busy: Cell<bool>,
+    /// A question waits for its own message (`WM_APP_QUESTION`), not the one that raised it.
+    posted: Cell<bool>,
     queue: RefCell<VecDeque<(Effect, ReplyFn)>>,
+}
+
+/// Posted to the effects window: open the questions that waited for a message of their own.
+const WM_APP_QUESTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+
+thread_local! {
+    static LATER: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
+    static LATER_WINDOW: Cell<isize> = const { Cell::new(0) };
+}
+
+/// A modal question; one raised inside a control's notification (a combo's selection) would hold
+/// that notification, and an automation client waiting on it, until the user answers.
+fn is_question(e: &Effect) -> bool {
+    matches!(
+        e,
+        Effect::Confirm(_) | Effect::Choose(_) | Effect::AskText(_) | Effect::AskPassword(_)
+    )
+}
+
+/// Ask for `inner`'s waiting questions on a message of their own.
+fn post_later(inner: &Rc<Inner>) {
+    use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
+    LATER.with(|l| l.borrow_mut().push(Rc::downgrade(inner)));
+    let mut hwnd = LATER_WINDOW.with(Cell::get);
+    if hwnd == 0 {
+        // SAFETY: registering and creating our own message-only window once per thread.
+        hwnd = unsafe {
+            let name = w!("RustyBackupQuestions");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(later_proc),
+                hInstance: GetModuleHandleW(None).unwrap_or_default().into(),
+                lpszClassName: name,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            CreateWindowExW(
+                Default::default(),
+                name,
+                PCWSTR::null(),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                GetModuleHandleW(None).ok().map(|i| i.into()),
+                None,
+            )
+        }
+        .map(|h| h.0 as isize)
+        .unwrap_or(0);
+        LATER_WINDOW.with(|w| w.set(hwnd));
+    }
+    // SAFETY: posting to our own window.
+    let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_APP_QUESTION, WPARAM(0), LPARAM(0)) };
+}
+
+unsafe extern "system" fn later_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg != WM_APP_QUESTION {
+        // SAFETY: the default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+    }
+    let hosts = LATER.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    for inner in hosts.iter().filter_map(Weak::upgrade) {
+        inner.posted.set(false);
+        EffectHost { inner }.drain(true);
+    }
+    LRESULT(0)
 }
 
 impl EffectHost {
@@ -92,6 +163,7 @@ impl EffectHost {
                 owner,
                 status,
                 busy: Cell::new(false),
+                posted: Cell::new(false),
                 queue: RefCell::default(),
             }),
         }
@@ -111,12 +183,23 @@ impl EffectHost {
                 .borrow_mut()
                 .push_back((effect, reply.clone()));
         }
-        if self.inner.busy.get() {
+        if self.inner.busy.get() || self.inner.posted.get() {
             return;
         }
+        self.drain(false);
+    }
+
+    /// Carry out the queue in order; `fresh` when on a message of its own, where a question may open.
+    fn drain(&self, fresh: bool) {
         loop {
             let next = self.inner.queue.borrow_mut().pop_front();
             let Some((effect, reply)) = next else { break };
+            if !fresh && is_question(&effect) {
+                self.inner.queue.borrow_mut().push_front((effect, reply));
+                self.inner.posted.set(true);
+                post_later(&self.inner);
+                break;
+            }
             self.inner.busy.set(true);
             self.one(effect, &reply);
             self.inner.busy.set(false);

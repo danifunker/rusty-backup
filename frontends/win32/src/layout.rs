@@ -124,6 +124,31 @@ impl<T> Node<T> {
         }
     }
 
+    /// The fewest DIPs tall the node can be with every control whole: a stretching leaf (a list)
+    /// keeps three rows, a stretching space none.
+    pub fn min_height(&self) -> i32 {
+        match self {
+            Node::Leaf { height, .. } => match height {
+                Size::Fixed(v) => *v,
+                Size::Stretch(_) => 3 * ROW,
+            },
+            Node::Space(Size::Fixed(v)) => *v,
+            Node::Space(Size::Stretch(_)) => 0,
+            Node::Row { children, .. } => {
+                children.iter().map(Node::min_height).max().unwrap_or(0)
+            }
+            Node::Column { children, gap } => {
+                let n = children.len() as i32;
+                children.iter().map(Node::min_height).sum::<i32>() + gap * (n - 1).max(0)
+            }
+            Node::Pair { height, field, .. } => match height {
+                Size::Fixed(v) => *v,
+                Size::Stretch(_) => field.min_height(),
+            },
+            Node::Inset { child, margin } => child.min_height() + 2 * margin,
+        }
+    }
+
     /// What the node asks of a column's main axis (its height).
     fn height(&self) -> Size {
         match self {
@@ -412,6 +437,20 @@ mod tests {
         let n = Node::column(vec![bar, Node::leaf(2, Size::Stretch(1), Size::Stretch(1))]);
         let out = layout(&n, r(0, 0, 200, 200), 96);
         assert_eq!(out, vec![(1, r(0, 0, 75, 23)), (2, r(0, 30, 200, 170))]);
+    }
+
+    #[test]
+    fn min_height_counts_every_row_and_keeps_a_list_visible() {
+        let n = Node::inset(
+            Node::column(vec![
+                Node::row(vec![Node::button(1, 75), Node::Space(Size::Stretch(1))]),
+                Node::leaf(2, Size::Stretch(1), Size::Stretch(1)),
+                Node::Space(Size::Stretch(1)),
+                Node::button(3, 75),
+            ]),
+            MARGIN,
+        );
+        assert_eq!(n.min_height(), ROW + 3 * ROW + 0 + ROW + 3 * GAP + 2 * MARGIN);
     }
 
     #[test]

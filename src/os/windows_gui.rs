@@ -30,6 +30,14 @@ impl WindowsGui {
         }
     }
 
+    /// The name Explorer's "Open with" shows; the shared version resource can't tell the GUIs apart.
+    pub fn app_name(self) -> &'static str {
+        match self {
+            Self::Egui => "Rusty Backup",
+            Self::Win32 => "Rusty Backup (Win32)",
+        }
+    }
+
     pub fn exe_name(self) -> &'static str {
         match self {
             Self::Egui => "rusty-backup.exe",
@@ -68,6 +76,12 @@ impl WindowsGui {
 #[cfg(test)]
 mod tests {
     use super::WindowsGui;
+
+    #[test]
+    fn each_gui_has_its_own_open_with_name() {
+        assert_eq!(WindowsGui::Win32.app_name(), "Rusty Backup (Win32)");
+        assert_ne!(WindowsGui::Egui.app_name(), WindowsGui::Win32.app_name());
+    }
 
     #[test]
     fn exe_name_picks_the_gui() {

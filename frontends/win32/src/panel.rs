@@ -19,7 +19,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, GetWindowLongPtrW, GetWindowRect,
     RegisterClassW, SetWindowLongPtrW, SetWindowPos, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
-    SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_NOTIFY, WM_SIZE, WNDCLASSW, WS_CAPTION,
+    SWP_NOZORDER, WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_MOUSEWHEEL, WM_NOTIFY, WM_SIZE,
+    WM_VSCROLL, WNDCLASSW, WS_CAPTION,
     WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
@@ -229,6 +230,96 @@ pub fn client(hwnd: HWND) -> (Rect, u32) {
     )
 }
 
+/// Where `tree` goes in `area`: the area itself while every showing control fits, else a taller
+/// area moved up by the panel's scroll position, with the vertical scroll bar shown to reach the rest.
+pub fn scroll_area(hwnd: HWND, tree: &layout::Node<HWND>, area: Rect, dpi: u32) -> Rect {
+    use windows::Win32::UI::Controls::{SetScrollInfo, ShowScrollBar};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetScrollPos, SCROLLINFO, SB_VERT, SIF_PAGE, SIF_RANGE,
+    };
+    // Laid out at its full height, the lowest showing control is how tall the page must be; the
+    // hidden controls of other steps sit below it and take nothing on screen.
+    let full = Rect {
+        h: layout::scale(tree.min_height(), dpi),
+        ..area
+    };
+    let need = layout::layout(tree, full, dpi)
+        .iter()
+        .filter(|(h, _)| crate::ui::shown(*h))
+        .map(|(_, r)| r.y + r.h)
+        .max()
+        .unwrap_or(0)
+        + layout::scale(layout::MARGIN, dpi);
+    // SAFETY: scroll bar calls on our own window.
+    unsafe {
+        if need <= area.h {
+            let _ = ShowScrollBar(hwnd, SB_VERT, false);
+            return area;
+        }
+        let si = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE,
+            nMin: 0,
+            nMax: need - 1,
+            nPage: area.h.max(0) as u32,
+            ..Default::default()
+        };
+        SetScrollInfo(hwnd, SB_VERT, &si, true);
+        let _ = ShowScrollBar(hwnd, SB_VERT, true);
+        let pos = GetScrollPos(hwnd, SB_VERT);
+        Rect {
+            x: area.x,
+            y: area.y - pos,
+            w: area.w,
+            h: need,
+        }
+    }
+}
+
+/// Move the panel's scroll position for a `WM_VSCROLL` (`code`) or a wheel turn (`wheel`); true
+/// when it moved, and the handler lays the panel out again at the new position.
+fn scroll(hwnd: HWND, code: Option<u32>, wheel: i32) -> bool {
+    use windows::Win32::UI::Controls::SetScrollInfo;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetScrollInfo, SCROLLINFO, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+        SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SIF_ALL, SIF_POS,
+    };
+    let mut si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_ALL,
+        ..Default::default()
+    };
+    // SAFETY: scroll bar calls on our own window.
+    unsafe {
+        if GetScrollInfo(hwnd, SB_VERT, &mut si).is_err() || si.nMax <= 0 {
+            return false;
+        }
+        let line = layout::scale(layout::ROW + layout::GAP, GetDpiForWindow(hwnd).max(96));
+        let page = si.nPage as i32;
+        let to = match code {
+            Some(c) if c == SB_LINEUP.0 as u32 => si.nPos - line,
+            Some(c) if c == SB_LINEDOWN.0 as u32 => si.nPos + line,
+            Some(c) if c == SB_PAGEUP.0 as u32 => si.nPos - page,
+            Some(c) if c == SB_PAGEDOWN.0 as u32 => si.nPos + page,
+            Some(c) if c == SB_THUMBTRACK.0 as u32 || c == SB_THUMBPOSITION.0 as u32 => {
+                si.nTrackPos
+            }
+            Some(c) if c == SB_TOP.0 as u32 => 0,
+            Some(c) if c == SB_BOTTOM.0 as u32 => si.nMax,
+            Some(_) => return false,
+            None => si.nPos - wheel * 3 * line / 120,
+        };
+        let to = to.clamp(0, (si.nMax + 1 - page).max(0));
+        if to == si.nPos {
+            return false;
+        }
+        si.fMask = SIF_POS;
+        si.nPos = to;
+        SetScrollInfo(hwnd, SB_VERT, &si, true);
+        true
+    }
+}
+
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let h = handler(hwnd);
     match (msg, h) {
@@ -259,6 +350,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         (WM_SIZE, Some(h)) => {
             h.resized();
             LRESULT(0)
+        }
+        (WM_VSCROLL, Some(h)) => {
+            if scroll(hwnd, Some((wp.0 & 0xffff) as u32), 0) {
+                h.resized();
+            }
+            LRESULT(0)
+        }
+        (WM_MOUSEWHEEL, Some(h)) => {
+            let delta = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+            if scroll(hwnd, None, delta) {
+                h.resized();
+                LRESULT(0)
+            } else {
+                // SAFETY: an unscrollable panel passes the wheel on to its parent.
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
         }
         (WM_CLOSE, Some(h)) => {
             h.close();

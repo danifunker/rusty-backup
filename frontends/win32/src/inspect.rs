@@ -1269,7 +1269,7 @@ impl InspectScreen {
             Node::Space(Size::Stretch(1)),
         ]));
         self.shape.set(self.shape_now());
-        for (h, r) in layout::layout(&tree, area, dpi) {
+        for (h, r) in layout::layout(&tree, panel::scroll_area(self.page, &tree, area, dpi), dpi) {
             ui::move_to(h, r);
         }
     }

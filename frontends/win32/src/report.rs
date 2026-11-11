@@ -119,6 +119,8 @@ impl ReportWindow {
                 ui::set_visible(b, s.button);
             }
         });
+        // The stats line's height follows its text.
+        self.layout();
     }
 
     fn layout(&self) {
@@ -133,10 +135,18 @@ impl ReportWindow {
         }
         bottom.push(Node::Space(Size::Stretch(1)));
         bottom.push(Node::button(self.close, 90));
+        // The stats wrap rather than run off the edge; a tenth extra allows for word breaks.
+        let avail = (area.w * 96 / dpi as i32 - 2 * layout::MARGIN).max(1);
+        let rows = ((ui::text_dips(self.stats) * 11 / 10 + avail - 1) / avail).max(1);
+        let stats = Node::leaf(
+            self.stats,
+            Size::Stretch(1),
+            Size::Fixed((layout::ROW - 8) * rows),
+        );
         let tree = Node::inset(
             Node::column(vec![
                 line(self.headline),
-                line(self.stats),
+                stats,
                 Node::leaf(self.text, Size::Stretch(1), Size::Stretch(1)),
                 Node::row(bottom),
             ]),

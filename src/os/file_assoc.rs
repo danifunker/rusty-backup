@@ -35,13 +35,19 @@ pub fn register_file_associations() -> io::Result<()> {
     // ProgId: friendly description, icon, and the open command. Values are
     // passed as `&String` so winreg infers `ToRegValue for String` unambiguously.
     // Each GUI has its own ProgId, so installing or removing one leaves the other's "Open with".
-    let (id, desc) = WindowsGui::current().progid();
+    let gui = WindowsGui::current();
+    let (id, desc) = gui.progid();
     let (progid, _) = classes.create_subkey(id)?;
     progid.set_value("", &desc.to_string())?;
     let (icon, _) = progid.create_subkey("DefaultIcon")?;
     icon.set_value("", &format!("{exe_str},0"))?;
-    let (cmd, _) = progid.create_subkey("shell\\open\\command")?;
+    let (open, _) = progid.create_subkey("shell\\open")?;
+    open.set_value("FriendlyAppName", &gui.app_name().to_string())?;
+    let (cmd, _) = open.create_subkey("command")?;
     cmd.set_value("", &format!("\"{exe_str}\" \"%1\""))?;
+    // "How do you want to open this file?" names the app from here, not from the ProgId.
+    let (app, _) = classes.create_subkey(format!("Applications\\{}", gui.exe_name()))?;
+    app.set_value("FriendlyAppName", &gui.app_name().to_string())?;
 
     // Non-destructive per-extension registration: list our ProgId under each
     // extension's OpenWithProgids (an empty-string value-data marker). This
@@ -58,8 +64,10 @@ pub fn register_file_associations() -> io::Result<()> {
 /// Leaves any other handlers and the user's chosen defaults untouched.
 pub fn unregister_file_associations() -> io::Result<()> {
     let classes = open_classes()?;
-    let (id, _) = WindowsGui::current().progid();
+    let gui = WindowsGui::current();
+    let (id, _) = gui.progid();
     let _ = classes.delete_subkey_all(id);
+    let _ = classes.delete_subkey_all(format!("Applications\\{}", gui.exe_name()));
     for ext in association_exts() {
         if let Ok(key) =
             classes.open_subkey_with_flags(format!(".{ext}\\OpenWithProgids"), KEY_WRITE)
