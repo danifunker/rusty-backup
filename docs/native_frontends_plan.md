@@ -425,7 +425,7 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 
 1. Linux (§9): does gtk3-rs build on 1.73; the oldest distro to test the GTK3 AppImage on; the Flatpak images-only edition.
 7. ~~Phase 2b's drift questions~~: decided 2026-11-09 (D8): staged copy into a host folder; disc conversion in the Convert tab.
-8. AppKit: ~~PyObjC or a Swift helper~~ Swift (2026-11-11); whether GitHub's macOS runners grant AX (its plan's Gate 0) is open.
+8. ~~AppKit: PyObjC or a Swift helper; whether GitHub's macOS runners grant AX~~: Swift (2026-11-11); the runners grant it (2026-11-12).
 9. Win32: Dynamic Annotation for `AutomationId` or a numeric id table (its plan's Gate 0).
 2. macOS 10.7 bindings: which ObjC crate builds on 1.73, or ObjC shell + C ABI.
 3. C ABI over JSON versus an engine process over the extended daemon protocol, for PPC and Sol9 (§8).

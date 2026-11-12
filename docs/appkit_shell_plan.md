@@ -156,7 +156,9 @@ plus `--shell tui`.
   `AXIdentifier`, switched screens through the toolbar items, pressed a button by id and answered
   an alert. The grant goes to the process macOS holds responsible: run from the Claude desktop
   app, that is the Claude Code binary (`claude.app` under `~/Library/Application Support/Claude`),
-  not Claude.app, and it took a new process to see it. GitHub's runners: CI's probe will say.
+  not Claude.app, and it took a new process to see it.
+- **Gate 0 on GitHub: passed (2026-11-12).** The `macos-26` runner reports `AXIsProcessTrusted`
+  true, and `flow.shell.appkit-start` passes in the `appkit` job, so the AX flows run in CI.
 
 ## Exit criteria
 
@@ -167,8 +169,8 @@ plus `--shell tui`.
 
 ## Open questions
 
-1. ~~PyObjC or a Swift helper for the driver~~: Swift (2026-11-11). Still open: whether GitHub's
-   macOS runners grant AX (Gate 0).
+1. ~~PyObjC or a Swift helper for the driver~~: Swift (2026-11-11). ~~Whether GitHub's macOS
+   runners grant AX~~: they do (2026-11-12).
 2. ~~App name and bundle id~~: bundle id `io.github.danifunker.rusty-backup` (2026-11-11), distinct
    from egui's `io.github.dani.rusty-backup`, so both install side by side.
 3. How the 10.7 vintage shell (Phase 6) shares slices with this one: forked like the Win32 pair,
