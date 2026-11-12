@@ -80,8 +80,22 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
   slice 1 needs them.
 - **Keys.** `Primary` in `controller::keys` is Cmd; Commander's F-keys need fn on a laptop, so every
   command also has its menu item (the menu bar is where Mac users look).
-- **Menus.** The menu bar carries the commands the GTK shell puts in its header menu, plus Edit's
-  standard items so text fields get copy and paste.
+- **Menus (agreed 2026-11-12, draft: [mockups/appkit-draft.html](mockups/appkit-draft.html)).**
+  The window keeps Win32's controls (D8) and the menu bar carries the same commands, each running
+  its button's action and greyed out with it: Rusty Backup (About, Check for Updates..., Settings...),
+  File (Open File for Inspect..., Open CD-ROM Image..., Open Backup Folder..., Open Recent, Open
+  Device, Connect to Remote..., Refresh Devices, Close Backup, Close), Edit's standard items, View
+  (the screens on Cmd 1 to 8, the log), Disk and Partition (Inspect's disk and row tools), Window
+  and Help. Shortcuts go into the controller's key map, not the shell.
+- **In-app update (asked 2026-11-12, design awaiting the user's OK).** As egui does on Windows:
+  the banner's Install downloads the release's signed, notarized DMG for this app and arch,
+  attaches it read-only (`hdiutil attach -nobrowse -readonly`), checks the bundle inside with
+  `codesign --verify --deep --strict` and that its Team ID matches the running app's, copies it
+  beside the running bundle with `ditto`, swaps the two by rename, detaches, relaunches with
+  `open -n` and quits; the old bundle goes at the next start. A folder the user cannot write
+  (a standard account's /Applications) or an unsigned build falls back to opening the DMG. The
+  logic is the engine's (`src/update.rs`) and the app controller's `InstallUpdate`, so egui on
+  macOS gets it too; the AppKit preview takes its own DMG, as Win32 takes its own ZIP.
 - **Drag and drop.** Drop routing goes through `AppController::route_drop` as in GTK. A drag *out*
   to Finder is a file promise (`NSFilePromiseProvider`); GTK never built its drag out.
 - **Packaging.** A second `.app` in the same DMG job, signed and notarized with the egui one; the
