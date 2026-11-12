@@ -297,6 +297,7 @@ pub struct UiSession {
     rb_cli: PathBuf,
     gtk: PathBuf,
     win32: PathBuf,
+    appkit: PathBuf,
     scratch: PathBuf,
     controls: Controls,
     /// The control the last `focus` landed on, which `fill` and `choose` act on.
@@ -312,6 +313,7 @@ impl UiSession {
         rb_cli: &Path,
         gtk: &Path,
         win32: &Path,
+        appkit: &Path,
         scratch: &Path,
         controls: Controls,
     ) -> Self {
@@ -320,6 +322,7 @@ impl UiSession {
             rb_cli: rb_cli.to_path_buf(),
             gtk: gtk.to_path_buf(),
             win32: win32.to_path_buf(),
+            appkit: appkit.to_path_buf(),
             scratch: scratch.to_path_buf(),
             controls,
             focused: Control::default(),
@@ -347,7 +350,7 @@ impl UiSession {
         let shell = self.shell.clone().unwrap_or_default();
         match shell.as_str() {
             "tui" => self.run_tui(ops, resolve),
-            "gtk" | "win32" => self.run_driver(&shell, ops, resolve),
+            "gtk" | "win32" | "appkit" => self.run_driver(&shell, ops, resolve),
             other => Err(UiError::Skip(
                 Verdict::SkipTool,
                 format!("no driver for the '{}' shell yet", other),
@@ -355,7 +358,7 @@ impl UiSession {
         }
     }
 
-    /// A shell driven by a JSON-lines driver script: GTK over AT-SPI, Win32 over UIA.
+    /// A shell driven by a JSON-lines driver: GTK over AT-SPI, Win32 over UIA, AppKit over AX.
     fn run_driver(
         &mut self,
         shell: &str,
@@ -365,6 +368,7 @@ impl UiSession {
         if self.gtk_driver.is_none() {
             let d = match shell {
                 "win32" => crate::uia::start(&self.win32, &self.scratch.join("win32"))?,
+                "appkit" => crate::ax::start(&self.appkit, &self.scratch.join("appkit"))?,
                 _ => crate::gtk::Driver::start(&self.gtk, &self.scratch.join("gtk"))?,
             };
             self.gtk_driver = Some(d);
@@ -398,8 +402,8 @@ impl UiSession {
                 continue;
             }
             let mut msg = self.driver_message(shell, op, resolve);
-            // Win32 finds a control by its AutomationId, the controller id itself.
-            if shell == "win32" && (op.focus.is_some() || op.activate.is_some()) {
+            // Win32 and AppKit find a control by its accessibility id, the controller id itself.
+            if (shell == "win32" || shell == "appkit") && (op.focus.is_some() || op.activate.is_some()) {
                 if let Some(m) = msg.as_object_mut() {
                     m.insert("id".to_string(), serde_json::Value::String(resolve(op_target(op))));
                 }
