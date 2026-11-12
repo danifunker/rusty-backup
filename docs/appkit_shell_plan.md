@@ -87,12 +87,14 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
   Device, Connect to Remote..., Refresh Devices, Close Backup, Close), Edit's standard items, View
   (the screens on Cmd 1 to 8, the log), Disk and Partition (Inspect's disk and row tools), Window
   and Help. Shortcuts go into the controller's key map, not the shell.
-- **In-app update (asked 2026-11-12, design awaiting the user's OK).** As egui does on Windows:
+- **In-app update (built 2026-11-12, `update::mac`).** As egui does on Windows:
   the banner's Install downloads the release's signed, notarized DMG for this app and arch,
   attaches it read-only (`hdiutil attach -nobrowse -readonly`), checks the bundle inside with
   `codesign --verify --deep --strict` and that its Team ID matches the running app's, copies it
-  beside the running bundle with `ditto`, swaps the two by rename, detaches, relaunches with
-  `open -n` and quits; the old bundle goes at the next start. A folder the user cannot write
+  beside the running bundle with `ditto`, swaps the two by rename and removes the old one (the
+  running process keeps its open files), detaches, and on Restart Now relaunches with `open -n`.
+  The menu's Check for Updates... (`AppAction::CheckForUpdates`) checks at once and says when the
+  build is up to date. A folder the user cannot write
   (a standard account's /Applications) or an unsigned build falls back to opening the DMG. The
   logic is the engine's (`src/update.rs`) and the app controller's `InstallUpdate`, so egui on
   macOS gets it too; the AppKit preview takes its own DMG, as Win32 takes its own ZIP.

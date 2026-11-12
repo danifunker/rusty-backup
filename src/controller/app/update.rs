@@ -1,5 +1,5 @@
-//! The update banner: the start-up release check and (Windows) the in-app download and install,
-//! each a job. macOS and Linux update through a DMG / AppImage, so they only link the release.
+//! The update banner: the start-up release check and (Windows, macOS) the in-app download and
+//! install, each a job. Linux updates through its AppImage, so it only links the release.
 
 use super::AppController;
 use crate::controller::job_outcome;
@@ -14,16 +14,21 @@ pub enum InstallState {
     Downloading(Option<f32>),
     /// Installed; restart to run it.
     Ready,
+    /// Not installed in place: the package was opened for the user, who installs it by hand.
+    Manual(String),
     Failed(String),
 }
 
 #[derive(Default)]
 pub(super) struct UpdateState {
     check: Option<Job<Option<UpdateInfo>>>,
+    /// The check was asked for (Check for Updates...), so its answer is said even when up to date.
+    asked: bool,
     info: Option<UpdateInfo>,
     dismissed: bool,
-    install: Option<Job<Result<(), String>>>,
-    installed: Option<Result<(), String>>,
+    /// `Ok(Some(why))`: opened for the user to install by hand.
+    install: Option<Job<Result<Option<String>, String>>>,
+    installed: Option<Result<Option<String>, String>>,
 }
 
 impl AppController {
@@ -33,6 +38,22 @@ impl AppController {
         if !config.enabled {
             return;
         }
+        self.spawn_check(config);
+    }
+
+    /// Check now, whatever config.json says (the menu's Check for Updates...); the answer is said.
+    pub(super) fn check_updates_now(&mut self) {
+        if self.update.check.is_some() {
+            return;
+        }
+        let mut config = self.config.load_config().update_check;
+        config.enabled = true;
+        self.update.asked = true;
+        self.update.dismissed = false;
+        self.spawn_check(config);
+    }
+
+    fn spawn_check(&mut self, config: crate::update::UpdateCheckConfig) {
         self.update.check = Some(Job::spawn(
             "Checking for updates",
             self.notify(),
@@ -72,9 +93,9 @@ impl AppController {
         self.update.dismissed = true;
     }
 
-    /// Whether this build installs the announced release itself (Windows, with a matching asset).
+    /// Whether this build installs the announced release itself (Windows, macOS; a matching asset).
     pub fn can_install_update(&self) -> bool {
-        cfg!(windows)
+        cfg!(any(windows, target_os = "macos"))
             && self
                 .update
                 .info
@@ -92,7 +113,8 @@ impl AppController {
             return Some(InstallState::Downloading(fraction));
         }
         match &self.update.installed {
-            Some(Ok(())) => Some(InstallState::Ready),
+            Some(Ok(None)) => Some(InstallState::Ready),
+            Some(Ok(Some(why))) => Some(InstallState::Manual(why.clone())),
             Some(Err(e)) => Some(InstallState::Failed(e.clone())),
             None => None,
         }
@@ -125,8 +147,14 @@ impl AppController {
                         },
                     });
                 };
-                Ok(crate::update::download_and_apply_update(&info, &progress)
-                    .map_err(|e| e.to_string()))
+                let done = match crate::update::download_and_apply_update(&info, &progress) {
+                    Ok(()) => Ok(None),
+                    Err(e) => match e.downcast::<crate::update::ManualInstall>() {
+                        Ok(manual) => Ok(Some(manual.0)),
+                        Err(e) => Err(e.to_string()),
+                    },
+                };
+                Ok(done)
             },
         ));
     }
@@ -136,15 +164,34 @@ impl AppController {
         self.update.installed = None;
     }
 
-    pub(super) fn poll_update(&mut self) {
+    pub(super) fn poll_update(&mut self) -> Vec<crate::controller::Effect> {
+        let mut effects = Vec::new();
         if let Some(done) = self.update.check.as_ref().and_then(job_outcome) {
             self.update.check = None;
             self.update.info = done.ok().flatten();
+            if std::mem::take(&mut self.update.asked) {
+                let current = env!("APP_VERSION");
+                let said = match &self.update.info {
+                    Some(i) if i.is_outdated => None,
+                    Some(_) => Some(format!("Up to date (current {current}).")),
+                    None => {
+                        Some("Update check failed: the release feed could not be read.".to_string())
+                    }
+                };
+                effects.extend(said.map(crate::controller::Effect::Message));
+            }
         }
         if let Some(done) = self.update.install.as_ref().and_then(job_outcome) {
             self.update.install = None;
-            self.update.installed = Some(done.and_then(|r| r));
+            let done = done.and_then(|r| r);
+            match &done {
+                Ok(None) => self.log.info("Update installed; restart to run it."),
+                Ok(Some(why)) => self.log.info(format!("Update: {why}")),
+                Err(e) => self.log.error(format!("Update failed: {e}")),
+            }
+            self.update.installed = Some(done);
         }
+        effects
     }
 
     /// For tests: announce `info` as if the start-up check had found it.

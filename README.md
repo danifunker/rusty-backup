@@ -26,6 +26,9 @@ Rusty Backup ships as a single self-contained binary per platform.
      existing portable-ZIP users can run `Setup.exe` once to gain the
      Start-Menu / ARP integration without re-downloading later updates.
    - **macOS** — open the DMG and drag `Rusty Backup.app` into `/Applications`.
+     Later updates install from the update banner (**Download & Install Update**):
+     the app checks the new DMG's signature before it replaces itself, and
+     opens the DMG for you instead when it cannot write to its own folder.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
    Linux, an authorisation prompt on macOS). Working with image files on disk
