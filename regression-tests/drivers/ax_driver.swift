@@ -145,7 +145,13 @@ func choose(_ value: String) throws {
         for it in elements() where str(it, kAXRoleAttribute) == (kAXMenuItemRole as String) {
             let t = str(it, kAXTitleAttribute).lowercased()
             if t == want || (!t.isEmpty && t.contains(want)) {
+                let title = str(it, kAXTitleAttribute)
                 AXUIElementPerformAction(it, kAXPressAction as CFString)
+                // A slow runner commits the pick after the menu closes: wait for the pop-up to show it.
+                let shown = Date().addingTimeInterval(5)
+                while Date() < shown && str(e, kAXValueAttribute) != title && str(e, kAXTitleAttribute) != title {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
                 Thread.sleep(forTimeInterval: 0.2)
                 return
             }

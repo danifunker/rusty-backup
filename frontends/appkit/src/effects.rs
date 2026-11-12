@@ -429,25 +429,18 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
         unsafe { msg_send![super(this), init] }
     };
     let validate = {
-        let (field, error, ok_button, check) = (
-            field.clone(),
-            error.clone(),
-            ok_button.clone(),
-            check.clone(),
-        );
+        let (field, error, check) = (field.clone(), error.clone(), check.clone());
         move || {
             let verdict = check(&field.stringValue().to_string());
+            // OK stays on: a value set through accessibility never runs this, and OK checks again.
             ui::set_text(&error, verdict.as_ref().err().map_or("", |e| e.as_str()));
-            ui::set_enabled(&ok_button, verdict.is_ok());
         }
     };
     let submit = {
         let ok_button = ok_button.clone();
         move || {
-            if ok_button.isEnabled() {
-                // SAFETY: a plain click on the alert's own button, with no sender.
-                unsafe { ok_button.performClick(None) };
-            }
+            // SAFETY: a plain click on the alert's own button, with no sender.
+            unsafe { ok_button.performClick(None) };
         }
     };
     *delegate.ivars().borrow_mut() = (Some(Box::new(validate.clone())), Some(Box::new(submit)));
