@@ -18,7 +18,7 @@ use objc2_app_kit::{
     NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSScrollView, NSTableColumn,
     NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSView,
 };
-use objc2_foundation::{NSIndexSet, NSNotification, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSIndexSet, NSMutableIndexSet, NSNotification, NSPoint, NSRect, NSSize};
 use rusty_backup::controller::commander::{
     format_size, BrowserPaneAction as P, CommanderController, DisplayRow, ListingStyle, Side,
     SortColumn,
@@ -60,6 +60,8 @@ pub enum PaneEvent {
     Menu(usize, NSPoint),
     /// A folder-tree row was picked or its icon clicked.
     Folder(P),
+    /// The list took the keyboard focus: its pane is the one keys act on.
+    Focused,
 }
 
 /// One listing row as the table draws it.
@@ -143,7 +145,12 @@ define_class!(
             let Some(table) = note.object().and_then(|o| o.downcast::<NSTableView>().ok()) else {
                 return;
             };
-            let row = table.selectedRow();
+            // The row a click or arrow key moved to; a marking pane reports it with its modifiers.
+            let row = match table.clickedRow() {
+                r if r >= 0 => r,
+                _ => table.selectedRow(),
+            };
+            let (ctrl, shift) = modifiers();
             let event = {
                 let s = self.ivars().borrow();
                 if s.quiet || row < 0 {
@@ -153,11 +160,7 @@ define_class!(
                 if is_tree(&table) {
                     Some(PaneEvent::Folder(P::FolderTreeClick(i)))
                 } else {
-                    s.rows.get(i + s.skip).cloned().map(|row| PaneEvent::Click {
-                        row,
-                        ctrl: false,
-                        shift: false,
-                    })
+                    s.rows.get(i + s.skip).cloned().map(|row| PaneEvent::Click { row, ctrl, shift })
                 }
             };
             if let Some(e) = event {
@@ -207,6 +210,18 @@ define_class!(
             }
         }
 
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            // SAFETY: the table's own answer, then the pane hears it has the keys.
+            let took: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            if took {
+                if let Some(f) = self.ivars().borrow().clone() {
+                    f(PaneEvent::Focused);
+                }
+            }
+            took
+        }
+
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
             let at = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -218,6 +233,22 @@ define_class!(
         }
     }
 );
+
+/// Cmd (the Mac's add-to-selection key, as Ctrl elsewhere) and Shift held on the current event.
+fn modifiers() -> (bool, bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return (false, false);
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(e) = app.currentEvent() else {
+        return (false, false);
+    };
+    let f = e.modifierFlags();
+    (
+        f.contains(NSEventModifierFlags::Command),
+        f.contains(NSEventModifierFlags::Shift),
+    )
+}
 
 fn is_tree(table: &NSTableView) -> bool {
     table.tag() == 1
@@ -421,7 +452,7 @@ fn table(mtm: MainThreadMarker, id: &str, tree: bool) -> (Retained<NSScrollView>
         }
         t.setUsesAlternatingRowBackgroundColors(true);
     }
-    t.setAllowsMultipleSelection(false);
+    t.setAllowsMultipleSelection(!tree);
     t.setAllowsEmptySelection(true);
     ui::set_id(&t, id);
     let scroll = NSScrollView::initWithFrame(mtm.alloc(), NSRect::ZERO);
@@ -595,11 +626,26 @@ impl PaneView {
                 let set = NSIndexSet::indexSetWithIndex(s.folder_cursor);
                 self.tree.selectRowIndexes_byExtendingSelection(&set, false);
             }
+            // A tick-box pane shows its cursor as the selection; a click-marking one its marks.
+            let want: Vec<usize> = if s.boxes {
+                s.cursor.into_iter().collect()
+            } else {
+                let st = self.source.ivars().borrow();
+                st.lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.marked)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let set = NSMutableIndexSet::new();
+            for i in &want {
+                set.addIndex(*i);
+            }
+            if !self.list.selectedRowIndexes().isEqualToIndexSet(&set) {
+                self.list.selectRowIndexes_byExtendingSelection(&set, false);
+            }
             if let Some(i) = s.cursor {
-                if self.list.selectedRow() != i as isize {
-                    let set = NSIndexSet::indexSetWithIndex(i);
-                    self.list.selectRowIndexes_byExtendingSelection(&set, false);
-                }
                 if self.shown_cursor.replace(Some(i)) != Some(i) {
                     self.list.scrollRowToVisible(i as isize);
                 }

@@ -130,3 +130,10 @@
 [win32]
 "commander.left.apply" = { skip = true }
 "commander.staged" = "Apply (1)"
+
+[appkit]
+# An NSToolbarItem is not a view and carries no AXIdentifier: the driver finds it by its label.
+"app.commander" = "Commander"
+# As on Win32: the controller writes a copy into a host folder at once, so there is no Apply.
+"commander.left.apply" = { skip = true }
+"commander.staged" = "Apply (1)"

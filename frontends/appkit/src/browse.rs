@@ -1086,6 +1086,7 @@ impl BrowseView {
                 self.apply(A::Focus(Side::Left));
                 self.apply(pane(a));
             }
+            PaneEvent::Focused => {}
         }
     }
 

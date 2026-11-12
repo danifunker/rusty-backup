@@ -202,6 +202,18 @@ plus `--shell tui`.
   opens it in the page's place. `flow.browse.inspect-extract-all`, `-new-folder` and
   `-edit-text` pass on `appkit`.
 
+- **Slice 3 (2026-11-12), Commander.** `commander.rs` on one `CommanderController`, as the
+  Win32 screen: two sides (source pull-down with recent sources, File / Folder / Backup / Remote,
+  Close, partitions, New Folder, Apply / Discard / Edits, title and free space, the path as link
+  crumbs, the unlock row, the job line) over the shared `PaneView`, the copy column between them,
+  quick view, the log and every window the controller describes. It covers the window (the
+  toolbar and the screens hide) until the controller closes it; closing the window with staged
+  edits asks the controller first. A click-marking pane shows its marks as the selection and
+  reports the list taking focus, as Win32 does, so an AX row selection marks and activates its
+  side. `drivers/labels.toml` gains an `[appkit]` section with Win32's two behaviour entries and
+  the Commander toolbar item's label (an `NSToolbarItem` carries no AX identifier). Not done:
+  dragging rows between panes, and drops from Finder (slice 8).
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

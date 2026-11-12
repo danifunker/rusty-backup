@@ -96,6 +96,17 @@ func find(_ idOrName: String, _ label: String?, nth: Int = 0, secs: Double = 10)
     }
 }
 
+/// The table row `e` sits in, when it is (or is inside) one.
+func rowOf(_ e: AXUIElement) -> AXUIElement? {
+    var cur: AXUIElement? = e
+    for _ in 0..<6 {
+        guard let c = cur else { return nil }
+        if str(c, kAXRoleAttribute) == (kAXRowRole as String) { return c }
+        cur = attr(c, kAXParentAttribute).map { $0 as! AXUIElement }
+    }
+    return nil
+}
+
 func actions(_ e: AXUIElement) -> [String] {
     var names: CFArray?
     guard AXUIElementCopyActionNames(e, &names) == .success else { return [] }
@@ -223,7 +234,13 @@ func run(_ op: [String: Any]) throws -> [String: Any] {
     case "focus":
         let e = try find(id, arg, nth: nth)
         current = e
-        if AXUIElementSetAttributeValue(e, kAXSelectedAttribute as CFString, kCFBooleanTrue) != .success {
+        if let row = rowOf(e) {
+            // A name in a list: select its row, and give the list the keys that follow.
+            AXUIElementSetAttributeValue(row, kAXSelectedAttribute as CFString, kCFBooleanTrue)
+            if let table = attr(row, kAXParentAttribute) {
+                AXUIElementSetAttributeValue(table as! AXUIElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            }
+        } else if AXUIElementSetAttributeValue(e, kAXSelectedAttribute as CFString, kCFBooleanTrue) != .success {
             AXUIElementSetAttributeValue(e, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         }
         Thread.sleep(forTimeInterval: 0.2)

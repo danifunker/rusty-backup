@@ -71,11 +71,6 @@ fn make_item(mtm: MainThreadMarker, id: &NSString) -> Option<Retained<NSToolbarI
         item.setTarget(Some(&t));
         item.setAction(Some(sel!(act:)));
     }
-    // Commander arrives in slice 3; until then its item shows but is off.
-    if key == ids::COMMANDER {
-        item.setAutovalidates(false);
-        item.setEnabled(false);
-    }
     Some(item)
 }
 

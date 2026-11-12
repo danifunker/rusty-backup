@@ -33,10 +33,10 @@ reference the shells are measured against. Per-feature limits by build target li
 | `build.format` | - | yes | yes | - | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
 | `build.open-inspect` | - | yes | yes | - | `flow.build.mbr-ntfs12` |
 | `build.partitioned` | - | yes | yes | - | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
-| `commander.apply` | yes | yes | yes | - | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
-| `commander.archive-browse` | yes | yes | yes | - | `flow.commander.open-zip`, `flow.commander.zip-to-image` |
-| `commander.copy` | yes | yes | yes | - | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
-| `commander.host-folder` | yes | yes | yes | - | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
+| `commander.apply` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
+| `commander.archive-browse` | yes | yes | yes | yes | `flow.commander.open-zip`, `flow.commander.zip-to-image` |
+| `commander.copy` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
+| `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | - | `flow.convert.iso-to-chd` |
 | `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
 | `inspect.expand-hfs` | yes | yes | yes | - | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |

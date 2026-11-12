@@ -8,6 +8,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod browse;
 #[cfg(target_os = "macos")]
+mod commander;
+#[cfg(target_os = "macos")]
 mod effects;
 #[cfg(target_os = "macos")]
 mod inspect;

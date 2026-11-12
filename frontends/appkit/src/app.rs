@@ -22,6 +22,7 @@ use rusty_backup::controller::app::{
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
@@ -127,6 +128,8 @@ pub struct App {
     log: Retained<NSTextView>,
     pages: Vec<(AppTab, Page)>,
     inspect: Rc<InspectScreen>,
+    /// Commander, while it is open, over the whole window.
+    commander: RefCell<Option<Rc<CommanderScreen>>>,
     log_shown: Cell<usize>,
     banner_shape: RefCell<Vec<bool>>,
     sync: SyncGuard,
@@ -169,6 +172,19 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for Delegate {
+        #[unsafe(method(windowShouldClose:))]
+        fn should_close(&self, _sender: &NSWindow) -> bool {
+            // Commander's staged edits would be lost: its controller asks, and may quit after.
+            let held = app().and_then(|a| a.commander.borrow().clone());
+            match held.filter(|c| c.has_staged_edits()) {
+                Some(c) => {
+                    c.hold_quit();
+                    false
+                }
+                None => true,
+            }
+        }
+
         #[unsafe(method(windowDidResize:))]
         fn did_resize(&self, _note: &NSNotification) {
             if let Some(app) = app() {
@@ -454,6 +470,7 @@ impl App {
             log,
             pages,
             inspect,
+            commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
             sync: SyncGuard::default(),
@@ -491,7 +508,46 @@ impl App {
         if self.inspect.take_backup_closed() {
             self.ctrl.borrow_mut().close_shared_backup();
         }
+        let commander = self.commander.borrow().clone();
+        if let Some(c) = commander {
+            c.tick();
+        }
         self.refresh();
+    }
+
+    /// Open Commander over the whole window; the toolbar and the screens hide until it closes.
+    fn open_commander(&self) {
+        if self.commander.borrow().is_some() {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let notify = self.ctrl.borrow().notify();
+        let jobs = rusty_backup::controller::commander::JobRegistry::new();
+        let on_close: Rc<dyn Fn()> = Rc::new(|| {
+            // The screen may still be on the stack: drop it once the action in hand is done.
+            later(Box::new(|| {
+                if let Some(app) = app() {
+                    app.close_commander();
+                }
+            }));
+        });
+        let screen = CommanderScreen::build(mtm, &jobs, &notify, self.host.clone(), on_close);
+        self.content.addSubview(&screen.page);
+        *self.commander.borrow_mut() = Some(screen);
+        self.toolbar.setVisible(false);
+        self.relayout();
+    }
+
+    fn close_commander(&self) {
+        let Some(screen) = self.commander.borrow_mut().take() else {
+            return;
+        };
+        screen.page.removeFromSuperview();
+        self.toolbar.setVisible(true);
+        self.refresh();
+        self.relayout();
     }
 
     fn command(&self, id: &str) {
@@ -500,6 +556,10 @@ impl App {
         }
         if let Some(tab) = crate::toolbar::tab_of(id) {
             self.apply(AppAction::SelectTab(tab));
+            return;
+        }
+        if id == ids::COMMANDER {
+            self.open_commander();
             return;
         }
         if id.starts_with("inspect.") {
@@ -598,21 +658,22 @@ impl App {
             }
             // Inspect's browse view stands in its page's place while it is open.
             let browsing = self.inspect.browse.is_active();
+            let covered = self.commander.borrow().is_some();
             for (t, page) in &self.pages {
                 let here = *t == tab && !(browsing && *t == AppTab::Inspect);
-                ui::set_visible(&page.scroll, here);
+                ui::set_visible(&page.scroll, here && !covered);
             }
-            ui::set_visible(
-                &self.inspect.browse.page,
-                browsing && tab == AppTab::Inspect,
-            );
+            let browse = browsing && tab == AppTab::Inspect && !covered;
+            ui::set_visible(&self.inspect.browse.page, browse);
         });
         if banner_was != banner.is_some() || shared_was != shared || self.banner_buttons_moved() {
             self.relayout();
         }
         self.sync_log(auto);
         let shared = self.ctrl.borrow().shared_backup().is_some();
+        let commander = self.commander.borrow().is_some();
         crate::menu::sync(&|id| match id {
+            ids::COMMANDER => Some(!commander),
             ids::CLOSE_BACKUP => Some(shared),
             ids::LOG_CLEAR | ids::LOG_AUTO_SCROLL => Some(true),
             _ if crate::toolbar::tab_of(id).is_some() => Some(true),
@@ -655,6 +716,27 @@ impl App {
         }
     }
 
+    /// After Commander: show the parts refresh does not manage, then let refresh decide the rest.
+    fn restore_parts(&self) {
+        for (p, v) in &self.parts {
+            let managed = matches!(
+                p,
+                Part::CloseBackup
+                    | Part::Refresh
+                    | Part::Elevate
+                    | Part::BannerText
+                    | Part::Install
+                    | Part::Restart
+                    | Part::Retry
+                    | Part::ViewRelease
+                    | Part::Dismiss
+            );
+            if !managed && v.isHidden() {
+                v.setHidden(false);
+            }
+        }
+    }
+
     /// Which banner buttons show changed since the last layout, so the row must be laid out again.
     fn banner_buttons_moved(&self) -> bool {
         let now: Vec<bool> = [Part::Install, Part::Restart, Part::Retry, Part::ViewRelease]
@@ -666,6 +748,20 @@ impl App {
 
     /// Place every view for the window's content area.
     fn relayout(&self) {
+        if let Some(c) = &*self.commander.borrow() {
+            // Commander covers the window; what is under it hides until it closes.
+            for (_, v) in &self.parts {
+                v.setHidden(true);
+            }
+            for (_, page) in &self.pages {
+                page.scroll.setHidden(true);
+            }
+            self.inspect.browse.page.setHidden(true);
+            ui::move_to(&c.page, ui::area(&self.content));
+            c.layout();
+            return;
+        }
+        self.restore_parts();
         let p = |x: Part| x;
         let rows = vec![
             Node::Row {
