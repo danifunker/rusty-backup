@@ -15,7 +15,7 @@ use objc2_app_kit::{
     NSTextField, NSTextView, NSToolbar, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
     NSWindowToolbarStyle,
 };
-use objc2_foundation::{NSNotification, NSPoint, NSRange, NSRect, NSSize};
+use objc2_foundation::{NSArray, NSNotification, NSPoint, NSRange, NSRect, NSSize, NSURL};
 use rusty_backup::controller::app::{
     about, app_version, elevation_button_hover, elevation_button_label, elevation_confirm,
     elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, InstallState,
@@ -156,6 +156,16 @@ define_class!(
             start(self.mtm());
         }
 
+        #[unsafe(method(application:openURLs:))]
+        fn open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
+            let paths: Vec<std::path::PathBuf> = urls
+                .iter()
+                .filter_map(|u| u.path())
+                .map(|p| std::path::PathBuf::from(p.to_string()))
+                .collect();
+            open_later(paths);
+        }
+
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn last_window_closed(&self, _app: &NSApplication) -> bool {
             true
@@ -184,6 +194,23 @@ define_class!(
         }
     }
 );
+
+thread_local! {
+    /// Files asked for before the app was built: opened once it is.
+    static PENDING: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Open `paths` in Inspect now, or once the app is built.
+fn open_later(paths: Vec<std::path::PathBuf>) {
+    match app() {
+        Some(app) => {
+            for p in paths {
+                app.open_file(p);
+            }
+        }
+        None => PENDING.with(|q| q.borrow_mut().extend(paths)),
+    }
+}
 
 /// Run the application until it quits.
 pub fn run() {
@@ -248,8 +275,16 @@ fn start(mtm: MainThreadMarker) {
         window.setToolbarStyle(NSWindowToolbarStyle::Expanded);
     }
     window.setToolbar(Some(&toolbar));
-    let content = ui::flipped(mtm);
-    window.setContentView(Some(&content));
+    let drop = ui::drop_view(
+        mtm,
+        Rc::new(|paths, at| {
+            if let Some(app) = app() {
+                app.dropped(paths, at);
+            }
+        }),
+    );
+    window.setContentView(Some(&drop));
+    let content: Retained<NSView> = Retained::into_super(drop);
     let app = App::build(mtm, window, content, toolbar, wake);
     DELEGATE.with(|d| {
         if let Some(delegate) = &*d.borrow() {
@@ -263,6 +298,11 @@ fn start(mtm: MainThreadMarker) {
     NSApplication::sharedApplication(mtm).activate();
     app.relayout();
     app.tick();
+    // A file named on the command line, then any Finder asked for while launching.
+    let named = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let mut pending: Vec<std::path::PathBuf> = named.into_iter().collect();
+    pending.extend(PENDING.with(|q| q.take()));
+    open_later(pending);
 }
 
 thread_local! {
@@ -597,6 +637,76 @@ impl App {
         }
         self.refresh();
         self.player_timer();
+    }
+
+    /// Files dropped from Finder: Commander takes them by pane, else the screen on show routes them.
+    fn dropped(&self, paths: Vec<std::path::PathBuf>, at: NSPoint) {
+        let commander = self.commander.borrow().clone();
+        match (commander, MainThreadMarker::new()) {
+            (Some(c), Some(mtm)) => c.drop_paths(mtm, paths, at),
+            _ => self.drop_on_tab(paths),
+        }
+    }
+
+    /// A drop on the window: Inspect's open volume takes it in Edit Mode, else the route says.
+    fn drop_on_tab(&self, paths: Vec<std::path::PathBuf>) {
+        use rusty_backup::controller::app::{DropRoute, DropTargets};
+        let Some(first) = paths.first().cloned() else {
+            return;
+        };
+        let tab = self.ctrl.borrow().active_tab();
+        if tab == AppTab::Inspect && self.inspect.drop_paths(paths) {
+            return;
+        }
+        let (inspect_remote, inspect_loaded) = self.inspect.drop_state();
+        let targets = DropTargets {
+            inspect_remote,
+            inspect_loaded,
+            optical_browsing: self.optical.browse.is_active(),
+        };
+        let route = self.ctrl.borrow_mut().route_drop(first, targets);
+        let tab = match route {
+            DropRoute::Inspect(path) => {
+                self.inspect.open_image(path);
+                AppTab::Inspect
+            }
+            DropRoute::Optical(path) => {
+                self.optical.open_image(path);
+                AppTab::Optical
+            }
+            DropRoute::Archives(path) => {
+                self.archives.open_path(path);
+                AppTab::Archives
+            }
+            DropRoute::Restore(path) => {
+                self.restore
+                    .apply(rusty_backup::controller::restore::RestoreAction::OpenDropped(path));
+                AppTab::Restore
+            }
+            DropRoute::Backup(path) => {
+                self.backup
+                    .apply(rusty_backup::controller::backup::BackupAction::OpenImage {
+                        path,
+                        rename: false,
+                    });
+                AppTab::Backup
+            }
+            DropRoute::Convert(path) => {
+                self.convert.open(path);
+                AppTab::Convert
+            }
+            DropRoute::Ignore => return,
+        };
+        self.apply(AppAction::SelectTab(tab));
+    }
+
+    /// A file Finder (or the command line) asks this app to open: Inspect opens it, as on Windows.
+    fn open_file(&self, path: std::path::PathBuf) {
+        if !path.exists() {
+            return;
+        }
+        self.apply(AppAction::SelectTab(AppTab::Inspect));
+        self.inspect.open_image(path);
     }
 
     /// Settings, one window at a time; Clear Recent Files reaches every screen's picker.

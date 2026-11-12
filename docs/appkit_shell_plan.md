@@ -100,8 +100,9 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
   macOS gets it too; the AppKit preview takes its own DMG, as Win32 takes its own ZIP.
 - **Drag and drop.** Drop routing goes through `AppController::route_drop` as in GTK. A drag *out*
   to Finder is a file promise (`NSFilePromiseProvider`); GTK never built its drag out.
-- **Packaging.** A second `.app` in the same DMG job, signed and notarized with the egui one; the
-  bundle id differs so both can be installed.
+- **Packaging.** Its own `.app` and DMG from the build-appkit job, signed and notarized like the
+  egui one (the updater expects the AppKit shell in a DMG of its own); the bundle id differs so
+  both can be installed.
 
 ## Slices
 
@@ -282,6 +283,21 @@ plus `--shell tui`.
   hand their image over. Every screen is now built, so the placeholder pages are gone (the
   `app.start` stand-in flow now checks Archives and Convert). Every tier 8 flow lists appkit,
   and all 64 pass locally. Left: drops and file open (8) and packaging (9).
+
+- **Slice 8, drops and file open (2026-11-12).** The window's content is a drop view taking
+  file URLs from Finder. Commander takes a drop by the pane under it (or asks which), and
+  plays the controller's drop plan; otherwise Inspect's browse view in Edit Mode stages it, or
+  `AppController::route_drop` picks the screen. Finder's open (`application:openURLs:`) and a
+  path on the command line open in Inspect, as on Windows; files asked for while launching
+  wait for the app to be built. No driver can drag yet, so drops have no tier 8 flow (none of
+  the shells has one); the command-line open was checked through the AX driver.
+
+- **Slice 9, packaging (2026-11-12).** `scripts/package-appkit.sh` builds "Rusty Backup
+  AppKit.app" (bundle id `io.github.danifunker.rusty-backup`, so it installs beside egui) and
+  `Rusty-Backup-AppKit-macos-<arch>-<version>.dmg`, the name the in-app updater looks for. Its
+  document types are `DISK_IMAGE_EXTS` at the Alternate rank: Finder's Open With lists it, and
+  it never takes a file type over. CI's build-appkit job signs, notarizes and uploads the DMG
+  as an artifact; like the Win32 preview, it is not attached to releases yet.
 
 ## Exit criteria
 

@@ -287,6 +287,17 @@ pub fn note(title: String, text: String) {
     });
 }
 
+/// A question the shell itself asks (which pane takes a drop): the button picked, Cancel none.
+pub fn ask(mtm: MainThreadMarker, title: &str, message: &str, buttons: &[String]) -> Option<usize> {
+    let a = alert(mtm, title, message);
+    for b in buttons {
+        a.addButtonWithTitle(&ns(b));
+    }
+    a.addButtonWithTitle(&ns("Cancel"));
+    let i = (a.runModal() - NSAlertFirstButtonReturn).max(0) as usize;
+    (i < buttons.len()).then_some(i)
+}
+
 fn confirm(mtm: MainThreadMarker, spec: &ConfirmSpec) -> bool {
     let a = alert(mtm, &spec.title, &spec.message);
     a.addButtonWithTitle(&ns(&spec.confirm_label));

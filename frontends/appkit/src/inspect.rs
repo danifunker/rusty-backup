@@ -587,6 +587,17 @@ impl InspectScreen {
         }
     }
 
+    /// Files dropped from Finder, staged into the browsed volume while it is in Edit Mode.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>) -> bool {
+        self.browse.drop_paths(paths)
+    }
+
+    /// Whether a remote session is open, and whether a local source is: where a drop may go.
+    pub fn drop_state(&self) -> (bool, bool) {
+        let ctrl = self.ctrl.borrow();
+        (ctrl.is_remote(), ctrl.has_local_source())
+    }
+
     /// Open an image file, as Build Disk's Open in Inspect asks.
     pub fn open_image(&self, path: PathBuf) {
         self.apply(InspectAction::Open(InspectSource::ImageFile(path)));

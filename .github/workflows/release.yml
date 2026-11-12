@@ -2085,6 +2085,7 @@ jobs:
     timeout-minutes: 60
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -2129,11 +2130,53 @@ jobs:
       - name: No AX on this runner
         if: steps.ax.outputs.trusted != 'true'
         run: echo "::notice::This runner does not grant AX; the appkit flows run on a self-hosted Mac (Gate 0)."
-      - name: Upload the binary
+      # Slice 9: its own .app and DMG, named as the in-app updater expects (src/update.rs).
+      - name: Import signing certificate
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+      - name: Package the app and DMG
+        env:
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          if [ "$HAS_SIGNING_CERT" = "true" ] && [ -n "$MACOS_TEAM_ID" ]; then
+            SIGN_IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            export SIGN_IDENTITY
+          fi
+          scripts/package-appkit.sh frontends/appkit/target/release/rusty-backup-appkit \
+            "${{ needs.generate-version.outputs.version }}" arm64 .
+      - name: Notarize the DMG
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          DMG_FILE="Rusty-Backup-AppKit-macos-arm64-${{ needs.generate-version.outputs.version }}.dmg"
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+            --password "$MACOS_NOTARIZE_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG_FILE"
+      - name: Upload the DMG
         uses: actions/upload-artifact@v7
         with:
-          name: Rusty-Backup-AppKit-preview-arm64-${{ needs.generate-version.outputs.version }}
-          path: frontends/appkit/target/release/rusty-backup-appkit
+          name: Rusty-Backup-AppKit-macos-arm64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-AppKit-macos-arm64-${{ needs.generate-version.outputs.version }}.dmg
 
   # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.

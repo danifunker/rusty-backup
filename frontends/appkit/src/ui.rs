@@ -5,17 +5,20 @@
 //! [`Target`], which hands the sender's id to `app::command`.
 
 use std::cell::{OnceCell, RefCell};
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSBackingStoreType, NSButton, NSControl, NSControlTextEditingDelegate,
-    NSMenuItem, NSProgressIndicator, NSProgressIndicatorStyle, NSTextDelegate, NSTextField,
+    NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSMenuItem, NSPasteboardTypeFileURL,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSTextDelegate, NSTextField,
     NSTextFieldDelegate, NSTextViewDelegate, NSToolbarItem, NSUserInterfaceItemIdentification,
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use crate::layout::Rect;
 
@@ -54,6 +57,80 @@ define_class!(
         }
     }
 );
+
+define_class!(
+    /// The main window's content: a flipped view that takes files dragged in from Finder.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBDropView"]
+    #[ivars = RefCell<Option<Rc<dyn Fn(Vec<PathBuf>, NSPoint)>>>]
+    pub struct DropView;
+
+    unsafe impl NSObjectProtocol for DropView {}
+
+    unsafe impl NSDraggingDestination for DropView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            match dropped_paths(info).is_empty() {
+                true => NSDragOperation::None,
+                false => NSDragOperation::Copy,
+            }
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let paths = dropped_paths(info);
+            let at = info.draggingLocation();
+            let f = self.ivars().borrow().clone();
+            match (paths.is_empty(), f) {
+                (false, Some(f)) => {
+                    // The drop may ask a question: answer the drag first.
+                    crate::app::later(Box::new(move || f(paths, at)));
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    impl DropView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+/// The file paths a drag carries.
+fn dropped_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
+    let board = info.draggingPasteboard();
+    let Some(items) = board.pasteboardItems() else {
+        return Vec::new();
+    };
+    // SAFETY: the system's own pasteboard type constant.
+    let kind = unsafe { NSPasteboardTypeFileURL };
+    items
+        .iter()
+        .filter_map(|item| item.stringForType(kind))
+        .filter_map(|url| NSURL::URLWithString(&url))
+        .filter_map(|url| url.path())
+        .map(|p| PathBuf::from(p.to_string()))
+        .collect()
+}
+
+/// A drop view that hands `f` the dropped paths and the point, in window coordinates.
+pub fn drop_view(
+    mtm: MainThreadMarker,
+    f: Rc<dyn Fn(Vec<PathBuf>, NSPoint)>,
+) -> Retained<DropView> {
+    let this = mtm.alloc::<DropView>().set_ivars(RefCell::new(Some(f)));
+    // SAFETY: NSView's designated initialiser.
+    let v: Retained<DropView> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+    // SAFETY: the system's own pasteboard type constant.
+    let kind = unsafe { NSPasteboardTypeFileURL };
+    v.registerForDraggedTypes(&NSArray::from_slice(&[kind]));
+    v
+}
 
 define_class!(
     /// A window's delegate that hands a close to its owner, which decides when the window goes.

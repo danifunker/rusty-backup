@@ -22,7 +22,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::commander::{
-    ids, BrowserPaneAction as P, CommanderAction as A, CommanderController, CopyColumn,
+    ids, BrowserPaneAction as P, CommanderAction as A, CommanderController, CopyColumn, DropPlan,
     ExportFormat, JobRegistry, PaneServices, PaneWindow, ResourceForkMode, Side, SideBars,
     FOLLOW_DELAY,
 };
@@ -794,6 +794,64 @@ impl CommanderScreen {
     }
 
     /// Staged edits would be lost if the window closed now.
+    /// Files dropped from Finder at window point `at`: the pane under it takes them, else ask.
+    pub fn drop_paths(&self, mtm: MainThreadMarker, paths: Vec<PathBuf>, at: NSPoint) {
+        let Some(first) = paths.first() else {
+            return;
+        };
+        let under = [Side::Left, Side::Right].into_iter().find(|side| {
+            let scroll = &self.sides[idx(*side)].pane.list_scroll;
+            let p = scroll.convertPoint_fromView(at, None);
+            let b = scroll.bounds();
+            p.x >= 0.0 && p.y >= 0.0 && p.x <= b.size.width && p.y <= b.size.height
+        });
+        let side = match under {
+            Some(side) => side,
+            None => {
+                let what = match paths.len() {
+                    1 => format!(
+                        "\"{}\"",
+                        first.file_name().map_or_else(
+                            || first.display().to_string(),
+                            |n| n.to_string_lossy().into_owned()
+                        )
+                    ),
+                    n => format!("these {n} items"),
+                };
+                let message = format!("Which pane should take {what}?");
+                let buttons = ["Left pane".to_string(), "Right pane".to_string()];
+                match crate::effects::ask(mtm, "Dropped files", &message, &buttons) {
+                    Some(0) => Side::Left,
+                    Some(1) => Side::Right,
+                    _ => return,
+                }
+            }
+        };
+        let plan = self.ctrl.borrow().drop_plan(side, &paths);
+        let actions = match plan {
+            None => return,
+            Some(DropPlan::Do(actions)) => actions,
+            Some(DropPlan::Ask {
+                title,
+                question,
+                choices,
+            }) => {
+                let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
+                let Some(i) = crate::effects::ask(mtm, &title, &question, &labels) else {
+                    return;
+                };
+                choices
+                    .into_iter()
+                    .nth(i)
+                    .map(|(_, a)| a)
+                    .unwrap_or_default()
+            }
+        };
+        for a in actions {
+            self.apply(a);
+        }
+    }
+
     pub fn has_staged_edits(&self) -> bool {
         self.ctrl.borrow().has_staged_edits()
     }
