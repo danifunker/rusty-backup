@@ -29,6 +29,9 @@ Rusty Backup ships as a single self-contained binary per platform.
      Later updates install from the update banner (**Download & Install Update**):
      the app checks the new DMG's signature before it replaces itself, and
      opens the DMG for you instead when it cannot write to its own folder.
+     A native AppKit preview ships beside it as `Rusty-Backup-AppKit-macos-*.dmg`
+     (`Rusty Backup AppKit.app`, its own bundle id, so both can be installed);
+     it updates itself the same way.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
    Linux, an authorisation prompt on macOS). Working with image files on disk

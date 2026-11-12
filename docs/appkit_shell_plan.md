@@ -306,6 +306,12 @@ plus `--shell tui`.
   and the remote-Inspect flow sets AppKit's modal prompt over AX, since posted keys never
   reach it there.
 
+- **Releases (2026-11-12).** The build-appkit job is a matrix: arm64, and x64 cross-built on the
+  same runner with its tier 8 flows run under Rosetta. Each leg signs and notarizes its own
+  `Rusty-Backup-AppKit-macos-<arch>-<version>.dmg`, and the release job publishes both beside
+  egui's DMGs as "native AppKit preview" rows, so the in-app updater finds them. A failed leg
+  never holds a release back.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the
