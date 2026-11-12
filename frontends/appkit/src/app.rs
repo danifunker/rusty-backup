@@ -27,6 +27,7 @@ use crate::archives::ArchivesScreen;
 use crate::backup::BackupScreen;
 use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
+use crate::convert::ConvertScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
@@ -64,32 +65,17 @@ enum Part {
 struct Page {
     scroll: Retained<NSScrollView>,
     body: Retained<NSView>,
-    /// The placeholder of a screen a later slice builds.
-    note: Option<Retained<NSTextField>>,
 }
 
 impl Page {
-    fn new(mtm: MainThreadMarker, tab: AppTab) -> Page {
+    fn new(mtm: MainThreadMarker) -> Page {
         let scroll = NSScrollView::initWithFrame(mtm.alloc(), NSRect::ZERO);
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setDrawsBackground(false);
         let body = ui::flipped(mtm);
         scroll.setDocumentView(Some(&body));
-        let note = slice(tab).map(|n| {
-            let note = ui::label(mtm, &format!("{} arrives in slice {n}.", tab.label()));
-            body.addSubview(&note);
-            note
-        });
-        Page { scroll, body, note }
-    }
-
-    /// Lay the placeholder out; a built screen lays out its own body through [`place_page`].
-    fn relayout(&self) {
-        if let Some(note) = &self.note {
-            let tree = Node::inset(Node::field(()), layout::MARGIN);
-            place_page(&self.body, &tree, &|_, r| ui::move_to(note, r));
-        }
+        Page { scroll, body }
     }
 }
 
@@ -111,15 +97,6 @@ pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout
     }
 }
 
-/// Which slice brings each screen not built yet (docs/appkit_shell_plan.md).
-fn slice(tab: AppTab) -> Option<&'static str> {
-    match tab {
-        AppTab::Inspect | AppTab::Backup | AppTab::Restore | AppTab::Build => None,
-        AppTab::Optical | AppTab::Archives => None,
-        AppTab::Convert => Some("7c"),
-    }
-}
-
 pub struct App {
     ctrl: RefCell<AppController>,
     wake: Arc<MacWake>,
@@ -138,6 +115,7 @@ pub struct App {
     build: Rc<BuildScreen>,
     archives: Rc<ArchivesScreen>,
     optical: Rc<OpticalScreen>,
+    convert: Rc<ConvertScreen>,
     settings: RefCell<Option<Rc<SettingsWindow>>>,
     /// A tick is queued for the playing track's position.
     player_tick: Cell<bool>,
@@ -427,7 +405,7 @@ impl App {
         let pages: Vec<(AppTab, Page)> = AppTab::ALL
             .iter()
             .map(|t| {
-                let page = Page::new(mtm, *t);
+                let page = Page::new(mtm);
                 content.addSubview(&page.scroll);
                 page.scroll.setHidden(true);
                 (*t, page)
@@ -495,6 +473,8 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        let convert =
+            ConvertScreen::build(mtm, body_of(AppTab::Convert), ctrl.notify(), host.clone());
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
         content.addSubview(&optical.browse.page);
@@ -539,6 +519,7 @@ impl App {
             build,
             archives,
             optical,
+            convert,
             player_tick: Cell::new(false),
             settings: RefCell::default(),
             commander: RefCell::default(),
@@ -585,7 +566,15 @@ impl App {
         self.build.tick();
         self.archives.tick();
         self.optical.tick();
+        self.convert.tick();
         self.share_backup();
+        for path in [self.inspect.take_convert(), self.optical.take_convert()]
+            .into_iter()
+            .flatten()
+        {
+            self.apply(AppAction::SelectTab(AppTab::Convert));
+            self.convert.open(path);
+        }
         if let Some(path) = self.inspect.take_optical() {
             self.apply(AppAction::SelectTab(AppTab::Optical));
             self.optical.open_image(path);
@@ -668,6 +657,7 @@ impl App {
                 self.build.is_running().then_some("Build Disk"),
             ),
             ("Optical", self.optical.is_running().then_some("Optical")),
+            ("Convert", self.convert.is_running().then_some("Convert")),
         ];
         let elsewhere = |me: &str| {
             running
@@ -680,6 +670,7 @@ impl App {
         self.build.set_busy(elsewhere("Build Disk"));
         self.archives.set_busy(elsewhere("Archives"));
         self.optical.set_busy(elsewhere("Optical"));
+        self.convert.set_busy(elsewhere("Convert"));
     }
 
     /// Restore and Inspect share a backup folder: the screen on show publishes or adopts it.
@@ -1029,7 +1020,6 @@ impl App {
             if *part == Part::Page {
                 for (_, page) in &self.pages {
                     ui::move_to(&page.scroll, *r);
-                    page.relayout();
                 }
                 self.inspect.relayout();
                 self.backup.relayout();
@@ -1037,6 +1027,7 @@ impl App {
                 self.build.relayout();
                 self.archives.relayout();
                 self.optical.relayout();
+                self.convert.relayout();
                 ui::move_to(&self.inspect.browse.page, *r);
                 self.inspect.browse.layout();
                 ui::move_to(&self.optical.browse.page, *r);

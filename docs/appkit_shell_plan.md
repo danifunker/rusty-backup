@@ -276,6 +276,13 @@ plus `--shell tui`.
   pass, and all 63 appkit flows pass. The metadata editor is the browse view's and already
   ships with slice 2; Convert (7c) is next.
 
+- **Slice 7c, Convert (2026-11-12).** `convert.rs` over `ConvertController`: the source, the
+  output, a format and extension per image kind, the three CHD profiles' options, the size and
+  floppy choices, and the file list with its tick boxes. Inspect's and Optical's Convert...
+  hand their image over. Every screen is now built, so the placeholder pages are gone (the
+  `app.start` stand-in flow now checks Archives and Convert). Every tier 8 flow lists appkit,
+  and all 64 pass locally. Left: drops and file open (8) and packaging (9).
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

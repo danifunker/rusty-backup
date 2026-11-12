@@ -20,6 +20,7 @@ mod build_rows;
 mod chd;
 #[cfg(target_os = "macos")]
 mod commander;
+mod convert;
 mod disk_write;
 #[cfg(target_os = "macos")]
 mod editor;

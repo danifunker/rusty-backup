@@ -21,7 +21,7 @@ ui = [
   { tab = "Archives" },
   { wait = "No archive selected" },
   { tab = "Convert" },
-  { wait = "Convert arrives in slice" },
+  { wait = "Choose Folder..." },
   { activate = "log.clear" },
   { expect = "Copy Log" },
 ]

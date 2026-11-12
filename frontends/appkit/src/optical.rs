@@ -4,7 +4,7 @@
 //! tools (Browse Contents, Close Disc, CHD Info, Audio Tracks), the rip's output form, and Start /
 //! Cancel. An image converts in the Convert screen, so image mode offers Convert... instead. The
 //! disc browser is a `BrowseView` in disc mode, shown in the screen's place while it is open, and
-//! the CD-DA player is its own window. Add remote daemon is `optical_remote.rs`; Convert comes with 7c.
+//! the CD-DA player is its own window. Add remote daemon is `optical_remote.rs`; Convert... hands the image to the Convert screen.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -276,6 +276,9 @@ pub struct OpticalScreen {
     pub browse: Rc<BrowseView>,
     chd_window: RefCell<Option<ReportWindow>>,
     add_remote_window: RefCell<Option<Rc<AddRemoteWindow>>>,
+    /// The disc image Convert... asked to hand to the Convert screen, once.
+    convert_asked: RefCell<Option<PathBuf>>,
+    notify: Arc<dyn Notify>,
     audio_window: RefCell<Option<Rc<AudioWindow>>>,
 }
 
@@ -344,14 +347,7 @@ impl OpticalScreen {
             f.label(K::Output, "");
             f.button(K::PickOutput, "Browse...", ids::PICK_OUTPUT);
             f.check(K::EjectAfter, "Eject after ripping", ids::EJECT_AFTER);
-            let convert = ui::later(
-                mtm,
-                labels::CONVERT,
-                ids::CONVERT,
-                "Arrives in slice 7c (the Convert screen).",
-            );
-            f.add(K::Convert, &convert);
-            convert.setEnabled(false);
+            f.button(K::Convert, labels::CONVERT, ids::CONVERT);
             f.wrap(K::ConvertNote, hints::CONVERT_MOVED);
             f.label(K::Target, "");
             f.wrap(K::Outcome, "");
@@ -362,7 +358,7 @@ impl OpticalScreen {
             f.label(K::Why, "");
             OpticalScreen {
                 mtm,
-                ctrl: RefCell::new(OpticalController::new(notify)),
+                ctrl: RefCell::new(OpticalController::new(notify.clone())),
                 host,
                 recent_files: RefCell::new(recent.list(RecentMode::Optical)),
                 recent,
@@ -375,6 +371,8 @@ impl OpticalScreen {
                 browse,
                 chd_window: RefCell::default(),
                 add_remote_window: RefCell::default(),
+                convert_asked: RefCell::default(),
+                notify: notify.clone(),
                 audio_window: RefCell::default(),
             }
         });
@@ -393,6 +391,11 @@ impl OpticalScreen {
 
     pub fn is_running(&self) -> bool {
         self.ctrl.borrow().is_running()
+    }
+
+    /// The disc image Convert... asked to hand to the Convert screen, once.
+    pub fn take_convert(&self) -> Option<PathBuf> {
+        self.convert_asked.borrow_mut().take()
     }
 
     /// Open `path` as the image source (Inspect's hand-off, or the File menu).
@@ -723,6 +726,7 @@ impl OpticalScreen {
         );
         f.set_check(K::EjectAfter, ctrl.eject_after());
         f.show(K::Convert, !rip);
+        f.enable(K::Convert, ctrl.convert_source().is_some());
         f.show(K::ConvertNote, !rip);
 
         let running = ctrl.is_running();
@@ -930,6 +934,12 @@ impl OpticalScreen {
             K::PickOutput => Some(OpticalAction::PickOutput),
             K::EjectAfter => Some(OpticalAction::SetEjectAfter(f.checked(k))),
             K::Start => self.start(),
+            K::Convert => {
+                *self.convert_asked.borrow_mut() = self.ctrl.borrow().convert_source();
+                // No action reaches the app loop from here, so wake it to take the request.
+                self.notify.wake();
+                None
+            }
             K::Cancel => Some(OpticalAction::Cancel),
             _ => None,
         };

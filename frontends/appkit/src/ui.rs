@@ -249,14 +249,6 @@ pub fn set_progress(bar: &NSProgressIndicator, running: bool, pct: Option<u32>) 
     }
 }
 
-/// A button that shows but stays off until the slice that builds its window (`why`).
-pub fn later(mtm: MainThreadMarker, title: &str, id: &str, why: &str) -> Retained<NSButton> {
-    let b = button(mtm, title, id);
-    b.setEnabled(false);
-    b.setToolTip(Some(&ns(why)));
-    b
-}
-
 /// The one action target; it lives as long as the app.
 pub fn target(mtm: MainThreadMarker) -> Retained<Target> {
     TARGET.with(|t| {

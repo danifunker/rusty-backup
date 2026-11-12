@@ -70,13 +70,6 @@ pub const DEVICE_ITEM: &str = "inspect.source.device.";
 const CHECK_CLOSE: &str = "inspect.check.close";
 const CHD_CLOSE: &str = "inspect.chd_info.close";
 
-/// Tools whose windows a later slice builds: they show, stay off and say when they come.
-const LATER: [(&str, &str); 1] = [(ids::CONVERT, "Arrives in slice 7c (the Convert screen).")];
-
-fn later(id: &str) -> Option<&'static str> {
-    LATER.iter().find(|(i, _)| *i == id).map(|(_, why)| *why)
-}
-
 fn cell(row: &PartitionRow, column: usize) -> String {
     match column {
         0 => row.number.clone(),
@@ -205,6 +198,7 @@ pub struct InspectScreen {
     /// A disc or archive Inspect handed to the Optical or Archives screen, once.
     optical: RefCell<Option<PathBuf>>,
     archive: RefCell<Option<PathBuf>>,
+    convert: RefCell<Option<PathBuf>>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
     body: Retained<NSView>,
@@ -239,12 +233,7 @@ impl InspectScreen {
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<Self> {
-        let button = |title: &str, id: &str| -> Retained<NSButton> {
-            match later(id) {
-                Some(why) => ui::later(mtm, title, id, why),
-                None => ui::button(mtm, title, id),
-            }
-        };
+        let button = |title: &str, id: &str| -> Retained<NSButton> { ui::button(mtm, title, id) };
         let source = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, true);
         ui::set_id(&source, ids::SOURCE);
         let note = ui::label(mtm, "");
@@ -372,6 +361,7 @@ impl InspectScreen {
             backup_closed: Cell::new(false),
             optical: RefCell::default(),
             archive: RefCell::default(),
+            convert: RefCell::default(),
             sync: SyncGuard::default(),
             me: me.clone(),
             body,
@@ -426,14 +416,9 @@ impl InspectScreen {
         self.part(p).downcast_ref::<NSButton>()
     }
 
-    /// Enable a tool, unless a later slice brings its window.
     fn set_enabled(&self, p: Part, on: bool) {
         if let Some(b) = self.button(p) {
-            let id =
-                objc2_app_kit::NSAccessibility::accessibilityIdentifier(b).map(|i| i.to_string());
-            if later(id.as_deref().unwrap_or("")).is_none() {
-                ui::set_enabled(b, on);
-            }
+            ui::set_enabled(b, on);
         }
     }
 
@@ -497,6 +482,11 @@ impl InspectScreen {
     /// The backup folder open here, for the share with Restore.
     pub fn loaded_backup(&self) -> Option<PathBuf> {
         self.ctrl.borrow().backup_folder().map(PathBuf::from)
+    }
+
+    /// The image Convert... asked the Convert screen to take, once.
+    pub fn take_convert(&self) -> Option<PathBuf> {
+        self.convert.borrow_mut().take()
     }
 
     /// The optical image Inspect asked the Optical screen to open, once.
@@ -681,6 +671,11 @@ impl InspectScreen {
             }
             remote_ids::BACKUP => InspectAction::BackupRemote,
             remote_ids::CLOSE => InspectAction::Unload { quiet: true },
+            ids::CONVERT => {
+                *self.convert.borrow_mut() = self.ctrl.borrow().convert_source();
+                // No action reaches the app loop from here, so wake it to take the request.
+                return self.notify.wake();
+            }
             ids::EDIT_TABLE => InspectAction::EditTable,
             ids::EXPORT => InspectAction::OpenExport,
             ids::CANCEL_EXPORT => InspectAction::CancelExport,
