@@ -85,7 +85,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32 appkit.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -109,6 +109,7 @@ jobs:
       crates-msrv: ${{ steps.p.outputs.crates-msrv }}
       gtk4: ${{ steps.p.outputs.gtk4 }}
       win32: ${{ steps.p.outputs.win32 }}
+      appkit: ${{ steps.p.outputs.appkit }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -124,7 +125,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32 appkit"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -2073,6 +2074,58 @@ jobs:
         with:
           name: Rusty-Backup-Win32-preview-x64-${{ needs.generate-version.outputs.version }}
           path: frontends/win32/target/release/rusty-backup-win32.exe
+
+  # The AppKit shell (docs/appkit_shell_plan.md): not shipped yet; it must keep compiling, and its
+  # tier 8 flows run over AX where the runner grants the permission (Gate 0, probed below).
+  build-appkit:
+    name: Build AppKit shell (arm64)
+    needs: [generate-version, plan]
+    if: needs.plan.outputs.appkit == 'true'
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    timeout-minutes: 60
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        working-directory: frontends/appkit
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Layout tests
+        working-directory: frontends/appkit
+        run: cargo test --locked
+      - name: Build
+        working-directory: frontends/appkit
+        run: cargo build --locked --release
+      - name: Gate 0 - does this runner grant AX?
+        id: ax
+        shell: bash
+        run: |
+          printf 'import ApplicationServices\nprint(AXIsProcessTrusted())\n' > "$RUNNER_TEMP/ax.swift"
+          swiftc -o "$RUNNER_TEMP/ax" "$RUNNER_TEMP/ax.swift"
+          trusted=$("$RUNNER_TEMP/ax")
+          echo "AXIsProcessTrusted: $trusted"
+          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
+      - name: Build rb-cli and rb-regress
+        if: steps.ax.outputs.trusted == 'true'
+        run: |
+          cargo build --locked --release --bin rb-cli
+          cargo build --locked --release --manifest-path regression-tests/runner/Cargo.toml
+      - name: Tier 8 flows over AX
+        if: steps.ax.outputs.trusted == 'true'
+        working-directory: regression-tests
+        run: ./runner/target/release/rb-regress run --tiers 8 --shell appkit --no-prompt
+      - name: No AX on this runner
+        if: steps.ax.outputs.trusted != 'true'
+        run: echo "::notice::This runner does not grant AX; the appkit flows run on a self-hosted Mac (Gate 0)."
+      - name: Upload the binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-AppKit-preview-arm64-${{ needs.generate-version.outputs.version }}
+          path: frontends/appkit/target/release/rusty-backup-appkit
 
   # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.

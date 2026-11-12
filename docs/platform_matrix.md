@@ -27,7 +27,8 @@ of rb-cli pulls no GUI dependencies.
 | Windows 10/11 x64, i686 | windows | modern | egui GUI + rb-cli, Inno installer; the Win32 shell (`rusty-backup-win32.exe`, a preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
 | Windows Win32 shell (x64) | win32 | modern | checks only: clippy, layout tests and the UIA flows for `frontends/win32/`; the exe ships from the windows and windows-arm64 targets | Win32 (Phase 5) | stable | shell features | Windows 10 1809+; the UIA flows run in CI with Python and comtypes |
 | Windows 11 ARM64 | windows-arm64 | modern | egui GUI + rb-cli; the Win32 shell (preview) as its own ZIP and installer | Win32 (Phase 5) | stable | default + gui | |
-| macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3, first) | stable | default + gui | |
+| macOS 10.13+ arm64, x64 | macos | modern | egui .app + rb-cli, DMG | AppKit (Phase 3) | stable | default + gui | |
+| macOS AppKit shell (arm64) | appkit | modern | checks only: clippy, layout tests and the build of `frontends/appkit/`, plus its tier 8 flows over AX where the runner grants the permission; not shipped yet (slice 9 adds the second .app to the DMG) | AppKit (Phase 3) | stable | shell features | macOS 10.13+; the AX flows need the Accessibility permission (Gate 0); slice 0: the window, screen toolbar, log, menus and effect host, the screens still placeholders |
 | Linux x64, arm64 (AppImage) | appimage | modern | egui AppImage + rb-cli | GTK4 (Phase 4); GTK3 for old distros | stable | default + gui | |
 | Linux x64, arm64 (deb, rpm, Arch) | linux-packages | modern | egui GUI + rb-cli packages | GTK4 (Phase 4) | stable | default + gui | x64 builds in docker/linux-packages-focal.Dockerfile (Ubuntu 20.04, glibc 2.31) on the libchdman glibc 2.31 prebuilt; arm64 builds on the 24.04 runner and needs glibc 2.39 |
 | Linux GTK4 shell (x64, arm64: AppImage, deb, rpm, Arch; riscv64: deb, rpm, tar) | gtk4 | modern | `rusty-backup-gtk` (`frontends/gtk4/`), in releases as a preview beside egui: packages built natively on x64 / arm64, cross-built for riscv64, and an AppImage that bundles GTK4 and libadwaita | GTK4 (Phase 4) | stable (gtk4-rs needs >= 1.92) | shell features | the packages need GTK >= 4.14 and libadwaita >= 1.5 (the AppImage does not); links ALSA (libasound) for the CD-DA player; the GUI suite and the AppImage smoke run on x64 only; riscv64 is build-only |
@@ -53,7 +54,7 @@ for wasm32) is a CI target too; the check script knows it.
 | egui | `src/gui/` | the modern GUI rows, until Phase 7 retires it |
 | TUI | `src/cli/verbs/tui*` (ratatui) | every rb-cli row |
 | GTK4 + libadwaita | `frontends/gtk4/` (shipped as a preview beside egui since 2026-11-08; CI target `gtk4`) | Linux modern, Phase 4 |
-| AppKit | `frontends/appkit/` (not yet; [appkit_shell_plan.md](appkit_shell_plan.md)) | macOS modern, Phase 3 |
+| AppKit | `frontends/appkit/` (the skeleton, slice 0; CI target `appkit`; [appkit_shell_plan.md](appkit_shell_plan.md)) | macOS modern, Phase 3 |
 | Win32 | `frontends/win32/` (the skeleton, slice 0; CI target `win32`; [win32_shell_plan.md](win32_shell_plan.md)) | Windows modern, Phase 5 |
 | Vintage shells | `frontends-vintage/` (not yet) | Phase 6 |
 

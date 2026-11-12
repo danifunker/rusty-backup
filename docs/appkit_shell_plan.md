@@ -2,8 +2,8 @@
 
 Phase 3 of [native_frontends_plan.md](native_frontends_plan.md). Drafted 2026-11-09 from what the
 GTK4 shell ([gtk4_shell_plan.md](gtk4_shell_plan.md)) and the tier 8 flows
-([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started: second, after
-the Win32 shell (main plan D7), which settles Phase 2b and the driver pattern first.
+([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Second, after the Win32 shell
+(main plan D7). **Slice 0 under way (2026-11-11)**; see "Progress" below.
 
 The shell is `frontends/appkit/`: AppKit through `objc2` / `objc2-app-kit` 0.3 (the versions the
 engine already links for IOKit and DiskArbitration), a pure view over `rusty_backup::controller`,
@@ -133,6 +133,26 @@ permission. Locally that is one grant to the terminal or Python. On GitHub's mac
 whether it is already granted (UI-testing images often are); if not, the AX flows run on a
 self-hosted Mac (named in the gitignored `local.toml`, never in the repo) and CI keeps the build
 plus `--shell tui`.
+
+## Progress
+
+- **Slice 0 (2026-11-11), built, not yet seen under the driver.** `frontends/appkit/`: its own
+  workspace and lockfile, `MACOSX_DEPLOYMENT_TARGET` 10.13 in its `.cargo/config.toml`. The window
+  with the D9 screen toolbar (`toolbar.rs`, an `NSToolbar` of selectable items, the shared PNGs
+  as template images, Commander at the right end and off until slice 3), the top bar, update
+  banner, a page per screen (a scroll view over a flipped body, holding a placeholder until its
+  slice), the status line and the log (`app.rs`); the menu bar (`menu.rs`); the effect host
+  (`effects.rs`: open and save panels after the scripted pick, alerts for Confirm and Choose, a
+  prompt with the controller's validator run as the user types, the pasteboard, URLs), with every
+  question opened from a main-queue block of its own; `MacWake` queues one tick on the main queue.
+  `layout.rs` is the Win32 shell's tree (prune, then measure), so hidden views take no room;
+  every control's action goes to one target that reads the sender's controller id.
+  `scripts/check-boundaries.sh` enforces `frontends/appkit/src` from the start, and CI target
+  `appkit` runs clippy, the layout tests, the build and the Gate 0 probe.
+- **The driver**: `drivers/ax_driver.swift` (the UIA driver's protocol and ops) and
+  `runner/src/ax.rs`, which builds it with `swiftc` into `runner/target/` and passes it
+  `--appkit <binary>`. Gate 0 locally: the session that built it had no Accessibility permission,
+  so the driver refuses to start until the user grants it.
 
 ## Exit criteria
 
