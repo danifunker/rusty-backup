@@ -190,6 +190,18 @@ plus `--shell tui`.
   `NSPopUpButton::itemAtIndex` raises on an empty menu, and a raised Objective-C exception
   inside a delegate callback silently ends it, so the window never appeared; ask the count first.
 
+- **Slice 2 (2026-11-12), the browse view.** `browse.rs` over the single-pane
+  `CommanderController`, as the Win32 view: the volume line and header tools, the edit bar, the
+  job line with Cancel, notices, the folder tree and listing (`pane_view.rs`: an `NSTableView`
+  subclass that hands unused keys to the controller's key map and reports right-clicks, with
+  tick boxes, the row icons from `assets/icons/rows` and the indent of a row inside a folder),
+  the side panel over its text or hex preview, the status line and mark bar, the View and row
+  menus (`popup.rs`), and every window the controller describes (`model_window.rs`, Win32's
+  `window.rs` in AppKit). A window's actions reach the view from a main-queue block of their
+  own (`app::later`), since the owner may rebuild the window that sent them. Inspect's Browse
+  opens it in the page's place. `flow.browse.inspect-extract-all`, `-new-folder` and
+  `-edit-text` pass on `appkit`.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

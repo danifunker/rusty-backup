@@ -268,4 +268,4 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32 | a file out of the CHD against the same file out of the ISO |
 | `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32 | against `rb-cli archive extract` |
 | `audio.toml` | play a CD-DA track | gtk, win32 (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
-| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32 | the TUI can join once its extract-to-folder step is checked |
+| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32, appkit | the TUI can join once its extract-to-folder step is checked |

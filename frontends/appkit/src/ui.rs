@@ -10,11 +10,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSBackingStoreType, NSButton, NSControl, NSMenuItem, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSTextField, NSToolbarItem, NSUserInterfaceItemIdentification,
+    NSAccessibility, NSBackingStoreType, NSButton, NSControl, NSControlTextEditingDelegate,
+    NSMenuItem, NSProgressIndicator, NSProgressIndicatorStyle, NSTextDelegate, NSTextField,
+    NSTextFieldDelegate, NSTextViewDelegate, NSToolbarItem, NSUserInterfaceItemIdentification,
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString};
 
 use crate::layout::Rect;
 
@@ -59,7 +60,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "RBCloseDelegate"]
-    #[ivars = Box<dyn Fn()>]
+    #[ivars = (Box<dyn Fn()>, RefCell<Option<Box<dyn Fn()>>>)]
     pub struct CloseDelegate;
 
     unsafe impl NSObjectProtocol for CloseDelegate {}
@@ -67,11 +68,95 @@ define_class!(
     unsafe impl NSWindowDelegate for CloseDelegate {
         #[unsafe(method(windowShouldClose:))]
         fn should_close(&self, _sender: &NSWindow) -> bool {
-            (self.ivars())();
+            (self.ivars().0)();
             false
+        }
+
+        #[unsafe(method(windowDidResize:))]
+        fn did_resize(&self, _note: &NSNotification) {
+            if let Some(f) = &*self.ivars().1.borrow() {
+                f();
+            }
         }
     }
 );
+
+impl CloseDelegate {
+    /// Run `f` whenever the window is resized, to lay it out again.
+    pub fn on_resize(&self, f: Box<dyn Fn()>) {
+        *self.ivars().1.borrow_mut() = Some(f);
+    }
+}
+
+define_class!(
+    /// An action target that runs a closure with the sender, for a window's own controls.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBCallback"]
+    #[ivars = Box<dyn Fn(&AnyObject)>]
+    pub struct Callback;
+
+    unsafe impl NSObjectProtocol for Callback {}
+
+    impl Callback {
+        #[unsafe(method(fire:))]
+        fn fire(&self, sender: Option<&AnyObject>) {
+            if let Some(s) = sender {
+                (self.ivars())(s);
+            }
+        }
+    }
+);
+
+define_class!(
+    /// A text field's or text view's delegate that runs a closure on every change.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBTextChange"]
+    #[ivars = Box<dyn Fn()>]
+    pub struct TextChange;
+
+    unsafe impl NSObjectProtocol for TextChange {}
+    unsafe impl NSControlTextEditingDelegate for TextChange {}
+    unsafe impl NSTextFieldDelegate for TextChange {}
+    unsafe impl NSTextDelegate for TextChange {}
+    unsafe impl NSTextViewDelegate for TextChange {}
+
+    impl TextChange {
+        #[unsafe(method(controlTextDidChange:))]
+        fn field_changed(&self, _note: &NSNotification) {
+            (self.ivars())();
+        }
+
+        #[unsafe(method(textDidChange:))]
+        fn view_changed(&self, _note: &NSNotification) {
+            (self.ivars())();
+        }
+    }
+);
+
+/// A target running `f`; the caller keeps it as long as the controls that use it.
+pub fn callback(mtm: MainThreadMarker, f: Box<dyn Fn(&AnyObject)>) -> Retained<Callback> {
+    let this = mtm.alloc::<Callback>().set_ivars(f);
+    // SAFETY: NSObject's plain init.
+    unsafe { msg_send![super(this), init] }
+}
+
+/// Point `control`'s action at `target`.
+pub fn hook(control: &NSControl, target: &Callback) {
+    // SAFETY: the caller keeps the target alive with the control.
+    unsafe {
+        control.setTarget(Some(target));
+        control.setAction(Some(sel!(fire:)));
+    }
+}
+
+/// A change delegate running `f`; the caller keeps it as long as the field.
+pub fn on_change(mtm: MainThreadMarker, f: Box<dyn Fn()>) -> Retained<TextChange> {
+    let this = mtm.alloc::<TextChange>().set_ivars(f);
+    // SAFETY: NSObject's plain init.
+    unsafe { msg_send![super(this), init] }
+}
 
 thread_local! {
     static TARGET: OnceCell<Retained<Target>> = const { OnceCell::new() };
@@ -123,7 +208,9 @@ pub fn window(
     window.setTitle(&ns(title));
     window.setContentView(Some(&flipped(mtm)));
     let delegate: Retained<CloseDelegate> = {
-        let this = mtm.alloc::<CloseDelegate>().set_ivars(on_close);
+        let this = mtm
+            .alloc::<CloseDelegate>()
+            .set_ivars((on_close, RefCell::new(None)));
         // SAFETY: NSObject's plain init.
         unsafe { msg_send![super(this), init] }
     };

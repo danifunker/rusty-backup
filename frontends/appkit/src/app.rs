@@ -258,6 +258,21 @@ fn start(mtm: MainThreadMarker) {
     app.tick();
 }
 
+thread_local! {
+    static LATER: RefCell<std::collections::VecDeque<Box<dyn FnOnce()>>> = RefCell::default();
+}
+
+/// Run `f` from a main-queue block of its own, once the handler on the stack has returned.
+pub fn later(f: Box<dyn FnOnce()>) {
+    LATER.with(|l| l.borrow_mut().push_back(f));
+    dispatch2::DispatchQueue::main().exec_async(|| {
+        let next = LATER.with(|l| l.borrow_mut().pop_front());
+        if let Some(f) = next {
+            f();
+        }
+    });
+}
+
 /// Run the controllers now, as a wake does.
 pub fn tick() {
     if let Some(app) = app() {
@@ -417,6 +432,14 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        content.addSubview(&inspect.browse.page);
+        inspect.browse.page.setHidden(true);
+        inspect.browse.on_change(Rc::new(|| {
+            if let Some(app) = app() {
+                app.refresh();
+                app.relayout();
+            }
+        }));
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -573,9 +596,16 @@ impl App {
             if self.log_auto.state() != state {
                 self.log_auto.setState(state);
             }
+            // Inspect's browse view stands in its page's place while it is open.
+            let browsing = self.inspect.browse.is_active();
             for (t, page) in &self.pages {
-                ui::set_visible(&page.scroll, *t == tab);
+                let here = *t == tab && !(browsing && *t == AppTab::Inspect);
+                ui::set_visible(&page.scroll, here);
             }
+            ui::set_visible(
+                &self.inspect.browse.page,
+                browsing && tab == AppTab::Inspect,
+            );
         });
         if banner_was != banner.is_some() || shared_was != shared || self.banner_buttons_moved() {
             self.relayout();
@@ -689,6 +719,8 @@ impl App {
                     page.relayout();
                 }
                 self.inspect.relayout();
+                ui::move_to(&self.inspect.browse.page, *r);
+                self.inspect.browse.layout();
             }
             ui::move_to(self.part(*part), *r);
         }

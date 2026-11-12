@@ -10,7 +10,7 @@ id = "flow.browse.inspect-extract-all"
 description = "Open a classic HFS floppy on Inspect, browse its partition, Extract All into a host folder, and compare the file with the one rb-cli put in"
 level = "smoke"
 area = ["inspect", "browse"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.extract"]
 timeout_ms = 120000
 
@@ -50,7 +50,7 @@ id = "flow.browse.inspect-new-folder"
 description = "Browse a FAT floppy from Inspect, turn on Edit Mode, stage a new folder through the name prompt, apply it, and list the image with rb-cli"
 level = "smoke"
 area = ["inspect", "browse", "files"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.new-folder"]
 timeout_ms = 120000
 
@@ -72,6 +72,7 @@ ui = [
   { focus = "prompt.text" },
   { fill = "NEWDIR" },
   { activate = "prompt.ok", only = "win32" },
+  { activate = "prompt.ok", only = "appkit" },
   # GTK's prompt buttons carry the prompt's own word, not an id.
   { activate = "Create", only = "gtk" },
   { wait = "Apply Edits (1)" },
@@ -89,7 +90,7 @@ id = "flow.browse.inspect-edit-text"
 description = "Browse a FAT floppy from Inspect, open its only file in the text editor, replace the text, save and apply, and compare the file rb-cli reads back"
 level = "smoke"
 area = ["inspect", "browse", "files"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["inspect.open-image", "inspect.browse", "browse.edit", "browse.edit-text"]
 timeout_ms = 120000
 

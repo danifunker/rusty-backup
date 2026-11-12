@@ -28,6 +28,7 @@ use rusty_backup::controller::inspect::{
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::browse::BrowseView;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
@@ -59,7 +60,7 @@ const CHECK_CLOSE: &str = "inspect.check.close";
 const CHD_CLOSE: &str = "inspect.chd_info.close";
 
 /// Tools whose windows a later slice builds: they show, stay off and say when they come.
-const LATER: [(&str, &str); 11] = [
+const LATER: [(&str, &str); 10] = [
     (ids::CONNECT_REMOTE, "Arrives in slice 7b (remote)."),
     (ids::EXPORT, "Arrives in slice 7b (Export Disk Image)."),
     (ids::CONVERT, "Arrives in slice 7c (the Convert screen)."),
@@ -73,7 +74,6 @@ const LATER: [(&str, &str); 11] = [
     ),
     (ids::RESIZE, "Arrives in slice 7a (Resize Partitions)."),
     (ids::EXPAND_IMAGE, "Arrives in slice 7a (Expand Image)."),
-    (ids::ROW_BROWSE, "Arrives in slice 2 (the browse view)."),
     (ids::ROW_EXPAND_HFS, "Arrives in slice 7a (Expand HFS)."),
     (
         ids::ROW_RESIZE_ALTO,
@@ -207,6 +207,8 @@ pub struct InspectScreen {
     cursor: Cell<usize>,
     check_window: RefCell<Option<ReportWindow>>,
     chd_window: RefCell<Option<ReportWindow>>,
+    /// The browse view, shown in the page's place while it is open.
+    pub browse: Rc<BrowseView>,
 }
 
 fn view<T: AsRef<NSView>>(v: &T) -> Retained<NSView> {
@@ -314,6 +316,7 @@ impl InspectScreen {
         for (_, v) in &parts {
             body.addSubview(v);
         }
+        let browse = BrowseView::build(mtm, notify.clone(), host.clone());
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             mtm,
             ctrl: RefCell::new(InspectController::new(InspectServices {
@@ -342,6 +345,7 @@ impl InspectScreen {
             cursor: Cell::new(0),
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
+            browse,
         });
         let me = screen.me.clone();
         screen.bar.on_select(Rc::new(move |p| {
@@ -388,6 +392,7 @@ impl InspectScreen {
     }
 
     pub fn tick(&self) {
+        self.browse.tick();
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -452,6 +457,10 @@ impl InspectScreen {
             },
             ids::ROW_CHECK => match row {
                 Some(i) => InspectAction::Check(i),
+                None => return,
+            },
+            ids::ROW_BROWSE => match row {
+                Some(i) => InspectAction::Browse(i),
                 None => return,
             },
             ids::ROW_DEFRAGMENT => match row {
@@ -521,9 +530,10 @@ impl InspectScreen {
 
     fn after(&self, effects: Vec<Effect>) {
         self.host.run(effects, &self.reply());
+        let dirty = self.browse.has_unsaved_edits();
         let (requests, mut log) = {
             let mut c = self.ctrl.borrow_mut();
-            c.set_browse_dirty(false);
+            c.set_browse_dirty(dirty);
             (c.take_requests(), c.take_log())
         };
         for r in requests {
@@ -533,14 +543,25 @@ impl InspectScreen {
         }
         crate::app::append_log(log);
         self.refresh();
+        if let Some(load) = self.browse.take_nested_load() {
+            self.apply(load);
+        }
     }
 
     /// Carry out `request`; what this shell cannot do yet says so. No `_` arm.
     fn carry_out(&self, request: HostRequest) -> Option<String> {
         match request {
-            HostRequest::CloseBrowse => None,
-            HostRequest::UpgradeSeekable(_) | HostRequest::OpenBrowse(_) => {
-                Some("Browsing arrives in the AppKit shell in slice 2.".to_string())
+            HostRequest::CloseBrowse => {
+                self.browse.close();
+                None
+            }
+            HostRequest::UpgradeSeekable(path) => {
+                self.browse.upgrade_seekable(path);
+                None
+            }
+            HostRequest::OpenBrowse(open) => {
+                self.browse.open_request(*open);
+                None
             }
             HostRequest::OpenOptical(_) => {
                 Some("The Optical screen arrives in the AppKit shell in slice 6.".to_string())
