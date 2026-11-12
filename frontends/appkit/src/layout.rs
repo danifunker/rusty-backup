@@ -256,11 +256,12 @@ fn place<T: Copy>(node: &Node<T>, area: Rect, dpi: u32, out: &mut Vec<(T, Rect)>
         Node::Leaf { id, width, height } => {
             let w = cross(*width, area.w, dpi);
             let h = cross(*height, area.h, dpi);
+            // Centred in its row: a caption beside a taller pop-up lines up with its text.
             out.push((
                 *id,
                 Rect {
                     x: area.x,
-                    y: area.y,
+                    y: area.y + (area.h - h).max(0) / 2,
                     w,
                     h,
                 },
@@ -456,7 +457,19 @@ mod tests {
     fn everything_scales_with_the_dpi() {
         let n = Node::inset(Node::row(vec![Node::button(1, 75), Node::field(2)]), MARGIN);
         let out = layout(&n, r(0, 0, 600, 100), 144);
-        assert_eq!(out, vec![(1, r(17, 17, 113, 35)), (2, r(141, 17, 442, 35))]);
+        // The row has the whole area, so its controls sit in its middle.
+        assert_eq!(out, vec![(1, r(17, 32, 113, 35)), (2, r(141, 32, 442, 35))]);
+    }
+
+    #[test]
+    fn a_caption_is_centred_beside_a_taller_control() {
+        let n = Node::row(vec![
+            Node::leaf(1, Size::Fixed(60), Size::Fixed(ROW - 4)),
+            Node::leaf(2, Size::Stretch(1), Size::Fixed(ROW + 2)),
+        ]);
+        let out = layout(&n, r(0, 0, 300, ROW + 2), 96);
+        assert_eq!(out[0].1.y, 3);
+        assert_eq!(out[1].1.y, 0);
     }
 
     #[test]

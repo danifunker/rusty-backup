@@ -23,6 +23,7 @@ var app: AXUIElement!
 var child: Process!
 var picks = ""
 var current: AXUIElement?
+var shotDir = ""
 
 func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
     var v: AnyObject?
@@ -191,6 +192,38 @@ let keyCodes: [String: CGKeyCode] = [
     "F9": 101, "F10": 109, "F11": 103, "F12": 111,
 ]
 
+/// Capture the shell's own on-screen windows, front to back: `<name>.png`, then `<name>-2.png`...
+/// Never the whole screen. The log is cleared first: its timestamps change every run. A runner
+/// that cannot capture gets zero shots, not a failure.
+func shot(_ name: String) -> [String: Any] {
+    if let clear = try? find("log.clear", nil, secs: 0) { try? activate(clear) }
+    Thread.sleep(forTimeInterval: 0.4)
+    let pid = child.processIdentifier
+    let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    let ids: [Int] = info.compactMap { w in
+        guard (w[kCGWindowOwnerPID as String] as? Int32) == pid,
+              (w[kCGWindowLayer as String] as? Int ?? 99) < 25,
+              let b = w[kCGWindowBounds as String] as? [String: Any],
+              (b["Width"] as? Double ?? 0) > 80, (b["Height"] as? Double ?? 0) > 60
+        else { return nil }
+        return w[kCGWindowNumber as String] as? Int
+    }
+    try? FileManager.default.createDirectory(atPath: shotDir, withIntermediateDirectories: true)
+    var saved: [String] = []
+    for (i, id) in ids.enumerated() {
+        let file = (shotDir as NSString).appendingPathComponent(i == 0 ? "\(name).png" : "\(name)-\(i + 1).png")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = ["-x", "-o", "-l\(id)", file]
+        try? p.run()
+        p.waitUntilExit()
+        let size = (try? FileManager.default.attributesOfItem(atPath: file)[.size] as? Int) ?? 0
+        if p.terminationStatus == 0 && size > 0 { saved.append(file) }
+    }
+    return ["ok": true, "shots": saved]
+}
+
 func post(_ code: CGKeyCode, _ flags: CGEventFlags, unicode: String? = nil) {
     let pid = child.processIdentifier
     for down in [true, false] {
@@ -269,6 +302,7 @@ func run(_ op: [String: Any]) throws -> [String: Any] {
         Thread.sleep(forTimeInterval: 0.5)
         if shows(arg) { throw Fail(expected: "the window without '\(arg)'", observed: visibleText()) }
     case "text": return ["ok": true, "text": visibleText()]
+    case "shot": return shot(arg)
     default: throw Fail(expected: "a known op, not '\(kind)'", observed: "")
     }
     return ["ok": true]
@@ -293,6 +327,9 @@ func main() {
         return
     }
     let fm = FileManager.default
+    // A tour run collects every case's shots in one folder; otherwise they stay with the case.
+    shotDir = ProcessInfo.processInfo.environment["RB_SHOTS_DIR"]
+        ?? (work as NSString).appendingPathComponent("shots")
     let home = (work as NSString).appendingPathComponent("home")
     let config = (home as NSString).appendingPathComponent(".config/rusty-backup")
     try? fm.createDirectory(atPath: config, withIntermediateDirectories: true)

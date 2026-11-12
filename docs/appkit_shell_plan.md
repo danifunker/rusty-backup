@@ -312,6 +312,19 @@ plus `--shell tui`.
   egui's DMGs as "native AppKit preview" rows, so the in-app updater finds them. A failed leg
   never holds a release back.
 
+- **Screenshot tour (2026-11-12).** The flows never look at the screen, so tier 9
+  (`cases/tier9/appkit-tour.toml`, `scripts/appkit-tour.sh`; FLOWS.md) shoots the app's own
+  windows across every screen and dialog in light and dark, 55 shots each, onto a contact sheet,
+  with a pixel comparison against an approved run. Its first review found and fixed:
+  - captions sat above the controls beside them: a row now centres each control vertically;
+  - AppKit links every radio sharing a superview and an action, so Export's layout and format
+    radios (and Optical's, and each table-editor row's) unchecked each other: each group now
+    lives on its own see-through layer;
+  - Inspect left Export, the table tools, Resize and Expand Image enabled with nothing open;
+  - Commander's bars overflowed a half-window pane: they now take four short rows;
+  - the browse view's notice row showed an empty notice and a stray OK from the start;
+  - the Check report's stats and the disk writer's source path were cut off.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

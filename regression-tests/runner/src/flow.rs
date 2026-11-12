@@ -169,6 +169,7 @@ pub fn describe(op: &UiOp) -> String {
         ("wait_file", &op.wait_file),
         ("expect", &op.expect),
         ("expect_not", &op.expect_not),
+        ("shot", &op.shot),
     ];
     for (k, v) in pairs {
         if let Some(v) = v {
@@ -377,6 +378,10 @@ impl UiSession {
             if op.only.as_deref().is_some_and(|o| o != shell) {
                 continue;
             }
+            // Only the AX driver can shoot its windows; elsewhere a tour's shot is no step.
+            if op.shot.is_some() && shell != "appkit" {
+                continue;
+            }
             if let Some(f) = &op.wait_file {
                 let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));
                 if !wait_file(Path::new(&resolve(f)), limit) {
@@ -492,6 +497,9 @@ impl UiSession {
         } else if let Some(e) = &op.expect_not {
             put("op", "expect_not".into());
             put("arg", label(&ctl(self, e), e));
+        } else if let Some(n) = &op.shot {
+            put("op", "shot".into());
+            put("arg", resolve(n));
         }
         m.insert(
             "timeout_ms".to_string(),
@@ -516,7 +524,7 @@ impl UiSession {
             self.tui = Some(s);
         }
         for op in ops {
-            if op.only.as_deref().is_some_and(|o| o != "tui") {
+            if op.only.as_deref().is_some_and(|o| o != "tui") || op.shot.is_some() {
                 continue;
             }
             let limit = Duration::from_millis(op.timeout_ms.unwrap_or(30_000));

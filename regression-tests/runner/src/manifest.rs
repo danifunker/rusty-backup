@@ -236,6 +236,8 @@ pub struct UiOp {
     pub expect: Option<String>,
     /// The screen must not show this.
     pub expect_not: Option<String>,
+    /// Capture the app's own windows under this name (AppKit tours, tier 9; other shells skip it).
+    pub shot: Option<String>,
     /// Budget for `wait`, `focus` and `choose`.
     pub timeout_ms: Option<u64>,
     /// Run only on this shell; a shell-specific step (a TUI-only key, say).
@@ -259,6 +261,7 @@ impl UiOp {
             self.wait_file.is_some(),
             self.expect.is_some(),
             self.expect_not.is_some(),
+            self.shot.is_some(),
         ]
         .iter()
         .filter(|b| **b)

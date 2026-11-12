@@ -496,14 +496,18 @@ impl SideView {
     fn nodes(&self) -> Vec<Node<Leaf>> {
         let i = idx(self.side);
         let l = |s: S| Leaf::Side(i, s);
+        // A pane is about half the window: the bars take four short rows, not two long ones.
         let first = vec![
             Node::leaf(l(S::Source), Size::Stretch(1), Size::Fixed(layout::ROW + 2)),
+            Node::button(l(S::Close), 65),
+        ];
+        let opens = vec![
             Node::button(l(S::OpenFile), 70),
             Node::button(l(S::OpenFolder), 80),
             Node::button(l(S::OpenBackup), 80),
             Node::button(l(S::Connect), 80),
             Node::button(l(S::CloseImage), 95),
-            Node::button(l(S::Close), 65),
+            Node::Space(Size::Stretch(1)),
         ];
         let mut second = vec![
             Node::leaf(
@@ -527,15 +531,18 @@ impl SideView {
         if !self.shown(S::Title) {
             second.push(Node::Space(Size::Stretch(1)));
         }
-        second.extend([
-            Node::button(l(S::NewFolder), 105),
+        second.push(Node::button(l(S::NewFolder), 105));
+        let edits = vec![
+            Node::Space(Size::Stretch(1)),
             Node::button(l(S::Apply), 90),
             Node::button(l(S::Discard), 75),
             Node::button(l(S::Edits), 85),
-        ]);
+        ];
         let mut rows = vec![
             Node::row(first),
+            Node::row(opens),
             Node::row(second),
+            Node::row(edits),
             Node::leaf(l(S::Path), Size::Stretch(1), Size::Fixed(layout::ROW)),
             Node::row(vec![
                 Node::leaf(l(S::Job), Size::Stretch(1), Size::Fixed(layout::ROW - 4)),

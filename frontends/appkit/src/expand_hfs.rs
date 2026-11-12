@@ -100,8 +100,8 @@ impl ExpandHfsWindow {
             f.wrap(K::Facts, "");
             f.label(K::TargetHead, "Target");
             f.label(K::FormatCaption, "Output format:");
-            f.radio(K::Apm, "APM disk (.hda)", ids::OUTPUT_FORMAT);
-            f.radio(K::Flat, "Bare HFS image (.hfv / .img)", "");
+            f.radio(K::Apm, 0, "APM disk (.hda)", ids::OUTPUT_FORMAT);
+            f.radio(K::Flat, 0, "Bare HFS image (.hfv / .img)", "");
             f.wrap(K::Note, HFV_NOTE);
             f.label(K::BlockCaption, "Allocation block size:");
             f.popup(K::Block, &[], ids::BLOCK_SIZE);

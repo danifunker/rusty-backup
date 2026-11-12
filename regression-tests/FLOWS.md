@@ -130,6 +130,7 @@ Each op sets exactly one action.
 | `wait_gone = "text or id"` | wait until it is no longer shown (a staged count clearing) | polls the screen | likewise |
 | `wait_file = "path"` | wait until the file exists and its size holds for half a second | the runner, the same for every shell | likewise |
 | `expect` / `expect_not` | the screen shows / does not show it now | after a short settle | likewise |
+| `shot = "name"` | AppKit only (tier 9 tours): clear the log, then save each of the app's own windows as `name.png`, `name-2.png`... | skipped | skipped |
 
 Prefer `wait_file` for a job's end: it is the output itself, the same on every
 shell, and GTK's log panel is not in its accessibility tree, so a log line is
@@ -270,3 +271,19 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32, appkit | against `rb-cli archive extract` |
 | `audio.toml` | play a CD-DA track | gtk, win32, appkit (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
 | `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32, appkit | the TUI can join once its extract-to-folder step is checked |
+
+## The AppKit screenshot tour (tier 9)
+
+The flows prove behaviour through the accessibility tree; nothing in them looks at the screen.
+`cases/tier9/appkit-tour.toml` does: each case walks screens and dialogs with real content and
+`shot`s them, and `scripts/appkit-tour.sh [binary] [out-dir] [baseline-dir]` runs it in light
+and dark (`RUSTY_BACKUP_APPEARANCE`) and writes `index.html`, each shot's two looks side by side.
+
+- Only the app's own windows are captured (`screencapture -l` by window id), never the screen,
+  so the process running it needs the Screen Recording permission besides Accessibility.
+- Given an earlier, approved out-dir as `baseline-dir`, a shot whose pixels moved by more than
+  0.05% (`scripts/shotdiff.swift`) is marked changed with its share. That asks for a look; it
+  never fails the run, since macOS versions draw a little differently. The log is cleared before
+  each shot, as its timestamps change every run; the playing CD player's position still moves.
+- Tier 9 is not in CI's `--tiers 8` run and is not a test: a tour case fails only when it cannot
+  reach the state it shoots.

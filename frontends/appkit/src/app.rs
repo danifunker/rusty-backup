@@ -212,11 +212,27 @@ fn open_later(paths: Vec<std::path::PathBuf>) {
     }
 }
 
+/// `RUSTY_BACKUP_APPEARANCE=light|dark` pins the look, so a screenshot tour can shoot both.
+fn force_appearance(ns_app: &NSApplication) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    let want = std::env::var("RUSTY_BACKUP_APPEARANCE").unwrap_or_default();
+    // SAFETY: AppKit's own appearance name constants.
+    let name = unsafe {
+        match want.as_str() {
+            "dark" => NSAppearanceNameDarkAqua,
+            "light" => NSAppearanceNameAqua,
+            _ => return,
+        }
+    };
+    ns_app.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+}
+
 /// Run the application until it quits.
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("main runs on the main thread");
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    force_appearance(&ns_app);
     let delegate: Retained<Delegate> = {
         let this = mtm.alloc::<Delegate>().set_ivars(());
         // SAFETY: NSObject's plain init.

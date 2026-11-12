@@ -348,8 +348,8 @@ impl EditorWindow {
                     f.check(K::Boot(i), "", &boot_id);
                 }
                 BootStyle::Radios => {
-                    f.radio(K::Boot(i), "boot", &boot_id);
-                    f.radio(K::BootNo(i), "no boot", "");
+                    f.radio(K::Boot(i), i, "boot", &boot_id);
+                    f.radio(K::BootNo(i), i, "no boot", "");
                 }
                 BootStyle::Label => {
                     f.label(K::BootLabel(i), "");

@@ -152,16 +152,17 @@ impl ExportWindow {
             f.label(K::AfterCaption, "");
             let after = Bar::new(mtm, "export.after_bar");
             f.add(K::After, &after);
-            f.radio(K::Whole, "Whole Disk (single file)", ids::EXPORT_WHOLE);
+            f.radio(K::Whole, 0, "Whole Disk (single file)", ids::EXPORT_WHOLE);
             f.radio(
                 K::Per,
+                0,
                 "Per Partition (one file per partition)",
                 ids::EXPORT_PER_PARTITION,
             );
             f.label(K::FormatCaption, "Format:");
             for (i, c) in EXPORT_FORMATS.iter().enumerate() {
                 let id = if i == 0 { ids::EXPORT_FORMAT } else { "" };
-                f.radio(K::Format(i), c.label, id);
+                f.radio(K::Format(i), 1, c.label, id);
             }
             let chd = ChdControl::build(
                 f,

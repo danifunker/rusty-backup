@@ -12,8 +12,8 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use objc2::rc::Retained;
-use objc2::{sel, MainThreadMarker};
-use objc2_app_kit::{NSButton, NSProgressIndicator, NSView, NSWindow};
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSProgressIndicator, NSView, NSWindow};
 use rusty_backup::controller::app::chd::ChdOptionsControl;
 use rusty_backup::controller::app::{
     busy_elsewhere_notice, physical_devices_available, Notify, RecentHandle, RecentMode,
@@ -35,19 +35,10 @@ use crate::layout::{self, Node, Size};
 use crate::optical_remote::{AddRemoteShown, AddRemoteWindow};
 use crate::report::{self, ReportWindow};
 use crate::sync::SyncGuard;
-use crate::ui::{self, ns, CloseDelegate};
+use crate::ui::{self, CloseDelegate};
 
 /// CHD Info's Close, which the app routes back here by its id.
 pub const CHD_CLOSE: &str = "optical.chd_info.close";
-
-fn radio(mtm: MainThreadMarker, title: &str, id: &str) -> Retained<NSButton> {
-    // SAFETY: the form points the button's action at its own target when it is added.
-    let b = unsafe {
-        NSButton::radioButtonWithTitle_target_action(&ns(title), None, Some(sel!(fire:)), mtm)
-    };
-    ui::set_id(&b, id);
-    b
-}
 
 fn progress_of<K: Copy + PartialEq + 'static>(
     form: &Form<K>,
@@ -304,11 +295,8 @@ impl OpticalScreen {
             );
             let f = &form;
             f.wrap(K::BusyNote, "");
-            f.add(
-                K::DriveMode,
-                &radio(mtm, "Physical drive", ids::SOURCE_DRIVE),
-            );
-            f.add(K::ImageMode, &radio(mtm, "Image file", ids::SOURCE_IMAGE));
+            f.radio(K::DriveMode, 0, "Physical drive", ids::SOURCE_DRIVE);
+            f.radio(K::ImageMode, 0, "Image file", ids::SOURCE_IMAGE);
             f.label(K::DriveCaption, "Drive:");
             f.popup(K::Drive, &[], ids::DRIVE);
             f.button(K::Refresh, "Refresh", ids::REFRESH);
@@ -330,7 +318,7 @@ impl OpticalScreen {
             f.label(K::FormatCaption, "Output format:");
             for (i, x) in OutputFormat::ALL.iter().enumerate() {
                 let id = format!("{}.{}", ids::OUTPUT_FORMAT, x.extension());
-                f.add(K::Format(i), &radio(mtm, x.label(), &id));
+                f.radio(K::Format(i), 1, x.label(), &id);
             }
             let chd = ChdControl::build(
                 f,

@@ -465,7 +465,7 @@ impl DiskWriteWindow {
         let pop = |k: K, w: Size| Node::leaf(k, w, Size::Fixed(layout::ROW + 2));
         let stretch = |k: K| Node::leaf(k, Size::Stretch(1), row_h);
         let caption = 110;
-        let mut col = vec![line(K::SourceHead, 1), line(K::Source, 2)];
+        let mut col = vec![line(K::SourceHead, 1), line(K::Source, 3)];
         if f.shown(K::Job) {
             let mut row = vec![
                 stretch(K::Job),

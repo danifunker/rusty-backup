@@ -109,6 +109,11 @@ pub fn job_line(s: &Snapshot) -> (String, Option<u32>) {
 struct Shown {
     /// An export is running, so Cancel Export shows.
     exporting: bool,
+    /// Which image and table tools apply to what is open.
+    can_expand_image: bool,
+    can_edit_table: bool,
+    can_export: bool,
+    can_add_partition: bool,
     /// A remote image is open, and whether its backup runs.
     remote_open: bool,
     remote_backing_up: bool,
@@ -890,6 +895,10 @@ impl InspectScreen {
             }),
             chd: c.chd_info_text().map(str::to_string),
             exporting: c.export_job().is_some(),
+            can_expand_image: c.can_expand_image(),
+            can_edit_table: c.can_edit_table(),
+            can_export: c.can_export(),
+            can_add_partition: c.can_add_partition(),
             remote_open: c.remote().is_some(),
             remote_backing_up: c.remote_backup_running(),
         }
@@ -1001,6 +1010,16 @@ impl InspectScreen {
         ui::set_visible(self.part(Part::Chd), s.has_chd);
         ui::set_visible(self.part(Part::Close), s.can_close);
         ui::set_visible(self.part(Part::CancelExport), s.exporting);
+        self.set_enabled(Part::ExpandImage, s.can_expand_image);
+        self.set_enabled(Part::Export, s.can_export);
+        self.set_enabled(Part::EditTable, s.can_edit_table);
+        self.set_enabled(Part::AddPartition, s.can_add_partition);
+        let resizing = self
+            .resize
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_running());
+        self.set_enabled(Part::Resize, s.can_edit_table && !resizing);
         for p in [Part::PickAnother, Part::BackupRemote, Part::CloseRemote] {
             ui::set_visible(self.part(p), s.remote_open);
         }

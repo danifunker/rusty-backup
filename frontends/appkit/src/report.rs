@@ -63,7 +63,8 @@ impl ReportWindow {
         let (window, delegate) = ui::window(mtm, title, 560.0, 440.0, on_close);
         let body = window.contentView().expect("the window's content view");
         let headline = ui::label(mtm, "");
-        let stats = ui::label(mtm, "");
+        // Long stats (a filesystem's counters) wrap onto a second line.
+        let stats = NSTextField::wrappingLabelWithString(&ns(""), mtm);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(500.0, 300.0));
         let scroll = NSScrollView::initWithFrame(mtm.alloc(), frame);
         scroll.setHasVerticalScroller(true);
@@ -154,7 +155,7 @@ impl ReportWindow {
             rows.push(Node::leaf(
                 Part::Stats,
                 Size::Stretch(1),
-                Size::Fixed(layout::ROW - 4),
+                Size::Fixed(2 * (layout::ROW - 6) + 4),
             ));
         }
         rows.push(Node::leaf(Part::Text, Size::Stretch(1), Size::Stretch(1)));

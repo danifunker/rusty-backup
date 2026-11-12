@@ -84,7 +84,7 @@ impl AltoWindow {
             form.label(K::Caption, "Target geometry:");
             for (i, t) in AltoTarget::ALL.iter().enumerate() {
                 let id = if i == 0 { ids::TARGET } else { "" };
-                form.radio(K::Target(i), t.label(), id);
+                form.radio(K::Target(i), 0, t.label(), id);
             }
             form.wrap(K::Warning, "");
             form.wrap(K::Result, "");

@@ -40,6 +40,44 @@ define_class!(
 );
 
 define_class!(
+    /// A full-size, see-through layer of a form: it holds one group of radio buttons (AppKit
+    /// links every radio sharing a superview and an action) and lets clicks through elsewhere.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBRadioLayer"]
+    pub struct RadioLayer;
+
+    unsafe impl NSObjectProtocol for RadioLayer {}
+
+    impl RadioLayer {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            // SAFETY: NSView's own hit test; the layer itself is never the answer.
+            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
+            hit.filter(|v| !std::ptr::eq(&**v, self.as_ref()))
+        }
+    }
+);
+
+/// A radio layer the size of `parent`, following it as it resizes.
+pub fn radio_layer(mtm: MainThreadMarker, parent: &NSView) -> Retained<NSView> {
+    let this = mtm.alloc::<RadioLayer>().set_ivars(());
+    // SAFETY: NSView's designated initialiser.
+    let v: Retained<RadioLayer> = unsafe { msg_send![super(this), initWithFrame: parent.bounds()] };
+    v.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    parent.addSubview(&v);
+    Retained::into_super(v)
+}
+
+define_class!(
     /// The target of every control's action.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]

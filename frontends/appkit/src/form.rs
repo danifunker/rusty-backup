@@ -105,6 +105,8 @@ pub struct Form<K: Copy + PartialEq + 'static> {
     target: Retained<Callback>,
     delegates: RefCell<Vec<Retained<TextChange>>>,
     keys: Rc<RefCell<Vec<K>>>,
+    /// Each radio group's layer over the body.
+    layers: RefCell<Vec<(usize, Retained<NSView>)>>,
     /// Each field and the text last reported to the screen or set from the controller.
     fields: Fields<K>,
     pops: Pops<K>,
@@ -165,6 +167,7 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
             target,
             delegates: RefCell::default(),
             keys,
+            layers: RefCell::default(),
             fields,
             pops,
             on,
@@ -210,15 +213,32 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
     }
 
     /// A radio button; AppKit groups the ones sharing an action, and the screen sets each state.
-    pub fn radio(&self, k: K, title: &str, id: &str) -> Retained<NSButton> {
-        // SAFETY: no target yet; `add` points the button at the form's own.
+    /// A radio button in group `group`: only radios of one group exclude each other.
+    pub fn radio(&self, k: K, group: usize, title: &str, id: &str) -> Retained<NSButton> {
+        // SAFETY: no target yet; it is pointed at the form's own below.
         let b = unsafe {
             NSButton::radioButtonWithTitle_target_action(&ns(title), None, None, self.mtm)
         };
         if !id.is_empty() {
             ui::set_id(&b, id);
         }
-        self.add(k, &b);
+        b.setTag(self.tag_of(k));
+        ui::hook(&b, &self.target);
+        let layer = {
+            let mut layers = self.layers.borrow_mut();
+            match layers.iter().find(|(g, _)| *g == group) {
+                Some((_, l)) => l.clone(),
+                None => {
+                    let l = ui::radio_layer(self.mtm, &self.body);
+                    layers.push((group, l.clone()));
+                    l
+                }
+            }
+        };
+        layer.addSubview(&b);
+        self.views
+            .borrow_mut()
+            .push((k, b.retain().into_super().into_super()));
         b
     }
 

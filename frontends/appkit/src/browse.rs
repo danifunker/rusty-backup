@@ -347,8 +347,13 @@ impl BrowseView {
             let progress = ui::progress(mtm);
             add(C::Progress, as_view(&progress));
             add(C::Cancel, button("Cancel", ids::CANCEL_JOB));
-            add(C::Notice, label(""));
-            add(C::NoticeOk, button("OK", "browse.notice_ok"));
+            // The notice row shows only while a notice is up (show_notice).
+            let notice = label("");
+            notice.setHidden(true);
+            add(C::Notice, notice);
+            let notice_ok = button("OK", "browse.notice_ok");
+            notice_ok.setHidden(true);
+            add(C::NoticeOk, notice_ok);
             add(C::Message, label(""));
             let pane = PaneView::build(mtm, Side::Left, ids::LIST, ids::FOLDER_TREE);
             add(C::TreeView, as_view(&pane.tree_scroll));
