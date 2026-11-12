@@ -106,14 +106,14 @@ The GTK slices, in the same order; each is done when its tier 8 flows pass on `a
 | 8 | Drop routing, file open (`application:openURLs:`), hand-offs, About, icon | manual: drops cannot be driven yet |
 | 9 | The AX driver in rb-regress, the DMG beside egui | every tier 8 flow with `shells` gaining `appkit` |
 
-## The flow driver: `drivers/ax_driver.py`
+## The flow driver: `drivers/ax_driver.swift`
 
 Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` back), run by a
 `runner/src/ax.rs` client, so every flow file only gains `"appkit"` in its `shells`.
 
-- **Language.** Python with PyObjC (`ApplicationServices` for `AXUIElement`), mirroring
-  `gtk_driver.py`. If PyObjC is a problem on the runners, a small Swift helper speaking the same
-  protocol is the fallback.
+- **Language.** Swift (decided 2026-11-11): one file over `ApplicationServices` (`AXUIElement`),
+  compiled by `swiftc` from the Xcode command-line tools, which every macOS runner has. No Python
+  package to install, and the same protocol as `gtk_driver.py`.
 - **Finding controls.** By `AXIdentifier`, which is the controller id. No `labels.toml` section;
   `[all]` messages still apply.
 - **Acting.** `AXPress` for buttons, menu items and pop-up items; `AXValue` set for text fields,
@@ -131,7 +131,8 @@ Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` ba
 **Gate 0, before slice 9 depends on it:** the process driving AX needs the Accessibility (TCC)
 permission. Locally that is one grant to the terminal or Python. On GitHub's macOS runners, check
 whether it is already granted (UI-testing images often are); if not, the AX flows run on a
-self-hosted Mac (`dani-dev.local`) and CI keeps the build plus `--shell tui`.
+self-hosted Mac (named in the gitignored `local.toml`, never in the repo) and CI keeps the build
+plus `--shell tui`.
 
 ## Exit criteria
 
@@ -142,7 +143,9 @@ self-hosted Mac (`dani-dev.local`) and CI keeps the build plus `--shell tui`.
 
 ## Open questions
 
-1. PyObjC or a Swift helper for the driver; and whether GitHub's macOS runners grant AX (Gate 0).
-2. App name and bundle id of the preview app beside egui (main plan § 11, item 5).
+1. ~~PyObjC or a Swift helper for the driver~~: Swift (2026-11-11). Still open: whether GitHub's
+   macOS runners grant AX (Gate 0).
+2. ~~App name and bundle id~~: bundle id `io.github.danifunker.rusty-backup` (2026-11-11), distinct
+   from egui's `io.github.dani.rusty-backup`, so both install side by side.
 3. How the 10.7 vintage shell (Phase 6) shares slices with this one: forked like the Win32 pair,
    or this package built against older bindings.

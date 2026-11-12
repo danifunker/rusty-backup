@@ -243,7 +243,7 @@ TUI and GTK; `capabilities.md` lists every flow.
 
 Second, after Win32 (D7). Plan: [appkit_shell_plan.md](appkit_shell_plan.md). `frontends/appkit/` on `objc2-app-kit` 0.3,
 macOS 10.13+, a second `.app` beside egui until parity. Controller ids become `AXIdentifier`, so
-its flow driver (`drivers/ax_driver.py`, PyObjC over AX) finds controls by id. Slices follow the
+its flow driver (`drivers/ax_driver.swift`, Swift over AX) finds controls by id. Slices follow the
 GTK shell's; each is done when its tier 8 flows pass on `appkit`.
 
 **Exit:** every tier 8 flow passes on `appkit`, and its `capabilities.md` column has no
@@ -425,10 +425,10 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 
 1. Linux (§9): does gtk3-rs build on 1.73; the oldest distro to test the GTK3 AppImage on; the Flatpak images-only edition.
 7. ~~Phase 2b's drift questions~~: decided 2026-11-09 (D8): staged copy into a host folder; disc conversion in the Convert tab.
-8. AppKit: PyObjC or a Swift helper for the AX driver, and whether GitHub's macOS runners grant AX (its plan's Gate 0).
+8. AppKit: ~~PyObjC or a Swift helper~~ Swift (2026-11-11); whether GitHub's macOS runners grant AX (its plan's Gate 0) is open.
 9. Win32: Dynamic Annotation for `AutomationId` or a numeric id table (its plan's Gate 0).
 2. macOS 10.7 bindings: which ObjC crate builds on 1.73, or ObjC shell + C ABI.
 3. C ABI over JSON versus an engine process over the extended daemon protocol, for PPC and Sol9 (§8).
 4. Whether the Buildroot appliance gains the `tui` feature or keeps `menu.rs`.
-5. Naming and distribution of the side-by-side native preview apps.
+5. Naming and distribution of the side-by-side native preview apps (AppKit: bundle id `io.github.danifunker.rusty-backup`, 2026-11-11).
 6. Whether `/fanout` becomes a project skill, or the CLAUDE.md section alone is enough.
