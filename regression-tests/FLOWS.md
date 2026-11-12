@@ -257,10 +257,10 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 |---|---|---|---|
 | `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32, appkit | restore + byte-compare; the .vhd read back |
 | `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare |
-| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32 | inspect + byte-compare; the TUI can join |
+| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32, appkit | inspect + byte-compare; the TUI can join |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32, appkit | byte-compare |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32, appkit | byte-compare + fsck |
-| `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
+| `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk, win32, appkit | size, byte-compare, fsck |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare out of the ISO; table + label |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32) | tui, gtk, win32 | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32, appkit | against `rb-cli optical extract` |

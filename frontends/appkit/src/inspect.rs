@@ -30,6 +30,7 @@ use rusty_backup::controller::{Controller, Effect};
 
 use crate::browse::BrowseView;
 use crate::effects::{EffectHost, Reply, ReplyFn};
+use crate::expand_hfs::ExpandHfsWindow;
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
 use crate::report::{self, ReportWindow};
@@ -60,7 +61,7 @@ const CHECK_CLOSE: &str = "inspect.check.close";
 const CHD_CLOSE: &str = "inspect.chd_info.close";
 
 /// Tools whose windows a later slice builds: they show, stay off and say when they come.
-const LATER: [(&str, &str); 10] = [
+const LATER: [(&str, &str); 9] = [
     (ids::CONNECT_REMOTE, "Arrives in slice 7b (remote)."),
     (ids::EXPORT, "Arrives in slice 7b (Export Disk Image)."),
     (ids::CONVERT, "Arrives in slice 7c (the Convert screen)."),
@@ -74,7 +75,6 @@ const LATER: [(&str, &str); 10] = [
     ),
     (ids::RESIZE, "Arrives in slice 7a (Resize Partitions)."),
     (ids::EXPAND_IMAGE, "Arrives in slice 7a (Expand Image)."),
-    (ids::ROW_EXPAND_HFS, "Arrives in slice 7a (Expand HFS)."),
     (
         ids::ROW_RESIZE_ALTO,
         "Arrives in slice 7a (Resize Alto Disk).",
@@ -183,6 +183,9 @@ enum Part {
 pub struct InspectScreen {
     mtm: MainThreadMarker,
     ctrl: RefCell<InspectController>,
+    notify: Arc<dyn Notify>,
+    /// Expand HFS Volume, while its controller has a source.
+    hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
     host: EffectHost,
     recent: RecentHandle,
     devices: RefCell<Vec<DiskDevice>>,
@@ -324,8 +327,10 @@ impl InspectScreen {
             mtm,
             ctrl: RefCell::new(InspectController::new(InspectServices {
                 jobs: JobRegistry::new(),
-                notify,
+                notify: notify.clone(),
             })),
+            notify,
+            hfs: RefCell::default(),
             host,
             recent,
             devices: RefCell::default(),
@@ -398,6 +403,13 @@ impl InspectScreen {
 
     pub fn tick(&self) {
         self.browse.tick();
+        let hfs = self.hfs.borrow().clone();
+        if let Some(d) = hfs {
+            d.tick();
+            if !d.is_open() {
+                self.hfs.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -456,9 +468,14 @@ impl InspectScreen {
     }
 
     /// The disk job running here, by name, for the other screens' locks.
-    #[allow(dead_code)] // read by the app once a second screen runs jobs
     pub fn running_job(&self) -> Option<&'static str> {
-        self.ctrl.borrow().running_job()
+        if let Some(job) = self.ctrl.borrow().running_job() {
+            Some(job)
+        } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
+            Some("Inspect: Expand HFS")
+        } else {
+            None
+        }
     }
 
     /// A control's action, by its controller id; the menu bar's items come here too.
@@ -507,6 +524,10 @@ impl InspectScreen {
             },
             ids::ROW_DEFRAGMENT => match row {
                 Some(i) => InspectAction::Defragment(i),
+                None => return,
+            },
+            ids::ROW_EXPAND_HFS => match row {
+                Some(i) => InspectAction::ExpandHfs(i),
                 None => return,
             },
             _ => return,
@@ -617,8 +638,15 @@ impl InspectScreen {
                 self.backup_closed.set(true);
                 None
             }
-            HostRequest::ExpandHfs(_) => {
-                Some("Expand HFS arrives in the AppKit shell in slice 7a.".to_string())
+            HostRequest::ExpandHfs(source) => {
+                let d = ExpandHfsWindow::open(
+                    self.mtm,
+                    self.notify.clone(),
+                    self.host.clone(),
+                    *source,
+                );
+                *self.hfs.borrow_mut() = Some(d);
+                None
             }
         }
     }

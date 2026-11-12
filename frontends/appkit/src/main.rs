@@ -18,8 +18,10 @@ mod build_rows;
 mod chd;
 #[cfg(target_os = "macos")]
 mod commander;
+mod disk_write;
 #[cfg(target_os = "macos")]
 mod effects;
+mod expand_hfs;
 #[cfg(target_os = "macos")]
 mod form;
 #[cfg(target_os = "macos")]

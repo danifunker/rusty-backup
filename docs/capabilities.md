@@ -39,7 +39,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | - | `flow.convert.iso-to-chd` |
 | `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
-| `inspect.expand-hfs` | yes | yes | yes | - | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
+| `inspect.expand-hfs` | yes | yes | yes | yes | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.open-backup` | - | yes | yes | yes | `flow.restore.share-with-inspect` |
 | `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.remote-backup` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
@@ -53,7 +53,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `restore.remote-target` | - | yes | yes | - | `flow.network.restore-to-remote-image` |
 | `restore.run` | yes | yes | yes | yes | `flow.network.restore-to-remote-image`, `flow.restore.folder-to-image` |
 | `restore.target-image` | yes | yes | yes | yes | `flow.restore.folder-to-image` |
-| `restore.write-image` | - | yes | yes | - | `flow.disk_write.image-file` |
+| `restore.write-image` | - | yes | yes | yes | `flow.disk_write.image-file` |
 | `settings.update-check` | - | yes | yes | - | `flow.settings.save-and-reopen` |
 <!-- capabilities:end -->
 

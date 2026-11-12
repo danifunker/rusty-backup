@@ -6,7 +6,7 @@
 //! scanned partition), the new disk's table, the full-disk sizes with alignment and trailing free
 //! space with its before and after bars, the caveats, and Restore / Cancel with the progress line
 //! and the outcome. Start only ever sends `Start`: the write begins on the controller's own
-//! `Confirm`. Write Image File's window comes with slice 7a, a daemon target with slice 7b.
+//! `Confirm`. Write Image File opens the disk writer; a daemon target comes with slice 7b.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ use rusty_backup::controller::restore::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::disk_write::DiskWriteWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::form::Form;
 use crate::layout::{self, Node, Size};
@@ -165,6 +166,10 @@ enum K {
 
 pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
+    mtm: MainThreadMarker,
+    notify: Arc<dyn Notify>,
+    /// Write Image File's disk writer, while its controller is open.
+    writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     host: EffectHost,
     recent: RecentHandle,
     recent_files: RefCell<Vec<String>>,
@@ -226,15 +231,11 @@ impl RestoreScreen {
             form.label(K::WritePath, "");
             form.button(K::WriteChoose, "Choose...", ids::WRITE_IMAGE);
             form.wrap(K::WriteLine, "");
-            let writer = form.button(
+            form.button(
                 K::WriteTarget,
                 "Choose target and write...",
                 ids::WRITE_TARGET,
             );
-            writer.setEnabled(false);
-            writer.setToolTip(Some(&crate::ui::ns(
-                "Arrives in slice 7a (the disk writer).",
-            )));
             form.label(K::KindCaption, &format!("{}:", labels::TARGET_KIND));
             form.popup(K::Kind, &strings(&KINDS), ids::TARGET_KIND);
             form.popup(K::Device, &[], ids::TARGET_DEVICE);
@@ -320,8 +321,11 @@ impl RestoreScreen {
             RestoreScreen {
                 ctrl: RefCell::new(RestoreController::new(RestoreServices {
                     jobs: JobRegistry::new(),
-                    notify,
+                    notify: notify.clone(),
                 })),
+                mtm,
+                notify,
+                writer: RefCell::default(),
                 host,
                 recent_files: RefCell::new(recent.list(RecentMode::Restore)),
                 recent,
@@ -342,6 +346,10 @@ impl RestoreScreen {
     /// The app's device list; a target's row is reconciled before anything shows it.
     pub fn set_devices(&self, devices: &[DiskDevice]) {
         self.ctrl.borrow_mut().reconcile_devices(devices);
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.set_devices(devices);
+        }
         *self.devices.borrow_mut() = devices.to_vec();
     }
 
@@ -351,7 +359,12 @@ impl RestoreScreen {
     }
 
     pub fn is_running(&self) -> bool {
-        self.ctrl.borrow().is_running()
+        let writing = self
+            .writer
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_writing());
+        self.ctrl.borrow().is_running() || writing
     }
 
     /// The backup folder open here, for the share with Inspect.
@@ -379,6 +392,13 @@ impl RestoreScreen {
     }
 
     pub fn tick(&self) {
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.tick();
+            if !d.is_open() {
+                self.writer.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -422,18 +442,29 @@ impl RestoreScreen {
             let mut ctrl = self.ctrl.borrow_mut();
             (ctrl.take_requests(), ctrl.take_log())
         };
-        let mut log = log;
         for request in requests {
             match request {
                 HostRequest::RememberRecent(path) => self.remember(&path),
-                HostRequest::WriteImage(_) => log.push((
-                    LogLevel::Warning,
-                    "The disk writer arrives in the AppKit shell in slice 7a.".to_string(),
-                )),
+                HostRequest::WriteImage(open) => self.open_writer(open),
             }
         }
         crate::app::append_log(log);
         self.refresh();
+    }
+
+    /// Write Image File: the image goes to the disk writer's window, one at a time.
+    fn open_writer(&self, open: rusty_backup::controller::restore::WriteOpen) {
+        if self.writer.borrow().as_ref().is_some_and(|d| d.is_open()) {
+            return;
+        }
+        let d = DiskWriteWindow::open(
+            self.mtm,
+            self.notify.clone(),
+            self.host.clone(),
+            &self.devices.borrow(),
+            open,
+        );
+        *self.writer.borrow_mut() = Some(d);
     }
 
     fn remember(&self, path: &Path) {

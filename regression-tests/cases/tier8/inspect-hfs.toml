@@ -10,7 +10,7 @@ id = "flow.inspect.hfs-expand"
 description = "Expand a 1.4 MB classic HFS volume to an 8 MiB flat HFV with Inspect's Expand HFS Volume, then check its size, its file and fsck"
 level = "smoke"
 area = ["inspect"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["inspect.open-image", "inspect.expand-hfs"]
 timeout_ms = 180000
 
@@ -62,7 +62,7 @@ id = "flow.inspect.hfs-shrink"
 description = "Shrink a 32 MiB classic HFS volume to an 8 MiB flat HFV with Inspect's Expand HFS Volume (it clones into any size the data fits), then check its size, its file and fsck"
 level = "full"
 area = ["inspect"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["inspect.open-image", "inspect.expand-hfs"]
 timeout_ms = 180000
 

@@ -48,23 +48,39 @@ define_class!(
                 let _: () = msg_send![super(self), setObjectValue: value];
             }
             let f = self.ivars().borrow().clone();
-            if let Some(f) = f {
+            if let Some(f) = f.filter(|_| !READING.with(|r| r.get())) {
                 f();
             }
         }
     }
 );
 
+thread_local! {
+    /// A field's text is being read: the commit that reading makes reports nothing.
+    static READING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 type Fields<K> = Rc<RefCell<Vec<(K, Retained<NSTextField>, String)>>>;
 type Pops<K> = Rc<RefCell<Vec<(K, Retained<NSPopUpButton>, isize)>>>;
 
 /// The next field whose text changed since it was last reported, now marked as reported.
-fn next_edit<K: Copy>(fields: &Fields<K>) -> Option<K> {
-    for (k, f, last) in fields.borrow_mut().iter_mut() {
+fn next_edit<K: Copy + PartialEq>(fields: &Fields<K>) -> Option<K> {
+    // No borrow while reading: reading a field being edited commits it, and its cell reports here.
+    let list: Vec<(K, Retained<NSTextField>)> = fields
+        .borrow()
+        .iter()
+        .map(|(k, f, _)| (*k, f.clone()))
+        .collect();
+    for (k, f) in list {
+        let was = READING.with(|r| r.replace(true));
         let now = f.stringValue().to_string();
-        if now != *last {
-            *last = now;
-            return Some(*k);
+        READING.with(|r| r.set(was));
+        let mut all = fields.borrow_mut();
+        if let Some(entry) = all.iter_mut().find(|(x, _, _)| *x == k) {
+            if now != entry.2 {
+                entry.2 = now;
+                return Some(k);
+            }
         }
     }
     None
@@ -189,6 +205,19 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
 
     pub fn check(&self, k: K, title: &str, id: &str) -> Retained<NSButton> {
         let b = ui::checkbox(self.mtm, title, id);
+        self.add(k, &b);
+        b
+    }
+
+    /// A radio button; AppKit groups the ones sharing an action, and the screen sets each state.
+    pub fn radio(&self, k: K, title: &str, id: &str) -> Retained<NSButton> {
+        // SAFETY: no target yet; `add` points the button at the form's own.
+        let b = unsafe {
+            NSButton::radioButtonWithTitle_target_action(&ns(title), None, None, self.mtm)
+        };
+        if !id.is_empty() {
+            ui::set_id(&b, id);
+        }
         self.add(k, &b);
         b
     }
