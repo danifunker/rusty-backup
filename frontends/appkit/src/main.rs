@@ -4,6 +4,7 @@
 //! or the model; `scripts/check-boundaries.sh` enforces that.
 
 #[cfg(target_os = "macos")]
+mod alto;
 mod app;
 mod archives;
 #[cfg(target_os = "macos")]
@@ -20,8 +21,10 @@ mod chd;
 mod commander;
 mod disk_write;
 #[cfg(target_os = "macos")]
+mod editor;
 mod effects;
 mod expand_hfs;
+mod expand_image;
 #[cfg(target_os = "macos")]
 mod form;
 #[cfg(target_os = "macos")]
@@ -40,6 +43,7 @@ mod partition_bar;
 mod popup;
 #[cfg(target_os = "macos")]
 mod report;
+mod resize;
 mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;

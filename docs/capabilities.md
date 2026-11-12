@@ -39,11 +39,14 @@ reference the shells are measured against. Per-feature limits by build target li
 | `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | - | `flow.convert.iso-to-chd` |
 | `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
+| `inspect.edit-table` | - | - | - | yes | `flow.inspect.table.expand-add` |
 | `inspect.expand-hfs` | yes | yes | yes | yes | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
+| `inspect.expand-image` | - | - | - | yes | `flow.inspect.table.expand-add` |
 | `inspect.open-backup` | - | yes | yes | yes | `flow.restore.share-with-inspect` |
 | `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.remote-backup` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
 | `inspect.remote-open` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
+| `inspect.resize` | - | - | - | yes | `flow.inspect.table.expand-add` |
 | `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `optical.cdda-play` | - | yes | yes | yes | `flow.audio.cdda-play` |
 | `optical.chd` | yes | yes | yes | yes | `flow.convert.iso-to-chd`, `flow.optical.chd-browse-extract` |

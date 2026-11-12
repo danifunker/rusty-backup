@@ -2118,6 +2118,14 @@ jobs:
         if: steps.ax.outputs.trusted == 'true'
         working-directory: regression-tests
         run: ./runner/target/release/rb-regress run --tiers 8 --shell appkit --no-prompt
+      - name: Upload the flow reports
+        if: failure() && steps.ax.outputs.trusted == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: appkit-flow-reports-${{ needs.generate-version.outputs.version }}
+          path: |
+            regression-tests/runs/
+            regression-tests/scratch/**/appkit-app.log
       - name: No AX on this runner
         if: steps.ax.outputs.trusted != 'true'
         run: echo "::notice::This runner does not grant AX; the appkit flows run on a self-hosted Mac (Gate 0)."

@@ -28,12 +28,16 @@ use rusty_backup::controller::inspect::{
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::alto::AltoWindow;
 use crate::browse::BrowseView;
+use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
+use crate::expand_image::{self, ExpandImageWindow};
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
 use crate::report::{self, ReportWindow};
+use crate::resize::ResizeWindow;
 use crate::sync::SyncGuard;
 use crate::table::Table;
 use crate::ui::{self, ns};
@@ -61,24 +65,10 @@ const CHECK_CLOSE: &str = "inspect.check.close";
 const CHD_CLOSE: &str = "inspect.chd_info.close";
 
 /// Tools whose windows a later slice builds: they show, stay off and say when they come.
-const LATER: [(&str, &str); 9] = [
+const LATER: [(&str, &str); 4] = [
     (ids::CONNECT_REMOTE, "Arrives in slice 7b (remote)."),
     (ids::EXPORT, "Arrives in slice 7b (Export Disk Image)."),
     (ids::CONVERT, "Arrives in slice 7c (the Convert screen)."),
-    (
-        ids::EDIT_TABLE,
-        "Arrives in slice 7a (the partition editor).",
-    ),
-    (
-        ids::ADD_PARTITION,
-        "Arrives in slice 7a (the partition editor).",
-    ),
-    (ids::RESIZE, "Arrives in slice 7a (Resize Partitions)."),
-    (ids::EXPAND_IMAGE, "Arrives in slice 7a (Expand Image)."),
-    (
-        ids::ROW_RESIZE_ALTO,
-        "Arrives in slice 7a (Resize Alto Disk).",
-    ),
     (
         ids::CANCEL_EXPORT,
         "Arrives in slice 7b (Export Disk Image).",
@@ -186,6 +176,13 @@ pub struct InspectScreen {
     notify: Arc<dyn Notify>,
     /// Expand HFS Volume, while its controller has a source.
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
+    /// Resize Partitions and Resize Alto Disk, while their controllers are open.
+    resize: RefCell<Option<Rc<ResizeWindow>>>,
+    alto: RefCell<Option<Rc<AltoWindow>>>,
+    /// Expand Image's window, which the view holds.
+    expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
+    /// The table editor, open while the controller hands out its view.
+    editor_window: RefCell<Option<Rc<EditorWindow>>>,
     host: EffectHost,
     recent: RecentHandle,
     devices: RefCell<Vec<DiskDevice>>,
@@ -331,6 +328,10 @@ impl InspectScreen {
             })),
             notify,
             hfs: RefCell::default(),
+            resize: RefCell::default(),
+            alto: RefCell::default(),
+            expand_window: RefCell::default(),
+            editor_window: RefCell::default(),
             host,
             recent,
             devices: RefCell::default(),
@@ -410,6 +411,23 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.tick();
+            if d.take_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if !d.is_open() {
+                self.resize.replace(None);
+            }
+        }
+        let alto = self.alto.borrow().clone();
+        if let Some(d) = alto {
+            d.tick();
+            if !d.is_open() {
+                self.alto.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -417,6 +435,10 @@ impl InspectScreen {
     /// The app's device list; a change under the open device closes or re-inspects it.
     pub fn set_devices(&self, devices: &[DiskDevice]) {
         self.ctrl.borrow_mut().reconcile_devices(devices);
+        let resize = self.resize.borrow().clone();
+        if let Some(d) = resize {
+            d.set_devices(devices);
+        }
         *self.devices.borrow_mut() = devices.to_vec();
     }
 
@@ -437,6 +459,65 @@ impl InspectScreen {
 
     pub fn take_backup_closed(&self) -> bool {
         self.backup_closed.replace(false)
+    }
+
+    /// Resize Partitions: a dialog with its own controller, on the table read here.
+    fn open_resize(&self) {
+        let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
+        let plan = self.ctrl.borrow().resize_plan();
+        if let (false, Some(plan)) = (busy, plan) {
+            let d = ResizeWindow::open(self.mtm, self.notify.clone(), self.host.clone(), plan);
+            d.set_devices(&self.devices.borrow());
+            *self.resize.borrow_mut() = Some(d);
+        }
+    }
+
+    /// Resize Alto Disk: a dialog with its own controller, on the open image file.
+    fn open_alto(&self) {
+        if self.alto.borrow().is_some() {
+            return;
+        }
+        let source = self.ctrl.borrow().alto_resize_source();
+        match source {
+            Ok(path) => {
+                let d = AltoWindow::open(self.mtm, self.notify.clone(), self.host.clone(), path);
+                *self.alto.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
+    }
+
+    /// Expand Image's window: the view's own, previewing sizes through the controller.
+    fn open_expand_image(&self) {
+        if self.expand_window.borrow().is_some() {
+            return;
+        }
+        let me = self.me.clone();
+        let w = ExpandImageWindow::open(
+            self.mtm,
+            Rc::new(move |event| {
+                let Some(s) = me.upgrade() else { return };
+                match event {
+                    expand_image::Event::Preview(mib) => s.preview_expand(mib),
+                    expand_image::Event::Expand(bytes) => {
+                        s.expand_window.replace(None);
+                        s.apply(InspectAction::ExpandImage(bytes));
+                    }
+                    expand_image::Event::Close => {
+                        s.expand_window.replace(None);
+                    }
+                }
+            }),
+        );
+        *self.expand_window.borrow_mut() = Some(w);
+        self.preview_expand(0);
+    }
+
+    fn preview_expand(&self, mib: u32) {
+        let (current, new) = self.ctrl.borrow_mut().expand_image_preview(mib);
+        if let Some(w) = self.expand_window.borrow().as_ref() {
+            w.show(current, new);
+        }
     }
 
     /// Open an image file, as Build Disk's Open in Inspect asks.
@@ -471,6 +552,13 @@ impl InspectScreen {
     pub fn running_job(&self) -> Option<&'static str> {
         if let Some(job) = self.ctrl.borrow().running_job() {
             Some(job)
+        } else if self
+            .resize
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_running())
+        {
+            Some("Inspect: Resize")
         } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
             Some("Inspect: Expand HFS")
         } else {
@@ -496,6 +584,11 @@ impl InspectScreen {
             ids::OPEN_FILE => InspectAction::ChooseImage,
             ids::OPEN_BACKUP => InspectAction::ChooseBackupFolder,
             ids::REINSPECT => InspectAction::Reinspect,
+            ids::EDIT_TABLE => InspectAction::EditTable,
+            ids::ADD_PARTITION => InspectAction::AddPartition,
+            ids::EXPAND_IMAGE => return self.open_expand_image(),
+            ids::RESIZE => return self.open_resize(),
+            ids::ROW_RESIZE_ALTO => return self.open_alto(),
             ids::MAKE_BOOTABLE => InspectAction::MakeBootable,
             ids::CHD_INFO => InspectAction::ChdInfo,
             ids::CLOSE => InspectAction::Close,
@@ -698,6 +791,38 @@ impl InspectScreen {
     fn refresh(&self) {
         let shown = self.read();
         self.sync.run(|| self.show(shown));
+        let editor = {
+            let c = self.ctrl.borrow();
+            c.table_editor().map(|v| (v, c.table_write_target()))
+        };
+        self.show_editor(editor);
+    }
+
+    /// The table editor follows the controller: open while it hands out a view.
+    fn show_editor(
+        &self,
+        shown: Option<(
+            rusty_backup::controller::partition_edit::TableEditView,
+            Option<String>,
+        )>,
+    ) {
+        let Some((view, target)) = shown else {
+            self.editor_window.replace(None);
+            return;
+        };
+        let existing = self.editor_window.borrow().clone();
+        let w = existing.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(InspectAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            let w = EditorWindow::open(self.mtm, send);
+            *self.editor_window.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(&view, target.as_deref());
     }
 
     fn show(&self, s: Shown) {

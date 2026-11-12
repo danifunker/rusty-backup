@@ -249,6 +249,16 @@ plus `--shell tui`.
   remote daemon waits for slice 7b and Convert... for 7c. The optical, audio and archives
   flows pass; all 53 appkit flows pass.
 
+- **Slice 7a, volume dialogs (2026-11-12).** The disk writer (`disk_write.rs`, from Restore's
+  Write Image File), Expand HFS (`expand_hfs.rs`), Resize Partitions (`resize.rs`), Resize Alto
+  Disk (`alto.rs`), Expand Image (`expand_image.rs`) and the partition table editor
+  (`editor.rs`), each a window on `form.rs` over its controller. A field read while it is being
+  edited commits the edit, and its cell reports back: the form now reads without holding its
+  borrow and ignores that report. A new flow, `flow.inspect.table.expand-add`, covers Expand
+  Image, Resize's preview and the table editor; the disk-write and Expand HFS flows pass too, and
+  all 57 appkit flows pass. Inspect's Export window (which also opens the disk writer) comes with
+  slice 7b. The Alto dialog has no flow yet (no Alto fixture in tier 8).
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

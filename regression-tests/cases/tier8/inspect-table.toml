@@ -1,0 +1,63 @@
+# Tier 8: Inspect's image and table tools, end to end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.inspect.table"
+description = "Grow an image, look at Resize's plan, and add a partition with the table editor, then prove it with rb-cli."
+
+[[case]]
+id = "flow.inspect.table.expand-add"
+description = "Build a 32 MiB MBR image, grow it by 16 MiB with Expand Image, preview Resize Partitions (no change), then add a partition in the free space with the table editor and check its start with rb-cli"
+level = "full"
+area = ["inspect"]
+# The ids and labels are shared; the other shells can join once they are checked.
+shells = ["appkit"]
+capabilities = ["inspect.expand-image", "inspect.resize", "inspect.edit-table"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "FAT12" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.open_inspect", timeout_ms = 240000 },
+  { activate = "build_disk.open_inspect" },
+  { wait = "Re-inspect" },
+  { activate = "inspect.expand_image" },
+  { wait = "Add free space" },
+  { focus = "inspect.expand_image.add_mib" },
+  { fill = "16" },
+  { wait = "New size: 48" },
+  { activate = "inspect.expand_image.start" },
+  { activate = "inspect.reinspect" },
+  { wait = "48.0 MiB" },
+  { activate = "inspect.resize" },
+  { wait = "Partition Sizes:" },
+  { activate = "resize.preview" },
+  { wait = "No size changes" },
+  { activate = "resize.close" },
+  { activate = "inspect.add_partition" },
+  { wait = "Will be added as partition" },
+  # By label: the 1 MiB gap ahead of the first partition comes first.
+  { activate = "16.0 MiB at LBA 65536" },
+  { activate = "partition_edit.add" },
+  { activate = "partition_edit.apply" },
+  # The controller's question; its button is labelled, not named by the purpose.
+  { activate = "Write Table" },
+  { wait = "Re-inspect" },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/mbr.img"]
+expect_exit = 0
+stdout_contains = ["65536"]
