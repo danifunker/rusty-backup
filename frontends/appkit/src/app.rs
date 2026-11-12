@@ -499,6 +499,14 @@ impl App {
         inspect.browse.page.setHidden(true);
         content.addSubview(&optical.browse.page);
         optical.browse.page.setHidden(true);
+        content.addSubview(&inspect.remote.page);
+        inspect.remote.page.setHidden(true);
+        inspect.on_page(Rc::new(|| {
+            if let Some(app) = app() {
+                app.refresh();
+                app.relayout();
+            }
+        }));
         optical.browse.on_change(Rc::new(|| {
             if let Some(app) = app() {
                 app.optical.browser_changed();
@@ -757,7 +765,8 @@ impl App {
             self.refresh();
             return;
         }
-        if id.starts_with("inspect.") {
+        // Inspect's own, and its remote session's buttons.
+        if id.starts_with("inspect.") || id.starts_with("remote_pick.") {
             // A menu item can reach Inspect from another screen: show it first.
             if self.ctrl.borrow().active_tab() != AppTab::Inspect {
                 self.apply(AppAction::SelectTab(AppTab::Inspect));
@@ -857,14 +866,18 @@ impl App {
             }
             // A browse view stands in its page's place while it is open.
             let browsing = self.inspect.browse.is_active();
+            let picking = !browsing && self.inspect.remote.is_active();
             let disc = self.optical.browse.is_active();
             let covered = self.commander.borrow().is_some();
             for (t, page) in &self.pages {
-                let over = (browsing && *t == AppTab::Inspect) || (disc && *t == AppTab::Optical);
+                let inspect = (browsing || picking) && *t == AppTab::Inspect;
+                let over = inspect || (disc && *t == AppTab::Optical);
                 ui::set_visible(&page.scroll, *t == tab && !over && !covered);
             }
             let browse = browsing && tab == AppTab::Inspect && !covered;
             ui::set_visible(&self.inspect.browse.page, browse);
+            let pick = picking && tab == AppTab::Inspect && !covered;
+            ui::set_visible(&self.inspect.remote.page, pick);
             let disc = disc && tab == AppTab::Optical && !covered;
             ui::set_visible(&self.optical.browse.page, disc);
         });
@@ -960,6 +973,7 @@ impl App {
             }
             self.inspect.browse.page.setHidden(true);
             self.optical.browse.page.setHidden(true);
+            self.inspect.remote.page.setHidden(true);
             ui::move_to(&c.page, ui::area(&self.content));
             c.layout();
             return;
@@ -1027,6 +1041,8 @@ impl App {
                 self.inspect.browse.layout();
                 ui::move_to(&self.optical.browse.page, *r);
                 self.optical.browse.layout();
+                ui::move_to(&self.inspect.remote.page, *r);
+                self.inspect.remote.layout();
             }
             ui::move_to(self.part(*part), *r);
         }

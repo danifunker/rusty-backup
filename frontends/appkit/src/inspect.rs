@@ -26,16 +26,22 @@ use rusty_backup::controller::inspect::{
     InspectSource, JobRegistry, LayoutSegment, MinCell, PartitionRow,
 };
 use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::remote_pick::{
+    hints as remote_hints, ids as remote_ids, RemotePickAction,
+};
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::alto::AltoWindow;
 use crate::browse::BrowseView;
+use crate::disk_write::DiskWriteWindow;
 use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
 use crate::expand_image::{self, ExpandImageWindow};
+use crate::export::{self, ExportWindow};
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
+use crate::remote_pick::RemotePage;
 use crate::report::{self, ReportWindow};
 use crate::resize::ResizeWindow;
 use crate::sync::SyncGuard;
@@ -65,15 +71,7 @@ const CHECK_CLOSE: &str = "inspect.check.close";
 const CHD_CLOSE: &str = "inspect.chd_info.close";
 
 /// Tools whose windows a later slice builds: they show, stay off and say when they come.
-const LATER: [(&str, &str); 4] = [
-    (ids::CONNECT_REMOTE, "Arrives in slice 7b (remote)."),
-    (ids::EXPORT, "Arrives in slice 7b (Export Disk Image)."),
-    (ids::CONVERT, "Arrives in slice 7c (the Convert screen)."),
-    (
-        ids::CANCEL_EXPORT,
-        "Arrives in slice 7b (Export Disk Image).",
-    ),
-];
+const LATER: [(&str, &str); 1] = [(ids::CONVERT, "Arrives in slice 7c (the Convert screen).")];
 
 fn later(id: &str) -> Option<&'static str> {
     LATER.iter().find(|(i, _)| *i == id).map(|(_, why)| *why)
@@ -116,6 +114,11 @@ pub fn job_line(s: &Snapshot) -> (String, Option<u32>) {
 
 /// Everything a refresh shows, read while the controller is borrowed.
 struct Shown {
+    /// An export is running, so Cancel Export shows.
+    exporting: bool,
+    /// A remote image is open, and whether its backup runs.
+    remote_open: bool,
+    remote_backing_up: bool,
     source: String,
     error: Option<String>,
     flux: Option<String>,
@@ -142,6 +145,10 @@ enum Part {
     OpenFile,
     OpenBackup,
     Connect,
+    PickAnother,
+    BackupRemote,
+    BackingUp,
+    CloseRemote,
     Note,
     Flux,
     Error,
@@ -183,6 +190,12 @@ pub struct InspectScreen {
     expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     /// The table editor, open while the controller hands out its view.
     editor_window: RefCell<Option<Rc<EditorWindow>>>,
+    /// The daemon's listing, standing in Inspect's place while it is active.
+    pub remote: Rc<RemotePage>,
+    page_changed: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Export, open while the controller says so, and its Physical Disk Export's writer.
+    export_window: RefCell<Option<Rc<ExportWindow>>>,
+    writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     host: EffectHost,
     recent: RecentHandle,
     devices: RefCell<Vec<DiskDevice>>,
@@ -259,6 +272,22 @@ impl InspectScreen {
                 Part::Connect,
                 view(&button("Connect to Remote...", ids::CONNECT_REMOTE)),
             ),
+            (
+                Part::PickAnother,
+                view(&button("Pick Another Image", remote_ids::PICK_ANOTHER)),
+            ),
+            (
+                Part::BackupRemote,
+                view(&button("Back Up Image...", remote_ids::BACKUP)),
+            ),
+            (
+                Part::BackingUp,
+                view(&ui::label(mtm, remote_hints::BACKING_UP)),
+            ),
+            (
+                Part::CloseRemote,
+                view(&button("Close Remote", remote_ids::CLOSE)),
+            ),
             (Part::Note, view(&note)),
             (Part::Flux, view(&flux)),
             (Part::Error, view(&error)),
@@ -320,6 +349,7 @@ impl InspectScreen {
             body.addSubview(v);
         }
         let browse = BrowseView::build(mtm, notify.clone(), host.clone(), false);
+        let remote = RemotePage::build(mtm, notify.clone(), host.clone());
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             mtm,
             ctrl: RefCell::new(InspectController::new(InspectServices {
@@ -332,6 +362,9 @@ impl InspectScreen {
             alto: RefCell::default(),
             expand_window: RefCell::default(),
             editor_window: RefCell::default(),
+            export_window: RefCell::default(),
+            page_changed: RefCell::default(),
+            writer: RefCell::default(),
             host,
             recent,
             devices: RefCell::default(),
@@ -357,7 +390,14 @@ impl InspectScreen {
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
             browse,
+            remote,
         });
+        let me = screen.me.clone();
+        screen.remote.on_change(Rc::new(move || {
+            if let Some(s) = me.upgrade() {
+                s.remote_changed();
+            }
+        }));
         let me = screen.me.clone();
         screen.bar.on_select(Rc::new(move |p| {
             if let Some(s) = me.upgrade() {
@@ -404,6 +444,7 @@ impl InspectScreen {
 
     pub fn tick(&self) {
         self.browse.tick();
+        self.remote.tick();
         let hfs = self.hfs.borrow().clone();
         if let Some(d) = hfs {
             d.tick();
@@ -428,6 +469,13 @@ impl InspectScreen {
                 self.alto.replace(None);
             }
         }
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
+            d.tick();
+            if !d.is_open() {
+                self.writer.replace(None);
+            }
+        }
         let effects = self.ctrl.borrow_mut().tick();
         self.after(effects);
     }
@@ -437,6 +485,10 @@ impl InspectScreen {
         self.ctrl.borrow_mut().reconcile_devices(devices);
         let resize = self.resize.borrow().clone();
         if let Some(d) = resize {
+            d.set_devices(devices);
+        }
+        let writer = self.writer.borrow().clone();
+        if let Some(d) = writer {
             d.set_devices(devices);
         }
         *self.devices.borrow_mut() = devices.to_vec();
@@ -459,6 +511,31 @@ impl InspectScreen {
 
     pub fn take_backup_closed(&self) -> bool {
         self.backup_closed.replace(false)
+    }
+
+    /// The remote picker changed: log its lines and open a picked image.
+    fn remote_changed(&self) {
+        let (lines, picked) = self.remote.take();
+        let log = lines
+            .into_iter()
+            .map(|l| (LogLevel::Info, format!("Remote: {l}")));
+        crate::app::append_log(log.collect());
+        if let Some(conn) = picked {
+            self.apply(InspectAction::Load(InspectSource::Remote { conn }));
+        }
+        self.on_page_change();
+    }
+
+    /// The page on show may have changed (browse view, remote listing, screen): tell the app.
+    fn on_page_change(&self) {
+        if let Some(f) = self.page_changed.borrow().clone() {
+            f();
+        }
+    }
+
+    /// The app's hook for a change of which page stands in Inspect's place.
+    pub fn on_page(&self, f: Rc<dyn Fn()>) {
+        *self.page_changed.borrow_mut() = Some(f);
     }
 
     /// Resize Partitions: a dialog with its own controller, on the table read here.
@@ -561,6 +638,13 @@ impl InspectScreen {
             Some("Inspect: Resize")
         } else if self.hfs.borrow().as_ref().is_some_and(|d| d.is_running()) {
             Some("Inspect: Expand HFS")
+        } else if self
+            .writer
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_writing())
+        {
+            Some("Inspect: Physical Disk Export")
         } else {
             None
         }
@@ -584,7 +668,22 @@ impl InspectScreen {
             ids::OPEN_FILE => InspectAction::ChooseImage,
             ids::OPEN_BACKUP => InspectAction::ChooseBackupFolder,
             ids::REINSPECT => InspectAction::Reinspect,
+            ids::CONNECT_REMOTE => {
+                self.remote.apply(RemotePickAction::Connect);
+                return self.on_page_change();
+            }
+            remote_ids::PICK_ANOTHER => {
+                let image = self.ctrl.borrow().remote().cloned();
+                if let Some(image) = image {
+                    self.remote.apply(RemotePickAction::BrowseOn(image));
+                }
+                return self.on_page_change();
+            }
+            remote_ids::BACKUP => InspectAction::BackupRemote,
+            remote_ids::CLOSE => InspectAction::Unload { quiet: true },
             ids::EDIT_TABLE => InspectAction::EditTable,
+            ids::EXPORT => InspectAction::OpenExport,
+            ids::CANCEL_EXPORT => InspectAction::CancelExport,
             ids::ADD_PARTITION => InspectAction::AddPartition,
             ids::EXPAND_IMAGE => return self.open_expand_image(),
             ids::RESIZE => return self.open_resize(),
@@ -784,6 +883,9 @@ impl InspectScreen {
                 button: r.check.repairable,
             }),
             chd: c.chd_info_text().map(str::to_string),
+            exporting: c.export_job().is_some(),
+            remote_open: c.remote().is_some(),
+            remote_backing_up: c.remote_backup_running(),
         }
     }
 
@@ -796,6 +898,55 @@ impl InspectScreen {
             c.table_editor().map(|v| (v, c.table_write_target()))
         };
         self.show_editor(editor);
+        let export = export::Shown::read(&mut self.ctrl.borrow_mut());
+        self.show_export(export);
+    }
+
+    /// The Export window follows the controller: open while it says so, updated each refresh.
+    fn show_export(&self, shown: Option<export::Shown>) {
+        let Some(shown) = shown else {
+            self.export_window.replace(None);
+            return;
+        };
+        let existing = self.export_window.borrow().clone();
+        let w = existing.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(InspectAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            let me = self.me.clone();
+            let physical: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = me.upgrade() {
+                    s.open_physical();
+                }
+            });
+            let w = ExportWindow::open(self.mtm, send, physical);
+            *self.export_window.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(shown);
+    }
+
+    /// Export's Physical Disk Export: the image goes to the disk writer's window.
+    fn open_physical(&self) {
+        let busy = self.writer.borrow().as_ref().is_some_and(|d| d.is_open());
+        let Some(open) = self.ctrl.borrow().physical_source() else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        self.apply(InspectAction::CloseExport);
+        let d = DiskWriteWindow::open(
+            self.mtm,
+            self.notify.clone(),
+            self.host.clone(),
+            &self.devices.borrow(),
+            open,
+        );
+        *self.writer.borrow_mut() = Some(d);
     }
 
     /// The table editor follows the controller: open while it hands out a view.
@@ -843,7 +994,16 @@ impl InspectScreen {
         ui::set_visible(self.part(Part::Convert), s.can_convert);
         ui::set_visible(self.part(Part::Chd), s.has_chd);
         ui::set_visible(self.part(Part::Close), s.can_close);
-        ui::set_visible(self.part(Part::CancelExport), false);
+        ui::set_visible(self.part(Part::CancelExport), s.exporting);
+        for p in [Part::PickAnother, Part::BackupRemote, Part::CloseRemote] {
+            ui::set_visible(self.part(p), s.remote_open);
+        }
+        self.set_enabled(Part::BackupRemote, !s.remote_backing_up);
+        self.set_enabled(Part::CloseRemote, !s.remote_backing_up);
+        ui::set_visible(
+            self.part(Part::BackingUp),
+            s.remote_open && s.remote_backing_up,
+        );
         ui::set_text(&self.details, &s.details.join("\n"));
         ui::set_visible(
             self.part(Part::NoPartitions),
@@ -1032,6 +1192,17 @@ impl InspectScreen {
             Node::button(p(Part::OpenBackup), 170),
             Node::button(p(Part::Connect), 170),
         ])];
+        rows.push(Node::row(vec![
+            Node::button(p(Part::PickAnother), 160),
+            Node::button(p(Part::BackupRemote), 140),
+            Node::button(p(Part::CloseRemote), 115),
+            Node::leaf(
+                p(Part::BackingUp),
+                Size::Fixed(140),
+                Size::Fixed(layout::ROW - 4),
+            ),
+            Node::Space(Size::Stretch(1)),
+        ]));
         let lines = |t: &NSTextField| {
             let text = t.stringValue().to_string();
             if text.is_empty() {

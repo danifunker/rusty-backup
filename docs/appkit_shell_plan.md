@@ -264,7 +264,17 @@ plus `--shell tui`.
   Every window now opens through `ui::present`, which leaves no field focused: a new window
   focused its first field, and the form keeps the controller's text out of a field being
   typed in, so a reopened Settings showed an empty URL. `flow.settings.save-and-reopen` passes;
-  all 58 appkit flows pass. Export and the remote windows are next.
+  all 58 appkit flows pass.
+
+- **Slice 7b, Export and the remote windows (2026-11-12).** `export.rs` (Export Disk Image,
+  whose Physical Disk Export opens Inspect's own disk writer), `remote_pick.rs` (the daemon's
+  listing, standing in Inspect's page while active, with Pick Another / Back Up Image / Close
+  Remote on Inspect), `backup_remote.rs` (Backup's Remote Drive), Restore's remote target rows
+  (in `restore.rs`), and `optical_remote.rs` (Add remote daemon). `Table` gained an activate
+  hook (Return or a double-click), and a prompt's field now presses the default button on
+  Return. A new flow, `flow.inspect.tools.export-vhd`, covers Export; the four network flows
+  pass, and all 63 appkit flows pass. The metadata editor is the browse view's and already
+  ships with slice 2; Convert (7c) is next.
 
 ## Exit criteria
 

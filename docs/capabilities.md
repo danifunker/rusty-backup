@@ -21,7 +21,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `archives.extract` | - | yes | yes | yes | `flow.archives.sit-extract-all` |
 | `archives.open` | - | yes | yes | yes | `flow.archives.sit-extract-all` |
 | `backup.format` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
-| `backup.remote-source` | - | yes | yes | - | `flow.network.backup-remote-connect` |
+| `backup.remote-source` | - | yes | yes | yes | `flow.network.backup-remote-connect` |
 | `backup.run` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `backup.source-image` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `browse.edit` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-new-folder` |
@@ -39,21 +39,22 @@ reference the shells are measured against. Per-feature limits by build target li
 | `commander.host-folder` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `convert.disc` | - | yes | yes | - | `flow.convert.iso-to-chd` |
 | `inspect.browse` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder` |
-| `inspect.edit-table` | - | - | - | yes | `flow.inspect.table.expand-add` |
+| `inspect.edit-table` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `inspect.expand-hfs` | yes | yes | yes | yes | `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
-| `inspect.expand-image` | - | - | - | yes | `flow.inspect.table.expand-add` |
+| `inspect.expand-image` | - | - | - | yes | `flow.inspect.tools.expand-add` |
+| `inspect.export` | - | - | - | yes | `flow.inspect.tools.export-vhd` |
 | `inspect.open-backup` | - | yes | yes | yes | `flow.restore.share-with-inspect` |
 | `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
-| `inspect.remote-backup` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
-| `inspect.remote-open` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
-| `inspect.resize` | - | - | - | yes | `flow.inspect.table.expand-add` |
+| `inspect.remote-backup` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
+| `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
+| `inspect.resize` | - | - | - | yes | `flow.inspect.tools.expand-add` |
 | `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `optical.cdda-play` | - | yes | yes | yes | `flow.audio.cdda-play` |
 | `optical.chd` | yes | yes | yes | yes | `flow.convert.iso-to-chd`, `flow.optical.chd-browse-extract` |
 | `optical.open-image` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
-| `optical.remote-drive` | - | yes | yes | - | `flow.network.optical-add-remote` |
+| `optical.remote-drive` | - | yes | yes | yes | `flow.network.optical-add-remote` |
 | `restore.backup-folder` | yes | yes | yes | yes | `flow.restore.folder-to-image`, `flow.restore.share-with-inspect` |
-| `restore.remote-target` | - | yes | yes | - | `flow.network.restore-to-remote-image` |
+| `restore.remote-target` | - | yes | yes | yes | `flow.network.restore-to-remote-image` |
 | `restore.run` | yes | yes | yes | yes | `flow.network.restore-to-remote-image`, `flow.restore.folder-to-image` |
 | `restore.target-image` | yes | yes | yes | yes | `flow.restore.folder-to-image` |
 | `restore.write-image` | - | yes | yes | yes | `flow.disk_write.image-file` |

@@ -7,6 +7,7 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::NSEvent;
 use objc2_app_kit::{
     NSAccessibility, NSBorderType, NSButton, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSScrollView, NSTableColumn, NSTableView, NSTableViewDataSource,
@@ -25,6 +26,7 @@ pub struct State {
     /// Each row's tick, when the table has a tick column, and the target its boxes act on.
     checks: Vec<bool>,
     check_target: Option<Retained<ui::Callback>>,
+    activate_target: Option<Retained<ui::Callback>>,
     on_select: Option<Rc<dyn Fn(Option<usize>)>>,
     /// The screen is setting the selection itself, so the change is not reported back.
     quiet: bool,
@@ -117,17 +119,46 @@ fn cell_view(
     Some(Retained::into_super(Retained::into_super(label)))
 }
 
+define_class!(
+    /// A table view that hands Return to its owner, which treats it as a double-click.
+    #[unsafe(super(NSTableView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBListTable"]
+    #[ivars = RefCell<Option<Rc<dyn Fn()>>>]
+    pub struct ListView;
+
+    unsafe impl NSObjectProtocol for ListView {}
+
+    impl ListView {
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let f = self.ivars().borrow().clone();
+            // Return and the keypad's Enter.
+            match (event.keyCode(), f) {
+                (36 | 76, Some(f)) => f(),
+                // SAFETY: the table's own handling of every other key.
+                _ => unsafe {
+                    let _: () = msg_send![super(self), keyDown: event];
+                },
+            }
+        }
+    }
+);
+
 /// A table in its scroll view; the screen keeps both.
 pub struct Table {
     pub scroll: Retained<NSScrollView>,
-    pub view: Retained<NSTableView>,
+    pub view: Retained<ListView>,
     source: Retained<Source>,
 }
 
 impl Table {
     /// `columns` are `(title, width in points, right-aligned)`; `id` is the controller id.
     pub fn new(mtm: MainThreadMarker, id: &str, columns: &[(&str, f64, bool)]) -> Table {
-        let view = NSTableView::initWithFrame(mtm.alloc(), NSRect::ZERO);
+        let this = mtm.alloc::<ListView>().set_ivars(RefCell::new(None));
+        // SAFETY: NSTableView's designated initialiser.
+        let view: Retained<ListView> =
+            unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         for (i, (title, width, _)) in columns.iter().enumerate() {
             let col = NSTableColumn::initWithIdentifier(mtm.alloc(), &ns(&i.to_string()));
             col.setTitle(&ns(title));
@@ -143,6 +174,7 @@ impl Table {
             right: columns.iter().map(|c| c.2).collect(),
             checks: Vec::new(),
             check_target: None,
+            activate_target: None,
             on_select: None,
             quiet: false,
         };
@@ -171,6 +203,18 @@ impl Table {
 
     pub fn on_select(&self, f: Rc<dyn Fn(Option<usize>)>) {
         self.source.ivars().borrow_mut().on_select = Some(f);
+    }
+
+    /// Return or a double-click on a row runs `f`; the selection says which row.
+    pub fn on_activate(&self, mtm: MainThreadMarker, f: Rc<dyn Fn()>) {
+        *self.view.ivars().borrow_mut() = Some(f.clone());
+        let target = ui::callback(mtm, Box::new(move |_| f()));
+        // SAFETY: the target is kept in the source's state, with the table.
+        unsafe {
+            self.view.setTarget(Some(&target));
+            self.view.setDoubleAction(Some(objc2::sel!(fire:)));
+        }
+        self.source.ivars().borrow_mut().activate_target = Some(target);
     }
 
     /// A first column of tick boxes; a click reports its row and its new state.

@@ -5,7 +5,7 @@
 //! Drive and Load partition info), the partition rows with Include, Calc min and Compact, the
 //! destination, name, output format with the shared CHD control, the sizing and split options,
 //! the checksum, and Start / Cancel with the progress line and the outcome. The VHD options
-//! window is `backup_vhd.rs`; the Remote Drive window comes with slice 7b.
+//! window is `backup_vhd.rs`, the Remote Drive window `backup_remote.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ use rusty_backup::controller::backup::{
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::backup_remote::{RemoteShown, RemoteWindow};
 use crate::backup_vhd::{VhdShown, VhdWindow};
 use crate::chd::{ChdControl, ChdIds, ChdKey};
 use crate::effects::{EffectHost, Reply, ReplyFn};
@@ -114,6 +115,8 @@ pub struct BackupScreen {
     /// The partitions the rows were built for.
     rows: RefCell<Vec<usize>>,
     vhd: RefCell<Option<Rc<VhdWindow>>>,
+    /// The Remote Drive window, while the controller holds it open.
+    remote: RefCell<Option<Rc<RemoteWindow>>>,
 }
 
 impl BackupScreen {
@@ -139,9 +142,7 @@ impl BackupScreen {
             form.label(K::SourceCaption, "Source:");
             form.pulldown(K::Source, ids::SOURCE);
             form.button(K::OpenImage, "Open Image File...", ids::OPEN_IMAGE);
-            let remote = form.button(K::RemoteOpen, "Remote Drive...", ids::REMOTE_OPEN);
-            remote.setEnabled(false);
-            remote.setToolTip(Some(&crate::ui::ns("Arrives in slice 7b (remote).")));
+            form.button(K::RemoteOpen, "Remote Drive...", ids::REMOTE_OPEN);
             form.button(K::Close, "Close Drive", ids::CLOSE_SOURCE);
             form.button(K::ClearRemote, "Disconnect", ids::CLEAR_REMOTE);
             form.button(K::Scan, "Load partition info", ids::LOAD_PARTITIONS);
@@ -212,6 +213,7 @@ impl BackupScreen {
                 chd,
                 rows: RefCell::default(),
                 vhd: RefCell::default(),
+                remote: RefCell::default(),
             }
         });
         screen.refresh();
@@ -279,6 +281,7 @@ impl BackupScreen {
         }
         crate::app::append_log(log);
         self.show_vhd();
+        self.show_remote();
         self.refresh();
     }
 
@@ -296,6 +299,36 @@ impl BackupScreen {
             let (options, custom) = self.chd.choice();
             ChdChoice { options, custom }
         })
+    }
+
+    /// The Remote Drive window follows the controller: open while it says so.
+    fn show_remote(&self) {
+        let shown = {
+            let ctrl = self.ctrl.borrow();
+            ctrl.remote_dialog_open().then(|| RemoteShown {
+                address: ctrl.remote_address().to_string(),
+                busy: ctrl.remote_busy(),
+                error: ctrl.remote_error().map(str::to_string),
+                drives: ctrl.remote_listed().then(|| ctrl.remote_drives()),
+            })
+        };
+        let Some(shown) = shown else {
+            self.remote.replace(None);
+            return;
+        };
+        let held = self.remote.borrow().clone();
+        let w = held.unwrap_or_else(|| {
+            let me = self.me.clone();
+            let send: Rc<dyn Fn(BackupAction)> = Rc::new(move |a| {
+                if let Some(s) = me.upgrade() {
+                    s.apply(a);
+                }
+            });
+            let w = RemoteWindow::open(self.mtm, send);
+            *self.remote.borrow_mut() = Some(w.clone());
+            w
+        });
+        w.show(shown);
     }
 
     /// The VHD options window follows the controller: open while it says so, rebuilt for new rows.
@@ -357,7 +390,7 @@ impl BackupScreen {
             items.push((d.display_name(), Some(K::Pick(Pick::Device(i))), true));
         }
         items.push(("Open Image File...".into(), Some(K::OpenImage), true));
-        items.push(("Remote Drive...".into(), Some(K::RemoteOpen), false));
+        items.push(("Remote Drive...".into(), Some(K::RemoteOpen), true));
         let title = if title.is_empty() {
             "Select a device or image..."
         } else {

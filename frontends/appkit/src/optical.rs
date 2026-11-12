@@ -4,7 +4,7 @@
 //! tools (Browse Contents, Close Disc, CHD Info, Audio Tracks), the rip's output form, and Start /
 //! Cancel. An image converts in the Convert screen, so image mode offers Convert... instead. The
 //! disc browser is a `BrowseView` in disc mode, shown in the screen's place while it is open, and
-//! the CD-DA player is its own window. Add remote daemon comes with slice 7b, Convert with 7c.
+//! the CD-DA player is its own window. Add remote daemon is `optical_remote.rs`; Convert comes with 7c.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -32,6 +32,7 @@ use crate::chd::{ChdControl, ChdIds, ChdKey};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::form::Form;
 use crate::layout::{self, Node, Size};
+use crate::optical_remote::{AddRemoteShown, AddRemoteWindow};
 use crate::report::{self, ReportWindow};
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns, CloseDelegate};
@@ -274,6 +275,7 @@ pub struct OpticalScreen {
     /// The disc browser, which stands in the screen's place while it is open.
     pub browse: Rc<BrowseView>,
     chd_window: RefCell<Option<ReportWindow>>,
+    add_remote_window: RefCell<Option<Rc<AddRemoteWindow>>>,
     audio_window: RefCell<Option<Rc<AudioWindow>>>,
 }
 
@@ -308,14 +310,7 @@ impl OpticalScreen {
             f.popup(K::Drive, &[], ids::DRIVE);
             f.button(K::Refresh, "Refresh", ids::REFRESH);
             f.button(K::Eject, "Eject", ids::EJECT);
-            let remote = ui::later(
-                mtm,
-                "Add remote daemon...",
-                ids::ADD_REMOTE,
-                "Arrives in slice 7b (remote windows).",
-            );
-            f.add(K::AddRemote, &remote);
-            remote.setEnabled(false);
+            f.button(K::AddRemote, "Add remote daemon...", ids::ADD_REMOTE);
             f.wrap(K::DriveNote, "");
             f.label(K::ImageCaption, "Image:");
             f.pulldown(K::Image, ids::IMAGE);
@@ -379,6 +374,7 @@ impl OpticalScreen {
                 chd,
                 browse,
                 chd_window: RefCell::default(),
+                add_remote_window: RefCell::default(),
                 audio_window: RefCell::default(),
             }
         });
@@ -488,8 +484,32 @@ impl OpticalScreen {
         })
     }
 
-    /// CHD Info and the player follow the controller: open while it says so.
+    /// CHD Info, Add remote daemon and the player follow the controller: open while it says so.
     fn show_windows(&self) {
+        let remote = {
+            let c = self.ctrl.borrow();
+            c.add_remote_open().then(|| {
+                let shown = AddRemoteShown {
+                    connecting: c.remote_connecting().is_some(),
+                    error: c.add_remote_error().map(str::to_string),
+                };
+                (shown, c.recent_daemons().to_vec())
+            })
+        };
+        match remote {
+            None => {
+                self.add_remote_window.replace(None);
+            }
+            Some((shown, recent)) => {
+                let held = self.add_remote_window.borrow().clone();
+                let w = held.unwrap_or_else(|| {
+                    let w = AddRemoteWindow::open(self.mtm, &recent, self.send());
+                    *self.add_remote_window.borrow_mut() = Some(w.clone());
+                    w
+                });
+                w.show(shown);
+            }
+        }
         let info = self.ctrl.borrow().chd_info().map(str::to_string);
         match info {
             None => {
@@ -712,6 +732,7 @@ impl OpticalScreen {
             K::ImageMode,
             K::Drive,
             K::Refresh,
+            K::AddRemote,
             K::Image,
             K::OpenImage,
             K::PickOutput,

@@ -10,6 +10,7 @@ mod archives;
 #[cfg(target_os = "macos")]
 mod backup;
 #[cfg(target_os = "macos")]
+mod backup_remote;
 mod backup_vhd;
 #[cfg(target_os = "macos")]
 mod browse;
@@ -25,6 +26,7 @@ mod editor;
 mod effects;
 mod expand_hfs;
 mod expand_image;
+mod export;
 #[cfg(target_os = "macos")]
 mod form;
 #[cfg(target_os = "macos")]
@@ -35,6 +37,7 @@ mod menu;
 #[cfg(target_os = "macos")]
 mod model_window;
 mod optical;
+mod optical_remote;
 #[cfg(target_os = "macos")]
 mod pane_view;
 #[cfg(target_os = "macos")]
@@ -42,6 +45,7 @@ mod partition_bar;
 #[cfg(target_os = "macos")]
 mod popup;
 #[cfg(target_os = "macos")]
+mod remote_pick;
 mod report;
 mod resize;
 mod restore;

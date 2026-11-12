@@ -12,13 +12,13 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSColor,
-    NSControlTextEditingDelegate, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSControl, NSControlTextEditingDelegate, NSModalResponseOK, NSOpenPanel, NSPasteboard,
     NSPasteboardTypeString, NSSavePanel, NSSecureTextField, NSTextField, NSTextFieldDelegate,
-    NSWorkspace,
+    NSTextView, NSWorkspace,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSURL};
 use rusty_backup::controller::app::picker_start_folder;
@@ -324,7 +324,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "RBPromptDelegate"]
-    #[ivars = RefCell<Option<Box<dyn Fn()>>>]
+    #[ivars = RefCell<(Option<Box<dyn Fn()>>, Option<Box<dyn Fn()>>)>]
     struct PromptDelegate;
 
     unsafe impl NSObjectProtocol for PromptDelegate {}
@@ -334,8 +334,20 @@ define_class!(
     impl PromptDelegate {
         #[unsafe(method(controlTextDidChange:))]
         fn changed(&self, _note: &NSNotification) {
-            if let Some(f) = &*self.ivars().borrow() {
+            if let Some(f) = &self.ivars().borrow().0 {
                 f();
+            }
+        }
+
+        /// Return in the field presses the alert's default button.
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn command(&self, _control: &NSControl, _view: &NSTextView, sel: Sel) -> bool {
+            match (sel == sel!(insertNewline:), &self.ivars().borrow().1) {
+                (true, Some(f)) => {
+                    f();
+                    true
+                }
+                _ => false,
             }
         }
     }
@@ -399,7 +411,9 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
     field.setAccessibilityLabel(Some(&ns(&ui::plain(message))));
     a.setAccessoryView(Some(&body));
     let delegate: Retained<PromptDelegate> = {
-        let this = mtm.alloc::<PromptDelegate>().set_ivars(RefCell::new(None));
+        let this = mtm
+            .alloc::<PromptDelegate>()
+            .set_ivars(RefCell::new((None, None)));
         // SAFETY: NSObject's plain init.
         unsafe { msg_send![super(this), init] }
     };
@@ -416,7 +430,16 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
             ui::set_enabled(&ok_button, verdict.is_ok());
         }
     };
-    *delegate.ivars().borrow_mut() = Some(Box::new(validate.clone()));
+    let submit = {
+        let ok_button = ok_button.clone();
+        move || {
+            if ok_button.isEnabled() {
+                // SAFETY: a plain click on the alert's own button, with no sender.
+                unsafe { ok_button.performClick(None) };
+            }
+        }
+    };
+    *delegate.ivars().borrow_mut() = (Some(Box::new(validate.clone())), Some(Box::new(submit)));
     // SAFETY: the delegate outlives the field's use of it; it is cleared before both go.
     unsafe { field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     a.window().setInitialFirstResponder(Some(&field));

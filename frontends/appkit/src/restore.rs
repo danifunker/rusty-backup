@@ -6,7 +6,7 @@
 //! scanned partition), the new disk's table, the full-disk sizes with alignment and trailing free
 //! space with its before and after bars, the caveats, and Restore / Cancel with the progress line
 //! and the outcome. Start only ever sends `Start`: the write begins on the controller's own
-//! `Confirm`. Write Image File opens the disk writer; a daemon target comes with slice 7b.
+//! `Confirm`. Write Image File opens the disk writer; and a full-disk restore can go to a daemon's drive or image file.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -24,8 +24,9 @@ use rusty_backup::controller::inspect::{LayoutSegment, SegmentKind};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::restore::{
     device_label, format_size, hints, ids, labels, AlignmentChoice, CaveatLevel, HostRequest,
-    JobRegistry, NewDiskChoice, NewTableType, PlanSegment, RestoreAction, RestoreController,
-    RestoreMode, RestoreServices, SizeMode, TargetSlot, ALIGN_SECTORS_MAX, MODES,
+    JobRegistry, NewDiskChoice, NewTableType, PlanSegment, RemoteDrive, RestoreAction,
+    RestoreController, RestoreMode, RestoreServices, SizeMode, TargetSlot, ALIGN_SECTORS_MAX,
+    MODES,
 };
 use rusty_backup::controller::{Controller, Effect};
 
@@ -35,6 +36,7 @@ use crate::form::Form;
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
 use crate::sync::SyncGuard;
+use crate::table::Table;
 
 const KINDS: [&str; 2] = ["Write to device", "Save as image file"];
 const TABLES: [(NewTableType, &str); 3] = [
@@ -114,6 +116,18 @@ enum K {
     WriteChoose,
     WriteLine,
     WriteTarget,
+    RemoteSwitch,
+    RemoteCaption,
+    RemoteAddress,
+    RemoteConnect,
+    RemoteBusy,
+    RemoteError,
+    RemoteNote,
+    RemoteList,
+    RemoteImageCaption,
+    RemoteImage,
+    RemoteUseImage,
+    RemoteSelected,
     KindCaption,
     Kind,
     Device,
@@ -168,6 +182,9 @@ pub struct RestoreScreen {
     ctrl: RefCell<RestoreController>,
     mtm: MainThreadMarker,
     notify: Arc<dyn Notify>,
+    /// The daemon's drives, as listed in the remote target's table.
+    remote_list: Table,
+    remote_drives: RefCell<Vec<RemoteDrive>>,
     /// Write Image File's disk writer, while its controller is open.
     writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     host: EffectHost,
@@ -236,6 +253,34 @@ impl RestoreScreen {
                 "Choose target and write...",
                 ids::WRITE_TARGET,
             );
+            form.check(K::RemoteSwitch, hints::REMOTE, ids::REMOTE_TARGET);
+            form.label(K::RemoteCaption, "Host:");
+            form.field(K::RemoteAddress, ids::REMOTE_ADDRESS, "Host", false);
+            form.button(K::RemoteConnect, "Connect", ids::REMOTE_CONNECT);
+            form.label(K::RemoteBusy, "Connecting...");
+            form.wrap(K::RemoteError, "");
+            form.wrap(K::RemoteNote, "");
+            let remote_list = Table::new(mtm, ids::REMOTE_DRIVE, &[("Drive", 460.0, false)]);
+            remote_list.view.setHeaderView(None);
+            let activate = me.clone();
+            remote_list.on_activate(
+                mtm,
+                Rc::new(move || {
+                    if let Some(s) = activate.upgrade() {
+                        s.remote_picked();
+                    }
+                }),
+            );
+            form.add(K::RemoteList, &remote_list.scroll);
+            form.label(K::RemoteImageCaption, "or image file:");
+            form.field(
+                K::RemoteImage,
+                ids::REMOTE_IMAGE_NAME,
+                "Image file name",
+                false,
+            );
+            form.button(K::RemoteUseImage, "Use file", ids::REMOTE_USE_IMAGE);
+            form.label(K::RemoteSelected, "");
             form.label(K::KindCaption, &format!("{}:", labels::TARGET_KIND));
             form.popup(K::Kind, &strings(&KINDS), ids::TARGET_KIND);
             form.popup(K::Device, &[], ids::TARGET_DEVICE);
@@ -325,6 +370,8 @@ impl RestoreScreen {
                 })),
                 mtm,
                 notify,
+                remote_list,
+                remote_drives: RefCell::default(),
                 writer: RefCell::default(),
                 host,
                 recent_files: RefCell::new(recent.list(RecentMode::Restore)),
@@ -594,7 +641,9 @@ impl RestoreScreen {
         let s = slot.unwrap_or(TargetSlot::FullDisk);
         let is_device = ctrl.target_is_device(s);
         let device_row = ctrl.device_row(s);
-        let on = slot.is_some();
+        // A daemon target replaces the local device and image rows.
+        let remote = self.show_remote(&ctrl, mode == RestoreMode::FullDisk);
+        let on = slot.is_some() && !remote;
         f.show(K::KindCaption, on);
         f.show(K::Kind, on && !single);
         f.select(K::Kind, usize::from(!is_device));
@@ -895,9 +944,88 @@ impl RestoreScreen {
         }
     }
 
+    /// The remote target rows; true while they stand in for the local target.
+    fn show_remote(&self, c: &RestoreController, full: bool) -> bool {
+        let f = &self.form;
+        let on = full && c.remote_active();
+        f.show(K::RemoteSwitch, full);
+        f.set_check(K::RemoteSwitch, on);
+        for k in [K::RemoteCaption, K::RemoteAddress, K::RemoteConnect] {
+            f.show(k, on);
+        }
+        f.set_text(K::RemoteAddress, c.remote_address());
+        f.enable(K::RemoteConnect, !c.remote_busy());
+        let label = if c.remote_connected() {
+            "Reconnect"
+        } else {
+            "Connect"
+        };
+        f.set_title(K::RemoteConnect, label);
+        f.show(K::RemoteBusy, on && c.remote_busy());
+        f.line(
+            K::RemoteError,
+            c.remote_error().filter(|_| on),
+            Some(Tone::Error),
+        );
+        let linked = on && c.remote_connected();
+        let drives = if linked {
+            c.remote_drives()
+        } else {
+            Vec::new()
+        };
+        let note = match (linked, drives.is_empty()) {
+            (true, true) => Some(hints::NO_REMOTE_DRIVES),
+            (true, false) => Some("Restore target on the remote machine (double-click or Enter):"),
+            (false, _) => None,
+        };
+        f.line(K::RemoteNote, note, None);
+        f.show(K::RemoteList, linked && !drives.is_empty());
+        if *self.remote_drives.borrow() != drives {
+            self.remote_list
+                .set_rows(drives.iter().map(|d| vec![d.label.clone()]).collect());
+            *self.remote_drives.borrow_mut() = drives;
+        }
+        for k in [K::RemoteImageCaption, K::RemoteImage, K::RemoteUseImage] {
+            f.show(k, linked);
+        }
+        f.set_text(K::RemoteImage, c.remote_image_name());
+        f.enable(K::RemoteUseImage, !c.remote_image_name().trim().is_empty());
+        let chosen = c
+            .remote_target_label()
+            .filter(|_| linked)
+            .map(|t| format!("Selected target: {t}"));
+        f.line(K::RemoteSelected, chosen.as_deref(), None);
+        on
+    }
+
+    /// Return or a double-click on a daemon's drive makes it the target.
+    fn remote_picked(&self) {
+        let Some(d) = self
+            .remote_list
+            .selected()
+            .and_then(|i| self.remote_drives.borrow().get(i).cloned())
+        else {
+            return;
+        };
+        let me = self.me.clone();
+        crate::app::later(Box::new(move || {
+            if let Some(s) = me.upgrade() {
+                s.apply(RestoreAction::RemotePickDevice {
+                    path: d.path,
+                    size: d.size_bytes,
+                });
+            }
+        }));
+    }
+
     /// The controls a running restore or another screen's job locks.
     fn form_controls(&self) -> Vec<K> {
         let mut v = vec![
+            K::RemoteSwitch,
+            K::RemoteAddress,
+            K::RemoteConnect,
+            K::RemoteImage,
+            K::RemoteUseImage,
             K::Mode,
             K::Folder,
             K::Recent,
@@ -977,6 +1105,29 @@ impl RestoreScreen {
                 Node::button(K::WriteTarget, 220),
                 Node::Space(Size::Stretch(1)),
             ]),
+            Node::row(vec![
+                Node::Space(Size::Fixed(caption)),
+                stretch(K::RemoteSwitch),
+            ]),
+            Node::row(vec![
+                cap(K::RemoteCaption),
+                Node::field(K::RemoteAddress),
+                Node::button(K::RemoteConnect, 100),
+                fixed(K::RemoteBusy, 100),
+            ]),
+            lines(K::RemoteError),
+            lines(K::RemoteNote),
+            Node::leaf(
+                K::RemoteList,
+                Size::Stretch(1),
+                Size::Fixed(layout::ROW * 3),
+            ),
+            Node::row(vec![
+                cap(K::RemoteImageCaption),
+                Node::field(K::RemoteImage),
+                Node::button(K::RemoteUseImage, 90),
+            ]),
+            stretch(K::RemoteSelected),
             Node::row(vec![
                 cap(K::KindCaption),
                 pop(K::Kind, Size::Fixed(170)),
@@ -1110,6 +1261,11 @@ impl RestoreScreen {
             }
             K::WriteChoose => Some(RestoreAction::PickWriteImage),
             K::WriteTarget => Some(RestoreAction::WriteImageTarget),
+            K::RemoteSwitch => Some(RestoreAction::SetRemote(f.checked(k))),
+            K::RemoteConnect => Some(RestoreAction::RemoteConnect),
+            K::RemoteUseImage => Some(RestoreAction::RemoteUseImage),
+            K::RemoteAddress => Some(RestoreAction::RemoteSetAddress(f.text(k))),
+            K::RemoteImage => Some(RestoreAction::RemoteSetImageName(f.text(k))),
             K::Kind => f
                 .picked(k)
                 .map(|i| RestoreAction::SetTargetIsDevice(slot, i == 0)),

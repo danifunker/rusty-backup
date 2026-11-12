@@ -261,9 +261,9 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32, appkit | byte-compare |
 | `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32, appkit | byte-compare + fsck |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk, win32, appkit | size, byte-compare, fsck |
-| `inspect-table.toml` | Expand Image grows a built MBR image by 16 MiB, Resize Partitions previews it, and the table editor adds a partition in the free space | appkit (the ids and labels are shared; the others can join) | the new partition's start LBA |
+| `inspect-tools.toml` | Expand Image grows a built MBR image by 16 MiB, Resize Partitions previews it, and the table editor adds a partition in the free space; Export Disk Image writes a floppy as a VHD | appkit (the ids and labels are shared; the others can join) | the new partition's start LBA; the file read back from the VHD |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare out of the ISO; table + label |
-| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32) | tui, gtk, win32 | restore + byte-compare |
+| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32, appkit) | tui, gtk, win32, appkit | restore + byte-compare |
 | `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32, appkit | against `rb-cli optical extract` |
 | `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry; AppKit has none) | gtk, win32, appkit | the reopened form |
 | `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32 | a file out of the CHD against the same file out of the ISO |
