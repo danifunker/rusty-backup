@@ -20,7 +20,7 @@ use rusty_backup::controller::app::{
     elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate,
 };
 use rusty_backup::controller::log::{capture, LogLevel};
-use rusty_backup::controller::{ConfirmSpec, Controller, Effect};
+use rusty_backup::controller::{Controller, Effect};
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
@@ -443,12 +443,11 @@ impl App {
         }
     }
 
-    /// The controller's About text as an alert; `adw::AboutDialog` and Win32's note say the same.
+    /// The controller's About text as a note; `adw::AboutDialog` and Win32's note say the same.
     fn about(&self) {
-        let spec = ConfirmSpec {
-            purpose: "about",
-            title: format!("About {}", about::NAME),
-            message: format!(
+        crate::effects::note(
+            format!("About {}", about::NAME),
+            format!(
                 "{} {}\n\n{}\n\n{}\n{}",
                 about::NAME,
                 app_version(),
@@ -456,10 +455,7 @@ impl App {
                 about::DEVELOPER,
                 about::WEBSITE
             ),
-            confirm_label: "OK".to_string(),
-            destructive: false,
-        };
-        self.host.run(vec![Effect::Confirm(spec)], &reply());
+        );
     }
 
     /// Read the controller first and release it, then set views inside the guard.

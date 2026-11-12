@@ -151,8 +151,12 @@ plus `--shell tui`.
   `appkit` runs clippy, the layout tests, the build and the Gate 0 probe.
 - **The driver**: `drivers/ax_driver.swift` (the UIA driver's protocol and ops) and
   `runner/src/ax.rs`, which builds it with `swiftc` into `runner/target/` and passes it
-  `--appkit <binary>`. Gate 0 locally: the session that built it had no Accessibility permission,
-  so the driver refuses to start until the user grants it.
+  `--appkit <binary>`.
+- **Gate 0 on a desk Mac: passed (2026-11-11, macOS 27).** The driver found every control by
+  `AXIdentifier`, switched screens through the toolbar items, pressed a button by id and answered
+  an alert. The grant goes to the process macOS holds responsible: run from the Claude desktop
+  app, that is the Claude Code binary (`claude.app` under `~/Library/Application Support/Claude`),
+  not Claude.app, and it took a new process to see it. GitHub's runners: CI's probe will say.
 
 ## Exit criteria
 

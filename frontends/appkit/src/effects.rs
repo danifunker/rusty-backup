@@ -275,6 +275,18 @@ fn alert(mtm: MainThreadMarker, title: &str, message: &str) -> Retained<NSAlert>
     a
 }
 
+/// A one-button note (About), opened from a block of its own like every other question.
+pub fn note(title: String, text: String) {
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let a = alert(mtm, &title, &text);
+        a.addButtonWithTitle(&ns("OK"));
+        a.runModal();
+    });
+}
+
 fn confirm(mtm: MainThreadMarker, spec: &ConfirmSpec) -> bool {
     let a = alert(mtm, &spec.title, &spec.message);
     a.addButtonWithTitle(&ns(&spec.confirm_label));
