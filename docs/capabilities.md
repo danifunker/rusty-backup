@@ -17,6 +17,7 @@ reference the shells are measured against. Per-feature limits by build target li
 <!-- capabilities:begin -->
 | Capability | TUI | GTK | Win32 | AppKit | Proved by |
 |---|---|---|---|---|---|
+| `app.start` | - | - | - | yes | `flow.shell.appkit-start` |
 | `archives.extract` | - | yes | yes | - | `flow.archives.sit-extract-all` |
 | `archives.open` | - | yes | yes | - | `flow.archives.sit-extract-all` |
 | `backup.format` | yes | yes | yes | - | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
@@ -58,15 +59,19 @@ reference the shells are measured against. Per-feature limits by build target li
 
 ## Gaps
 
-Every GTK and Win32 cell is **yes** (Phase 5's exit criterion for Win32; the 13 flows written with
+Every GTK and Win32 cell but `app.start` is **yes** (Phase 5's exit criterion for Win32; the 13 flows written with
 the Win32 shell were extended to GTK on 2026-11-10 and run under WSL, regression-tests/FLOWS.md).
 The other columns' dashes, by reason:
 
 - **By design**
   - TUI, `optical.cdda-play`: the TUI has no CD-DA player; audio needs a desktop audio stack
     (platform_matrix.md, Optical row).
-- **Not started**
-  - AppKit: the shell does not exist yet (Phase 3); its column is its checklist.
+- **Proved by every flow**
+  - `app.start` on TUI, GTK and Win32: every flow those shells run starts them first. Only the
+    AppKit skeleton's stand-in flow (`flow.shell.appkit-start`) carries the tag, until its first
+    screen has flows; the stand-in goes then.
+- **Under way**
+  - AppKit: slice 0 (the skeleton) is in (Phase 3); its column is its checklist.
 - **No TUI flow yet**: the TUI has these screens (platform_matrix.md's feature rows) but the flows
   list only `gtk` and `win32`: Archives, the Inspect browse view and its edits, Build Disk's
   partitioned path, Convert, the disk writer, Restore's hand-off to Inspect, the remote Backup /
