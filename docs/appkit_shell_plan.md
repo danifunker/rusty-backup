@@ -232,6 +232,13 @@ plus `--shell tui`.
   waits for the disk writer (slice 7a). `flow.restore.folder-to-image` and
   `-share-with-inspect` pass; all 46 appkit flows pass.
 
+- **Slice 5, Build Disk (2026-11-12).** `build_disk.rs` over `BuildDiskController`, the wizard's
+  steps on one form with Back / Next / Create, and `build_rows.rs` for the Partitions and
+  Options steps, whose rows and option groups are built again only when the plan's shape
+  changes. A row's Pick... is a pull-down of the table's type catalog, so accessibility can
+  reach every entry. Open in Inspect switches to Inspect with the built image. The three
+  `flow.build` flows pass; all 49 appkit flows pass.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

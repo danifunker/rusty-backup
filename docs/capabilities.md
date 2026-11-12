@@ -28,11 +28,11 @@ reference the shells are measured against. Per-feature limits by build target li
 | `browse.edit-text` | - | yes | yes | yes | `flow.browse.inspect-edit-text` |
 | `browse.extract` | yes | yes | yes | yes | `flow.browse.inspect-extract-all`, `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `browse.new-folder` | - | yes | yes | yes | `flow.browse.inspect-new-folder` |
-| `build.cd-efs` | yes | yes | yes | - | `flow.build.efs-cd` |
-| `build.cd-from-folder` | yes | yes | yes | - | `flow.build.efs-cd` |
-| `build.format` | - | yes | yes | - | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
-| `build.open-inspect` | - | yes | yes | - | `flow.build.mbr-ntfs12` |
-| `build.partitioned` | - | yes | yes | - | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
+| `build.cd-efs` | yes | yes | yes | yes | `flow.build.efs-cd` |
+| `build.cd-from-folder` | yes | yes | yes | yes | `flow.build.efs-cd` |
+| `build.format` | - | yes | yes | yes | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
+| `build.open-inspect` | - | yes | yes | yes | `flow.build.mbr-ntfs12` |
+| `build.partitioned` | - | yes | yes | yes | `flow.build.mbr-fat`, `flow.build.mbr-ntfs12` |
 | `commander.apply` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |
 | `commander.archive-browse` | yes | yes | yes | yes | `flow.commander.open-zip`, `flow.commander.zip-to-image` |
 | `commander.copy` | yes | yes | yes | yes | `flow.commander.zip-to-image`, `flow.files.extract`, `flow.files.inject` |

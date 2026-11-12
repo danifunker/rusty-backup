@@ -11,6 +11,8 @@ mod backup;
 mod backup_vhd;
 #[cfg(target_os = "macos")]
 mod browse;
+mod build_disk;
+mod build_rows;
 #[cfg(target_os = "macos")]
 mod chd;
 #[cfg(target_os = "macos")]

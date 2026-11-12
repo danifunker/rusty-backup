@@ -10,7 +10,7 @@ id = "flow.build.efs-cd"
 description = "Build an IRIX EFS CD-ROM image filled from a host folder on the Build Disk screen, then read the file back from it with rb-cli"
 level = "smoke"
 area = ["build-disk", "optical"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["build.cd-efs", "build.cd-from-folder"]
 timeout_ms = 300000
 
@@ -51,7 +51,7 @@ id = "flow.build.mbr-fat"
 description = "Build a 32 MiB MBR image with one FAT partition and a typed label on the Build Disk screen, walking the Partitions and Options steps, then check the table and the label with rb-cli"
 level = "smoke"
 area = ["build-disk"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["build.partitioned", "build.format"]
 timeout_ms = 300000
 
@@ -97,7 +97,7 @@ id = "flow.build.mbr-ntfs12"
 description = "Build an MBR image with an NTFS 1.2 partition from its own entry in the filesystem list (Review names the version), open it with Open in Inspect, then check the version, the used size and fsck's count of a new folder with rb-cli"
 level = "full"
 area = ["build-disk", "inspect"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["build.partitioned", "build.format", "build.open-inspect"]
 timeout_ms = 300000
 

@@ -23,6 +23,7 @@ use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::backup::BackupScreen;
+use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -109,8 +110,7 @@ pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout
 /// Which slice brings each screen not built yet (docs/appkit_shell_plan.md).
 fn slice(tab: AppTab) -> Option<&'static str> {
     match tab {
-        AppTab::Inspect | AppTab::Backup | AppTab::Restore => None,
-        AppTab::Build => Some("5"),
+        AppTab::Inspect | AppTab::Backup | AppTab::Restore | AppTab::Build => None,
         AppTab::Optical | AppTab::Archives => Some("6"),
         AppTab::Convert => Some("7c"),
     }
@@ -131,6 +131,7 @@ pub struct App {
     inspect: Rc<InspectScreen>,
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
+    build: Rc<BuildScreen>,
     /// Commander, while it is open, over the whole window.
     commander: RefCell<Option<Rc<CommanderScreen>>>,
     log_shown: Cell<usize>,
@@ -472,6 +473,7 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        let build = BuildScreen::build(mtm, body_of(AppTab::Build), ctrl.notify(), host.clone());
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
         inspect.browse.on_change(Rc::new(|| {
@@ -496,6 +498,7 @@ impl App {
             inspect,
             backup,
             restore,
+            build,
             commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
@@ -533,10 +536,16 @@ impl App {
         self.inspect.tick();
         self.backup.set_devices(&devices);
         self.restore.set_devices(&devices);
+        self.build.set_devices(&devices);
         self.lock_screens();
         self.backup.tick();
         self.restore.tick();
+        self.build.tick();
         self.share_backup();
+        if let Some(path) = self.build.take_open_inspect() {
+            self.apply(AppAction::SelectTab(AppTab::Inspect));
+            self.inspect.open_image(path);
+        }
         let commander = self.commander.borrow().clone();
         if let Some(c) = commander {
             c.tick();
@@ -550,6 +559,10 @@ impl App {
             ("Inspect", self.inspect.running_job()),
             ("Backup", self.backup.is_running().then_some("Backup")),
             ("Restore", self.restore.is_running().then_some("Restore")),
+            (
+                "Build Disk",
+                self.build.is_running().then_some("Build Disk"),
+            ),
         ];
         let elsewhere = |me: &str| {
             running
@@ -559,6 +572,7 @@ impl App {
         };
         self.backup.set_busy(elsewhere("Backup"));
         self.restore.set_busy(elsewhere("Restore"));
+        self.build.set_busy(elsewhere("Build Disk"));
     }
 
     /// Restore and Inspect share a backup folder: the screen on show publishes or adopts it.
@@ -894,6 +908,7 @@ impl App {
                 self.inspect.relayout();
                 self.backup.relayout();
                 self.restore.relayout();
+                self.build.relayout();
                 ui::move_to(&self.inspect.browse.page, *r);
                 self.inspect.browse.layout();
             }

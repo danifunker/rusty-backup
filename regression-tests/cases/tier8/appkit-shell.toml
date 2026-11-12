@@ -20,8 +20,8 @@ capabilities = ["app.start"]
 ui = [
   { tab = "Optical" },
   { wait = "Optical arrives in slice" },
-  { tab = "Build" },
-  { wait = "Build Disk arrives in slice" },
+  { tab = "Convert" },
+  { wait = "Convert arrives in slice" },
   { activate = "log.clear" },
   { expect = "Copy Log" },
 ]

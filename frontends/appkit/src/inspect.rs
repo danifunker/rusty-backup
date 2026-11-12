@@ -412,6 +412,11 @@ impl InspectScreen {
         self.backup_closed.replace(false)
     }
 
+    /// Open an image file, as Build Disk's Open in Inspect asks.
+    pub fn open_image(&self, path: PathBuf) {
+        self.apply(InspectAction::Open(InspectSource::ImageFile(path)));
+    }
+
     /// Nothing open here, so a shared backup folder may be adopted.
     pub fn is_empty(&self) -> bool {
         let ctrl = self.ctrl.borrow();
