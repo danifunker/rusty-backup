@@ -299,6 +299,13 @@ plus `--shell tui`.
   it never takes a file type over. CI's build-appkit job signs, notarizes and uploads the DMG
   as an artifact; like the Win32 preview, it is not attached to releases yet.
 
+- **CI (2026-11-12, b5fdd8c2).** The build-appkit job is green on GitHub's macos-26 runner:
+  59 tier 8 flows pass over AX and 5 skip for a fixture the runner lacks (the optical ISO and
+  CD-DA images; all 64 pass locally), and the DMG is signed, notarized and uploaded. Two fixes
+  came from the slower runner: the AX driver's `choose` waits for a pop-up to show its pick,
+  and the remote-Inspect flow sets AppKit's modal prompt over AX, since posted keys never
+  reach it there.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the
