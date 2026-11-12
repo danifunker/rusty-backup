@@ -18,8 +18,8 @@ capabilities = ["app.start"]
 
 [[case.step]]
 ui = [
-  { tab = "Optical" },
-  { wait = "Optical arrives in slice" },
+  { tab = "Archives" },
+  { wait = "No archive selected" },
   { tab = "Convert" },
   { wait = "Convert arrives in slice" },
   { activate = "log.clear" },

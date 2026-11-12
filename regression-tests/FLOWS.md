@@ -263,9 +263,9 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 | `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
 | `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare out of the ISO; table + label |
 | `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32) | tui, gtk, win32 | restore + byte-compare |
-| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32 | against `rb-cli optical extract` |
+| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32, appkit | against `rb-cli optical extract` |
 | `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry) | gtk, win32 | the reopened form |
 | `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32 | a file out of the CHD against the same file out of the ISO |
-| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32 | against `rb-cli archive extract` |
-| `audio.toml` | play a CD-DA track | gtk, win32 (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
+| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32, appkit | against `rb-cli archive extract` |
+| `audio.toml` | play a CD-DA track | gtk, win32, appkit (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
 | `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32, appkit | the TUI can join once its extract-to-folder step is checked |

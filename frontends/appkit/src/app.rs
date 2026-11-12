@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
@@ -22,12 +23,14 @@ use rusty_backup::controller::app::{
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::archives::ArchivesScreen;
 use crate::backup::BackupScreen;
 use crate::build_disk::BuildScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
+use crate::optical::OpticalScreen;
 use crate::restore::RestoreScreen;
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
@@ -111,7 +114,7 @@ pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout
 fn slice(tab: AppTab) -> Option<&'static str> {
     match tab {
         AppTab::Inspect | AppTab::Backup | AppTab::Restore | AppTab::Build => None,
-        AppTab::Optical | AppTab::Archives => Some("6"),
+        AppTab::Optical | AppTab::Archives => None,
         AppTab::Convert => Some("7c"),
     }
 }
@@ -132,6 +135,10 @@ pub struct App {
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
     build: Rc<BuildScreen>,
+    archives: Rc<ArchivesScreen>,
+    optical: Rc<OpticalScreen>,
+    /// A tick is queued for the playing track's position.
+    player_tick: Cell<bool>,
     /// Commander, while it is open, over the whole window.
     commander: RefCell<Option<Rc<CommanderScreen>>>,
     log_shown: Cell<usize>,
@@ -474,8 +481,31 @@ impl App {
             host.clone(),
         );
         let build = BuildScreen::build(mtm, body_of(AppTab::Build), ctrl.notify(), host.clone());
+        let archives = ArchivesScreen::build(
+            mtm,
+            body_of(AppTab::Archives),
+            ctrl.notify(),
+            ctrl.recent_handle(),
+            host.clone(),
+        );
+        let optical = OpticalScreen::build(
+            mtm,
+            body_of(AppTab::Optical),
+            ctrl.notify(),
+            ctrl.recent_handle(),
+            host.clone(),
+        );
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
+        content.addSubview(&optical.browse.page);
+        optical.browse.page.setHidden(true);
+        optical.browse.on_change(Rc::new(|| {
+            if let Some(app) = app() {
+                app.optical.browser_changed();
+                app.refresh();
+                app.relayout();
+            }
+        }));
         inspect.browse.on_change(Rc::new(|| {
             if let Some(app) = app() {
                 app.refresh();
@@ -499,6 +529,9 @@ impl App {
             backup,
             restore,
             build,
+            archives,
+            optical,
+            player_tick: Cell::new(false),
             commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
@@ -541,7 +574,21 @@ impl App {
         self.backup.tick();
         self.restore.tick();
         self.build.tick();
+        self.archives.tick();
+        self.optical.tick();
         self.share_backup();
+        if let Some(path) = self.inspect.take_optical() {
+            self.apply(AppAction::SelectTab(AppTab::Optical));
+            self.optical.open_image(path);
+        }
+        if let Some(path) = self.inspect.take_archive() {
+            self.apply(AppAction::SelectTab(AppTab::Archives));
+            self.archives.open_path(path);
+        }
+        if let Some(path) = self.archives.take_mount() {
+            self.apply(AppAction::SelectTab(AppTab::Inspect));
+            self.inspect.open_image(path);
+        }
         if let Some(path) = self.build.take_open_inspect() {
             self.apply(AppAction::SelectTab(AppTab::Inspect));
             self.inspect.open_image(path);
@@ -551,6 +598,25 @@ impl App {
             c.tick();
         }
         self.refresh();
+        self.player_timer();
+    }
+
+    /// A playing track moves with no job to wake the shell, so a timer ticks while it plays.
+    fn player_timer(&self) {
+        if !self.optical.playing() || self.player_tick.replace(true) {
+            return;
+        }
+        let when = DispatchTime::try_from(std::time::Duration::from_millis(250))
+            .unwrap_or(DispatchTime::NOW);
+        let queued = DispatchQueue::main().after(when, || {
+            if let Some(app) = app() {
+                app.player_tick.set(false);
+                app.tick();
+            }
+        });
+        if queued.is_err() {
+            self.player_tick.set(false);
+        }
     }
 
     /// One disk job at a time: each screen hears who else runs.
@@ -563,6 +629,7 @@ impl App {
                 "Build Disk",
                 self.build.is_running().then_some("Build Disk"),
             ),
+            ("Optical", self.optical.is_running().then_some("Optical")),
         ];
         let elsewhere = |me: &str| {
             running
@@ -573,6 +640,8 @@ impl App {
         self.backup.set_busy(elsewhere("Backup"));
         self.restore.set_busy(elsewhere("Restore"));
         self.build.set_busy(elsewhere("Build Disk"));
+        self.archives.set_busy(elsewhere("Archives"));
+        self.optical.set_busy(elsewhere("Optical"));
     }
 
     /// Restore and Inspect share a backup folder: the screen on show publishes or adopts it.
@@ -648,6 +717,14 @@ impl App {
         }
         if id == ids::COMMANDER {
             self.open_commander();
+            return;
+        }
+        if id.starts_with("optical.") {
+            if self.ctrl.borrow().active_tab() != AppTab::Optical {
+                self.apply(AppAction::SelectTab(AppTab::Optical));
+            }
+            self.optical.command(id);
+            self.refresh();
             return;
         }
         if id.starts_with("inspect.") {
@@ -747,15 +824,18 @@ impl App {
             if self.log_auto.state() != state {
                 self.log_auto.setState(state);
             }
-            // Inspect's browse view stands in its page's place while it is open.
+            // A browse view stands in its page's place while it is open.
             let browsing = self.inspect.browse.is_active();
+            let disc = self.optical.browse.is_active();
             let covered = self.commander.borrow().is_some();
             for (t, page) in &self.pages {
-                let here = *t == tab && !(browsing && *t == AppTab::Inspect);
-                ui::set_visible(&page.scroll, here && !covered);
+                let over = (browsing && *t == AppTab::Inspect) || (disc && *t == AppTab::Optical);
+                ui::set_visible(&page.scroll, *t == tab && !over && !covered);
             }
             let browse = browsing && tab == AppTab::Inspect && !covered;
             ui::set_visible(&self.inspect.browse.page, browse);
+            let disc = disc && tab == AppTab::Optical && !covered;
+            ui::set_visible(&self.optical.browse.page, disc);
         });
         if banner_was != banner.is_some() || shared_was != shared || self.banner_buttons_moved() {
             self.relayout();
@@ -848,6 +928,7 @@ impl App {
                 page.scroll.setHidden(true);
             }
             self.inspect.browse.page.setHidden(true);
+            self.optical.browse.page.setHidden(true);
             ui::move_to(&c.page, ui::area(&self.content));
             c.layout();
             return;
@@ -909,8 +990,12 @@ impl App {
                 self.backup.relayout();
                 self.restore.relayout();
                 self.build.relayout();
+                self.archives.relayout();
+                self.optical.relayout();
                 ui::move_to(&self.inspect.browse.page, *r);
                 self.inspect.browse.layout();
+                ui::move_to(&self.optical.browse.page, *r);
+                self.optical.browse.layout();
             }
             ui::move_to(self.part(*part), *r);
         }

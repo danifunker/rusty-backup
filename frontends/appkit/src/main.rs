@@ -5,6 +5,7 @@
 
 #[cfg(target_os = "macos")]
 mod app;
+mod archives;
 #[cfg(target_os = "macos")]
 mod backup;
 #[cfg(target_os = "macos")]
@@ -28,6 +29,7 @@ mod layout;
 mod menu;
 #[cfg(target_os = "macos")]
 mod model_window;
+mod optical;
 #[cfg(target_os = "macos")]
 mod pane_view;
 #[cfg(target_os = "macos")]

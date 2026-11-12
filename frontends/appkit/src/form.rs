@@ -414,6 +414,13 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         ui::set_text(&f, t);
     }
 
+    /// Set a line's text and tone; hidden when there is none.
+    pub fn line(&self, k: K, text: Option<&str>, tone: Option<Tone>) {
+        self.set_text(k, text.unwrap_or(""));
+        self.show(k, text.is_some());
+        self.set_tone(k, tone);
+    }
+
     pub fn set_tone(&self, k: K, tone: Option<Tone>) {
         self.text_of(k).setTextColor(Some(&tone_color(tone)));
     }

@@ -189,14 +189,18 @@ const ALL: [C; 63] = [
 ];
 
 /// The pane's controller: Inspect's browse profile.
-fn new_controller(notify: &Arc<dyn Notify>) -> CommanderController {
+/// The pane's controller: Inspect's browse profile, or the Optical screen's disc browser.
+fn new_controller(notify: &Arc<dyn Notify>, disc: bool) -> CommanderController {
     let services = PaneServices {
         jobs: JobRegistry::new(),
         notify: Arc::clone(notify),
         recent: Box::new(CommanderRecent(UserConfig)),
     };
     let (keymap, problems) = KeyMap::load(KeyMap::user_file().as_deref());
-    let mut ctl = CommanderController::single(services, keymap, PaneProfile::inspect());
+    let mut ctl = match disc {
+        true => rusty_backup::controller::optical::disc_browser(services, keymap),
+        false => CommanderController::single(services, keymap, PaneProfile::inspect()),
+    };
     ctl.report_keymap_problems(problems);
     ctl
 }
@@ -230,6 +234,8 @@ pub struct BrowseView {
     sync: SyncGuard,
     me: Weak<BrowseView>,
     active: Cell<bool>,
+    /// The Optical screen's disc browser rather than Inspect's.
+    disc: bool,
     /// The view's own page, which the Inspect page gives way to while it is open.
     pub page: Retained<NSView>,
     _target: Retained<Callback>,
@@ -264,6 +270,7 @@ impl BrowseView {
         mtm: MainThreadMarker,
         notify: Arc<dyn Notify>,
         host: EffectHost,
+        disc: bool,
     ) -> Rc<BrowseView> {
         Rc::new_cyclic(|me: &Weak<BrowseView>| {
             let fire_me = me.clone();
@@ -423,7 +430,8 @@ impl BrowseView {
             );
             BrowseView {
                 mtm,
-                ctrl: RefCell::new(new_controller(&notify)),
+                ctrl: RefCell::new(new_controller(&notify, disc)),
+                disc,
                 notify,
                 host,
                 sync: SyncGuard::default(),
@@ -525,6 +533,16 @@ impl BrowseView {
         self.active.get() && self.ctrl.borrow().has_unsaved_edits()
     }
 
+    /// Open the Optical screen's disc in the disc browser.
+    pub fn open_disc(&self, src: rusty_backup::controller::optical::DiscSource) {
+        self.close();
+        let fx = self.ctrl.borrow_mut().open_disc(src);
+        self.active.set(true);
+        self.after(fx);
+        self.changed();
+        self.pane.focus();
+    }
+
     /// Open the partition the Inspect controller chose, with its edit flow and label prefix.
     pub fn open_request(&self, req: BrowseOpen) {
         self.close();
@@ -571,7 +589,7 @@ impl BrowseView {
         if !self.active.replace(false) {
             return;
         }
-        let fresh = new_controller(&self.notify);
+        let fresh = new_controller(&self.notify, self.disc);
         // The old pane's readers go before its CHD diff or archive temp is removed.
         self.ctrl.replace(fresh).close_inspect();
         self.label_prefix.borrow_mut().clear();

@@ -239,6 +239,16 @@ plus `--shell tui`.
   reach every entry. Open in Inspect switches to Inspect with the built image. The three
   `flow.build` flows pass; all 49 appkit flows pass.
 
+- **Slice 6, Optical and Archives (2026-11-12).** `optical.rs` over `OpticalController`: the
+  source (a drive, or an image with a pull-down of recent ones), the disc and its tools, the
+  rip form with the shared CHD control, and the CD-DA player in its own window, with a 250 ms
+  timer while a track plays because nothing else wakes the shell then. The disc browser is
+  `BrowseView` in disc mode, standing in the Optical page's place while it is open. CHD Info
+  reuses the report window. `archives.rs` over `ArchivesController`, its entries in a `Table`
+  that gained a tick-box column. Inspect now hands discs and archives to these screens. Add
+  remote daemon waits for slice 7b and Convert... for 7c. The optical, audio and archives
+  flows pass; all 53 appkit flows pass.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

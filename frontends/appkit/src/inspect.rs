@@ -189,6 +189,9 @@ pub struct InspectScreen {
     /// The recent files and devices the source menu was last built from.
     menu_built: RefCell<(Vec<String>, Vec<String>)>,
     backup_closed: Cell<bool>,
+    /// A disc or archive Inspect handed to the Optical or Archives screen, once.
+    optical: RefCell<Option<PathBuf>>,
+    archive: RefCell<Option<PathBuf>>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
     body: Retained<NSView>,
@@ -316,7 +319,7 @@ impl InspectScreen {
         for (_, v) in &parts {
             body.addSubview(v);
         }
-        let browse = BrowseView::build(mtm, notify.clone(), host.clone());
+        let browse = BrowseView::build(mtm, notify.clone(), host.clone(), false);
         let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
             mtm,
             ctrl: RefCell::new(InspectController::new(InspectServices {
@@ -328,6 +331,8 @@ impl InspectScreen {
             devices: RefCell::default(),
             menu_built: RefCell::new((vec!["-".to_string()], Vec::new())),
             backup_closed: Cell::new(false),
+            optical: RefCell::default(),
+            archive: RefCell::default(),
             sync: SyncGuard::default(),
             me: me.clone(),
             body,
@@ -406,6 +411,16 @@ impl InspectScreen {
     /// The backup folder open here, for the share with Restore.
     pub fn loaded_backup(&self) -> Option<PathBuf> {
         self.ctrl.borrow().backup_folder().map(PathBuf::from)
+    }
+
+    /// The optical image Inspect asked the Optical screen to open, once.
+    pub fn take_optical(&self) -> Option<PathBuf> {
+        self.optical.borrow_mut().take()
+    }
+
+    /// The Mac archive Inspect asked the Archives screen to open, once.
+    pub fn take_archive(&self) -> Option<PathBuf> {
+        self.archive.borrow_mut().take()
     }
 
     pub fn take_backup_closed(&self) -> bool {
@@ -590,11 +605,13 @@ impl InspectScreen {
                 self.browse.open_request(*open);
                 None
             }
-            HostRequest::OpenOptical(_) => {
-                Some("The Optical screen arrives in the AppKit shell in slice 6.".to_string())
+            HostRequest::OpenOptical(path) => {
+                *self.optical.borrow_mut() = Some(path);
+                None
             }
-            HostRequest::OpenArchive(_) => {
-                Some("The Archives screen arrives in the AppKit shell in slice 6.".to_string())
+            HostRequest::OpenArchive(path) => {
+                *self.archive.borrow_mut() = Some(path);
+                None
             }
             HostRequest::BackupClosed => {
                 self.backup_closed.set(true);

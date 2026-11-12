@@ -56,9 +56,7 @@ fn stretch(k: K) -> Node<K> {
 
 /// Set a line's text and tone; hidden when there is none.
 pub fn line(f: &Form<K>, k: K, text: Option<&str>, tone: Option<Tone>) {
-    f.set_text(k, text.unwrap_or(""));
-    f.show(k, text.is_some());
-    f.set_tone(k, tone);
+    f.line(k, text, tone);
 }
 
 /// What the rows were built for: a change here builds them again.

@@ -18,8 +18,8 @@ reference the shells are measured against. Per-feature limits by build target li
 | Capability | TUI | GTK | Win32 | AppKit | Proved by |
 |---|---|---|---|---|---|
 | `app.start` | - | - | - | yes | `flow.shell.appkit-start` |
-| `archives.extract` | - | yes | yes | - | `flow.archives.sit-extract-all` |
-| `archives.open` | - | yes | yes | - | `flow.archives.sit-extract-all` |
+| `archives.extract` | - | yes | yes | yes | `flow.archives.sit-extract-all` |
+| `archives.open` | - | yes | yes | yes | `flow.archives.sit-extract-all` |
 | `backup.format` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `backup.remote-source` | - | yes | yes | - | `flow.network.backup-remote-connect` |
 | `backup.run` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
@@ -44,10 +44,10 @@ reference the shells are measured against. Per-feature limits by build target li
 | `inspect.open-image` | yes | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-extract-all`, `flow.browse.inspect-new-folder`, `flow.inspect.hfs-expand`, `flow.inspect.hfs-shrink` |
 | `inspect.remote-backup` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
 | `inspect.remote-open` | yes | yes | yes | - | `flow.network.remote-inspect-backup` |
-| `optical.browse_contents` | yes | yes | yes | - | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
-| `optical.cdda-play` | - | yes | yes | - | `flow.audio.cdda-play` |
-| `optical.chd` | yes | yes | yes | - | `flow.convert.iso-to-chd`, `flow.optical.chd-browse-extract` |
-| `optical.open-image` | yes | yes | yes | - | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
+| `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
+| `optical.cdda-play` | - | yes | yes | yes | `flow.audio.cdda-play` |
+| `optical.chd` | yes | yes | yes | yes | `flow.convert.iso-to-chd`, `flow.optical.chd-browse-extract` |
+| `optical.open-image` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `optical.remote-drive` | - | yes | yes | - | `flow.network.optical-add-remote` |
 | `restore.backup-folder` | yes | yes | yes | yes | `flow.restore.folder-to-image`, `flow.restore.share-with-inspect` |
 | `restore.remote-target` | - | yes | yes | - | `flow.network.restore-to-remote-image` |

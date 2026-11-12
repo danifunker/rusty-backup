@@ -8,16 +8,23 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBorderType, NSControlTextEditingDelegate, NSScrollView, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSView,
+    NSAccessibility, NSBorderType, NSButton, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSScrollView, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextAlignment, NSView,
 };
 use objc2_foundation::{NSIndexSet, NSNotification, NSRect};
 
 use crate::ui::{self, ns};
 
+/// The tick column's identifier; the text columns are numbered.
+const CHECK: &str = "check";
+
 pub struct State {
     rows: Vec<Vec<String>>,
     right: Vec<bool>,
+    /// Each row's tick, when the table has a tick column, and the target its boxes act on.
+    checks: Vec<bool>,
+    check_target: Option<Retained<ui::Callback>>,
     on_select: Option<Rc<dyn Fn(Option<usize>)>>,
     /// The screen is setting the selection itself, so the change is not reported back.
     quiet: bool,
@@ -48,22 +55,7 @@ define_class!(
             column: Option<&NSTableColumn>,
             row: isize,
         ) -> Option<Retained<NSView>> {
-            let state = self.ivars().borrow();
-            let col = column
-                .map(|c| c.identifier().to_string())
-                .and_then(|i| i.parse::<usize>().ok())
-                .unwrap_or(0);
-            let text = state
-                .rows
-                .get(row as usize)
-                .and_then(|r| r.get(col))
-                .cloned()
-                .unwrap_or_default();
-            let label = ui::label(self.mtm(), &text);
-            if state.right.get(col).copied().unwrap_or(false) {
-                label.setAlignment(NSTextAlignment::Right);
-            }
-            Some(Retained::into_super(Retained::into_super(label)))
+            cell_view(self.mtm(), &self.ivars().borrow(), column, row)
         }
 
         #[unsafe(method(tableViewSelectionDidChange:))]
@@ -87,6 +79,43 @@ define_class!(
         }
     }
 );
+
+/// One cell: a tick box in the tick column, else the row's text for that column.
+fn cell_view(
+    mtm: MainThreadMarker,
+    state: &State,
+    column: Option<&NSTableColumn>,
+    row: isize,
+) -> Option<Retained<NSView>> {
+    let ident = column.map(|c| c.identifier().to_string());
+    if ident.as_deref() == Some(CHECK) {
+        let b = ui::checkbox(mtm, "", "");
+        let on = state.checks.get(row as usize).copied().unwrap_or(false);
+        b.setState(if on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        b.setTag(row);
+        b.setAccessibilityLabel(Some(&ns(&format!("Select row {}", row + 1))));
+        if let Some(t) = &state.check_target {
+            ui::hook(&b, t);
+        }
+        return Some(Retained::into_super(Retained::into_super(b)));
+    }
+    let col = ident.and_then(|i| i.parse::<usize>().ok()).unwrap_or(0);
+    let text = state
+        .rows
+        .get(row as usize)
+        .and_then(|r| r.get(col))
+        .cloned()
+        .unwrap_or_default();
+    let label = ui::label(mtm, &text);
+    if state.right.get(col).copied().unwrap_or(false) {
+        label.setAlignment(NSTextAlignment::Right);
+    }
+    Some(Retained::into_super(Retained::into_super(label)))
+}
 
 /// A table in its scroll view; the screen keeps both.
 pub struct Table {
@@ -112,6 +141,8 @@ impl Table {
         let state = State {
             rows: Vec::new(),
             right: columns.iter().map(|c| c.2).collect(),
+            checks: Vec::new(),
+            check_target: None,
             on_select: None,
             quiet: false,
         };
@@ -140,6 +171,38 @@ impl Table {
 
     pub fn on_select(&self, f: Rc<dyn Fn(Option<usize>)>) {
         self.source.ivars().borrow_mut().on_select = Some(f);
+    }
+
+    /// A first column of tick boxes; a click reports its row and its new state.
+    pub fn add_checks(&self, mtm: MainThreadMarker, on: Rc<dyn Fn(usize, bool)>) {
+        let col = NSTableColumn::initWithIdentifier(mtm.alloc(), &ns(CHECK));
+        col.setTitle(&ns(""));
+        col.setWidth(24.0);
+        self.view.addTableColumn(&col);
+        let last = self.view.numberOfColumns() - 1;
+        self.view.moveColumn_toColumn(last, 0);
+        let target = ui::callback(
+            mtm,
+            Box::new(move |sender| {
+                if let Some(b) = sender.downcast_ref::<NSButton>() {
+                    on(b.tag() as usize, b.state() == NSControlStateValueOn);
+                }
+            }),
+        );
+        self.source.ivars().borrow_mut().check_target = Some(target);
+    }
+
+    /// Show each row's tick; only a change reloads.
+    pub fn set_checks(&self, checks: Vec<bool>) {
+        if self.source.ivars().borrow().checks == checks {
+            return;
+        }
+        let selected = self.selected();
+        self.source.ivars().borrow_mut().checks = checks;
+        self.quietly(|| self.view.reloadData());
+        if let Some(i) = selected.filter(|i| *i < self.len()) {
+            self.select(i);
+        }
     }
 
     /// Show `rows`; only a change reloads, so the selection and scroll survive a refresh.
