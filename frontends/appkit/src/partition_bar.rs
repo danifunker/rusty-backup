@@ -26,6 +26,9 @@ const LEGEND: f64 = 20.0;
 /// The bar and its legend's height in points.
 pub const HEIGHT: i32 = BAR_HEIGHT as i32 + 6 + LEGEND as i32;
 
+/// The bar alone, without its legend.
+pub const BAR_ONLY: i32 = BAR_HEIGHT as i32;
+
 const DARK_FILLS: [(u8, u8, u8); 8] = [
     (62, 118, 166),
     (74, 129, 52),
@@ -69,11 +72,25 @@ fn fill(kind: SegmentKind, dark: bool) -> Retained<NSColor> {
     })
 }
 
-#[derive(Default)]
 pub struct State {
     segments: Vec<LayoutSegment>,
     selected: Option<usize>,
     on_select: Option<Rc<dyn Fn(Option<usize>)>>,
+    /// The part of the width the bar spans, so two bars share one scale.
+    scale: f32,
+    legend: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            segments: Vec::new(),
+            selected: None,
+            on_select: None,
+            scale: 1.0,
+            legend: true,
+        }
+    }
 }
 
 define_class!(
@@ -104,7 +121,8 @@ define_class!(
             }
             let (picked, f) = {
                 let state = self.ivars().borrow();
-                let widths = segment_widths(&state.segments, self.bounds().size.width as f32, MIN_SEGMENT_PX);
+                let width = self.bounds().size.width as f32 * state.scale;
+                let widths = segment_widths(&state.segments, width, MIN_SEGMENT_PX);
                 let hit = segment_at(&widths, at.x as f32).and_then(|i| state.segments.get(i));
                 (hit.and_then(|s| s.partition), state.on_select.clone())
             };
@@ -122,6 +140,19 @@ impl Bar {
         let bar: Retained<Bar> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         ui::set_id(&bar, id);
         bar
+    }
+
+    /// Draw across `scale` of the width (a smaller disk beside a larger one), with or without a legend.
+    pub fn set_options(&self, scale: f32, legend: bool) {
+        {
+            let mut s = self.ivars().borrow_mut();
+            if (s.scale - scale).abs() < f32::EPSILON && s.legend == legend {
+                return;
+            }
+            s.scale = scale;
+            s.legend = legend;
+        }
+        self.setNeedsDisplay(true);
     }
 
     pub fn on_select(&self, f: Rc<dyn Fn(Option<usize>)>) {
@@ -151,7 +182,11 @@ impl Bar {
         let dark = self.dark();
         let bounds = self.bounds();
         let bar_h = BAR_HEIGHT as f64;
-        let widths = segment_widths(&state.segments, bounds.size.width as f32, MIN_SEGMENT_PX);
+        let widths = segment_widths(
+            &state.segments,
+            bounds.size.width as f32 * state.scale,
+            MIN_SEGMENT_PX,
+        );
         let on_fill = if dark {
             NSColor::whiteColor()
         } else {
@@ -191,7 +226,8 @@ impl Bar {
         let top = bar_h + 6.0;
         let plain = attributes(&NSColor::labelColor(), NSTextAlignment::Left);
         let mut lx = 0.0f64;
-        for seg in &state.segments {
+        let segments: &[LayoutSegment] = if state.legend { &state.segments } else { &[] };
+        for seg in segments {
             fill(seg.kind, dark).setFill();
             NSBezierPath::fillRect(rect(lx, top + 4.0, 12.0, 12.0));
             let text = ns(&ui::plain(&seg.legend_text()));

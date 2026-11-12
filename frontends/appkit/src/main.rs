@@ -34,6 +34,7 @@ mod partition_bar;
 mod popup;
 #[cfg(target_os = "macos")]
 mod report;
+mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;
 #[cfg(target_os = "macos")]

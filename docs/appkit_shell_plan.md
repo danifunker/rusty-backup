@@ -224,6 +224,14 @@ plus `--shell tui`.
   undoes an edit the screen has not heard. `flow.backup.image-zstd` and `-image-vhd` pass. The
   Remote Drive window comes with slice 7b.
 
+- **Slice 4, Restore (2026-11-12).** `restore.rs` over `RestoreController` on `form.rs`: the
+  backup folder and its Recent list, the target (a device, an image file or a new disk), the
+  expand and size rows with the before and after partition bars, alignment, notes and the
+  caveats. Restore and Inspect share one backup folder through `AppController::share_backup`,
+  and the top bar's Close Backup closes it on both. Writing to a target image as its own action
+  waits for the disk writer (slice 7a). `flow.restore.folder-to-image` and
+  `-share-with-inspect` pass; all 46 appkit flows pass.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

@@ -404,13 +404,35 @@ impl InspectScreen {
     }
 
     /// The backup folder open here, for the share with Restore.
-    #[allow(dead_code)] // the app shares it once Restore exists (slice 4)
     pub fn loaded_backup(&self) -> Option<PathBuf> {
         self.ctrl.borrow().backup_folder().map(PathBuf::from)
     }
 
     pub fn take_backup_closed(&self) -> bool {
         self.backup_closed.replace(false)
+    }
+
+    /// Nothing open here, so a shared backup folder may be adopted.
+    pub fn is_empty(&self) -> bool {
+        let ctrl = self.ctrl.borrow();
+        ctrl.backup_folder().is_none() && !ctrl.has_local_source()
+    }
+
+    /// Open the shared backup folder.
+    pub fn load_backup(&self, folder: &std::path::Path) {
+        if self.ctrl.borrow().backup_folder() != Some(folder) {
+            self.apply(InspectAction::Open(InspectSource::Backup {
+                folder: folder.to_path_buf(),
+            }));
+        }
+    }
+
+    /// Close Backup from elsewhere: the app already dropped the shared folder.
+    pub fn clear_backup(&self) {
+        if self.ctrl.borrow().backup_folder().is_some() {
+            self.apply(InspectAction::Unload { quiet: true });
+            self.backup_closed.set(false);
+        }
     }
 
     /// The disk job running here, by name, for the other screens' locks.

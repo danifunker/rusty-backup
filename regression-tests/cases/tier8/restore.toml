@@ -10,7 +10,7 @@ id = "flow.restore.folder-to-image"
 description = "Restore a zstd backup folder to a new image file from the Restore screen and read the file back"
 level = "smoke"
 area = ["restore"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["restore.backup-folder", "restore.target-image", "restore.run"]
 timeout_ms = 180000
 
@@ -51,7 +51,7 @@ id = "flow.restore.share-with-inspect"
 description = "A backup folder opened on Restore shows in Inspect too, and the top bar's Close Backup closes it on both tabs"
 level = "smoke"
 area = ["restore", "inspect"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["restore.backup-folder", "inspect.open-backup"]
 timeout_ms = 120000
 

@@ -27,6 +27,7 @@ use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
+use crate::restore::RestoreScreen;
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
 use crate::wake::MacWake;
@@ -108,8 +109,7 @@ pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout
 /// Which slice brings each screen not built yet (docs/appkit_shell_plan.md).
 fn slice(tab: AppTab) -> Option<&'static str> {
     match tab {
-        AppTab::Inspect | AppTab::Backup => None,
-        AppTab::Restore => Some("4"),
+        AppTab::Inspect | AppTab::Backup | AppTab::Restore => None,
         AppTab::Build => Some("5"),
         AppTab::Optical | AppTab::Archives => Some("6"),
         AppTab::Convert => Some("7c"),
@@ -130,6 +130,7 @@ pub struct App {
     pages: Vec<(AppTab, Page)>,
     inspect: Rc<InspectScreen>,
     backup: Rc<BackupScreen>,
+    restore: Rc<RestoreScreen>,
     /// Commander, while it is open, over the whole window.
     commander: RefCell<Option<Rc<CommanderScreen>>>,
     log_shown: Cell<usize>,
@@ -464,6 +465,13 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        let restore = RestoreScreen::build(
+            mtm,
+            body_of(AppTab::Restore),
+            ctrl.notify(),
+            ctrl.recent_handle(),
+            host.clone(),
+        );
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
         inspect.browse.on_change(Rc::new(|| {
@@ -487,6 +495,7 @@ impl App {
             pages,
             inspect,
             backup,
+            restore,
             commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
@@ -523,11 +532,11 @@ impl App {
         self.inspect.set_devices(&devices);
         self.inspect.tick();
         self.backup.set_devices(&devices);
+        self.restore.set_devices(&devices);
         self.lock_screens();
         self.backup.tick();
-        if self.inspect.take_backup_closed() {
-            self.ctrl.borrow_mut().close_shared_backup();
-        }
+        self.restore.tick();
+        self.share_backup();
         let commander = self.commander.borrow().clone();
         if let Some(c) = commander {
             c.tick();
@@ -540,6 +549,7 @@ impl App {
         let running = [
             ("Inspect", self.inspect.running_job()),
             ("Backup", self.backup.is_running().then_some("Backup")),
+            ("Restore", self.restore.is_running().then_some("Restore")),
         ];
         let elsewhere = |me: &str| {
             running
@@ -548,6 +558,35 @@ impl App {
                 .and_then(|(_, r)| *r)
         };
         self.backup.set_busy(elsewhere("Backup"));
+        self.restore.set_busy(elsewhere("Restore"));
+    }
+
+    /// Restore and Inspect share a backup folder: the screen on show publishes or adopts it.
+    fn share_backup(&self) {
+        use rusty_backup::controller::app::ShareStep;
+        if self.inspect.take_backup_closed() {
+            self.ctrl.borrow_mut().close_shared_backup();
+            self.restore.clear_backup();
+        }
+        let tab = self.ctrl.borrow().active_tab();
+        let (loaded, empty) = match tab {
+            AppTab::Restore => (self.restore.loaded_backup(), self.restore.is_empty()),
+            AppTab::Inspect => (self.inspect.loaded_backup(), self.inspect.is_empty()),
+            AppTab::Backup
+            | AppTab::Build
+            | AppTab::Optical
+            | AppTab::Archives
+            | AppTab::Convert => return,
+        };
+        let step = self.ctrl.borrow_mut().share_backup(loaded, empty);
+        match (step, tab) {
+            (ShareStep::Publish(folder), AppTab::Restore)
+            | (ShareStep::Adopt(folder), AppTab::Inspect) => self.inspect.load_backup(&folder),
+            (ShareStep::Publish(folder), _) | (ShareStep::Adopt(folder), _) => {
+                self.restore.load_backup(&folder)
+            }
+            (ShareStep::Nothing, _) => {}
+        }
     }
 
     /// Open Commander over the whole window; the toolbar and the screens hide until it closes.
@@ -608,7 +647,10 @@ impl App {
         }
         match id {
             ids::CLOSE_BACKUP => {
+                // It closes on both screens.
                 self.ctrl.borrow_mut().close_shared_backup();
+                self.restore.clear_backup();
+                self.inspect.clear_backup();
                 append_log(vec![(LogLevel::Info, "Backup closed".to_string())]);
                 self.refresh();
             }
@@ -851,6 +893,7 @@ impl App {
                 }
                 self.inspect.relayout();
                 self.backup.relayout();
+                self.restore.relayout();
                 ui::move_to(&self.inspect.browse.page, *r);
                 self.inspect.browse.layout();
             }
