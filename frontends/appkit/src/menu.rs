@@ -69,6 +69,7 @@ pub fn build(mtm: MainThreadMarker) {
         name,
         vec![
             ours(mtm, &format!("About {name}"), ids::ABOUT, ""),
+            ours(mtm, "Check for Updates...", ids::UPDATE_CHECK, ""),
             NSMenuItem::separatorItem(mtm),
             settings,
             NSMenuItem::separatorItem(mtm),

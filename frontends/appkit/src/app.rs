@@ -17,7 +17,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSNotification, NSPoint, NSRange, NSRect, NSSize};
 use rusty_backup::controller::app::{
     about, app_version, elevation_button_hover, elevation_button_label, elevation_confirm,
-    elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate,
+    elevation_gate, ids, AppAction, AppController, AppTab, ElevationGate, InstallState,
 };
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
@@ -37,6 +37,9 @@ enum Part {
     Settings,
     About,
     BannerText,
+    Install,
+    Restart,
+    Retry,
     ViewRelease,
     Dismiss,
     /// Every page takes this place; the one for the screen on show is visible.
@@ -113,6 +116,7 @@ pub struct App {
     log: Retained<NSTextView>,
     pages: Vec<(AppTab, Page)>,
     log_shown: Cell<usize>,
+    banner_shape: RefCell<Vec<bool>>,
     sync: SyncGuard,
 }
 
@@ -320,6 +324,22 @@ impl App {
             Retained::into_super(Retained::into_super(banner.clone())),
         );
         add(
+            Part::Install,
+            into(ui::button(
+                mtm,
+                "Download & Install Update",
+                ids::UPDATE_INSTALL,
+            )),
+        );
+        add(
+            Part::Restart,
+            into(ui::button(mtm, "Restart Now", ids::UPDATE_RESTART)),
+        );
+        add(
+            Part::Retry,
+            into(ui::button(mtm, "Retry", ids::UPDATE_RETRY)),
+        );
+        add(
             Part::ViewRelease,
             into(ui::button(mtm, "View Release", ids::UPDATE_VIEW)),
         );
@@ -360,7 +380,15 @@ impl App {
             })
             .collect();
         for (p, v) in &parts {
-            if matches!(p, Part::BannerText | Part::ViewRelease | Part::Dismiss) {
+            if matches!(
+                p,
+                Part::BannerText
+                    | Part::Install
+                    | Part::Restart
+                    | Part::Retry
+                    | Part::ViewRelease
+                    | Part::Dismiss
+            ) {
                 v.setHidden(true);
             }
         }
@@ -379,6 +407,7 @@ impl App {
             log,
             pages,
             log_shown: Cell::new(0),
+            banner_shape: RefCell::default(),
             sync: SyncGuard::default(),
         })
     }
@@ -429,6 +458,10 @@ impl App {
             ids::ELEVATE => self.apply(AppAction::RequestElevation),
             ids::ABOUT => self.about(),
             ids::UPDATE_VIEW => self.apply(AppAction::ViewRelease),
+            ids::UPDATE_INSTALL => self.apply(AppAction::InstallUpdate),
+            ids::UPDATE_RESTART => self.apply(AppAction::RestartApp),
+            ids::UPDATE_RETRY => self.apply(AppAction::RetryUpdate),
+            ids::UPDATE_CHECK => self.apply(AppAction::CheckForUpdates),
             ids::UPDATE_DISMISS => self.apply(AppAction::DismissUpdate),
             ids::LOG_COPY => self.apply(AppAction::CopyLog),
             ids::LOG_CLEAR => self.apply(AppAction::ClearLog),
@@ -465,7 +498,7 @@ impl App {
             (
                 c.active_tab(),
                 c.shared_backup().is_some(),
-                c.update_banner_text(),
+                banner_of(&c),
                 c.log_auto_scroll(),
             )
         };
@@ -473,11 +506,19 @@ impl App {
         let shared_was = ui::shown(self.part(Part::CloseBackup));
         self.sync.run(|| {
             ui::set_visible(self.part(Part::CloseBackup), shared);
-            for p in [Part::BannerText, Part::ViewRelease, Part::Dismiss] {
-                ui::set_visible(self.part(p), banner.is_some());
+            let shows = |p: Part| banner.as_ref().is_some_and(|b| b.buttons.contains(&p));
+            ui::set_visible(self.part(Part::BannerText), banner.is_some());
+            for p in [
+                Part::Install,
+                Part::Restart,
+                Part::Retry,
+                Part::ViewRelease,
+                Part::Dismiss,
+            ] {
+                ui::set_visible(self.part(p), shows(p));
             }
-            if let Some(text) = &banner {
-                ui::set_text(&self.banner, &format!("Update: {text}"));
+            if let Some(b) = &banner {
+                ui::set_text(&self.banner, &b.text);
             }
             crate::toolbar::select(&self.toolbar, tab);
             let state = if auto {
@@ -492,7 +533,7 @@ impl App {
                 ui::set_visible(&page.scroll, *t == tab);
             }
         });
-        if banner_was != banner.is_some() || shared_was != shared {
+        if banner_was != banner.is_some() || shared_was != shared || self.banner_buttons_moved() {
             self.relayout();
         }
         self.sync_log(auto);
@@ -533,6 +574,15 @@ impl App {
         }
     }
 
+    /// Which banner buttons show changed since the last layout, so the row must be laid out again.
+    fn banner_buttons_moved(&self) -> bool {
+        let now: Vec<bool> = [Part::Install, Part::Restart, Part::Retry, Part::ViewRelease]
+            .iter()
+            .map(|p| ui::shown(self.part(*p)))
+            .collect();
+        self.banner_shape.replace(now.clone()) != now
+    }
+
     /// Place every view for the window's content area.
     fn relayout(&self) {
         let p = |x: Part| x;
@@ -554,6 +604,9 @@ impl App {
                     Size::Stretch(1),
                     Size::Fixed(layout::ROW - 4),
                 ),
+                Node::button(p(Part::Install), 210),
+                Node::button(p(Part::Restart), 120),
+                Node::button(p(Part::Retry), 80),
                 Node::button(p(Part::ViewRelease), 120),
                 Node::button(p(Part::Dismiss), 230),
             ]),
@@ -588,6 +641,48 @@ impl App {
             ui::move_to(self.part(*part), *r);
         }
     }
+}
+
+/// What the update banner says, and which of its buttons show.
+struct Banner {
+    text: String,
+    buttons: Vec<Part>,
+}
+
+/// The banner from the app controller: the announced release, then the in-app install's state.
+fn banner_of(c: &AppController) -> Option<Banner> {
+    let announced = c.update_banner_text();
+    let state = c.install_state();
+    if announced.is_none() && state.is_none() {
+        return None;
+    }
+    let (text, buttons) = match state {
+        None if c.can_install_update() => (
+            format!("Update: {}", announced.unwrap_or_default()),
+            vec![Part::Install, Part::ViewRelease, Part::Dismiss],
+        ),
+        None => (
+            format!("Update: {}", announced.unwrap_or_default()),
+            vec![Part::ViewRelease, Part::Dismiss],
+        ),
+        Some(InstallState::Downloading(f)) => (
+            match f {
+                Some(f) => format!("Downloading update... {:.0}%", f * 100.0),
+                None => "Downloading update...".to_string(),
+            },
+            Vec::new(),
+        ),
+        Some(InstallState::Ready) => ("Update installed.".to_string(), vec![Part::Restart]),
+        Some(InstallState::Manual(why)) => (
+            format!("Update: {why}"),
+            vec![Part::ViewRelease, Part::Dismiss],
+        ),
+        Some(InstallState::Failed(e)) => (
+            format!("Update failed: {e}"),
+            vec![Part::Retry, Part::ViewRelease],
+        ),
+    };
+    Some(Banner { text, buttons })
 }
 
 fn log_font() -> Retained<NSFont> {
