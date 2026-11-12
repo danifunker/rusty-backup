@@ -23,6 +23,7 @@ use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
 use crate::effects::{EffectHost, Reply, ReplyFn};
+use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
@@ -55,8 +56,8 @@ enum Part {
 struct Page {
     scroll: Retained<NSScrollView>,
     body: Retained<NSView>,
-    /// What the page lays out; a screen builds its own from slice 1 on.
-    note: Retained<NSTextField>,
+    /// The placeholder of a screen a later slice builds.
+    note: Option<Retained<NSTextField>>,
 }
 
 impl Page {
@@ -67,39 +68,49 @@ impl Page {
         scroll.setDrawsBackground(false);
         let body = ui::flipped(mtm);
         scroll.setDocumentView(Some(&body));
-        let note = ui::label(
-            mtm,
-            &format!("{} arrives in slice {}.", tab.label(), slice(tab)),
-        );
-        body.addSubview(&note);
+        let note = slice(tab).map(|n| {
+            let note = ui::label(mtm, &format!("{} arrives in slice {n}.", tab.label()));
+            body.addSubview(&note);
+            note
+        });
         Page { scroll, body, note }
     }
 
-    /// Lay the body out at the scroll view's width; taller than the view, it scrolls.
+    /// Lay the placeholder out; a built screen lays out its own body through [`place_page`].
     fn relayout(&self) {
-        let tree = Node::inset(Node::field(0usize), layout::MARGIN);
-        let visible = self.scroll.contentSize();
-        let h = (visible.height as i32).max(tree.min_height());
-        let w = visible.width as i32;
-        let size = NSSize::new(f64::from(w), f64::from(h));
-        if self.body.frame().size != size {
-            self.body.setFrameSize(size);
-        }
-        let area = layout::Rect { x: 0, y: 0, w, h };
-        for (_, r) in layout::layout(&tree, area, 96) {
-            ui::move_to(&self.note, r);
+        if let Some(note) = &self.note {
+            let tree = Node::inset(Node::field(()), layout::MARGIN);
+            place_page(&self.body, &tree, &|_, r| ui::move_to(note, r));
         }
     }
 }
 
-/// Which slice brings each screen (docs/appkit_shell_plan.md).
-fn slice(tab: AppTab) -> u32 {
+/// Lay `tree` out in a page's body at its scroll view's width: taller than the view, it scrolls.
+pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout::Rect)) {
+    let Some(scroll) = body.enclosingScrollView() else {
+        return;
+    };
+    let visible = scroll.contentSize();
+    let h = (visible.height as i32).max(tree.min_height());
+    let w = visible.width as i32;
+    let size = NSSize::new(f64::from(w), f64::from(h));
+    if body.frame().size != size {
+        body.setFrameSize(size);
+    }
+    let area = layout::Rect { x: 0, y: 0, w, h };
+    for (id, r) in layout::layout(tree, area, 96) {
+        set(id, r);
+    }
+}
+
+/// Which slice brings each screen not built yet (docs/appkit_shell_plan.md).
+fn slice(tab: AppTab) -> Option<&'static str> {
     match tab {
-        AppTab::Inspect => 1,
-        AppTab::Backup | AppTab::Restore => 4,
-        AppTab::Build => 5,
-        AppTab::Optical | AppTab::Archives => 6,
-        AppTab::Convert => 7,
+        AppTab::Inspect => None,
+        AppTab::Backup | AppTab::Restore => Some("4"),
+        AppTab::Build => Some("5"),
+        AppTab::Optical | AppTab::Archives => Some("6"),
+        AppTab::Convert => Some("7c"),
     }
 }
 
@@ -115,6 +126,7 @@ pub struct App {
     log_auto: Retained<NSButton>,
     log: Retained<NSTextView>,
     pages: Vec<(AppTab, Page)>,
+    inspect: Rc<InspectScreen>,
     log_shown: Cell<usize>,
     banner_shape: RefCell<Vec<bool>>,
     sync: SyncGuard,
@@ -393,6 +405,18 @@ impl App {
             }
         }
         let host = EffectHost::new(mtm, status);
+        let inspect_body = pages
+            .iter()
+            .find(|(t, _)| *t == AppTab::Inspect)
+            .map(|(_, p)| p.body.clone())
+            .expect("the Inspect page");
+        let inspect = InspectScreen::build(
+            mtm,
+            inspect_body,
+            ctrl.notify(),
+            ctrl.recent_handle(),
+            host.clone(),
+        );
         ctrl.start_update_check();
         Rc::new(App {
             ctrl: RefCell::new(ctrl),
@@ -406,6 +430,7 @@ impl App {
             log_auto,
             log,
             pages,
+            inspect,
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
             sync: SyncGuard::default(),
@@ -437,6 +462,12 @@ impl App {
             self.host
                 .run(vec![Effect::Confirm(elevation_confirm())], &reply());
         }
+        let devices = self.ctrl.borrow().devices().to_vec();
+        self.inspect.set_devices(&devices);
+        self.inspect.tick();
+        if self.inspect.take_backup_closed() {
+            self.ctrl.borrow_mut().close_shared_backup();
+        }
         self.refresh();
     }
 
@@ -446,6 +477,15 @@ impl App {
         }
         if let Some(tab) = crate::toolbar::tab_of(id) {
             self.apply(AppAction::SelectTab(tab));
+            return;
+        }
+        if id.starts_with("inspect.") {
+            // A menu item can reach Inspect from another screen: show it first.
+            if self.ctrl.borrow().active_tab() != AppTab::Inspect {
+                self.apply(AppAction::SelectTab(AppTab::Inspect));
+            }
+            self.inspect.command(id);
+            self.refresh();
             return;
         }
         match id {
@@ -466,9 +506,13 @@ impl App {
             ids::LOG_COPY => self.apply(AppAction::CopyLog),
             ids::LOG_CLEAR => self.apply(AppAction::ClearLog),
             ids::LOG_AUTO_SCROLL => {
-                let on = self.log_auto.state() == NSControlStateValueOn;
+                // The tick box has flipped already; the menu item asks for the same flip.
+                let on = !self.ctrl.borrow().log_auto_scroll();
                 self.apply(AppAction::SetLogAutoScroll(on));
             }
+            crate::menu::ISSUES => self
+                .host
+                .run(vec![Effect::OpenUrl(about::ISSUES.to_string())], &reply()),
             crate::menu::WEBSITE => self
                 .host
                 .run(vec![Effect::OpenUrl(about::WEBSITE.to_string())], &reply()),
@@ -537,6 +581,13 @@ impl App {
             self.relayout();
         }
         self.sync_log(auto);
+        let shared = self.ctrl.borrow().shared_backup().is_some();
+        crate::menu::sync(&|id| match id {
+            ids::CLOSE_BACKUP => Some(shared),
+            ids::LOG_CLEAR | ids::LOG_AUTO_SCROLL => Some(true),
+            _ if crate::toolbar::tab_of(id).is_some() => Some(true),
+            _ => None,
+        });
     }
 
     /// Append the log lines not shown yet; a cleared log starts over.
@@ -637,6 +688,7 @@ impl App {
                     ui::move_to(&page.scroll, *r);
                     page.relayout();
                 }
+                self.inspect.relayout();
             }
             ui::move_to(self.part(*part), *r);
         }
@@ -685,7 +737,7 @@ fn banner_of(c: &AppController) -> Option<Banner> {
     Some(Banner { text, buttons })
 }
 
-fn log_font() -> Retained<NSFont> {
+pub fn log_font() -> Retained<NSFont> {
     NSFont::userFixedPitchFontOfSize(11.0).unwrap_or_else(|| NSFont::systemFontOfSize(11.0))
 }
 

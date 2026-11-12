@@ -176,6 +176,20 @@ plus `--shell tui`.
 - **Gate 0 on GitHub: passed (2026-11-12).** The `macos-26` runner reports `AXIsProcessTrusted`
   true, and `flow.shell.appkit-start` passes in the `appkit` job, so the AX flows run in CI.
 
+- **Slice 1 (2026-11-12), Inspect, first pass.** `inspect.rs` over `InspectController`, as the
+  Win32 screen: the source pull-down (recent files and devices), Open File, Open Backup Folder,
+  the facts, the job line with its bar, the two rows of tools, the partition bar
+  (`partition_bar.rs`, a custom `NSView` with Win32's palette and legend), the partition list
+  (`table.rs`, a view-based `NSTableView`), the row tools, and the Check and CHD Info windows
+  (`report.rs`). Tools whose windows later slices build (Export, the table editor, Resize, Expand
+  Image, Expand HFS, Alto, Browse, Convert, remote) show, stay off and say which slice brings
+  them. The menu bar has the agreed File, View, Disk and Partition menus; each item follows the
+  control with its id (`ui::usable`), and the shortcuts come from
+  `controller::app::MENU_SHORTCUTS` and `AppTab::shortcut`. Checked under the AX driver: an
+  AHDI disk and an HFS floppy open, Check runs and its window closes. Learned:
+  `NSPopUpButton::itemAtIndex` raises on an empty menu, and a raised Objective-C exception
+  inside a delegate callback silently ends it, so the window never appeared; ask the count first.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the

@@ -7,11 +7,19 @@
 mod app;
 #[cfg(target_os = "macos")]
 mod effects;
+#[cfg(target_os = "macos")]
+mod inspect;
 mod layout;
 #[cfg(target_os = "macos")]
 mod menu;
 #[cfg(target_os = "macos")]
+mod partition_bar;
+#[cfg(target_os = "macos")]
+mod report;
+#[cfg(target_os = "macos")]
 mod sync;
+#[cfg(target_os = "macos")]
+mod table;
 #[cfg(target_os = "macos")]
 mod toolbar;
 #[cfg(target_os = "macos")]

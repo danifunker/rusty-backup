@@ -4,14 +4,15 @@
 //! `AXIdentifier`; the flow driver finds controls by it. Every control's action goes to one
 //! [`Target`], which hands the sender's id to `app::command`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSMenuItem, NSTextField, NSToolbarItem,
-    NSUserInterfaceItemIdentification, NSView,
+    NSAccessibility, NSBackingStoreType, NSButton, NSControl, NSMenuItem, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextField, NSToolbarItem, NSUserInterfaceItemIdentification,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -53,8 +54,114 @@ define_class!(
     }
 );
 
+define_class!(
+    /// A window's delegate that hands a close to its owner, which decides when the window goes.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RBCloseDelegate"]
+    #[ivars = Box<dyn Fn()>]
+    pub struct CloseDelegate;
+
+    unsafe impl NSObjectProtocol for CloseDelegate {}
+
+    unsafe impl NSWindowDelegate for CloseDelegate {
+        #[unsafe(method(windowShouldClose:))]
+        fn should_close(&self, _sender: &NSWindow) -> bool {
+            (self.ivars())();
+            false
+        }
+    }
+);
+
 thread_local! {
     static TARGET: OnceCell<Retained<Target>> = const { OnceCell::new() };
+    /// Every control by its controller id, so the menu bar can mirror its state.
+    static CONTROLS: RefCell<Vec<(String, Retained<NSControl>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Remember `control` under `id`; a menu item with the same id follows its state.
+pub fn register(control: &NSControl, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let keep: Retained<NSControl> = control.retain();
+    CONTROLS.with(|c| c.borrow_mut().push((id.to_string(), keep)));
+}
+
+/// Whether the control with `id` is on screen and enabled: what its menu item should say.
+pub fn usable(id: &str) -> bool {
+    CONTROLS.with(|c| {
+        c.borrow().iter().any(|(i, v)| {
+            i == id && v.isEnabled() && !v.isHiddenOrHasHiddenAncestor() && v.window().is_some()
+        })
+    })
+}
+
+/// A titled window the caller owns; closing it asks `on_close`, which decides.
+pub fn window(
+    mtm: MainThreadMarker,
+    title: &str,
+    w: f64,
+    h: f64,
+    on_close: Box<dyn Fn()>,
+) -> (Retained<NSWindow>, Retained<CloseDelegate>) {
+    let style =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
+    // SAFETY: the designated initialiser; the caller keeps the window.
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            mtm.alloc(),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    // SAFETY: the caller owns the window, so AppKit must not release it on close.
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&ns(title));
+    window.setContentView(Some(&flipped(mtm)));
+    let delegate: Retained<CloseDelegate> = {
+        let this = mtm.alloc::<CloseDelegate>().set_ivars(on_close);
+        // SAFETY: NSObject's plain init.
+        unsafe { msg_send![super(this), init] }
+    };
+    window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    window.center();
+    (window, delegate)
+}
+
+/// A bar for a running job: its percentage, or an indeterminate sweep when it has none.
+pub fn progress(mtm: MainThreadMarker) -> Retained<NSProgressIndicator> {
+    let p = NSProgressIndicator::initWithFrame(mtm.alloc(), NSRect::ZERO);
+    p.setStyle(NSProgressIndicatorStyle::Bar);
+    p.setMinValue(0.0);
+    p.setMaxValue(100.0);
+    p
+}
+
+/// Show `bar` for a running job at `pct`, or sweeping when there is no percentage.
+pub fn set_progress(bar: &NSProgressIndicator, running: bool, pct: Option<u32>) {
+    set_visible(bar, running);
+    let sweep = running && pct.is_none();
+    if bar.isIndeterminate() != sweep {
+        bar.setIndeterminate(sweep);
+    }
+    if sweep {
+        // SAFETY: a plain animation start on the main thread.
+        unsafe { bar.startAnimation(None) };
+    } else {
+        bar.setDoubleValue(f64::from(pct.unwrap_or(0)));
+    }
+}
+
+/// A button that shows but stays off until the slice that builds its window (`why`).
+pub fn later(mtm: MainThreadMarker, title: &str, id: &str, why: &str) -> Retained<NSButton> {
+    let b = button(mtm, title, id);
+    b.setEnabled(false);
+    b.setToolTip(Some(&ns(why)));
+    b
 }
 
 /// The one action target; it lives as long as the app.
@@ -110,6 +217,7 @@ pub fn button(mtm: MainThreadMarker, title: &str, id: &str) -> Retained<NSButton
         NSButton::buttonWithTitle_target_action(&ns(title), Some(&t), Some(sel!(act:)), mtm)
     };
     set_id(&b, id);
+    register(&b, id);
     b
 }
 
@@ -120,6 +228,7 @@ pub fn checkbox(mtm: MainThreadMarker, title: &str, id: &str) -> Retained<NSButt
         NSButton::checkboxWithTitle_target_action(&ns(title), Some(&t), Some(sel!(act:)), mtm)
     };
     set_id(&b, id);
+    register(&b, id);
     b
 }
 
