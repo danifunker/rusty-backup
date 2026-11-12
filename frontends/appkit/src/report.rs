@@ -97,7 +97,7 @@ impl ReportWindow {
             shown: Default::default(),
         };
         w.layout();
-        w.window.makeKeyAndOrderFront(None);
+        ui::present(&w.window);
         w
     }
 

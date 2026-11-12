@@ -131,7 +131,7 @@ impl AudioWindow {
                 form.label(AK::Track(*n), idle);
             }
             form.button(AK::Close, "Close", audio_ids::CLOSE);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             AudioWindow {
                 window,
                 _delegate: delegate,
@@ -384,6 +384,11 @@ impl OpticalScreen {
         });
         screen.apply(OpticalAction::FindDrives);
         screen
+    }
+
+    /// Settings cleared the recent files: the picker forgets its copy too.
+    pub fn forget_recents(&self) {
+        self.recent_files.borrow_mut().clear();
     }
 
     pub fn set_busy(&self, busy: Option<&'static str>) {

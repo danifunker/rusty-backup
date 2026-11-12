@@ -200,7 +200,7 @@ impl EditorWindow {
             f.button(K::Validate, "Validate", ids::TABLE_VALIDATE);
             f.button(K::Apply, "Apply Changes", ids::TABLE_APPLY);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             EditorWindow {
                 window,
                 _delegate: delegate,

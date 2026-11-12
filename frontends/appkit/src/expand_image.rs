@@ -83,7 +83,7 @@ impl ExpandImageWindow {
             );
             form.button(K::Start, "Expand", ids::EXPAND_IMAGE_START);
             form.button(K::Cancel, "Cancel", "");
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             ExpandImageWindow {
                 window,
                 _delegate: delegate,

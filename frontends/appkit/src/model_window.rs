@@ -565,7 +565,7 @@ impl ModelWindow {
                 window.setContentSize(NSSize::new(f64::from(width), f64::from(h)));
                 window.center();
             }
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             ModelWindow {
                 window,
                 _delegate: delegate,

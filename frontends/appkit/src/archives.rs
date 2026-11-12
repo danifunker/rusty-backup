@@ -193,6 +193,11 @@ impl ArchivesScreen {
         screen
     }
 
+    /// Settings cleared the recent files: the picker forgets its copy too.
+    pub fn forget_recents(&self) {
+        self.recent_files.borrow_mut().clear();
+    }
+
     pub fn set_busy(&self, busy: Option<&'static str>) {
         self.busy.set(busy);
     }

@@ -185,8 +185,8 @@ impl<K: Copy + PartialEq + 'static> ChdControl<K> {
                 .unwrap_or(presets.len()),
         );
         let choices = codec_choices(self.profile);
-        for slot in 0..4 {
-            if let Some(i) = choices.iter().position(|c| *c == state.custom.codecs[slot]) {
+        for (slot, codec) in state.custom.codecs.iter().enumerate().take(4) {
+            if let Some(i) = choices.iter().position(|c| c == codec) {
                 form.select(w(ChdKey::Codec(slot)), i);
             }
         }

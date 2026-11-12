@@ -57,7 +57,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `restore.run` | yes | yes | yes | yes | `flow.network.restore-to-remote-image`, `flow.restore.folder-to-image` |
 | `restore.target-image` | yes | yes | yes | yes | `flow.restore.folder-to-image` |
 | `restore.write-image` | - | yes | yes | yes | `flow.disk_write.image-file` |
-| `settings.update-check` | - | yes | yes | - | `flow.settings.save-and-reopen` |
+| `settings.update-check` | - | yes | yes | yes | `flow.settings.save-and-reopen` |
 <!-- capabilities:end -->
 
 ## Gaps

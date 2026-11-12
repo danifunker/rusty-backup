@@ -108,7 +108,7 @@ impl VhdWindow {
             }
             form.button(K::Start, "Start VHD Backup", ids::VHD_START);
             form.button(K::Cancel, "Cancel", ids::VHD_CANCEL);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             VhdWindow {
                 window,
                 _delegate: delegate,

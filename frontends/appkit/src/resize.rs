@@ -165,7 +165,7 @@ impl ResizeWindow {
             f.button(K::Apply, "Apply", ids::APPLY);
             f.button(K::Cancel, "Cancel", ids::CANCEL);
             f.button(K::Close, "Close", ids::CLOSE);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             ResizeWindow {
                 ctrl: RefCell::new(ResizeController::new(notify)),
                 host,

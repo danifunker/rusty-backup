@@ -203,7 +203,7 @@ impl DiskWriteWindow {
             f.button(K::Write, "Write to disk...", ids::WRITE);
             f.button(K::CancelWrite, "Cancel write", ids::CANCEL_WRITE);
             f.button(K::Close, "Cancel", ids::CLOSE);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             DiskWriteWindow {
                 ctrl: RefCell::new(DiskWriteController::new(DiskWriteServices {
                     jobs: JobRegistry::new(),

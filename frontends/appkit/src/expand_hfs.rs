@@ -115,7 +115,7 @@ impl ExpandHfsWindow {
             f.wrap(K::Lines, "");
             f.button(K::Expand, labels::EXPAND, ids::EXPAND);
             f.button(K::Close, "Cancel", ids::CLOSE);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             ExpandHfsWindow {
                 ctrl: RefCell::new(ExpandHfsController::new(notify)),
                 host,

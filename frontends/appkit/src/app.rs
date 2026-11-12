@@ -32,6 +32,7 @@ use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
 use crate::optical::OpticalScreen;
 use crate::restore::RestoreScreen;
+use crate::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
 use crate::wake::MacWake;
@@ -137,6 +138,7 @@ pub struct App {
     build: Rc<BuildScreen>,
     archives: Rc<ArchivesScreen>,
     optical: Rc<OpticalScreen>,
+    settings: RefCell<Option<Rc<SettingsWindow>>>,
     /// A tick is queued for the playing track's position.
     player_tick: Cell<bool>,
     /// Commander, while it is open, over the whole window.
@@ -364,9 +366,7 @@ impl App {
         elevate.setToolTip(Some(&ns(elevation_button_hover())));
         let elevate = add(Part::Elevate, into(elevate));
         elevate.setHidden(gate != ElevationGate::NeedsElevation);
-        // Settings arrives in slice 7b; until then it shows but is off.
         let settings = ui::button(mtm, "Settings...", ids::SETTINGS);
-        settings.setEnabled(false);
         add(Part::Settings, into(settings));
         add(
             Part::About,
@@ -532,6 +532,7 @@ impl App {
             archives,
             optical,
             player_tick: Cell::new(false),
+            settings: RefCell::default(),
             commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
@@ -599,6 +600,35 @@ impl App {
         }
         self.refresh();
         self.player_timer();
+    }
+
+    /// Settings, one window at a time; Clear Recent Files reaches every screen's picker.
+    fn open_settings(&self) {
+        let open = self.settings.borrow().as_ref().is_some_and(|w| w.is_open());
+        if open {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let recent = self.ctrl.borrow().recent_handle();
+        let window = SettingsWindow::open(
+            mtm,
+            recent,
+            Box::new(|| {
+                if let Some(app) = app() {
+                    app.forget_recents();
+                }
+            }),
+        );
+        *self.settings.borrow_mut() = Some(window);
+    }
+
+    fn forget_recents(&self) {
+        self.backup.forget_recents();
+        self.restore.forget_recents();
+        self.optical.forget_recents();
+        self.archives.forget_recents();
     }
 
     /// A playing track moves with no job to wake the shell, so a timer ticks while it plays.
@@ -748,6 +778,7 @@ impl App {
             ids::REFRESH_DEVICES => self.apply(AppAction::RefreshDevices),
             ids::ELEVATE => self.apply(AppAction::RequestElevation),
             ids::ABOUT => self.about(),
+            ids::SETTINGS => self.open_settings(),
             ids::UPDATE_VIEW => self.apply(AppAction::ViewRelease),
             ids::UPDATE_INSTALL => self.apply(AppAction::InstallUpdate),
             ids::UPDATE_RESTART => self.apply(AppAction::RestartApp),

@@ -220,6 +220,12 @@ pub fn window(
 }
 
 /// A bar for a running job: its percentage, or an indeterminate sweep when it has none.
+/// Show a new window with nothing focused: a focused field would keep the controller's text out.
+pub fn present(window: &NSWindow) {
+    window.makeKeyAndOrderFront(None);
+    window.makeFirstResponder(None);
+}
+
 pub fn progress(mtm: MainThreadMarker) -> Retained<NSProgressIndicator> {
     let p = NSProgressIndicator::initWithFrame(mtm.alloc(), NSRect::ZERO);
     p.setStyle(NSProgressIndicatorStyle::Bar);

@@ -90,7 +90,7 @@ impl AltoWindow {
             form.wrap(K::Result, "");
             form.button(K::Save, "Resize and Save As...", ids::SAVE_AS);
             form.button(K::Close, "Close", ids::CLOSE);
-            window.makeKeyAndOrderFront(None);
+            ui::present(&window);
             AltoWindow {
                 ctrl: RefCell::new(AltoResizeController::new(notify)),
                 host,

@@ -48,6 +48,7 @@ mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;
 #[cfg(target_os = "macos")]
+mod settings;
 mod sync;
 #[cfg(target_os = "macos")]
 mod table;

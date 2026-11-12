@@ -259,6 +259,13 @@ plus `--shell tui`.
   all 57 appkit flows pass. Inspect's Export window (which also opens the disk writer) comes with
   slice 7b. The Alto dialog has no flow yet (no Alto fixture in tier 8).
 
+- **Slice 7b, Settings (2026-11-12).** `settings.rs`: the update check and Clear Recent Files.
+  File associations are left out, as a Mac app declares its document types in Info.plist.
+  Every window now opens through `ui::present`, which leaves no field focused: a new window
+  focused its first field, and the form keeps the controller's text out of a field being
+  typed in, so a reopened Settings showed an empty URL. `flow.settings.save-and-reopen` passes;
+  all 58 appkit flows pass. Export and the remote windows are next.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the
