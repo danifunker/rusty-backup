@@ -6,11 +6,19 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
+mod backup;
+#[cfg(target_os = "macos")]
+mod backup_vhd;
+#[cfg(target_os = "macos")]
 mod browse;
+#[cfg(target_os = "macos")]
+mod chd;
 #[cfg(target_os = "macos")]
 mod commander;
 #[cfg(target_os = "macos")]
 mod effects;
+#[cfg(target_os = "macos")]
+mod form;
 #[cfg(target_os = "macos")]
 mod inspect;
 mod layout;

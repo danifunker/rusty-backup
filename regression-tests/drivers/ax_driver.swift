@@ -240,6 +240,8 @@ func run(_ op: [String: Any]) throws -> [String: Any] {
             if let table = attr(row, kAXParentAttribute) {
                 AXUIElementSetAttributeValue(table as! AXUIElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
+        } else if [kAXTextFieldRole as String, kAXTextAreaRole as String].contains(str(e, kAXRoleAttribute)) {
+            // A field takes its value whole through `fill`; focusing it would route that to the field editor.
         } else if AXUIElementSetAttributeValue(e, kAXSelectedAttribute as CFString, kCFBooleanTrue) != .success {
             AXUIElementSetAttributeValue(e, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         }

@@ -255,7 +255,7 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 
 | File | Flows | Shells | Checks |
 |---|---|---|---|
-| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32 | restore + byte-compare; the .vhd read back |
+| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32, appkit | restore + byte-compare; the .vhd read back |
 | `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (gtk, win32) | tui, gtk, win32 | byte-compare |
 | `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32 | inspect + byte-compare; the TUI can join |
 | `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32, appkit | byte-compare |

@@ -22,6 +22,7 @@ use rusty_backup::controller::app::{
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
+use crate::backup::BackupScreen;
 use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::inspect::InspectScreen;
@@ -107,8 +108,8 @@ pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout
 /// Which slice brings each screen not built yet (docs/appkit_shell_plan.md).
 fn slice(tab: AppTab) -> Option<&'static str> {
     match tab {
-        AppTab::Inspect => None,
-        AppTab::Backup | AppTab::Restore => Some("4"),
+        AppTab::Inspect | AppTab::Backup => None,
+        AppTab::Restore => Some("4"),
         AppTab::Build => Some("5"),
         AppTab::Optical | AppTab::Archives => Some("6"),
         AppTab::Convert => Some("7c"),
@@ -128,6 +129,7 @@ pub struct App {
     log: Retained<NSTextView>,
     pages: Vec<(AppTab, Page)>,
     inspect: Rc<InspectScreen>,
+    backup: Rc<BackupScreen>,
     /// Commander, while it is open, over the whole window.
     commander: RefCell<Option<Rc<CommanderScreen>>>,
     log_shown: Cell<usize>,
@@ -448,6 +450,20 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        let body_of = |tab: AppTab| {
+            pages
+                .iter()
+                .find(|(t, _)| *t == tab)
+                .map(|(_, p)| p.body.clone())
+                .expect("a page per screen")
+        };
+        let backup = BackupScreen::build(
+            mtm,
+            body_of(AppTab::Backup),
+            ctrl.notify(),
+            ctrl.recent_handle(),
+            host.clone(),
+        );
         content.addSubview(&inspect.browse.page);
         inspect.browse.page.setHidden(true);
         inspect.browse.on_change(Rc::new(|| {
@@ -470,6 +486,7 @@ impl App {
             log,
             pages,
             inspect,
+            backup,
             commander: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
@@ -505,6 +522,9 @@ impl App {
         let devices = self.ctrl.borrow().devices().to_vec();
         self.inspect.set_devices(&devices);
         self.inspect.tick();
+        self.backup.set_devices(&devices);
+        self.lock_screens();
+        self.backup.tick();
         if self.inspect.take_backup_closed() {
             self.ctrl.borrow_mut().close_shared_backup();
         }
@@ -513,6 +533,21 @@ impl App {
             c.tick();
         }
         self.refresh();
+    }
+
+    /// One disk job at a time: each screen hears who else runs.
+    fn lock_screens(&self) {
+        let running = [
+            ("Inspect", self.inspect.running_job()),
+            ("Backup", self.backup.is_running().then_some("Backup")),
+        ];
+        let elsewhere = |me: &str| {
+            running
+                .iter()
+                .find(|(t, r)| *t != me && r.is_some())
+                .and_then(|(_, r)| *r)
+        };
+        self.backup.set_busy(elsewhere("Backup"));
     }
 
     /// Open Commander over the whole window; the toolbar and the screens hide until it closes.
@@ -815,6 +850,7 @@ impl App {
                     page.relayout();
                 }
                 self.inspect.relayout();
+                self.backup.relayout();
                 ui::move_to(&self.inspect.browse.page, *r);
                 self.inspect.browse.layout();
             }

@@ -20,10 +20,10 @@ reference the shells are measured against. Per-feature limits by build target li
 | `app.start` | - | - | - | yes | `flow.shell.appkit-start` |
 | `archives.extract` | - | yes | yes | - | `flow.archives.sit-extract-all` |
 | `archives.open` | - | yes | yes | - | `flow.archives.sit-extract-all` |
-| `backup.format` | yes | yes | yes | - | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
+| `backup.format` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `backup.remote-source` | - | yes | yes | - | `flow.network.backup-remote-connect` |
-| `backup.run` | yes | yes | yes | - | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
-| `backup.source-image` | yes | yes | yes | - | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
+| `backup.run` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
+| `backup.source-image` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `browse.edit` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-new-folder` |
 | `browse.edit-text` | - | yes | yes | yes | `flow.browse.inspect-edit-text` |
 | `browse.extract` | yes | yes | yes | yes | `flow.browse.inspect-extract-all`, `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |

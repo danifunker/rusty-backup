@@ -214,6 +214,16 @@ plus `--shell tui`.
   the Commander toolbar item's label (an `NSToolbarItem` carries no AX identifier). Not done:
   dragging rows between panes, and drops from Finder (slice 8).
 
+- **Slice 4, Backup (2026-11-12).** `backup.rs` and its VHD options window
+  (`backup_vhd.rs`) over `BackupController`, with the shared CHD control (`chd.rs`), all on
+  `form.rs`: a screen's controls keyed by its own enum, their actions and text changes handed
+  to it by key. A value or pick set through accessibility sends AppKit no change notification
+  (it goes through the field's cell, and a pop-up's action waits for its menu to close), so the
+  form keeps each field's and pop-up's last reported value: a field's cell reports an outside
+  set at once, any other unreported change goes before the next action, and a refresh never
+  undoes an edit the screen has not heard. `flow.backup.image-zstd` and `-image-vhd` pass. The
+  Remote Drive window comes with slice 7b.
+
 ## Exit criteria
 
 - Every tier 8 flow passes on `appkit` (the audio flow too), and the expected failures match the
