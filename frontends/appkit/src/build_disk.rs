@@ -216,8 +216,10 @@ impl BuildScreen {
             f.label(K::AlignCaption, "Alignment:");
             f.popup(K::AlignPick, &[], ids::ALIGN_PICK);
             f.field(K::Align, ids::ALIGN, "Alignment", false);
-            f.v(K::AlignPick).setToolTip(Some(&crate::ui::ns(hints::ALIGN)));
-            f.v(K::Align).setToolTip(Some(&crate::ui::ns(hints::ALIGN_CUSTOM)));
+            f.v(K::AlignPick)
+                .setToolTip(Some(&crate::ui::ns(hints::ALIGN)));
+            f.v(K::Align)
+                .setToolTip(Some(&crate::ui::ns(hints::ALIGN_CUSTOM)));
             f.label(K::HeadsCaption, "Heads:");
             f.field(K::Heads, ids::HEADS, "Heads", false);
             f.label(K::SectorsCaption, "Sectors/track:");

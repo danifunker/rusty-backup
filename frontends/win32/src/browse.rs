@@ -16,11 +16,11 @@ use std::sync::Arc;
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
-    default_volume_export, editor_window, extract_fork_modes, journal_window, tree_window,
-    volume_export_formats, BrowserPaneAction as P, CommanderAction as A, CommanderController,
-    DisplayRow, EditBar, ExportFormat, ExtractOptions, HeaderTools, JobRegistry, MarkBar,
-    ModeAction, PaneProfile, PaneServices, PaneWindow, PanelActions, ResourceForkMode, Side,
-    SidePanel, TreeText, VolumeLine, WindowKind, FOLLOW_DELAY,
+    editor_window, extract_fork_modes, journal_window, tree_window, BrowserPaneAction as P,
+    CommanderAction as A, CommanderController, DisplayRow, EditBar, ExportBar, ExtractOptions,
+    HeaderTools, JobRegistry, MarkBar, ModeAction, PaneProfile, PaneServices, PaneWindow,
+    PanelActions, ResourceForkMode, Side, SidePanel, TreeText, VolumeLine, WindowKind,
+    FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
@@ -79,8 +79,7 @@ struct Shown {
     volume: VolumeLine,
     message: String,
     export_volume: bool,
-    /// The volume's filesystem, which picks the export formats on offer and the first one.
-    fs_type: String,
+    export: ExportBar,
     job: Option<(Snapshot, bool)>,
     panel_key: Option<(u64, bool)>,
     panel: Option<SidePanel>,
@@ -110,8 +109,6 @@ pub struct BrowseView {
     extract_all: HWND,
     export_volume: HWND,
     volume_format: Combo,
-    /// The filesystem the format list was filled for, and its formats in list order.
-    volume_formats: RefCell<(String, Vec<ExportFormat>)>,
     close: HWND,
     job: HWND,
     progress: HWND,
@@ -269,7 +266,6 @@ impl BrowseView {
             extract_all,
             export_volume,
             volume_format,
-            volume_formats: RefCell::default(),
             close,
             job,
             progress,
@@ -553,24 +549,21 @@ impl BrowseView {
                     self.extract(path);
                 }
             }
-            Some(Command::ExportVolume) => self.export_volume(),
+            Some(Command::ExportVolume) => self.apply(A::ExportEntry {
+                from: Side::Left,
+                path: "/".to_string(),
+                format: None,
+            }),
             _ => self.apply(A::Key(key, mods)),
         }
         true
     }
 
-    /// Archive the whole volume in the format the list beside the button shows.
+    /// The export bar's button: the marked rows, else the whole volume.
     fn export_volume(&self) {
-        let format = self
-            .volume_format
-            .picked()
-            .and_then(|i| self.volume_formats.borrow().1.get(i).copied())
-            .unwrap_or(ExportFormat::Zip);
-        self.apply(A::ExportEntry {
-            from: Side::Left,
-            path: "/".to_string(),
-            format: Some(format),
-        });
+        let mode = self.extract_options().fork_mode;
+        self.apply(A::SetForkMode(mode));
+        self.apply(A::ExportFromBar(Side::Left));
     }
 
     fn read(&self) -> Shown {
@@ -599,7 +592,7 @@ impl BrowseView {
             volume: ctl.volume_line(Side::Left, &prefix),
             message,
             export_volume: !ctl.edit_mode() && ctl.copy_job().is_none(),
-            fs_type: ctl.pane(Side::Left).volume().fs_type.clone(),
+            export: ctl.export_bar(Side::Left),
             job: jobs.into_iter().next(),
             panel: detail
                 .filter(|_| self.panel_key.get() != panel_key)
@@ -657,19 +650,14 @@ impl BrowseView {
         }
     }
 
-    /// A new volume refills the format list and starts it on the filesystem's own format;
-    /// the same volume keeps the user's pick.
-    fn show_volume_formats(&self, fs_type: &str) {
-        if self.volume_formats.borrow().0 == fs_type {
-            return;
-        }
-        let formats = volume_export_formats(fs_type);
-        let first = default_volume_export(fs_type);
-        let names: Vec<String> = formats.iter().map(|f| f.label().to_string()).collect();
-        self.volume_format.set_items(&names);
-        self.volume_format
-            .select(formats.iter().position(|f| *f == first).unwrap_or(0));
-        *self.volume_formats.borrow_mut() = (fs_type.to_string(), formats);
+    /// The export bar: its list, its pick and its button's target.
+    fn show_export(&self, bar: &ExportBar) {
+        let labels: Vec<String> = bar.choices.iter().map(|c| c.label.clone()).collect();
+        self.volume_format.set_items(&labels);
+        self.volume_format.select(bar.pick);
+        ui::set_text(self.export_volume, &bar.button);
+        ui::set_enabled(self.export_volume, bar.enabled);
+        ui::set_enabled(self.volume_format.h, bar.enabled);
     }
 
     fn show(&self, s: Shown) {
@@ -684,7 +672,7 @@ impl BrowseView {
         ui::set_visible(self.extract_all, s.export_volume && s.loaded);
         ui::set_visible(self.export_volume, s.export_volume && s.loaded);
         ui::set_visible(self.volume_format.h, s.export_volume && s.loaded);
-        self.show_volume_formats(&s.fs_type);
+        self.show_export(&s.export);
         let (job_text, pct) = s
             .job
             .as_ref()
@@ -799,14 +787,6 @@ impl BrowseView {
                 if !paths.is_empty() {
                     self.apply(A::Pane(Side::Left, P::AddPicked(paths)));
                 }
-            }
-            BarCmd::ExportMarked(format) => {
-                let mode = self.extract_options().fork_mode;
-                self.apply(A::SetForkMode(mode));
-                self.apply(A::Export {
-                    from: Side::Left,
-                    format: Some(format),
-                });
             }
             BarCmd::ViewMenu => self.view_menu(),
         }
@@ -938,8 +918,8 @@ impl BrowseView {
         let a = actions.unwrap_or_default();
         self.panel_tools.show(&a);
         let (extract, export) = match a.folder {
-            true => ("Extract Folder...", "Export Folder to .tgz..."),
-            false => ("Extract File...", "Export File to .tgz..."),
+            true => ("Extract Folder...", "Export Folder..."),
+            false => ("Extract File...", "Export File..."),
         };
         ui::set_text(self.extract, extract);
         ui::set_text(self.export, export);
@@ -999,10 +979,10 @@ impl BrowseView {
         }
         if ui::shown(self.extract_all) {
             tools.push(Node::button(self.extract_all, 100));
-            tools.push(Node::button(self.export_volume, 120));
+            tools.push(Node::button(self.export_volume, 140));
             tools.push(Node::leaf(
                 self.volume_format.h,
-                Size::Fixed(190),
+                Size::Fixed(230),
                 Size::Fixed(layout::ROW),
             ));
         }
@@ -1180,6 +1160,17 @@ impl Handler for BrowseView {
             }
             return;
         }
+        if from == self.volume_format.h {
+            if code == CBN_SELCHANGE {
+                if let Some(choice) = self.volume_format.picked() {
+                    self.apply(A::PickExport {
+                        from: Side::Left,
+                        choice,
+                    });
+                }
+            }
+            return;
+        }
         if from == self.fork {
             if code == CBN_SELCHANGE {
                 let mode = self.extract_options().fork_mode;
@@ -1215,7 +1206,7 @@ impl Handler for BrowseView {
                 self.apply(A::ExportEntry {
                     from: Side::Left,
                     path,
-                    format: Some(ExportFormat::TarGz),
+                    format: None,
                 });
             }
         } else if from == self.nested {

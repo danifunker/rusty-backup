@@ -1023,3 +1023,39 @@ fn a_drop_opens_in_an_empty_pane_copies_into_a_volume_and_asks_only_for_an_image
     ));
     assert!(ctl.drop_plan(Side::Left, &[]).is_none());
 }
+
+#[test]
+fn the_export_bar_exports_the_marked_rows_else_the_volume_in_its_one_format() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let bar = ctl.export_bar(Side::Left);
+    assert_eq!(bar.button, "Export Volume...");
+    // Loose files in each fork form first, then the archives a FAT volume can fill.
+    let labels: Vec<&str> = bar.choices.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels[0].starts_with("Files, "), "{labels:?}");
+    assert!(!labels.contains(&"StuffIt (.sit)"), "{labels:?}");
+    assert_eq!(bar.choices[bar.pick].format, ExportFormat::Zip);
+    let tar = bar
+        .choices
+        .iter()
+        .position(|c| c.format == ExportFormat::Tar);
+    let choice = tar.unwrap();
+    ctl.apply(A::PickExport {
+        from: Side::Left,
+        choice,
+    });
+    assert_eq!(ctl.export_bar(Side::Left).pick, choice);
+    // Nothing marked: the whole volume, named after it.
+    match ctl.apply(A::ExportFromBar(Side::Left)).as_slice() {
+        [Effect::PickFile(spec)] => assert!(spec.file_name.ends_with(".tar"), "{spec:?}"),
+        other => panic!("expected a save picker, got {other:?}"),
+    }
+    ctl.apply(A::Picked {
+        purpose: purpose::EXPORT,
+        path: None,
+    });
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    assert_eq!(ctl.export_bar(Side::Left).button, "Export 1 Selected...");
+}

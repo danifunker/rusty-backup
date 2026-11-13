@@ -10,9 +10,8 @@ use rusty_backup::controller::commander::{
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, CBN_SELCHANGE, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, WINDOW_EX_STYLE, WINDOW_STYLE, WS_TABSTOP,
-    WS_VSCROLL,
+    SendMessageW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, WINDOW_EX_STYLE, WINDOW_STYLE, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::layout::{self, Node, Size};
@@ -24,8 +23,6 @@ pub enum BarCmd {
     Send(Vec<A>),
     /// Pick host files and stage them.
     AddFiles,
-    /// Export the marked rows in the format the mark bar shows.
-    ExportMarked(ExportFormat),
     /// Pop the View menu up under its button.
     ViewMenu,
 }
@@ -356,55 +353,22 @@ impl EditRow {
     }
 }
 
-/// The mark bar beside the status line: the count, the export format, Export and Clear.
+/// The mark bar beside the status line: the count and Clear; the header's export bar exports.
 pub struct MarkRow {
     count: HWND,
-    caption: HWND,
-    format: HWND,
-    export: HWND,
     clear: HWND,
 }
 
 impl MarkRow {
     pub fn build(page: HWND) -> MarkRow {
-        let style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0);
-        let format = ui::child(
-            page,
-            w!("COMBOBOX"),
-            "",
-            style,
-            WINDOW_EX_STYLE(0),
-            ids::EXPORT_FORMAT,
-        );
-        for f in ExportFormat::ALL {
-            let t = ui::wide(f.label());
-            // SAFETY: the combo copies the string.
-            unsafe {
-                SendMessageW(
-                    format,
-                    CB_ADDSTRING,
-                    None,
-                    Some(LPARAM(t.as_ptr() as isize)),
-                );
-            }
-        }
         MarkRow {
             count: ui::cell_label(page, ""),
-            caption: ui::cell_label(page, "Export as:"),
-            format,
-            export: ui::button(page, "Export...", ids::EXPORT_MARKED),
             clear: ui::button(page, "Clear", ids::CLEAR_MARKS),
         }
     }
 
-    pub fn all(&self) -> [HWND; 5] {
-        [
-            self.count,
-            self.caption,
-            self.format,
-            self.export,
-            self.clear,
-        ]
+    pub fn all(&self) -> [HWND; 2] {
+        [self.count, self.clear]
     }
 
     pub fn show(&self, m: &MarkBar) {
@@ -412,12 +376,6 @@ impl MarkRow {
             ui::set_visible(h, m.count > 0);
         }
         ui::set_text(self.count, &m.label);
-        // SAFETY: plain combo messages.
-        unsafe {
-            if SendMessageW(self.format, CB_GETCURSEL, None, None).0 != m.format as isize {
-                SendMessageW(self.format, CB_SETCURSEL, Some(WPARAM(m.format)), None);
-            }
-        }
     }
 
     pub fn nodes(&self) -> Vec<Node<HWND>> {
@@ -426,37 +384,15 @@ impl MarkRow {
         }
         vec![
             Node::leaf(self.count, Size::Fixed(90), Size::Fixed(layout::ROW)),
-            Node::leaf(self.caption, Size::Fixed(70), Size::Fixed(layout::ROW)),
-            Node::leaf(self.format, Size::Fixed(170), Size::Fixed(layout::ROW)),
-            Node::button(self.export, 80),
             Node::button(self.clear, 65),
         ]
     }
 
-    fn picked(&self) -> Option<ExportFormat> {
-        // SAFETY: a plain combo query.
-        let i = unsafe { SendMessageW(self.format, CB_GETCURSEL, None, None).0 };
-        usize::try_from(i)
-            .ok()
-            .and_then(|i| ExportFormat::ALL.get(i).copied())
-    }
-
     pub fn command(&self, from: HWND, code: u32) -> Option<BarCmd> {
-        if from == self.format && code == CBN_SELCHANGE {
-            return self
-                .picked()
-                .map(|f| BarCmd::Send(vec![A::SetExportFormat(f)]));
+        if code == BN_CLICKED && from == self.clear {
+            return Some(BarCmd::Send(vec![pane(P::ClearSelection)]));
         }
-        if code != BN_CLICKED {
-            return None;
-        }
-        if from == self.export {
-            self.picked().map(BarCmd::ExportMarked)
-        } else if from == self.clear {
-            Some(BarCmd::Send(vec![pane(P::ClearSelection)]))
-        } else {
-            None
-        }
+        None
     }
 }
 

@@ -58,8 +58,8 @@ mod modes;
 pub use drop::DropPlan;
 mod panel;
 pub use panel::{
-    CopyColumn, EditBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SideBars, SidePanel,
-    VolumeLine,
+    CopyColumn, EditBar, ExportBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SideBars,
+    SidePanel, VolumeLine,
 };
 mod windows;
 pub use windows::{
@@ -166,6 +166,13 @@ pub enum CommanderAction {
     Export {
         from: Side,
         format: Option<ExportFormat>,
+    },
+    /// The export bar's button: the marked rows, else the whole volume, in the screen's format.
+    ExportFromBar(Side),
+    /// The export bar's list: an index into [`CommanderController::export_bar`]'s choices.
+    PickExport {
+        from: Side,
+        choice: usize,
     },
     /// Export the entry at `path` (`/`: the whole volume) instead of the selection.
     ExportEntry {
@@ -367,6 +374,22 @@ pub fn export_choices() -> Vec<ExportChoice> {
             fork: None,
         }))
         .collect()
+}
+
+/// The browse view's one export list for a volume of `fs_type`: loose files in each fork form,
+/// then the archives the volume can fill (Mac archives only on a Mac volume).
+pub fn export_bar_choices(fs_type: &str) -> Vec<ExportChoice> {
+    let loose = export_choices()
+        .into_iter()
+        .filter(|c| c.format == ExportFormat::LooseFiles);
+    let archives = volume_export_formats(fs_type)
+        .into_iter()
+        .map(|f| ExportChoice {
+            label: f.label().to_string(),
+            format: f,
+            fork: None,
+        });
+    loose.chain(archives).collect()
 }
 
 /// The entries a run skipped after the user was asked about them, shown when it ends.
@@ -672,6 +695,21 @@ impl CommanderController {
                 self.forward(self.active, BrowserPaneAction::Delete)
             }
             A::Export { from, format } => self.request_export(from, format),
+            A::ExportFromBar(from) => match self.mark_bar(from).count {
+                0 => self.request_export_entry(from, "/", None),
+                _ => self.request_export(from, None),
+            },
+            A::PickExport { from, choice } => {
+                let fs = self.pane(from).volume().fs_type.clone();
+                if let Some(c) = export_bar_choices(&fs).get(choice) {
+                    let key = self.volume_key(from);
+                    self.export_pick[from.idx()] = Some((c.format, key));
+                    if let Some(fork) = c.fork {
+                        self.export_fork_mode = fork;
+                    }
+                }
+                Vec::new()
+            }
             A::Checksums(from) => {
                 self.status = self.start_checksums(from);
                 Vec::new()

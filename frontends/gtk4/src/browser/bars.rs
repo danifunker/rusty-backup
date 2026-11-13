@@ -1,15 +1,14 @@
 //! The bars around the listing: the volume header, the edit toolbar and the marked-rows bar.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use rusty_backup::controller::browser::ids;
 use rusty_backup::controller::commander::{
-    default_volume_export, format_size, volume_export_formats, BrowseCaps, BrowserPaneAction as P,
-    CommanderAction as A, CommanderController, ExportFormat, ModeAction, Side, SpaceReadout,
-    ViewItemKind, ViewMenuItem,
+    format_size, BrowseCaps, BrowserPaneAction as P, CommanderAction as A, CommanderController,
+    ExportBar, ModeAction, Side, SpaceReadout, ViewItemKind, ViewMenuItem,
 };
 
 use super::SendFn;
@@ -43,8 +42,7 @@ pub struct HeaderShown {
     edit_mode: bool,
     edit_busy: bool,
     export_volume: bool,
-    /// The volume's filesystem, which picks the export formats on offer and the first one.
-    fs_type: String,
+    bar: ExportBar,
     tool_free: bool,
     chd: bool,
     deleted: bool,
@@ -61,9 +59,10 @@ pub struct Header {
     boot: gtk::Label,
     edit: gtk::Button,
     export: gtk::Button,
-    /// Export Volume's format; the list follows the filesystem it was filled for.
+    /// The export bar's format list, for the marked rows or the whole volume.
     volume_format: gtk::DropDown,
-    volume_formats: Rc<RefCell<(String, Vec<ExportFormat>)>>,
+    /// Set while `show` fills the list, so its own changes send nothing.
+    format_sync: Rc<Cell<bool>>,
     extract: gtk::Button,
     check: gtk::Button,
     journal: gtk::Button,
@@ -76,11 +75,13 @@ pub struct Header {
 }
 
 impl Header {
-    /// `items` reads the View menu; `extract_all` starts an extract of the whole volume.
+    /// `items` reads the View menu; `extract_all` starts an extract of the whole volume, and
+    /// `export` the export bar's export (the marked rows, else the volume).
     pub fn build(
         send: &SendFn,
         items: Rc<dyn Fn() -> Vec<ViewMenuItem>>,
         extract_all: Rc<dyn Fn()>,
+        export_bar: Rc<dyn Fn()>,
     ) -> Header {
         let title = gtk::Label::new(Some("Filesystem Browser"));
         title.add_css_class("heading");
@@ -101,26 +102,22 @@ impl Header {
         let export = gtk::Button::with_label("Export Volume...");
         export.set_widget_name(ids::EXPORT_VOLUME);
         export.set_tooltip_text(Some(
-            "Archive the whole volume in the format beside this button",
+            "Export the marked rows, or else the whole volume, in the format beside this button",
         ));
         let volume_format = gtk::DropDown::from_strings(&[]);
         volume_format.set_widget_name(ids::EXPORT_VOLUME_FORMAT);
-        let volume_formats: Rc<RefCell<(String, Vec<ExportFormat>)>> = Rc::default();
-        let to_archive = send.clone();
-        let (picked, formats) = (volume_format.clone(), volume_formats.clone());
-        export.connect_clicked(move |_| {
-            let format = formats
-                .borrow()
-                .1
-                .get(picked.selected() as usize)
-                .copied()
-                .unwrap_or(ExportFormat::Zip);
-            to_archive(A::ExportEntry {
-                from: Side::Left,
-                path: "/".to_string(),
-                format: Some(format),
-            });
+        let format_sync: Rc<Cell<bool>> = Rc::default();
+        let (to_screen, held) = (send.clone(), format_sync.clone());
+        volume_format.connect_selected_notify(move |d| {
+            if !held.get() {
+                let choice = d.selected() as usize;
+                to_screen(A::PickExport {
+                    from: Side::Left,
+                    choice,
+                });
+            }
         });
+        export.connect_clicked(move |_| export_bar());
         let extract = gtk::Button::with_label("Extract All...");
         extract.set_widget_name(ids::EXTRACT_ALL);
         extract.connect_clicked(move |_| extract_all());
@@ -192,7 +189,7 @@ impl Header {
             edit,
             export,
             volume_format,
-            volume_formats,
+            format_sync,
             extract,
             check,
             journal,
@@ -210,10 +207,6 @@ impl Header {
     }
 
     /// The Export Volume key: what a click on the button does.
-    pub fn export_volume(&self) {
-        self.export.emit_clicked();
-    }
-
     pub fn read(ctl: &CommanderController, prefix: &str) -> HeaderShown {
         let pane = ctl.pane(Side::Left);
         let v = pane.volume();
@@ -253,7 +246,7 @@ impl Header {
             edit_mode: ctl.edit_mode(),
             edit_busy: ctl.copy_job().is_some() || ctl.mode_working().is_some(),
             export_volume: !ctl.edit_mode() && ctl.copy_job().is_none(),
-            fs_type: v.fs_type.clone(),
+            bar: ctl.export_bar(Side::Left),
             tool_free: pane.tool_working().is_none(),
             chd: ctl.is_chd_source(),
             deleted: ctl.show_deleted(),
@@ -313,17 +306,27 @@ impl Header {
         self.edit.set_tooltip_text(hint);
         self.export.set_visible(s.export_volume && s.loaded);
         self.volume_format.set_visible(s.export_volume && s.loaded);
-        if self.volume_formats.borrow().0 != s.fs_type {
-            // A new volume starts on its filesystem's own format; the same one keeps the pick.
-            let formats = volume_export_formats(&s.fs_type);
-            let first = default_volume_export(&s.fs_type);
-            let labels: Vec<&str> = formats.iter().map(|f| f.label()).collect();
+        self.format_sync.set(true);
+        let labels: Vec<&str> = s.bar.choices.iter().map(|c| c.label.as_str()).collect();
+        let list = self.volume_format.model().and_downcast::<gtk::StringList>();
+        let same = list.as_ref().is_some_and(|l| {
+            l.n_items() as usize == labels.len()
+                && labels
+                    .iter()
+                    .enumerate()
+                    .all(|(i, t)| l.string(i as u32).as_deref() == Some(*t))
+        });
+        if !same {
             self.volume_format
                 .set_model(Some(&gtk::StringList::new(&labels)));
-            let at = formats.iter().position(|f| *f == first).unwrap_or(0);
-            self.volume_format.set_selected(at as u32);
-            *self.volume_formats.borrow_mut() = (s.fs_type.clone(), formats);
         }
+        if self.volume_format.selected() != s.bar.pick as u32 {
+            self.volume_format.set_selected(s.bar.pick as u32);
+        }
+        self.format_sync.set(false);
+        self.export.set_label(&s.bar.button);
+        self.export.set_sensitive(s.bar.enabled);
+        self.volume_format.set_sensitive(s.bar.enabled);
         self.extract.set_visible(s.export_volume && s.loaded);
         self.tree.set_visible(s.loaded);
         self.check.set_visible(s.caps.check && s.tool_free);
@@ -758,53 +761,26 @@ impl EditBar {
     }
 }
 
-/// The bar above the listing while rows are marked: the count, the export format, Export and Clear.
+/// The bar above the listing while rows are marked: the count and Clear; the header exports.
 pub struct MarkBar {
     root: gtk::Box,
     count: gtk::Label,
-    format: gtk::DropDown,
 }
 
 pub struct MarkShown {
     count: usize,
-    format: usize,
 }
 
 impl MarkBar {
-    /// `export` exports the marked rows in the given format.
-    pub fn build(send: &SendFn, export: Rc<dyn Fn(ExportFormat)>) -> MarkBar {
+    pub fn build(send: &SendFn) -> MarkBar {
         let count = gtk::Label::new(None);
-        let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
-        let format = gtk::DropDown::from_strings(&labels);
-        format.set_widget_name(ids::EXPORT_FORMAT);
-        let to_screen = send.clone();
-        format.connect_selected_notify(move |d| {
-            if let Some(f) = ExportFormat::ALL.get(d.selected() as usize) {
-                to_screen(A::SetExportFormat(*f));
-            }
-        });
-        let go = gtk::Button::with_label("Export...");
-        go.set_widget_name(ids::EXPORT_MARKED);
-        let picked = format.clone();
-        go.connect_clicked(move |_| {
-            if let Some(f) = ExportFormat::ALL.get(picked.selected() as usize) {
-                export(*f);
-            }
-        });
         let clear = button("Clear", ids::CLEAR_MARKS, send, pane(P::ClearSelection));
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         root.set_margin_start(8);
         root.set_margin_end(8);
         root.append(&count);
-        root.append(&gtk::Label::new(Some("Export as:")));
-        root.append(&format);
-        root.append(&go);
         root.append(&clear);
-        MarkBar {
-            root,
-            count,
-            format,
-        }
+        MarkBar { root, count }
     }
 
     pub fn root(&self) -> &gtk::Box {
@@ -817,21 +793,11 @@ impl MarkBar {
             true => pane.selected_entries().len(),
             false => 0,
         };
-        let format = ctl.export_format();
-        MarkShown {
-            count,
-            format: ExportFormat::ALL
-                .iter()
-                .position(|f| *f == format)
-                .unwrap_or(0),
-        }
+        MarkShown { count }
     }
 
     pub fn show(&self, s: MarkShown) {
         self.root.set_visible(s.count > 0);
         set_text(&self.count, &format!("{} selected", s.count));
-        if self.format.selected() != s.format as u32 {
-            self.format.set_selected(s.format as u32);
-        }
     }
 }

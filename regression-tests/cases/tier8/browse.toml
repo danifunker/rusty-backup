@@ -163,3 +163,50 @@ ui = [
   { activate = "commander.left.open_file" },
   { wait = "HELLO.TXT" },
 ]
+
+[[case]]
+id = "flow.browse.export-selected-zip"
+description = "Mark one of two files in the browse view; the one export bar then reads Export 1 Selected, and a zip picked from its list holds the marked file only"
+level = "smoke"
+area = ["inspect", "browse"]
+shells = ["appkit"]
+capabilities = ["browse.export-volume"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/OTHER.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/f.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "OTHER.TXT" },
+  { expect = "Export Volume..." },
+  { focus = "browse.list" },
+  { key = "Home" },
+  { key = "Space" },
+  { wait = "Export 1 Selected..." },
+  { focus = "browse.export_volume_format" },
+  { choose = "Zip (.zip)" },
+  { pick = "{scratch}/out.zip" },
+  { activate = "browse.export_volume" },
+  { wait_file = "{scratch}/out.zip", timeout_ms = 30000 },
+  { activate = "browse.close" },
+  { activate = "app.commander" },
+  { pick = "{scratch}/out.zip" },
+  { activate = "commander.left.open_file" },
+  { wait = "HELLO.TXT" },
+  { expect_not = "OTHER.TXT" },
+]

@@ -6,8 +6,8 @@
 
 use super::windows::Tone;
 use super::{
-    BrowseCaps, CommanderController, ExportFormat, FileDetail, ResourceForkMode, Side,
-    MAX_PREVIEW_SIZE,
+    export_bar_choices, BrowseCaps, CommanderController, ExportChoice, ExportFormat, FileDetail,
+    ResourceForkMode, Side, MAX_PREVIEW_SIZE,
 };
 use crate::controller::commander::{
     detect_content_type, entry_facts, extract_applies, hex_dump, is_known_prodos_type,
@@ -287,6 +287,17 @@ pub struct EditBar {
     pub after: Option<(String, Tone)>,
 }
 
+/// The browse view's one export bar: a format list and a button for the marked rows or else
+/// the whole volume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportBar {
+    pub choices: Vec<ExportChoice>,
+    pub pick: usize,
+    /// "Export Volume..." or "Export 3 Selected...".
+    pub button: String,
+    pub enabled: bool,
+}
+
 /// The bar shown while rows are marked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkBar {
@@ -368,6 +379,25 @@ impl CommanderController {
                 s.after
                     .map(|a| (format!("After: {}", format_size(a)), tone))
             }),
+        }
+    }
+
+    pub fn export_bar(&self, side: Side) -> ExportBar {
+        let pane = self.pane(side);
+        let choices = export_bar_choices(&pane.volume().fs_type);
+        let (format, fork) = (self.export_format_for(side), self.export_fork_mode());
+        let exact = |c: &ExportChoice| c.format == format && c.fork.unwrap_or(fork) == fork;
+        let pick = choices.iter().position(exact);
+        let pick = pick.or_else(|| choices.iter().position(|c| c.format == format));
+        let marked = self.mark_bar(side).count;
+        ExportBar {
+            pick: pick.unwrap_or(0),
+            choices,
+            button: match marked {
+                0 => "Export Volume...".to_string(),
+                n => format!("Export {n} Selected..."),
+            },
+            enabled: pane.listing.is_loaded() && !self.edit_mode() && self.copy_job().is_none(),
         }
     }
 
