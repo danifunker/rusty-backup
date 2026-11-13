@@ -580,10 +580,12 @@ pub fn write_entry(
 }
 
 /// Stamp a host file or folder's mtime (and atime) from a Mac-epoch modify
-/// date. Best effort: an undated entry (0, or before 1970) keeps the extract
-/// time, and a filesystem that refuses to set times doesn't fail extraction.
+/// date. Archive dates are classic-Mac wall-clock time with no zone, so they
+/// are read as this host's local time, the same as an HFS `get` or `cp`.
+/// Best effort: an undated entry (0, or before 1970) keeps the extract time,
+/// and a filesystem that refuses to set times doesn't fail extraction.
 fn set_host_mtime(path: &Path, mac_mod_date: u32) {
-    let Some(secs) = fs_mac::hfs_common::mac_date_to_unix(mac_mod_date) else {
+    let Some(secs) = disk_core::times::mac_local_to_unix(mac_mod_date) else {
         return;
     };
     let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
@@ -786,7 +788,7 @@ mod tests {
         const CREATED: u32 = 3_642_142_848;
         const MODIFIED: u32 = 3_642_142_850;
         const DIR_MODIFIED: u32 = MODIFIED - 86_400;
-        let unix = |mac: u32| (mac as i64) - 2_082_844_800;
+        let unix = |mac: u32| disk_core::times::mac_local_to_unix(mac).unwrap() as i64;
 
         let tree = vec![StuffItInputNode::Folder {
             name: "Folder".into(),
