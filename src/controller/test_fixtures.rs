@@ -129,3 +129,35 @@ pub fn dos_floppy(path: &std::path::Path) {
     let img = fs_pc::fat::create_dos_floppy(1_474_560, Some("F")).expect("format");
     std::fs::write(path, img).expect("write floppy");
 }
+
+/// A `disk_mib` MiB image with one blank FAT volume per entry of `parts_mib`, under `kind`'s table.
+pub fn fat_disk(
+    dir: &std::path::Path,
+    kind: crate::partition::type_catalog::TableKind,
+    disk_mib: u64,
+    parts_mib: &[u64],
+) -> std::path::PathBuf {
+    use crate::partition::provision::{place, write_table, Geometry, PartSpec};
+    use crate::partition::type_catalog::TableKind;
+    use std::io::{Seek, SeekFrom, Write};
+    const MIB: u64 = 1024 * 1024;
+    let specs: Vec<PartSpec> = parts_mib
+        .iter()
+        .map(|&m| PartSpec {
+            size: Some(m * MIB),
+            type_text: matches!(kind, TableKind::Mbr).then(|| "0C".to_string()),
+            name: None,
+        })
+        .collect();
+    let size = disk_mib * MIB;
+    let placed = place(&specs, kind, size, MIB, Geometry::default()).unwrap();
+    let path = dir.join("disk.img");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.set_len(size).unwrap();
+    write_table(&mut file, kind, &placed, size, Geometry::default()).unwrap();
+    for p in &placed {
+        file.seek(SeekFrom::Start(p.start_byte())).unwrap();
+        file.write_all(&blank_fat(p.size_bytes, None)).unwrap();
+    }
+    path
+}

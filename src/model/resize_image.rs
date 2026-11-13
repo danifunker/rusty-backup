@@ -102,6 +102,66 @@ pub fn repair_partition(path: &Path, offset: u64, part: &PartitionInfo) -> Verdi
     check_partition(path, offset, part)
 }
 
+/// The disk's size in bytes (a VHD's footer not counted), and whether it is a VHD.
+pub fn disk_size_of(path: &Path) -> Result<(u64, bool)> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file.seek(SeekFrom::End(0))?;
+    Ok(match detect_vhd(&mut file, len) {
+        true => (len - SECTOR, true),
+        false => (len, false),
+    })
+}
+
+/// What the wizard learns about a partition before it plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartProbe {
+    pub index: usize,
+    /// `Some(name)`: a filesystem with no in-place resizer, so the partition keeps its size.
+    pub fixed: Option<String>,
+    /// The smallest size its filesystem shrinks to, when known.
+    pub minimum: Option<u64>,
+}
+
+/// Probe each partition of `path`: can its filesystem resize, and how small can it go.
+pub fn probe(path: &Path, partitions: &[PartitionInfo], ctx: &JobCtx) -> Result<Vec<PartProbe>> {
+    use crate::fs::{InPlaceResize, MinimumResult};
+    let mut out = Vec::new();
+    for p in partitions.iter().filter(|p| !p.is_extended_container) {
+        if ctx.is_cancelled() {
+            bail!("cancelled");
+        }
+        ctx.set_phase(format!("Reading partition {}", p.index + 1));
+        let ts = p.partition_type_string.as_deref();
+        let mut file = std::fs::File::open(path)?;
+        let fixed = match crate::fs::in_place_resize_support(&mut file, p.byte_offset(), ts) {
+            InPlaceResize::Unsupported(name) => Some(name.to_string()),
+            _ => None,
+        };
+        let minimum = match fixed {
+            Some(_) => None,
+            None => match crate::fs::partition_minimum_size(
+                std::fs::File::open(path)?,
+                p.byte_offset(),
+                check_type(p),
+                ts,
+                p.size_bytes,
+                true,
+                None,
+                &|_| {},
+            ) {
+                MinimumResult::Computed { in_place, .. } => in_place.map(|m| m.min(p.size_bytes)),
+                _ => None,
+            },
+        };
+        out.push(PartProbe {
+            index: p.index,
+            fixed,
+            minimum,
+        });
+    }
+    Ok(out)
+}
+
 /// What one resize writes.
 #[derive(Debug, Clone)]
 pub struct ResizeImageRequest {

@@ -791,6 +791,30 @@ impl InspectController {
         })
     }
 
+    /// What Resize Image starts from, or why this source cannot be resized as an image file.
+    pub fn resize_image_source(
+        &mut self,
+    ) -> Result<crate::controller::resize_image::ResizeImageSource, String> {
+        if !self.is_image_file() || self.found.chd_path.is_some() {
+            return Err("Resize Image works on a disk image file.".to_string());
+        }
+        if matches!(&self.source, Some(Source::Image { _temp: Some(_), .. })) {
+            return Err(
+                "This image is unpacked from a container; convert it to a raw image first."
+                    .to_string(),
+            );
+        }
+        let plan = self
+            .resize_plan()
+            .ok_or_else(|| "This image has no partition table to resize.".to_string())?;
+        let places = plan
+            .partitions
+            .iter()
+            .filter_map(|p| self.partition_place(p.index).map(|pl| (p.index, pl)))
+            .collect();
+        Ok(crate::controller::resize_image::ResizeImageSource { plan, places })
+    }
+
     /// The device size the shell knows for the open device.
     pub fn device_size(&self) -> Option<u64> {
         match &self.source {

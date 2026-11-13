@@ -1,35 +1,11 @@
 use super::*;
 use crate::model::job::{Job, NoNotify};
-use crate::partition::provision::{place, write_table, Geometry, PartSpec};
 use crate::partition::type_catalog::TableKind;
 
 const MIB: u64 = 1024 * 1024;
 
-/// A `disk_mib` image holding one blank FAT volume per entry of `parts_mib`.
 fn disk(dir: &Path, kind: TableKind, disk_mib: u64, parts_mib: &[u64]) -> PathBuf {
-    let specs: Vec<PartSpec> = parts_mib
-        .iter()
-        .map(|&m| PartSpec {
-            size: Some(m * MIB),
-            type_text: matches!(kind, TableKind::Mbr).then(|| "0C".to_string()),
-            name: None,
-        })
-        .collect();
-    let size = disk_mib * MIB;
-    let placed = place(&specs, kind, size, MIB, Geometry::default()).unwrap();
-    let path = dir.join("disk.img");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.set_len(size).unwrap();
-    write_table(&mut file, kind, &placed, size, Geometry::default()).unwrap();
-    for p in &placed {
-        file.seek(SeekFrom::Start(p.start_byte())).unwrap();
-        file.write_all(&crate::controller::test_fixtures::blank_fat(
-            p.size_bytes,
-            None,
-        ))
-        .unwrap();
-    }
-    path
+    crate::controller::test_fixtures::fat_disk(dir, kind, disk_mib, parts_mib)
 }
 
 fn table(path: &Path) -> PartitionTable {
