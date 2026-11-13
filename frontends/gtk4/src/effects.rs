@@ -9,6 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use rusty_backup::controller::app::picker_start_folder;
+use rusty_backup::controller::remote_pick::asks_for_a_daemon;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec};
 
 use crate::widgets::plain;
@@ -219,6 +220,12 @@ impl EffectHost {
         error.add_css_class("error");
         error.set_text(&plain(spec.error.as_deref().unwrap_or("")));
         let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        if asks_for_a_daemon(spec.purpose) {
+            // The theme's two-arrow connection icon, above the address field.
+            let icon = gtk::Image::from_icon_name("network-transmit-receive-symbolic");
+            icon.set_pixel_size(48);
+            body.append(&icon);
+        }
         body.append(&entry);
         body.append(&error);
         dialog.set_extra_child(Some(&body));
