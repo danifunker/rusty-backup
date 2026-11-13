@@ -85,7 +85,26 @@ ui = [
   { activate = "build_disk.next" },
   { activate = "build_disk.create" },
   { wait = "build_disk.open_inspect", timeout_ms = 240000 },
-  { activate = "build_disk.open_inspect" },
+]
+
+# Something to browse and preview: a folder and two text files.
+[[case.step]]
+args = ["mkdir", "{scratch}/mbr.img@1", "/DOCS"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/mbr.img@1", "{cases}/tier8/data/hello.txt", "/README.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/mbr.img@1", "{cases}/tier8/data/edited.txt", "/DOCS/NOTES.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "inspect.source.open_file" },
   { wait = "Re-inspect" },
   { shot = "inspect-loaded" },
   { activate = "inspect.row.check" },
@@ -114,8 +133,15 @@ ui = [
   { shot = "inspect-export" },
   { activate = "inspect.export.close" },
   { activate = "inspect.row.browse" },
-  { wait = "Filesystem Browser" },
+  { wait = "README.TXT" },
+  { focus = "browse.list" },
+  { key = "Down" },
+  { wait = "Hello from" },
   { shot = "browse-readonly" },
+  { key = "Space" },
+  { wait = "Export 1 Selected..." },
+  { shot = "browse-marked" },
+  { key = "Space" },
   { activate = "browse.edit_mode" },
   { wait = "Edit Mode ON" },
   { shot = "browse-edit-mode" },
@@ -297,6 +323,9 @@ ui = [
   { shot = "optical-disc" },
   { activate = "optical.browse_contents" },
   { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { focus = "browse.list" },
+  { key = "Home" },
+  { wait = "StuffIt (c)" },
   { shot = "optical-browser" },
   { tab = "Archives" },
   { pick = "{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT" },

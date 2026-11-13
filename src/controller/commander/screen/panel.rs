@@ -15,6 +15,11 @@ use crate::controller::commander::{
 };
 use disk_core::display::format_size;
 
+/// What a hex preview dumps: the first 64 KiB, so a long binary stays quick to draw.
+fn hex_head(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(64 * 1024)]
+}
+
 /// The volume's line above the listing; an empty field is not shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VolumeLine {
@@ -143,19 +148,30 @@ impl FileDetail {
         } else if entry.is_special() {
             let kind = entry.special_type.as_deref().unwrap_or("special file");
             PanelPreview::Note(format!("{kind} -- no preview available"))
-        } else if entry.size > MAX_PREVIEW_SIZE as u64 {
-            PanelPreview::Note(format!(
-                "File too large to preview ({}).",
-                format_size(entry.size)
-            ))
         } else {
-            match &self.preview {
-                None => PanelPreview::None,
-                Some(data) => {
+            match (&self.preview, &self.rsrc_preview) {
+                (None, _) => PanelPreview::None,
+                // A classic Mac application keeps everything in its resource fork.
+                (Some(data), Some(rsrc)) if data.is_empty() && !rsrc.is_empty() => {
+                    let head = "(The data fork is empty; this is the resource fork.)";
+                    PanelPreview::Hex(format!("{head}\n{}", hex_dump(hex_head(rsrc))))
+                }
+                (Some(data), _) if data.is_empty() => PanelPreview::Note("Empty file.".into()),
+                (Some(data), _) => {
+                    let head = (entry.size > data.len() as u64).then(|| {
+                        format!(
+                            "(The first {} of {}.)\n",
+                            format_size(data.len() as u64),
+                            format_size(entry.size)
+                        )
+                    });
+                    let head = head.unwrap_or_default();
                     let shown = preview_bytes(&self.fs_type, data);
                     match detect_content_type(entry, &shown) {
-                        FileContent::Text(t) => PanelPreview::Text(t),
-                        FileContent::Binary(bytes) => PanelPreview::Hex(hex_dump(&bytes)),
+                        FileContent::Text(t) => PanelPreview::Text(format!("{head}{t}")),
+                        FileContent::Binary(bytes) => {
+                            PanelPreview::Hex(format!("{head}{}", hex_dump(hex_head(&bytes))))
+                        }
                     }
                 }
             }

@@ -1059,3 +1059,41 @@ fn the_export_bar_exports_the_marked_rows_else_the_volume_in_its_one_format() {
     select(&mut ctl, Side::Left, &name);
     assert_eq!(ctl.export_bar(Side::Left).button, "Export 1 Selected...");
 }
+
+#[test]
+fn the_preview_shows_a_large_files_head_and_an_empty_data_forks_resource_fork() {
+    let detail = |size: u64, data: Vec<u8>, rsrc: Option<Vec<u8>>| FileDetail {
+        side: Side::Left,
+        entry: FileEntry::new_file("F".into(), "/F".into(), size, 0),
+        editable: false,
+        fs_type: "HFS".into(),
+        loading: false,
+        preview: Some(data),
+        rsrc_preview: rsrc,
+        xattrs: Vec::new(),
+        id_names: IdNameMap::default(),
+        size_plan: None,
+        result: None,
+        serial: 0,
+    };
+    let big = detail(
+        3 * MAX_PREVIEW_SIZE as u64,
+        vec![b'a'; MAX_PREVIEW_SIZE],
+        None,
+    );
+    match big.panel_preview() {
+        PanelPreview::Text(t) => {
+            assert!(t.starts_with("(The first 1.0 MiB of 3.0 MiB.)"), "{t:.60}")
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+    let app = detail(0, Vec::new(), Some(vec![0, 0, 1, 0]));
+    match app.panel_preview() {
+        PanelPreview::Hex(h) => assert!(h.starts_with("(The data fork is empty;"), "{h}"),
+        other => panic!("expected hex, got {other:?}"),
+    }
+    assert_eq!(
+        detail(0, Vec::new(), None).panel_preview(),
+        PanelPreview::Note("Empty file.".into())
+    );
+}
