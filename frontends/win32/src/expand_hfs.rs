@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
+use crate::partition_bar;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -35,6 +36,8 @@ pub struct ExpandHfsWindow {
     sync: SyncGuard,
     me: Weak<ExpandHfsWindow>,
     window: HWND,
+    partition: HWND,
+    usage: HWND,
     facts: HWND,
     apm: HWND,
     flat: HWND,
@@ -73,6 +76,9 @@ impl ExpandHfsWindow {
             )
         };
         let source_head = ui::label(window, "Source");
+        let partition = ui::label(window, "");
+        let usage = partition_bar::build(window, Box::new(|_| {}));
+        partition_bar::set_options(usage, 1.0, true);
         let facts = ui::label(window, "");
         let target_head = ui::label(window, "Target");
         let format_label = ui::label(window, "Output format:");
@@ -120,6 +126,8 @@ impl ExpandHfsWindow {
             sync: SyncGuard::default(),
             me: me.clone(),
             window,
+            partition,
+            usage,
             facts,
             apm,
             flat,
@@ -198,6 +206,10 @@ impl ExpandHfsWindow {
     /// Read the controller, then set the controls; only changed values are set.
     fn refresh(&self) {
         let c = self.ctrl.borrow();
+        let line = c.partition_line();
+        ui::set_visible(self.partition, line.is_some());
+        ui::set_text(self.partition, line.as_deref().unwrap_or_default());
+        partition_bar::show(self.usage, c.usage_bar(), None);
         if let Some(src) = c.source() {
             let block = match src.source_block_size % 1024 {
                 0 => format!("{} KiB", src.source_block_size / 1024),
@@ -304,6 +316,12 @@ impl ExpandHfsWindow {
         let tree = Node::inset(
             Node::column(vec![
                 text(l[0], 1),
+                text(self.partition, 1),
+                Node::leaf(
+                    self.usage,
+                    Size::Stretch(1),
+                    Size::Fixed(partition_bar::HEIGHT),
+                ),
                 text(self.facts, 4),
                 text(l[1], 1),
                 Node::row(vec![

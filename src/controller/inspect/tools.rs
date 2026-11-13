@@ -52,6 +52,8 @@ pub(super) struct ToolState {
     pending_repack: Option<(u64, String)>,
     swab: Option<Job<()>>,
     hfs_summary: Option<Job<Result<crate::model::hfs_expand_runner::ExpandSource, String>>>,
+    /// The partition Expand HFS reads, named for its dialog.
+    hfs_place: Option<crate::model::hfs_expand_runner::PartitionPlace>,
     chd_info: Option<Job<Result<String, String>>>,
     chd_info_text: Option<String>,
 }
@@ -989,6 +991,7 @@ impl InspectController {
         if self.tools.hfs_summary.is_some() {
             return;
         }
+        self.tools.hfs_place = self.partition_place(index);
         self.tools.hfs_summary = Some(self.spawn("Reading the HFS volume...", move |_| {
             Ok(
                 crate::model::hfs_expand_runner::summarize_source(path.as_path(), offset, size)
@@ -1051,7 +1054,10 @@ impl InspectController {
         if let Some(done) = self.tools.hfs_summary.as_ref().and_then(finished) {
             self.tools.hfs_summary = None;
             match done.and_then(|r| r) {
-                Ok(source) => self.requests.push(HostRequest::ExpandHfs(Box::new(source))),
+                Ok(mut source) => {
+                    source.place = self.tools.hfs_place.take();
+                    self.requests.push(HostRequest::ExpandHfs(Box::new(source)));
+                }
                 Err(e) => self.error(format!("Cannot read source HFS volume: {e}")),
             }
         }

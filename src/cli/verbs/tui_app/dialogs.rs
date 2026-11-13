@@ -308,8 +308,23 @@ impl App {
             return;
         };
         const MIB: u64 = 1024 * 1024;
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::styled("  Source", pal.accent()),
+        let mut lines: Vec<Line<'static>> = vec![Line::styled("  Source", pal.accent())];
+        if let Some(p) = c.partition_line() {
+            lines.push(Line::raw(format!("  {p}")));
+        }
+        let (used, size) = (
+            src.used_bytes.min(src.partition_size),
+            src.partition_size.max(1),
+        );
+        let filled = (used * 30 / size) as usize;
+        lines.push(Line::raw(format!(
+            "  [{}{}] {} used, {} free",
+            "#".repeat(filled),
+            ".".repeat(30 - filled),
+            crate::controller::commander::format_size(used),
+            crate::controller::commander::format_size(src.partition_size - used)
+        )));
+        lines.extend([
             Line::raw(format!("  Volume: {}", src.volume_name)),
             Line::raw(format!(
                 "  Size: {} MiB ({} bytes)",
@@ -328,7 +343,7 @@ impl App {
             )),
             Line::raw(""),
             Line::styled("  Target", pal.accent()),
-        ];
+        ]);
         let mut focus = 0;
         let format = if c.flat_hfv() {
             "Bare HFS image (.hfv / .img)"

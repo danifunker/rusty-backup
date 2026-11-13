@@ -17,7 +17,9 @@ use crate::model::hfs_expand_runner::{
 };
 use crate::model::job::{Job, Notify, Snapshot};
 
-pub use crate::model::hfs_expand_runner::ExpandSource;
+pub use crate::controller::inspect::{LayoutSegment, SegmentKind};
+pub use crate::model::hfs_expand_runner::{ExpandSource, PartitionPlace};
+use disk_core::display::format_size;
 
 const MIB: u64 = 1024 * 1024;
 /// HFV's 4063 MB ceiling in whole MiB.
@@ -36,6 +38,7 @@ pub mod ids {
     pub const SAVE_AS: &str = "expand_hfs.save_as";
     pub const EXPAND: &str = "expand_hfs.expand";
     pub const CLOSE: &str = "expand_hfs.close";
+    pub const USAGE: &str = "expand_hfs.usage";
 }
 
 /// What every shell calls each control and outcome (D8); a shell adds only layout (a `:`, brackets).
@@ -129,6 +132,49 @@ impl ExpandHfsController {
 
     pub fn source(&self) -> Option<&ExpandSource> {
         self.source.as_ref()
+    }
+
+    /// "Partition 3 of 5: Macintosh HD (Apple_HFS, 512.0 MiB)" when the volume came from a disk.
+    pub fn partition_line(&self) -> Option<String> {
+        let s = self.source.as_ref()?;
+        let p = s.place.as_ref()?;
+        let name = match s.volume_name.is_empty() {
+            true => p.label.as_str(),
+            false => s.volume_name.as_str(),
+        };
+        Some(format!(
+            "Partition {} of {}: {name} ({}, {})",
+            p.number,
+            p.of,
+            p.kind,
+            format_size(s.partition_size)
+        ))
+    }
+
+    /// The volume's space as a bar in its partition's colour: used, then free.
+    pub fn usage_bar(&self) -> Vec<LayoutSegment> {
+        let Some(s) = self.source.as_ref() else {
+            return Vec::new();
+        };
+        let color_index = s.place.as_ref().map_or(0, |p| p.color_index);
+        let used = s.used_bytes.min(s.partition_size);
+        let free = s.partition_size - used;
+        vec![
+            LayoutSegment {
+                label: "Used".to_string(),
+                fs: String::new(),
+                size_bytes: used,
+                kind: SegmentKind::Partition { color_index },
+                partition: None,
+            },
+            LayoutSegment {
+                label: "Free".to_string(),
+                fs: String::new(),
+                size_bytes: free,
+                kind: SegmentKind::Free,
+                partition: None,
+            },
+        ]
     }
 
     pub fn flat_hfv(&self) -> bool {
@@ -452,5 +498,37 @@ mod tests {
         assert!(ctl.take_log()[0]
             .1
             .starts_with("Expanding HFS volume 'Work/Disk' to 8 MiB"));
+    }
+
+    #[test]
+    fn the_dialog_names_its_partition_and_shows_its_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = hfs_image(dir.path(), 4);
+        let mut source =
+            crate::model::hfs_expand_runner::summarize_source(&src, 0, 4 * MIB).unwrap();
+        let mut ctl = ExpandHfsController::new(Arc::new(NoNotify));
+        ctl.apply(ExpandHfsAction::Open(source.clone()));
+        assert_eq!(
+            ctl.partition_line(),
+            None,
+            "a bare volume has no partition to name"
+        );
+        source.place = Some(PartitionPlace {
+            number: 2,
+            of: 3,
+            label: "Partition 3".into(),
+            kind: "Apple_HFS".into(),
+            color_index: 1,
+        });
+        ctl.apply(ExpandHfsAction::Close);
+        ctl.apply(ExpandHfsAction::Open(source.clone()));
+        assert_eq!(
+            ctl.partition_line().unwrap(),
+            "Partition 2 of 3: Work/Disk (Apple_HFS, 4.0 MiB)"
+        );
+        let bar = ctl.usage_bar();
+        assert_eq!(bar[0].kind, SegmentKind::Partition { color_index: 1 });
+        assert_eq!(bar[0].size_bytes + bar[1].size_bytes, 4 * MIB);
+        assert_eq!(bar[0].size_bytes, source.used_bytes);
     }
 }

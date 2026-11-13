@@ -149,23 +149,20 @@ ui = [
 
 [[case]]
 id = "tour.appkit.hfs"
-description = "Expand HFS Volume on a classic HFS floppy"
+description = "Expand HFS Volume on a Mac II's APM disk: the dialog names the partition and shows its space"
 level = "smoke"
 area = ["inspect"]
 shells = ["appkit"]
 capabilities = []
+fixture = "fs.hfs.populated-macii.hd"
 timeout_ms = 120000
-
-[[case.step]]
-args = ["new", "floppy", "hfs", "--size", "1440K", "{scratch}/h.img"]
-expect_exit = 0
 
 [[case.step]]
 ui = [
   { tab = "Inspect" },
-  { pick = "{scratch}/h.img" },
+  { pick = "{fixture}" },
   { activate = "inspect.source.open_file" },
-  { wait = "HFS" },
+  { wait = "Partition Table: APM" },
   { activate = "inspect.row.expand_hfs" },
   { wait = "Expand HFS Volume" },
   { shot = "inspect-expand-hfs" },

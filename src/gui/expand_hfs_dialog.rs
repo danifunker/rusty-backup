@@ -3,6 +3,7 @@
 //! Draws the source summary and the target form, maps them to [`ExpandHfsAction`]s, answers
 //! the Save As picker through an [`EffectHost`] and shows the expand's step and lines.
 
+use rusty_backup::controller::commander::format_size;
 use rusty_backup::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController, ExpandSource};
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller, Effect};
@@ -56,6 +57,17 @@ impl ExpandHfsDialog {
         };
         window.resizable(true).default_width(520.0).show(ctx, |ui| {
             ui.label(egui::RichText::new("Source").strong());
+            if let Some(line) = self.ctl.partition_line() {
+                ui.label(line);
+            }
+            let used = src.used_bytes.min(src.partition_size);
+            let share = used as f32 / src.partition_size.max(1) as f32;
+            let text = format!(
+                "{} used, {} free",
+                format_size(used),
+                format_size(src.partition_size - used)
+            );
+            ui.add(egui::ProgressBar::new(share).text(text));
             ui.label(format!("Volume: {}", src.volume_name));
             ui.label(format!(
                 "Size: {} MiB ({} bytes)",

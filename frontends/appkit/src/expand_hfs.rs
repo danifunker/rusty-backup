@@ -17,6 +17,7 @@ use rusty_backup::controller::{Controller, Effect};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::form::Form;
 use crate::layout::{self, Node, Size};
+use crate::partition_bar::{self, Bar};
 use crate::sync::SyncGuard;
 use crate::ui::{self, CloseDelegate};
 
@@ -27,6 +28,8 @@ const HFV_NOTE: &str = "Bare classic-HFS volume with no partition table: Basilis
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum K {
     SourceHead,
+    Partition,
+    Usage,
     Facts,
     TargetHead,
     FormatCaption,
@@ -56,6 +59,7 @@ pub struct ExpandHfsWindow {
     _delegate: Retained<CloseDelegate>,
     form: Form<K>,
     blocks: RefCell<Vec<BlockChoice>>,
+    usage: Retained<Bar>,
 }
 
 impl ExpandHfsWindow {
@@ -71,7 +75,7 @@ impl ExpandHfsWindow {
                 mtm,
                 "Expand HFS Volume",
                 560.0,
-                520.0,
+                600.0,
                 Box::new(move || {
                     if let Some(d) = close.upgrade() {
                         d.send(ExpandHfsAction::Close);
@@ -97,6 +101,10 @@ impl ExpandHfsWindow {
             );
             let f = &form;
             f.label(K::SourceHead, "Source");
+            f.label(K::Partition, "");
+            let usage = Bar::new(mtm, ids::USAGE);
+            usage.set_options(1.0, true);
+            f.add(K::Usage, &usage);
             f.wrap(K::Facts, "");
             f.label(K::TargetHead, "Target");
             f.label(K::FormatCaption, "Output format:");
@@ -125,6 +133,7 @@ impl ExpandHfsWindow {
                 _delegate: delegate,
                 form,
                 blocks: RefCell::default(),
+                usage,
             }
         });
         me.layout();
@@ -192,6 +201,10 @@ impl ExpandHfsWindow {
     fn refresh(&self) {
         let f = &self.form;
         let c = self.ctrl.borrow();
+        let line = c.partition_line();
+        f.show(K::Partition, line.is_some());
+        f.set_text(K::Partition, line.as_deref().unwrap_or_default());
+        self.usage.show(c.usage_bar(), None);
         if let Some(src) = c.source() {
             let block = match src.source_block_size % 1024 {
                 0 => format!("{} KiB", src.source_block_size / 1024),
@@ -282,6 +295,12 @@ impl ExpandHfsWindow {
         let tree = Node::inset(
             Node::column(vec![
                 text(K::SourceHead, 1),
+                text(K::Partition, 1),
+                Node::leaf(
+                    K::Usage,
+                    Size::Stretch(1),
+                    Size::Fixed(partition_bar::HEIGHT),
+                ),
                 text(K::Facts, 4),
                 text(K::TargetHead, 1),
                 Node::row(vec![

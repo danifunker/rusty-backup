@@ -7,13 +7,14 @@ use std::sync::Arc;
 use adw::prelude::*;
 use rusty_backup::controller::app::Notify;
 use rusty_backup::controller::expand_hfs::{
-    ids, BlockChoice, ExpandHfsAction, ExpandHfsController, ExpandSource,
+    ids, BlockChoice, ExpandHfsAction, ExpandHfsController, ExpandSource, LayoutSegment,
 };
 use rusty_backup::controller::{Controller, Effect};
 
 use super::{button_row, fact_line, radios, set_radio, window};
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::form::{button, set_line};
+use crate::inspect::bar::PartitionBar;
 use crate::sync::SyncGuard;
 use crate::widgets::{plain, set_text};
 
@@ -25,6 +26,8 @@ const HFV_NOTE: &str = "Bare classic-HFS volume with no partition table - mounta
 
 struct Shown {
     source: Option<ExpandSource>,
+    partition: Option<String>,
+    usage: Vec<LayoutSegment>,
     editable: bool,
     flat: bool,
     blocks: Vec<BlockChoice>,
@@ -45,6 +48,8 @@ pub struct ExpandHfsDialog {
     sync: SyncGuard,
     me: Weak<ExpandHfsDialog>,
     dialog: adw::Dialog,
+    partition: gtk::Label,
+    usage: PartitionBar,
     facts: gtk::Label,
     form: gtk::Box,
     format: Vec<gtk::CheckButton>,
@@ -83,6 +88,8 @@ impl ExpandHfsDialog {
             };
             let source_head = gtk::Label::builder().label("Source").xalign(0.0).build();
             source_head.add_css_class("heading");
+            let partition = fact_line();
+            let usage = PartitionBar::build(|_| {});
             let facts = fact_line();
             let target_head = gtk::Label::builder().label("Target").xalign(0.0).build();
             target_head.add_css_class("heading");
@@ -151,6 +158,8 @@ impl ExpandHfsDialog {
 
             let body = crate::browser::dialogs::page();
             body.append(&source_head);
+            body.append(&partition);
+            body.append(usage.root());
             body.append(&facts);
             body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
             body.append(&target_head);
@@ -176,6 +185,8 @@ impl ExpandHfsDialog {
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 dialog,
+                partition,
+                usage,
                 facts,
                 form,
                 format,
@@ -263,6 +274,8 @@ impl ExpandHfsDialog {
         let ctrl = self.ctrl.borrow();
         Shown {
             source: ctrl.source().cloned(),
+            partition: ctrl.partition_line(),
+            usage: ctrl.usage_bar(),
             editable: ctrl.editable(),
             flat: ctrl.flat_hfv(),
             blocks: ctrl.block_choices(),
@@ -285,6 +298,9 @@ impl ExpandHfsDialog {
     }
 
     fn show(&self, s: Shown) {
+        self.partition.set_visible(s.partition.is_some());
+        set_text(&self.partition, s.partition.as_deref().unwrap_or_default());
+        self.usage.show(s.usage.clone(), None);
         if let Some(src) = &s.source {
             let block = match src.source_block_size % 1024 {
                 0 => format!("{} KiB", src.source_block_size / 1024),
