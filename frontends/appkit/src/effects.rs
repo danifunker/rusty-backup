@@ -381,6 +381,31 @@ struct Ask<'a> {
     first_error: Option<String>,
 }
 
+/// A connection's icon: two passing arrows in a circle (a system symbol, macOS 11 and later),
+/// else the system network icon.
+fn connection_icon() -> Option<Retained<objc2_app_kit::NSImage>> {
+    use objc2_app_kit::NSImage;
+    if objc2::available!(macos = 11.0) {
+        let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &ns("arrow.left.arrow.right.circle"),
+            Some(&ns("Connection")),
+        );
+        if let Some(symbol) = symbol {
+            // SAFETY: a constant font weight AppKit exports.
+            let weight = unsafe { objc2_app_kit::NSFontWeightRegular };
+            let config =
+                objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(
+                    48.0, weight,
+                );
+            return symbol
+                .imageWithSymbolConfiguration(&config)
+                .or(Some(symbol));
+        }
+    }
+    // SAFETY: a constant image name AppKit exports.
+    NSImage::imageNamed(unsafe { objc2_app_kit::NSImageNameNetwork })
+}
+
 fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
     let Ask {
         title,
@@ -393,13 +418,9 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
         first_error,
     } = ask;
     let a = alert(mtm, title, message);
-    if network {
-        // SAFETY: a constant image name AppKit exports.
-        let name = unsafe { objc2_app_kit::NSImageNameNetwork };
-        if let Some(icon) = objc2_app_kit::NSImage::imageNamed(name) {
-            // SAFETY: the alert keeps its own reference to the image.
-            unsafe { a.setIcon(Some(&icon)) };
-        }
+    if let Some(icon) = network.then(connection_icon).flatten() {
+        // SAFETY: the alert keeps its own reference to the image.
+        unsafe { a.setIcon(Some(&icon)) };
     }
     a.addButtonWithTitle(&ns(ok));
     a.addButtonWithTitle(&ns("Cancel"));
