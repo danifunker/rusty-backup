@@ -126,3 +126,40 @@ ui = [
 args = ["get", "{scratch}/t.img", "/HELLO.TXT", "{scratch}/back.txt"]
 expect_exit = 0
 files_identical = [["{cases}/tier8/data/edited.txt", "{scratch}/back.txt"]]
+
+[[case]]
+id = "flow.browse.export-volume-zip"
+description = "Export a FAT floppy's volume from the browse view with Export Volume, its format list starting on Zip for a PC filesystem, then open the zip in Commander and find the file"
+level = "smoke"
+area = ["inspect", "browse", "commander"]
+shells = ["appkit"]
+capabilities = ["browse.export-volume"]
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/f.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/f.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/f.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.row.browse" },
+  { wait = "HELLO.TXT" },
+  # A PC filesystem starts on Zip; the list also offers the tar flavours.
+  { expect = "Zip (.zip)" },
+  { pick = "{scratch}/out.zip" },
+  { activate = "browse.export_volume" },
+  { wait_file = "{scratch}/out.zip", timeout_ms = 30000 },
+  { activate = "browse.close" },
+  { activate = "app.commander" },
+  { pick = "{scratch}/out.zip" },
+  { activate = "commander.left.open_file" },
+  { wait = "HELLO.TXT" },
+]

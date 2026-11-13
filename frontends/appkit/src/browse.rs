@@ -23,11 +23,11 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
-    editor_window, extract_fork_modes, journal_window, tree_window, ArchiveUse,
-    BrowserPaneAction as P, CommanderAction as A, CommanderController, EditBar, ExportFormat,
-    ExtractOptions, HeaderTools, JobRegistry, MarkBar, ModeAction, PaneProfile, PaneServices,
-    PaneWindow, PanelActions, ProdosExportMode, ResourceForkMode, Side, SidePanel, Tone, TreeText,
-    VolumeLine, WindowKind, FOLLOW_DELAY,
+    default_volume_export, editor_window, extract_fork_modes, journal_window, tree_window,
+    volume_export_formats, ArchiveUse, BrowserPaneAction as P, CommanderAction as A,
+    CommanderController, EditBar, ExportFormat, ExtractOptions, HeaderTools, JobRegistry, MarkBar,
+    ModeAction, PaneProfile, PaneServices, PaneWindow, PanelActions, ProdosExportMode,
+    ResourceForkMode, Side, SidePanel, Tone, TreeText, VolumeLine, WindowKind, FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
@@ -63,6 +63,7 @@ enum C {
     EditMode,
     ExtractAll,
     ExportVolume,
+    VolumeFormat,
     Check,
     Journal,
     ChdInfo,
@@ -122,13 +123,14 @@ enum C {
     MarkClear,
 }
 
-const ALL: [C; 63] = [
+const ALL: [C; 64] = [
     C::Title,
     C::Volume,
     C::Boot,
     C::EditMode,
     C::ExtractAll,
     C::ExportVolume,
+    C::VolumeFormat,
     C::Check,
     C::Journal,
     C::ChdInfo,
@@ -212,6 +214,8 @@ struct Shown {
     volume: VolumeLine,
     message: String,
     export_volume: bool,
+    /// The volume's filesystem, which picks the export formats on offer and the first one.
+    fs_type: String,
     job: Option<(Snapshot, bool)>,
     panel_key: Option<(u64, bool)>,
     panel: Option<SidePanel>,
@@ -258,6 +262,8 @@ pub struct BrowseView {
     follow_set: Cell<bool>,
     edits_shown: Cell<bool>,
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The filesystem the volume-format list was filled for, and its formats in list order.
+    volume_formats: RefCell<(String, Vec<ExportFormat>)>,
 }
 
 fn as_view<T: AsRef<NSView>>(v: &T) -> Retained<NSView> {
@@ -317,7 +323,11 @@ impl BrowseView {
             add(C::ExtractAll, button("Extract All...", ids::EXTRACT_ALL));
             add(
                 C::ExportVolume,
-                button("Export to .tar.gz...", ids::EXPORT_VOLUME),
+                button("Export Volume...", ids::EXPORT_VOLUME),
+            );
+            add(
+                C::VolumeFormat,
+                popup(Vec::new(), ids::EXPORT_VOLUME_FORMAT),
             );
             add(C::Check, button("Check", ids::CHECK));
             add(C::Journal, button("Journal", ids::JOURNAL));
@@ -459,6 +469,7 @@ impl BrowseView {
                 follow_set: Cell::new(false),
                 edits_shown: Cell::new(false),
                 on_change: RefCell::default(),
+                volume_formats: RefCell::default(),
             }
         })
     }
@@ -786,6 +797,7 @@ impl BrowseView {
             volume: ctl.volume_line(Side::Left, &prefix),
             message,
             export_volume: !ctl.edit_mode() && ctl.copy_job().is_none(),
+            fs_type: ctl.pane(Side::Left).volume().fs_type.clone(),
             job: jobs.into_iter().next(),
             panel: detail
                 .filter(|_| self.panel_key.get() != panel_key)
@@ -839,6 +851,24 @@ impl BrowseView {
         }
     }
 
+    /// A new volume refills the format list and starts it on the filesystem's own format;
+    /// the same volume keeps the user's pick.
+    fn show_volume_formats(&self, fs_type: &str) {
+        if self.volume_formats.borrow().0 == fs_type {
+            return;
+        }
+        let formats = volume_export_formats(fs_type);
+        let first = default_volume_export(fs_type);
+        let p = self.popup(C::VolumeFormat);
+        p.removeAllItems();
+        for f in &formats {
+            p.addItemWithTitle(&ns(f.label()));
+        }
+        let at = formats.iter().position(|f| *f == first).unwrap_or(0);
+        p.selectItemAtIndex(at as isize);
+        *self.volume_formats.borrow_mut() = (fs_type.to_string(), formats);
+    }
+
     fn show(&self, s: Shown) {
         let v = &s.volume;
         let parts = [&v.fs, &v.usage, &v.label, &v.blessed];
@@ -850,6 +880,8 @@ impl BrowseView {
         ui::set_text(self.text(C::Volume), &line.join("    "));
         self.show_if(C::ExtractAll, s.export_volume && s.loaded);
         self.show_if(C::ExportVolume, s.export_volume && s.loaded);
+        self.show_if(C::VolumeFormat, s.export_volume && s.loaded);
+        self.show_volume_formats(&s.fs_type);
         let (job_text, pct) = s
             .job
             .as_ref()
@@ -1266,11 +1298,19 @@ impl BrowseView {
             }
             C::NoticeOk => self.show_notice(None),
             C::ExtractAll => self.extract("/".to_string()),
-            C::ExportVolume => self.apply(A::ExportEntry {
-                from: Side::Left,
-                path: "/".to_string(),
-                format: Some(ExportFormat::TarGz),
-            }),
+            C::ExportVolume => {
+                let at = self.popup(C::VolumeFormat).indexOfSelectedItem();
+                let format = usize::try_from(at)
+                    .ok()
+                    .and_then(|i| self.volume_formats.borrow().1.get(i).copied())
+                    .unwrap_or(ExportFormat::Zip);
+                self.apply(A::ExportEntry {
+                    from: Side::Left,
+                    path: "/".to_string(),
+                    format: Some(format),
+                });
+            }
+            C::VolumeFormat => {}
             C::Extract => {
                 if let Some(path) = self.cursor_path() {
                     self.extract(path);
@@ -1373,7 +1413,12 @@ impl BrowseView {
         col.push(Node::row(vec![
             button(C::EditMode, 120),
             button(C::ExtractAll, 110),
-            button(C::ExportVolume, 160),
+            button(C::ExportVolume, 130),
+            Node::leaf(
+                C::VolumeFormat,
+                Size::Fixed(190),
+                Size::Fixed(layout::ROW + 2),
+            ),
             button(C::Check, 70),
             button(C::Journal, 80),
             button(C::ChdInfo, 80),

@@ -7,8 +7,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use rusty_backup::controller::browser::ids;
 use rusty_backup::controller::commander::{
-    format_size, BrowseCaps, BrowserPaneAction as P, CommanderAction as A, CommanderController,
-    ExportFormat, ModeAction, Side, SpaceReadout, ViewItemKind, ViewMenuItem,
+    default_volume_export, format_size, volume_export_formats, BrowseCaps, BrowserPaneAction as P,
+    CommanderAction as A, CommanderController, ExportFormat, ModeAction, Side, SpaceReadout,
+    ViewItemKind, ViewMenuItem,
 };
 
 use super::SendFn;
@@ -42,6 +43,8 @@ pub struct HeaderShown {
     edit_mode: bool,
     edit_busy: bool,
     export_volume: bool,
+    /// The volume's filesystem, which picks the export formats on offer and the first one.
+    fs_type: String,
     tool_free: bool,
     chd: bool,
     deleted: bool,
@@ -58,6 +61,9 @@ pub struct Header {
     boot: gtk::Label,
     edit: gtk::Button,
     export: gtk::Button,
+    /// Export Volume's format; the list follows the filesystem it was filled for.
+    volume_format: gtk::DropDown,
+    volume_formats: Rc<RefCell<(String, Vec<ExportFormat>)>>,
     extract: gtk::Button,
     check: gtk::Button,
     journal: gtk::Button,
@@ -92,18 +98,27 @@ impl Header {
             send,
             A::Mode(ModeAction::ToggleEditMode),
         );
-        let export = gtk::Button::with_label("Export to .tar.gz...");
+        let export = gtk::Button::with_label("Export Volume...");
         export.set_widget_name(ids::EXPORT_VOLUME);
         export.set_tooltip_text(Some(
-            "Archive the whole volume to .tar.gz / .tar.zst / .tar (preserves case + symlinks; \
-             choose the extension in the save dialog)",
+            "Archive the whole volume in the format beside this button",
         ));
-        let to_tar = send.clone();
+        let volume_format = gtk::DropDown::from_strings(&[]);
+        volume_format.set_widget_name(ids::EXPORT_VOLUME_FORMAT);
+        let volume_formats: Rc<RefCell<(String, Vec<ExportFormat>)>> = Rc::default();
+        let to_archive = send.clone();
+        let (picked, formats) = (volume_format.clone(), volume_formats.clone());
         export.connect_clicked(move |_| {
-            to_tar(A::ExportEntry {
+            let format = formats
+                .borrow()
+                .1
+                .get(picked.selected() as usize)
+                .copied()
+                .unwrap_or(ExportFormat::Zip);
+            to_archive(A::ExportEntry {
                 from: Side::Left,
                 path: "/".to_string(),
-                format: Some(ExportFormat::TarGz),
+                format: Some(format),
             });
         });
         let extract = gtk::Button::with_label("Extract All...");
@@ -147,7 +162,11 @@ impl Header {
         let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         tools.append(&full_scan);
         tools.append(&deleted);
-        for b in [&edit, &export, &extract, &check, &journal, &chd, &tree] {
+        for b in [&edit, &export] {
+            tools.append(b);
+        }
+        tools.append(&volume_format);
+        for b in [&extract, &check, &journal, &chd, &tree] {
             tools.append(b);
         }
         tools.append(&view);
@@ -172,6 +191,8 @@ impl Header {
             boot,
             edit,
             export,
+            volume_format,
+            volume_formats,
             extract,
             check,
             journal,
@@ -227,6 +248,7 @@ impl Header {
             edit_mode: ctl.edit_mode(),
             edit_busy: ctl.copy_job().is_some() || ctl.mode_working().is_some(),
             export_volume: !ctl.edit_mode() && ctl.copy_job().is_none(),
+            fs_type: v.fs_type.clone(),
             tool_free: pane.tool_working().is_none(),
             chd: ctl.is_chd_source(),
             deleted: ctl.show_deleted(),
@@ -285,6 +307,18 @@ impl Header {
         let hint = (!s.edit_mode).then_some("Enable editing to add or delete files on this image");
         self.edit.set_tooltip_text(hint);
         self.export.set_visible(s.export_volume && s.loaded);
+        self.volume_format.set_visible(s.export_volume && s.loaded);
+        if self.volume_formats.borrow().0 != s.fs_type {
+            // A new volume starts on its filesystem's own format; the same one keeps the pick.
+            let formats = volume_export_formats(&s.fs_type);
+            let first = default_volume_export(&s.fs_type);
+            let labels: Vec<&str> = formats.iter().map(|f| f.label()).collect();
+            self.volume_format
+                .set_model(Some(&gtk::StringList::new(&labels)));
+            let at = formats.iter().position(|f| *f == first).unwrap_or(0);
+            self.volume_format.set_selected(at as u32);
+            *self.volume_formats.borrow_mut() = (s.fs_type.clone(), formats);
+        }
         self.extract.set_visible(s.export_volume && s.loaded);
         self.tree.set_visible(s.loaded);
         self.check.set_visible(s.caps.check && s.tool_free);

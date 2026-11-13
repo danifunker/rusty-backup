@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{CommanderRecent, UserConfig};
 use rusty_backup::controller::commander::{
-    format_size, import_prompt, is_known_prodos_type, preview_bytes, ArchiveUse, BrowseSession,
-    BrowserPaneAction, CommanderAction, CommanderController, DiscSource, DisplayRow, ExportFormat,
-    ExtractOptions, FileEntry, ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle,
-    MacArchiveKind, ModeAction, PaneProfile, PaneServices, ProdosExportMode, ResourceForkMode,
-    RowKind, RowTone, Side, Snapshot, TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
+    default_volume_export, format_size, import_prompt, is_known_prodos_type, preview_bytes,
+    volume_export_formats, ArchiveUse, BrowseSession, BrowserPaneAction, CommanderAction,
+    CommanderController, DiscSource, DisplayRow, ExportFormat, ExtractOptions, FileEntry,
+    ForkFormat, ImportChoice, JobRegistry, LineEnding, ListingStyle, MacArchiveKind, ModeAction,
+    PaneProfile, PaneServices, ProdosExportMode, ResourceForkMode, RowKind, RowTone, Side,
+    Snapshot, TarChoice, TextShape, UnsavedChoice, MIN_NESTED_IMAGE_BYTES,
     PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
@@ -48,6 +49,8 @@ fn new_controller(optical: bool) -> CommanderController {
 pub struct BrowseView {
     /// The Optical tab's disc browser (read-only, its own header), not the Inspect browse view.
     optical: bool,
+    /// Export Volume's format, and the filesystem it was chosen on (a new volume starts afresh).
+    volume_export: Option<(String, ExportFormat)>,
     /// Effects from a host call made outside `show`, run on the next frame.
     pending_fx: Vec<Effect>,
     /// The modes' volume generation the panel last followed.
@@ -147,6 +150,7 @@ impl Default for BrowseView {
     fn default() -> Self {
         Self {
             optical: false,
+            volume_export: None,
             pending_fx: Vec::new(),
             generation_seen: 0,
             ctl: new_controller(false),
@@ -585,15 +589,27 @@ impl BrowseView {
                 // fork only) so a case-insensitive host won't clobber files that
                 // differ only in case. Runs on a worker thread.
                 if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
-                    let btn = ui.button("Export to .tar.gz...");
+                    let fs = self.ctl.pane(Side::Left).volume().fs_type.clone();
+                    let mut format = match &self.volume_export {
+                        Some((f, pick)) if *f == fs => *pick,
+                        _ => default_volume_export(&fs),
+                    };
+                    let btn = ui.button("Export Volume...");
                     if btn.hovered() {
                         btn.clone().on_hover_text(
-                            "Archive the whole volume to .tar.gz / .tar.zst / .tar \
-                         (preserves case + symlinks; choose the extension in the save dialog)",
+                            "Archive the whole volume in the format beside this button",
                         );
                     }
+                    egui::ComboBox::from_id_salt("browse_volume_export_format")
+                        .selected_text(format.label())
+                        .show_ui(ui, |ui| {
+                            for f in volume_export_formats(&fs) {
+                                ui.selectable_value(&mut format, f, f.label());
+                            }
+                        });
+                    self.volume_export = Some((fs, format));
                     if btn.clicked() {
-                        self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
+                        self.export_entry(ui.ctx(), &FileEntry::root(), format);
                     }
                 }
 

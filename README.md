@@ -411,7 +411,10 @@ The app has seven tabs:
     whole selection into a single archive — Mac Archive (`.mar`), StuffIt
     (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
     Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
-    run the same `export_selection` engine.
+    run the same `export_selection` engine. **Export Volume** archives the
+    whole volume the same way, in the format picked beside it: tar.gz for a
+    Unix filesystem (it keeps permissions and symlinks), Mac Archive for HFS
+    and MFS, Zip for the rest; Zip and every tar flavour are always offered.
     The browse view is the same file browser as Commander's panes: its
     **View** menu switches between one expandable tree (the default), a flat
     folder list and a folder tree beside the list, archives and disk images

@@ -265,7 +265,17 @@ pub fn default_export_format(fs_type: &str) -> ExportFormat {
     if t == "mfs" || t.starts_with("hfs") {
         return ExportFormat::MacArchive;
     }
-    if t.starts_with("fat") || t.starts_with("vfat") || has(&["exfat", "ntfs", "hpfs", "msdos"]) {
+    let pc = [
+        "exfat",
+        "ntfs",
+        "hpfs",
+        "msdos",
+        "iso 9660",
+        "udf",
+        "high sierra",
+        "joliet",
+    ];
+    if t.starts_with("fat") || t.starts_with("vfat") || has(&pc) {
         return ExportFormat::Zip;
     }
     let unix = [
@@ -277,6 +287,25 @@ pub fn default_export_format(fs_type: &str) -> ExportFormat {
         return ExportFormat::TarGz;
     }
     ExportFormat::LooseFiles
+}
+
+/// The single-file formats a whole volume exports to: zip and tar, plus Mac archives on a Mac volume.
+pub fn volume_export_formats(fs_type: &str) -> Vec<ExportFormat> {
+    use ExportFormat as F;
+    let mut v = vec![F::Zip, F::TarGz, F::TarZstd, F::Tar];
+    if default_export_format(fs_type) == F::MacArchive {
+        v.extend([F::MacArchive, F::StuffIt, F::StuffItHqx]);
+    }
+    v
+}
+
+/// Where a volume's export starts: its filesystem's own archive format, else zip.
+pub fn default_volume_export(fs_type: &str) -> ExportFormat {
+    let f = default_export_format(fs_type);
+    match volume_export_formats(fs_type).contains(&f) {
+        true => f,
+        false => ExportFormat::Zip,
+    }
 }
 
 /// The "Export as" menu for a view without an always-visible format chooser.

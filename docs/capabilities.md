@@ -26,6 +26,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `backup.source-image` | yes | yes | yes | yes | `flow.backup.image-vhd`, `flow.backup.image-zstd` |
 | `browse.edit` | - | yes | yes | yes | `flow.browse.inspect-edit-text`, `flow.browse.inspect-new-folder` |
 | `browse.edit-text` | - | yes | yes | yes | `flow.browse.inspect-edit-text` |
+| `browse.export-volume` | - | - | - | yes | `flow.browse.export-volume-zip` |
 | `browse.extract` | yes | yes | yes | yes | `flow.browse.inspect-extract-all`, `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `browse.new-folder` | - | yes | yes | yes | `flow.browse.inspect-new-folder` |
 | `build.cd-efs` | yes | yes | yes | yes | `flow.build.efs-cd` |

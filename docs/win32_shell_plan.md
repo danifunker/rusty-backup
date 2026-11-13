@@ -146,7 +146,7 @@ in check-group mode with the bundled icons); the screens and slices below are un
    Disk, and Physical Disk Export (slice 7a). Left: the remote listing (7b). The facts, the Check report, the export notes and the editor bars'
    segments moved into the controller on the way.
    Slice 2 (browsing) first pass (2026-11-09): Inspect's Browse opens `browse.rs` in the
-   Inspect page's place: the volume line, Extract All, Export to .tar.gz, Close, the job line
+   Inspect page's place: the volume line, Extract All, Export Volume with its format list, Close, the job line
    with Cancel, notices, the folder tree, the listing (a virtual list; the combined tree shows
    folders inline, Right and Left expand and collapse through the key map), the side panel with
    its fork mode, Extract, Export and Open as Disk Image over a text or hex preview, and the

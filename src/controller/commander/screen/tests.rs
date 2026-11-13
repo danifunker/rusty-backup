@@ -707,10 +707,26 @@ fn the_export_default_follows_the_filesystem_family() {
         ("UFS", F::TarGz),
         ("Alto BFS", F::LooseFiles),
         ("ProDOS", F::LooseFiles),
+        ("ISO 9660", F::Zip),
+        ("UDF", F::Zip),
     ];
     for (fs, want) in cases {
         assert_eq!(default_export_format(fs), want, "{fs}");
     }
+}
+
+#[test]
+fn a_volume_exports_to_one_archive_starting_from_its_filesystems_format() {
+    use ExportFormat as F;
+    assert_eq!(default_volume_export("ext4"), F::TarGz);
+    assert_eq!(default_volume_export("ISO 9660"), F::Zip);
+    assert_eq!(default_volume_export("ProDOS"), F::Zip);
+    assert_eq!(default_volume_export("HFS+"), F::MacArchive);
+    assert!(volume_export_formats("FAT16")
+        .iter()
+        .all(|f| f.is_single_file()));
+    assert!(!volume_export_formats("FAT16").contains(&F::StuffIt));
+    assert!(volume_export_formats("HFS").contains(&F::StuffIt));
 }
 
 #[test]
