@@ -39,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
     IsDialogMessageW, IsWindow, PostMessageW, RegisterClassW, SendMessageW, SetWindowPos,
     TranslateMessage, BN_CLICKED, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, ES_PASSWORD, HMENU,
-    IDCANCEL, IDOK, MSG, SS_CENTER, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    IDCANCEL, IDOK, MSG, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WNDCLASSW, WS_CAPTION, WS_EX_CLIENTEDGE,
     WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
 };
@@ -594,7 +594,7 @@ impl Prompt {
                 .then(|| ui::icon_font(layout::scale(32, dpi)))
                 .flatten();
             let icon = icon_font.map(|font| {
-                let style = WINDOW_STYLE(SS_CENTER.0);
+                let style = WINDOW_STYLE(0x1) // SS_CENTER;
                 let h = ui::child(
                     window,
                     w!("STATIC"),
