@@ -464,6 +464,14 @@ impl ResizeImageController {
         }
     }
 
+    /// "2: Data", as a bar segment names a partition.
+    fn short_title(&self, index: usize) -> String {
+        match self.source.as_ref().and_then(|s| s.places.get(&index)) {
+            Some(p) => format!("{}: {}", p.number, p.label),
+            None => format!("{}", index + 1),
+        }
+    }
+
     /// Each row's new size from its mode and field; a Fill row is left at its size here.
     fn typed_sizes(&self) -> Result<Vec<(usize, u64)>, String> {
         let mut out = Vec::new();
@@ -602,7 +610,7 @@ impl ResizeImageController {
     /// The disk before and after, in each partition's layout colour, then free space.
     pub fn bars(&self) -> (Vec<LayoutSegment>, Vec<LayoutSegment>) {
         let seg = |r: &PartRow, size| LayoutSegment {
-            label: self.title(r.index),
+            label: self.short_title(r.index),
             fs: String::new(),
             size_bytes: size,
             kind: match r.color_index {

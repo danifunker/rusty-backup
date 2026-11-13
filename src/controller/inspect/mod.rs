@@ -101,6 +101,7 @@ pub mod ids {
     pub const CHECK_DEBUG: &str = "inspect.check.debug";
     pub const MAKE_BOOTABLE: &str = "inspect.make_bootable";
     pub const RESIZE: &str = "inspect.resize";
+    pub const RESIZE_IMAGE: &str = "inspect.resize_image";
     pub const CHD_INFO: &str = "inspect.chd_info";
     pub const CLOSE: &str = "inspect.close";
     pub const SOURCE: &str = "inspect.source";

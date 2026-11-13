@@ -49,6 +49,7 @@ mod popup;
 mod remote_pick;
 mod report;
 mod resize;
+mod resize_image;
 mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;

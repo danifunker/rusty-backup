@@ -207,6 +207,14 @@ impl InspectController {
         self.is_image_file() && !self.export_running() && self.tools.expand.is_none()
     }
 
+    /// Resize Image applies: a plain image file with a partition table, read as it is on disk.
+    pub fn can_resize_image(&self) -> bool {
+        self.can_expand_image()
+            && self.found.chd_path.is_none()
+            && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
+            && !matches!(self.found.table, None | Some(PartitionTable::None { .. }))
+    }
+
     pub fn expanding(&self) -> bool {
         self.tools.expand.is_some()
     }

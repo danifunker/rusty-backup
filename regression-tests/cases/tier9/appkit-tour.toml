@@ -359,3 +359,67 @@ ui = [
   { wait = "Playing track 2" },
   { shot = "optical-player" },
 ]
+
+[[case]]
+id = "tour.appkit.resize-image"
+description = "The Resize Image wizard on a two-partition FAT disk, page by page, then on the Mac II disk past HFS's block limit"
+level = "smoke"
+area = ["inspect"]
+shells = ["appkit"]
+capabilities = []
+fixture = "fs.hfs.populated-macii.hd"
+timeout_ms = 300000
+
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "16M"]
+expect_exit = 0
+
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b",
+        "--fill", "1={scratch}/v.img", "--fill", "2={scratch}/v.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/disk.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Re-inspect" },
+  { activate = "inspect.resize_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "96M" },
+  { wait = "Grows by 32.0 MiB" },
+  { shot = "resize-image-size" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { shot = "resize-image-check" },
+  { activate = "resize_image.next" },
+  { wait = "Step 3 of 6" },
+  { focus = "resize_image.row_size.1" },
+  { fill = "40" },
+  { wait = "Free space left at the end of the disk: 39.0 MiB" },
+  { shot = "resize-image-partitions" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { shot = "resize-image-review" },
+  { activate = "resize_image.next" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+  { shot = "resize-image-done" },
+  { activate = "resize_image.cancel" },
+  { pick = "{fixture}" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Partition Table: APM" },
+  { activate = "inspect.resize_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "40M" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { focus = "resize_image.row_mode.0" },
+  { choose = "Fill free space" },
+  { wait = "rebuilt with 4 KiB blocks" },
+  { shot = "resize-image-hfs-rebuild" },
+]

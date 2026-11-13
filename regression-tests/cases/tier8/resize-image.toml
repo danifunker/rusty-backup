@@ -1,0 +1,74 @@
+# Tier 8: Inspect's Resize Image wizard, end to end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.inspect.resize-image"
+description = "Resize Image: a bigger disk, one partition grown with its filesystem, free space left, checked before and after."
+
+[[case]]
+id = "flow.inspect.resize-image.grow-copy"
+description = "Grow a 64 MiB two-partition FAT disk to 96 MiB in the wizard, partition 2 to 40 MiB leaving 39 MiB free, as a copy; prove it with rb-cli"
+level = "smoke"
+area = ["inspect"]
+# The ids and labels are shared; the other shells join once their wizard is built.
+shells = ["appkit"]
+capabilities = ["inspect.resize-image"]
+timeout_ms = 300000
+
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "16M"]
+expect_exit = 0
+
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b",
+        "--fill", "1={scratch}/v.img", "--fill", "2={scratch}/v.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/disk.img@2", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/disk.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Re-inspect" },
+  { activate = "inspect.resize_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "96M" },
+  { wait = "Grows by 32.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { wait = "Step 3 of 6" },
+  { focus = "resize_image.row_size.1" },
+  { fill = "40" },
+  { wait = "Free space left at the end of the disk: 39.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { wait = "Copy the image to" },
+  { activate = "resize_image.next" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/disk-resized.img"]
+expect_exit = 0
+stdout_contains = ["40.0 MiB"]
+
+[[case.step]]
+args = ["ls", "{scratch}/disk-resized.img@2"]
+expect_exit = 0
+stdout_contains = ["HELLO.TXT"]
+
+[[case.step]]
+args = ["fsck", "{scratch}/disk-resized.img@2"]
+expect_exit = 0
+
+[[case.step]]
+args = ["inspect", "{scratch}/disk.img"]
+expect_exit = 0
+stdout_not_contains = ["40.0 MiB"]
