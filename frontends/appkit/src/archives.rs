@@ -16,7 +16,7 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSProgressIndicator, NSView};
 use rusty_backup::controller::app::{busy_elsewhere_notice, Notify, RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
-    hints, human_size, ids, mount_label, ArchiveEntryRow, ArchivesAction, ArchivesController,
+    hints, human_size, ids, mount_label, row_label, ArchiveEntryRow, ArchivesAction, ArchivesController,
     ExtractOutcome, ForkFormat, HostRequest,
 };
 use rusty_backup::controller::commander::Tone;
@@ -38,13 +38,13 @@ const COLUMNS: [(&str, f64, bool); 4] = [
 fn cells(r: &ArchiveEntryRow) -> Vec<String> {
     match r.is_dir {
         true => vec![
-            format!("[ {} ]", r.path),
+            row_label(r),
             String::new(),
             String::new(),
             String::new(),
         ],
         false => vec![
-            r.path.clone(),
+            row_label(r),
             format!("{} / {}", r.type_code, r.creator),
             human_size(r.size),
             r.method.to_string(),
@@ -354,7 +354,7 @@ impl ArchivesScreen {
         );
 
         let loaded = ctrl.is_loaded();
-        f.set_text(K::Count, &format!("{} files in archive", ctrl.file_count()));
+        f.set_text(K::Count, &ctrl.summary());
         for k in [
             K::Count,
             K::List,

@@ -24,7 +24,7 @@ ui = [
   { tab = "Archives" },
   { pick = "{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT" },
   { activate = "archives.browse" },
-  { wait = "files in archive", timeout_ms = 60000 },
+  { wait = "no folders", timeout_ms = 60000 },
   { focus = "archives.format" },
   { choose = "Raw" },
   { pick = "{scratch}/ui" },

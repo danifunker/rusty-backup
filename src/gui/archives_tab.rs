@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
-    hints, human_size, mount_hint, mount_label, ArchivesAction, ArchivesController, ForkFormat,
-    HostRequest,
+    hints, human_size, mount_hint, mount_label, row_label, ArchivesAction, ArchivesController,
+    ForkFormat, HostRequest,
 };
 use rusty_backup::controller::log::LogStore;
 use rusty_backup::controller::{Controller as _, Effect};
@@ -161,7 +161,7 @@ impl ArchivesTab {
         // Entry list.
         if self.ctl.is_loaded() {
             ui.separator();
-            ui.label(format!("{} files in archive", self.ctl.file_count()));
+            ui.label(self.ctl.summary());
 
             egui::ScrollArea::vertical()
                 .max_height(320.0)
@@ -183,7 +183,7 @@ impl ArchivesTab {
                                 if e.is_dir {
                                     // Folder markers are always extracted, so no checkbox.
                                     ui.label("");
-                                    ui.label(format!("[ {} ]", e.path));
+                                    ui.label(row_label(e));
                                     ui.label("");
                                     ui.label("");
                                     ui.label("");
@@ -196,7 +196,7 @@ impl ArchivesTab {
                                 if new_checked != checked {
                                     actions.push(ArchivesAction::SetSelected(i, new_checked));
                                 }
-                                ui.label(e.path.as_str());
+                                ui.label(row_label(e));
                                 ui.label(format!("{} / {}", e.type_code, e.creator));
                                 ui.label(human_size(e.size));
                                 ui.label(e.method);

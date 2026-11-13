@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use rusty_backup::controller::archives::{
-    human_size, ids, ArchiveEntryRow, ArchivesAction, ArchivesController,
+    human_size, ids, row_label, ArchiveEntryRow, ArchivesAction, ArchivesController,
 };
 
 use super::ActionFn;
@@ -116,10 +116,7 @@ impl EntryList {
         view.set_widget_name(ids::ENTRIES);
         view.set_show_row_separators(true);
         view.append_column(&tick_column(send, ticked, guarded));
-        view.append_column(&text_column("Name", 0.0, true, |r| match r.is_dir {
-            true => format!("[ {} ]", r.path),
-            false => r.path.clone(),
-        }));
+        view.append_column(&text_column("Name", 0.0, true, row_label));
         view.append_column(&text_column("Type/Creator", 0.0, false, |r| {
             match r.is_dir {
                 true => String::new(),
