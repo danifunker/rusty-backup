@@ -638,11 +638,6 @@ fn build_field(page: HWND, t: &FormatTarget, opt: FsOption, id: &str) -> Option<
             |t: &FormatTarget| t.opts.big_endian,
             OptionEdit::BigEndian,
         ),
-        FsOption::Fat32 => check(
-            "FAT32 whatever the size",
-            |t: &FormatTarget| t.opts.fat32,
-            OptionEdit::Fat32,
-        ),
         FsOption::CaseSensitive => check(
             "Case-sensitive (HFSX)",
             |t: &FormatTarget| t.opts.case_sensitive,

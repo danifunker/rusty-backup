@@ -151,6 +151,7 @@ pub mod ids {
     pub const DONOR: &str = "build_disk.donor";
     pub const DONOR_BLANK: &str = "build_disk.donor_blank";
     pub const ALIGN: &str = "build_disk.align";
+    pub const ALIGN_PICK: &str = "build_disk.align_pick";
     pub const HEADS: &str = "build_disk.heads";
     pub const SECTORS: &str = "build_disk.sectors";
     pub const PRESET: &str = "build_disk.preset";
@@ -269,8 +270,9 @@ pub mod hints {
     pub const DONOR: &str = "Take the table, its special partitions and their contents from \
          another disk image, at this disk's size. A label (SGI, Sun, NeXT, RDB, ...) keeps its \
          volume header or boot blocks verbatim.";
-    pub const ALIGN: &str = "Partition starts are rounded up to this. Blank uses the table \
-         default. Accepts 1M / 63s (sectors).";
+    pub const ALIGN: &str = "Where each partition may start. Modern systems want 1 MiB; DOS and \
+         Windows 9x expect partitions on a track (63 sectors).";
+    pub const ALIGN_CUSTOM: &str = "A size such as 1M or 4K, or a sector count such as 63s.";
     pub const SYSTEM_DISK: &str = "A Human68k system floppy cloned into partition 1";
     pub const NO_SYSTEM_DISK: &str = "(none: seed files)";
     pub const ROW_SIZE: &str = "20M / 1G / bytes, or `rest` for whatever is left";
@@ -284,7 +286,6 @@ pub mod hints {
          strap loads it from the RDB";
     pub const MAC_DRIVER: &str = "A Mac mounts an APM disk only through a driver on the disk. \
          Bundled uses a donor's own driver when it has one";
-    pub const FAT32: &str = "An EFI System Partition is FAT32";
 }
 
 /// The wizard's steps, in the order they are walked.
@@ -1542,10 +1543,13 @@ impl BuildDiskController {
             for (i, r) in self.builder.rows.iter_mut().enumerate() {
                 if let (true, Some(f)) = (auto[i], r.format.as_ref()) {
                     let size = sizes.get(i).copied().unwrap_or(0);
-                    r.type_text = crate::model::disk_builder::suggested_type(kind, f.kind, size)
-                        .unwrap_or_else(|| {
-                            crate::partition::provision::default_type(kind).to_string()
-                        });
+                    r.type_text = crate::model::disk_builder::suggested_type(
+                        kind,
+                        f.kind,
+                        size,
+                        f.opts.fat32,
+                    )
+                    .unwrap_or_else(|| crate::partition::provision::default_type(kind).to_string());
                 }
             }
             return Vec::new();
@@ -1616,13 +1620,16 @@ impl BuildDiskController {
         let Some(r) = self.builder.rows.get(row) else {
             return false;
         };
-        let fs = r.format.as_ref().map(|f| f.kind);
         let kind = self.builder.kind;
-        fs.and_then(|fs| crate::model::disk_builder::suggested_type(kind, fs, size))
+        r.format
+            .as_ref()
+            .and_then(|f| {
+                crate::model::disk_builder::suggested_type(kind, f.kind, size, f.opts.fat32)
+            })
             .is_some_and(|t| t == r.type_text.trim())
     }
 
-    fn set_row_fs(&mut self, row: usize, fs: Option<FsKind>) {
+    fn set_row_fs(&mut self, row: usize, fs: Option<FsChoice>) {
         let kind = self.builder.kind;
         let size = self.planned_sizes().get(row).copied().unwrap_or(0);
         let suggested = self.row_type_is_suggested(row);
@@ -1632,20 +1639,24 @@ impl BuildDiskController {
         r.copy_from = None;
         match fs {
             None => r.format = None,
-            Some(fs) => {
+            Some(choice) => {
+                let fs = choice.kind;
                 r.source = None;
                 r.source_size = 0;
                 let mut f = RowFormat::new(fs);
                 if let Some(label) = r.format.as_ref().and_then(|old| typed_label(old, fs)) {
                     f.opts.label = label;
                 }
+                choice.apply_to(&mut f);
                 // A default, donor or proposed type follows the filesystem; one the user typed stays.
                 if r.type_text.trim().is_empty()
                     || r.type_text.trim() == crate::partition::provision::default_type(kind)
                     || r.donor_part.is_some()
                     || suggested
                 {
-                    if let Some(t) = crate::model::disk_builder::suggested_type(kind, fs, size) {
+                    if let Some(t) =
+                        crate::model::disk_builder::suggested_type(kind, fs, size, f.opts.fat32)
+                    {
                         r.type_text = t;
                     }
                 }
@@ -1920,15 +1931,7 @@ impl Controller for BuildDiskController {
             BuildDiskAction::SetSize(t) => self.size_text = t,
             BuildDiskAction::Table(a) => return self.table_edit(a),
             BuildDiskAction::SetRowFs { row, fs } => {
-                self.set_row_fs(row, fs.map(|c| c.kind));
-                let format = self
-                    .builder
-                    .rows
-                    .get_mut(row)
-                    .and_then(|r| r.format.as_mut());
-                if let (Some(f), Some(c)) = (format, fs) {
-                    c.apply_to(f);
-                }
+                self.set_row_fs(row, fs);
             }
             BuildDiskAction::SetRowOptions { row, opts } => {
                 if let Some(f) = self

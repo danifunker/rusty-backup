@@ -4,7 +4,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
 use rusty_backup::controller::build_disk::{
     format_size, hints, ids, BuildDiskAction, BuildDiskController, CdLayout, CdOption, CdOptionRow,
     CdSidecars, CdView, DiskKind, FsChoice, PresetKind, PresetView, TableKind, CD_AUTO_SIZE,
@@ -16,7 +15,7 @@ use crate::form::{
     button, combo, group, line, path_row, set_combo, set_entry, set_labels, set_line, set_spin,
     set_subtitle, set_switch, spin, switch,
 };
-use crate::widgets::{plain, set_text};
+use crate::widgets::set_text;
 
 const CONTROLLERS: [&str; 2] = ["SASI (256-byte sectors)", "SCSI (1024-byte sectors)"];
 
@@ -359,6 +358,9 @@ pub struct DiskStep {
     device_size: adw::ActionRow,
     size_error: gtk::Label,
     layout_group: adw::PreferencesGroup,
+    align_pick: adw::ComboRow,
+    /// Set while `show` fills the alignment list, so its own changes send nothing.
+    align_sync: Rc<Cell<bool>>,
     align: adw::EntryRow,
     heads: adw::SpinRow,
     sectors: adw::SpinRow,
@@ -437,9 +439,19 @@ impl DiskStep {
         size_group.add(&size_error);
 
         let layout_group = group("Layout");
-        let align = adw::EntryRow::builder().title("Alignment").build();
+        let align_pick = combo("Alignment", ids::ALIGN_PICK, &[]);
+        align_pick.set_tooltip_text(Some(hints::ALIGN));
+        let align_sync: Rc<Cell<bool>> = Rc::default();
+        let (s, held) = (send.clone(), align_sync.clone());
+        align_pick.connect_selected_notify(move |r| {
+            if !held.get() {
+                let at = r.selected() as usize;
+                s(BuildDiskAction::Table(BuildAction::PickAlign(at)));
+            }
+        });
+        let align = adw::EntryRow::builder().title("Custom alignment").build();
         align.set_widget_name(ids::ALIGN);
-        align.set_tooltip_text(Some(hints::ALIGN));
+        align.set_tooltip_text(Some(hints::ALIGN_CUSTOM));
         let s = send.clone();
         align.connect_changed(move |e| {
             s(BuildDiskAction::Table(BuildAction::SetAlign(
@@ -460,6 +472,7 @@ impl DiskStep {
                 r.value() as u16,
             )));
         });
+        layout_group.add(&align_pick);
         layout_group.add(&align);
         layout_group.add(&heads);
         layout_group.add(&sectors);
@@ -491,6 +504,8 @@ impl DiskStep {
             device_size,
             size_error,
             layout_group,
+            align_pick,
+            align_sync,
             align,
             heads,
             sectors,
@@ -517,11 +532,11 @@ impl DiskStep {
         set_combo(&self.table, at.unwrap_or(0) as u32);
         self.table.set_sensitive(!v.fixed);
 
-        let title = format!("Alignment (blank: {})", v.align_hint);
-        let title = glib::markup_escape_text(&plain(&title));
-        if self.align.title() != title.as_str() {
-            self.align.set_title(&title);
-        }
+        self.align_sync.set(true);
+        set_labels(&self.align_pick, &v.align_choices);
+        set_combo(&self.align_pick, v.align_pick as u32);
+        self.align_sync.set(false);
+        self.align.set_visible(v.align_custom);
         set_entry(&self.align, &v.align_text);
         self.layout_group.set_sensitive(!v.fixed);
         self.heads.set_visible(v.geometry.is_some());

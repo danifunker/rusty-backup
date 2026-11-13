@@ -62,6 +62,7 @@ pub enum K {
     Size,
     SizeHint,
     AlignCaption,
+    AlignPick,
     Align,
     HeadsCaption,
     Heads,
@@ -213,7 +214,10 @@ impl BuildScreen {
             f.field(K::Size, ids::SIZE, "Size", false);
             f.label(K::SizeHint, "");
             f.label(K::AlignCaption, "Alignment:");
+            f.popup(K::AlignPick, &[], ids::ALIGN_PICK);
             f.field(K::Align, ids::ALIGN, "Alignment", false);
+            f.v(K::AlignPick).setToolTip(Some(&crate::ui::ns(hints::ALIGN)));
+            f.v(K::Align).setToolTip(Some(&crate::ui::ns(hints::ALIGN_CUSTOM)));
             f.label(K::HeadsCaption, "Heads:");
             f.field(K::Heads, ids::HEADS, "Heads", false);
             f.label(K::SectorsCaption, "Sectors/track:");
@@ -465,7 +469,11 @@ impl BuildScreen {
         *self.table_kinds.borrow_mut() = view.kinds.to_vec();
         f.enable(K::Table, !view.fixed);
         f.show(K::AlignCaption, part);
-        f.show(K::Align, part);
+        f.show(K::AlignPick, part);
+        f.set_items(K::AlignPick, &view.align_choices);
+        f.select(K::AlignPick, view.align_pick);
+        f.enable(K::AlignPick, !view.fixed);
+        f.show(K::Align, part && view.align_custom);
         f.set_text(K::Align, &view.align_text);
         let geo = part && view.geometry.is_some();
         for k in [K::HeadsCaption, K::Heads, K::SectorsCaption, K::Sectors] {
@@ -715,8 +723,11 @@ impl BuildScreen {
                 stretch(K::SizeHint),
             ]));
         }
-        if shown(K::Align) {
-            let mut row = vec![fixed(K::AlignCaption, cap), fixed(K::Align, 120)];
+        if shown(K::AlignPick) {
+            let mut row = vec![fixed(K::AlignCaption, cap), fixed(K::AlignPick, 330)];
+            if shown(K::Align) {
+                row.push(fixed(K::Align, 120));
+            }
             if shown(K::Heads) {
                 row.extend([
                     fixed(K::HeadsCaption, 60),
@@ -847,6 +858,7 @@ impl BuildScreen {
             }
             K::Size => BuildDiskAction::SetSize(text()),
             K::Align => return table(BuildAction::SetAlign(text())),
+            K::AlignPick => return table(BuildAction::PickAlign(f.picked(k)?)),
             K::Heads => return table(BuildAction::SetHeads(number()?)),
             K::Sectors => return table(BuildAction::SetSectorsPerTrack(number()?)),
             K::X68kParts => {
