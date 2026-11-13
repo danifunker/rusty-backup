@@ -1006,7 +1006,10 @@ impl BuildDiskController {
         match self.kind {
             DiskKind::Volume => vec![target(
                 None,
-                format!("Volume ({})", self.volume.kind.display_name()),
+                format!(
+                    "Volume ({})",
+                    FsChoice::of(self.volume.kind, &self.volume.opts).label()
+                ),
                 &self.volume,
             )],
             DiskKind::Preset | DiskKind::Cd => Vec::new(),
@@ -1019,7 +1022,11 @@ impl BuildDiskController {
                     r.format.as_ref().map(|f| {
                         target(
                             Some(i),
-                            format!("Partition {} ({})", i + 1, f.kind.display_name()),
+                            format!(
+                                "Partition {} ({})",
+                                i + 1,
+                                FsChoice::of(f.kind, &f.opts).label()
+                            ),
                             f,
                         )
                     })

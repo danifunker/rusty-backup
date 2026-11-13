@@ -26,8 +26,8 @@ use rusty_backup::controller::commander::{
     editor_window, extract_fork_modes, journal_window, tree_window, ArchiveUse,
     BrowserPaneAction as P, CommanderAction as A, CommanderController, EditBar, ExportBar,
     ExportFormat, ExtractOptions, HeaderTools, JobRegistry, MarkBar, ModeAction, PaneProfile,
-    PaneServices, PaneWindow, PanelActions, ProdosExportMode, ResourceForkMode, Side, SidePanel,
-    Tone, TreeText, VolumeLine, WindowKind, FOLLOW_DELAY,
+    PaneServices, PaneWindow, PanelActions, PanelPreview, ProdosExportMode, ResourceForkMode, Side,
+    SidePanel, Tone, TreeText, VolumeLine, WindowKind, FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
@@ -839,6 +839,22 @@ impl BrowseView {
         }
     }
 
+    /// Text wraps at the pane's width; a hex dump keeps its columns and scrolls sideways.
+    fn wrap_preview(&self, wrap: bool) {
+        let Some(container) = (unsafe { self.preview.textContainer() }) else {
+            return;
+        };
+        let wide = NSSize::new(1.0e7, 1.0e7);
+        self.preview.setHorizontallyResizable(!wrap);
+        self.preview.setMaxSize(wide);
+        container.setWidthTracksTextView(wrap);
+        let width = match wrap {
+            true => self.preview.frame().size.width,
+            false => wide.width,
+        };
+        container.setContainerSize(NSSize::new(width, wide.height));
+    }
+
     /// The export bar: its list refilled only when the choices change, its button's target.
     fn show_export(&self, bar: &ExportBar) {
         let p = self.popup(C::VolumeFormat);
@@ -1176,6 +1192,8 @@ impl BrowseView {
             ui::set_text(self.text(C::Facts), &p.facts.join("\n"));
             ui::set_text(self.text(C::Note), p.note.as_deref().unwrap_or(""));
             ui::set_text(self.text(C::Budget), &p.budget.join("\n"));
+            let hex = matches!(p.preview, PanelPreview::Hex(_));
+            self.wrap_preview(!hex);
             self.preview.setString(&ns(&ui::plain(p.preview.text())));
             self.preview.setTextColor(Some(&NSColor::textColor()));
         }
