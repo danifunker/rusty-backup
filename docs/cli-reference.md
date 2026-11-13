@@ -731,6 +731,28 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 - `--output` — Destination path for the new image. Created (or truncated)
 - `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 4063 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
 
+### `export`
+
+Archive a whole volume to one file: zip, tar (plain / gzip / zstd), or on a Mac volume Mac Archive / StuffIt. The format is `--format`, OUT's extension, or the filesystem's own
+
+```
+Usage: export [OPTIONS] <IMAGE> <OUT>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<OUT>` — Output archive path
+
+**Options**
+
+- `--format` — The archive format: zip, tar, tar.gz (tgz), tar.zst, and on a Mac volume mar, sit or sit.hqx. Without it, OUT's extension decides, then the filesystem
+- `--force` — Overwrite OUT if it already exists
+- `--password` — Password for encrypted containers or an encrypted filesystem (APFS FileVault)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `floppy`
 
 Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88

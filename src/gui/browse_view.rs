@@ -16,6 +16,7 @@ use rusty_backup::controller::commander::{
     PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
+use rusty_backup::controller::keys::Command;
 use rusty_backup::controller::{Controller as _, Effect};
 
 use super::commander::pane::PaneView;
@@ -584,10 +585,7 @@ impl BrowseView {
                     }
                 }
 
-                // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
-                // .tar). Preserves case-sensitive names + real symlinks (data
-                // fork only) so a case-insensitive host won't clobber files that
-                // differ only in case. Runs on a worker thread.
+                // The whole volume to one archive, in the format the list beside the button shows.
                 if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
                     let fs = self.ctl.pane(Side::Left).volume().fs_type.clone();
                     let mut format = match &self.volume_export {
@@ -1023,11 +1021,28 @@ impl BrowseView {
         }
         ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
         for (key, mods) in keys {
+            if self.ctl.command_for(key, mods) == Some(Command::ExportVolume) {
+                self.export_volume_key(ctx);
+                continue;
+            }
             self.dispatch(ctx, CommanderAction::Key(key, mods));
         }
         self.cursor_armed = true;
         self.scroll_cursor = true;
         ctx.request_repaint();
+    }
+
+    /// The Export Volume key: the button's click, in the format its list shows.
+    fn export_volume_key(&mut self, ctx: &egui::Context) {
+        if self.ctl.edit_mode() || self.ctl.copy_job().is_some() {
+            return;
+        }
+        let fs = self.ctl.pane(Side::Left).volume().fs_type.clone();
+        let format = match &self.volume_export {
+            Some((f, pick)) if *f == fs => *pick,
+            _ => default_volume_export(&fs),
+        };
+        self.export_entry(ctx, &FileEntry::root(), format);
     }
 
     /// Point the content panel at the cursor row once it moved (a click or a key).

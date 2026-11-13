@@ -308,6 +308,40 @@ pub fn default_volume_export(fs_type: &str) -> ExportFormat {
     }
 }
 
+/// A volume-export format by its short name (`zip`, `tar`, `tar.gz` / `tgz`, `tar.zst`, `mar`,
+/// `sit`, `sit.hqx`), as `rb-cli export --format` takes it.
+pub fn export_format_named(name: &str) -> Option<ExportFormat> {
+    use ExportFormat as F;
+    Some(
+        match name
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "zip" => F::Zip,
+            "tar" => F::Tar,
+            "tar.gz" | "tgz" | "targz" => F::TarGz,
+            "tar.zst" | "tzst" | "tarzst" => F::TarZstd,
+            "mar" => F::MacArchive,
+            "sit" => F::StuffIt,
+            "sit.hqx" | "hqx" => F::StuffItHqx,
+            _ => return None,
+        },
+    )
+}
+
+/// The volume-export format an output file name asks for, by its extension.
+pub fn export_format_of_path(path: &std::path::Path) -> Option<ExportFormat> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let ext = [
+        "tar.gz", "tar.zst", "sit.hqx", "tgz", "tzst", "tar", "zip", "mar", "sit",
+    ];
+    ext.iter()
+        .find(|e| name.ends_with(&format!(".{e}")))
+        .and_then(|e| export_format_named(e))
+}
+
 /// The "Export as" menu for a view without an always-visible format chooser.
 pub fn export_choices() -> Vec<ExportChoice> {
     use ResourceForkMode as M;
@@ -1363,6 +1397,7 @@ impl CommanderController {
             | Command::ViewMenu
             | Command::Transforms
             | Command::Extract
+            | Command::ExportVolume
             | Command::EditMode => None,
         };
         if let Some(action) = pane_action {
@@ -1400,7 +1435,8 @@ impl CommanderController {
             | Command::Delete
             | Command::Transforms
             | Command::Edit
-            | Command::Extract => {}
+            | Command::Extract
+            | Command::ExportVolume => {}
             Command::CursorUp
             | Command::CursorDown
             | Command::PageUp

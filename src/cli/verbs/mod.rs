@@ -24,6 +24,7 @@ pub mod cp;
 pub mod du;
 pub mod edit;
 pub mod expand;
+pub mod export;
 pub mod floppy;
 pub mod fsck;
 pub mod get;

@@ -571,6 +571,7 @@ impl BrowseView {
                     self.extract(path);
                 }
             }
+            Some(Command::ExportVolume) => self.header.export_volume(),
             Some(Command::PageUp | Command::PageDown) => {
                 self.apply(A::SetPageRows(Side::Left, self.pane.page_rows()));
                 self.apply(A::Key(key, mods));

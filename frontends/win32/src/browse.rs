@@ -553,9 +553,24 @@ impl BrowseView {
                     self.extract(path);
                 }
             }
+            Some(Command::ExportVolume) => self.export_volume(),
             _ => self.apply(A::Key(key, mods)),
         }
         true
+    }
+
+    /// Archive the whole volume in the format the list beside the button shows.
+    fn export_volume(&self) {
+        let format = self
+            .volume_format
+            .picked()
+            .and_then(|i| self.volume_formats.borrow().1.get(i).copied())
+            .unwrap_or(ExportFormat::Zip);
+        self.apply(A::ExportEntry {
+            from: Side::Left,
+            path: "/".to_string(),
+            format: Some(format),
+        });
     }
 
     fn read(&self) -> Shown {
@@ -1188,16 +1203,7 @@ impl Handler for BrowseView {
         } else if from == self.extract_all {
             self.extract("/".to_string());
         } else if from == self.export_volume {
-            let format = self
-                .volume_format
-                .picked()
-                .and_then(|i| self.volume_formats.borrow().1.get(i).copied())
-                .unwrap_or(ExportFormat::Zip);
-            self.apply(A::ExportEntry {
-                from: Side::Left,
-                path: "/".to_string(),
-                format: Some(format),
-            });
+            self.export_volume();
         } else if from == self.extract {
             if let Some(path) = self.cursor_path() {
                 self.extract(path);

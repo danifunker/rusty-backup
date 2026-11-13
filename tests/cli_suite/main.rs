@@ -27,6 +27,7 @@ mod cli_container_rw;
 mod cli_cp;
 mod cli_cpm_floppy;
 mod cli_dragon;
+mod cli_export;
 mod cli_hfs;
 mod cli_literal_paths;
 mod cli_macplus_appleii;

@@ -209,6 +209,11 @@ impl Header {
         &self.root
     }
 
+    /// The Export Volume key: what a click on the button does.
+    pub fn export_volume(&self) {
+        self.export.emit_clicked();
+    }
+
     pub fn read(ctl: &CommanderController, prefix: &str) -> HeaderShown {
         let pane = ctl.pane(Side::Left);
         let v = pane.volume();

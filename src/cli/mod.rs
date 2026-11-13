@@ -123,6 +123,10 @@ pub enum Command {
     /// files that differ only in case.
     Tar(verbs::tar::TarArgs),
 
+    /// Archive a whole volume to one file: zip, tar (plain / gzip / zstd), or on a Mac volume
+    /// Mac Archive / StuffIt. The format is `--format`, OUT's extension, or the filesystem's own.
+    Export(verbs::export::ExportArgs),
+
     /// Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a
     /// filesystem in an image (the inverse of `tar`). Recreates the tree,
     /// streams files in, and recreates symlinks where the target FS
@@ -498,6 +502,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Get(args) => verbs::get::run(args),
         Command::Edit(args) => verbs::edit::run(args),
         Command::Tar(args) => verbs::tar::run(args),
+        Command::Export(args) => verbs::export::run(args),
         Command::Untar(args) => verbs::untar::run(args),
         Command::Import(args) => verbs::import::run(args),
         Command::Cp(args) => verbs::cp::run(args),

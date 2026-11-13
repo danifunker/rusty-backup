@@ -730,6 +730,25 @@ fn a_volume_exports_to_one_archive_starting_from_its_filesystems_format() {
 }
 
 #[test]
+fn an_export_format_is_named_or_read_off_the_output_name() {
+    use std::path::Path;
+    use ExportFormat as F;
+    assert_eq!(export_format_named("TGZ"), Some(F::TarGz));
+    assert_eq!(export_format_named(".zip"), Some(F::Zip));
+    assert_eq!(export_format_named("rar"), None);
+    assert_eq!(
+        export_format_of_path(Path::new("a/b.TAR.ZST")),
+        Some(F::TarZstd)
+    );
+    assert_eq!(
+        export_format_of_path(Path::new("disc.sit.hqx")),
+        Some(F::StuffItHqx)
+    );
+    assert_eq!(export_format_of_path(Path::new("plain.tar")), Some(F::Tar));
+    assert_eq!(export_format_of_path(Path::new("noext")), None);
+}
+
+#[test]
 fn an_explicit_export_pick_survives_a_refresh_but_not_another_volume() {
     let dir = tempfile::tempdir().unwrap();
     let mut ctl = CommanderController::headless();
