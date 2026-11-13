@@ -28,6 +28,7 @@ pub struct RemoteShown {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum K {
+    Intro,
     Caption,
     Address,
     Connect,
@@ -79,6 +80,7 @@ impl RemoteWindow {
                     }
                 }),
             );
+            form.wrap(K::Intro, hints::REMOTE_DRIVE_INTRO);
             form.label(K::Caption, "Host:");
             form.field(K::Address, ids::REMOTE_ADDRESS, "Host", false);
             form.button(K::Connect, "Connect", ids::REMOTE_CONNECT);
@@ -156,6 +158,7 @@ impl RemoteWindow {
         let line = |k: K| Node::leaf(k, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * 2 + 4));
         let tree = Node::inset(
             Node::column(vec![
+                line(K::Intro),
                 Node::row(vec![
                     Node::leaf(K::Caption, Size::Fixed(50), row_h),
                     Node::field(K::Address),

@@ -227,12 +227,27 @@ fn force_appearance(ns_app: &NSApplication) {
     ns_app.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
 }
 
+/// The app's own icon, so a build run outside its bundle (the flows, the tour) shows it in
+/// alerts and the Dock instead of a folder.
+fn set_icon(app: &NSApplication) {
+    use objc2::AllocAnyThread;
+    let bytes = include_bytes!("../../../assets/icons/icon-256.png");
+    let data = objc2_foundation::NSData::with_bytes(bytes);
+    if let Some(image) =
+        objc2_app_kit::NSImage::initWithData(objc2_app_kit::NSImage::alloc(), &data)
+    {
+        // SAFETY: setting the shared application's icon on the main thread.
+        unsafe { app.setApplicationIconImage(Some(&image)) };
+    }
+}
+
 /// Run the application until it quits.
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("main runs on the main thread");
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     force_appearance(&ns_app);
+    set_icon(&ns_app);
     let delegate: Retained<Delegate> = {
         let this = mtm.alloc::<Delegate>().set_ivars(());
         // SAFETY: NSObject's plain init.

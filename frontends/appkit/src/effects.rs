@@ -22,6 +22,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSURL};
 use rusty_backup::controller::app::picker_start_folder;
+use rusty_backup::controller::remote_pick::asks_for_a_daemon;
 use rusty_backup::controller::{
     picks, ChoiceSpec, ConfirmSpec, Effect, PasswordSpec, PickSpec, TextSpec,
 };
@@ -374,6 +375,8 @@ struct Ask<'a> {
     initial: &'a str,
     ok: &'a str,
     secure: bool,
+    /// The address of a remote daemon: the alert shows the system's network icon.
+    network: bool,
     check: Check,
     first_error: Option<String>,
 }
@@ -385,10 +388,19 @@ fn prompt(mtm: MainThreadMarker, ask: Ask) -> Option<String> {
         initial,
         ok,
         secure,
+        network,
         check,
         first_error,
     } = ask;
     let a = alert(mtm, title, message);
+    if network {
+        // SAFETY: a constant image name AppKit exports.
+        let name = unsafe { objc2_app_kit::NSImageNameNetwork };
+        if let Some(icon) = objc2_app_kit::NSImage::imageNamed(name) {
+            // SAFETY: the alert keeps its own reference to the image.
+            unsafe { a.setIcon(Some(&icon)) };
+        }
+    }
     a.addButtonWithTitle(&ns(ok));
     a.addButtonWithTitle(&ns("Cancel"));
     let buttons = a.buttons();
@@ -475,6 +487,7 @@ fn ask_text(mtm: MainThreadMarker, spec: &TextSpec) -> Option<String> {
         initial: &spec.initial,
         ok: &spec.ok_label,
         secure: false,
+        network: asks_for_a_daemon(spec.purpose),
         check,
         first_error: spec.error.clone(),
     };
@@ -488,6 +501,7 @@ fn ask_password(mtm: MainThreadMarker, spec: &PasswordSpec) -> Option<String> {
         initial: "",
         ok: "OK",
         secure: true,
+        network: false,
         check: Rc::new(|_| Ok(())),
         first_error: None,
     };
