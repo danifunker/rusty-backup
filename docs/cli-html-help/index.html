@@ -70,6 +70,7 @@
 <li><a href="reformat.html"><code>reformat</code></a><span class="desc">Reformat a partition in place, leaving the partition table intact (HFS only today)</span></li>
 <li><a href="repack.html"><code>repack</code></a><span class="desc">Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place resizer can't (it keeps cluster byte-offsets)</span></li>
 <li><a href="resize.html"><code>resize</code></a><span class="desc">Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</span></li>
+<li><a href="resize-image.html"><code>resize-image</code></a><span class="desc">Give a disk image a new size and resize its partitions with their filesystems, checking the volumes before and after (the GUI's Resize Image). Writes a copy unless `--in-place`</span></li>
 <li><a href="restore.html"><code>restore</code></a><span class="desc">Restore a backup folder to a target image or device</span></li>
 <li><a href="rm.html"><code>rm</code></a><span class="desc">Delete a file or directory from a filesystem</span></li>
 <li><a href="serve.html"><code>serve</code></a><span class="desc">Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander) can browse, read, and write files inside images this host holds (`rb://host:port/img@N`) and on its host filesystem. Writable under the serve root by default; pass `--read-only` for a browse-only daemon. See docs/remote_transfer_plan.md</span></li>

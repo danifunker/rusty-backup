@@ -2011,6 +2011,27 @@ Usage: resize [OPTIONS] --size <SIZE> <IMAGE>
 - `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
 - `--confirm-shrink` — Required to shrink. Growing needs no flag; shrinking truncates the image, which is not reversible, so it has to be asked for. A shrink that would cut into live data is refused with or without this
 
+### `resize-image`
+
+Give a disk image a new size and resize its partitions with their filesystems, checking the volumes before and after (the GUI's Resize Image). Writes a copy unless `--in-place`
+
+```
+Usage: resize-image [OPTIONS] --size <SIZE> <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — The disk image to resize (raw `.img` / `.hda` / `.vhd`)
+
+**Options**
+
+- `--size` — The disk's new size (e.g. `512M`, `2G`)
+- `--part` — A partition's new size, by its `idx` from `rb-cli inspect`: `2=300M`, `2=fill` (the space the others leave), `2=min` (its smallest) or `2=keep`. Repeat per partition
+- `--out` — Write the resized image here (default: `NAME-resized.EXT` beside the image)
+- `--in-place` — Change the image itself instead of writing a copy
+- `--no-check` — Skip the volume checks before and after
+- `--force` — Resize even when the check before finds problems
+
 ### `restore`
 
 Restore a backup folder to a target image or device

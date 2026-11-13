@@ -23,6 +23,7 @@ fn request(path: &Path, disk_mib: u64, sizes: &[(usize, u64)]) -> ResizeImageReq
         disk_size: disk_mib * MIB,
         sizes: sizes.iter().map(|&(i, m)| (i, m * MIB)).collect(),
         check_after: true,
+        rebuild: Vec::new(),
     }
 }
 
@@ -163,5 +164,74 @@ fn a_vhd_keeps_one_footer_at_its_new_end() {
         "no stray footer is left in the free space: {at:?}"
     );
     assert_eq!(sizes_of(&path), [16 * MIB, 40 * MIB]);
+    all_clean(&shared);
+}
+
+/// A 64 MiB MBR disk holding a 16 MiB classic HFS volume with 512-byte blocks (32 MiB cap).
+fn hfs_disk(dir: &Path) -> PathBuf {
+    use crate::partition::provision::{place, write_table, Geometry, PartSpec};
+    let path = dir.join("mac.img");
+    let spec = PartSpec {
+        size: Some(16 * MIB),
+        type_text: Some("AF".to_string()),
+        name: None,
+    };
+    let placed = place(&[spec], TableKind::Mbr, 64 * MIB, MIB, Geometry::default()).unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.set_len(64 * MIB).unwrap();
+    write_table(
+        &mut file,
+        TableKind::Mbr,
+        &placed,
+        64 * MIB,
+        Geometry::default(),
+    )
+    .unwrap();
+    let hfs = fs_mac::hfs::create_blank_hfs(16 * MIB, 512, "Mac").unwrap();
+    file.seek(SeekFrom::Start(placed[0].start_byte())).unwrap();
+    file.write_all(&hfs).unwrap();
+    path
+}
+
+#[test]
+fn a_grow_past_classic_hfs_s_block_limit_is_found_before_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = hfs_disk(dir.path());
+    let before = std::fs::read(&path).unwrap();
+    let err = plan(&request(&path, 64, &[(0, 40)])).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("partition 1 cannot grow to 40.0 MiB"), "{msg}");
+    assert!(msg.contains("65535"), "{msg}");
+    let (result, _) = run_job(request(&path, 64, &[(0, 40)]));
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+}
+
+#[test]
+fn an_hfs_volume_past_its_block_limit_is_rebuilt_with_larger_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = hfs_disk(dir.path());
+    let out = dir.path().join("mac-resized.img");
+    let mut req = request(&path, 64, &[(0, 40)]);
+    req.copy_to = Some(out.clone());
+    req.rebuild = vec![(0, 4096)];
+    let (result, shared) = run_job(req);
+    result.unwrap();
+    let steps: Vec<Step> = shared.lock().unwrap().steps.iter().map(|s| s.0).collect();
+    assert_eq!(
+        steps,
+        [
+            Step::Copy,
+            Step::Rebuild,
+            Step::Partitions,
+            Step::Place,
+            Step::Check
+        ]
+    );
+    assert_eq!(sizes_of(&out), [40 * MIB]);
+    let mut f = std::fs::File::open(&out).unwrap();
+    assert_eq!(classic_hfs_block(&mut f, MIB), Some(4096));
+    let fs = fs_mac::hfs::HfsFilesystem::open(f, MIB).unwrap();
+    assert_eq!(fs.volume_summary().volume_name, "Mac");
     all_clean(&shared);
 }

@@ -120,6 +120,23 @@ pub struct PartProbe {
     pub fixed: Option<String>,
     /// The smallest size its filesystem shrinks to, when known.
     pub minimum: Option<u64>,
+    /// A classic HFS volume's allocation block size, which caps how far it grows in place.
+    pub hfs_block: Option<u32>,
+}
+
+/// Classic HFS (an MDB without an embedded HFS+ volume): its allocation block size.
+pub fn classic_hfs_block(file: &mut (impl Read + Seek), offset: u64) -> Option<u32> {
+    let mut mdb = [0u8; 512];
+    file.seek(SeekFrom::Start(offset + 1024)).ok()?;
+    file.read_exact(&mut mdb).ok()?;
+    let embedded = &mdb[124..126] == b"H+" || &mdb[124..126] == b"HX";
+    (&mdb[0..2] == b"BD" && !embedded)
+        .then(|| u32::from_be_bytes([mdb[20], mdb[21], mdb[22], mdb[23]]))
+}
+
+/// The largest size classic HFS reaches in place at `block` bytes per allocation block.
+pub fn hfs_ceiling(block: u32) -> u64 {
+    fs_mac::hfv::max_volume_for_block_size(block)
 }
 
 /// Probe each partition of `path`: can its filesystem resize, and how small can it go.
@@ -133,6 +150,7 @@ pub fn probe(path: &Path, partitions: &[PartitionInfo], ctx: &JobCtx) -> Result<
         ctx.set_phase(format!("Reading partition {}", p.index + 1));
         let ts = p.partition_type_string.as_deref();
         let mut file = std::fs::File::open(path)?;
+        let hfs_block = classic_hfs_block(&mut file, p.byte_offset());
         let fixed = match crate::fs::in_place_resize_support(&mut file, p.byte_offset(), ts) {
             InPlaceResize::Unsupported(name) => Some(name.to_string()),
             _ => None,
@@ -157,6 +175,7 @@ pub fn probe(path: &Path, partitions: &[PartitionInfo], ctx: &JobCtx) -> Result<
             index: p.index,
             fixed,
             minimum,
+            hfs_block,
         });
     }
     Ok(out)
@@ -177,6 +196,8 @@ pub struct ResizeImageRequest {
     pub sizes: Vec<(usize, u64)>,
     /// Check every resized or moved filesystem once the write is done.
     pub check_after: bool,
+    /// Classic HFS partitions rebuilt at a new allocation block size: `(index, block size)`.
+    pub rebuild: Vec<(usize, u32)>,
 }
 
 impl ResizeImageRequest {
@@ -190,8 +211,10 @@ impl ResizeImageRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Copy,
+    Rebuild,
     Grow,
     Partitions,
+    Place,
     Finish,
     Check,
 }
@@ -200,8 +223,10 @@ impl Step {
     pub fn label(self) -> &'static str {
         match self {
             Step::Copy => "Copy the image",
+            Step::Rebuild => "Rebuild the HFS volume with larger blocks",
             Step::Grow => "Grow the file",
             Step::Partitions => "Move and resize the partitions",
+            Step::Place => "Write the rebuilt HFS volume",
             Step::Finish => "Set the disk size",
             Step::Check => "Check the volumes again",
         }
@@ -281,7 +306,27 @@ pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
     if plans.is_empty() && req.disk_size == old_disk_size {
         bail!("nothing to change: the disk and every partition keep their size");
     }
-    rehearse_shrinks(&mut file, &plans)?;
+    for &(index, block) in &req.rebuild {
+        let size = plans
+            .iter()
+            .find(|r| r.index == index)
+            .map(|r| r.new_size_bytes)
+            .ok_or_else(|| anyhow::anyhow!("partition {} is rebuilt but not resized", index + 1))?;
+        if size > hfs_ceiling(block) {
+            bail!(
+                "partition {} at {} is past classic HFS's largest volume ({})",
+                index + 1,
+                format_size(size),
+                format_size(hfs_ceiling(block))
+            );
+        }
+    }
+    let patched: Vec<_> = plans
+        .iter()
+        .filter(|p| !req.rebuild.iter().any(|(i, _)| *i == p.index))
+        .cloned()
+        .collect();
+    rehearse(&mut file, &patched)?;
     Ok(Layout {
         old_disk_size,
         is_vhd,
@@ -290,20 +335,27 @@ pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
     })
 }
 
-/// Shrink each shrinking filesystem on an overlay first: the engine writes the table before it
-/// patches a filesystem, so a refusal found there would leave the disk half-written.
-fn rehearse_shrinks(
+/// Resize each filesystem on an overlay first: the engine writes the table before it patches a
+/// filesystem, so a refusal found there would leave the disk half-written.
+fn rehearse(
     file: &mut std::fs::File,
     plans: &[crate::partition::resize::PartitionResizePlan],
 ) -> Result<()> {
-    for p in plans.iter().filter(|p| p.new_size_bytes < p.old_size_bytes) {
+    for p in plans
+        .iter()
+        .filter(|p| p.new_size_bytes != p.old_size_bytes)
+    {
         let mut overlay = Overlay::new(&mut *file);
         let mut quiet = |_: &str| {};
         let offset = p.old_start_lba * SECTOR;
+        let verb = match p.new_size_bytes < p.old_size_bytes {
+            true => "shrink",
+            false => "grow",
+        };
         crate::fs::resize_filesystem_for(&mut overlay, offset, p.new_size_bytes, &mut quiet)
             .with_context(|| {
                 format!(
-                    "partition {} cannot shrink to {}",
+                    "partition {} cannot {verb} to {}",
                     p.index + 1,
                     format_size(p.new_size_bytes)
                 )
@@ -391,11 +443,17 @@ pub fn steps(req: &ResizeImageRequest, layout: &Layout) -> Vec<Step> {
     if req.copy_to.is_some() {
         steps.push(Step::Copy);
     }
+    if !req.rebuild.is_empty() {
+        steps.push(Step::Rebuild);
+    }
     if req.disk_size > layout.old_disk_size {
         steps.push(Step::Grow);
     }
     if !layout.plans.is_empty() {
         steps.push(Step::Partitions);
+    }
+    if !req.rebuild.is_empty() {
+        steps.push(Step::Place);
     }
     // A VHD resize writes a footer at the last partition's end, which Finish clears.
     if req.disk_size != layout.old_disk_size || (layout.is_vhd && !layout.plans.is_empty()) {
@@ -420,25 +478,30 @@ fn line(shared: &SharedProgress, text: &str) {
         .push(text.to_string());
 }
 
-/// Run every step of `req`; a failed step stops the rest, and a failed copy is removed.
+/// Run every step of `req`; a failed step stops the rest, and a copy that failed is removed.
 pub fn run(req: &ResizeImageRequest, ctx: &JobCtx, shared: &SharedProgress) -> Result<()> {
     let layout = plan(req)?;
     let steps = steps(req, &layout);
     crate::model::worker::lock_status(&**shared).steps =
         steps.iter().map(|s| (*s, StepState::Pending)).collect();
+    let mut rebuilt = Vec::new();
     for step in steps {
         if ctx.is_cancelled() {
             bail!("cancelled before \"{}\"", step.label());
         }
         set_state(shared, step, StepState::Running);
         ctx.set_phase(step.label());
-        match run_step(step, req, &layout, ctx, shared) {
+        match run_step(step, req, &layout, ctx, shared, &mut rebuilt) {
             Ok(note) => set_state(shared, step, StepState::Done(note)),
             Err(e) => {
                 let msg = format!("{e:#}");
                 set_state(shared, step, StepState::Failed(msg.clone()));
-                if step == Step::Copy {
+                if req.copy_to.is_some() {
                     let _ = std::fs::remove_file(req.target());
+                    line(
+                        shared,
+                        "The unfinished copy was removed; the original is unchanged.",
+                    );
                 }
                 bail!("{}: {msg}", step.label());
             }
@@ -453,6 +516,7 @@ fn run_step(
     layout: &Layout,
     ctx: &JobCtx,
     shared: &SharedProgress,
+    rebuilt: &mut Vec<(usize, std::fs::File)>,
 ) -> Result<String> {
     let target = req.target();
     let mut log = |m: &str| line(shared, m);
@@ -460,6 +524,21 @@ fn run_step(
         Step::Copy => {
             copy_file(req.source.as_path(), target, ctx)?;
             Ok(format!("to {}", target.display()))
+        }
+        Step::Rebuild => {
+            for &(index, block) in &req.rebuild {
+                rebuilt.push((index, rebuild_hfs(req, layout, index, block, &mut log)?));
+            }
+            Ok(format!("{} volume(s)", rebuilt.len()))
+        }
+        Step::Place => {
+            for (index, volume) in rebuilt.iter_mut() {
+                let plan = layout.plans.iter().find(|r| r.index == *index);
+                let start = plan.map_or(0, |r| r.new_start_lba * SECTOR);
+                place_volume(volume, target, start, ctx)?;
+                log(&format!("Partition {}: rebuilt volume written", *index + 1));
+            }
+            Ok(format!("{} volume(s)", rebuilt.len()))
         }
         Step::Grow => {
             let add = req.disk_size - layout.old_disk_size;
@@ -537,6 +616,75 @@ fn copy_file(from: &Path, to: &Path, ctx: &JobCtx) -> Result<()> {
         ctx.set_bytes(done, total);
     }
     dst.flush()?;
+    Ok(())
+}
+
+/// Clone partition `index`'s HFS volume, read from the untouched source, into a temp file at its
+/// new size and `block`; then clear the old volume's signature so the table resize leaves it be.
+fn rebuild_hfs(
+    req: &ResizeImageRequest,
+    layout: &Layout,
+    index: usize,
+    block: u32,
+    log: &mut impl FnMut(&str),
+) -> Result<std::fs::File> {
+    let part = req
+        .partitions
+        .iter()
+        .find(|p| p.index == index)
+        .ok_or_else(|| anyhow::anyhow!("no partition {}", index + 1))?;
+    let size = layout
+        .plans
+        .iter()
+        .find(|r| r.index == index)
+        .map_or(part.size_bytes, |r| r.new_size_bytes);
+    let source = std::fs::File::open(&req.source)?;
+    let mut fs = fs_mac::hfs::HfsFilesystem::open(source, part.byte_offset())
+        .map_err(|e| anyhow::anyhow!("open the HFS volume: {e}"))?;
+    let name = fs.volume_summary().volume_name;
+    let dir = req.target().parent().filter(|d| !d.as_os_str().is_empty());
+    let mut out = tempfile::tempfile_in(dir.unwrap_or(Path::new(".")))?;
+    log(&format!(
+        "Partition {}: rebuilding \"{name}\" at {} with {} KiB blocks",
+        index + 1,
+        format_size(size),
+        block / 1024
+    ));
+    let (_, report) = fs_mac::hfs_clone::clone_hfs_at(&mut fs, &mut out, 0, size, block, &name)
+        .map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    for (path, why) in report.errors.iter().chain(report.skipped.iter()) {
+        log(&format!("  {path}: {why}"));
+    }
+    log(&format!(
+        "Partition {}: {} file(s), {} folder(s) copied",
+        index + 1,
+        report.files_copied,
+        report.dirs_copied
+    ));
+    let mut target = open_rw(req.target())?;
+    target.seek(SeekFrom::Start(part.byte_offset()))?;
+    target.write_all(&[0u8; 3 * SECTOR as usize])?;
+    Ok(out)
+}
+
+/// Stream a rebuilt volume into the image at `start`.
+fn place_volume(volume: &mut std::fs::File, target: &Path, start: u64, ctx: &JobCtx) -> Result<()> {
+    let total = volume.seek(SeekFrom::End(0))?;
+    volume.seek(SeekFrom::Start(0))?;
+    let mut out = open_rw(target)?;
+    out.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut done = 0u64;
+    loop {
+        let n = volume.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        done += n as u64;
+        ctx.set_bytes(done, total);
+    }
+    out.flush()?;
     Ok(())
 }
 

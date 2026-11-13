@@ -243,6 +243,10 @@ pub enum Command {
     /// subsequent `partmap` edit can place a new partition.
     Grow(verbs::grow::GrowArgs),
 
+    /// Give a disk image a new size and resize its partitions with their filesystems, checking
+    /// the volumes before and after (the GUI's Resize Image). Writes a copy unless `--in-place`.
+    ResizeImage(verbs::resize_image::ResizeImageArgs),
+
     /// Whole-disk aggregate read-only view (partition table + per-partition
     /// summary + CHD metadata when applicable). The `idx` column is the
     /// selector: pass it back as `IMG@N`, `--partition N`, `--partitions N`,
@@ -527,6 +531,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Repack(args) => verbs::repack::run(args),
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
+        Command::ResizeImage(args) => verbs::resize_image::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
         #[cfg(feature = "remote")]
         Command::Serve(args) => verbs::serve::run(args),

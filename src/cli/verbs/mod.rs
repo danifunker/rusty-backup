@@ -54,6 +54,7 @@ pub mod put_macbinary;
 pub mod reformat;
 pub mod repack;
 pub mod resize;
+pub mod resize_image;
 pub mod restore;
 pub mod rm;
 #[cfg(feature = "remote")]

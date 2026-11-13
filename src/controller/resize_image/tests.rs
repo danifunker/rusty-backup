@@ -176,3 +176,43 @@ fn the_copy_name_is_numbered_when_taken() {
     std::fs::write(dir.path().join("disk-resized.img"), b"x").unwrap();
     assert_eq!(default_copy(&src), dir.path().join("disk-resized-2.img"));
 }
+
+#[test]
+fn an_hfs_partition_past_its_limit_is_marked_for_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mac.img");
+    let disk = crate::controller::test_fixtures::fat_disk(dir.path(), TableKind::Mbr, 64, &[16]);
+    std::fs::rename(&disk, &path).unwrap();
+    let hfs = fs_mac::hfs::create_blank_hfs(16 * MIB, 512, "Mac").unwrap();
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    f.seek(SeekFrom::Start(MIB)).unwrap();
+    f.write_all(&hfs).unwrap();
+    drop(f);
+    let mut c = wizard(&path);
+    assert_eq!(c.rows()[0].hfs_block, Some(512));
+    c.apply(A::SetSizeText {
+        index: 0,
+        text: "30".into(),
+    });
+    assert_eq!(c.rebuild_block(0), None, "30 MiB fits 512-byte blocks");
+    c.apply(A::SetSizeText {
+        index: 0,
+        text: "40".into(),
+    });
+    assert_eq!(c.rebuild_block(0), Some(4096));
+    assert!(c
+        .row_warning(0)
+        .unwrap()
+        .contains("rebuilt with 4 KiB blocks"));
+    c.apply(A::SetCheck(false));
+    c.apply(A::Next);
+    c.apply(A::Next);
+    c.apply(A::Next);
+    c.wait_idle();
+    assert_eq!(c.page(), Page::Review, "{:?}", c.plan_error());
+    assert!(c.review().join("\n").contains("rebuilt with 4 KiB blocks"));
+    c.apply(A::Start);
+    c.wait_idle();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{:?}", c.steps());
+}

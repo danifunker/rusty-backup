@@ -142,6 +142,8 @@ pub struct PartRow {
     pub minimum: Option<u64>,
     /// Why the partition keeps its size (a filesystem with no in-place resizer).
     pub fixed: Option<String>,
+    /// Classic HFS: its allocation block size, which caps how far it grows in place.
+    pub hfs_block: Option<u32>,
     pub mode: PartMode,
     /// The size field, MiB.
     pub text: String,
@@ -544,6 +546,28 @@ impl ResizeImageController {
         Ok(sizes)
     }
 
+    /// The block size partition `index` is rebuilt at: classic HFS asked past its in-place limit.
+    pub fn rebuild_block(&self, index: usize) -> Option<u32> {
+        let row = self.rows.iter().find(|r| r.index == index)?;
+        let block = row.hfs_block?;
+        let sizes = self.final_sizes().ok()?;
+        let size = sizes.iter().find(|(i, _)| *i == index)?.1;
+        (size > engine::hfs_ceiling(block)).then(|| fs_mac::hfv::suggest_block_size(size))
+    }
+
+    /// What a row's size means beyond the number: an HFS rebuild, said plainly.
+    pub fn row_warning(&self, index: usize) -> Option<String> {
+        let block = self.rebuild_block(index)?;
+        let old = self.rows.iter().find(|r| r.index == index)?.hfs_block?;
+        Some(format!(
+            "Past classic HFS's {} limit at {} blocks: rebuilt with {} KiB blocks (every file is \
+             copied into a new volume).",
+            format_size(engine::hfs_ceiling(old)),
+            block_text(old),
+            block / 1024
+        ))
+    }
+
     /// Why the typed layout cannot be written, found without touching the disk.
     pub fn live_error(&self) -> Option<String> {
         let disk = match self.disk_size() {
@@ -644,9 +668,14 @@ impl ResizeImageController {
                 let size = sizes.iter().find(|(i, _)| *i == p.index).map_or(0, |s| s.1);
                 let resized = p.new_size_bytes != p.old_size_bytes;
                 let mut parts = Vec::new();
+                let rebuilt = self.rebuild_block(p.index);
                 if resized {
+                    let how = match rebuilt {
+                        Some(block) => format!("rebuilt with {} KiB blocks", block / 1024),
+                        None => "with its filesystem".to_string(),
+                    };
                     parts.push(format!(
-                        "{} -> {} with its filesystem",
+                        "{} -> {} {how}",
                         format_size(p.old_size_bytes),
                         format_size(size.max(p.new_size_bytes))
                     ));
@@ -705,6 +734,7 @@ impl ResizeImageController {
                 size: p.size_bytes,
                 minimum: source.plan.min_sizes.get(&p.index).copied(),
                 fixed: None,
+                hfs_block: None,
                 mode: PartMode::Keep,
                 text: stamp_mib(p.size_bytes),
             })
@@ -844,6 +874,11 @@ impl ResizeImageController {
             disk_size: self.disk_size().ok()?,
             sizes,
             check_after: self.check,
+            rebuild: self
+                .rows
+                .iter()
+                .filter_map(|r| self.rebuild_block(r.index).map(|b| (r.index, b)))
+                .collect(),
         })
     }
 
@@ -989,6 +1024,7 @@ impl ResizeImageController {
                         if let Some(r) = self.rows.iter_mut().find(|r| r.index == p.index) {
                             r.fixed = p.fixed;
                             r.minimum = p.minimum.or(r.minimum);
+                            r.hfs_block = p.hfs_block;
                         }
                     }
                 }
@@ -1140,6 +1176,14 @@ impl Controller for ResizeImageController {
     fn tick(&mut self) -> Vec<Effect> {
         self.poll();
         Vec::new()
+    }
+}
+
+/// "512-byte" or "4 KiB".
+fn block_text(block: u32) -> String {
+    match block % 1024 {
+        0 => format!("{} KiB", block / 1024),
+        _ => format!("{block}-byte"),
     }
 }
 
