@@ -517,13 +517,12 @@ impl Prompt {
             &spec.initial,
             &spec.ok_label,
             false,
-            asks_for_a_daemon(spec.purpose),
             Some(spec.clone()),
         )
     }
 
     fn password(owner: HWND, spec: &PasswordSpec) -> Option<String> {
-        Self::run(owner, "Password", &spec.prompt, "", "OK", true, false, None)
+        Self::run(owner, "Password", &spec.prompt, "", "OK", true, None)
     }
 
     fn run(
@@ -533,9 +532,9 @@ impl Prompt {
         initial: &str,
         ok: &str,
         secret: bool,
-        network: bool,
         spec: Option<TextSpec>,
     ) -> Option<String> {
+        let network = spec.as_ref().is_some_and(|s| asks_for_a_daemon(s.purpose));
         // SAFETY: plain window creation and a modal loop over the owner, which is disabled meanwhile.
         unsafe {
             let inst = GetModuleHandleW(None).ok()?;
