@@ -594,7 +594,7 @@ impl Prompt {
                 .then(|| ui::icon_font(layout::scale(32, dpi)))
                 .flatten();
             let icon = icon_font.map(|font| {
-                let style = WINDOW_STYLE(0x1) // SS_CENTER;
+                let style = WINDOW_STYLE(0x1); // SS_CENTER
                 let h = ui::child(
                     window,
                     w!("STATIC"),
