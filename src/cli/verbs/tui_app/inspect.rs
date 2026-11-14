@@ -26,6 +26,7 @@ use ratatui::Frame;
 use super::ask::Ask;
 use super::dialogs::{DRow, DialogKey, DialogWindow, HINTS_ALTO_RESIZE, HINTS_EXPAND_HFS};
 use super::resize::{ResizeKey, ResizeWindow, HINTS_RESIZE};
+use super::resize_image::{WizardKey, WizardWindow, HINTS_RESIZE_IMAGE};
 use super::table_edit::{TableKey, TableWindow, HINTS_TABLE_EDIT};
 use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
 use super::{centered_rect, hint, App, FilePicker, KeyHint, PartRow, PickKind, PickResult};
@@ -47,6 +48,7 @@ use crate::controller::inspect::{
 #[cfg(feature = "remote")]
 use crate::controller::remote_pick::{RemotePickAction, RemotePickController};
 use crate::controller::resize::{ResizeAction, ResizeController};
+use crate::controller::resize_image::{ResizeImageAction, ResizeImageController};
 use crate::controller::{Controller as _, Effect, PickSpec};
 
 /// Which controller asked a question.
@@ -59,6 +61,7 @@ pub(super) enum Who {
     Resize,
     Alto,
     Hfs,
+    Wizard,
 }
 
 /// A window of the screen's own, drawn over the grid.
@@ -101,6 +104,10 @@ pub(super) const HINTS_INSPECT_SOURCE: &[KeyHint] = &[
     hint("d", "Defragment a Human68k partition"),
     hint("r", "Re-inspect the source"),
     hint("e", "Export the disk image (and Physical Disk Export)"),
+    hint(
+        "z",
+        "Resize Image: a new disk size, partitions and filesystems resized",
+    ),
     hint("x", "Expand Image: grow the image file with zeros"),
     hint("B", "Make Bootable (classic Mac disks)"),
     hint("w", "Swap the 16-bit word order into a new image"),
@@ -153,6 +160,9 @@ pub(super) struct InspectState {
     /// The Inspect dialogs' controllers and their windows' cursors.
     pub(super) resize: ResizeController,
     pub(super) rwin: ResizeWindow,
+    /// Resize Image, and its cursor.
+    pub(super) wizard: ResizeImageController,
+    pub(super) iwin: WizardWindow,
     pub(super) twin: TableWindow,
     pub(super) alto: AltoResizeController,
     pub(super) hfs: ExpandHfsController,
@@ -216,6 +226,8 @@ impl InspectState {
             remote_sel: 0,
             resize: ResizeController::new(Arc::new(NoNotify)),
             rwin: ResizeWindow::default(),
+            wizard: ResizeImageController::new(Arc::new(NoNotify)),
+            iwin: WizardWindow::default(),
             twin: TableWindow::default(),
             alto: AltoResizeController::new(Arc::new(NoNotify)),
             hfs: ExpandHfsController::new(Arc::new(NoNotify)),
@@ -278,6 +290,7 @@ impl InspectState {
             || self.writer.opening().is_some()
             || self.ctl.summarizing_hfs()
             || self.resize.is_running()
+            || self.wizard.is_running()
             || self.alto.opening().is_some()
             || self.alto.is_writing()
             || self.hfs.is_running()
@@ -308,6 +321,13 @@ impl InspectState {
         let fx = self.resize.apply(action);
         self.absorb(Who::Resize, fx);
         self.after();
+    }
+
+    pub(super) fn iact(&mut self, action: ResizeImageAction) {
+        let fx = self.wizard.apply(action);
+        self.absorb(Who::Wizard, fx);
+        self.after();
+        self.iwin.settle(&self.wizard);
     }
 
     pub(super) fn aact(&mut self, action: AltoResizeAction) {
@@ -412,8 +432,19 @@ impl InspectState {
                 self.absorb(Who::Inspect, fx);
             }
         }
+        if let Some(path) = self.wizard.take_open_request() {
+            let fx = self.wizard.apply(ResizeImageAction::Close);
+            self.absorb(Who::Wizard, fx);
+            self.disk = None;
+            self.plain = None;
+            self.sel = 0;
+            let fx = self
+                .ctl
+                .apply(InspectAction::Open(InspectSource::ImageFile(path)));
+            self.absorb(Who::Inspect, fx);
+        }
         // A resize rewrote the table under the grid: read it again.
-        if self.resize.take_disk_changed() {
+        if self.resize.take_disk_changed() | self.wizard.take_disk_changed() {
             let fx = self.ctl.apply(InspectAction::DiskChanged);
             self.absorb(Who::Inspect, fx);
         }
@@ -423,6 +454,7 @@ impl InspectState {
             .into_iter()
             .chain(self.writer.take_log())
             .chain(self.resize.take_log())
+            .chain(self.wizard.take_log())
             .chain(self.alto.take_log())
             .chain(self.hfs.take_log())
             .map(|(_, msg)| msg)
@@ -477,6 +509,9 @@ impl InspectState {
             Pick::Of(Who::Alto, purpose) => self.aact(AltoResizeAction::Picked { purpose, path }),
             Pick::Of(Who::Hfs, purpose) => self.hact(ExpandHfsAction::Picked { purpose, path }),
             Pick::Of(Who::Writer, purpose) => self.wact(DiskWriteAction::Picked { purpose, path }),
+            Pick::Of(Who::Wizard, purpose) => {
+                self.iact(ResizeImageAction::Picked { purpose, path })
+            }
             // The remote picker and Resize ask for no file.
             Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
             Pick::WriterImage => {
@@ -522,6 +557,10 @@ impl InspectState {
                 text,
             }),
             Ask::Confirm(Who::Resize, spec) => self.zact(ResizeAction::Confirmed {
+                purpose: spec.purpose,
+                yes,
+            }),
+            Ask::Confirm(Who::Wizard, spec) => self.iact(ResizeImageAction::Confirmed {
                 purpose: spec.purpose,
                 yes,
             }),
@@ -875,6 +914,25 @@ impl InspectState {
         }
     }
 
+    fn wizard_key(&mut self, code: KeyCode) {
+        match self.iwin.key(&self.wizard, code) {
+            WizardKey::Done => {}
+            WizardKey::Act(a) => self.iact(a),
+        }
+        self.iwin.settle(&self.wizard);
+    }
+
+    fn open_resize_image(&mut self) {
+        match self.ctl.resize_image_source() {
+            Ok(source) => {
+                self.iact(ResizeImageAction::Open(Box::new(source)));
+                self.iwin = WizardWindow::default();
+                self.iwin.settle(&self.wizard);
+            }
+            Err(e) => self.note = Some(e),
+        }
+    }
+
     fn resize_key(&mut self, code: KeyCode) {
         match self.rwin.key(&self.resize, code) {
             ResizeKey::Done => {}
@@ -905,7 +963,11 @@ impl InspectState {
 
     /// A dialog of the screen's own is up over the grid.
     pub(super) fn dialog_open(&self) -> bool {
-        self.ctl.editor_open() || self.resize.is_open() || self.alto.is_open() || self.hfs.is_open()
+        self.ctl.editor_open()
+            || self.resize.is_open()
+            || self.wizard.is_open()
+            || self.alto.is_open()
+            || self.hfs.is_open()
     }
 
     fn open_table_editor(&mut self, add: bool) {
@@ -978,6 +1040,9 @@ impl InspectState {
                 self.act(InspectAction::OpenExport);
                 self.window = Some(Win::Export);
                 self.esel = ERow::Format;
+            }
+            KeyCode::Char('z') if self.ctl.can_resize_image() && !self.wizard.is_running() => {
+                self.open_resize_image()
             }
             KeyCode::Char('x') if self.ctl.can_expand_image() => {
                 self.expand_mib = 0;
@@ -1076,6 +1141,9 @@ impl App {
         }
         if s.resize.is_open() {
             return Some(("Inspect - resize", HINTS_RESIZE));
+        }
+        if s.wizard.is_open() {
+            return Some(("Inspect - resize image", HINTS_RESIZE_IMAGE));
         }
         if s.hfs.is_open() {
             return Some(("Inspect - expand HFS", HINTS_EXPAND_HFS));
@@ -1327,6 +1395,11 @@ impl App {
             self.after_inspect();
             return true;
         }
+        if s.wizard.is_open() {
+            s.wizard_key(code);
+            self.after_inspect();
+            return true;
+        }
         if s.hfs.is_open() || s.alto.is_open() {
             s.dialog_key(code);
             self.after_inspect();
@@ -1367,6 +1440,9 @@ impl App {
         }
         let fx = s.resize.tick();
         s.absorb(Who::Resize, fx);
+        let fx = s.wizard.tick();
+        s.absorb(Who::Wizard, fx);
+        s.iwin.settle(&s.wizard);
         let fx = s.alto.tick();
         s.absorb(Who::Alto, fx);
         let fx = s.hfs.tick();
@@ -1561,6 +1637,9 @@ impl App {
         }
         if s.resize.is_open() {
             self.draw_resize(frame, area, &s.resize, &s.rwin);
+        }
+        if s.wizard.is_open() {
+            self.draw_resize_image(frame, area, &s.wizard, &s.iwin);
         }
         if s.alto.is_open() {
             self.draw_alto_resize(frame, area, &s.alto, &s.dwin);
