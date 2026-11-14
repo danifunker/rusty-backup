@@ -5,8 +5,7 @@ edition = "2021"
 license = "AGPL-3.0"
 authors = ["Dani <dani@funkervogt.com>"]
 description = "Cross-platform GUI for backing up and restoring vintage computer hard disk images"
-homepage = "https://github.com/dani/rusty-backup"
-repository = "https://github.com/dani/rusty-backup"
+repository = "https://github.com/danifunker/rusty-backup"
 resolver = "2"
 default-run = "rusty-backup"
 
