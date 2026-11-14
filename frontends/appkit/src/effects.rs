@@ -84,6 +84,23 @@ pub(crate) fn pick(mtm: MainThreadMarker, spec: &PickSpec, folder: bool) -> Opti
     path_of(panel.URLs().firstObject())
 }
 
+/// An open panel for several files; none when cancelled.
+pub(crate) fn pick_files(mtm: MainThreadMarker, title: &str) -> Vec<PathBuf> {
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setMessage(Some(&ns(title)));
+    panel.setCanChooseFiles(true);
+    panel.setAllowsMultipleSelection(true);
+    if panel.runModal() != NSModalResponseOK {
+        return Vec::new();
+    }
+    panel
+        .URLs()
+        .iter()
+        .filter_map(|u| u.path())
+        .map(|p| PathBuf::from(p.to_string()))
+        .collect()
+}
+
 fn alert(mtm: MainThreadMarker, title: &str, message: &str) -> Retained<NSAlert> {
     let a = NSAlert::new(mtm);
     a.setMessageText(&ns(&ui::plain(title)));

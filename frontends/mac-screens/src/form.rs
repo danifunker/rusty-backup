@@ -28,6 +28,7 @@ pub enum Kind {
     Table,
     Canvas,
     TextView,
+    TextArea,
     /// A view the shell builds itself (a list, a bar) and hands the host.
     Custom,
 }
@@ -107,7 +108,9 @@ impl<K: Copy + PartialEq> State<K> {
         };
         match ev {
             Ev::Edited => {
-                while self.next_edit(host, s).is_some() {}
+                if kind == Some(Kind::Field) {
+                    while self.next_edit(host, s).is_some() {}
+                }
                 (self.on)(k);
             }
             // Only a change the screen has not heard yet: typing reports as `Edited`.
@@ -366,6 +369,17 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         self.host.text_view(self.surface, c, id);
     }
 
+    /// An editable plain-text area; typing reports `k`.
+    pub fn text_area(&self, k: K, id: &str, caption: &str) {
+        let c = self.built(k, Kind::TextArea);
+        self.host.text_area(self.surface, c, id, caption);
+    }
+
+    /// A text view's or area's text now.
+    pub fn text_view_text(&self, k: K) -> String {
+        self.host.text_view_text(self.surface, self.st.ctl(k))
+    }
+
     pub fn set_text_view(&self, k: K, text: &str) {
         self.host
             .set_text_view(self.surface, self.st.ctl(k), &plain(text));
@@ -499,6 +513,11 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
                 entry.1 = now;
             }
         }
+    }
+
+    /// A pop-up's item titles; a pull-down's first is its title.
+    pub fn items(&self, k: K) -> Vec<String> {
+        self.host.items(self.surface, self.st.ctl(k))
     }
 
     /// Replace a pop-up's items, only when they changed.

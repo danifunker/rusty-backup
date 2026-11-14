@@ -6,38 +6,23 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
-mod browse;
 mod canvas;
-#[cfg(target_os = "macos")]
-mod commander;
 #[cfg(target_os = "macos")]
 mod effects;
 #[cfg(target_os = "macos")]
 mod form;
 #[cfg(target_os = "macos")]
-mod inspect;
 // Shared with the vintage Cocoa shell (docs/cocoa_vintage_shell_plan.md); `crate::layout` stays its path.
 #[path = "../../mac-screens/src/mod.rs"]
 mod screens;
-use screens::{
-    alto, chd, disk_write, editor, expand_hfs, export, layout, optical_remote, remote_pick, resize,
-    resize_image, sync,
-};
+use screens::{layout, sync};
 #[cfg(target_os = "macos")]
 mod menu;
 #[cfg(target_os = "macos")]
-mod model_window;
-mod optical;
-#[cfg(target_os = "macos")]
-mod pane_view;
-#[cfg(target_os = "macos")]
-mod partition_bar;
-#[cfg(target_os = "macos")]
 mod popup;
 #[cfg(target_os = "macos")]
-mod report;
-#[cfg(target_os = "macos")]
 mod row_icons;
+mod rows;
 #[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]

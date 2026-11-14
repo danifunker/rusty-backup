@@ -2,24 +2,16 @@
 //! `browse.rs` and `browse_bars.rs` are the reference.
 //!
 //! The volume line and the header's tools, the edit bar while Edit Mode is on, the running job
-//! with Cancel, notices, the folder tree and the listing ([`crate::pane_view`]), the side panel
+//! with Cancel, notices, the folder tree and the listing ([`super::pane_view`]), the side panel
 //! over a text or hex preview, the status line and the mark bar, the View and row menus, and the
-//! windows the controller describes ([`crate::model_window`]). Keys go through the controller's
-//! key map. Every control's action comes to [`BrowseView::fired`] by its tag.
+//! windows the controller describes ([`super::model_window`]). Keys go through the controller's
+//! key map. Every control's action comes to [`BrowseView::fired`] by its key.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSOpenPanel, NSPopUpButton, NSProgressIndicator, NSScrollView, NSTextField, NSTextView, NSView,
-};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::{ids, TextDoc};
 use rusty_backup::controller::commander::{
@@ -34,13 +26,14 @@ use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{picks, Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::layout::{self, Node, Size};
-use crate::model_window::{Event, ModelWindow};
-use crate::pane_view::{PaneEvent, PaneShown, PaneView};
-use crate::popup::{track, MenuItem};
-use crate::sync::SyncGuard;
-use crate::ui::{self, ns, Callback};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::model_window::{Event, ModelWindow};
+use super::pane_view::{PaneEvent, PaneShown, PaneView};
+use super::popup::{track, MenuItem};
+use super::sync::SyncGuard;
 
 /// The side panel's width and the folder tree's, in points.
 const DETAIL_W: i32 = 330;
@@ -120,70 +113,6 @@ enum C {
     MarkClear,
 }
 
-const ALL: [C; 61] = [
-    C::Title,
-    C::Volume,
-    C::Boot,
-    C::EditMode,
-    C::ExtractAll,
-    C::ExportVolume,
-    C::VolumeFormat,
-    C::Check,
-    C::Journal,
-    C::ChdInfo,
-    C::Tree,
-    C::FullScan,
-    C::ShowDeleted,
-    C::View,
-    C::Close,
-    C::EditNote,
-    C::EditTarget,
-    C::AddFile,
-    C::Import,
-    C::NewFolder,
-    C::Rename,
-    C::Delete,
-    C::Bless,
-    C::BootBlocks,
-    C::Lock,
-    C::Unlock,
-    C::Apply,
-    C::Discard,
-    C::Edits,
-    C::Free,
-    C::After,
-    C::Job,
-    C::Progress,
-    C::Cancel,
-    C::Notice,
-    C::NoticeOk,
-    C::Message,
-    C::TreeView,
-    C::List,
-    C::Name,
-    C::Facts,
-    C::Note,
-    C::Budget,
-    C::Result,
-    C::ForkCaption,
-    C::Fork,
-    C::Extract,
-    C::Export,
-    C::Nested,
-    C::ProdosCaption,
-    C::Prodos,
-    C::RsToLf,
-    C::SaveArchive,
-    C::BrowseArchive,
-    C::EditText,
-    C::Metadata,
-    C::MacArchive,
-    C::Preview,
-    C::Status,
-    C::MarkCount,
-    C::MarkClear,
-];
-
 /// The pane's controller: Inspect's browse profile.
 /// The pane's controller: Inspect's browse profile, or the Optical screen's disc browser.
 fn new_controller(notify: &Arc<dyn Notify>, disc: bool) -> CommanderController {
@@ -193,9 +122,16 @@ fn new_controller(notify: &Arc<dyn Notify>, disc: bool) -> CommanderController {
         recent: Box::new(CommanderRecent(UserConfig)),
     };
     let (keymap, problems) = KeyMap::load(KeyMap::user_file().as_deref());
+    #[cfg(feature = "optical")]
     let mut ctl = match disc {
         true => rusty_backup::controller::optical::disc_browser(services, keymap),
         false => CommanderController::single(services, keymap, PaneProfile::inspect()),
+    };
+    // Without optical media there is no Optical screen, so no disc browser either.
+    #[cfg(not(feature = "optical"))]
+    let mut ctl = {
+        let _ = disc;
+        CommanderController::single(services, keymap, PaneProfile::inspect())
     };
     ctl.report_keymap_problems(problems);
     ctl
@@ -224,7 +160,7 @@ struct Shown {
 }
 
 pub struct BrowseView {
-    mtm: MainThreadMarker,
+    ui: Rc<dyn Host>,
     ctrl: RefCell<CommanderController>,
     notify: Arc<dyn Notify>,
     host: EffectHost,
@@ -234,12 +170,9 @@ pub struct BrowseView {
     /// The Optical screen's disc browser rather than Inspect's.
     disc: bool,
     /// The view's own page, which the Inspect page gives way to while it is open.
-    pub page: Retained<NSView>,
-    _target: Retained<Callback>,
-    views: Vec<(C, Retained<NSView>)>,
+    page: Surface,
+    form: Form<C>,
     pane: PaneView,
-    preview: Retained<NSTextView>,
-    progress: Retained<NSProgressIndicator>,
     windows: RefCell<Vec<Rc<ModelWindow>>>,
     /// The Check report's "Show debug messages", which only this view keeps.
     debug: Cell<bool>,
@@ -257,178 +190,123 @@ pub struct BrowseView {
     on_change: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
-fn as_view<T: AsRef<NSView>>(v: &T) -> Retained<NSView> {
-    use objc2::Message;
-    v.as_ref().retain()
-}
-
 impl BrowseView {
+    /// The view on `page`, a surface its parent places.
     pub fn build(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
+        page: Surface,
         notify: Arc<dyn Notify>,
         host: EffectHost,
         disc: bool,
     ) -> Rc<BrowseView> {
         Rc::new_cyclic(|me: &Weak<BrowseView>| {
             let fire_me = me.clone();
-            let target = ui::callback(
-                mtm,
-                Box::new(move |sender: &AnyObject| {
-                    let tag = sender.downcast_ref::<NSControl>().map(|c| c.tag());
-                    if let (Some(v), Some(tag)) = (fire_me.upgrade(), tag) {
-                        if let Some(c) = ALL.get(tag as usize) {
-                            v.fired(*c, sender);
-                        }
+            let form = Form::with_host(
+                ui.clone(),
+                page,
+                Rc::new(move |c| {
+                    if let Some(v) = fire_me.upgrade() {
+                        v.fired(c);
                     }
                 }),
             );
-            let page = ui::flipped(mtm);
-            let mut views: Vec<(C, Retained<NSView>)> = Vec::new();
-            let mut add = |c: C, v: Retained<NSView>| {
-                if let Some(ctl) = v.downcast_ref::<NSControl>() {
-                    ctl.setTag(ALL.iter().position(|x| *x == c).unwrap_or(0) as isize);
-                    if ctl.downcast_ref::<NSTextField>().is_none() {
-                        ui::hook(ctl, &target);
-                    }
-                }
-                page.addSubview(&v);
-                views.push((c, v));
-            };
-            let button = |title: &str, id: &str| as_view(&ui::button(mtm, title, id));
-            let check = |title: &str, id: &str| as_view(&ui::checkbox(mtm, title, id));
-            let label = |text: &str| as_view(&ui::label(mtm, text));
-            let popup = |items: Vec<String>, id: &str| {
-                let p = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, false);
-                for i in items {
-                    p.addItemWithTitle(&ns(&i));
-                }
-                if !id.is_empty() {
-                    ui::set_id(&p, id);
-                }
-                as_view(&p)
-            };
-            add(C::Title, label("Filesystem Browser"));
-            add(C::Volume, label(""));
-            add(C::Boot, label(""));
-            add(C::EditMode, button("Edit Mode", ids::EDIT_MODE));
-            add(C::ExtractAll, button("Extract All...", ids::EXTRACT_ALL));
-            add(
-                C::ExportVolume,
-                button("Export Volume...", ids::EXPORT_VOLUME),
-            );
-            add(
-                C::VolumeFormat,
-                popup(Vec::new(), ids::EXPORT_VOLUME_FORMAT),
-            );
-            add(C::Check, button("Check", ids::CHECK));
-            add(C::Journal, button("Journal", ids::JOURNAL));
-            add(C::ChdInfo, button("CHD Info", ids::CHD_INFO));
-            add(C::Tree, button("Tree", ids::TREE));
-            add(C::FullScan, check("Full scan", ids::FULL_SCAN));
-            add(C::ShowDeleted, check("Show deleted", ids::SHOW_DELETED));
-            add(C::View, button("View...", ids::VIEW_MENU));
-            add(C::Close, button("Close", ids::CLOSE));
-            add(C::EditNote, label(""));
-            add(C::EditTarget, label(""));
-            add(C::AddFile, button("Add File...", ids::ADD_FILE));
-            add(C::Import, button("Import Archive...", ids::IMPORT_ARCHIVE));
-            add(C::NewFolder, button("New Folder...", ids::NEW_FOLDER));
-            add(C::Rename, button("Rename...", ids::RENAME));
-            add(C::Delete, button("Delete", ids::DELETE));
-            add(C::Bless, button("Bless Folder", ids::BLESS));
-            add(C::BootBlocks, button("Boot Blocks...", ids::BOOT_BLOCKS));
-            add(C::Lock, button("Lock", ids::PRODOS_LOCK));
-            add(C::Unlock, button("Unlock", ids::PRODOS_UNLOCK));
-            add(C::Apply, button("Apply Edits", ids::APPLY));
-            add(C::Discard, button("Discard", ids::DISCARD));
-            add(C::Edits, button("Edits", ids::EDITS));
-            add(C::Free, label(""));
-            add(C::After, label(""));
-            add(C::Job, label(""));
-            let progress = ui::progress(mtm);
-            add(C::Progress, as_view(&progress));
-            add(C::Cancel, button("Cancel", ids::CANCEL_JOB));
+            let f = &form;
+            f.label(C::Title, "Filesystem Browser");
+            f.label(C::Volume, "");
+            f.label(C::Boot, "");
+            f.button(C::EditMode, "Edit Mode", ids::EDIT_MODE);
+            f.button(C::ExtractAll, "Extract All...", ids::EXTRACT_ALL);
+            f.button(C::ExportVolume, "Export Volume...", ids::EXPORT_VOLUME);
+            f.popup(C::VolumeFormat, &[], ids::EXPORT_VOLUME_FORMAT);
+            f.button(C::Check, "Check", ids::CHECK);
+            f.button(C::Journal, "Journal", ids::JOURNAL);
+            f.button(C::ChdInfo, "CHD Info", ids::CHD_INFO);
+            f.button(C::Tree, "Tree", ids::TREE);
+            f.check(C::FullScan, "Full scan", ids::FULL_SCAN);
+            f.check(C::ShowDeleted, "Show deleted", ids::SHOW_DELETED);
+            f.button(C::View, "View...", ids::VIEW_MENU);
+            f.button(C::Close, "Close", ids::CLOSE);
+            f.label(C::EditNote, "");
+            f.set_tone(C::EditNote, Some(Tone::Warning));
+            f.label(C::EditTarget, "");
+            f.button(C::AddFile, "Add File...", ids::ADD_FILE);
+            f.button(C::Import, "Import Archive...", ids::IMPORT_ARCHIVE);
+            f.button(C::NewFolder, "New Folder...", ids::NEW_FOLDER);
+            f.button(C::Rename, "Rename...", ids::RENAME);
+            f.button(C::Delete, "Delete", ids::DELETE);
+            f.button(C::Bless, "Bless Folder", ids::BLESS);
+            f.button(C::BootBlocks, "Boot Blocks...", ids::BOOT_BLOCKS);
+            f.button(C::Lock, "Lock", ids::PRODOS_LOCK);
+            f.button(C::Unlock, "Unlock", ids::PRODOS_UNLOCK);
+            f.button(C::Apply, "Apply Edits", ids::APPLY);
+            f.button(C::Discard, "Discard", ids::DISCARD);
+            f.button(C::Edits, "Edits", ids::EDITS);
+            f.label(C::Free, "");
+            f.label(C::After, "");
+            f.label(C::Job, "");
+            f.progress(C::Progress);
+            f.button(C::Cancel, "Cancel", ids::CANCEL_JOB);
             // The notice row shows only while a notice is up (show_notice).
-            let notice = label("");
-            notice.setHidden(true);
-            add(C::Notice, notice);
-            let notice_ok = button("OK", "browse.notice_ok");
-            notice_ok.setHidden(true);
-            add(C::NoticeOk, notice_ok);
-            add(C::Message, label(""));
-            let pane = PaneView::build(mtm, Side::Left, ids::LIST, ids::FOLDER_TREE);
-            add(C::TreeView, as_view(&pane.tree_scroll));
-            add(C::List, as_view(&pane.list_scroll));
-            add(C::Name, label(""));
-            add(C::Facts, label(""));
-            add(C::Note, label(""));
-            add(C::Budget, label(""));
-            add(C::Result, label(""));
-            add(C::ForkCaption, label("Resource forks:"));
+            f.label(C::Notice, "");
+            f.show(C::Notice, false);
+            f.button(C::NoticeOk, "OK", "browse.notice_ok");
+            f.show(C::NoticeOk, false);
+            f.label(C::Message, "");
+            let pane = PaneView::build(
+                f,
+                C::List,
+                C::TreeView,
+                Side::Left,
+                ids::LIST,
+                ids::FOLDER_TREE,
+            );
+            f.label(C::Name, "");
+            f.label(C::Facts, "");
+            f.label(C::Note, "");
+            f.label(C::Budget, "");
+            f.label(C::Result, "");
+            f.label(C::ForkCaption, "Resource forks:");
             let modes: Vec<String> = extract_fork_modes()
                 .iter()
                 .map(|m| m.label().to_string())
                 .collect();
-            let fork = popup(modes, "");
-            if let Some(p) = fork.downcast_ref::<NSPopUpButton>() {
-                let start = extract_fork_modes()
-                    .iter()
-                    .position(|m| *m == ResourceForkMode::AppleDouble)
-                    .unwrap_or(0);
-                p.selectItemAtIndex(start as isize);
-                p.setAccessibilityLabel(Some(&ns("Resource forks")));
-            }
-            add(C::Fork, fork);
-            add(C::Extract, button("Extract...", ids::EXTRACT));
-            add(C::Export, button("Export to .tgz...", ids::EXPORT_ENTRY));
-            add(C::Nested, button("Open as Disk Image", ids::OPEN_NESTED));
-            add(C::ProdosCaption, label("Export name:"));
+            f.popup(C::Fork, &modes, "");
+            let start = extract_fork_modes()
+                .iter()
+                .position(|m| *m == ResourceForkMode::AppleDouble)
+                .unwrap_or(0);
+            f.select(C::Fork, start);
+            f.button(C::Extract, "Extract...", ids::EXTRACT);
+            f.button(C::Export, "Export to .tgz...", ids::EXPORT_ENTRY);
+            f.button(C::Nested, "Open as Disk Image", ids::OPEN_NESTED);
+            f.label(C::ProdosCaption, "Export name:");
             let prodos: Vec<String> = ProdosExportMode::ALL
                 .iter()
                 .map(|m| m.label().to_string())
                 .collect();
-            add(C::Prodos, popup(prodos, ""));
-            add(C::RsToLf, check("Text: RS to LF", ""));
-            add(
-                C::SaveArchive,
-                button("Save as Mac archive...", ids::SAVE_ARCHIVE),
-            );
-            add(
-                C::BrowseArchive,
-                button("Browse archive...", ids::BROWSE_ARCHIVE),
-            );
-            add(C::EditText, button("Edit as text...", ids::EDIT_TEXT));
-            add(C::Metadata, button("Edit Metadata...", ids::EDIT_METADATA));
-            add(
+            f.popup(C::Prodos, &prodos, "");
+            f.check(C::RsToLf, "Text: RS to LF", "");
+            f.button(C::SaveArchive, "Save as Mac archive...", ids::SAVE_ARCHIVE);
+            f.button(C::BrowseArchive, "Browse archive...", ids::BROWSE_ARCHIVE);
+            f.button(C::EditText, "Edit as text...", ids::EDIT_TEXT);
+            f.button(C::Metadata, "Edit Metadata...", ids::EDIT_METADATA);
+            f.button(
                 C::MacArchive,
-                button("Export as Mac archive...", "browse.export_mac"),
+                "Export as Mac archive...",
+                "browse.export_mac",
             );
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 200.0));
-            let preview_scroll = NSScrollView::initWithFrame(mtm.alloc(), frame);
-            preview_scroll.setHasVerticalScroller(true);
-            preview_scroll.setHasHorizontalScroller(true);
-            preview_scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
-            let preview = NSTextView::initWithFrame(mtm.alloc(), frame);
-            preview.setEditable(false);
-            preview.setFont(Some(&crate::app::log_font()));
-            preview.setTextColor(Some(&NSColor::textColor()));
-            ui::set_id(&preview, ids::DETAIL);
-            preview_scroll.setDocumentView(Some(&preview));
-            add(C::Preview, as_view(&preview_scroll));
-            add(C::Status, label(""));
-            add(C::MarkCount, label(""));
-            add(C::MarkClear, button("Clear", ids::CLEAR_MARKS));
+            f.text_view(C::Preview, ids::DETAIL);
+            f.label(C::Status, "");
+            f.label(C::MarkCount, "");
+            f.button(C::MarkClear, "Clear", ids::CLEAR_MARKS);
             let events_me = me.clone();
-            pane.on_event(
-                mtm,
-                Rc::new(move |e| {
-                    if let Some(v) = events_me.upgrade() {
-                        v.pane_event(e);
-                    }
-                }),
-            );
+            pane.on_event(Rc::new(move |e| {
+                if let Some(v) = events_me.upgrade() {
+                    v.pane_event(e);
+                }
+            }));
             BrowseView {
-                mtm,
+                ui: ui.clone(),
                 ctrl: RefCell::new(new_controller(&notify, disc)),
                 disc,
                 notify,
@@ -437,11 +315,8 @@ impl BrowseView {
                 me: me.clone(),
                 active: Cell::new(false),
                 page,
-                _target: target,
-                views,
+                form,
                 pane,
-                preview,
-                progress,
                 windows: RefCell::default(),
                 debug: Cell::new(false),
                 tree_text: RefCell::default(),
@@ -457,59 +332,28 @@ impl BrowseView {
         })
     }
 
-    fn v(&self, c: C) -> &NSView {
-        self.views
-            .iter()
-            .find(|(x, _)| *x == c)
-            .map(|(_, v)| &**v)
-            .expect("every control is built")
-    }
-
-    fn text(&self, c: C) -> &NSTextField {
-        self.v(c).downcast_ref::<NSTextField>().expect("a label")
-    }
-
-    fn button(&self, c: C) -> &NSButton {
-        self.v(c).downcast_ref::<NSButton>().expect("a button")
-    }
-
-    fn popup(&self, c: C) -> &NSPopUpButton {
-        self.v(c).downcast_ref::<NSPopUpButton>().expect("a pop-up")
-    }
-
     fn shown(&self, c: C) -> bool {
-        ui::shown(self.v(c))
+        self.form.shown(c)
     }
 
     fn show_if(&self, c: C, on: bool) {
-        ui::set_visible(self.v(c), on);
+        self.form.show(c, on);
     }
 
     fn enable(&self, c: C, on: bool) {
-        ui::set_enabled(self.button(c), on);
+        self.form.enable(c, on);
     }
 
     fn checked(&self, c: C) -> bool {
-        self.button(c).state() == NSControlStateValueOn
+        self.form.checked(c)
     }
 
     fn set_check(&self, c: C, on: bool) {
-        let want = if on {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        };
-        let b = self.button(c);
-        if b.state() != want {
-            b.setState(want);
-        }
+        self.form.set_check(c, on);
     }
 
     fn set_title(&self, c: C, t: &str) {
-        let b = self.button(c);
-        if b.title().to_string() != t {
-            b.setTitle(&ns(t));
-        }
+        self.form.set_title(c, t);
     }
 
     pub fn is_active(&self) -> bool {
@@ -542,6 +386,7 @@ impl BrowseView {
     }
 
     /// Open the Optical screen's disc in the disc browser.
+    #[cfg(feature = "optical")]
     pub fn open_disc(&self, src: rusty_backup::controller::optical::DiscSource) {
         self.close();
         let fx = self.ctrl.borrow_mut().open_disc(src);
@@ -689,24 +534,25 @@ impl BrowseView {
         if let Some(last) = lines.last() {
             self.show_notice(Some(last));
         }
-        crate::app::append_log(lines.into_iter().map(|l| (LogLevel::Info, l)).collect());
+        self.ui
+            .log(lines.into_iter().map(|l| (LogLevel::Info, l)).collect());
     }
 
     fn show_notice(&self, text: Option<&str>) {
         let text = text.filter(|t| !t.trim().is_empty());
-        ui::set_text(self.text(C::Notice), text.unwrap_or(""));
+        self.form.set_text(C::Notice, text.unwrap_or(""));
         self.show_if(C::Notice, text.is_some());
         self.show_if(C::NoticeOk, text.is_some());
         self.layout();
     }
 
     fn extract_options(&self) -> ExtractOptions {
-        let i = self.popup(C::Fork).indexOfSelectedItem();
+        let i = self.form.picked(C::Fork).map_or(-1, |i| i as isize);
         let fork_mode = usize::try_from(i)
             .ok()
             .and_then(|i| extract_fork_modes().get(i).copied())
             .unwrap_or(ResourceForkMode::AppleDouble);
-        let mode = usize::try_from(self.popup(C::Prodos).indexOfSelectedItem())
+        let mode = usize::try_from(self.form.picked(C::Prodos).map_or(-1, |i| i as isize))
             .ok()
             .and_then(|i| ProdosExportMode::ALL.get(i).copied());
         ExtractOptions {
@@ -824,16 +670,24 @@ impl BrowseView {
         if view_menu {
             // The key map asked for the View menu: it opens once this refresh is done.
             let me = self.me.clone();
-            crate::app::later(Box::new(move || {
+            self.ui.later(Box::new(move || {
                 if let Some(v) = me.upgrade() {
                     v.view_menu();
                 }
             }));
         }
         if follow && !self.follow_set.replace(true) {
-            let when = dispatch2::DispatchTime::try_from(FOLLOW_DELAY)
-                .unwrap_or(dispatch2::DispatchTime::NOW);
-            let _ = dispatch2::DispatchQueue::main().after(when, crate::app::tick);
+            // The preview follows the cursor once it has rested: a tick after the delay.
+            let me = self.me.clone();
+            let ms = FOLLOW_DELAY.as_millis() as u64;
+            self.ui.after(
+                ms,
+                Box::new(move || {
+                    if let Some(v) = me.upgrade() {
+                        v.tick();
+                    }
+                }),
+            );
         } else if !follow {
             self.follow_set.set(false);
         }
@@ -841,36 +695,15 @@ impl BrowseView {
 
     /// Text wraps at the pane's width; a hex dump keeps its columns and scrolls sideways.
     fn wrap_preview(&self, wrap: bool) {
-        let Some(container) = (unsafe { self.preview.textContainer() }) else {
-            return;
-        };
-        let wide = NSSize::new(1.0e7, 1.0e7);
-        self.preview.setHorizontallyResizable(!wrap);
-        self.preview.setMaxSize(wide);
-        container.setWidthTracksTextView(wrap);
-        let width = match wrap {
-            true => self.preview.frame().size.width,
-            false => wide.width,
-        };
-        container.setContainerSize(NSSize::new(width, wide.height));
+        self.ui
+            .wrap_text_view(self.page, self.form.ctl(C::Preview), wrap);
     }
 
     /// The export bar: its list refilled only when the choices change, its button's target.
     fn show_export(&self, bar: &ExportBar) {
-        let p = self.popup(C::VolumeFormat);
-        let titles: Vec<String> = (0..p.numberOfItems())
-            .filter_map(|i| p.itemTitleAtIndex(i).to_string().into())
-            .collect();
         let labels: Vec<String> = bar.choices.iter().map(|c| c.label.clone()).collect();
-        if titles != labels {
-            p.removeAllItems();
-            for l in &labels {
-                p.addItemWithTitle(&ns(l));
-            }
-        }
-        if p.indexOfSelectedItem() != bar.pick as isize {
-            p.selectItemAtIndex(bar.pick as isize);
-        }
+        self.form.set_items(C::VolumeFormat, &labels);
+        self.form.select(C::VolumeFormat, bar.pick);
         self.set_title(C::ExportVolume, &bar.button);
         self.enable(C::ExportVolume, bar.enabled);
         self.enable(C::VolumeFormat, bar.enabled);
@@ -884,7 +717,7 @@ impl BrowseView {
             .map(|p| p.as_str())
             .filter(|p| !p.is_empty())
             .collect();
-        ui::set_text(self.text(C::Volume), &line.join("    "));
+        self.form.set_text(C::Volume, &line.join("    "));
         self.show_if(C::ExtractAll, s.export_volume && s.loaded);
         self.show_if(C::ExportVolume, s.export_volume && s.loaded);
         self.show_if(C::VolumeFormat, s.export_volume && s.loaded);
@@ -892,17 +725,17 @@ impl BrowseView {
         let (job_text, pct) = s
             .job
             .as_ref()
-            .map(|(j, _)| crate::inspect::job_line(j))
+            .map(|(j, _)| super::jobs::job_line(j))
             .unwrap_or_default();
-        ui::set_text(self.text(C::Job), &job_text);
+        self.form.set_text(C::Job, &job_text);
         self.show_if(C::Job, s.job.is_some());
-        ui::set_progress(&self.progress, s.job.is_some(), pct);
+        self.form.set_progress(C::Progress, s.job.is_some(), pct);
         self.show_if(C::Cancel, s.job.as_ref().is_some_and(|(_, c)| *c));
-        ui::set_text(self.text(C::Message), &s.message);
+        self.form.set_text(C::Message, &s.message);
         self.show_if(C::Message, !s.message.is_empty());
         self.pane.show(s.pane);
         self.show_panel(s.panel_key, s.panel, s.result, s.actions);
-        ui::set_text(self.text(C::Status), &s.status);
+        self.form.set_text(C::Status, &s.status);
         self.show_tools(&s.tools);
         self.show_edit(&s.edit);
         self.show_marks(&s.marks);
@@ -926,14 +759,9 @@ impl BrowseView {
             Some(false) => ("Boot blocks: absent", true),
             None => ("", false),
         };
-        let boot = self.text(C::Boot);
-        ui::set_text(boot, text);
-        let color = if warn {
-            NSColor::systemOrangeColor()
-        } else {
-            NSColor::labelColor()
-        };
-        boot.setTextColor(Some(&color));
+        self.form.set_text(C::Boot, text);
+        self.form
+            .set_tone(C::Boot, if warn { Some(Tone::Warning) } else { None });
         self.show_if(C::Boot, t.boot.is_some());
     }
 
@@ -962,11 +790,9 @@ impl BrowseView {
         if !e.on {
             return;
         }
-        ui::set_text(self.text(C::EditNote), e.copy_note.unwrap_or(""));
+        self.form.set_text(C::EditNote, e.copy_note.unwrap_or(""));
         self.show_if(C::EditNote, e.copy_note.is_some());
-        self.text(C::EditNote)
-            .setTextColor(Some(&NSColor::systemOrangeColor()));
-        ui::set_text(self.text(C::EditTarget), &e.target);
+        self.form.set_text(C::EditTarget, &e.target);
         self.show_if(C::NewFolder, e.caps.new_folder);
         self.enable(C::Rename, e.deletable);
         self.enable(C::Delete, e.deletable);
@@ -986,24 +812,17 @@ impl BrowseView {
         self.enable(C::Apply, e.apply_enabled);
         self.enable(C::Discard, e.discard_enabled);
         self.edits_shown.set(e.edits_shown);
-        ui::set_text(self.text(C::Free), &e.free);
+        self.form.set_text(C::Free, &e.free);
         let (after, tone) = e.after.clone().unzip();
-        let a = self.text(C::After);
-        ui::set_text(a, after.as_deref().unwrap_or(""));
-        let color = match tone {
-            Some(Tone::Warning) => NSColor::systemOrangeColor(),
-            Some(Tone::Error) => NSColor::systemRedColor(),
-            Some(Tone::Success) => NSColor::systemGreenColor(),
-            Some(Tone::Plain) | None => NSColor::labelColor(),
-        };
-        a.setTextColor(Some(&color));
+        self.form.set_text(C::After, after.as_deref().unwrap_or(""));
+        self.form.set_tone(C::After, tone);
     }
 
     fn show_marks(&self, m: &MarkBar) {
         for c in [C::MarkCount, C::MarkClear] {
             self.show_if(c, m.count > 0);
         }
-        ui::set_text(self.text(C::MarkCount), &m.label);
+        self.form.set_text(C::MarkCount, &m.label);
     }
 
     /// Open, keep or close the controller's windows: one per kind, built again when it changes.
@@ -1019,18 +838,24 @@ impl BrowseView {
             let frame = at.map(|i| open.remove(i).frame());
             let me = self.me.clone();
             let kind = p.kind;
+            let ui = self.ui.clone();
             let on_event: Rc<dyn Fn(Event)> = Rc::new(move |e| {
                 if let Some(view) = me.upgrade() {
                     // The window's own handler is still on the stack: act once it returns.
                     let weak = Rc::downgrade(&view);
-                    crate::app::later(Box::new(move || {
+                    ui.later(Box::new(move || {
                         if let Some(view) = weak.upgrade() {
                             view.window_event(kind, e);
                         }
                     }));
                 }
             });
-            open.push(ModelWindow::open(self.mtm, &p, frame, on_event));
+            open.push(ModelWindow::open(
+                self.ui.clone(),
+                &p,
+                frame.flatten(),
+                on_event,
+            ));
         }
     }
 
@@ -1062,7 +887,7 @@ impl BrowseView {
                     self.apply(a);
                 }
             }
-            Event::Copy(text) => crate::effects::copy_text(&text),
+            Event::Copy(text) => self.ui.copy_text(&text),
             Event::Toggle(on) => {
                 self.debug.set(on);
                 self.refresh();
@@ -1091,9 +916,9 @@ impl BrowseView {
         if self.ctrl.borrow().view_menu_shown() {
             self.apply(A::ShowViewMenu(false));
         }
-        let b = self.v(C::View);
-        let at = NSPoint::new(0.0, b.frame().size.height + 2.0);
-        if let Some(a) = track(self.mtm, b, items, at) {
+        let c = self.form.ctl(C::View);
+        let (_, h) = self.ui.control_size(self.page, c);
+        if let Some(a) = track(&*self.ui, self.page, c, items, 0.0, h + 2.0) {
             self.apply(a);
         }
     }
@@ -1138,9 +963,9 @@ impl BrowseView {
                 self.key(key, mods);
             }
             PaneEvent::Sort(col) => self.apply(pane(P::SortBy(col))),
-            PaneEvent::Menu(i, at) => {
+            PaneEvent::Menu(i, x, y) => {
                 if let Some(row) = self.pane.row_at(i) {
-                    self.row_menu(&row, at);
+                    self.row_menu(&row, x, y);
                 }
             }
             PaneEvent::Folder(a) => {
@@ -1152,7 +977,7 @@ impl BrowseView {
     }
 
     /// The right-click menu of `row` at `at` in the list.
-    fn row_menu(&self, row: &rusty_backup::controller::commander::DisplayRow, at: NSPoint) {
+    fn row_menu(&self, row: &rusty_backup::controller::commander::DisplayRow, x: f64, y: f64) {
         let context = self.ctrl.borrow().pane(Side::Left).row_context(row);
         self.apply(A::Focus(Side::Left));
         if let Some(a) = context {
@@ -1168,7 +993,7 @@ impl BrowseView {
         if items.is_empty() {
             return;
         }
-        if let Some(a) = track(self.mtm, self.pane.list_view(), items, at) {
+        if let Some(a) = track(&*self.ui, self.page, self.pane.list_ctl(), items, x, y) {
             self.apply(a);
         }
     }
@@ -1182,24 +1007,24 @@ impl BrowseView {
     ) {
         if key.is_none() {
             for c in [C::Name, C::Facts, C::Note, C::Budget] {
-                ui::set_text(self.text(c), "");
+                self.form.set_text(c, "");
             }
-            self.preview.setString(&ns(""));
+            self.form.set_text_view(C::Preview, "");
         }
         self.panel_key.set(key);
         if let Some(p) = panel {
-            ui::set_text(self.text(C::Name), &p.name);
-            ui::set_text(self.text(C::Facts), &p.facts.join("\n"));
-            ui::set_text(self.text(C::Note), p.note.as_deref().unwrap_or(""));
-            ui::set_text(self.text(C::Budget), &p.budget.join("\n"));
+            self.form.set_text(C::Name, &p.name);
+            self.form.set_text(C::Facts, &p.facts.join("\n"));
+            self.form.set_text(C::Note, p.note.as_deref().unwrap_or(""));
+            self.form.set_text(C::Budget, &p.budget.join("\n"));
             let hex = matches!(p.preview, PanelPreview::Hex(_));
             self.wrap_preview(!hex);
-            self.preview.setString(&ns(&ui::plain(p.preview.text())));
-            self.preview.setTextColor(Some(&NSColor::textColor()));
+            self.form.set_text_view(C::Preview, p.preview.text());
         }
-        ui::set_text(self.text(C::Result), result.as_deref().unwrap_or(""));
+        self.form
+            .set_text(C::Result, result.as_deref().unwrap_or(""));
         for c in [C::Note, C::Budget, C::Result] {
-            let on = !self.text(c).stringValue().to_string().is_empty();
+            let on = !self.form.text(c).is_empty();
             self.show_if(c, on);
         }
         let a = actions.unwrap_or_default();
@@ -1237,26 +1062,14 @@ impl BrowseView {
             }
             return;
         }
-        let panel = NSOpenPanel::openPanel(self.mtm);
-        panel.setMessage(Some(&ns("Select files to add")));
-        panel.setCanChooseFiles(true);
-        panel.setAllowsMultipleSelection(true);
-        if panel.runModal() != objc2_app_kit::NSModalResponseOK {
-            return;
-        }
-        let paths: Vec<PathBuf> = panel
-            .URLs()
-            .iter()
-            .filter_map(|u| u.path())
-            .map(|p| PathBuf::from(p.to_string()))
-            .collect();
+        let paths = self.ui.pick_files("Select files to add");
         if !paths.is_empty() {
             self.apply(A::Pane(Side::Left, P::AddPicked(paths)));
         }
     }
 
     /// A control's action, by the control.
-    fn fired(&self, c: C, _sender: &AnyObject) {
+    fn fired(&self, c: C) {
         if self.sync.active() {
             return;
         }
@@ -1303,7 +1116,7 @@ impl BrowseView {
                 self.apply(A::ExportFromBar(Side::Left));
             }
             C::VolumeFormat => {
-                let at = self.popup(C::VolumeFormat).indexOfSelectedItem();
+                let at = self.form.picked(C::VolumeFormat).map_or(-1, |i| i as isize);
                 if let Ok(choice) = usize::try_from(at) {
                     self.apply(A::PickExport {
                         from: Side::Left,
@@ -1368,9 +1181,9 @@ impl BrowseView {
                 },
             })
             .collect();
-        let b = self.v(C::MacArchive);
-        let at = NSPoint::new(0.0, b.frame().size.height + 2.0);
-        if let Some(export) = track(self.mtm, b, items, at) {
+        let c = self.form.ctl(C::MacArchive);
+        let (_, h) = self.ui.control_size(self.page, c);
+        if let Some(export) = track(&*self.ui, self.page, c, items, 0.0, h + 2.0) {
             let mode = self.extract_options().fork_mode;
             self.apply(A::SetForkMode(mode));
             self.apply(export);
@@ -1441,7 +1254,7 @@ impl BrowseView {
         col.push(line(C::Message));
         // A line of the label font is 16 points; about 46 characters fit across the panel.
         let lines = |c: C| -> i32 {
-            let text = self.text(c).stringValue().to_string();
+            let text = self.form.text(c);
             let n: usize = text
                 .lines()
                 .map(|l| l.chars().count().div_ceil(46).max(1))
@@ -1516,17 +1329,13 @@ impl BrowseView {
         ]));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
         let keep = |c: &C| match c {
-            C::Note | C::Budget | C::Result | C::Facts => {
-                !self.text(*c).stringValue().to_string().is_empty()
-            }
+            C::Note | C::Budget | C::Result | C::Facts => !self.form.text(*c).is_empty(),
             C::Preview | C::Name => true,
             _ => self.shown(*c),
         };
         let Some(tree) = tree.prune(&keep) else {
             return;
         };
-        for (c, r) in layout::layout(&tree, ui::area(&self.page), 96) {
-            ui::move_to(self.v(c), r);
-        }
+        self.form.place(&tree, self.ui.area(self.page));
     }
 }

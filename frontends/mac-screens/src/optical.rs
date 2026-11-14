@@ -11,9 +11,6 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSProgressIndicator, NSView, NSWindow};
 use rusty_backup::controller::app::chd::ChdOptionsControl;
 use rusty_backup::controller::app::{
     busy_elsewhere_notice, physical_devices_available, Notify, RecentHandle, RecentMode,
@@ -27,27 +24,18 @@ use rusty_backup::controller::optical::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::browse::BrowseView;
-use crate::chd::{ChdControl, ChdIds, ChdKey};
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::form::Form;
-use crate::layout::{self, Node, Size};
-use crate::optical_remote::{AddRemoteShown, AddRemoteWindow};
-use crate::report::{self, ReportWindow};
-use crate::sync::SyncGuard;
-use crate::ui::{self, CloseDelegate};
+use super::browse::BrowseView;
+use super::chd::{ChdControl, ChdIds, ChdKey};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::optical_remote::{AddRemoteShown, AddRemoteWindow};
+use super::report::{self, ReportWindow};
+use super::sync::SyncGuard;
 
 /// CHD Info's Close, which the app routes back here by its id.
 pub const CHD_CLOSE: &str = "optical.chd_info.close";
-
-fn progress_of<K: Copy + PartialEq + 'static>(
-    form: &Form<K>,
-    k: K,
-) -> Retained<NSProgressIndicator> {
-    form.v(k)
-        .downcast::<NSProgressIndicator>()
-        .expect("a progress bar")
-}
 
 /// One audio track as the player shows it.
 struct TrackShown {
@@ -75,8 +63,8 @@ enum AK {
 
 /// The CD-DA player window: a Play / Stop button per audio track and the playing one's line.
 struct AudioWindow {
-    window: Retained<NSWindow>,
-    _delegate: Retained<CloseDelegate>,
+    ui: Rc<dyn Host>,
+    window: Surface,
     form: Form<AK>,
     tracks: Vec<u32>,
     playing: RefCell<Vec<u32>>,
@@ -85,30 +73,31 @@ struct AudioWindow {
 
 impl AudioWindow {
     fn open(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
         tracks: &[(u32, String)],
         send: Rc<dyn Fn(OpticalAction)>,
     ) -> Rc<AudioWindow> {
         Rc::new_cyclic(|me: &Weak<AudioWindow>| {
             let close = send.clone();
-            let (window, delegate) = ui::window(
-                mtm,
+            let window = ui.window(
                 "Audio Tracks",
-                560.0,
-                420.0,
+                560,
+                420,
                 Box::new(move || close(OpticalAction::Audio(AudioAction::Close))),
             );
             let resize = me.clone();
-            delegate.on_resize(Box::new(move || {
-                if let Some(w) = resize.upgrade() {
-                    w.layout();
-                }
-            }));
-            let body = window.contentView().expect("the window's content view");
+            ui.on_resize(
+                window,
+                Box::new(move || {
+                    if let Some(w) = resize.upgrade() {
+                        w.layout();
+                    }
+                }),
+            );
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body,
+            let form = Form::with_host(
+                ui.clone(),
+                window,
                 Rc::new(move |k| {
                     if let Some(w) = fire.upgrade() {
                         w.fired(k);
@@ -123,10 +112,10 @@ impl AudioWindow {
                 form.label(AK::Track(*n), idle);
             }
             form.button(AK::Close, "Close", audio_ids::CLOSE);
-            ui::present(&window);
+            ui.present(window);
             AudioWindow {
+                ui: ui.clone(),
                 window,
-                _delegate: delegate,
                 form,
                 tracks: tracks.iter().map(|t| t.0).collect(),
                 playing: RefCell::default(),
@@ -142,7 +131,7 @@ impl AudioWindow {
         let pct = fraction
             .flatten()
             .map(|x| (x.clamp(0.0, 1.0) * 100.0) as u32);
-        ui::set_progress(&progress_of(f, AK::Bar), heading.is_some(), pct);
+        f.set_progress(AK::Bar, heading.is_some(), pct);
         f.line(AK::Error, s.error.as_deref(), Some(Tone::Error));
         let mut playing = Vec::new();
         for t in &s.tracks {
@@ -159,9 +148,6 @@ impl AudioWindow {
     }
 
     fn layout(&self) {
-        let Some(body) = self.window.contentView() else {
-            return;
-        };
         let line = |k: AK| Node::leaf(k, Size::Stretch(1), Size::Fixed(layout::ROW - 4));
         let mut col = vec![
             line(AK::Heading),
@@ -186,7 +172,7 @@ impl AudioWindow {
             Node::button(AK::Close, 90),
         ]));
         let tree = Node::inset(Node::column(col), layout::MARGIN);
-        self.form.place_shown(tree, ui::area(&body));
+        self.form.place_shown(tree, self.ui.area(self.window));
     }
 
     fn fired(&self, k: AK) {
@@ -198,14 +184,14 @@ impl AudioWindow {
         };
         let send = self.send.clone();
         // The window may close with what this sends: act once the handler returns.
-        crate::app::later(Box::new(move || send(OpticalAction::Audio(audio))));
+        self.ui
+            .later(Box::new(move || send(OpticalAction::Audio(audio))));
     }
 }
 
 impl Drop for AudioWindow {
     fn drop(&mut self) {
-        self.window.setDelegate(None);
-        self.window.orderOut(None);
+        self.ui.release(self.window);
     }
 }
 
@@ -252,7 +238,6 @@ enum K {
 }
 
 pub struct OpticalScreen {
-    mtm: MainThreadMarker,
     ctrl: RefCell<OpticalController>,
     host: EffectHost,
     recent: RecentHandle,
@@ -260,7 +245,8 @@ pub struct OpticalScreen {
     busy: Cell<Option<&'static str>>,
     sync: SyncGuard,
     me: Weak<OpticalScreen>,
-    body: Retained<NSView>,
+    ui: Rc<dyn Host>,
+    page: Surface,
     form: Form<K>,
     chd: ChdControl<K>,
     /// The disc browser, which stands in the screen's place while it is open.
@@ -274,19 +260,21 @@ pub struct OpticalScreen {
 }
 
 impl OpticalScreen {
+    /// The screen on `page`; the disc browser gets `browse_page`, which the shell places over it.
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
+        browse_page: Surface,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<OpticalScreen> {
-        let browse = BrowseView::build(mtm, notify.clone(), host.clone(), true);
+        let browse = BrowseView::build(ui.clone(), browse_page, notify.clone(), host.clone(), true);
         let screen = Rc::new_cyclic(|me: &Weak<OpticalScreen>| {
             let fire = me.clone();
-            let form = Form::new(
-                mtm,
-                body.clone(),
+            let form = Form::with_host(
+                ui.clone(),
+                page,
                 Rc::new(move |k| {
                     if let Some(s) = fire.upgrade() {
                         s.fired(k);
@@ -345,7 +333,6 @@ impl OpticalScreen {
             f.button(K::Cancel, "Cancel", ids::CANCEL);
             f.label(K::Why, "");
             OpticalScreen {
-                mtm,
                 ctrl: RefCell::new(OpticalController::new(notify.clone())),
                 host,
                 recent_files: RefCell::new(recent.list(RecentMode::Optical)),
@@ -353,7 +340,8 @@ impl OpticalScreen {
                 busy: Cell::new(None),
                 sync: SyncGuard::default(),
                 me: me.clone(),
-                body,
+                ui: ui.clone(),
+                page,
                 form,
                 chd,
                 browse,
@@ -458,10 +446,10 @@ impl OpticalScreen {
                 HostRequest::CloseBrowser => self.browse.close(),
             }
         }
-        crate::app::append_log(log);
+        self.ui.log(log);
         self.show_windows();
         // Off screen nothing needs it, and a job wakes this many times a second.
-        if !self.body.isHiddenOrHasHiddenAncestor() {
+        if self.ui.on_screen(self.page) {
             self.refresh();
         }
     }
@@ -494,11 +482,7 @@ impl OpticalScreen {
             Some((shown, recent)) => {
                 let held = self.add_remote_window.borrow().clone();
                 let w = held.unwrap_or_else(|| {
-                    let w = AddRemoteWindow::open(
-                        crate::form::AppKitHost::current(),
-                        &recent,
-                        self.send(),
-                    );
+                    let w = AddRemoteWindow::open(self.ui.clone(), &recent, self.send());
                     *self.add_remote_window.borrow_mut() = Some(w.clone());
                     w
                 });
@@ -513,13 +497,20 @@ impl OpticalScreen {
             Some(text) => {
                 if self.chd_window.borrow().is_none() {
                     let send = self.send();
+                    let me = self.me.clone();
+                    let command: Rc<dyn Fn(&str)> = Rc::new(move |id| {
+                        if let Some(s) = me.upgrade() {
+                            s.command(id);
+                        }
+                    });
                     let w = ReportWindow::open(
-                        self.mtm,
+                        self.ui.clone(),
                         "CHD Info",
                         None,
                         None,
                         CHD_CLOSE,
                         Box::new(move || send(OpticalAction::CloseChdInfo)),
+                        command,
                     );
                     *self.chd_window.borrow_mut() = Some(w);
                 }
@@ -551,7 +542,7 @@ impl OpticalScreen {
                 .iter()
                 .map(|t| (t.number, t.idle.clone()))
                 .collect();
-            let w = AudioWindow::open(self.mtm, &list, self.send());
+            let w = AudioWindow::open(self.ui.clone(), &list, self.send());
             *self.audio_window.borrow_mut() = Some(w.clone());
             w
         });
@@ -657,13 +648,10 @@ impl OpticalScreen {
         );
 
         let job = ctrl.detecting();
-        let (text, pct) = job
-            .as_ref()
-            .map(crate::inspect::job_line)
-            .unwrap_or_default();
+        let (text, pct) = job.as_ref().map(super::jobs::job_line).unwrap_or_default();
         f.set_text(K::Job, &text);
         f.show(K::Job, job.is_some());
-        ui::set_progress(&progress_of(f, K::JobProgress), job.is_some(), pct);
+        f.set_progress(K::JobProgress, job.is_some(), pct);
 
         let disc = ctrl.disc();
         let text = match (&disc, ctrl.disc_error()) {
@@ -758,7 +746,7 @@ impl OpticalScreen {
         });
         f.set_text(K::Run, run.as_deref().unwrap_or(""));
         f.show(K::Run, run.is_some());
-        ui::set_progress(&progress_of(f, K::Progress), run.is_some(), pct);
+        f.set_progress(K::Progress, run.is_some(), pct);
         let chd_error = (ctrl.output_format() == OutputFormat::Chd && !self.chd.is_valid())
             .then(|| "Check the CHD options.".to_string());
         let why = ctrl.start_refusal().or(chd_error).or(notice);
@@ -937,7 +925,7 @@ impl OpticalScreen {
         };
         if let Some(a) = action {
             let me = self.me.clone();
-            crate::app::later(Box::new(move || {
+            self.ui.later(Box::new(move || {
                 if let Some(s) = me.upgrade() {
                     s.apply(a);
                 }

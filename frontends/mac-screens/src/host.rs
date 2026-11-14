@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use rusty_backup::controller::commander::Tone;
+use rusty_backup::controller::keys::{Key, Mods};
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
@@ -75,6 +76,79 @@ pub trait Pen {
     fn text_width(&self, text: &str) -> f64;
 }
 
+/// A listing row's icon (`assets/icons/rows`): a file or folder, and whether it opens and is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowIcon {
+    None,
+    File {
+        expandable: bool,
+        expanded: bool,
+    },
+    Folder {
+        expandable: bool,
+        expanded: bool,
+    },
+    /// A folder-tree row: open or shut.
+    TreeFolder {
+        open: bool,
+    },
+}
+
+/// One row of a pane list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowLine {
+    pub cells: Vec<String>,
+    /// Folder levels to indent the first cell by.
+    pub depth: usize,
+    pub icon: RowIcon,
+    /// A tick box before the icon, and its state, when the list marks with them.
+    pub tick: Option<bool>,
+}
+
+/// How a pane list looks: its columns and whether it has a header and takes several rows.
+pub struct RowsSpec {
+    pub columns: Vec<Column>,
+    pub header: bool,
+    pub multiple: bool,
+    pub stripes: bool,
+}
+
+/// What the user did in a pane list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RowsEvent {
+    /// A click or an arrow key moved the selection to `row`, with Cmd and Shift as held.
+    Select { row: usize, cmd: bool, shift: bool },
+    /// The tick box of `row`.
+    Tick(usize),
+    /// The icon of `row`.
+    Icon(usize),
+    /// A double-click.
+    Activate,
+    /// A key the list does not use itself (arrows, paging and Home / End move its selection).
+    Key(Key, Mods),
+    /// A click on column `col`'s header.
+    Header(usize),
+    /// A right-click on `row` at `(x, y)` in the list.
+    Menu { row: usize, x: f64, y: f64 },
+    /// The list took the keyboard focus.
+    Focused,
+}
+
+/// One entry of a context menu. Picks are numbered in the order entries appear, a submenu's
+/// items in its place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        label: String,
+        enabled: bool,
+        checked: bool,
+    },
+    Sub {
+        label: String,
+        items: Vec<String>,
+    },
+}
+
 /// Draws a canvas `w` by `h` points; `dark` is the view's appearance.
 pub type Painter = Rc<dyn Fn(&dyn Pen, f64, f64, bool)>;
 
@@ -136,8 +210,35 @@ pub trait Host {
     fn set_text_view(&self, s: Surface, c: Ctl, text: &str);
     /// Add to its text, scrolling to the end when `follow`.
     fn append_text_view(&self, s: Surface, c: Ctl, text: &str, follow: bool);
+    /// An editable plain-text area in the fixed-width font; typing reports `Edited`.
+    fn text_area(&self, s: Surface, c: Ctl, id: &str, caption: &str);
+    /// A text view's or area's text now.
+    fn text_view_text(&self, s: Surface, c: Ctl) -> String;
 
     fn tooltip(&self, s: Surface, c: Ctl, text: &str);
+    /// A control's size in points, to open a menu under it.
+    fn control_size(&self, s: Surface, c: Ctl) -> (f64, f64);
+    /// A pane list in its scroll view; what the user does goes to `on`.
+    fn rows_view(&self, s: Surface, c: Ctl, id: &str, spec: &RowsSpec, on: Rc<dyn Fn(RowsEvent)>);
+    /// Show `lines`; only a change reloads, so the selection and scroll survive.
+    fn set_row_lines(&self, s: Surface, c: Ctl, lines: &[RowLine]);
+    fn hide_column(&self, s: Surface, c: Ctl, col: usize, hidden: bool);
+    /// Select `rows` as the screen's own change, scrolling `visible` into view.
+    fn select_rows(&self, s: Surface, c: Ctl, rows: &[usize], visible: Option<usize>);
+    /// Give the list the keyboard.
+    fn focus(&self, s: Surface, c: Ctl);
+    /// The rows one page of the list shows, for Page Up and Page Down.
+    fn page_rows(&self, s: Surface, c: Ctl) -> i32;
+    /// Show `items` at `(x, y)` in control `c` and wait; the entry picked, numbered as
+    /// [`MenuEntry`] says.
+    fn menu_at(&self, s: Surface, c: Ctl, items: &[MenuEntry], x: f64, y: f64) -> Option<usize>;
+    /// Wrap a text view's lines at its width, or let them run on and scroll.
+    fn wrap_text_view(&self, s: Surface, c: Ctl, wrap: bool);
+    /// A window's frame on screen `(x, y, w, h)`, to reopen one where it was.
+    fn window_frame(&self, s: Surface) -> Option<(f64, f64, f64, f64)>;
+    fn set_window_frame(&self, s: Surface, frame: (f64, f64, f64, f64));
+    /// Size a window's content and centre it on screen.
+    fn resize_window(&self, s: Surface, w: i32, h: i32);
     /// The visible size of the scroll view a page's surface sits in, if it is in one.
     fn page_viewport(&self, s: Surface) -> Option<(i32, i32)>;
     /// Size a page's surface; taller than its viewport, it scrolls.
@@ -169,17 +270,25 @@ pub trait Host {
 
     /// Run `f` on the main queue after the current event.
     fn later(&self, f: Box<dyn FnOnce()>);
+    /// Run `f` on the main queue `ms` milliseconds from now.
+    fn after(&self, ms: u64, f: Box<dyn FnOnce()>);
     /// Add lines to the app's log.
     fn log(&self, lines: Vec<(LogLevel, String)>);
     /// The transient message under the screens.
     fn status(&self, text: &str);
+    /// The menu bar's recent files and devices, which mirror Inspect's source pull-down.
+    fn menu_sources(&self, recent: &[String], devices: &[String]);
     fn open_url(&self, url: &str);
     fn copy_text(&self, text: &str);
     fn quit(&self);
 
     /// The open or save panel (`spec.save`); `None` when cancelled.
     fn pick(&self, spec: &PickSpec, folder: bool) -> Option<PathBuf>;
+    /// An open panel that takes several files; none when cancelled.
+    fn pick_files(&self, title: &str) -> Vec<PathBuf>;
     fn confirm(&self, spec: &ConfirmSpec) -> bool;
+    /// A question the shell itself asks: the button picked, or `None` for the Cancel it adds.
+    fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize>;
     /// The choice picked; Esc gives `spec.dismiss`.
     fn choose(&self, spec: &ChoiceSpec) -> usize;
     /// A one-line prompt that runs the spec's validator as the user types.

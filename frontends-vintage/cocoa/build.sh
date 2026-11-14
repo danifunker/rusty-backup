@@ -51,6 +51,10 @@ VERSION="$(strings "$APP/Contents/MacOS/Rusty Backup" | grep -m1 -E '^[0-9]+\.[0
 sed "s/@VERSION@/$VERSION/g" "$HERE/host/Info.plist" > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ROOT/assets/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
+# The listing's row icons (Tabler), which the pane lists draw.
+for i in file file-plus file-minus folder folder-plus folder-minus folder-open; do
+    cp "$ROOT/assets/icons/rows/png/$i-32.png" "$APP/Contents/Resources/"
+done
 codesign -s - --force "$APP" 2>/dev/null || true
 
 otool -l "$APP/Contents/MacOS/Rusty Backup" | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' | grep -E 'version|minos' | head -2

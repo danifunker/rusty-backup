@@ -12,7 +12,9 @@ extern void rb_event(uint32_t s, uint32_t c, uint32_t kind);
 extern void rb_window_event(uint32_t s, uint32_t kind);
 extern void rb_later(void);
 extern void rb_tick(void);
+extern void rb_timed(void);
 extern void rb_canvas_draw(uint32_t s, uint32_t c, double w, double h, int dark);
+extern void rb_rows_event(uint32_t s, uint32_t c, uint32_t kind, uint32_t a, uint32_t b, uint32_t mods, double x, double y);
 
 enum { RB_ACT = 0, RB_EDITED = 1, RB_VALUE_SET = 2, RB_SELECTED = 3, RB_ACTIVATED = 4, RB_TOGGLED = 5 };
 
@@ -55,6 +57,15 @@ static BOOL rb_reading = NO;
 - (void)controlTextDidChange:(NSNotification *)note
 {
     rb_event(sid, (uint32_t)[[note object] tag], RB_EDITED);
+}
+
+// A text area's edits: an NSTextView has no tag, so the area's control is looked up.
+- (void)textDidChange:(NSNotification *)note
+{
+    extern int32_t rb_text_area_ctl(uint32_t s, id view);
+    int32_t c = rb_text_area_ctl(sid, [note object]);
+    if (c >= 0)
+        rb_event(sid, (uint32_t)c, RB_EDITED);
 }
 @end
 
@@ -268,6 +279,7 @@ static BOOL rb_painting_dark = NO;
     NSMutableDictionary *views;
     NSMutableDictionary *lists;
     NSMutableDictionary *texts;
+    NSMutableDictionary *rowsv;
     RBTarget *target;
 }
 @end
@@ -282,6 +294,7 @@ static BOOL rb_painting_dark = NO;
     [views release];
     [lists release];
     [texts release];
+    [rowsv release];
     [target release];
     [super dealloc];
 }
@@ -300,6 +313,11 @@ static BOOL rb_painting_dark = NO;
 - (void)tick
 {
     rb_tick();
+}
+
+- (void)timed
+{
+    rb_timed();
 }
 @end
 
@@ -381,6 +399,7 @@ uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
     x->views = [[NSMutableDictionary alloc] init];
     x->lists = [[NSMutableDictionary alloc] init];
     x->texts = [[NSMutableDictionary alloc] init];
+    x->rowsv = [[NSMutableDictionary alloc] init];
     x->target = [[RBTarget alloc] initWithSurface:s];
     x->delegate = [[RBWindowDelegate alloc] initWithSurface:s];
     [x->window setDelegate:(id)x->delegate];
@@ -425,6 +444,11 @@ static RBPoster *poster(void)
 void rb_host_post(void)
 {
     [poster() performSelectorOnMainThread:@selector(run) withObject:nil waitUntilDone:NO];
+}
+
+void rb_host_post_after(uint64_t ms)
+{
+    [poster() performSelector:@selector(timed) withObject:nil afterDelay:ms / 1000.0];
 }
 
 // Safe from any thread: a job's wake arrives on its worker.
@@ -1054,4 +1078,551 @@ int rb_host_on_screen(uint32_t s)
         if ([v isHidden])
             return 0;
     return 1;
+}
+
+// ---- Pane lists: a cell-based table (10.4 has no other) with an indented, iconned name cell.
+
+enum { RB_ROWS_SELECT = 0, RB_ROWS_TICK, RB_ROWS_ICON, RB_ROWS_ACTIVATE, RB_ROWS_KEY, RB_ROWS_HEADER, RB_ROWS_MENU, RB_ROWS_FOCUSED };
+
+// The Tabler row icons bundled in Resources, by the code rows.rs sends.
+static NSImage *rb_row_icon(int code)
+{
+    static NSMutableDictionary *cache = nil;
+    static const char *names[] = { NULL, "file", "file-plus", "file", "file-minus", "folder",
+                                   "folder-plus", "folder", "folder-minus", "folder", "folder-open" };
+    if (code <= 0 || code > 10)
+        return nil;
+    if (cache == nil)
+        cache = [[NSMutableDictionary alloc] init];
+    NSNumber *k = [NSNumber numberWithInt:code];
+    NSImage *img = [cache objectForKey:k];
+    if (img == nil) {
+        NSString *name = [NSString stringWithFormat:@"%s-32", names[code]];
+        NSString *path = [[NSBundle mainBundle] pathForResource:name ofType:@"png"];
+        img = path ? [[[NSImage alloc] initWithContentsOfFile:path] autorelease] : nil;
+        if (img == nil)
+            return nil;
+        [img setSize:NSMakeSize(16, 16)];
+        if ([img respondsToSelector:@selector(setTemplate:)])
+            [img setTemplate:YES];
+        [cache setObject:img forKey:k];
+    }
+    return img;
+}
+
+static uint32_t rb_mods(NSUInteger f)
+{
+    return ((f & NSCommandKeyMask) ? 1 : 0) | ((f & NSShiftKeyMask) ? 2 : 0)
+         | ((f & NSControlKeyMask) ? 4 : 0) | ((f & NSAlternateKeyMask) ? 8 : 0);
+}
+
+// The name cell: indented by depth, the row icon, then the name.
+@interface RBNameCell : NSTextFieldCell
+{
+@public
+    int depth;
+    int icon;
+}
+@end
+
+@implementation RBNameCell
+- (void)drawWithFrame:(NSRect)frame inView:(NSView *)view
+{
+    NSRect r = frame;
+    r.origin.x += 2 + 16 * depth;
+    r.size.width -= 2 + 16 * depth;
+    NSImage *img = rb_row_icon(icon);
+    if (img != nil) {
+        NSRect at = NSMakeRect(r.origin.x, r.origin.y + (r.size.height - 16) / 2, 16, 16);
+        SEL modern = @selector(drawInRect:fromRect:operation:fraction:respectFlipped:hints:);
+        if ([img respondsToSelector:modern]) {
+            NSMethodSignature *sig = [img methodSignatureForSelector:modern];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            NSRect zero = NSZeroRect;
+            NSCompositingOperation op = NSCompositeSourceOver;
+            CGFloat fraction = 1.0;
+            BOOL flip = YES;
+            id hints = nil;
+            [inv setSelector:modern];
+            [inv setArgument:&at atIndex:2];
+            [inv setArgument:&zero atIndex:3];
+            [inv setArgument:&op atIndex:4];
+            [inv setArgument:&fraction atIndex:5];
+            [inv setArgument:&flip atIndex:6];
+            [inv setArgument:&hints atIndex:7];
+            [inv invokeWithTarget:img];
+        } else {
+            [img setFlipped:[view isFlipped]];
+            [img drawInRect:at fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1.0];
+        }
+        r.origin.x += 20;
+        r.size.width -= 20;
+    }
+    [super drawWithFrame:r inView:view];
+}
+@end
+
+@class RBRows;
+
+// A table that hands its owner the keys it does not use, right-clicks and icon clicks.
+@interface RBRowsTable : NSTableView
+{
+@public
+    RBRows *owner;
+}
+@end
+
+@interface RBRows : NSObject
+{
+@public
+    uint32_t sid;
+    uint32_t ctl;
+    RBRowsTable *table;
+    NSScrollView *scroll;
+    NSTableColumn *tick_col;
+    NSTableColumn *name_col;
+    NSArray *right;
+    NSMutableArray *cells;
+    NSMutableArray *depths;
+    NSMutableArray *icons;
+    NSMutableArray *ticks;
+    BOOL quiet;
+}
+@end
+
+@implementation RBRowsTable
+- (void)keyDown:(NSEvent *)e
+{
+    unsigned short code = [e keyCode];
+    // Arrows, Page Up / Down, Home and End move the table's own selection.
+    if (code == 125 || code == 126 || code == 116 || code == 121 || code == 115 || code == 119) {
+        [super keyDown:e];
+        return;
+    }
+    NSString *ch = [e charactersIgnoringModifiers];
+    unichar u = [ch length] > 0 ? [ch characterAtIndex:0] : 0;
+    rb_rows_event(owner->sid, owner->ctl, RB_ROWS_KEY, code, u, rb_mods([e modifierFlags]), 0, 0);
+}
+
+- (BOOL)becomeFirstResponder
+{
+    BOOL took = [super becomeFirstResponder];
+    if (took)
+        rb_rows_event(owner->sid, owner->ctl, RB_ROWS_FOCUSED, 0, 0, 0, 0, 0);
+    return took;
+}
+
+- (void)rightMouseDown:(NSEvent *)e
+{
+    NSPoint at = [self convertPoint:[e locationInWindow] fromView:nil];
+    NSInteger row = [self rowAtPoint:at];
+    if (row >= 0)
+        rb_rows_event(owner->sid, owner->ctl, RB_ROWS_MENU, (uint32_t)row, 0, 0, at.x, at.y);
+}
+
+// A click on a row's icon opens or shuts it, as the icon button does on AppKit's list.
+- (void)mouseDown:(NSEvent *)e
+{
+    NSPoint at = [self convertPoint:[e locationInWindow] fromView:nil];
+    NSInteger row = [self rowAtPoint:at];
+    NSInteger col = [self columnAtPoint:at];
+    if (row >= 0 && col >= 0 && [[self tableColumns] objectAtIndex:col] == owner->name_col
+        && row < (NSInteger)[owner->icons count] && [[owner->icons objectAtIndex:row] intValue] != 0) {
+        NSRect cell = [self frameOfCellAtColumn:col row:row];
+        double x0 = cell.origin.x + 2 + 16 * [[owner->depths objectAtIndex:row] intValue];
+        if (at.x >= x0 && at.x < x0 + 18) {
+            rb_rows_event(owner->sid, owner->ctl, RB_ROWS_ICON, (uint32_t)row, 0, 0, 0, 0);
+            return;
+        }
+    }
+    [super mouseDown:e];
+}
+@end
+
+@implementation RBRows
+- (void)dealloc
+{
+    [table setDataSource:nil];
+    [table setDelegate:nil];
+    [table release];
+    [scroll release];
+    [tick_col release];
+    [name_col release];
+    [right release];
+    [cells release];
+    [depths release];
+    [icons release];
+    [ticks release];
+    [super dealloc];
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)view
+{
+    return (NSInteger)[cells count];
+}
+
+- (id)tableView:(NSTableView *)view objectValueForTableColumn:(NSTableColumn *)col row:(NSInteger)row
+{
+    if (col == tick_col)
+        return [ticks objectAtIndex:row];
+    NSArray *line = [cells objectAtIndex:row];
+    int i = [[col identifier] intValue];
+    return i < (int)[line count] ? [line objectAtIndex:i] : @"";
+}
+
+- (void)tableView:(NSTableView *)view setObjectValue:(id)value forTableColumn:(NSTableColumn *)col row:(NSInteger)row
+{
+    if (col == tick_col)
+        rb_rows_event(sid, ctl, RB_ROWS_TICK, (uint32_t)row, 0, 0, 0, 0);
+}
+
+- (void)tableView:(NSTableView *)view willDisplayCell:(id)cell forTableColumn:(NSTableColumn *)col row:(NSInteger)row
+{
+    if (col == tick_col)
+        return;
+    if (col == name_col && [cell isKindOfClass:[RBNameCell class]]) {
+        ((RBNameCell *)cell)->depth = [[depths objectAtIndex:row] intValue];
+        ((RBNameCell *)cell)->icon = [[icons objectAtIndex:row] intValue];
+    }
+    int i = [[col identifier] intValue];
+    BOOL r = i < (int)[right count] && [[right objectAtIndex:i] boolValue];
+    [cell setAlignment:(r ? NSRightTextAlignment : NSLeftTextAlignment)];
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)note
+{
+    if (quiet)
+        return;
+    NSInteger row = [table clickedRow];
+    if (row < 0)
+        row = [table selectedRow];
+    if (row < 0)
+        return;
+    NSEvent *e = [NSApp currentEvent];
+    rb_rows_event(sid, ctl, RB_ROWS_SELECT, (uint32_t)row, 0, e ? rb_mods([e modifierFlags]) : 0, 0, 0);
+}
+
+- (void)tableView:(NSTableView *)view didClickTableColumn:(NSTableColumn *)col
+{
+    if (col != tick_col)
+        rb_rows_event(sid, ctl, RB_ROWS_HEADER, (uint32_t)[[col identifier] intValue], 0, 0, 0, 0);
+}
+
+- (void)activate:(id)sender
+{
+    rb_rows_event(sid, ctl, RB_ROWS_ACTIVATE, 0, 0, 0, 0, 0);
+}
+@end
+
+static RBRows *rows_of(uint32_t s, uint32_t c)
+{
+    return [surf(s)->rowsv objectForKey:key(c)];
+}
+
+void rb_host_rows(uint32_t s, uint32_t c, const char *ax_id, const char *const *titles,
+                  const double *widths, const uint8_t *right, uint32_t n, int header, int multiple, int stripes)
+{
+    RBRows *r = [[[RBRows alloc] init] autorelease];
+    r->sid = s;
+    r->ctl = c;
+    r->cells = [[NSMutableArray alloc] init];
+    r->depths = [[NSMutableArray alloc] init];
+    r->icons = [[NSMutableArray alloc] init];
+    r->ticks = [[NSMutableArray alloc] init];
+    r->table = [[RBRowsTable alloc] initWithFrame:NSZeroRect];
+    r->table->owner = r;
+    NSMutableArray *ra = [NSMutableArray array];
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        NSTableColumn *col = [[[NSTableColumn alloc] initWithIdentifier:[NSString stringWithFormat:@"%u", i]] autorelease];
+        [[col headerCell] setStringValue:str(titles[i])];
+        [col setWidth:widths[i]];
+        [col setEditable:NO];
+        if (i == 0) {
+            RBNameCell *cell = [[[RBNameCell alloc] initTextCell:@""] autorelease];
+            [cell setLineBreakMode:NSLineBreakByTruncatingTail];
+            [col setDataCell:cell];
+            r->name_col = [col retain];
+        }
+        [r->table addTableColumn:col];
+        [ra addObject:[NSNumber numberWithBool:(right[i] ? YES : NO)]];
+    }
+    r->right = [ra retain];
+    NSTableColumn *tc = [[NSTableColumn alloc] initWithIdentifier:@"check"];
+    NSButtonCell *bc = [[[NSButtonCell alloc] init] autorelease];
+    [bc setButtonType:NSSwitchButton];
+    [bc setTitle:@""];
+    [tc setDataCell:bc];
+    [tc setWidth:22];
+    [[tc headerCell] setStringValue:@""];
+    r->tick_col = tc;
+    if (!header)
+        [r->table setHeaderView:nil];
+    [r->table setUsesAlternatingRowBackgroundColors:(stripes ? YES : NO)];
+    [r->table setAllowsMultipleSelection:(multiple ? YES : NO)];
+    [r->table setAllowsEmptySelection:YES];
+    [r->table setDataSource:(id)r];
+    [r->table setDelegate:(id)r];
+    [r->table setTarget:r];
+    [r->table setDoubleAction:@selector(activate:)];
+    set_id(r->table, ax_id);
+    r->scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    [r->scroll setHasVerticalScroller:YES];
+    [r->scroll setHasHorizontalScroller:YES];
+    [r->scroll setAutohidesScrollers:YES];
+    [r->scroll setBorderType:NSBezelBorder];
+    [r->scroll setDocumentView:r->table];
+    [surf(s)->rowsv setObject:r forKey:key(c)];
+    adopt(s, c, r->scroll, NO);
+}
+
+void rb_host_set_row_lines(uint32_t s, uint32_t c, const char *const *cells, uint32_t nrows, uint32_t ncols,
+                           const uint32_t *depth, const uint8_t *icon, const int8_t *tick)
+{
+    RBRows *r = rows_of(s, c);
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:nrows];
+    NSMutableArray *ds = [NSMutableArray arrayWithCapacity:nrows];
+    NSMutableArray *is = [NSMutableArray arrayWithCapacity:nrows];
+    NSMutableArray *ts = [NSMutableArray arrayWithCapacity:nrows];
+    BOOL any_tick = NO;
+    uint32_t i, k;
+    for (i = 0; i < nrows; i++) {
+        NSMutableArray *line = [NSMutableArray arrayWithCapacity:ncols];
+        for (k = 0; k < ncols; k++)
+            [line addObject:str(cells[i * ncols + k])];
+        [rows addObject:line];
+        [ds addObject:[NSNumber numberWithInt:depth[i]]];
+        [is addObject:[NSNumber numberWithInt:icon[i]]];
+        [ts addObject:[NSNumber numberWithBool:(tick[i] > 0)]];
+        any_tick = any_tick || tick[i] >= 0;
+    }
+    if ([rows isEqualToArray:r->cells] && [ds isEqualToArray:r->depths] && [is isEqualToArray:r->icons]
+        && [ts isEqualToArray:r->ticks])
+        return;
+    [r->cells setArray:rows];
+    [r->depths setArray:ds];
+    [r->icons setArray:is];
+    [r->ticks setArray:ts];
+    BOOL has = [[r->table tableColumns] indexOfObject:r->tick_col] != NSNotFound;
+    if (any_tick && !has) {
+        [r->table addTableColumn:r->tick_col];
+        [r->table moveColumn:[[r->table tableColumns] count] - 1 toColumn:0];
+    } else if (!any_tick && has) {
+        [r->table removeTableColumn:r->tick_col];
+    }
+    r->quiet = YES;
+    [r->table reloadData];
+    r->quiet = NO;
+}
+
+void rb_host_hide_column(uint32_t s, uint32_t c, uint32_t col, int hidden)
+{
+    RBRows *r = rows_of(s, c);
+    NSTableColumn *tc = [r->table tableColumnWithIdentifier:[NSString stringWithFormat:@"%u", col]];
+    if (tc == nil)
+        return;
+    if ([tc respondsToSelector:@selector(setHidden:)]) {
+        BOOL h = hidden ? YES : NO;
+        NSMethodSignature *sig = [tc methodSignatureForSelector:@selector(setHidden:)];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv setSelector:@selector(setHidden:)];
+        [inv setArgument:&h atIndex:2];
+        [inv invokeWithTarget:tc];
+    } else {
+        [tc setWidth:(hidden ? 0 : 80)];
+    }
+}
+
+void rb_host_select_rows(uint32_t s, uint32_t c, const uint32_t *rows, uint32_t n, int32_t visible)
+{
+    RBRows *r = rows_of(s, c);
+    NSMutableIndexSet *set = [NSMutableIndexSet indexSet];
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (rows[i] < [r->cells count])
+            [set addIndex:rows[i]];
+    r->quiet = YES;
+    if (![[r->table selectedRowIndexes] isEqualToIndexSet:set])
+        [r->table selectRowIndexes:set byExtendingSelection:NO];
+    if (visible >= 0 && visible < (int32_t)[r->cells count])
+        [r->table scrollRowToVisible:visible];
+    r->quiet = NO;
+}
+
+void rb_host_focus(uint32_t s, uint32_t c)
+{
+    RBRows *r = rows_of(s, c);
+    NSView *v = r != nil ? (NSView *)r->table : (NSView *)view(s, c);
+    [[v window] makeFirstResponder:v];
+}
+
+int32_t rb_host_page_rows(uint32_t s, uint32_t c)
+{
+    RBRows *r = rows_of(s, c);
+    double visible = [r->scroll contentSize].height;
+    double row = [r->table rowHeight] + [r->table intercellSpacing].height;
+    int32_t n = (int32_t)(visible / (row > 1 ? row : 1));
+    return n > 1 ? n : 1;
+}
+
+void rb_host_control_size(uint32_t s, uint32_t c, double *out)
+{
+    NSRect f = [(NSView *)view(s, c) frame];
+    out[0] = f.size.width;
+    out[1] = f.size.height;
+}
+
+// The menu's pick, kept by its items' target until the menu closes.
+@interface RBMenuTarget : NSObject
+{
+@public
+    NSInteger picked;
+}
+@end
+
+@implementation RBMenuTarget
+- (void)pick:(id)sender
+{
+    picked = [sender tag];
+}
+@end
+
+int32_t rb_host_menu_at(uint32_t s, uint32_t c, const char *const *labels, const uint8_t *kinds, uint32_t n,
+                        double x, double y)
+{
+    RBMenuTarget *t = [[[RBMenuTarget alloc] init] autorelease];
+    t->picked = -1;
+    NSMenu *menu = [[[NSMenu alloc] initWithTitle:@""] autorelease];
+    [menu setAutoenablesItems:NO];
+    NSMenu *into = menu;
+    NSInteger next = 0;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        if (kinds[i] == 3) {
+            NSMenu *sub = [[[NSMenu alloc] initWithTitle:str(labels[i])] autorelease];
+            [sub setAutoenablesItems:NO];
+            NSMenuItem *holder = [[[NSMenuItem alloc] initWithTitle:str(labels[i]) action:NULL keyEquivalent:@""] autorelease];
+            [holder setSubmenu:sub];
+            [menu addItem:holder];
+            into = sub;
+            continue;
+        }
+        if (kinds[i] == 5) {
+            into = menu;
+            continue;
+        }
+        NSMenuItem *it = [[[NSMenuItem alloc] initWithTitle:str(labels[i]) action:@selector(pick:) keyEquivalent:@""] autorelease];
+        [it setTarget:t];
+        [it setTag:next++];
+        [it setEnabled:(kinds[i] != 1)];
+        if (kinds[i] == 2)
+            [it setState:NSOnState];
+        [into addItem:it];
+    }
+    RBRows *r = rows_of(s, c);
+    NSView *v = r != nil ? (NSView *)r->table : (NSView *)view(s, c);
+    SEL modern = @selector(popUpMenuPositioningItem:atLocation:inView:);
+    if ([menu respondsToSelector:modern]) {
+        NSMethodSignature *sig = [menu methodSignatureForSelector:modern];
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        id item = nil;
+        NSPoint at = NSMakePoint(x, y);
+        [inv setSelector:modern];
+        [inv setArgument:&item atIndex:2];
+        [inv setArgument:&at atIndex:3];
+        [inv setArgument:&v atIndex:4];
+        [inv invokeWithTarget:menu];
+    } else {
+        NSEvent *e = [NSApp currentEvent];
+        if (e != nil)
+            [NSMenu popUpContextMenu:menu withEvent:e forView:v];
+    }
+    return (int32_t)t->picked;
+}
+
+void rb_host_wrap_text_view(uint32_t s, uint32_t c, int wrap)
+{
+    NSTextView *t = [surf(s)->texts objectForKey:key(c)];
+    NSTextContainer *tc = [t textContainer];
+    NSSize wide = NSMakeSize(1.0e7, 1.0e7);
+    [t setHorizontallyResizable:(wrap ? NO : YES)];
+    [t setMaxSize:wide];
+    [tc setWidthTracksTextView:(wrap ? YES : NO)];
+    [tc setContainerSize:NSMakeSize(wrap ? [t frame].size.width : wide.width, wide.height)];
+}
+
+int rb_host_window_frame(uint32_t s, double *out)
+{
+    NSWindow *w = surf(s)->window;
+    if (w == nil)
+        return 0;
+    NSRect f = [w frame];
+    out[0] = f.origin.x;
+    out[1] = f.origin.y;
+    out[2] = f.size.width;
+    out[3] = f.size.height;
+    return 1;
+}
+
+void rb_host_set_window_frame(uint32_t s, double x, double y, double w, double h)
+{
+    [surf(s)->window setFrame:NSMakeRect(x, y, w, h) display:YES];
+}
+
+// Several files, joined by newlines; empty when cancelled.
+char *rb_host_pick_files(const char *title)
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    [panel setMessage:str(title)];
+    [panel setCanChooseFiles:YES];
+    [panel setCanChooseDirectories:NO];
+    [panel setAllowsMultipleSelection:YES];
+    if ([panel runModalForDirectory:nil file:nil types:nil] != NSOKButton)
+        return dup_str(@"");
+    return dup_str([[panel filenames] componentsJoinedByString:@"\n"]);
+}
+
+// The control a text view is, on surface `s`; -1 if it is none of them.
+int32_t rb_text_area_ctl(uint32_t s, id v)
+{
+    NSDictionary *texts = surf(s)->texts;
+    NSEnumerator *e = [texts keyEnumerator];
+    NSNumber *k;
+    while ((k = [e nextObject]) != nil)
+        if ([texts objectForKey:k] == v)
+            return [k intValue];
+    return -1;
+}
+
+void rb_host_text_area(uint32_t s, uint32_t c, const char *ax_id, const char *caption)
+{
+    NSRect frame = NSMakeRect(0, 0, 400, 160);
+    NSScrollView *scroll = [[[NSScrollView alloc] initWithFrame:frame] autorelease];
+    [scroll setHasVerticalScroller:YES];
+    [scroll setBorderType:NSBezelBorder];
+    NSTextView *t = [[[NSTextView alloc] initWithFrame:frame] autorelease];
+    [t setEditable:YES];
+    [t setRichText:NO];
+    [t setVerticallyResizable:YES];
+    [t setAutoresizingMask:NSViewWidthSizable];
+    [t setFont:rb_log_font()];
+    set_id(t, ax_id);
+    [t accessibilitySetOverrideValue:str(caption) forAttribute:NSAccessibilityDescriptionAttribute];
+    [t setDelegate:(id)surf(s)->target];
+    [scroll setDocumentView:t];
+    [surf(s)->texts setObject:t forKey:key(c)];
+    adopt(s, c, scroll, NO);
+}
+
+char *rb_host_text_view_text(uint32_t s, uint32_t c)
+{
+    NSTextView *t = [surf(s)->texts objectForKey:key(c)];
+    return dup_str(t != nil ? [t string] : @"");
+}
+
+void rb_host_resize_window(uint32_t s, int32_t w, int32_t h)
+{
+    NSWindow *win = surf(s)->window;
+    [win setContentSize:NSMakeSize(w, h)];
+    [win center];
 }

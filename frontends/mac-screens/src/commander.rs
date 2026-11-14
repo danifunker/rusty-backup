@@ -1,25 +1,16 @@
 //! Commander Mode: two browser panes that take over the window, on one `CommanderController`.
 //!
 //! The Win32 shell's `commander.rs` is the reference. Each side is a [`SideView`]: its source,
-//! volume and path rows (`side_bars`) over the same [`PaneView`] Inspect's browse view uses;
-//! between them is the copy column (`copy_column`). Every window comes from the controller
-//! (`side_windows` for each side, `screen_windows`) through [`ModelWindow`]. Every control's action
-//! comes to [`CommanderScreen::fired`] by its tag: the side, then the control.
+//! volume and path rows over the same [`PaneView`] Inspect's browse view uses; between them is the
+//! copy column. Every window comes from the controller (`side_windows` for each side,
+//! `screen_windows`) through [`ModelWindow`]. Every control reports to
+//! [`CommanderScreen::fired`] by its [`Leaf`]: the side and the control, or the screen's own.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, Message};
-use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSPopUpButton, NSProgressIndicator, NSScrollView, NSSecureTextField, NSTextField, NSTextView,
-    NSView,
-};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::commander::{
     ids, BrowserPaneAction as P, CommanderAction as A, CommanderController, CopyColumn, DropPlan,
@@ -29,13 +20,14 @@ use rusty_backup::controller::commander::{
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::layout::{self, Node, Size};
-use crate::model_window::{Event, ModelWindow};
-use crate::pane_view::{PaneEvent, PaneShown, PaneView};
-use crate::popup::{track, MenuItem};
-use crate::sync::SyncGuard;
-use crate::ui::{self, ns, Callback};
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::layout::{self, Node, Size};
+use super::model_window::{Event, ModelWindow};
+use super::pane_view::{PaneEvent, PaneShown, PaneView};
+use super::popup::{track, MenuItem};
+use super::sync::SyncGuard;
 
 const SIDES: [Side; 2] = [Side::Left, Side::Right];
 
@@ -61,7 +53,7 @@ fn new_controller(jobs: &JobRegistry, notify: &Arc<dyn Notify>) -> CommanderCont
     ctl
 }
 
-/// A side's controls, as tags and places in the layout.
+/// A side's controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum S {
     Source,
@@ -80,7 +72,6 @@ enum S {
     Apply,
     Discard,
     Edits,
-    Path,
     Job,
     Progress,
     CancelOpen,
@@ -92,36 +83,6 @@ enum S {
     Tree,
     List,
 }
-
-const SIDE_ALL: [S; 27] = [
-    S::Source,
-    S::OpenFile,
-    S::OpenFolder,
-    S::OpenBackup,
-    S::Connect,
-    S::Close,
-    S::CloseImage,
-    S::Partition,
-    S::NoParts,
-    S::Title,
-    S::Free,
-    S::ReadOnly,
-    S::NewFolder,
-    S::Apply,
-    S::Discard,
-    S::Edits,
-    S::Path,
-    S::Job,
-    S::Progress,
-    S::CancelOpen,
-    S::UnlockNote,
-    S::Password,
-    S::Unlock,
-    S::QuickHint,
-    S::Quick,
-    S::Tree,
-    S::List,
-];
 
 /// The screen's own controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,52 +106,21 @@ enum T {
     Status,
 }
 
-const TOP_ALL: [T; 17] = [
-    T::Title,
-    T::View,
-    T::Log,
-    T::Close,
-    T::CopyJob,
-    T::CopyProgress,
-    T::CancelCopy,
-    T::Ltr,
-    T::Rtl,
-    T::Delete,
-    T::Compare,
-    T::KeepDates,
-    T::FormatCaption,
-    T::Format,
-    T::ForkCaption,
-    T::Fork,
-    T::Status,
-];
-
-/// A layout leaf: a side's control or the screen's.
+/// A control on the page: a side's, a side's path crumb or recent source, or the screen's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Leaf {
     Side(usize, S),
+    Crumb(usize, usize),
+    Recent(usize, usize),
     Top(T),
-}
-
-/// Tags: a side's control is 1000 * (side + 1) + its place; the screen's is its place; a path
-/// crumb is 10000 * (side + 1) + its place.
-fn side_tag(side: usize, s: S) -> isize {
-    1000 * (side as isize + 1) + SIDE_ALL.iter().position(|x| *x == s).unwrap_or(0) as isize
-}
-
-fn top_tag(t: T) -> isize {
-    TOP_ALL.iter().position(|x| *x == t).unwrap_or(0) as isize
 }
 
 /// One side: its bars, its job line, the unlock row and the listing (or the other side's quick view).
 struct SideView {
     side: Side,
-    views: Vec<(S, Retained<NSView>)>,
-    crumbs: RefCell<Vec<(Retained<NSButton>, Option<String>)>>,
-    path: Retained<NSView>,
-    quick: Retained<NSTextView>,
-    progress: Retained<NSProgressIndicator>,
     pane: PaneView,
+    /// Each crumb's label and target folder; the crumbs' buttons are rebuilt with the path.
+    crumbs: RefCell<Vec<(String, Option<String>)>>,
     bars: RefCell<Option<SideBars>>,
     edits_open: Cell<bool>,
 }
@@ -202,128 +132,52 @@ struct SideShown {
     pane: PaneShown,
 }
 
-fn as_view<T: AsRef<NSView>>(v: &T) -> Retained<NSView> {
-    v.as_ref().retain()
-}
-
 impl SideView {
-    fn build(mtm: MainThreadMarker, page: &NSView, target: &Callback, side: Side) -> SideView {
+    fn build(f: &Form<Leaf>, side: Side) -> SideView {
         let names = match side {
             Side::Left => ids::LEFT,
             Side::Right => ids::RIGHT,
         };
         let i = idx(side);
-        let mut views: Vec<(S, Retained<NSView>)> = Vec::new();
-        let mut add = |s: S, v: Retained<NSView>| {
-            if let Some(c) = v.downcast_ref::<NSControl>() {
-                c.setTag(side_tag(i, s));
-                if c.downcast_ref::<NSTextField>().is_none()
-                    || c.downcast_ref::<NSSecureTextField>().is_some()
-                {
-                    ui::hook(c, target);
-                }
-            }
-            page.addSubview(&v);
-            views.push((s, v));
-        };
-        let button = |title: &str, id: &str| as_view(&ui::button(mtm, title, id));
-        let label = |text: &str| as_view(&ui::label(mtm, text));
-        let source = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, true);
-        ui::set_id(&source, names.source);
-        add(S::Source, as_view(&source));
-        add(S::OpenFile, button("File...", names.open_file));
-        add(S::OpenFolder, button("Folder...", names.open_folder));
-        add(S::OpenBackup, button("Backup...", names.open_backup));
-        add(S::Connect, button("Remote...", names.connect));
-        add(S::Close, button("Close", names.close));
-        add(S::CloseImage, button("Close image", names.close_image));
-        let partition = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, false);
-        ui::set_id(&partition, names.partition);
-        add(S::Partition, as_view(&partition));
-        add(S::NoParts, label(""));
-        add(S::Title, label(""));
-        add(S::Free, label(""));
-        add(S::ReadOnly, label("Read-only"));
-        add(S::NewFolder, button("New Folder...", names.new_folder));
-        add(S::Apply, button("Apply", names.apply));
-        add(S::Discard, button("Discard", names.discard));
-        add(S::Edits, button("Edits", names.edits));
-        let path = ui::flipped(mtm);
-        add(S::Path, path.clone());
-        add(S::Job, label(""));
-        let progress = ui::progress(mtm);
-        add(S::Progress, as_view(&progress));
-        add(S::CancelOpen, button("Cancel", names.cancel_open));
-        let note = ui::label(mtm, "");
-        note.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
-        add(S::UnlockNote, as_view(&note));
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 22.0));
-        let password = NSSecureTextField::initWithFrame(mtm.alloc(), frame);
-        password.setAccessibilityLabel(Some(&ns("Password")));
-        add(S::Password, as_view(&password));
-        add(S::Unlock, button("Unlock", names.unlock));
-        add(S::QuickHint, label(""));
-        let scroll = NSScrollView::initWithFrame(mtm.alloc(), frame);
-        scroll.setHasVerticalScroller(true);
-        scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
-        let quick = NSTextView::initWithFrame(mtm.alloc(), frame);
-        quick.setEditable(false);
-        quick.setFont(Some(&crate::app::log_font()));
-        quick.setTextColor(Some(&NSColor::textColor()));
-        scroll.setDocumentView(Some(&quick));
-        add(S::Quick, as_view(&scroll));
-        let pane = PaneView::build(mtm, side, names.list, "");
-        add(S::Tree, as_view(&pane.tree_scroll));
-        add(S::List, as_view(&pane.list_scroll));
-        let view = SideView {
+        let l = |s: S| Leaf::Side(i, s);
+        f.pulldown(l(S::Source), names.source);
+        f.button(l(S::OpenFile), "File...", names.open_file);
+        f.button(l(S::OpenFolder), "Folder...", names.open_folder);
+        f.button(l(S::OpenBackup), "Backup...", names.open_backup);
+        f.button(l(S::Connect), "Remote...", names.connect);
+        f.button(l(S::Close), "Close", names.close);
+        f.button(l(S::CloseImage), "Close image", names.close_image);
+        f.popup(l(S::Partition), &[], names.partition);
+        f.label(l(S::NoParts), "");
+        f.label(l(S::Title), "");
+        f.label(l(S::Free), "");
+        f.label(l(S::ReadOnly), "Read-only");
+        f.button(l(S::NewFolder), "New Folder...", names.new_folder);
+        f.button(l(S::Apply), "Apply", names.apply);
+        f.button(l(S::Discard), "Discard", names.discard);
+        f.button(l(S::Edits), "Edits", names.edits);
+        f.label(l(S::Job), "");
+        f.progress(l(S::Progress));
+        f.button(l(S::CancelOpen), "Cancel", names.cancel_open);
+        f.wrap(l(S::UnlockNote), "");
+        f.field(l(S::Password), "", "Password", true);
+        f.button(l(S::Unlock), "Unlock", names.unlock);
+        f.label(l(S::QuickHint), "");
+        f.text_view(l(S::Quick), "");
+        let pane = PaneView::build(f, l(S::List), l(S::Tree), side, names.list, "");
+        f.show(l(S::Quick), false);
+        f.show(l(S::QuickHint), false);
+        SideView {
             side,
-            views,
-            crumbs: RefCell::default(),
-            path,
-            quick,
-            progress,
             pane,
+            crumbs: RefCell::default(),
             bars: RefCell::default(),
             edits_open: Cell::new(false),
-        };
-        view.show_if(S::Quick, false);
-        view.show_if(S::QuickHint, false);
-        view
-    }
-
-    fn v(&self, s: S) -> &NSView {
-        self.views
-            .iter()
-            .find(|(x, _)| *x == s)
-            .map(|(_, v)| &**v)
-            .expect("every control is built")
-    }
-
-    fn text(&self, s: S) -> &NSTextField {
-        self.v(s).downcast_ref::<NSTextField>().expect("a label")
-    }
-
-    fn button(&self, s: S) -> &NSButton {
-        self.v(s).downcast_ref::<NSButton>().expect("a button")
-    }
-
-    fn popup(&self, s: S) -> &NSPopUpButton {
-        self.v(s).downcast_ref::<NSPopUpButton>().expect("a pop-up")
-    }
-
-    fn show_if(&self, s: S, on: bool) {
-        ui::set_visible(self.v(s), on);
-    }
-
-    fn shown(&self, s: S) -> bool {
-        ui::shown(self.v(s))
-    }
-
-    fn set_title(&self, s: S, t: &str) {
-        let b = self.button(s);
-        if b.title().to_string() != t {
-            b.setTitle(&ns(t));
         }
+    }
+
+    fn l(&self, s: S) -> Leaf {
+        Leaf::Side(idx(self.side), s)
     }
 
     fn read(&self, ctl: &CommanderController) -> SideShown {
@@ -344,139 +198,104 @@ impl SideView {
     }
 
     /// Show `s`; true when the bars changed, so the screen lays out again.
-    fn show(&self, mtm: MainThreadMarker, target: &Callback, s: SideShown) -> bool {
+    fn show(&self, f: &Form<Leaf>, s: SideShown) -> bool {
         let (line, pct) = s
             .job
             .as_ref()
-            .map(|(j, _)| crate::inspect::job_line(j))
+            .map(|(j, _)| super::jobs::job_line(j))
             .unwrap_or_default();
-        ui::set_text(self.text(S::Job), &line);
-        self.show_if(S::Job, s.job.is_some());
-        ui::set_progress(&self.progress, s.job.is_some(), pct);
-        self.show_if(S::CancelOpen, s.job.as_ref().is_some_and(|(_, c)| *c));
+        f.set_text(self.l(S::Job), &line);
+        f.show(self.l(S::Job), s.job.is_some());
+        f.set_progress(self.l(S::Progress), s.job.is_some(), pct);
+        f.show(
+            self.l(S::CancelOpen),
+            s.job.as_ref().is_some_and(|(_, c)| *c),
+        );
         self.pane.show(s.pane);
         if self.bars.borrow().as_ref() == Some(&s.bars) {
             return false;
         }
         let b = s.bars;
-        self.show_source(mtm, target, &b.source, &b.recent);
-        self.show_if(S::CloseImage, b.close_image.is_some());
-        ui::set_enabled(self.button(S::CloseImage), b.close_image.unwrap_or(false));
-        self.show_if(S::Close, b.can_close);
+        self.show_source(f, &b.source, &b.recent);
+        f.show(self.l(S::CloseImage), b.close_image.is_some());
+        f.enable(self.l(S::CloseImage), b.close_image.unwrap_or(false));
+        f.show(self.l(S::Close), b.can_close);
         for x in [S::Apply, S::Discard] {
-            self.show_if(x, b.stages);
-            ui::set_enabled(self.button(x), b.apply_enabled);
+            f.show(self.l(x), b.stages);
+            f.enable(self.l(x), b.apply_enabled);
         }
-        self.set_title(S::Apply, &b.apply_label);
-        self.show_if(S::Edits, b.stages && b.staged > 0);
-        self.set_title(S::Edits, &b.edits_label);
+        f.set_title(self.l(S::Apply), &b.apply_label);
+        f.show(self.l(S::Edits), b.stages && b.staged > 0);
+        f.set_title(self.l(S::Edits), &b.edits_label);
         self.edits_open.set(b.edits_open);
-        let p = self.popup(S::Partition);
-        p.removeAllItems();
-        for part in &b.parts {
-            p.addItemWithTitle(&ns(&ui::plain(part)));
-        }
+        f.set_items(self.l(S::Partition), &b.parts);
         if let Some(i) = b.part {
-            p.selectItemAtIndex(i as isize);
+            f.select(self.l(S::Partition), i);
         }
         // Shown whenever the source has partitions, so one that fails to open can be left.
-        self.show_if(S::Partition, !b.parts.is_empty());
-        ui::set_text(self.text(S::NoParts), b.no_parts);
-        self.show_if(
-            S::NoParts,
+        f.show(self.l(S::Partition), !b.parts.is_empty());
+        f.set_text(self.l(S::NoParts), b.no_parts);
+        f.show(
+            self.l(S::NoParts),
             b.loaded && b.parts.is_empty() && !b.no_parts.is_empty(),
         );
-        self.show_if(S::NewFolder, b.new_folder);
-        ui::set_text(self.text(S::Title), &b.title);
-        self.show_if(S::Title, b.loaded);
-        ui::set_text(self.text(S::Free), b.free.as_deref().unwrap_or(""));
-        self.show_if(S::Free, b.loaded && b.free.is_some());
-        self.show_if(S::ReadOnly, b.read_only);
-        self.show_crumbs(mtm, target, &b.prefix, &b.crumbs);
+        f.show(self.l(S::NewFolder), b.new_folder);
+        f.set_text(self.l(S::Title), &b.title);
+        f.show(self.l(S::Title), b.loaded);
+        f.set_text(self.l(S::Free), b.free.as_deref().unwrap_or(""));
+        f.show(self.l(S::Free), b.loaded && b.free.is_some());
+        f.show(self.l(S::ReadOnly), b.read_only);
+        self.show_crumbs(f, &b.prefix, &b.crumbs);
         let locked = b.locked;
         for x in [S::UnlockNote, S::Password, S::Unlock] {
-            self.show_if(x, locked.is_some());
+            f.show(self.l(x), locked.is_some());
         }
         if let Some(apfs) = locked {
             let note = match apfs {
                 true => "This APFS volume is encrypted with FileVault. Enter the volume password or personal recovery key.",
                 false => "This source is password-protected.",
             };
-            ui::set_text(self.text(S::UnlockNote), note);
+            f.set_text(self.l(S::UnlockNote), note);
         }
         *self.bars.borrow_mut() = Some(b);
         true
     }
 
     /// The source pull-down: its title is the source; its menu the recent sources and the ways to open one.
-    fn show_source(
-        &self,
-        mtm: MainThreadMarker,
-        target: &Callback,
-        title: &str,
-        recent: &[String],
-    ) {
-        let p = self.popup(S::Source);
-        p.removeAllItems();
+    fn show_source(&self, f: &Form<Leaf>, title: &str, recent: &[String]) {
         let title = if title.is_empty() {
             "Open image, backup, or folder..."
         } else {
             title
         };
-        p.addItemWithTitle(&ns(&ui::plain(title)));
         let i = idx(self.side);
-        let add = |label: &str, tag: isize| {
-            p.addItemWithTitle(&ns(&ui::plain(label)));
-            if let Some(item) = p.lastItem() {
-                item.setTag(tag);
-                // SAFETY: the target is the screen's, kept as long as the controls.
-                unsafe {
-                    item.setTarget(Some(target));
-                    item.setAction(Some(objc2::sel!(fire:)));
-                }
-            }
-        };
-        for (n, path) in recent.iter().take(8).enumerate() {
-            add(path, 20000 * (i as isize + 1) + n as isize);
+        let mut items: Vec<(String, Option<Leaf>, bool)> = recent
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(n, path)| (path.clone(), Some(Leaf::Recent(i, n)), true))
+            .collect();
+        for (label, s) in [
+            ("Open Image File...", S::OpenFile),
+            ("Open Host Folder...", S::OpenFolder),
+            ("Open Backup Folder...", S::OpenBackup),
+            ("Connect to Remote...", S::Connect),
+        ] {
+            items.push((label.to_string(), Some(self.l(s)), true));
         }
-        add("Open Image File...", side_tag(i, S::OpenFile));
-        add("Open Host Folder...", side_tag(i, S::OpenFolder));
-        add("Open Backup Folder...", side_tag(i, S::OpenBackup));
-        add("Connect to Remote...", side_tag(i, S::Connect));
-        let _ = mtm;
+        f.set_pulldown(self.l(S::Source), title, &items);
     }
 
-    /// The path's crumbs as borderless buttons; the last, where the pane is, cannot be pressed.
-    fn show_crumbs(
-        &self,
-        mtm: MainThreadMarker,
-        target: &Callback,
-        prefix: &str,
-        crumbs: &[(String, Option<String>)],
-    ) {
-        for (b, _) in self.crumbs.borrow_mut().drain(..) {
-            b.removeFromSuperview();
-        }
-        let mut built = Vec::new();
+    /// The path's crumbs as buttons; the last, where the pane is, cannot be pressed.
+    fn show_crumbs(&self, f: &Form<Leaf>, prefix: &str, crumbs: &[(String, Option<String>)]) {
         let i = idx(self.side);
-        let mut x = 0.0;
-        let mut add = |label: &str, target_path: Option<String>, link: bool| {
-            let n = built.len();
-            let b = ui::button(mtm, label, "");
-            b.setBordered(false);
-            if link {
-                b.setContentTintColor(Some(&NSColor::linkColor()));
-                b.setTag(10000 * (i as isize + 1) + n as isize);
-                ui::hook(&b, target);
-            } else {
-                b.setEnabled(target_path.is_some() && link);
-            }
-            b.sizeToFit();
-            let w = b.frame().size.width;
-            b.setFrame(NSRect::new(NSPoint::new(x, 0.0), NSSize::new(w, 22.0)));
-            x += w + 2.0;
-            self.path.addSubview(&b);
-            built.push((b, target_path));
+        f.remove(|k| matches!(k, Leaf::Crumb(s, _) if *s == i));
+        let mut targets = Vec::new();
+        let mut add = |label: &str, target: Option<String>, link: bool| {
+            let k = Leaf::Crumb(i, targets.len());
+            f.button(k, label, "");
+            f.enable(k, link);
+            targets.push((label.to_string(), target.filter(|_| link)));
         };
         if !prefix.is_empty() {
             add(prefix, None, false);
@@ -489,13 +308,33 @@ impl SideView {
             let link = t.is_some() && n < last;
             add(label, t.clone(), link);
         }
-        *self.crumbs.borrow_mut() = built;
+        *self.crumbs.borrow_mut() = targets;
+    }
+
+    /// The crumbs' row: each as wide as its label.
+    fn crumb_row(&self, f: &Form<Leaf>) -> Node<Leaf> {
+        let i = idx(self.side);
+        let _ = f;
+        let mut row: Vec<Node<Leaf>> = self
+            .crumbs
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(n, (label, _))| {
+                let w = (label.chars().count() as i32 * 7 + 16).max(24);
+                Node::button(Leaf::Crumb(i, n), w)
+            })
+            .collect();
+        row.push(Node::Space(Size::Stretch(1)));
+        Node::Row {
+            children: row,
+            gap: 2,
+        }
     }
 
     /// The side's rows: bars, path, job, then the listing, the unlock row or the quick view.
-    fn nodes(&self) -> Vec<Node<Leaf>> {
-        let i = idx(self.side);
-        let l = |s: S| Leaf::Side(i, s);
+    fn nodes(&self, f: &Form<Leaf>) -> Vec<Node<Leaf>> {
+        let l = |s: S| self.l(s);
         // A pane is about half the window: the bars take four short rows, not two long ones.
         let first = vec![
             Node::leaf(l(S::Source), Size::Stretch(1), Size::Fixed(layout::ROW + 2)),
@@ -528,7 +367,7 @@ impl SideView {
                 Size::Fixed(layout::ROW - 4),
             ),
         ];
-        if !self.shown(S::Title) {
+        if !f.shown(l(S::Title)) {
             second.push(Node::Space(Size::Stretch(1)));
         }
         second.push(Node::button(l(S::NewFolder), 105));
@@ -543,7 +382,7 @@ impl SideView {
             Node::row(opens),
             Node::row(second),
             Node::row(edits),
-            Node::leaf(l(S::Path), Size::Stretch(1), Size::Fixed(layout::ROW)),
+            self.crumb_row(f),
             Node::row(vec![
                 Node::leaf(l(S::Job), Size::Stretch(1), Size::Fixed(layout::ROW - 4)),
                 Node::leaf(
@@ -554,7 +393,7 @@ impl SideView {
                 Node::button(l(S::CancelOpen), 75),
             ]),
         ];
-        if self.shown(S::Unlock) {
+        if f.shown(l(S::Unlock)) {
             rows.push(Node::leaf(
                 l(S::UnlockNote),
                 Size::Stretch(1),
@@ -565,7 +404,7 @@ impl SideView {
                 Node::button(l(S::Unlock), 75),
             ]));
             rows.push(Node::Space(Size::Stretch(1)));
-        } else if self.shown(S::Quick) {
+        } else if f.shown(l(S::Quick)) {
             rows.push(Node::leaf(
                 l(S::QuickHint),
                 Size::Stretch(1),
@@ -582,13 +421,10 @@ impl SideView {
     }
 
     /// A side control's action, as the actions it sends.
-    fn fired(&self, s: S, sender: &AnyObject) -> Option<Vec<A>> {
+    fn fired(&self, f: &Form<Leaf>, s: S) -> Option<Vec<A>> {
         let pane = |a| A::Pane(self.side, a);
         let a = match s {
-            S::Partition => {
-                let i = self.popup(S::Partition).indexOfSelectedItem();
-                pane(P::SelectPartition(usize::try_from(i).ok()?))
-            }
+            S::Partition => pane(P::SelectPartition(f.picked(self.l(S::Partition))?)),
             S::OpenFile => pane(P::PickImage),
             S::OpenFolder => pane(P::PickHostFolder),
             S::OpenBackup => pane(P::PickBackupFolder),
@@ -600,18 +436,16 @@ impl SideView {
             S::Discard => pane(P::Discard),
             S::Edits => pane(P::ShowEdits(!self.edits_open.get())),
             S::CancelOpen => pane(P::CancelOpen),
-            S::Unlock | S::Password => {
-                let field = self.v(S::Password).downcast_ref::<NSTextField>()?;
-                let secret = field.stringValue().to_string();
+            S::Unlock => {
+                let secret = f.text(self.l(S::Password));
                 if secret.is_empty() {
                     return None;
                 }
-                field.setStringValue(&ns(""));
+                f.set_text(self.l(S::Password), "");
                 pane(P::SubmitPassword(secret))
             }
             _ => return None,
         };
-        let _ = sender;
         Some(vec![A::Focus(self.side), a])
     }
 
@@ -650,15 +484,13 @@ struct Shown {
 }
 
 pub struct CommanderScreen {
-    mtm: MainThreadMarker,
+    ui: Rc<dyn Host>,
     ctrl: RefCell<CommanderController>,
     host: EffectHost,
     sync: SyncGuard,
     me: Weak<CommanderScreen>,
-    pub page: Retained<NSView>,
-    target: Retained<Callback>,
-    top: Vec<(T, Retained<NSView>)>,
-    copy_progress: Retained<NSProgressIndicator>,
+    page: Surface,
+    form: Form<Leaf>,
     sides: [SideView; 2],
     windows: RefCell<Vec<(Option<Side>, Rc<ModelWindow>)>>,
     debug: [Cell<bool>; 2],
@@ -670,9 +502,10 @@ pub struct CommanderScreen {
 }
 
 impl CommanderScreen {
-    /// The screen; `on_close` runs when the controller leaves it, and drops it.
+    /// The screen on `page`; `on_close` runs when the controller leaves it, and drops it.
     pub fn build(
-        mtm: MainThreadMarker,
+        ui: Rc<dyn Host>,
+        page: Surface,
         jobs: &JobRegistry,
         notify: &Arc<dyn Notify>,
         host: EffectHost,
@@ -680,85 +513,55 @@ impl CommanderScreen {
     ) -> Rc<CommanderScreen> {
         let screen = Rc::new_cyclic(|me: &Weak<CommanderScreen>| {
             let fire_me = me.clone();
-            let target = ui::callback(
-                mtm,
-                Box::new(move |sender: &AnyObject| {
-                    let tag = sender
-                        .downcast_ref::<NSControl>()
-                        .map(|c| c.tag())
-                        .or_else(|| {
-                            sender
-                                .downcast_ref::<objc2_app_kit::NSMenuItem>()
-                                .map(|m| m.tag())
-                        });
-                    if let (Some(s), Some(tag)) = (fire_me.upgrade(), tag) {
-                        s.fired(tag, sender);
+            let form = Form::with_host(
+                ui.clone(),
+                page,
+                Rc::new(move |l| {
+                    if let Some(s) = fire_me.upgrade() {
+                        s.fired(l);
                     }
                 }),
             );
-            let page = ui::flipped(mtm);
-            let mut top: Vec<(T, Retained<NSView>)> = Vec::new();
-            let mut add = |t: T, v: Retained<NSView>| {
-                if let Some(c) = v.downcast_ref::<NSControl>() {
-                    c.setTag(top_tag(t));
-                    if c.downcast_ref::<NSTextField>().is_none() {
-                        ui::hook(c, &target);
-                    }
-                }
-                page.addSubview(&v);
-                top.push((t, v));
-            };
-            let button = |title: &str, id: &str| as_view(&ui::button(mtm, title, id));
-            let label = |text: &str| as_view(&ui::label(mtm, text));
-            add(T::Title, label("Commander Mode"));
-            add(T::View, button("View...", ids::VIEW_MENU));
-            add(T::Log, button("Log (0)", ids::LOG));
-            add(T::Close, button("Close", ids::CLOSE));
-            add(T::CopyJob, label(""));
-            let copy_progress = ui::progress(mtm);
-            add(T::CopyProgress, as_view(&copy_progress));
-            add(T::CancelCopy, button("Cancel", ids::CANCEL_COPY));
-            add(T::Ltr, button("Copy ->", ids::COPY_LEFT_TO_RIGHT));
-            add(T::Rtl, button("<- Copy", ids::COPY_RIGHT_TO_LEFT));
-            add(T::Delete, button("Delete", ids::DELETE));
-            let compare = ui::button(mtm, "Compare", ids::COMPARE);
-            compare.setEnabled(false);
-            add(T::Compare, as_view(&compare));
-            add(
-                T::KeepDates,
-                as_view(&ui::checkbox(mtm, "Keep original dates", ids::KEEP_DATES)),
-            );
-            add(T::FormatCaption, label("Export as:"));
-            let format = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, false);
-            for f in ExportFormat::ALL {
-                format.addItemWithTitle(&ns(f.label()));
-            }
-            ui::set_id(&format, ids::EXPORT_FORMAT);
-            add(T::Format, as_view(&format));
-            add(T::ForkCaption, label("Forks as:"));
-            let fork = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, false);
-            for m in ResourceForkMode::ALL {
-                fork.addItemWithTitle(&ns(m.label()));
-            }
-            ui::set_id(&fork, ids::FORK_MODE);
-            add(T::Fork, as_view(&fork));
-            let status = ui::label(mtm, "");
-            ui::set_id(&status, ids::STATUS);
-            add(T::Status, as_view(&status));
+            let f = &form;
+            let t = Leaf::Top;
+            f.label(t(T::Title), "Commander Mode");
+            f.button(t(T::View), "View...", ids::VIEW_MENU);
+            f.button(t(T::Log), "Log (0)", ids::LOG);
+            f.button(t(T::Close), "Close", ids::CLOSE);
+            f.label(t(T::CopyJob), "");
+            f.progress(t(T::CopyProgress));
+            f.button(t(T::CancelCopy), "Cancel", ids::CANCEL_COPY);
+            f.button(t(T::Ltr), "Copy ->", ids::COPY_LEFT_TO_RIGHT);
+            f.button(t(T::Rtl), "<- Copy", ids::COPY_RIGHT_TO_LEFT);
+            f.button(t(T::Delete), "Delete", ids::DELETE);
+            f.button(t(T::Compare), "Compare", ids::COMPARE);
+            f.enable(t(T::Compare), false);
+            f.check(t(T::KeepDates), "Keep original dates", ids::KEEP_DATES);
+            f.label(t(T::FormatCaption), "Export as:");
+            let formats: Vec<String> = ExportFormat::ALL
+                .iter()
+                .map(|x| x.label().to_string())
+                .collect();
+            f.popup(t(T::Format), &formats, ids::EXPORT_FORMAT);
+            f.label(t(T::ForkCaption), "Forks as:");
+            let forks: Vec<String> = ResourceForkMode::ALL
+                .iter()
+                .map(|m| m.label().to_string())
+                .collect();
+            f.popup(t(T::Fork), &forks, ids::FORK_MODE);
+            f.label(t(T::Status), "");
             let sides = [
-                SideView::build(mtm, &page, &target, Side::Left),
-                SideView::build(mtm, &page, &target, Side::Right),
+                SideView::build(f, Side::Left),
+                SideView::build(f, Side::Right),
             ];
             CommanderScreen {
-                mtm,
+                ui: ui.clone(),
                 ctrl: RefCell::new(new_controller(jobs, notify)),
                 host,
                 sync: SyncGuard::default(),
                 me: me.clone(),
                 page,
-                target,
-                top,
-                copy_progress,
+                form,
                 sides,
                 windows: RefCell::default(),
                 debug: [Cell::new(false), Cell::new(false)],
@@ -770,48 +573,33 @@ impl CommanderScreen {
         });
         for side in SIDES {
             let me = screen.me.clone();
-            screen.sides[idx(side)].pane.on_event(
-                mtm,
-                Rc::new(move |e| {
-                    if let Some(s) = me.upgrade() {
-                        s.pane_event(side, e);
-                    }
-                }),
-            );
+            screen.sides[idx(side)].pane.on_event(Rc::new(move |e| {
+                if let Some(s) = me.upgrade() {
+                    s.pane_event(side, e);
+                }
+            }));
         }
         screen.refresh();
         screen.sides[0].pane.focus();
         screen
     }
 
-    fn t(&self, t: T) -> &NSView {
-        self.top
-            .iter()
-            .find(|(x, _)| *x == t)
-            .map(|(_, v)| &**v)
-            .expect("every control is built")
+    /// The page the screen is on.
+    pub fn page(&self) -> Surface {
+        self.page
     }
 
-    fn t_button(&self, t: T) -> &NSButton {
-        self.t(t).downcast_ref::<NSButton>().expect("a button")
+    /// The list control of `side`, for a shell that hit-tests a drop against it.
+    pub fn list_ctl(&self, side: Side) -> super::host::Ctl {
+        self.sides[idx(side)].pane.list_ctl()
     }
 
-    fn t_popup(&self, t: T) -> &NSPopUpButton {
-        self.t(t).downcast_ref::<NSPopUpButton>().expect("a pop-up")
-    }
-
-    /// Staged edits would be lost if the window closed now.
-    /// Files dropped from Finder at window point `at`: the pane under it takes them, else ask.
-    pub fn drop_paths(&self, mtm: MainThreadMarker, paths: Vec<PathBuf>, at: NSPoint) {
-        let Some(first) = paths.first() else {
-            return;
+    /// Files dropped from the desktop: `under` is the pane the drop landed on, else ask which.
+    pub fn drop_paths(&self, paths: Vec<PathBuf>, under: Option<Side>) {
+        let first = match paths.first() {
+            Some(p) => p,
+            None => return,
         };
-        let under = [Side::Left, Side::Right].into_iter().find(|side| {
-            let scroll = &self.sides[idx(*side)].pane.list_scroll;
-            let p = scroll.convertPoint_fromView(at, None);
-            let b = scroll.bounds();
-            p.x >= 0.0 && p.y >= 0.0 && p.x <= b.size.width && p.y <= b.size.height
-        });
         let side = match under {
             Some(side) => side,
             None => {
@@ -823,11 +611,11 @@ impl CommanderScreen {
                             |n| n.to_string_lossy().into_owned()
                         )
                     ),
-                    n => format!("these {n} items"),
+                    n => format!("these {} items", n),
                 };
-                let message = format!("Which pane should take {what}?");
+                let message = format!("Which pane should take {}?", what);
                 let buttons = ["Left pane".to_string(), "Right pane".to_string()];
-                match crate::effects::ask(mtm, "Dropped files", &message, &buttons) {
+                match self.ui.ask("Dropped files", &message, &buttons) {
                     Some(0) => Side::Left,
                     Some(1) => Side::Right,
                     _ => return,
@@ -844,8 +632,9 @@ impl CommanderScreen {
                 choices,
             }) => {
                 let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
-                let Some(i) = crate::effects::ask(mtm, &title, &question, &labels) else {
-                    return;
+                let i = match self.ui.ask(&title, &question, &labels) {
+                    Some(i) => i,
+                    None => return,
                 };
                 choices
                     .into_iter()
@@ -859,6 +648,7 @@ impl CommanderScreen {
         }
     }
 
+    /// Staged edits would be lost if the window closed now.
     pub fn has_staged_edits(&self) -> bool {
         self.ctrl.borrow().has_staged_edits()
     }
@@ -881,8 +671,9 @@ impl CommanderScreen {
     fn reply(&self) -> ReplyFn {
         let me = self.me.clone();
         Rc::new(move |reply| {
-            let Some(screen) = me.upgrade() else {
-                return;
+            let screen = match me.upgrade() {
+                Some(s) => s,
+                None => return,
             };
             let action = match reply {
                 Reply::Picked { purpose, path } => A::Picked { purpose, path },
@@ -936,7 +727,7 @@ impl CommanderScreen {
                 .map(|d| d.info_text(ctl.browse_caps()))
                 .unwrap_or_default();
             let hint = ctl.key_hint(Command::QuickView);
-            (side, text, format!("Quick view ({hint} to close)"))
+            (side, text, format!("Quick view ({} to close)", hint))
         });
         let mut windows = Vec::new();
         for side in SIDES {
@@ -968,48 +759,45 @@ impl CommanderScreen {
         self.layout();
         if menu_up {
             let me = self.me.clone();
-            crate::app::later(Box::new(move || {
+            self.ui.later(Box::new(move || {
                 if let Some(s) = me.upgrade() {
                     s.view_menu();
                 }
             }));
         }
         if follow && !self.follow_set.replace(true) {
-            let when = dispatch2::DispatchTime::try_from(FOLLOW_DELAY)
-                .unwrap_or(dispatch2::DispatchTime::NOW);
-            let _ = dispatch2::DispatchQueue::main().after(when, crate::app::tick);
+            let me = self.me.clone();
+            let ms = FOLLOW_DELAY.as_millis() as u64;
+            self.ui.after(
+                ms,
+                Box::new(move || {
+                    if let Some(s) = me.upgrade() {
+                        s.tick();
+                    }
+                }),
+            );
         } else if !follow {
             self.follow_set.set(false);
         }
     }
 
     fn show(&self, s: Shown) {
-        let status = self
-            .t(T::Status)
-            .downcast_ref::<NSTextField>()
-            .expect("a label");
-        ui::set_text(status, &s.status);
-        let log = self.t_button(T::Log);
-        let title = format!("Log ({})", s.log_lines);
-        if log.title().to_string() != title {
-            log.setTitle(&ns(&title));
-        }
+        let f = &self.form;
+        let t = Leaf::Top;
+        f.set_text(t(T::Status), &s.status);
+        f.set_title(t(T::Log), &format!("Log ({})", s.log_lines));
         let (line, pct) = s
             .copying
             .as_ref()
-            .map(crate::inspect::job_line)
+            .map(super::jobs::job_line)
             .unwrap_or_default();
-        let job = self
-            .t(T::CopyJob)
-            .downcast_ref::<NSTextField>()
-            .expect("a label");
-        ui::set_text(job, &line);
-        for t in [T::CopyJob, T::CancelCopy] {
-            ui::set_visible(self.t(t), s.copying.is_some());
+        f.set_text(t(T::CopyJob), &line);
+        for x in [T::CopyJob, T::CancelCopy] {
+            f.show(t(x), s.copying.is_some());
         }
-        ui::set_progress(&self.copy_progress, s.copying.is_some(), pct);
+        f.set_progress(t(T::CopyProgress), s.copying.is_some(), pct);
         for (view, side) in self.sides.iter().zip(s.sides) {
-            view.show(self.mtm, &self.target, side);
+            view.show(f, side);
         }
         self.show_column(&s.column);
         self.show_quick(s.quick);
@@ -1020,43 +808,33 @@ impl CommanderScreen {
     }
 
     fn show_column(&self, c: &CopyColumn) {
-        ui::set_enabled(self.t_button(T::Ltr), c.copy_left);
-        ui::set_enabled(self.t_button(T::Rtl), c.copy_right);
-        ui::set_enabled(self.t_button(T::Delete), c.delete);
-        let keep = self.t_button(T::KeepDates);
-        let want = if c.keep_dates {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        };
-        if keep.state() != want {
-            keep.setState(want);
-        }
-        for (t, i) in [(T::Format, c.format), (T::Fork, c.fork)] {
-            let p = self.t_popup(t);
-            if p.indexOfSelectedItem() != i as isize {
-                p.selectItemAtIndex(i as isize);
-            }
-        }
-        ui::set_enabled(self.t_popup(T::Fork), c.loose);
+        let f = &self.form;
+        let t = Leaf::Top;
+        f.enable(t(T::Ltr), c.copy_left);
+        f.enable(t(T::Rtl), c.copy_right);
+        f.enable(t(T::Delete), c.delete);
+        f.set_check(t(T::KeepDates), c.keep_dates);
+        f.select(t(T::Format), c.format);
+        f.select(t(T::Fork), c.fork);
+        f.enable(t(T::Fork), c.loose);
     }
 
     fn show_quick(&self, quick: Option<(Side, String, String)>) {
+        let f = &self.form;
         let covered = quick.as_ref().map(|q| q.0);
         for view in &self.sides {
             let on = covered == Some(view.side);
-            view.show_if(S::Quick, on);
-            view.show_if(S::QuickHint, on);
-            view.show_if(S::List, !on);
+            f.show(view.l(S::Quick), on);
+            f.show(view.l(S::QuickHint), on);
+            f.show(view.l(S::List), !on);
             if on {
-                view.show_if(S::Tree, false);
+                f.show(view.l(S::Tree), false);
             }
         }
         if let Some((side, text, hint)) = quick {
             let view = &self.sides[idx(side)];
-            view.quick.setString(&ns(&ui::plain(&text)));
-            view.quick.setTextColor(Some(&NSColor::textColor()));
-            ui::set_text(view.text(S::QuickHint), &hint);
+            f.set_text_view(view.l(S::Quick), &text);
+            f.set_text(view.l(S::QuickHint), &hint);
         }
     }
 
@@ -1072,18 +850,22 @@ impl CommanderScreen {
                 w.update(&p);
                 continue;
             }
-            let frame = at.map(|i| open.remove(i).1.frame());
+            let frame = at.and_then(|i| open.remove(i).1.frame());
             let me = self.me.clone();
             let side = p.side;
+            let ui = self.ui.clone();
             let on_event: Rc<dyn Fn(Event)> = Rc::new(move |e| {
                 let me = me.clone();
-                crate::app::later(Box::new(move || {
+                ui.later(Box::new(move || {
                     if let Some(screen) = me.upgrade() {
                         screen.window_event(side, e);
                     }
                 }));
             });
-            open.push((p.side, ModelWindow::open(self.mtm, &p, frame, on_event)));
+            open.push((
+                p.side,
+                ModelWindow::open(self.ui.clone(), &p, frame, on_event),
+            ));
         }
     }
 
@@ -1094,7 +876,7 @@ impl CommanderScreen {
                     self.apply(a);
                 }
             }
-            Event::Copy(text) => crate::effects::copy_text(&text),
+            Event::Copy(text) => self.ui.copy_text(&text),
             Event::Toggle(on) => {
                 if let Some(side) = side {
                     self.debug[idx(side)].set(on);
@@ -1116,9 +898,9 @@ impl CommanderScreen {
         if self.ctrl.borrow().view_menu_shown() {
             self.apply(A::ShowViewMenu(false));
         }
-        let b = self.t(T::View);
-        let at = NSPoint::new(0.0, b.frame().size.height + 2.0);
-        if let Some(a) = track(self.mtm, b, items, at) {
+        let c = self.form.ctl(Leaf::Top(T::View));
+        let (_, h) = self.ui.control_size(self.page, c);
+        if let Some(a) = track(&*self.ui, self.page, c, items, 0.0, h + 2.0) {
             self.apply(a);
         }
     }
@@ -1157,9 +939,10 @@ impl CommanderScreen {
                 self.key(key, mods);
             }
             PaneEvent::Sort(col) => self.apply(pane(P::SortBy(col))),
-            PaneEvent::Menu(i, at) => {
-                let Some(row) = self.sides[idx(side)].pane.row_at(i) else {
-                    return;
+            PaneEvent::Menu(i, x, y) => {
+                let row = match self.sides[idx(side)].pane.row_at(i) {
+                    Some(r) => r,
+                    None => return,
                 };
                 self.apply(A::Focus(side));
                 let context = {
@@ -1183,8 +966,8 @@ impl CommanderScreen {
                 if items.is_empty() {
                     return;
                 }
-                let list = self.sides[idx(side)].pane.list_view().retain();
-                if let Some(a) = track(self.mtm, &list, items, at) {
+                let list = self.sides[idx(side)].pane.list_ctl();
+                if let Some(a) = track(&*self.ui, self.page, list, items, x, y) {
                     self.apply(a);
                 }
             }
@@ -1200,28 +983,16 @@ impl CommanderScreen {
         }
     }
 
-    /// A control's action, by its tag.
-    fn fired(&self, tag: isize, sender: &AnyObject) {
+    /// A control's action, by its leaf.
+    fn fired(&self, l: Leaf) {
         if self.sync.active() {
             return;
         }
-        let actions = if tag >= 20000 {
-            let side = (tag / 20000 - 1) as usize;
-            self.sides
-                .get(side)
-                .and_then(|s| s.recent((tag % 20000) as usize))
-        } else if tag >= 10000 {
-            let side = (tag / 10000 - 1) as usize;
-            self.sides
-                .get(side)
-                .and_then(|s| s.crumb((tag % 10000) as usize))
-        } else if tag >= 1000 {
-            let side = (tag / 1000 - 1) as usize;
-            let s = SIDE_ALL.get((tag % 1000) as usize).copied();
-            s.and_then(|s| self.sides.get(side).and_then(|v| v.fired(s, sender)))
-        } else {
-            let t = TOP_ALL.get(tag as usize).copied();
-            t.and_then(|t| self.top_fired(t))
+        let actions = match l {
+            Leaf::Recent(i, n) => self.sides.get(i).and_then(|s| s.recent(n)),
+            Leaf::Crumb(i, n) => self.sides.get(i).and_then(|s| s.crumb(n)),
+            Leaf::Side(i, s) => self.sides.get(i).and_then(|v| v.fired(&self.form, s)),
+            Leaf::Top(t) => self.top_fired(t),
         };
         for a in actions.unwrap_or_default() {
             self.apply(a);
@@ -1229,6 +1000,7 @@ impl CommanderScreen {
     }
 
     fn top_fired(&self, t: T) -> Option<Vec<A>> {
+        let f = &self.form;
         Some(vec![match t {
             T::View => {
                 self.view_menu();
@@ -1240,15 +1012,13 @@ impl CommanderScreen {
             T::Ltr => A::Copy(Side::Left),
             T::Rtl => A::Copy(Side::Right),
             T::Delete => A::Delete,
-            T::KeepDates => {
-                A::SetKeepDates(self.t_button(T::KeepDates).state() == NSControlStateValueOn)
-            }
+            T::KeepDates => A::SetKeepDates(f.checked(Leaf::Top(T::KeepDates))),
             T::Format => {
-                let i = usize::try_from(self.t_popup(T::Format).indexOfSelectedItem()).ok()?;
+                let i = f.picked(Leaf::Top(T::Format))?;
                 A::SetExportFormat(*ExportFormat::ALL.get(i)?)
             }
             T::Fork => {
-                let i = usize::try_from(self.t_popup(T::Fork).indexOfSelectedItem()).ok()?;
+                let i = f.picked(Leaf::Top(T::Fork))?;
                 A::SetForkMode(*ResourceForkMode::ALL.get(i)?)
             }
             _ => return None,
@@ -1256,8 +1026,9 @@ impl CommanderScreen {
     }
 
     pub fn layout(&self) {
+        let f = &self.form;
         let w = COLUMN_W;
-        let top = |t: T| Leaf::Top(t);
+        let top = Leaf::Top;
         let line = |t: T| Node::leaf(top(t), Size::Fixed(w), Size::Fixed(layout::ROW - 4));
         let column = Node::column(vec![
             Node::Space(Size::Fixed(3 * layout::ROW)),
@@ -1298,9 +1069,9 @@ impl CommanderScreen {
                 Node::button(top(T::CancelCopy), 75),
             ]),
             Node::row(vec![
-                Node::column(self.sides[0].nodes()),
+                Node::column(self.sides[0].nodes(f)),
                 column,
-                Node::column(self.sides[1].nodes()),
+                Node::column(self.sides[1].nodes(f)),
             ]),
             Node::leaf(
                 top(T::Status),
@@ -1310,21 +1081,14 @@ impl CommanderScreen {
         ];
         let tree = Node::inset(Node::column(col), layout::MARGIN);
         let keep = |l: &Leaf| match l {
-            Leaf::Top(T::CopyJob) => ui::shown(self.t(T::CopyJob)),
-            Leaf::Top(T::CopyProgress) => ui::shown(&self.copy_progress),
-            Leaf::Top(t) => ui::shown(self.t(*t)),
-            Leaf::Side(i, S::Job) => ui::shown(&self.sides[*i].progress),
-            Leaf::Side(i, s) => self.sides[*i].shown(*s),
+            Leaf::Side(i, S::Job) => f.shown(Leaf::Side(*i, S::Progress)),
+            Leaf::Recent(..) => false,
+            _ => f.shown(*l),
         };
-        let Some(tree) = tree.prune(&keep) else {
-            return;
+        let tree = match tree.prune(&keep) {
+            Some(t) => t,
+            None => return,
         };
-        for (l, r) in layout::layout(&tree, ui::area(&self.page), 96) {
-            let v = match l {
-                Leaf::Top(t) => self.t(t),
-                Leaf::Side(i, s) => self.sides[i].v(s),
-            };
-            ui::move_to(v, r);
-        }
+        f.place(&tree, self.ui.area(self.page));
     }
 }

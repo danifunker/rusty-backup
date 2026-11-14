@@ -454,12 +454,6 @@ pub fn set_visible(view: &NSView, on: bool) {
     }
 }
 
-pub fn set_enabled(button: &NSButton, on: bool) {
-    if button.isEnabled() != on {
-        button.setEnabled(on);
-    }
-}
-
 pub fn move_to(view: &NSView, r: Rect) {
     let frame = NSRect::new(
         NSPoint::new(f64::from(r.x), f64::from(r.y)),

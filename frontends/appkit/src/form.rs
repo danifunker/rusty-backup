@@ -3,7 +3,7 @@
 //!
 //! What stays here is AppKit's own: a field's cell that reports a value set through accessibility
 //! (typing reports through the delegate), and a guard so reading a field, which commits an edit in
-//! progress, reports nothing. `Form::new` and `v` are this shell's extras.
+//! progress, reports nothing.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -26,12 +26,12 @@ use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, 
 
 use crate::canvas::Canvas;
 use crate::layout;
-use crate::screens::host::{Column, Ctl, Ev, Host, Painter, PullItem, Surface};
+use crate::rows::Rows;
+use crate::screens::host::{
+    Column, Ctl, Ev, Host, MenuEntry, Painter, PullItem, RowLine, RowsEvent, RowsSpec, Surface,
+};
 use crate::table::Table;
 use crate::ui::{self, ns, Callback, CloseDelegate, TextChange};
-
-/// A screen's controls; on this shell the host is [`AppKitHost`].
-pub type Form<K> = crate::screens::form::Form<K>;
 
 /// A control's colour for a controller's tone.
 pub fn tone_color(t: Option<Tone>) -> Retained<NSColor> {
@@ -72,6 +72,23 @@ thread_local! {
     /// A field's text is being read: the commit that reading makes reports nothing.
     static READING: Cell<bool> = const { Cell::new(false) };
     static HOST: RefCell<Option<Rc<AppKitHost>>> = const { RefCell::new(None) };
+    /// Work `after` queued, run in the order its delays end.
+    static TIMED: RefCell<Vec<Timed>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Work for when a delay ends.
+type Timed = (std::time::Instant, Box<dyn FnOnce()>);
+
+/// A delay ended: run the item due first.
+fn run_timed() {
+    let next = TIMED.with(|t| {
+        let mut t = t.borrow_mut();
+        let at = (0..t.len()).min_by_key(|i| t[*i].0)?;
+        Some(t.remove(at).1)
+    });
+    if let Some(f) = next {
+        f();
+    }
 }
 
 /// A list's last tick-box change, as `toggled` answers it.
@@ -100,6 +117,7 @@ struct Rec {
     window: Option<(Retained<NSWindow>, Retained<CloseDelegate>)>,
     tables: Vec<(Ctl, Table, LastTick)>,
     canvases: Vec<(Ctl, Retained<Canvas>)>,
+    rows: Vec<(Ctl, Rc<Rows>)>,
     /// Each text view and the text it shows.
     texts: Vec<(Ctl, Retained<NSTextView>, String)>,
 }
@@ -171,6 +189,7 @@ impl AppKitHost {
             window: None,
             tables: Vec::new(),
             canvases: Vec::new(),
+            rows: Vec::new(),
             texts: Vec::new(),
         }));
         (all.len() - 1) as Surface
@@ -236,6 +255,11 @@ impl AppKitHost {
     }
 
     /// Run `f` on list `c`, outside the surfaces' borrow (a reload reports back into the host).
+    fn rows_of(&self, s: Surface, c: Ctl) -> Rc<Rows> {
+        self.with(s, |r| r.rows.iter().find(|x| x.0 == c).map(|x| x.1.clone()))
+            .expect("a pane list")
+    }
+
     fn on_table<R>(&self, s: Surface, c: Ctl, f: impl FnOnce(&Table) -> R) -> R {
         let found = self.with(s, |r| {
             let at = r.tables.iter().position(|t| t.0 == c);
@@ -574,7 +598,7 @@ impl Host for AppKitHost {
     fn set_text_view(&self, s: Surface, c: Ctl, text: &str) {
         let view = self.with(s, |r| {
             let entry = r.texts.iter_mut().find(|x| x.0 == c)?;
-            if entry.2 == text {
+            if entry.2 == text && entry.1.string().to_string() == text {
                 return None;
             }
             entry.2 = text.to_string();
@@ -612,6 +636,92 @@ impl Host for AppKitHost {
         self.view(s, c).setToolTip(Some(&ns(text)));
     }
 
+    fn control_size(&self, s: Surface, c: Ctl) -> (f64, f64) {
+        let f = self.view(s, c).frame();
+        (f.size.width, f.size.height)
+    }
+
+    fn rows_view(&self, s: Surface, c: Ctl, id: &str, spec: &RowsSpec, on: Rc<dyn Fn(RowsEvent)>) {
+        let rows = Rc::new(Rows::new(self.mtm, id, spec, on));
+        self.adopt_view(s, c, &rows.scroll);
+        self.with(s, |r| {
+            r.rows.retain(|x| x.0 != c);
+            r.rows.push((c, rows));
+        });
+    }
+
+    fn set_row_lines(&self, s: Surface, c: Ctl, lines: &[RowLine]) {
+        self.rows_of(s, c).set_lines(lines);
+    }
+
+    fn hide_column(&self, s: Surface, c: Ctl, col: usize, hidden: bool) {
+        self.rows_of(s, c).hide_column(col, hidden);
+    }
+
+    fn select_rows(&self, s: Surface, c: Ctl, rows: &[usize], visible: Option<usize>) {
+        self.rows_of(s, c).select(rows, visible);
+    }
+
+    fn focus(&self, s: Surface, c: Ctl) {
+        let list = self.with(s, |r| r.rows.iter().find(|x| x.0 == c).map(|x| x.1.clone()));
+        match list {
+            Some(l) => l.focus(),
+            None => {
+                let v = self.view(s, c);
+                if let Some(w) = v.window() {
+                    w.makeFirstResponder(Some(&v));
+                }
+            }
+        }
+    }
+
+    fn page_rows(&self, s: Surface, c: Ctl) -> i32 {
+        self.rows_of(s, c).page_rows()
+    }
+
+    fn menu_at(&self, s: Surface, c: Ctl, items: &[MenuEntry], x: f64, y: f64) -> Option<usize> {
+        // A pane list's point is in its table, inside the scroll view the surface holds.
+        let list = self.with(s, |r| r.rows.iter().find(|x| x.0 == c).map(|x| x.1.clone()));
+        let view: Retained<NSView> = match &list {
+            Some(l) => l.table_view().retain(),
+            None => self.view(s, c),
+        };
+        crate::popup::show(self.mtm, &view, items, NSPoint::new(x, y))
+    }
+
+    fn wrap_text_view(&self, s: Surface, c: Ctl, wrap: bool) {
+        let view = self.with(s, |r| {
+            r.texts.iter().find(|x| x.0 == c).map(|x| x.1.clone())
+        });
+        let Some(v) = view else {
+            return;
+        };
+        // SAFETY: the text view's own container, read on the main thread.
+        let Some(container) = (unsafe { v.textContainer() }) else {
+            return;
+        };
+        let wide = NSSize::new(1.0e7, 1.0e7);
+        v.setHorizontallyResizable(!wrap);
+        v.setMaxSize(wide);
+        container.setWidthTracksTextView(wrap);
+        let width = match wrap {
+            true => v.frame().size.width,
+            false => wide.width,
+        };
+        container.setContainerSize(NSSize::new(width, wide.height));
+    }
+
+    fn window_frame(&self, s: Surface) -> Option<(f64, f64, f64, f64)> {
+        let f = self.ns_window(s)?.frame();
+        Some((f.origin.x, f.origin.y, f.size.width, f.size.height))
+    }
+
+    fn set_window_frame(&self, s: Surface, (x, y, w, h): (f64, f64, f64, f64)) {
+        if let Some(win) = self.ns_window(s) {
+            win.setFrame_display(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)), true);
+        }
+    }
+
     fn page_viewport(&self, s: Surface) -> Option<(i32, i32)> {
         let scroll = self.body(s).enclosingScrollView()?;
         let visible = scroll.contentSize();
@@ -630,6 +740,48 @@ impl Host for AppKitHost {
         !self.body(s).isHiddenOrHasHiddenAncestor()
     }
 
+    fn text_area(&self, s: Surface, c: Ctl, id: &str, caption: &str) {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 160.0));
+        let scroll = NSScrollView::initWithFrame(self.mtm.alloc(), frame);
+        scroll.setHasVerticalScroller(true);
+        scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+        let view = NSTextView::initWithFrame(self.mtm.alloc(), frame);
+        view.setEditable(true);
+        view.setRichText(false);
+        view.setVerticallyResizable(true);
+        view.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
+        view.setFont(Some(&crate::app::log_font()));
+        view.setTextColor(Some(&NSColor::textColor()));
+        if !id.is_empty() {
+            ui::set_id(&view, id);
+        }
+        view.setAccessibilityLabel(Some(&ns(caption)));
+        let slot = self.with(s, |r| r.slot.clone());
+        let d = ui::on_change(self.mtm, Box::new(move || fire(&slot, c, Ev::Edited)));
+        view.setDelegate(Some(ProtocolObject::from_ref(&*d)));
+        scroll.setDocumentView(Some(&view));
+        self.adopt_view(s, c, &scroll);
+        self.with(s, |r| {
+            r.delegates.push((c, d));
+            r.texts.retain(|x| x.0 != c);
+            r.texts.push((c, view, String::new()));
+        });
+    }
+
+    fn text_view_text(&self, s: Surface, c: Ctl) -> String {
+        let view = self.with(s, |r| {
+            r.texts.iter().find(|x| x.0 == c).map(|x| x.1.clone())
+        });
+        view.map(|v| v.string().to_string()).unwrap_or_default()
+    }
+
+    fn resize_window(&self, s: Surface, w: i32, h: i32) {
+        if let Some(win) = self.ns_window(s) {
+            win.setContentSize(NSSize::new(f64::from(w), f64::from(h)));
+            win.center();
+        }
+    }
+
     fn key_equivalent(&self, s: Surface, c: Ctl, key: &str) {
         self.button_of(s, c).setKeyEquivalent(&ns(key));
     }
@@ -639,6 +791,7 @@ impl Host for AppKitHost {
             r.delegates.retain(|(x, _)| *x != c);
             r.tables.retain(|t| t.0 != c);
             r.canvases.retain(|t| t.0 != c);
+            r.rows.retain(|t| t.0 != c);
             r.texts.retain(|t| t.0 != c);
             let at = r.views.iter().position(|(x, _)| *x == c);
             at.map(|i| r.views.remove(i).1)
@@ -737,6 +890,14 @@ impl Host for AppKitHost {
         crate::app::later(f);
     }
 
+    fn after(&self, ms: u64, f: Box<dyn FnOnce()>) {
+        let wait = std::time::Duration::from_millis(ms);
+        let due = std::time::Instant::now() + wait;
+        TIMED.with(|t| t.borrow_mut().push((due, f)));
+        let when = dispatch2::DispatchTime::try_from(wait).unwrap_or(dispatch2::DispatchTime::NOW);
+        let _ = dispatch2::DispatchQueue::main().after(when, run_timed);
+    }
+
     fn log(&self, lines: Vec<(LogLevel, String)>) {
         crate::app::append_log(lines);
     }
@@ -746,6 +907,10 @@ impl Host for AppKitHost {
         if let Some(f) = field {
             ui::set_text(&f, text);
         }
+    }
+
+    fn menu_sources(&self, recent: &[String], devices: &[String]) {
+        crate::menu::set_sources(recent, devices);
     }
 
     fn open_url(&self, url: &str) {
@@ -766,8 +931,16 @@ impl Host for AppKitHost {
         crate::effects::pick(self.mtm, spec, folder)
     }
 
+    fn pick_files(&self, title: &str) -> Vec<PathBuf> {
+        crate::effects::pick_files(self.mtm, title)
+    }
+
     fn confirm(&self, spec: &ConfirmSpec) -> bool {
         crate::effects::confirm(self.mtm, spec)
+    }
+
+    fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize> {
+        crate::effects::ask(self.mtm, title, message, buttons)
     }
 
     fn choose(&self, spec: &ChoiceSpec) -> usize {
@@ -780,23 +953,5 @@ impl Host for AppKitHost {
 
     fn ask_password(&self, spec: &PasswordSpec) -> Option<String> {
         crate::effects::ask_password(self.mtm, spec)
-    }
-}
-
-impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K> {
-    /// A form on `body`; `on` hears each control's key when it acts or its text changes.
-    pub fn new(mtm: MainThreadMarker, body: Retained<NSView>, on: Rc<dyn Fn(K)>) -> Form<K> {
-        let host = AppKitHost::get(mtm);
-        let s = host.adopt(body);
-        Self::with_host(host, s, on)
-    }
-
-    /// The AppKit host behind every form on this shell.
-    fn ak(&self) -> Rc<AppKitHost> {
-        AppKitHost::current()
-    }
-
-    pub fn v(&self, k: K) -> Retained<NSView> {
-        self.ak().view(self.surface(), self.ctl(k))
     }
 }

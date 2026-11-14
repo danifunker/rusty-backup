@@ -15,6 +15,7 @@ pub mod archives;
 pub mod backup;
 pub mod backup_remote;
 pub mod backup_vhd;
+pub mod browse;
 pub mod build_disk;
 pub mod build_rows;
 // CHD and optical media need prebuilt libraries the vintage build cannot link; see the plan § 8.
@@ -23,6 +24,7 @@ pub mod chd;
 #[cfg(not(feature = "chd"))]
 #[path = "chd_off.rs"]
 pub mod chd;
+pub mod commander;
 pub mod convert;
 pub mod disk_write;
 pub mod editor;
@@ -31,11 +33,17 @@ pub mod expand_hfs;
 pub mod export;
 pub mod form;
 pub mod host;
+pub mod inspect;
 pub mod jobs;
 pub mod layout;
+pub mod model_window;
+#[cfg(feature = "optical")]
+pub mod optical;
 #[cfg(feature = "optical")]
 pub mod optical_remote;
+pub mod pane_view;
 pub mod partition_bar;
+pub mod popup;
 pub mod prompt;
 pub mod remote_pick;
 pub mod report;

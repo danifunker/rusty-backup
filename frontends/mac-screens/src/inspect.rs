@@ -11,15 +11,8 @@ use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-use objc2::rc::Retained;
-use objc2::{sel, MainThreadMarker, Message};
-use objc2_app_kit::{
-    NSButton, NSMenu, NSMenuItem, NSPopUpButton, NSProgressIndicator, NSTextField,
-    NSUserInterfaceItemIdentification, NSView,
-};
-use objc2_foundation::NSRect;
 use rusty_backup::controller::app::{
-    unelevated_device_note, DiskDevice, Notify, Progress, RecentHandle, RecentMode, Snapshot,
+    unelevated_device_note, DiskDevice, Notify, RecentHandle, RecentMode, Snapshot,
 };
 use rusty_backup::controller::inspect::{
     format_size, ids, purpose, HostRequest, InspectAction, InspectController, InspectServices,
@@ -31,22 +24,23 @@ use rusty_backup::controller::remote_pick::{
 };
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::alto::AltoWindow;
-use crate::browse::BrowseView;
-use crate::disk_write::DiskWriteWindow;
-use crate::editor::EditorWindow;
-use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::expand_hfs::ExpandHfsWindow;
-use crate::export::{self, ExportWindow};
-use crate::layout::{self, Node, Size};
-use crate::partition_bar::{self, Bar};
-use crate::remote_pick::RemotePage;
-use crate::report::{self, ReportWindow};
-use crate::resize::ResizeWindow;
-use crate::resize_image::ResizeImageWindow;
-use crate::sync::SyncGuard;
-use crate::table::Table;
-use crate::ui::{self, ns};
+use super::alto::AltoWindow;
+use super::browse::BrowseView;
+use super::disk_write::DiskWriteWindow;
+use super::editor::EditorWindow;
+use super::effects::{EffectHost, Reply, ReplyFn};
+use super::expand_hfs::ExpandHfsWindow;
+use super::export::{self, ExportWindow};
+use super::form::Form;
+use super::host::{Host, Surface};
+use super::jobs::job_line;
+use super::layout::{self, Node, Size};
+use super::partition_bar::{self, Bar};
+use super::remote_pick::RemotePage;
+use super::report::{self, ReportWindow};
+use super::resize::ResizeWindow;
+use super::resize_image::ResizeImageWindow;
+use super::sync::SyncGuard;
 
 /// The list's columns: title, width in points, right-aligned.
 const COLUMNS: [(&str, f64, bool); 7] = [
@@ -84,25 +78,6 @@ fn cell(row: &PartitionRow, column: usize) -> String {
         },
         _ => row.block_size.clone(),
     }
-}
-
-/// A job's one-line summary (what runs, its phase, how far) and its percentage when known.
-pub fn job_line(s: &Snapshot) -> (String, Option<u32>) {
-    let pct = match &s.progress {
-        Progress::Determinate { done, total, .. } if *total > 0 => {
-            Some((done.saturating_mul(100) / total).min(100) as u32)
-        }
-        _ => None,
-    };
-    let mut line = s.label.clone();
-    if !s.phase.is_empty() {
-        line.push_str(": ");
-        line.push_str(&s.phase);
-    }
-    if let Some(p) = pct {
-        line.push_str(&format!(" ({p}%)"));
-    }
-    (line, pct)
 }
 
 /// Everything a refresh shows, read while the controller is borrowed.
@@ -174,10 +149,48 @@ enum Part {
     Expand,
     Defragment,
     ResizeAlto,
+    /// A recent file or a device in the source pull-down.
+    Recent(usize),
+    Device(usize),
+}
+
+/// The controller id each control sends, as the menu bar's items do.
+fn part_id(p: Part) -> Option<String> {
+    Some(
+        match p {
+            Part::OpenFile => ids::OPEN_FILE,
+            Part::OpenBackup => ids::OPEN_BACKUP,
+            Part::Connect => ids::CONNECT_REMOTE,
+            Part::PickAnother => remote_ids::PICK_ANOTHER,
+            Part::BackupRemote => remote_ids::BACKUP,
+            Part::CloseRemote => remote_ids::CLOSE,
+            Part::CancelExport => ids::CANCEL_EXPORT,
+            Part::Reinspect => ids::REINSPECT,
+            Part::Export => ids::EXPORT,
+            Part::Convert => ids::CONVERT,
+            Part::Chd => ids::CHD_INFO,
+            Part::Close => ids::CLOSE,
+            Part::EditTable => ids::EDIT_TABLE,
+            Part::AddPartition => ids::ADD_PARTITION,
+            Part::Resize => ids::RESIZE,
+            Part::ExpandImage => ids::EXPAND_IMAGE,
+            Part::Bootable => ids::MAKE_BOOTABLE,
+            Part::Browse => ids::ROW_BROWSE,
+            Part::CalcMin => ids::ROW_CALC_MIN,
+            Part::Check => ids::ROW_CHECK,
+            Part::Expand => ids::ROW_EXPAND_HFS,
+            Part::Defragment => ids::ROW_DEFRAGMENT,
+            Part::ResizeAlto => ids::ROW_RESIZE_ALTO,
+            Part::Recent(n) => return Some(format!("{}{}", RECENT_ITEM, n)),
+            Part::Device(n) => return Some(format!("{}{}", DEVICE_ITEM, n)),
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 pub struct InspectScreen {
-    mtm: MainThreadMarker,
+    ui: Rc<dyn Host>,
     ctrl: RefCell<InspectController>,
     notify: Arc<dyn Notify>,
     /// Expand HFS Volume, while its controller has a source.
@@ -191,8 +204,6 @@ pub struct InspectScreen {
     editor_window: RefCell<Option<Rc<EditorWindow>>>,
     /// The daemon's listing, standing in Inspect's place while it is active.
     pub remote: Rc<RemotePage>,
-    /// The remote picker's page, which the app places in Inspect's while it is active.
-    pub remote_view: Retained<NSView>,
     page_changed: RefCell<Option<Rc<dyn Fn()>>>,
     /// Export, open while the controller says so, and its Physical Disk Export's writer.
     export_window: RefCell<Option<Rc<ExportWindow>>>,
@@ -209,17 +220,9 @@ pub struct InspectScreen {
     convert: RefCell<Option<PathBuf>>,
     sync: SyncGuard,
     me: Weak<InspectScreen>,
-    body: Retained<NSView>,
-    parts: Vec<(Part, Retained<NSView>)>,
-    source: Retained<NSPopUpButton>,
-    note: Retained<NSTextField>,
-    flux: Retained<NSTextField>,
-    error: Retained<NSTextField>,
-    job: Retained<NSTextField>,
-    progress: Retained<NSProgressIndicator>,
-    details: Retained<NSTextField>,
-    bar: Retained<Bar>,
-    table: Table,
+    page: Surface,
+    form: Form<Part>,
+    bar: Bar,
     rows: RefCell<Vec<PartitionRow>>,
     /// The row the tools act on: the list's selection, else the first row (as the TUI's cursor).
     cursor: Cell<usize>,
@@ -229,174 +232,107 @@ pub struct InspectScreen {
     pub browse: Rc<BrowseView>,
 }
 
-fn view<T: AsRef<NSView>>(v: &T) -> Retained<NSView> {
-    v.as_ref().retain()
-}
-
 impl InspectScreen {
+    /// The screen on `page`; the browse view and the remote picker get the pages the shell places
+    /// over it while they are open.
     pub fn build(
-        mtm: MainThreadMarker,
-        body: Retained<NSView>,
+        ui: Rc<dyn Host>,
+        page: Surface,
+        browse_page: Surface,
+        remote_page: Surface,
         notify: Arc<dyn Notify>,
         recent: RecentHandle,
         host: EffectHost,
     ) -> Rc<Self> {
-        let button = |title: &str, id: &str| -> Retained<NSButton> { ui::button(mtm, title, id) };
-        let source = NSPopUpButton::initWithFrame_pullsDown(mtm.alloc(), NSRect::ZERO, true);
-        ui::set_id(&source, ids::SOURCE);
-        let note = ui::label(mtm, "");
-        let flux = ui::label(mtm, "");
-        let error = ui::label(mtm, "");
-        let job = ui::label(mtm, "");
-        let progress = ui::progress(mtm);
-        let details = ui::label(mtm, "");
-        details.setSelectable(true);
-        let bar = Bar::new(mtm, ids::PARTITION_BAR);
-        let table = Table::new(mtm, ids::PARTITION_TABLE, &COLUMNS);
-        let no_partitions = ui::label(mtm, "No partitions found.");
-        let parts: Vec<(Part, Retained<NSView>)> = vec![
-            (Part::SourceCaption, view(&ui::label(mtm, "Source:"))),
-            (Part::Source, view(&source)),
-            (
-                Part::OpenFile,
-                view(&button("Open File...", ids::OPEN_FILE)),
-            ),
-            (
-                Part::OpenBackup,
-                view(&button("Open Backup Folder...", ids::OPEN_BACKUP)),
-            ),
-            (
-                Part::Connect,
-                view(&button("Connect to Remote...", ids::CONNECT_REMOTE)),
-            ),
-            (
+        let browse =
+            BrowseView::build(ui.clone(), browse_page, notify.clone(), host.clone(), false);
+        let remote = RemotePage::build(ui.clone(), remote_page, notify.clone(), host.clone());
+        let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| {
+            let fire = me.clone();
+            let form = Form::with_host(
+                ui.clone(),
+                page,
+                Rc::new(move |p| {
+                    if let Some(s) = fire.upgrade() {
+                        s.fired(p);
+                    }
+                }),
+            );
+            let f = &form;
+            f.label(Part::SourceCaption, "Source:");
+            f.pulldown(Part::Source, ids::SOURCE);
+            f.button(Part::OpenFile, "Open File...", ids::OPEN_FILE);
+            f.button(Part::OpenBackup, "Open Backup Folder...", ids::OPEN_BACKUP);
+            f.button(Part::Connect, "Connect to Remote...", ids::CONNECT_REMOTE);
+            f.button(
                 Part::PickAnother,
-                view(&button("Pick Another Image", remote_ids::PICK_ANOTHER)),
-            ),
-            (
-                Part::BackupRemote,
-                view(&button("Back Up Image...", remote_ids::BACKUP)),
-            ),
-            (
-                Part::BackingUp,
-                view(&ui::label(mtm, remote_hints::BACKING_UP)),
-            ),
-            (
-                Part::CloseRemote,
-                view(&button("Close Remote", remote_ids::CLOSE)),
-            ),
-            (Part::Note, view(&note)),
-            (Part::Flux, view(&flux)),
-            (Part::Error, view(&error)),
-            (Part::Job, view(&job)),
-            (Part::Progress, view(&progress)),
-            (
-                Part::CancelExport,
-                view(&button("Cancel Export", ids::CANCEL_EXPORT)),
-            ),
-            (Part::Reinspect, view(&button("Re-inspect", ids::REINSPECT))),
-            (
-                Part::Export,
-                view(&button("Export Disk Image...", ids::EXPORT)),
-            ),
-            (Part::Convert, view(&button("Convert...", ids::CONVERT))),
-            (Part::Chd, view(&button("CHD Info", ids::CHD_INFO))),
-            (Part::Close, view(&button("Close", ids::CLOSE))),
-            (
-                Part::EditTable,
-                view(&button("Edit Partition Table...", ids::EDIT_TABLE)),
-            ),
-            (
-                Part::AddPartition,
-                view(&button("Add Partition...", ids::ADD_PARTITION)),
-            ),
-            (
-                Part::Resize,
-                view(&button("Resize Partitions...", ids::RESIZE)),
-            ),
-            (
-                Part::ExpandImage,
-                view(&button("Expand Image...", ids::EXPAND_IMAGE)),
-            ),
-            (
-                Part::Bootable,
-                view(&button("Make Bootable...", ids::MAKE_BOOTABLE)),
-            ),
-            (Part::Details, view(&details)),
-            (Part::Bar, view(&bar)),
-            (Part::Table, view(&table.scroll)),
-            (Part::NoPartitions, view(&no_partitions)),
-            (Part::Browse, view(&button("Browse", ids::ROW_BROWSE))),
-            (Part::CalcMin, view(&button("Calc min", ids::ROW_CALC_MIN))),
-            (Part::Check, view(&button("Check", ids::ROW_CHECK))),
-            (
-                Part::Expand,
-                view(&button("Expand/Export...", ids::ROW_EXPAND_HFS)),
-            ),
-            (
-                Part::Defragment,
-                view(&button("Defragment...", ids::ROW_DEFRAGMENT)),
-            ),
-            (
-                Part::ResizeAlto,
-                view(&button("Resize...", ids::ROW_RESIZE_ALTO)),
-            ),
-        ];
-        for (_, v) in &parts {
-            body.addSubview(v);
-        }
-        let browse = BrowseView::build(mtm, notify.clone(), host.clone(), false);
-        let remote_view = ui::flipped(mtm);
-        let remote_surface = crate::form::AppKitHost::get(mtm).adopt(remote_view.clone());
-        let remote = RemotePage::build(
-            crate::form::AppKitHost::get(mtm),
-            remote_surface,
-            notify.clone(),
-            host.clone(),
-        );
-        let screen = Rc::new_cyclic(|me: &Weak<InspectScreen>| InspectScreen {
-            mtm,
-            ctrl: RefCell::new(InspectController::new(InspectServices {
-                jobs: JobRegistry::new(),
-                notify: notify.clone(),
-            })),
-            notify,
-            hfs: RefCell::default(),
-            resize: RefCell::default(),
-            resize_image: RefCell::default(),
-            alto: RefCell::default(),
-            editor_window: RefCell::default(),
-            export_window: RefCell::default(),
-            page_changed: RefCell::default(),
-            writer: RefCell::default(),
-            host,
-            recent,
-            devices: RefCell::default(),
-            menu_built: RefCell::new((vec!["-".to_string()], Vec::new())),
-            backup_closed: Cell::new(false),
-            optical: RefCell::default(),
-            archive: RefCell::default(),
-            convert: RefCell::default(),
-            sync: SyncGuard::default(),
-            me: me.clone(),
-            body,
-            parts,
-            source,
-            note,
-            flux,
-            error,
-            job,
-            progress,
-            details,
-            bar,
-            table,
-            rows: RefCell::default(),
-            cursor: Cell::new(0),
-            check_window: RefCell::default(),
-            chd_window: RefCell::default(),
-            browse,
-            remote,
-            remote_view,
+                "Pick Another Image",
+                remote_ids::PICK_ANOTHER,
+            );
+            f.button(Part::BackupRemote, "Back Up Image...", remote_ids::BACKUP);
+            f.label(Part::BackingUp, remote_hints::BACKING_UP);
+            f.button(Part::CloseRemote, "Close Remote", remote_ids::CLOSE);
+            f.label(Part::Note, "");
+            f.label(Part::Flux, "");
+            f.label(Part::Error, "");
+            f.label(Part::Job, "");
+            f.progress(Part::Progress);
+            f.button(Part::CancelExport, "Cancel Export", ids::CANCEL_EXPORT);
+            f.button(Part::Reinspect, "Re-inspect", ids::REINSPECT);
+            f.button(Part::Export, "Export Disk Image...", ids::EXPORT);
+            f.button(Part::Convert, "Convert...", ids::CONVERT);
+            f.button(Part::Chd, "CHD Info", ids::CHD_INFO);
+            f.button(Part::Close, "Close", ids::CLOSE);
+            f.button(Part::EditTable, "Edit Partition Table...", ids::EDIT_TABLE);
+            f.button(Part::AddPartition, "Add Partition...", ids::ADD_PARTITION);
+            f.button(Part::Resize, "Resize Partitions...", ids::RESIZE);
+            f.button(Part::ExpandImage, "Expand Image...", ids::EXPAND_IMAGE);
+            f.button(Part::Bootable, "Make Bootable...", ids::MAKE_BOOTABLE);
+            f.wrap(Part::Details, "");
+            let bar = Bar::add(f, Part::Bar, ids::PARTITION_BAR);
+            f.table(Part::Table, ids::PARTITION_TABLE, &COLUMNS, None, None);
+            f.label(Part::NoPartitions, "No partitions found.");
+            f.button(Part::Browse, "Browse", ids::ROW_BROWSE);
+            f.button(Part::CalcMin, "Calc min", ids::ROW_CALC_MIN);
+            f.button(Part::Check, "Check", ids::ROW_CHECK);
+            f.button(Part::Expand, "Expand/Export...", ids::ROW_EXPAND_HFS);
+            f.button(Part::Defragment, "Defragment...", ids::ROW_DEFRAGMENT);
+            f.button(Part::ResizeAlto, "Resize...", ids::ROW_RESIZE_ALTO);
+            InspectScreen {
+                ui: ui.clone(),
+                ctrl: RefCell::new(InspectController::new(InspectServices {
+                    jobs: JobRegistry::new(),
+                    notify: notify.clone(),
+                })),
+                notify,
+                hfs: RefCell::default(),
+                resize: RefCell::default(),
+                resize_image: RefCell::default(),
+                alto: RefCell::default(),
+                editor_window: RefCell::default(),
+                export_window: RefCell::default(),
+                page_changed: RefCell::default(),
+                writer: RefCell::default(),
+                host,
+                recent,
+                devices: RefCell::default(),
+                menu_built: RefCell::new((vec!["-".to_string()], Vec::new())),
+                backup_closed: Cell::new(false),
+                optical: RefCell::default(),
+                archive: RefCell::default(),
+                convert: RefCell::default(),
+                sync: SyncGuard::default(),
+                me: me.clone(),
+                page,
+                form,
+                bar,
+                rows: RefCell::default(),
+                cursor: Cell::new(0),
+                check_window: RefCell::default(),
+                chd_window: RefCell::default(),
+                browse,
+                remote,
+            }
         });
         let me = screen.me.clone();
         screen.remote.on_change(Rc::new(move || {
@@ -404,38 +340,34 @@ impl InspectScreen {
                 s.remote_changed();
             }
         }));
-        let me = screen.me.clone();
-        screen.bar.on_select(Rc::new(move |p| {
-            if let Some(s) = me.upgrade() {
-                s.apply(InspectAction::SelectPartition(p));
-            }
-        }));
-        let me = screen.me.clone();
-        screen.table.on_select(Rc::new(move |i| {
-            if let Some(s) = me.upgrade() {
-                s.row_selected(i);
-            }
-        }));
         screen.refresh();
         screen
     }
 
-    fn part(&self, p: Part) -> &NSView {
-        self.parts
-            .iter()
-            .find(|(q, _)| *q == p)
-            .map(|(_, v)| &**v)
-            .expect("every part is built")
-    }
-
-    fn button(&self, p: Part) -> Option<&NSButton> {
-        self.part(p).downcast_ref::<NSButton>()
+    /// A control reported: the bar and the list by their own events, the rest by controller id.
+    fn fired(&self, p: Part) {
+        match p {
+            Part::Bar => {
+                if let Some(picked) = self.bar.picked() {
+                    if !self.sync.active() {
+                        self.apply(InspectAction::SelectPartition(picked));
+                    }
+                }
+            }
+            Part::Table => {
+                let i = self.form.selected_row(Part::Table);
+                self.row_selected(i);
+            }
+            _ => {
+                if let Some(id) = part_id(p) {
+                    self.command(&id);
+                }
+            }
+        }
     }
 
     fn set_enabled(&self, p: Part, on: bool) {
-        if let Some(b) = self.button(p) {
-            ui::set_enabled(b, on);
-        }
+        self.form.enable(p, on);
     }
 
     pub fn apply(&self, action: InspectAction) {
@@ -539,7 +471,7 @@ impl InspectScreen {
         let log = lines
             .into_iter()
             .map(|l| (LogLevel::Info, format!("Remote: {l}")));
-        crate::app::append_log(log.collect());
+        self.ui.log(log.collect());
         if let Some(conn) = picked {
             self.apply(InspectAction::Load(InspectSource::Remote { conn }));
         }
@@ -564,7 +496,7 @@ impl InspectScreen {
         let plan = self.ctrl.borrow().resize_plan();
         if let (false, Some(plan)) = (busy, plan) {
             let d = ResizeWindow::open(
-                crate::form::AppKitHost::current(),
+                self.ui.clone(),
                 self.notify.clone(),
                 self.host.clone(),
                 plan,
@@ -588,14 +520,14 @@ impl InspectScreen {
         match source {
             Ok(source) => {
                 let d = ResizeImageWindow::open(
-                    crate::form::AppKitHost::current(),
+                    self.ui.clone(),
                     self.notify.clone(),
                     self.host.clone(),
                     source,
                 );
                 *self.resize_image.borrow_mut() = Some(d);
             }
-            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+            Err(e) => self.ui.log(vec![(LogLevel::Error, e)]),
         }
     }
 
@@ -608,14 +540,14 @@ impl InspectScreen {
         match source {
             Ok(path) => {
                 let d = AltoWindow::open(
-                    crate::form::AppKitHost::current(),
+                    self.ui.clone(),
                     self.notify.clone(),
                     self.host.clone(),
                     path,
                 );
                 *self.alto.borrow_mut() = Some(d);
             }
-            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+            Err(e) => self.ui.log(vec![(LogLevel::Error, e)]),
         }
     }
 
@@ -834,7 +766,7 @@ impl InspectScreen {
                 log.push((LogLevel::Warning, line));
             }
         }
-        crate::app::append_log(log);
+        self.ui.log(log);
         self.refresh();
         if let Some(load) = self.browse.take_nested_load() {
             self.apply(load);
@@ -870,7 +802,7 @@ impl InspectScreen {
             }
             HostRequest::ExpandHfs(source) => {
                 let d = ExpandHfsWindow::open(
-                    crate::form::AppKitHost::current(),
+                    self.ui.clone(),
                     self.notify.clone(),
                     self.host.clone(),
                     *source,
@@ -964,7 +896,7 @@ impl InspectScreen {
                     s.open_physical();
                 }
             });
-            let w = ExportWindow::open(crate::form::AppKitHost::current(), send, physical);
+            let w = ExportWindow::open(self.ui.clone(), send, physical);
             *self.export_window.borrow_mut() = Some(w.clone());
             w
         });
@@ -982,7 +914,7 @@ impl InspectScreen {
         }
         self.apply(InspectAction::CloseExport);
         let d = DiskWriteWindow::open(
-            crate::form::AppKitHost::current(),
+            self.ui.clone(),
             self.notify.clone(),
             self.host.clone(),
             &self.devices.borrow(),
@@ -1011,7 +943,7 @@ impl InspectScreen {
                     s.apply(a);
                 }
             });
-            let w = EditorWindow::open(crate::form::AppKitHost::current(), send);
+            let w = EditorWindow::open(self.ui.clone(), send);
             *self.editor_window.borrow_mut() = Some(w.clone());
             w
         });
@@ -1021,22 +953,23 @@ impl InspectScreen {
     fn show(&self, s: Shown) {
         self.show_source(&s.source);
         let note = InspectController::needs_elevation_note().then(unelevated_device_note);
-        ui::set_text(&self.note, note.unwrap_or(""));
-        ui::set_text(&self.flux, s.flux.as_deref().unwrap_or(""));
-        ui::set_text(
-            &self.error,
-            &s.error.map(|e| format!("Error: {e}")).unwrap_or_default(),
+        let f = &self.form;
+        f.set_text(Part::Note, note.unwrap_or(""));
+        f.set_text(Part::Flux, s.flux.as_deref().unwrap_or(""));
+        f.set_text(
+            Part::Error,
+            &s.error.map(|e| format!("Error: {}", e)).unwrap_or_default(),
         );
         let job = s.jobs.first();
         let (line, pct) = job.map(job_line).unwrap_or_default();
-        ui::set_text(&self.job, &line);
-        ui::set_progress(&self.progress, job.is_some(), pct);
+        f.set_text(Part::Job, &line);
+        f.set_progress(Part::Progress, job.is_some(), pct);
         self.set_enabled(Part::Reinspect, s.can_reinspect);
         self.set_enabled(Part::Bootable, s.can_bootable);
-        ui::set_visible(self.part(Part::Convert), s.can_convert);
-        ui::set_visible(self.part(Part::Chd), s.has_chd);
-        ui::set_visible(self.part(Part::Close), s.can_close);
-        ui::set_visible(self.part(Part::CancelExport), s.exporting);
+        f.show(Part::Convert, s.can_convert);
+        f.show(Part::Chd, s.has_chd);
+        f.show(Part::Close, s.can_close);
+        f.show(Part::CancelExport, s.exporting);
         self.set_enabled(Part::ExpandImage, s.can_resize_image);
         self.set_enabled(Part::Export, s.can_export);
         self.set_enabled(Part::EditTable, s.can_edit_table);
@@ -1048,20 +981,14 @@ impl InspectScreen {
             .is_some_and(|d| d.is_running());
         self.set_enabled(Part::Resize, s.can_edit_table && !resizing);
         for p in [Part::PickAnother, Part::BackupRemote, Part::CloseRemote] {
-            ui::set_visible(self.part(p), s.remote_open);
+            f.show(p, s.remote_open);
         }
         self.set_enabled(Part::BackupRemote, !s.remote_backing_up);
         self.set_enabled(Part::CloseRemote, !s.remote_backing_up);
-        ui::set_visible(
-            self.part(Part::BackingUp),
-            s.remote_open && s.remote_backing_up,
-        );
-        ui::set_text(&self.details, &s.details.join("\n"));
-        ui::set_visible(
-            self.part(Part::NoPartitions),
-            s.has_table && s.rows.is_empty(),
-        );
-        ui::set_visible(&self.bar, s.has_table && !s.rows.is_empty());
+        f.show(Part::BackingUp, s.remote_open && s.remote_backing_up);
+        f.set_text(Part::Details, &s.details.join("\n"));
+        f.show(Part::NoPartitions, s.has_table && s.rows.is_empty());
+        f.show(Part::Bar, s.has_table && !s.rows.is_empty());
         self.bar.show(s.segments, s.selected);
         self.show_rows(s.rows);
         // A click on the bar selects the partition; the list follows it.
@@ -1070,7 +997,7 @@ impl InspectScreen {
             .and_then(|p| self.rows.borrow().iter().position(|r| r.index == p));
         if let Some(i) = at {
             self.cursor.set(i);
-            self.table.select(i);
+            f.select_row(Part::Table, i);
         }
         self.show_windows(s.check, s.chd);
         self.relayout();
@@ -1097,57 +1024,49 @@ impl InspectScreen {
         };
         let want = (recent.clone(), devices.clone());
         let same = *self.menu_built.borrow() == want;
-        // `itemAtIndex` raises on an empty menu, so ask for the count first.
-        let shown = (self.source.numberOfItems() > 0)
-            .then(|| self.source.itemAtIndex(0))
-            .flatten()
-            .map(|i| i.title().to_string());
-        if same && shown.as_deref() == Some(&ui::plain(title)) {
+        let shown = self.form.items(Part::Source).into_iter().next();
+        if same && shown.as_deref() == Some(title) {
             return;
         }
         *self.menu_built.borrow_mut() = want;
-        let mtm = self.mtm;
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false);
-        // A pull-down's first item is its title; on, so the button does not look greyed out.
-        menu.addItem(&item(mtm, &ui::plain(title), "", true));
-        menu.addItem(&item(mtm, "Recent files", "", false));
+        // A pull-down's first item is its title; captions and placeholders are items with no key.
+        let mut items: Vec<(String, Option<Part>, bool)> =
+            vec![("Recent files".to_string(), None, false)];
         if recent.is_empty() {
-            menu.addItem(&item(mtm, "    (none yet)", "", false));
+            items.push(("    (none yet)".to_string(), None, false));
         }
         for (i, path) in recent.iter().enumerate() {
-            menu.addItem(&item(mtm, path, &format!("{RECENT_ITEM}{i}"), true));
+            items.push((path.clone(), Some(Part::Recent(i)), true));
         }
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&item(mtm, "Devices", "", false));
+        items.push((String::new(), None, false));
+        items.push(("Devices".to_string(), None, false));
         if devices.is_empty() {
-            menu.addItem(&item(
-                mtm,
-                "    (none listed; Refresh Devices may find more)",
-                "",
+            items.push((
+                "    (none listed; Refresh Devices may find more)".to_string(),
+                None,
                 false,
             ));
         }
         for (i, name) in devices.iter().enumerate() {
-            menu.addItem(&item(mtm, name, &format!("{DEVICE_ITEM}{i}"), true));
+            items.push((name.clone(), Some(Part::Device(i)), true));
         }
-        self.source.setMenu(Some(&menu));
-        crate::menu::set_sources(&recent, &devices);
+        self.form.set_pulldown(Part::Source, title, &items);
+        self.ui.menu_sources(&recent, &devices);
     }
 
     fn show_rows(&self, rows: Vec<PartitionRow>) {
         let table: Vec<Vec<String>> = rows
             .iter()
-            .map(|r| (0..COLUMNS.len()).map(|c| ui::plain(&cell(r, c))).collect())
+            .map(|r| (0..COLUMNS.len()).map(|c| cell(r, c)).collect())
             .collect();
         let count = rows.len();
         *self.rows.borrow_mut() = rows;
-        self.table.set_rows(table);
+        self.form.set_rows(Part::Table, &table);
         if self.cursor.get() >= count {
             self.cursor.set(0);
         }
-        if count > 0 && self.table.selected().is_none() {
-            self.table.select(self.cursor.get());
+        if count > 0 && self.form.selected_row(Part::Table).is_none() {
+            self.form.select_row(Part::Table, self.cursor.get());
         }
         let rows = self.rows.borrow();
         let row = rows.get(self.cursor.get());
@@ -1157,9 +1076,11 @@ impl InspectScreen {
         self.set_enabled(Part::CalcMin, can_calc && !locked);
         self.set_enabled(Part::Check, acts.browse && acts.check && !locked);
         self.set_enabled(Part::Expand, acts.browse && acts.expand_hfs && !locked);
-        ui::set_visible(self.part(Part::Defragment), acts.browse && acts.defragment);
+        self.form
+            .show(Part::Defragment, acts.browse && acts.defragment);
         self.set_enabled(Part::Defragment, !locked);
-        ui::set_visible(self.part(Part::ResizeAlto), acts.browse && acts.resize_alto);
+        self.form
+            .show(Part::ResizeAlto, acts.browse && acts.resize_alto);
     }
 
     /// Open, update or close the Check and CHD Info windows to match the controller.
@@ -1219,7 +1140,21 @@ impl InspectScreen {
         } else {
             (None, None, CHD_CLOSE)
         };
-        ReportWindow::open(self.mtm, title, toggle, button, close, on_close)
+        let me = self.me.clone();
+        let command: Rc<dyn Fn(&str)> = Rc::new(move |id| {
+            if let Some(s) = me.upgrade() {
+                s.command(id);
+            }
+        });
+        ReportWindow::open(
+            self.ui.clone(),
+            title,
+            toggle,
+            button,
+            close,
+            on_close,
+            command,
+        )
     }
 
     fn row_index(&self) -> Option<usize> {
@@ -1255,8 +1190,8 @@ impl InspectScreen {
             ),
             Node::Space(Size::Stretch(1)),
         ]));
-        let lines = |t: &NSTextField| {
-            let text = t.stringValue().to_string();
+        let lines = |p: Part| {
+            let text = self.form.text(p);
             if text.is_empty() {
                 0
             } else {
@@ -1265,13 +1200,13 @@ impl InspectScreen {
         };
         let line =
             |x: Part, n: i32| Node::leaf(x, Size::Stretch(1), Size::Fixed((layout::ROW - 6) * n));
-        if lines(&self.note) > 0 {
+        if lines(Part::Note) > 0 {
             rows.push(line(Part::Note, 2));
         }
-        if lines(&self.flux) > 0 {
+        if lines(Part::Flux) > 0 {
             rows.push(line(Part::Flux, 1));
         }
-        if lines(&self.error) > 0 {
+        if lines(Part::Error) > 0 {
             rows.push(line(Part::Error, 1));
         }
         rows.push(Node::row(vec![
@@ -1299,7 +1234,7 @@ impl InspectScreen {
             Node::button(p(Part::Bootable), 130),
             Node::Space(Size::Stretch(1)),
         ]));
-        let n = lines(&self.details);
+        let n = lines(Part::Details);
         if n > 0 {
             rows.push(line(Part::Details, n));
         }
@@ -1326,35 +1261,11 @@ impl InspectScreen {
         let tree = Node::inset(Node::column(rows), layout::MARGIN);
         // Hidden views take no room (the Win32 shell's R-095 lesson).
         let keep = |x: &Part| match x {
-            Part::Job => ui::shown(&self.progress),
-            _ => ui::shown(self.part(*x)),
+            Part::Job => self.form.shown(Part::Progress),
+            _ => self.form.shown(*x),
         };
-        let Some(tree) = tree.prune(&keep) else {
-            return;
-        };
-        crate::app::place_page(&self.body, &tree, &|x: Part, r| {
-            ui::move_to(self.part(x), r)
-        });
+        if let Some(tree) = tree.prune(&keep) {
+            self.form.place_page(tree);
+        }
     }
-}
-
-/// A menu item that goes to the action target with `id`; an empty id makes a caption.
-fn item(mtm: MainThreadMarker, title: &str, id: &str, on: bool) -> Retained<NSMenuItem> {
-    // SAFETY: a plain menu item; its action goes to the target set below.
-    let it = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            mtm.alloc(),
-            &ns(&ui::plain(title)),
-            (!id.is_empty()).then_some(sel!(act:)),
-            &ns(""),
-        )
-    };
-    if !id.is_empty() {
-        let t = ui::target(mtm);
-        // SAFETY: the target is never dropped.
-        unsafe { it.setTarget(Some(&t)) };
-        it.setIdentifier(Some(&ns(id)));
-    }
-    it.setEnabled(on);
-    it
 }

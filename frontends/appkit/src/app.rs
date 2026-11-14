@@ -23,15 +23,15 @@ use rusty_backup::controller::app::{
 use rusty_backup::controller::log::{capture, LogLevel};
 use rusty_backup::controller::{Controller, Effect};
 
-use crate::commander::CommanderScreen;
 use crate::effects::{EffectHost, Reply, ReplyFn};
-use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
-use crate::optical::OpticalScreen;
 use crate::screens::archives::ArchivesScreen;
 use crate::screens::backup::BackupScreen;
 use crate::screens::build_disk::BuildScreen;
+use crate::screens::commander::CommanderScreen;
 use crate::screens::convert::ConvertScreen;
+use crate::screens::inspect::InspectScreen;
+use crate::screens::optical::OpticalScreen;
 use crate::screens::restore::RestoreScreen;
 use crate::screens::settings::SettingsWindow;
 use crate::sync::SyncGuard;
@@ -79,24 +79,6 @@ impl Page {
     }
 }
 
-/// Lay `tree` out in a page's body at its scroll view's width: taller than the view, it scrolls.
-pub fn place_page<T: Copy>(body: &NSView, tree: &Node<T>, set: &dyn Fn(T, layout::Rect)) {
-    let Some(scroll) = body.enclosingScrollView() else {
-        return;
-    };
-    let visible = scroll.contentSize();
-    let h = (visible.height as i32).max(tree.min_height());
-    let w = visible.width as i32;
-    let size = NSSize::new(f64::from(w), f64::from(h));
-    if body.frame().size != size {
-        body.setFrameSize(size);
-    }
-    let area = layout::Rect { x: 0, y: 0, w, h };
-    for (id, r) in layout::layout(tree, area, 96) {
-        set(id, r);
-    }
-}
-
 pub struct App {
     ctrl: RefCell<AppController>,
     wake: Arc<MacWake>,
@@ -110,6 +92,11 @@ pub struct App {
     log: Retained<NSTextView>,
     pages: Vec<(AppTab, Page)>,
     inspect: Rc<InspectScreen>,
+    /// Inspect's browse view and remote picker pages, placed over its page while open.
+    inspect_browse: Retained<NSView>,
+    inspect_remote: Retained<NSView>,
+    /// Optical's disc browser page, placed over its page while open.
+    optical_browse: Retained<NSView>,
     backup: Rc<BackupScreen>,
     restore: Rc<RestoreScreen>,
     build: Rc<BuildScreen>,
@@ -121,6 +108,8 @@ pub struct App {
     player_tick: Cell<bool>,
     /// Commander, while it is open, over the whole window.
     commander: RefCell<Option<Rc<CommanderScreen>>>,
+    /// Commander's page while it is open.
+    commander_view: RefCell<Option<Retained<NSView>>>,
     log_shown: Cell<usize>,
     banner_shape: RefCell<Vec<bool>>,
     sync: SyncGuard,
@@ -497,15 +486,18 @@ impl App {
         }
         let ak = crate::form::AppKitHost::get(mtm);
         ak.set_status_view(status);
-        let host = EffectHost::new(ak);
+        let host = EffectHost::new(ak.clone());
         let inspect_body = pages
             .iter()
             .find(|(t, _)| *t == AppTab::Inspect)
             .map(|(_, p)| p.body.clone())
             .expect("the Inspect page");
+        let (inspect_browse, inspect_remote) = (ui::flipped(mtm), ui::flipped(mtm));
         let inspect = InspectScreen::build(
-            mtm,
-            inspect_body,
+            ak.clone(),
+            ak.adopt(inspect_body),
+            ak.adopt(inspect_browse.clone()),
+            ak.adopt(inspect_remote.clone()),
             ctrl.notify(),
             ctrl.recent_handle(),
             host.clone(),
@@ -517,7 +509,6 @@ impl App {
                 .map(|(_, p)| p.body.clone())
                 .expect("a page per screen")
         };
-        let ak = crate::form::AppKitHost::get(mtm);
         let page_of = |tab: AppTab| ak.adopt(body_of(tab));
         let backup = BackupScreen::build(
             ak.clone(),
@@ -546,9 +537,11 @@ impl App {
             ctrl.recent_handle(),
             host.clone(),
         );
+        let optical_browse = ui::flipped(mtm);
         let optical = OpticalScreen::build(
-            mtm,
-            body_of(AppTab::Optical),
+            ak.clone(),
+            page_of(AppTab::Optical),
+            ak.adopt(optical_browse.clone()),
             ctrl.notify(),
             ctrl.recent_handle(),
             host.clone(),
@@ -559,12 +552,12 @@ impl App {
             ctrl.notify(),
             host.clone(),
         );
-        content.addSubview(&inspect.browse.page);
-        inspect.browse.page.setHidden(true);
-        content.addSubview(&optical.browse.page);
-        optical.browse.page.setHidden(true);
-        content.addSubview(&inspect.remote_view);
-        inspect.remote_view.setHidden(true);
+        content.addSubview(&inspect_browse);
+        inspect_browse.setHidden(true);
+        content.addSubview(&optical_browse);
+        optical_browse.setHidden(true);
+        content.addSubview(&inspect_remote);
+        inspect_remote.setHidden(true);
         inspect.on_page(Rc::new(|| {
             if let Some(app) = app() {
                 app.refresh();
@@ -598,6 +591,9 @@ impl App {
             log,
             pages,
             inspect,
+            inspect_browse,
+            inspect_remote,
+            optical_browse,
             backup,
             restore,
             build,
@@ -607,6 +603,7 @@ impl App {
             player_tick: Cell::new(false),
             settings: RefCell::default(),
             commander: RefCell::default(),
+            commander_view: RefCell::default(),
             log_shown: Cell::new(0),
             banner_shape: RefCell::default(),
             sync: SyncGuard::default(),
@@ -687,7 +684,21 @@ impl App {
     fn dropped(&self, paths: Vec<std::path::PathBuf>, at: NSPoint) {
         let commander = self.commander.borrow().clone();
         match (commander, MainThreadMarker::new()) {
-            (Some(c), Some(mtm)) => c.drop_paths(mtm, paths, at),
+            (Some(c), Some(_)) => {
+                let host = crate::form::AppKitHost::current();
+                let under = [
+                    rusty_backup::controller::commander::Side::Left,
+                    rusty_backup::controller::commander::Side::Right,
+                ]
+                .into_iter()
+                .find(|side| {
+                    let list = host.view(c.page(), c.list_ctl(*side));
+                    let p = list.convertPoint_fromView(at, None);
+                    let b = list.bounds();
+                    p.x >= 0.0 && p.y >= 0.0 && p.x <= b.size.width && p.y <= b.size.height
+                });
+                c.drop_paths(paths, under);
+            }
             _ => self.drop_on_tab(paths),
         }
     }
@@ -870,9 +881,13 @@ impl App {
                 }
             }));
         });
-        let screen = CommanderScreen::build(mtm, &jobs, &notify, self.host.clone(), on_close);
-        self.content.addSubview(&screen.page);
+        let view = ui::flipped(mtm);
+        let ak = crate::form::AppKitHost::get(mtm);
+        let page = ak.adopt(view.clone());
+        let screen = CommanderScreen::build(ak, page, &jobs, &notify, self.host.clone(), on_close);
+        self.content.addSubview(&view);
         *self.commander.borrow_mut() = Some(screen);
+        *self.commander_view.borrow_mut() = Some(view);
         self.toolbar.setVisible(false);
         self.relayout();
     }
@@ -881,7 +896,10 @@ impl App {
         let Some(screen) = self.commander.borrow_mut().take() else {
             return;
         };
-        screen.page.removeFromSuperview();
+        if let Some(view) = self.commander_view.borrow_mut().take() {
+            view.removeFromSuperview();
+        }
+        drop(screen);
         self.toolbar.setVisible(true);
         self.refresh();
         self.relayout();
@@ -1017,11 +1035,11 @@ impl App {
                 ui::set_visible(&page.scroll, *t == tab && !over && !covered);
             }
             let browse = browsing && tab == AppTab::Inspect && !covered;
-            ui::set_visible(&self.inspect.browse.page, browse);
+            ui::set_visible(&self.inspect_browse, browse);
             let pick = picking && tab == AppTab::Inspect && !covered;
-            ui::set_visible(&self.inspect.remote_view, pick);
+            ui::set_visible(&self.inspect_remote, pick);
             let disc = disc && tab == AppTab::Optical && !covered;
-            ui::set_visible(&self.optical.browse.page, disc);
+            ui::set_visible(&self.optical_browse, disc);
         });
         if banner_was != banner.is_some() || shared_was != shared || self.banner_buttons_moved() {
             self.relayout();
@@ -1113,10 +1131,12 @@ impl App {
             for (_, page) in &self.pages {
                 page.scroll.setHidden(true);
             }
-            self.inspect.browse.page.setHidden(true);
-            self.optical.browse.page.setHidden(true);
-            self.inspect.remote_view.setHidden(true);
-            ui::move_to(&c.page, ui::area(&self.content));
+            self.inspect_browse.setHidden(true);
+            self.optical_browse.setHidden(true);
+            self.inspect_remote.setHidden(true);
+            if let Some(view) = &*self.commander_view.borrow() {
+                ui::move_to(view, ui::area(&self.content));
+            }
             c.layout();
             return;
         }
@@ -1179,11 +1199,11 @@ impl App {
                 self.archives.relayout();
                 self.optical.relayout();
                 self.convert.relayout();
-                ui::move_to(&self.inspect.browse.page, *r);
+                ui::move_to(&self.inspect_browse, *r);
                 self.inspect.browse.layout();
-                ui::move_to(&self.optical.browse.page, *r);
+                ui::move_to(&self.optical_browse, *r);
                 self.optical.browse.layout();
-                ui::move_to(&self.inspect.remote_view, *r);
+                ui::move_to(&self.inspect_remote, *r);
                 self.inspect.remote.layout();
             }
             ui::move_to(self.part(*part), *r);

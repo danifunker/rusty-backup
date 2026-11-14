@@ -16,7 +16,12 @@ use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::log::LogLevel;
 use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
-use crate::screens::host::{Align, Column, Ctl, Ev, Host, Ink, Painter, Pen, PullItem, Surface};
+use rusty_backup::controller::keys::{Key, Mods};
+
+use crate::screens::host::{
+    Align, Column, Ctl, Ev, Host, Ink, MenuEntry, Painter, Pen, PullItem, RowIcon, RowLine,
+    RowsEvent, RowsSpec, Surface,
+};
 use crate::screens::layout::Rect;
 use crate::screens::prompt;
 
@@ -31,6 +36,7 @@ extern "C" {
     fn rb_host_run_modal(s: u32);
     fn rb_host_stop_modal();
     fn rb_host_post();
+    fn rb_host_post_after(ms: u64);
 
     fn rb_host_set_progress(s: u32, c: u32, running: c_int, pct: i32);
     fn rb_host_table(
@@ -54,6 +60,49 @@ extern "C" {
     fn rb_host_set_surface_size(s: u32, w: i32, h: i32);
     fn rb_host_on_screen(s: u32) -> c_int;
     fn rb_host_canvas(s: u32, c: u32, id: *const c_char);
+    fn rb_host_control_size(s: u32, c: u32, out: *mut f64);
+    fn rb_host_rows(
+        s: u32,
+        c: u32,
+        id: *const c_char,
+        titles: *const *const c_char,
+        widths: *const f64,
+        right: *const u8,
+        n: u32,
+        header: c_int,
+        multiple: c_int,
+        stripes: c_int,
+    );
+    fn rb_host_set_row_lines(
+        s: u32,
+        c: u32,
+        cells: *const *const c_char,
+        rows: u32,
+        cols: u32,
+        depth: *const u32,
+        icon: *const u8,
+        tick: *const i8,
+    );
+    fn rb_host_hide_column(s: u32, c: u32, col: u32, hidden: c_int);
+    fn rb_host_select_rows(s: u32, c: u32, rows: *const u32, n: u32, visible: i32);
+    fn rb_host_focus(s: u32, c: u32);
+    fn rb_host_page_rows(s: u32, c: u32) -> i32;
+    fn rb_host_menu_at(
+        s: u32,
+        c: u32,
+        labels: *const *const c_char,
+        kinds: *const u8,
+        n: u32,
+        x: f64,
+        y: f64,
+    ) -> i32;
+    fn rb_host_wrap_text_view(s: u32, c: u32, wrap: c_int);
+    fn rb_host_window_frame(s: u32, out: *mut f64) -> c_int;
+    fn rb_host_set_window_frame(s: u32, x: f64, y: f64, w: f64, h: f64);
+    fn rb_host_pick_files(title: *const c_char) -> *mut c_char;
+    fn rb_host_text_area(s: u32, c: u32, id: *const c_char, caption: *const c_char);
+    fn rb_host_text_view_text(s: u32, c: u32) -> *mut c_char;
+    fn rb_host_resize_window(s: u32, w: i32, h: i32);
     fn rb_host_redraw(s: u32, c: u32);
     fn rb_host_clicked(s: u32, c: u32, out: *mut f64) -> c_int;
     fn rb_host_text_view(s: u32, c: u32, id: *const c_char);
@@ -177,7 +226,10 @@ thread_local! {
     static HANDLERS: RefCell<Vec<(Surface, Rc<dyn Fn(Ctl, Ev)>)>> = RefCell::new(Vec::new());
     static WINDOWS: RefCell<Vec<WindowHooks>> = RefCell::new(Vec::new());
     static LATER: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::new(VecDeque::new());
+    /// Work for a later turn, in the order its delays end; each post runs the earliest due.
+    static TIMED: RefCell<Vec<(std::time::Instant, Box<dyn FnOnce()>)>> = RefCell::new(Vec::new());
     static PAINTERS: RefCell<Vec<((Surface, Ctl), Painter)>> = RefCell::new(Vec::new());
+    static ROWS: RefCell<Vec<((Surface, Ctl), Rc<dyn Fn(RowsEvent)>)>> = RefCell::new(Vec::new());
     static HOST: Rc<VintageHost> = Rc::new(VintageHost {
         status: RefCell::new(String::new()),
         log: RefCell::new(Vec::new()),
@@ -199,6 +251,93 @@ pub extern "C" fn rb_window_event(s: u32, kind: u32) {
     if let Some(f) = hook {
         f();
     }
+}
+
+/// The controller's name for a key a list hands over (`code` is the Mac virtual key code); `None`
+/// for one it keeps. AppKit's shell maps the same codes.
+fn key_of(code: u32, ch: u32) -> Option<Key> {
+    Some(match code {
+        36 | 76 => Key::Enter,
+        53 => Key::Escape,
+        51 => Key::Backspace,
+        117 => Key::Delete,
+        114 => Key::Insert,
+        48 => Key::Tab,
+        49 => Key::Space,
+        123 => Key::Left,
+        124 => Key::Right,
+        122 => Key::F(1),
+        120 => Key::F(2),
+        99 => Key::F(3),
+        118 => Key::F(4),
+        96 => Key::F(5),
+        97 => Key::F(6),
+        98 => Key::F(7),
+        100 => Key::F(8),
+        101 => Key::F(9),
+        109 => Key::F(10),
+        103 => Key::F(11),
+        111 => Key::F(12),
+        125 | 126 | 116 | 121 | 115 | 119 => return None,
+        _ => {
+            let c = char::from_u32(ch).filter(|c| c.is_ascii_alphanumeric())?;
+            Key::Char(c.to_ascii_lowercase())
+        }
+    })
+}
+
+/// What a pane list reported: 0 select, 1 tick, 2 icon, 3 activate, 4 key, 5 header, 6 menu,
+/// 7 focused. `a` is the row, column or key code; `b` the modifiers (1 cmd, 2 shift, 4 ctrl,
+/// 8 alt) or the key's character; `x` and `y` a menu's point.
+#[no_mangle]
+pub extern "C" fn rb_rows_event(
+    s: u32,
+    c: u32,
+    kind: u32,
+    a: u32,
+    b: u32,
+    mods: u32,
+    x: f64,
+    y: f64,
+) {
+    let f = ROWS.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|e| e.0 == (s, c))
+            .map(|e| e.1.clone())
+    });
+    let f = match f {
+        Some(f) => f,
+        None => return,
+    };
+    let m = Mods {
+        cmd: mods & 1 != 0,
+        shift: mods & 2 != 0,
+        ctrl: mods & 4 != 0,
+        alt: mods & 8 != 0,
+    };
+    let e = match kind {
+        0 => RowsEvent::Select {
+            row: a as usize,
+            cmd: m.cmd,
+            shift: m.shift,
+        },
+        1 => RowsEvent::Tick(a as usize),
+        2 => RowsEvent::Icon(a as usize),
+        3 => RowsEvent::Activate,
+        4 => match key_of(a, b) {
+            Some(k) => RowsEvent::Key(k, m),
+            None => return,
+        },
+        5 => RowsEvent::Header(a as usize),
+        6 => RowsEvent::Menu {
+            row: a as usize,
+            x,
+            y,
+        },
+        _ => RowsEvent::Focused,
+    };
+    f(e);
 }
 
 /// A canvas's `drawRect:`: run its painter with a pen over the current graphics context.
@@ -258,6 +397,19 @@ impl Pen for VintagePen {
         let t = cs(text);
         // SAFETY: measuring only; the host copies the text.
         unsafe { rb_pen_text_width(t.as_ptr()) }
+    }
+}
+
+/// A delay `after` asked for ended: run the item that is due first.
+#[no_mangle]
+pub extern "C" fn rb_timed() {
+    let next = TIMED.with(|t| {
+        let mut t = t.borrow_mut();
+        let at = (0..t.len()).min_by_key(|i| t[*i].0)?;
+        Some(t.remove(at).1)
+    });
+    if let Some(f) = next {
+        f();
     }
 }
 
@@ -363,6 +515,17 @@ impl Host for VintageHost {
             gone
         });
         drop(painters);
+        let rows = ROWS.with(|r| {
+            let mut r = r.borrow_mut();
+            let gone: Vec<Rc<dyn Fn(RowsEvent)>> = r
+                .iter()
+                .filter(|e| e.0 .0 == s)
+                .map(|e| e.1.clone())
+                .collect();
+            r.retain(|e| e.0 .0 != s);
+            gone
+        });
+        drop(rows);
         // SAFETY: a plain call on the main thread.
         unsafe { rb_host_release(s) }
     }
@@ -586,6 +749,196 @@ impl Host for VintageHost {
         unsafe { rb_host_on_screen(s) != 0 }
     }
 
+    fn control_size(&self, s: Surface, c: Ctl) -> (f64, f64) {
+        let mut out = [0f64; 2];
+        // SAFETY: the host writes two numbers.
+        unsafe { rb_host_control_size(s, c, out.as_mut_ptr()) };
+        (out[0], out[1])
+    }
+
+    fn rows_view(&self, s: Surface, c: Ctl, id: &str, spec: &RowsSpec, on: Rc<dyn Fn(RowsEvent)>) {
+        ROWS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|e| e.0 != (s, c));
+            r.push(((s, c), on));
+        });
+        let titles: Vec<String> = spec.columns.iter().map(|x| x.0.clone()).collect();
+        let (_owned, ptrs) = list(&titles);
+        let widths: Vec<f64> = spec.columns.iter().map(|x| x.1).collect();
+        let right: Vec<u8> = spec.columns.iter().map(|x| u8::from(x.2)).collect();
+        let i = cs(id);
+        // SAFETY: three arrays of `n` entries, alive for the call; the host copies.
+        unsafe {
+            rb_host_rows(
+                s,
+                c,
+                i.as_ptr(),
+                ptrs.as_ptr(),
+                widths.as_ptr(),
+                right.as_ptr(),
+                titles.len() as u32,
+                flag(spec.header),
+                flag(spec.multiple),
+                flag(spec.stripes),
+            )
+        }
+    }
+
+    fn set_row_lines(&self, s: Surface, c: Ctl, lines: &[RowLine]) {
+        let cols = lines.iter().map(|l| l.cells.len()).max().unwrap_or(0);
+        let mut flat: Vec<String> = Vec::with_capacity(lines.len() * cols);
+        for l in lines {
+            for i in 0..cols {
+                flat.push(l.cells.get(i).cloned().unwrap_or_default());
+            }
+        }
+        let (_owned, ptrs) = list(&flat);
+        let depth: Vec<u32> = lines.iter().map(|l| l.depth as u32).collect();
+        // Icons: 0 none; 1-4 a file, 5-8 a folder (+1 expandable, +2 expanded); 9 / 10 a tree folder.
+        let icon: Vec<u8> = lines
+            .iter()
+            .map(|l| match l.icon {
+                RowIcon::None => 0,
+                RowIcon::File {
+                    expandable,
+                    expanded,
+                } => 1 + u8::from(expandable) + 2 * u8::from(expanded),
+                RowIcon::Folder {
+                    expandable,
+                    expanded,
+                } => 5 + u8::from(expandable) + 2 * u8::from(expanded),
+                RowIcon::TreeFolder { open } => 9 + u8::from(open),
+            })
+            .collect();
+        let tick: Vec<i8> = lines
+            .iter()
+            .map(|l| match l.tick {
+                None => -1,
+                Some(on) => i8::from(on),
+            })
+            .collect();
+        // SAFETY: `rows * cols` cells and three arrays of `rows`, alive for the call.
+        unsafe {
+            rb_host_set_row_lines(
+                s,
+                c,
+                ptrs.as_ptr(),
+                lines.len() as u32,
+                cols as u32,
+                depth.as_ptr(),
+                icon.as_ptr(),
+                tick.as_ptr(),
+            )
+        }
+    }
+
+    fn hide_column(&self, s: Surface, c: Ctl, col: usize, hidden: bool) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_hide_column(s, c, col as u32, flag(hidden)) }
+    }
+
+    fn select_rows(&self, s: Surface, c: Ctl, rows: &[usize], visible: Option<usize>) {
+        let v: Vec<u32> = rows.iter().map(|r| *r as u32).collect();
+        let vis = visible.map(|i| i as i32).unwrap_or(-1);
+        // SAFETY: `n` rows, alive for the call.
+        unsafe { rb_host_select_rows(s, c, v.as_ptr(), v.len() as u32, vis) }
+    }
+
+    fn focus(&self, s: Surface, c: Ctl) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_focus(s, c) }
+    }
+
+    fn page_rows(&self, s: Surface, c: Ctl) -> i32 {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_page_rows(s, c) }
+    }
+
+    fn menu_at(&self, s: Surface, c: Ctl, items: &[MenuEntry], x: f64, y: f64) -> Option<usize> {
+        // Flattened: kind 0 an item (1 when off, 2 when ticked), 3 a submenu, 4 its item, 5 its end.
+        let mut labels = Vec::new();
+        let mut kinds = Vec::new();
+        for e in items {
+            match e {
+                MenuEntry::Item {
+                    label,
+                    enabled,
+                    checked,
+                } => {
+                    labels.push(label.clone());
+                    kinds.push(if !enabled {
+                        1
+                    } else if *checked {
+                        2
+                    } else {
+                        0
+                    });
+                }
+                MenuEntry::Sub { label, items } => {
+                    labels.push(label.clone());
+                    kinds.push(3);
+                    for i in items {
+                        labels.push(i.clone());
+                        kinds.push(4);
+                    }
+                    labels.push(String::new());
+                    kinds.push(5);
+                }
+            }
+        }
+        let (_owned, ptrs) = list(&labels);
+        // SAFETY: two arrays of `n`, alive for the modal call.
+        let i = unsafe {
+            rb_host_menu_at(
+                s,
+                c,
+                ptrs.as_ptr(),
+                kinds.as_ptr(),
+                kinds.len() as u32,
+                x,
+                y,
+            )
+        };
+        usize::try_from(i).ok()
+    }
+
+    fn wrap_text_view(&self, s: Surface, c: Ctl, wrap: bool) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_wrap_text_view(s, c, flag(wrap)) }
+    }
+
+    fn window_frame(&self, s: Surface) -> Option<(f64, f64, f64, f64)> {
+        let mut out = [0f64; 4];
+        // SAFETY: the host writes four numbers for a window's surface.
+        let any = unsafe { rb_host_window_frame(s, out.as_mut_ptr()) };
+        if any == 0 {
+            None
+        } else {
+            Some((out[0], out[1], out[2], out[3]))
+        }
+    }
+
+    fn set_window_frame(&self, s: Surface, (x, y, w, h): (f64, f64, f64, f64)) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_set_window_frame(s, x, y, w, h) }
+    }
+
+    fn text_area(&self, s: Surface, c: Ctl, id: &str, caption: &str) {
+        let (i, cap) = (cs(id), cs(caption));
+        // SAFETY: the host copies both strings.
+        unsafe { rb_host_text_area(s, c, i.as_ptr(), cap.as_ptr()) }
+    }
+
+    fn text_view_text(&self, s: Surface, c: Ctl) -> String {
+        // SAFETY: the host hands over a malloc'd string.
+        take(unsafe { rb_host_text_view_text(s, c) })
+    }
+
+    fn resize_window(&self, s: Surface, w: i32, h: i32) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_resize_window(s, w, h) }
+    }
+
     fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter) {
         PAINTERS.with(|p| {
             let mut p = p.borrow_mut();
@@ -736,6 +1089,13 @@ impl Host for VintageHost {
         unsafe { rb_host_post() }
     }
 
+    fn after(&self, ms: u64, f: Box<dyn FnOnce()>) {
+        let due = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        TIMED.with(|t| t.borrow_mut().push((due, f)));
+        // SAFETY: queues one `rb_timed` on the main thread `ms` from now.
+        unsafe { rb_host_post_after(ms) }
+    }
+
     fn log(&self, lines: Vec<(LogLevel, String)>) {
         for (_, line) in &lines {
             eprintln!("{}", line);
@@ -746,6 +1106,8 @@ impl Host for VintageHost {
     fn status(&self, text: &str) {
         *self.status.borrow_mut() = text.to_string();
     }
+
+    fn menu_sources(&self, _recent: &[String], _devices: &[String]) {}
 
     fn open_url(&self, url: &str) {
         let u = cs(url);
@@ -801,6 +1163,16 @@ impl Host for VintageHost {
         }
     }
 
+    fn pick_files(&self, title: &str) -> Vec<PathBuf> {
+        let t = cs(title);
+        // SAFETY: a modal panel; the host returns the paths joined by newlines, malloc'd.
+        let all = take(unsafe { rb_host_pick_files(t.as_ptr()) });
+        all.lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+
     fn confirm(&self, spec: &ConfirmSpec) -> bool {
         let buttons = vec![spec.confirm_label.clone(), "Cancel".to_string()];
         self.alert(
@@ -810,6 +1182,14 @@ impl Host for VintageHost {
             spec.destructive,
             Some(1),
         ) == Some(0)
+    }
+
+    fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize> {
+        let mut all = buttons.to_vec();
+        all.push("Cancel".to_string());
+        let cancel = all.len() - 1;
+        self.alert(title, message, &all, false, Some(cancel))
+            .filter(|i| *i < cancel)
     }
 
     fn choose(&self, spec: &ChoiceSpec) -> usize {
