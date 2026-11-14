@@ -3,12 +3,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rusty_backup::controller::app::{about, app_version};
+use std::sync::Arc;
+
+use rusty_backup::controller::app::{about, app_version, AppController};
 use rusty_backup::controller::commander::Tone;
 
 use crate::host::VintageHost;
 use crate::screens::form::Form;
+use crate::screens::host::Host;
 use crate::screens::layout::{self, Node, Size};
+use crate::screens::settings::SettingsWindow;
+use crate::wake::VintageWake;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum K {
@@ -20,13 +25,17 @@ enum K {
     Echo,
     Loud,
     Pick,
+    Settings,
     Close,
 }
 
 struct Gate {
-    host: Rc<VintageHost>,
+    host: Rc<dyn Host>,
     surface: u32,
-    form: Form<K, VintageHost>,
+    form: Form<K>,
+    wake: Arc<VintageWake>,
+    ctrl: RefCell<AppController>,
+    settings: RefCell<Option<Rc<SettingsWindow>>>,
 }
 
 thread_local! {
@@ -34,8 +43,9 @@ thread_local! {
 }
 
 pub fn open() {
-    let host = VintageHost::get();
-    let surface = host.window("Rusty Backup", 460, 260);
+    let host: Rc<dyn Host> = VintageHost::get();
+    let quit = host.clone();
+    let surface = host.window("Rusty Backup", 460, 260, Box::new(move || quit.quit()));
     let form = Form::with_host(host.clone(), surface, Rc::new(fired));
     let f = &form;
     f.label(K::Title, "Rusty Backup");
@@ -47,11 +57,17 @@ pub fn open() {
     f.check(K::Loud, "Shout", "gate.loud");
     let greetings = vec!["Hello".to_string(), "Welcome".to_string(), "Hi".to_string()];
     f.popup(K::Pick, &greetings, "gate.pick");
+    f.button(K::Settings, "Settings...", "gate.settings");
     f.button(K::Close, "Close", "gate.close");
+    let wake = Arc::new(VintageWake::default());
+    let ctrl = AppController::new(wake.clone());
     let gate = Rc::new(Gate {
         host,
         surface,
         form,
+        wake,
+        ctrl: RefCell::new(ctrl),
+        settings: RefCell::new(None),
     });
     GATE.with(|g| *g.borrow_mut() = Some(gate.clone()));
     gate.refresh();
@@ -63,10 +79,25 @@ fn fired(k: K) {
     let gate = GATE.with(|g| g.borrow().clone());
     if let Some(gate) = gate {
         if k == K::Close {
-            gate.host.close(gate.surface);
+            gate.host.quit();
+            return;
+        }
+        if k == K::Settings {
+            let recent = gate.ctrl.borrow().recent_handle();
+            let w = SettingsWindow::open(gate.host.clone(), recent, Box::new(|| {}));
+            *gate.settings.borrow_mut() = Some(w);
             return;
         }
         gate.refresh();
+    }
+}
+
+/// Run the controllers, as a wake asks.
+pub fn tick() {
+    let gate = GATE.with(|g| g.borrow().clone());
+    if let Some(gate) = gate {
+        gate.wake.ticked();
+        let _ = rusty_backup::controller::Controller::tick(&mut *gate.ctrl.borrow_mut());
     }
 }
 

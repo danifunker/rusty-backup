@@ -6,6 +6,7 @@
 //! progress, reports nothing. `Form::new`, `add`, `v` and `place_page` are this shell's extras.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
@@ -13,19 +14,22 @@ use objc2::runtime::NSObjectProtocol;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSLineBreakMode, NSMenuItem, NSPopUpButton, NSSecureTextField, NSTextField, NSTextFieldCell,
-    NSView,
+    NSAccessibility, NSApplication, NSButton, NSColor, NSControl, NSControlStateValueOff,
+    NSControlStateValueOn, NSLineBreakMode, NSMenuItem, NSPopUpButton, NSProgressIndicator,
+    NSSecureTextField, NSTextField, NSTextFieldCell, NSView, NSWindow, NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSURL};
 use rusty_backup::controller::commander::Tone;
+use rusty_backup::controller::log::LogLevel;
+use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, TextSpec};
 
 use crate::layout::{self, Node};
-use crate::screens::host::{Ctl, Ev, Host, PullItem, Surface};
-use crate::ui::{self, ns, Callback, TextChange};
+use crate::screens::host::{Column, Ctl, Ev, Host, PullItem, Surface};
+use crate::table::Table;
+use crate::ui::{self, ns, Callback, CloseDelegate, TextChange};
 
-/// A screen's controls on the AppKit host.
-pub type Form<K> = crate::screens::form::Form<K, AppKitHost>;
+/// A screen's controls; on this shell the host is [`AppKitHost`].
+pub type Form<K> = crate::screens::form::Form<K>;
 
 /// A control's colour for a controller's tone.
 pub fn tone_color(t: Option<Tone>) -> Retained<NSColor> {
@@ -68,6 +72,9 @@ thread_local! {
     static HOST: RefCell<Option<Rc<AppKitHost>>> = const { RefCell::new(None) };
 }
 
+/// A list's last tick-box change, as `toggled` answers it.
+type LastTick = Rc<Cell<Option<(usize, bool)>>>;
+
 /// Where a surface's controls report; set by `bind`, shared with its target and delegates.
 type Slot = Rc<RefCell<Option<Rc<dyn Fn(Ctl, Ev)>>>>;
 
@@ -87,12 +94,17 @@ struct Rec {
     target: Retained<Callback>,
     delegates: Vec<(Ctl, Retained<TextChange>)>,
     slot: Slot,
+    /// The window whose content this surface is, when it is one.
+    window: Option<(Retained<NSWindow>, Retained<CloseDelegate>)>,
+    tables: Vec<(Ctl, Table, LastTick)>,
 }
 
 pub struct AppKitHost {
     mtm: MainThreadMarker,
     /// Each surface by its number; `None` once released (numbers are not reused).
     surfaces: RefCell<Vec<Option<Rec>>>,
+    /// The status line under the screens, once the app window has one.
+    status: RefCell<Option<Retained<NSTextField>>>,
 }
 
 impl AppKitHost {
@@ -104,10 +116,27 @@ impl AppKitHost {
                     Rc::new(AppKitHost {
                         mtm,
                         surfaces: RefCell::new(Vec::new()),
+                        status: RefCell::new(None),
                     })
                 })
                 .clone()
         })
+    }
+
+    /// The app's one host, once `get` has made it.
+    pub fn current() -> Rc<AppKitHost> {
+        HOST.with(|h| h.borrow().clone())
+            .expect("the host is made at launch")
+    }
+
+    /// Where `Effect::Message` text goes.
+    pub fn set_status_view(&self, field: Retained<NSTextField>) {
+        *self.status.borrow_mut() = Some(field);
+    }
+
+    /// The window of surface `s`, when it is one.
+    pub fn ns_window(&self, s: Surface) -> Option<Retained<NSWindow>> {
+        self.with(s, |r| r.window.as_ref().map(|w| w.0.clone()))
     }
 
     /// A new surface on `body`.
@@ -134,6 +163,8 @@ impl AppKitHost {
             target,
             delegates: Vec::new(),
             slot,
+            window: None,
+            tables: Vec::new(),
         }));
         (all.len() - 1) as Surface
     }
@@ -196,6 +227,18 @@ impl AppKitHost {
             .downcast::<NSTextField>()
             .expect("a text field")
     }
+
+    /// Run `f` on list `c`, outside the surfaces' borrow (a reload reports back into the host).
+    fn on_table<R>(&self, s: Surface, c: Ctl, f: impl FnOnce(&Table) -> R) -> R {
+        let found = self.with(s, |r| {
+            let at = r.tables.iter().position(|t| t.0 == c);
+            at.map(|i| r.tables.remove(i))
+        });
+        let entry = found.expect("a list");
+        let out = f(&entry.1);
+        self.with(s, |r| r.tables.push(entry));
+        out
+    }
 }
 
 impl Host for AppKitHost {
@@ -213,8 +256,52 @@ impl Host for AppKitHost {
         // Dropped outside the borrow: a view's teardown can reach the host.
         if let Some(rec) = gone {
             *rec.slot.borrow_mut() = None;
+            if let Some((w, _)) = &rec.window {
+                w.setDelegate(None);
+                w.orderOut(None);
+            }
             drop(rec);
         }
+    }
+
+    fn window(&self, title: &str, w: i32, h: i32, on_close: Box<dyn Fn()>) -> Surface {
+        let (window, delegate) = ui::window(self.mtm, title, f64::from(w), f64::from(h), on_close);
+        let body = window.contentView().expect("the window's content view");
+        let s = self.adopt(body);
+        self.with(s, |r| r.window = Some((window, delegate)));
+        s
+    }
+
+    fn on_resize(&self, s: Surface, f: Box<dyn Fn()>) {
+        if let Some(d) = self.with(s, |r| r.window.as_ref().map(|w| w.1.clone())) {
+            d.on_resize(f);
+        }
+    }
+
+    fn present(&self, s: Surface) {
+        if let Some(w) = self.ns_window(s) {
+            ui::present(&w);
+        }
+    }
+
+    fn hide(&self, s: Surface) {
+        if let Some(w) = self.ns_window(s) {
+            w.orderOut(None);
+        }
+    }
+
+    fn area(&self, s: Surface) -> layout::Rect {
+        ui::area(&self.body(s))
+    }
+
+    fn run_modal(&self, s: Surface) {
+        if let Some(w) = self.ns_window(s) {
+            NSApplication::sharedApplication(self.mtm).runModalForWindow(&w);
+        }
+    }
+
+    fn stop_modal(&self) {
+        NSApplication::sharedApplication(self.mtm).stopModal();
     }
 
     fn button(&self, s: Surface, c: Ctl, title: &str, id: &str) {
@@ -356,9 +443,78 @@ impl Host for AppKitHost {
         self.adopt_view(s, c, &ui::progress(self.mtm));
     }
 
+    fn set_progress(&self, s: Surface, c: Ctl, running: bool, pct: Option<u32>) {
+        if let Some(bar) = self.view(s, c).downcast_ref::<NSProgressIndicator>() {
+            ui::set_progress(bar, running, pct);
+        }
+    }
+
+    fn table(&self, s: Surface, c: Ctl, id: &str, columns: &[Column], checks: bool) {
+        let cols: Vec<(&str, f64, bool)> = columns
+            .iter()
+            .map(|(t, w, r)| (t.as_str(), *w, *r))
+            .collect();
+        let t = Table::new(self.mtm, id, &cols);
+        let slot = self.with(s, |r| r.slot.clone());
+        let picked = slot.clone();
+        t.on_select(Rc::new(move |_| fire(&picked, c, Ev::Selected)));
+        let activated = slot.clone();
+        t.on_activate(
+            self.mtm,
+            Rc::new(move || fire(&activated, c, Ev::Activated)),
+        );
+        let last: LastTick = Rc::new(Cell::new(None));
+        if checks {
+            let (seen, toggled) = (last.clone(), slot);
+            t.add_checks(
+                self.mtm,
+                Rc::new(move |row, on| {
+                    seen.set(Some((row, on)));
+                    fire(&toggled, c, Ev::Toggled);
+                }),
+            );
+        }
+        let body = self.body(s);
+        body.addSubview(&t.scroll);
+        let view: Retained<NSView> = Retained::into_super(t.scroll.clone());
+        self.with(s, |r| {
+            r.views.retain(|(x, _)| *x != c);
+            r.views.push((c, view));
+            r.tables.retain(|x| x.0 != c);
+            r.tables.push((c, t, last));
+        });
+    }
+
+    fn set_rows(&self, s: Surface, c: Ctl, rows: &[Vec<String>]) {
+        self.on_table(s, c, |t| t.set_rows(rows.to_vec()));
+    }
+
+    fn set_checks(&self, s: Surface, c: Ctl, checks: &[bool]) {
+        self.on_table(s, c, |t| t.set_checks(checks.to_vec()));
+    }
+
+    fn selected_row(&self, s: Surface, c: Ctl) -> Option<usize> {
+        self.on_table(s, c, |t| t.selected())
+    }
+
+    fn select_row(&self, s: Surface, c: Ctl, i: usize) {
+        self.on_table(s, c, |t| t.select(i));
+    }
+
+    fn toggled(&self, s: Surface, c: Ctl) -> Option<(usize, bool)> {
+        self.with(s, |r| {
+            r.tables.iter().find(|t| t.0 == c).and_then(|t| t.2.get())
+        })
+    }
+
+    fn key_equivalent(&self, s: Surface, c: Ctl, key: &str) {
+        self.button_of(s, c).setKeyEquivalent(&ns(key));
+    }
+
     fn remove(&self, s: Surface, c: Ctl) {
         let gone = self.with(s, |r| {
             r.delegates.retain(|(x, _)| *x != c);
+            r.tables.retain(|t| t.0 != c);
             let at = r.views.iter().position(|(x, _)| *x == c);
             at.map(|i| r.views.remove(i).1)
         });
@@ -451,9 +607,58 @@ impl Host for AppKitHost {
     fn move_to(&self, s: Surface, c: Ctl, r: layout::Rect) {
         ui::move_to(&self.view(s, c), r);
     }
+
+    fn later(&self, f: Box<dyn FnOnce()>) {
+        crate::app::later(f);
+    }
+
+    fn log(&self, lines: Vec<(LogLevel, String)>) {
+        crate::app::append_log(lines);
+    }
+
+    fn status(&self, text: &str) {
+        let field = self.status.borrow().clone();
+        if let Some(f) = field {
+            ui::set_text(&f, text);
+        }
+    }
+
+    fn open_url(&self, url: &str) {
+        if let Some(u) = NSURL::URLWithString(&ns(url)) {
+            NSWorkspace::sharedWorkspace().openURL(&u);
+        }
+    }
+
+    fn copy_text(&self, text: &str) {
+        crate::effects::copy_text(text);
+    }
+
+    fn quit(&self) {
+        NSApplication::sharedApplication(self.mtm).terminate(None);
+    }
+
+    fn pick(&self, spec: &PickSpec, folder: bool) -> Option<PathBuf> {
+        crate::effects::pick(self.mtm, spec, folder)
+    }
+
+    fn confirm(&self, spec: &ConfirmSpec) -> bool {
+        crate::effects::confirm(self.mtm, spec)
+    }
+
+    fn choose(&self, spec: &ChoiceSpec) -> usize {
+        crate::effects::choose(self.mtm, spec)
+    }
+
+    fn ask_text(&self, spec: &TextSpec) -> Option<String> {
+        crate::effects::ask_text(self.mtm, spec)
+    }
+
+    fn ask_password(&self, spec: &PasswordSpec) -> Option<String> {
+        crate::effects::ask_password(self.mtm, spec)
+    }
 }
 
-impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K, AppKitHost> {
+impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K> {
     /// A form on `body`; `on` hears each control's key when it acts or its text changes.
     pub fn new(mtm: MainThreadMarker, body: Retained<NSView>, on: Rc<dyn Fn(K)>) -> Form<K> {
         let host = AppKitHost::get(mtm);
@@ -461,21 +666,26 @@ impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K, AppKitHost> {
         Self::with_host(host, s, on)
     }
 
+    /// The AppKit host behind every form on this shell.
+    fn ak(&self) -> Rc<AppKitHost> {
+        AppKitHost::current()
+    }
+
     /// Add a view the screen built (a list, a bar) as `k`.
     pub fn add(&self, k: K, view: &NSView) {
         let c = self.custom(k);
-        self.host().adopt_view(self.surface(), c, view);
+        self.ak().adopt_view(self.surface(), c, view);
     }
 
     pub fn v(&self, k: K) -> Retained<NSView> {
-        self.host().view(self.surface(), self.ctl(k))
+        self.ak().view(self.surface(), self.ctl(k))
     }
 
     /// Prune `tree` of hidden views and lay it out in the page the form is on, which scrolls.
     pub fn place_page(&self, tree: Node<K>) {
         let keep = |k: &K| self.shown(*k);
         if let Some(tree) = tree.prune(&keep) {
-            let body = self.host().body(self.surface());
+            let body = self.ak().body(self.surface());
             crate::app::place_page(&body, &tree, &|k, r| ui::move_to(&self.v(k), r));
         }
     }

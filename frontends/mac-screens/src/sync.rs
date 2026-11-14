@@ -1,4 +1,4 @@
-//! A guard against the delegate and selection notifications AppKit sends for the shell's own sets.
+//! A guard against the delegate and selection notifications a toolkit sends for the shell's own sets.
 
 use std::cell::Cell;
 

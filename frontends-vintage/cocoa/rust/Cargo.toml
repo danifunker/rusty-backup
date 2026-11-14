@@ -21,6 +21,8 @@ rust173-polyfill = ["rb-cli-vintage/rust173-polyfill"]
 native-zstd = ["rb-cli-vintage/native-zstd"]
 remote = ["rb-cli-vintage/remote"]
 yaml = ["rb-cli-vintage/yaml"]
+# The settings and recent-files controllers are gated on it (as for any shell); TUI code is stripped.
+tui = ["rb-cli-vintage/tui"]
 os-stub = ["rb-cli-vintage/os-stub"]
 
 [dependencies]

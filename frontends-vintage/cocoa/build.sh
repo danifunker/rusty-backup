@@ -12,7 +12,7 @@ ARCH="${2:-x86_64}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$ROOT/frontends-vintage/cocoa"
 OUT="$HERE/build/$ARCH"
-FEATURES="native-zstd,remote,rust173-polyfill,yaml"
+FEATURES="native-zstd,remote,rust173-polyfill,yaml,tui"
 case "$ARCH" in
     x86_64) TARGET=x86_64-apple-darwin; MIN=10.7 ;;
     arm64) TARGET=aarch64-apple-darwin; MIN=11.0 ;;

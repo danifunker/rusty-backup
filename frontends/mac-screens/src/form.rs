@@ -11,7 +11,7 @@ use std::rc::{Rc, Weak};
 
 use rusty_backup::controller::commander::Tone;
 
-use super::host::{Ctl, Ev, Host, PullItem, Surface};
+use super::host::{Column, Ctl, Ev, Host, PullItem, Surface};
 use super::layout::{self, Node};
 
 /// What a control is, as far as reporting its changes goes.
@@ -25,6 +25,7 @@ pub enum Kind {
     Popup,
     Pulldown,
     Progress,
+    Table,
     /// A view the shell builds itself (a list, a bar) and hands the host.
     Custom,
 }
@@ -34,6 +35,9 @@ pub fn plain(s: &str) -> String {
     s.replace('\0', "")
 }
 
+/// A list's control and its activate and toggle keys.
+type ListKeys<K> = (Ctl, Option<K>, Option<K>);
+
 struct State<K> {
     /// Each key by its control number; `None` until built, and again once removed.
     keys: RefCell<Vec<(K, Option<Kind>)>>,
@@ -41,6 +45,8 @@ struct State<K> {
     fields: RefCell<Vec<(K, String)>>,
     /// Each pop-up and the pick last reported or set.
     pops: RefCell<Vec<(K, Option<usize>)>>,
+    /// A list's activate and toggle keys, when they differ from its own.
+    lists: RefCell<Vec<ListKeys<K>>>,
     on: Rc<dyn Fn(K)>,
 }
 
@@ -61,7 +67,7 @@ impl<K: Copy + PartialEq> State<K> {
     }
 
     /// The next field whose text changed since it was last reported, now marked as reported.
-    fn next_edit<H: Host>(&self, host: &H, s: Surface) -> Option<K> {
+    fn next_edit(&self, host: &dyn Host, s: Surface) -> Option<K> {
         let list: Vec<K> = self.fields.borrow().iter().map(|f| f.0).collect();
         for k in list {
             let now = host.text(s, self.ctl(k));
@@ -77,7 +83,7 @@ impl<K: Copy + PartialEq> State<K> {
     }
 
     /// The next pop-up whose pick changed without its action, now marked.
-    fn next_pick<H: Host>(&self, host: &H, s: Surface) -> Option<K> {
+    fn next_pick(&self, host: &dyn Host, s: Surface) -> Option<K> {
         let list: Vec<K> = self.pops.borrow().iter().map(|p| p.0).collect();
         for k in list {
             let now = host.picked(s, self.ctl(k));
@@ -92,7 +98,7 @@ impl<K: Copy + PartialEq> State<K> {
         None
     }
 
-    fn report<H: Host>(&self, host: &H, s: Surface, c: Ctl, ev: Ev) {
+    fn report(&self, host: &dyn Host, s: Surface, c: Ctl, ev: Ev) {
         let (k, kind) = match self.key(c) {
             Some(x) => x,
             None => return,
@@ -107,6 +113,17 @@ impl<K: Copy + PartialEq> State<K> {
                 if self.next_edit(host, s).is_some() {
                     (self.on)(k);
                 }
+            }
+            Ev::Selected => (self.on)(k),
+            Ev::Activated | Ev::Toggled => {
+                let alias = self.lists.borrow().iter().find(|l| l.0 == c).map(|l| {
+                    if ev == Ev::Activated {
+                        l.1
+                    } else {
+                        l.2
+                    }
+                });
+                (self.on)(alias.flatten().unwrap_or(k));
             }
             Ev::Act => {
                 // The sender's own pick or tick, which the reports below could reset.
@@ -146,22 +163,24 @@ impl<K: Copy + PartialEq> State<K> {
     }
 }
 
-pub struct Form<K: Copy + PartialEq + 'static, H: Host + 'static> {
-    host: Rc<H>,
+pub struct Form<K: Copy + PartialEq + 'static> {
+    host: Rc<dyn Host>,
     surface: Surface,
     st: Rc<State<K>>,
 }
 
-impl<K: Copy + PartialEq + 'static, H: Host + 'static> Form<K, H> {
+impl<K: Copy + PartialEq + 'static> Form<K> {
     /// A form on `surface`; `on` hears each control's key when it acts or its text changes.
-    pub fn with_host(host: Rc<H>, surface: Surface, on: Rc<dyn Fn(K)>) -> Form<K, H> {
+    pub fn with_host(host: Rc<dyn Host>, surface: Surface, on: Rc<dyn Fn(K)>) -> Form<K> {
         let st = Rc::new(State {
             keys: RefCell::new(Vec::new()),
             fields: RefCell::new(Vec::new()),
             pops: RefCell::new(Vec::new()),
+            lists: RefCell::new(Vec::new()),
             on,
         });
-        let (h, state): (Weak<H>, Weak<State<K>>) = (Rc::downgrade(&host), Rc::downgrade(&st));
+        let (h, state): (Weak<dyn Host>, Weak<State<K>>) =
+            (Rc::downgrade(&host), Rc::downgrade(&st));
         host.bind(
             surface,
             Rc::new(move |c, ev| {
@@ -173,7 +192,7 @@ impl<K: Copy + PartialEq + 'static, H: Host + 'static> Form<K, H> {
         Form { host, surface, st }
     }
 
-    pub fn host(&self) -> &Rc<H> {
+    pub fn host(&self) -> &Rc<dyn Host> {
         &self.host
     }
 
@@ -265,6 +284,65 @@ impl<K: Copy + PartialEq + 'static, H: Host + 'static> Form<K, H> {
         self.host.progress(self.surface, c);
     }
 
+    /// Show the bar for a running job at `pct`, or sweeping when there is no percentage.
+    pub fn set_progress(&self, k: K, running: bool, pct: Option<u32>) {
+        self.host
+            .set_progress(self.surface, self.st.ctl(k), running, pct);
+    }
+
+    /// A list; Return or a double-click reports `activate`, a row's tick box `toggle` (with
+    /// `checks`), each `k` when not given. `columns` are `(title, width, right-aligned)`.
+    pub fn table(
+        &self,
+        k: K,
+        id: &str,
+        columns: &[(&str, f64, bool)],
+        activate: Option<K>,
+        toggle: Option<K>,
+    ) {
+        let c = self.built(k, Kind::Table);
+        let cols: Vec<Column> = columns
+            .iter()
+            .map(|(t, w, r)| (t.to_string(), *w, *r))
+            .collect();
+        self.host
+            .table(self.surface, c, id, &cols, toggle.is_some());
+        if let Some(a) = activate {
+            self.st.ctl(a);
+        }
+        if let Some(t) = toggle {
+            self.st.ctl(t);
+        }
+        self.st.lists.borrow_mut().push((c, activate, toggle));
+    }
+
+    /// Show `rows`; only a change reloads, so the selection and scroll survive a refresh.
+    pub fn set_rows(&self, k: K, rows: &[Vec<String>]) {
+        let rows: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| r.iter().map(|x| plain(x)).collect())
+            .collect();
+        self.host.set_rows(self.surface, self.st.ctl(k), &rows);
+    }
+
+    pub fn set_checks(&self, k: K, checks: &[bool]) {
+        self.host.set_checks(self.surface, self.st.ctl(k), checks);
+    }
+
+    pub fn selected_row(&self, k: K) -> Option<usize> {
+        self.host.selected_row(self.surface, self.st.ctl(k))
+    }
+
+    /// Select row `i` as the screen's own change: it is not reported back.
+    pub fn select_row(&self, k: K, i: usize) {
+        self.host.select_row(self.surface, self.st.ctl(k), i);
+    }
+
+    /// The row and state of the last tick box the user changed on list `k`.
+    pub fn toggled(&self, k: K) -> Option<(usize, bool)> {
+        self.host.toggled(self.surface, self.st.ctl(k))
+    }
+
     /// Drop every view whose key `gone` names (rows built again for a new source).
     pub fn remove(&self, gone: impl Fn(&K) -> bool) {
         self.st.fields.borrow_mut().retain(|f| !gone(&f.0));
@@ -315,6 +393,11 @@ impl<K: Copy + PartialEq + 'static, H: Host + 'static> Form<K, H> {
 
     pub fn set_title(&self, k: K, t: &str) {
         self.host.set_title(self.surface, self.st.ctl(k), t);
+    }
+
+    /// The key that presses button `k`: "\r" for the default button, "\u{1b}" for Cancel.
+    pub fn key_equivalent(&self, k: K, key: &str) {
+        self.host.key_equivalent(self.surface, self.st.ctl(k), key);
     }
 
     /// A label's text, or a field's: a field keeps text the screen has not heard yet.
@@ -411,7 +494,7 @@ impl<K: Copy + PartialEq + 'static, H: Host + 'static> Form<K, H> {
     }
 }
 
-impl<K: Copy + PartialEq + 'static, H: Host + 'static> Drop for Form<K, H> {
+impl<K: Copy + PartialEq + 'static> Drop for Form<K> {
     fn drop(&mut self) {
         self.host.release(self.surface);
     }

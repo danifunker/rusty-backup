@@ -10,6 +10,10 @@
 // Each shell uses part of this: what one leaves out is not dead in the other.
 #![allow(dead_code)]
 
+pub mod effects;
 pub mod form;
 pub mod host;
 pub mod layout;
+pub mod prompt;
+pub mod settings;
+pub mod sync;

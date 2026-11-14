@@ -33,7 +33,7 @@ use crate::inspect::InspectScreen;
 use crate::layout::{self, Node, Size};
 use crate::optical::OpticalScreen;
 use crate::restore::RestoreScreen;
-use crate::settings::SettingsWindow;
+use crate::screens::settings::SettingsWindow;
 use crate::sync::SyncGuard;
 use crate::ui::{self, ns};
 use crate::wake::MacWake;
@@ -495,7 +495,9 @@ impl App {
                 v.setHidden(true);
             }
         }
-        let host = EffectHost::new(mtm, status);
+        let ak = crate::form::AppKitHost::get(mtm);
+        ak.set_status_view(status);
+        let host = EffectHost::new(ak);
         let inspect_body = pages
             .iter()
             .find(|(t, _)| *t == AppTab::Inspect)
@@ -746,12 +748,9 @@ impl App {
         if open {
             return;
         }
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
         let recent = self.ctrl.borrow().recent_handle();
         let window = SettingsWindow::open(
-            mtm,
+            crate::form::AppKitHost::current(),
             recent,
             Box::new(|| {
                 if let Some(app) = app() {

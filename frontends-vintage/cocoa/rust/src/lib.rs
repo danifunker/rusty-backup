@@ -9,6 +9,7 @@ mod screens;
 
 mod gate;
 mod host;
+mod wake;
 
 use std::os::raw::c_char;
 
@@ -29,4 +30,10 @@ pub extern "C" fn rb_version() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn rb_start() {
     gate::open();
+}
+
+/// A wake's turn on the main thread: run the controllers.
+#[no_mangle]
+pub extern "C" fn rb_tick() {
+    gate::tick();
 }

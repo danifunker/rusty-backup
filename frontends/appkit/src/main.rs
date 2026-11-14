@@ -34,7 +34,7 @@ mod inspect;
 // Shared with the vintage Cocoa shell (docs/cocoa_vintage_shell_plan.md); `crate::layout` stays its path.
 #[path = "../../mac-screens/src/mod.rs"]
 mod screens;
-use screens::layout;
+use screens::{layout, sync};
 #[cfg(target_os = "macos")]
 mod menu;
 #[cfg(target_os = "macos")]
@@ -56,8 +56,6 @@ mod restore;
 #[cfg(target_os = "macos")]
 mod row_icons;
 #[cfg(target_os = "macos")]
-mod settings;
-mod sync;
 #[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]
