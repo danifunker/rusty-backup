@@ -68,6 +68,7 @@ mod remote_pick;
 mod report;
 #[cfg(windows)]
 mod resize;
+mod resize_image;
 #[cfg(windows)]
 mod restore;
 #[cfg(windows)]

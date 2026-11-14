@@ -10,8 +10,7 @@ id = "flow.inspect.resize-image.grow-copy"
 description = "Grow a 64 MiB two-partition FAT disk to 96 MiB in the wizard, partition 2 to 40 MiB leaving 39 MiB free, as a copy; prove it with rb-cli"
 level = "smoke"
 area = ["inspect"]
-# The ids and labels are shared; the other shells join once their wizard is built.
-shells = ["appkit"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["inspect.resize-image"]
 timeout_ms = 300000
 
@@ -78,7 +77,7 @@ id = "flow.inspect.resize-image.chd"
 description = "Resize a CHD in the wizard: it is unpacked, partition 2 fills a 96 MiB disk, and it is packed again; prove the new CHD with rb-cli"
 level = "smoke"
 area = ["inspect"]
-shells = ["appkit"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["inspect.resize-image"]
 timeout_ms = 300000
 

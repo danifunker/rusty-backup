@@ -18,6 +18,8 @@ pub struct ToolState {
     pub can_expand_image: bool,
     pub expand_hint: &'static str,
     pub can_make_bootable: bool,
+    /// Resize Image applies, and its wizard is not mid-write.
+    pub can_resize_image: bool,
     /// Resize Partitions is open on a running write.
     pub resizing: bool,
     pub can_close: bool,
@@ -34,6 +36,7 @@ pub struct ToolBar {
     expand: gtk::Button,
     bootable: gtk::Button,
     resize: gtk::Button,
+    resize_image: gtk::Button,
     convert: gtk::Button,
     chd: gtk::Button,
     close: gtk::Button,
@@ -64,6 +67,7 @@ impl ToolBar {
         send: &ActionFn,
         expand_image: Rc<dyn Fn()>,
         resize: Rc<dyn Fn()>,
+        resize_image: Rc<dyn Fn()>,
         convert: Rc<dyn Fn()>,
     ) -> ToolBar {
         let reinspect = live("Re-inspect", ids::REINSPECT, send, || {
@@ -86,12 +90,27 @@ impl ToolBar {
         });
         bootable.set_tooltip_text(Some(hints::MAKE_BOOTABLE));
         let resize = view("Resize Partitions...", ids::RESIZE, resize);
+        let resize_image = view("Resize Image...", ids::RESIZE_IMAGE, resize_image);
+        resize_image.set_tooltip_text(Some(
+            "Give the image a new size and resize its partitions with their filesystems, \
+             checking the volumes before and after.",
+        ));
         let chd = live("CHD Info", ids::CHD_INFO, send, || InspectAction::ChdInfo);
         let close = live("Close", ids::CLOSE, send, || InspectAction::Close);
 
         let root = flow();
         for b in [
-            &reinspect, &export, &convert, &edit, &add, &expand, &bootable, &resize, &chd, &close,
+            &reinspect,
+            &export,
+            &convert,
+            &edit,
+            &add,
+            &resize_image,
+            &expand,
+            &bootable,
+            &resize,
+            &chd,
+            &close,
         ] {
             root.append(b);
         }
@@ -104,6 +123,7 @@ impl ToolBar {
             expand,
             bootable,
             resize,
+            resize_image,
             convert,
             chd,
             close,
@@ -123,6 +143,7 @@ impl ToolBar {
         self.expand.set_sensitive(state.can_expand_image);
         self.expand.set_tooltip_text(Some(state.expand_hint));
         self.bootable.set_sensitive(state.can_make_bootable);
+        self.resize_image.set_sensitive(state.can_resize_image);
         self.resize
             .set_sensitive(state.can_edit_table && !state.resizing);
         flow_show(&self.convert, state.can_convert);

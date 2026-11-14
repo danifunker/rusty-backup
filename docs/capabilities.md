@@ -49,7 +49,7 @@ reference the shells are measured against. Per-feature limits by build target li
 | `inspect.remote-backup` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
 | `inspect.remote-open` | yes | yes | yes | yes | `flow.network.remote-inspect-backup` |
 | `inspect.resize` | - | - | - | yes | `flow.inspect.tools.expand-add` |
-| `inspect.resize-image` | - | - | - | yes | `flow.inspect.resize-image.chd`, `flow.inspect.resize-image.grow-copy` |
+| `inspect.resize-image` | - | yes | yes | yes | `flow.inspect.resize-image.chd`, `flow.inspect.resize-image.grow-copy` |
 | `optical.browse_contents` | yes | yes | yes | yes | `flow.optical.chd-browse-extract`, `flow.optical.iso-browse-extract` |
 | `optical.cdda-play` | - | yes | yes | yes | `flow.audio.cdda-play` |
 | `optical.chd` | yes | yes | yes | yes | `flow.convert.iso-to-chd`, `flow.optical.chd-browse-extract` |

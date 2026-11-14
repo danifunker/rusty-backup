@@ -441,6 +441,14 @@ The app has seven tabs:
     file itself, so a partition can be grown past the end of the current
     container without dropping to `rb-cli grow` first (a physical device's
     size is fixed, and a compressed container can't be extended in place).
+  - **Resize Image…**, a guided wizard: a new disk size, each
+    partition kept, filled, shrunk to its minimum or typed, with its
+    filesystem resized and free space left where you want it; the
+    volumes are checked before and after, and a copy is written unless
+    you choose in place. A classic HFS volume past its block-size limit
+    is rebuilt with larger blocks; a CHD is unpacked, resized and packed
+    again (the free space it needs is shown first). Also `rb-cli
+    resize-image`.
   - **Add Partition…** as a streamlined entry into the editor when
     trailing free space exists, pre-filled per partition-table type.
   - **Expand Image…** to grow a raw, VHD, or CHD image with trailing

@@ -53,6 +53,7 @@ use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::report::{self, ReportWindow};
 use crate::resize::ResizeWindow;
+use crate::resize_image::ResizeImageWindow;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -155,6 +156,7 @@ struct Shown {
     can_reinspect: bool,
     can_bootable: bool,
     can_expand_image: bool,
+    can_resize_image: bool,
     can_edit_table: bool,
     can_export: bool,
     exporting: bool,
@@ -208,6 +210,7 @@ pub struct InspectScreen {
     bootable: HWND,
     chd: HWND,
     expand_image: HWND,
+    resize_image_btn: HWND,
     resize_btn: HWND,
     export_btn: HWND,
     edit_table: HWND,
@@ -216,6 +219,7 @@ pub struct InspectScreen {
     cancel_export: HWND,
     export_window: RefCell<Option<Rc<ExportWindow>>>,
     resize: RefCell<Option<Rc<ResizeWindow>>>,
+    resize_image: RefCell<Option<Rc<ResizeImageWindow>>>,
     writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     close: HWND,
     details: HWND,
@@ -288,6 +292,7 @@ impl InspectScreen {
         let bootable = ui::button(page, "Make Bootable...", ids::MAKE_BOOTABLE);
         let chd = ui::button(page, "CHD Info", ids::CHD_INFO);
         let expand_image = ui::button(page, "Expand Image...", ids::EXPAND_IMAGE);
+        let resize_image_btn = ui::button(page, "Resize Image...", ids::RESIZE_IMAGE);
         let resize_btn = ui::button(page, "Resize Partitions...", ids::RESIZE);
         let export_btn = ui::button(page, "Export Disk Image...", ids::EXPORT);
         let edit_table = ui::button(page, "Edit Partition Table...", ids::EDIT_TABLE);
@@ -391,6 +396,7 @@ impl InspectScreen {
             bootable,
             chd,
             expand_image,
+            resize_image_btn,
             resize_btn,
             export_btn,
             edit_table,
@@ -399,6 +405,7 @@ impl InspectScreen {
             cancel_export,
             export_window: RefCell::default(),
             resize: RefCell::default(),
+            resize_image: RefCell::default(),
             writer: RefCell::default(),
             close,
             details,
@@ -541,6 +548,20 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let wizard = self.resize_image.borrow().clone();
+        if let Some(d) = wizard {
+            d.tick();
+            if d.take_disk_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if let Some(path) = d.take_open_request() {
+                d.apply(rusty_backup::controller::resize_image::ResizeImageAction::Close);
+                self.apply(InspectAction::Open(InspectSource::ImageFile(path)));
+            }
+            if !d.is_open() {
+                self.resize_image.replace(None);
+            }
+        }
         let resize = self.resize.borrow().clone();
         if let Some(d) = resize {
             d.tick();
@@ -637,6 +658,30 @@ impl InspectScreen {
     }
 
     /// Resize Partitions: a dialog with its own controller, on the table read here.
+    fn open_resize_image(&self) {
+        if self
+            .resize_image
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_open())
+        {
+            return;
+        }
+        let source = self.ctrl.borrow_mut().resize_image_source();
+        match source {
+            Ok(source) => {
+                let d = ResizeImageWindow::open(
+                    self.owner,
+                    self.notify.clone(),
+                    self.host.clone(),
+                    source,
+                );
+                *self.resize_image.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
+    }
+
     fn open_resize(&self) {
         let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
         let plan = self.ctrl.borrow().resize_plan();
@@ -841,6 +886,12 @@ impl InspectScreen {
             can_reinspect: c.can_reinspect(),
             can_bootable: c.can_make_bootable(),
             can_expand_image: c.can_expand_image(),
+            can_resize_image: c.can_resize_image()
+                && !self
+                    .resize_image
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|d| d.is_running()),
             can_edit_table: c.can_edit_table(),
             can_export: c.can_export(),
             exporting: c.export_job().is_some(),
@@ -887,6 +938,7 @@ impl InspectScreen {
         ui::set_enabled(self.reinspect, s.can_reinspect);
         ui::set_enabled(self.bootable, s.can_bootable);
         ui::set_enabled(self.expand_image, s.can_expand_image);
+        ui::set_enabled(self.resize_image_btn, s.can_resize_image);
         ui::set_enabled(self.export_btn, s.can_export);
         ui::set_visible(self.cancel_export, s.exporting);
         self.show_export(s.export);
@@ -1242,6 +1294,7 @@ impl InspectScreen {
             (self.edit_table, 160),
             (self.add_partition, 120),
             (self.resize_btn, 140),
+            (self.resize_image_btn, 120),
             (self.expand_image, 120),
             (self.bootable, 120),
         ]);
@@ -1371,6 +1424,9 @@ impl Handler for InspectScreen {
             InspectAction::ChdInfo
         } else if from == self.expand_image {
             self.open_expand_image();
+            return;
+        } else if from == self.resize_image_btn {
+            self.open_resize_image();
             return;
         } else if from == self.resize_btn {
             self.open_resize();

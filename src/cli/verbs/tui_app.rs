@@ -5202,7 +5202,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let img = crate::controller::test_fixtures::fat_disk(
             dir.path(),
-            crate::partition::type_catalog::TableKind::Mbr,
+            crate::controller::test_fixtures::TableKind::Mbr,
             64,
             &[16, 16],
         );

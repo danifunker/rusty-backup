@@ -1,5 +1,7 @@
 //! Fixture builders for shell tests (the TUI's), so a view's tests reach the model through here.
 
+pub use crate::partition::type_catalog::TableKind;
+
 /// A blank FAT volume of `size` bytes.
 pub fn blank_fat(size: u64, label: Option<&str>) -> Vec<u8> {
     fs_pc::fat::create_blank_fat(size, label).expect("blank FAT")

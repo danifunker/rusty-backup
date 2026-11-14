@@ -9,6 +9,7 @@ pub mod alto;
 pub mod disk_write;
 pub mod expand_hfs;
 pub mod resize;
+pub mod resize_image;
 
 use std::rc::Rc;
 

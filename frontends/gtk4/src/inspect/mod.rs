@@ -42,6 +42,7 @@ use crate::volume::alto::AltoDialog;
 use crate::volume::disk_write::DiskWriteDialog;
 use crate::volume::expand_hfs::ExpandHfsDialog;
 use crate::volume::resize::ResizeDialog;
+use crate::volume::resize_image::ResizeImageDialog;
 use crate::widgets::set_text;
 
 use bar::PartitionBar;
@@ -82,6 +83,7 @@ pub struct InspectScreen {
     no_partitions: gtk::Label,
     windows: Windows,
     resize: RefCell<Option<Rc<ResizeDialog>>>,
+    resize_image: RefCell<Option<Rc<ResizeImageDialog>>>,
     hfs: RefCell<Option<Rc<ExpandHfsDialog>>>,
     alto: RefCell<Option<Rc<AltoDialog>>>,
     /// The image "Convert..." hands to the Convert tab, taken by the app.
@@ -219,6 +221,12 @@ impl InspectScreen {
                 }
             });
             let screen = me.clone();
+            let resize_image: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(s) = screen.upgrade() {
+                    s.open_resize_image();
+                }
+            });
+            let screen = me.clone();
             let convert: Rc<dyn Fn()> = Rc::new(move || {
                 if let Some(s) = screen.upgrade() {
                     let src = s.ctrl.borrow().convert_source();
@@ -226,7 +234,7 @@ impl InspectScreen {
                     crate::app::tick();
                 }
             });
-            let tools = ToolBar::build(&send, expand_image, resize, convert);
+            let tools = ToolBar::build(&send, expand_image, resize, resize_image, convert);
             let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
             error.add_css_class("error");
             let details = Details::build(&send);
@@ -361,6 +369,7 @@ impl InspectScreen {
                 no_partitions,
                 windows,
                 resize: RefCell::default(),
+                resize_image: RefCell::default(),
                 hfs: RefCell::default(),
                 alto: RefCell::default(),
                 writer: RefCell::default(),
@@ -417,6 +426,20 @@ impl InspectScreen {
                 self.resize.replace(None);
             }
         }
+        let wizard = self.resize_image.borrow().clone();
+        if let Some(d) = wizard {
+            d.tick();
+            if d.take_disk_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if let Some(path) = d.take_open_request() {
+                d.apply(rusty_backup::controller::resize_image::ResizeImageAction::Close);
+                self.apply(InspectAction::Load(InspectSource::ImageFile(path)));
+            }
+            if !d.is_open() {
+                self.resize_image.replace(None);
+            }
+        }
         let hfs = self.hfs.borrow().clone();
         if let Some(d) = hfs {
             d.tick();
@@ -444,6 +467,25 @@ impl InspectScreen {
             let d = ResizeDialog::open(self.notify.clone(), self.host.clone(), plan);
             d.set_devices(&self.devices.borrow());
             *self.resize.borrow_mut() = Some(d);
+        }
+    }
+
+    fn open_resize_image(&self) {
+        if self
+            .resize_image
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_open())
+        {
+            return;
+        }
+        let source = self.ctrl.borrow_mut().resize_image_source();
+        match source {
+            Ok(source) => {
+                let d = ResizeImageDialog::open(self.notify.clone(), self.host.clone(), source);
+                *self.resize_image.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
         }
     }
 
@@ -715,6 +757,12 @@ impl InspectScreen {
                 can_add_partition: ctrl.can_add_partition(),
                 add_hint: ctrl.add_partition_hint(),
                 can_expand_image: ctrl.can_expand_image(),
+                can_resize_image: ctrl.can_resize_image()
+                    && !self
+                        .resize_image
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|d| d.is_running()),
                 expand_hint: if !ctrl.is_image_file() {
                     "Only image files can be expanded - devices have fixed size."
                 } else if ctrl.expanding() {
