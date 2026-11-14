@@ -4830,19 +4830,27 @@ mod tests {
         let img = crate::controller::commander::blank_fat_image(dir.path());
         let before = std::fs::metadata(&img).unwrap().len();
         let mut app = inspect_on(&img);
+        // Expand Image opens Resize Image: the bare volume grows with its disk, as a copy.
         ikey(&mut app, KeyCode::Char('x'));
-        ikeys(&mut app, "3");
+        wizard_settle(&mut app);
         let text = backup_screen(&app);
-        assert!(
-            text.contains("Expand Image") && text.contains("New size"),
-            "{text}"
-        );
-        ikey(&mut app, KeyCode::Enter);
-        inspect_settle(&mut app);
-        assert_eq!(
-            std::fs::metadata(&img).unwrap().len(),
-            before + 3 * 1024 * 1024
-        );
+        assert!(text.contains("Resize Image"), "{text}");
+        for _ in 0..4 {
+            ikey(&mut app, KeyCode::Backspace);
+        }
+        ikeys(&mut app, "5M");
+        for _ in 0..3 {
+            ikey(&mut app, KeyCode::Char('n'));
+            wizard_settle(&mut app);
+        }
+        ikey(&mut app, KeyCode::Char('n'));
+        wizard_settle(&mut app);
+        let w = &app.inspect.as_ref().unwrap().wizard;
+        assert_eq!(w.outcome(), Some(&Ok(())), "{:?}", w.steps());
+        let copy = w.output().expect("a copy");
+        assert_eq!(std::fs::metadata(&copy).unwrap().len(), 5 * 1024 * 1024);
+        assert_eq!(std::fs::metadata(&img).unwrap().len(), before);
+        ikey(&mut app, KeyCode::Esc);
         for k in ['B', 'w', 'i', 'u'] {
             ikey(&mut app, KeyCode::Char(k));
             assert!(inspect_note(&app).contains("does not apply"), "{k}");
@@ -5195,7 +5203,7 @@ mod tests {
         }
     }
 
-    /// Resize Image by keys: a bigger disk, partition 2 filling it, written as a copy.
+    /// Expand Image (`x`) opens Resize Image; by keys: a bigger disk, partition 2 filling it, a copy.
     #[test]
     fn the_resize_image_wizard_grows_a_copy_by_keys() {
         use crate::controller::resize_image::{Page, PartMode};
@@ -5207,7 +5215,7 @@ mod tests {
             &[16, 16],
         );
         let mut app = inspect_on(&img);
-        ikey(&mut app, KeyCode::Char('z'));
+        ikey(&mut app, KeyCode::Char('x'));
         assert_eq!(app.key_context().0, "Inspect - resize image");
         wizard_settle(&mut app);
         for _ in 0..3 {

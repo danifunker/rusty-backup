@@ -29,6 +29,11 @@ pub fn table_tail(table: &PartitionTable) -> u64 {
     }
 }
 
+/// A bare volume (a superfloppy, an `.hfv`): no table, the one volume is the whole disk.
+pub fn is_bare(table: &PartitionTable) -> bool {
+    matches!(table, PartitionTable::None { .. })
+}
+
 /// The tables whose own records hold the disk size, so a new size means writing them again.
 fn records_disk_size(table: &PartitionTable) -> bool {
     matches!(
@@ -324,6 +329,30 @@ fn space_needed(req: &ResizeImageRequest, old: u64, chd: bool) -> Result<Space> 
     })
 }
 
+/// A bare volume's one plan: from its whole old size to the whole new disk.
+fn bare_plan(
+    req: &ResizeImageRequest,
+    old: u64,
+) -> Result<Vec<crate::partition::resize::PartitionResizePlan>> {
+    let index = req.partitions.first().map_or(0, |p| p.index);
+    if req
+        .sizes
+        .iter()
+        .any(|(i, s)| *i != index || *s != req.disk_size)
+    {
+        bail!("a bare volume is the whole disk: it takes the disk's size");
+    }
+    Ok(vec![crate::partition::resize::PartitionResizePlan {
+        index,
+        old_start_lba: 0,
+        old_size_bytes: old,
+        new_start_lba: 0,
+        new_size_bytes: req.disk_size,
+        needs_data_move: false,
+        move_delta_bytes: 0,
+    }])
+}
+
 /// A CHD's packing settings (codecs, hunk size), or why it cannot be resized here.
 #[cfg(feature = "chd")]
 fn chd_settings(path: &Path) -> Result<([u32; 4], u32)> {
@@ -363,9 +392,11 @@ pub fn plan(req: &ResizeImageRequest) -> Result<Layout> {
         bail!("the disk size must be a whole number of 512-byte sectors");
     }
     let room = old_disk_size.max(req.disk_size);
-    let plans = match req.sizes.is_empty() {
-        true => Vec::new(),
-        false => compute_resize_plan(
+    let plans = match (req.sizes.is_empty(), is_bare(&req.table)) {
+        (true, _) => Vec::new(),
+        // The volume starts at 0 and is the disk: it takes the disk's new size, in place.
+        (false, true) => bare_plan(req, old_disk_size)?,
+        (false, false) => compute_resize_plan(
             req.partitions.as_slice(),
             req.sizes.as_slice(),
             req.alignment_sectors,
@@ -686,6 +717,13 @@ fn run_step(
             let add = req.disk_size - layout.old_disk_size;
             crate::partition::resize::expand_image_file(target, add, &mut log)?;
             Ok(format!("{} added", format_size(add)))
+        }
+        Step::Partitions if is_bare(&req.table) => {
+            // No table to edit: the volume itself takes the new size (the file grew first).
+            let mut file = open_rw(target)?;
+            crate::fs::resize_filesystem_for(&mut file, 0, req.disk_size, &mut log)?;
+            file.flush()?;
+            Ok(format!("the volume, to {}", format_size(req.disk_size)))
         }
         Step::Partitions => {
             let mut file = open_rw(target)?;

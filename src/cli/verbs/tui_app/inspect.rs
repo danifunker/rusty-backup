@@ -40,10 +40,9 @@ use crate::controller::app::{DiskDevice, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
 use crate::controller::inspect::{
-    expand_image_bytes, format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile,
-    ExportFormat, HostRequest, InspectAction, InspectController, InspectServices, InspectSource,
-    JobRegistry, LayoutSegment, MinCell, NoNotify, SegmentKind, SizeMode, CHD_REFUSAL,
-    EXPAND_IMAGE_MIB_MAX,
+    format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile, ExportFormat,
+    HostRequest, InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
+    LayoutSegment, MinCell, NoNotify, SegmentKind, SizeMode, CHD_REFUSAL,
 };
 #[cfg(feature = "remote")]
 use crate::controller::remote_pick::{RemotePickAction, RemotePickController};
@@ -69,7 +68,6 @@ pub(super) enum Who {
 #[cfg_attr(not(feature = "remote"), allow(dead_code))]
 pub(super) enum Win {
     Export,
-    Expand,
     Remote,
 }
 
@@ -105,10 +103,9 @@ pub(super) const HINTS_INSPECT_SOURCE: &[KeyHint] = &[
     hint("r", "Re-inspect the source"),
     hint("e", "Export the disk image (and Physical Disk Export)"),
     hint(
-        "z",
-        "Resize Image: a new disk size, partitions and filesystems resized",
+        "x",
+        "Expand Image: the Resize Image wizard (size, partitions, filesystems)",
     ),
-    hint("x", "Expand Image: grow the image file with zeros"),
     hint("B", "Make Bootable (classic Mac disks)"),
     hint("w", "Swap the 16-bit word order into a new image"),
     hint("i", "CHD Info"),
@@ -179,9 +176,6 @@ pub(super) struct InspectState {
     pub(super) esel: ERow,
     #[cfg(feature = "chd")]
     chd: ChdOptionsControl,
-    pub(super) expand_mib: u32,
-    /// Expand Image's (current, after) sizes for `expand_mib`.
-    expand_preview: (u64, u64),
     /// The layout line's segments, refreshed each tick (the controller caches the disk size).
     layout: Vec<LayoutSegment>,
     scroll: usize,
@@ -241,8 +235,6 @@ impl InspectState {
             esel: ERow::Format,
             #[cfg(feature = "chd")]
             chd: ChdOptionsControl::new(ChdProfile::Hd),
-            expand_mib: 0,
-            expand_preview: (0, 0),
             layout: Vec::new(),
             scroll: 0,
             ask: None,
@@ -779,29 +771,6 @@ impl InspectState {
 
     // --- the other windows --------------------------------------------------------------
 
-    fn expand_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => self.window = None,
-            KeyCode::Enter if self.expand_mib > 0 => {
-                self.window = None;
-                let bytes = expand_image_bytes(self.expand_mib);
-                self.act(InspectAction::ExpandImage(bytes));
-            }
-            KeyCode::Backspace => self.expand_mib /= 10,
-            KeyCode::Char(c) => {
-                if let Some(d) = c.to_digit(10) {
-                    self.expand_mib = self
-                        .expand_mib
-                        .saturating_mul(10)
-                        .saturating_add(d)
-                        .min(EXPAND_IMAGE_MIB_MAX);
-                }
-            }
-            _ => {}
-        }
-        self.expand_preview = self.ctl.expand_image_preview(self.expand_mib);
-    }
-
     fn check_key(&mut self, code: KeyCode) {
         let (repairable, has_debug, debug) = match self.ctl.fsck_view() {
             Some(v) => (
@@ -1041,13 +1010,8 @@ impl InspectState {
                 self.window = Some(Win::Export);
                 self.esel = ERow::Format;
             }
-            KeyCode::Char('z') if self.ctl.can_resize_image() && !self.wizard.is_running() => {
+            KeyCode::Char('x') if self.ctl.can_resize_image() && !self.wizard.is_running() => {
                 self.open_resize_image()
-            }
-            KeyCode::Char('x') if self.ctl.can_expand_image() => {
-                self.expand_mib = 0;
-                self.expand_preview = self.ctl.expand_image_preview(0);
-                self.window = Some(Win::Expand);
             }
             KeyCode::Char('B') if self.ctl.can_make_bootable() => {
                 self.act(InspectAction::MakeBootable)
@@ -1371,10 +1335,6 @@ impl App {
                 s.export_key(code);
                 return true;
             }
-            Some(Win::Expand) => {
-                s.expand_key(code);
-                return true;
-            }
             None => {}
         }
         if s.ctl.fsck_view().is_some() {
@@ -1606,7 +1566,6 @@ impl App {
     pub(super) fn draw_inspect_windows(&self, frame: &mut Frame, area: Rect, s: &InspectState) {
         match s.window {
             Some(Win::Export) => self.draw_inspect_export(frame, area, s),
-            Some(Win::Expand) => self.draw_inspect_expand(frame, area, s),
             Some(Win::Remote) => self.draw_inspect_remote(frame, area, s),
             None => {}
         }
@@ -2192,28 +2151,6 @@ impl App {
     #[cfg(not(feature = "chd"))]
     fn inspect_chd_row(&self, _s: &InspectState, _row: ERow) -> String {
         String::new()
-    }
-
-    fn draw_inspect_expand(&self, frame: &mut Frame, area: Rect, s: &InspectState) {
-        let pal = self.palette;
-        let (current, after) = s.expand_preview;
-        let lines = vec![
-            Line::raw(format!("  Current size: {}", format_size(current))),
-            Line::styled(
-                format!("  Add free space: {}_ MiB", s.expand_mib),
-                pal.accent().add_modifier(Modifier::REVERSED),
-            ),
-            Line::raw(format!("  New size: {}", format_size(after))),
-            Line::raw(""),
-            Line::styled(
-                "  After expansion, re-inspect (r) to refresh the partition list, then add or \
-                 extend a partition into the new space.",
-                pal.dim(),
-            ),
-            Line::raw(""),
-            Line::styled("  0-9 type MiB   Enter expand   Esc cancel", pal.dim()),
-        ];
-        self.draw_inspect_popup(frame, area, "Expand Image", lines, 1);
     }
 
     fn draw_inspect_check(&self, frame: &mut Frame, area: Rect, s: &InspectState) {

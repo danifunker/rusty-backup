@@ -26,7 +26,6 @@ mod disk_write;
 mod editor;
 mod effects;
 mod expand_hfs;
-mod expand_image;
 mod export;
 #[cfg(target_os = "macos")]
 mod form;

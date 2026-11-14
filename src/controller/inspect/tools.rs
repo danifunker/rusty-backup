@@ -212,7 +212,7 @@ impl InspectController {
         self.can_expand_image()
             && (self.found.chd_path.is_none() || cfg!(feature = "chd"))
             && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
-            && !matches!(self.found.table, None | Some(PartitionTable::None { .. }))
+            && self.found.table.is_some()
     }
 
     pub fn expanding(&self) -> bool {

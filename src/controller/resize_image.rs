@@ -144,6 +144,8 @@ pub struct PartRow {
     pub fixed: Option<String>,
     /// Classic HFS: its allocation block size, which caps how far it grows in place.
     pub hfs_block: Option<u32>,
+    /// A bare volume: it is the whole disk, so it always fills it.
+    pub whole: bool,
     pub mode: PartMode,
     /// The size field, MiB.
     pub text: String,
@@ -151,6 +153,9 @@ pub struct PartRow {
 
 impl PartRow {
     pub fn modes(&self) -> Vec<PartMode> {
+        if self.whole {
+            return vec![PartMode::Fill];
+        }
         if self.fixed.is_some() {
             return vec![PartMode::Keep];
         }
@@ -165,7 +170,15 @@ impl PartRow {
     /// "Used 12.0 MiB of 32.0 MiB" or why it cannot change.
     pub fn note(&self) -> String {
         if let Some(fs) = &self.fixed {
-            return format!("{fs}: cannot be resized, keeps its size (may still move)");
+            let how = match self.whole {
+                true => "cannot be resized, so the disk keeps its size",
+                false => "cannot be resized, keeps its size (may still move)",
+            };
+            return format!("{fs}: {how}");
+        }
+        if self.whole {
+            let smallest = self.minimum.map_or("unknown".to_string(), format_size);
+            return format!("A bare volume: it is the whole disk. Smallest: {smallest}");
         }
         match self.minimum {
             Some(m) => format!("Smallest: {}", format_size(m)),
@@ -501,6 +514,9 @@ impl ResizeImageController {
 
     /// Where the partitions end for `sizes`, through the same planner the write uses.
     fn data_end(&self, sizes: &[(usize, u64)], room: u64) -> Result<u64, String> {
+        if self.is_bare() {
+            return Ok(sizes.first().map_or(0, |s| s.1));
+        }
         let changed: Vec<(usize, u64)> = sizes
             .iter()
             .filter(|(i, s)| self.rows.iter().any(|r| r.index == *i && r.size != *s))
@@ -527,6 +543,13 @@ impl ResizeImageController {
             .unwrap_or(0))
     }
 
+    /// The image is one bare volume: no table, the volume is the disk.
+    fn is_bare(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|s| engine::is_bare(&s.plan.table))
+    }
+
     fn tail(&self) -> u64 {
         self.source
             .as_ref()
@@ -536,6 +559,21 @@ impl ResizeImageController {
     /// The final sizes, with a Fill row given the space the others leave.
     pub fn final_sizes(&self) -> Result<Vec<(usize, u64)>, String> {
         let disk = self.disk_size()?;
+        if self.is_bare() {
+            let Some(row) = self.rows.first() else {
+                return Ok(Vec::new());
+            };
+            if let Some(m) = row.minimum.filter(|m| disk < *m) {
+                return Err(format!(
+                    "The volume can shrink to {} at the smallest.",
+                    format_size(m)
+                ));
+            }
+            if row.fixed.is_some() && disk != row.size {
+                return Err(row.note());
+            }
+            return Ok(vec![(row.index, disk)]);
+        }
         let mut sizes = self.typed_sizes()?;
         let room = disk.max(self.old_disk);
         let end = self.data_end(sizes.as_slice(), room)?;
@@ -761,7 +799,11 @@ impl ResizeImageController {
                 minimum: source.plan.min_sizes.get(&p.index).copied(),
                 fixed: None,
                 hfs_block: None,
-                mode: PartMode::Keep,
+                whole: engine::is_bare(&source.plan.table),
+                mode: match engine::is_bare(&source.plan.table) {
+                    true => PartMode::Fill,
+                    false => PartMode::Keep,
+                },
                 text: stamp_mib(p.size_bytes),
             })
             .collect();
@@ -870,7 +912,7 @@ impl ResizeImageController {
 
     fn set_text(&mut self, index: usize, text: String) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.index == index) {
-            if row.fixed.is_none() && row.text != text {
+            if row.fixed.is_none() && !row.whole && row.text != text {
                 row.text = text;
                 row.mode = PartMode::Custom;
                 self.stale();
@@ -985,7 +1027,7 @@ impl ResizeImageController {
                 "Resize {} in place? There is no copy to go back to if it fails part way.",
                 name.unwrap_or_default()
             ),
-            confirm_label: labels::START.to_string(),
+            confirm_label: "Resize in Place".to_string(),
             destructive: true,
         })]
     }

@@ -37,7 +37,6 @@ use crate::disk_write::DiskWriteWindow;
 use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
-use crate::expand_image::{self, ExpandImageWindow};
 use crate::export::{self, ExportWindow};
 use crate::layout::{self, Node, Size};
 use crate::partition_bar::{self, Bar};
@@ -111,7 +110,7 @@ struct Shown {
     /// An export is running, so Cancel Export shows.
     exporting: bool,
     /// Which image and table tools apply to what is open.
-    can_expand_image: bool,
+    /// Expand Image opens Resize Image: an image file with a table.
     can_resize_image: bool,
     can_edit_table: bool,
     can_export: bool,
@@ -164,7 +163,6 @@ enum Part {
     AddPartition,
     Resize,
     ExpandImage,
-    ResizeImage,
     Bootable,
     Details,
     Bar,
@@ -189,8 +187,6 @@ pub struct InspectScreen {
     /// Resize Image, while its controller is open.
     resize_image: RefCell<Option<Rc<ResizeImageWindow>>>,
     alto: RefCell<Option<Rc<AltoWindow>>>,
-    /// Expand Image's window, which the view holds.
-    expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     /// The table editor, open while the controller hands out its view.
     editor_window: RefCell<Option<Rc<EditorWindow>>>,
     /// The daemon's listing, standing in Inspect's place while it is active.
@@ -317,10 +313,6 @@ impl InspectScreen {
                 view(&button("Resize Partitions...", ids::RESIZE)),
             ),
             (
-                Part::ResizeImage,
-                view(&button("Resize Image...", ids::RESIZE_IMAGE)),
-            ),
-            (
                 Part::ExpandImage,
                 view(&button("Expand Image...", ids::EXPAND_IMAGE)),
             ),
@@ -364,7 +356,6 @@ impl InspectScreen {
             resize: RefCell::default(),
             resize_image: RefCell::default(),
             alto: RefCell::default(),
-            expand_window: RefCell::default(),
             editor_window: RefCell::default(),
             export_window: RefCell::default(),
             page_changed: RefCell::default(),
@@ -568,7 +559,7 @@ impl InspectScreen {
         }
     }
 
-    /// Resize Image: the wizard with its own controller, on what Inspect read.
+    /// Expand Image opens the Resize Image wizard, with its own controller, on what Inspect read.
     fn open_resize_image(&self) {
         if self
             .resize_image
@@ -605,39 +596,6 @@ impl InspectScreen {
                 *self.alto.borrow_mut() = Some(d);
             }
             Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
-        }
-    }
-
-    /// Expand Image's window: the view's own, previewing sizes through the controller.
-    fn open_expand_image(&self) {
-        if self.expand_window.borrow().is_some() {
-            return;
-        }
-        let me = self.me.clone();
-        let w = ExpandImageWindow::open(
-            self.mtm,
-            Rc::new(move |event| {
-                let Some(s) = me.upgrade() else { return };
-                match event {
-                    expand_image::Event::Preview(mib) => s.preview_expand(mib),
-                    expand_image::Event::Expand(bytes) => {
-                        s.expand_window.replace(None);
-                        s.apply(InspectAction::ExpandImage(bytes));
-                    }
-                    expand_image::Event::Close => {
-                        s.expand_window.replace(None);
-                    }
-                }
-            }),
-        );
-        *self.expand_window.borrow_mut() = Some(w);
-        self.preview_expand(0);
-    }
-
-    fn preview_expand(&self, mib: u32) {
-        let (current, new) = self.ctrl.borrow_mut().expand_image_preview(mib);
-        if let Some(w) = self.expand_window.borrow().as_ref() {
-            w.show(current, new);
         }
     }
 
@@ -745,9 +703,8 @@ impl InspectScreen {
             ids::EXPORT => InspectAction::OpenExport,
             ids::CANCEL_EXPORT => InspectAction::CancelExport,
             ids::ADD_PARTITION => InspectAction::AddPartition,
-            ids::EXPAND_IMAGE => return self.open_expand_image(),
+            ids::EXPAND_IMAGE => return self.open_resize_image(),
             ids::RESIZE => return self.open_resize(),
-            ids::RESIZE_IMAGE => return self.open_resize_image(),
             ids::ROW_RESIZE_ALTO => return self.open_alto(),
             ids::MAKE_BOOTABLE => InspectAction::MakeBootable,
             ids::CHD_INFO => InspectAction::ChdInfo,
@@ -945,7 +902,6 @@ impl InspectScreen {
             }),
             chd: c.chd_info_text().map(str::to_string),
             exporting: c.export_job().is_some(),
-            can_expand_image: c.can_expand_image(),
             can_resize_image: c.can_resize_image(),
             can_edit_table: c.can_edit_table(),
             can_export: c.can_export(),
@@ -1061,8 +1017,7 @@ impl InspectScreen {
         ui::set_visible(self.part(Part::Chd), s.has_chd);
         ui::set_visible(self.part(Part::Close), s.can_close);
         ui::set_visible(self.part(Part::CancelExport), s.exporting);
-        self.set_enabled(Part::ExpandImage, s.can_expand_image);
-        self.set_enabled(Part::ResizeImage, s.can_resize_image);
+        self.set_enabled(Part::ExpandImage, s.can_resize_image);
         self.set_enabled(Part::Export, s.can_export);
         self.set_enabled(Part::EditTable, s.can_edit_table);
         self.set_enabled(Part::AddPartition, s.can_add_partition);
@@ -1320,7 +1275,6 @@ impl InspectScreen {
             Node::button(p(Part::EditTable), 170),
             Node::button(p(Part::AddPartition), 130),
             Node::button(p(Part::Resize), 150),
-            Node::button(p(Part::ResizeImage), 130),
             Node::button(p(Part::ExpandImage), 130),
             Node::button(p(Part::Bootable), 130),
             Node::Space(Size::Stretch(1)),

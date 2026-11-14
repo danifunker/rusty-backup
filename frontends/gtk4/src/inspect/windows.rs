@@ -1,13 +1,11 @@
-//! Inspect's own windows, each up while the controller (or, for Expand Image, the view) says so:
-//! Check results, CHD Info, Expand Image, Edit Partition Table and Export Disk Image.
+//! Inspect's own windows, each up while the controller says so: Check results, CHD Info, Edit
+//! Partition Table and Export Disk Image.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use rusty_backup::controller::inspect::{
-    format_size, ids, CheckReport, InspectAction, EXPAND_IMAGE_MIB_MAX,
-};
+use rusty_backup::controller::inspect::{ids, CheckReport, InspectAction};
 use rusty_backup::controller::partition_edit::{TableEditView, TableKind};
 
 use super::editor::EditorParts;
@@ -16,7 +14,6 @@ use super::ActionFn;
 use crate::browser::dialogs::{page, text_view, window, wrapped, Slot};
 use crate::effects::EffectHost;
 use crate::form::button;
-use crate::widgets::set_text;
 
 /// Which window a user closed.
 #[derive(Clone, Copy)]
@@ -24,7 +21,6 @@ pub enum Dismiss {
     Check,
     Chd,
     Editor,
-    Expand,
     Export,
 }
 
@@ -33,15 +29,7 @@ pub struct WindowsShown {
     pub check: Option<CheckReport>,
     pub chd: Option<String>,
     pub editor: Option<(TableEditView, Option<String>)>,
-    /// Expand Image's current and new size, while its window is open.
-    pub expand: Option<(u64, u64)>,
     pub export: Option<ExportShown>,
-}
-
-struct ExpandParts {
-    current: gtk::Label,
-    new: gtk::Label,
-    start: gtk::Button,
 }
 
 pub struct Windows {
@@ -52,17 +40,10 @@ pub struct Windows {
     chd: Slot,
     editor: Slot,
     editor_parts: RefCell<Option<EditorParts>>,
-    expand: Slot,
-    expand_parts: RefCell<Option<ExpandParts>>,
     export: Slot,
     export_parts: RefCell<Option<ExportParts>>,
     /// Hands the image to Physical Disk Export.
     physical: Rc<dyn Fn()>,
-    /// Expand Image is the view's own window: open, and the MiB typed so far.
-    pub expand_open: Cell<bool>,
-    pub expand_mib: Rc<Cell<u32>>,
-    /// Runs when the typed MiB changes, so the new size is read again.
-    on_mib: Rc<dyn Fn()>,
 }
 
 fn toned(text: &str, class: &str) -> gtk::Label {
@@ -76,7 +57,6 @@ impl Windows {
         host: EffectHost,
         send: ActionFn,
         dismiss: Rc<dyn Fn(Dismiss)>,
-        on_mib: Rc<dyn Fn()>,
         physical: Rc<dyn Fn()>,
     ) -> Windows {
         Windows {
@@ -87,14 +67,9 @@ impl Windows {
             chd: Slot::default(),
             editor: Slot::default(),
             editor_parts: RefCell::default(),
-            expand: Slot::default(),
-            expand_parts: RefCell::default(),
             export: Slot::default(),
             export_parts: RefCell::default(),
             physical,
-            expand_open: Cell::new(false),
-            expand_mib: Rc::new(Cell::new(0)),
-            on_mib,
         }
     }
 
@@ -109,7 +84,6 @@ impl Windows {
             window("CHD Info", 560, 420, &body)
         });
         self.show_editor(s.editor);
-        self.show_expand(s.expand);
         self.show_export(s.export);
     }
 
@@ -180,89 +154,6 @@ impl Windows {
         if editor.is_none() {
             self.editor_parts.borrow_mut().take();
         }
-    }
-
-    fn show_expand(&self, sizes: Option<(u64, u64)>) {
-        let key = sizes.map(|_| "expand".to_string());
-        let built = RefCell::new(None);
-        self.expand.sync(
-            &self.host,
-            &self.dismiss,
-            key,
-            Some(Dismiss::Expand),
-            || {
-                let (dialog, parts) = self.expand_window();
-                *built.borrow_mut() = Some(parts);
-                dialog
-            },
-        );
-        if let Some(parts) = built.into_inner() {
-            *self.expand_parts.borrow_mut() = Some(parts);
-        }
-        let parts = self.expand_parts.borrow();
-        if let (Some((current, new)), Some(p)) = (sizes, parts.as_ref()) {
-            set_text(
-                &p.current,
-                &format!("Current size: {}", format_size(current)),
-            );
-            set_text(&p.new, &format!("New size: {}", format_size(new)));
-            p.start.set_sensitive(self.expand_mib.get() > 0);
-        }
-    }
-
-    fn expand_window(&self) -> (adw::Dialog, ExpandParts) {
-        let body = page();
-        let current = wrapped("");
-        let spin = gtk::SpinButton::with_range(0.0, f64::from(EXPAND_IMAGE_MIB_MAX), 1.0);
-        spin.set_widget_name(ids::EXPAND_IMAGE_ADD);
-        spin.set_value(f64::from(self.expand_mib.get()));
-        let mib = self.expand_mib.clone();
-        let on_mib = self.on_mib.clone();
-        spin.connect_value_changed(move |s| {
-            mib.set(s.value() as u32);
-            on_mib();
-        });
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&gtk::Label::new(Some("Add free space:")));
-        row.append(&spin);
-        row.append(&gtk::Label::new(Some("MiB")));
-        let new = wrapped("");
-        let note = wrapped(
-            "After expansion, click Re-inspect to refresh the partition list, then use 'Add \
-             Partition...' or 'Edit Partition Table...' to allocate the new space.",
-        );
-        note.add_css_class("dim-label");
-        let start = button("Expand", ids::EXPAND_IMAGE_START);
-        start.add_css_class("suggested-action");
-        let (send, mib, dismiss) = (
-            self.send.clone(),
-            self.expand_mib.clone(),
-            self.dismiss.clone(),
-        );
-        start.connect_clicked(move |_| {
-            let add = rusty_backup::controller::inspect::expand_image_bytes(mib.get());
-            if add > 0 {
-                send(InspectAction::ExpandImage(add));
-                dismiss(Dismiss::Expand);
-            }
-        });
-        let cancel = gtk::Button::with_label("Cancel");
-        let dismiss = self.dismiss.clone();
-        cancel.connect_clicked(move |_| dismiss(Dismiss::Expand));
-        body.append(&current);
-        body.append(&row);
-        body.append(&new);
-        body.append(&note);
-        body.append(&crate::volume::button_row(&[&start, &cancel]));
-        let dialog = window("Expand Image", 440, -1, &body);
-        (
-            dialog,
-            ExpandParts {
-                current,
-                new,
-                start,
-            },
-        )
     }
 }
 

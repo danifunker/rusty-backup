@@ -137,7 +137,9 @@ fn a_layout_that_does_not_fit_or_goes_below_the_minimum_is_named() {
         index: 1,
         text: stamp_mib(min - MIB),
     });
-    assert!(c.live_error().unwrap().contains("can shrink to"));
+    let err = c.live_error();
+    eprintln!("min={min} err={err:?}");
+    assert!(err.unwrap_or_default().contains("can shrink to"));
 }
 
 #[test]
@@ -215,4 +217,63 @@ fn an_hfs_partition_past_its_limit_is_marked_for_a_rebuild() {
     c.apply(A::Start);
     c.wait_idle();
     assert_eq!(c.outcome(), Some(&Ok(())), "{:?}", c.steps());
+}
+
+#[test]
+fn a_bare_volume_grows_and_shrinks_with_its_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = crate::controller::commander::blank_fat_image(dir.path());
+    let mut c = wizard(&img);
+    assert!(c.rows()[0].whole);
+    assert_eq!(c.rows()[0].modes(), [PartMode::Fill]);
+    c.apply(A::SetDiskSize("3M".into()));
+    assert_eq!(c.final_sizes().unwrap(), [(0, 3 * MIB)]);
+    assert_eq!(c.free_at_end(), Some(0));
+    assert_eq!(c.live_error(), None);
+    c.apply(A::SetSizeText {
+        index: 0,
+        text: "1".into(),
+    });
+    assert_eq!(
+        c.rows()[0].mode,
+        PartMode::Fill,
+        "a bare volume's size is the disk's"
+    );
+    c.apply(A::Next);
+    c.wait_idle();
+    c.apply(A::Next);
+    c.apply(A::Next);
+    c.wait_idle();
+    assert_eq!(c.page(), Page::Review, "{:?}", c.plan_error());
+    c.apply(A::SetInPlace(true));
+    c.apply(A::Start);
+    c.apply(A::Confirmed {
+        purpose: purpose::IN_PLACE,
+        yes: true,
+    });
+    c.wait_idle();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{:?}", c.steps());
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 3 * MIB);
+    assert!(c
+        .after_checks()
+        .iter()
+        .all(|r| r.verdict == Some(Verdict::Clean)));
+    // And back down: the volume shrinks first, then the file.
+    let mut c = wizard(&img);
+    c.apply(A::SetDiskSize("2M".into()));
+    c.apply(A::SetCheck(false));
+    for _ in 0..3 {
+        c.apply(A::Next);
+        c.wait_idle();
+    }
+    assert_eq!(c.page(), Page::Review, "{:?}", c.plan_error());
+    c.apply(A::SetInPlace(true));
+    c.apply(A::Start);
+    c.apply(A::Confirmed {
+        purpose: purpose::IN_PLACE,
+        yes: true,
+    });
+    c.wait_idle();
+    assert_eq!(c.outcome(), Some(&Ok(())), "{:?}", c.steps());
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 2 * MIB);
 }

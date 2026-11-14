@@ -209,12 +209,6 @@ impl InspectScreen {
                 Rc::new(move || cancel(InspectAction::CancelExport)),
             );
             let screen = me.clone();
-            let expand_image: Rc<dyn Fn()> = Rc::new(move || {
-                if let Some(s) = screen.upgrade() {
-                    s.open_expand_image();
-                }
-            });
-            let screen = me.clone();
             let resize: Rc<dyn Fn()> = Rc::new(move || {
                 if let Some(s) = screen.upgrade() {
                     s.open_resize();
@@ -234,7 +228,7 @@ impl InspectScreen {
                     crate::app::tick();
                 }
             });
-            let tools = ToolBar::build(&send, expand_image, resize, resize_image, convert);
+            let tools = ToolBar::build(&send, resize, resize_image, convert);
             let error = gtk::Label::builder().xalign(0.0).wrap(true).build();
             error.add_css_class("error");
             let details = Details::build(&send);
@@ -262,18 +256,12 @@ impl InspectScreen {
                 }
             });
             let screen = me.clone();
-            let on_mib: Rc<dyn Fn()> = Rc::new(move || {
-                if let Some(s) = screen.upgrade() {
-                    s.refresh();
-                }
-            });
-            let screen = me.clone();
             let physical: Rc<dyn Fn()> = Rc::new(move || {
                 if let Some(s) = screen.upgrade() {
                     s.open_physical();
                 }
             });
-            let windows = Windows::new(host.clone(), send.clone(), dismiss, on_mib, physical);
+            let windows = Windows::new(host.clone(), send.clone(), dismiss, physical);
             let no_partitions = gtk::Label::builder()
                 .label("No partitions found.")
                 .xalign(0.0)
@@ -535,14 +523,6 @@ impl InspectScreen {
         writer.open(open);
     }
 
-    fn open_expand_image(&self) {
-        if self.ctrl.borrow().can_expand_image() {
-            self.windows.expand_mib.set(0);
-            self.windows.expand_open.set(true);
-            self.refresh();
-        }
-    }
-
     /// The user closed one of the tab's own windows.
     fn dismissed(&self, which: Dismiss) {
         let action = match which {
@@ -550,11 +530,6 @@ impl InspectScreen {
             Dismiss::Chd => InspectAction::CloseChdInfo,
             Dismiss::Editor => InspectAction::CloseEditor,
             Dismiss::Export => InspectAction::CloseExport,
-            Dismiss::Expand => {
-                self.windows.expand_open.set(false);
-                self.refresh();
-                return;
-            }
         };
         self.apply(action);
     }
@@ -756,21 +731,12 @@ impl InspectScreen {
                 can_edit_table: ctrl.can_edit_table(),
                 can_add_partition: ctrl.can_add_partition(),
                 add_hint: ctrl.add_partition_hint(),
-                can_expand_image: ctrl.can_expand_image(),
                 can_resize_image: ctrl.can_resize_image()
                     && !self
                         .resize_image
                         .borrow()
                         .as_ref()
                         .is_some_and(|d| d.is_running()),
-                expand_hint: if !ctrl.is_image_file() {
-                    "Only image files can be expanded - devices have fixed size."
-                } else if ctrl.expanding() {
-                    "Expansion already running."
-                } else {
-                    "Grow the image file with zero-padding so you can add or extend partitions \
-                     in the new free space."
-                },
                 resizing: self
                     .resize
                     .borrow()
@@ -795,11 +761,6 @@ impl InspectScreen {
                 check: ctrl.check_report(),
                 chd: ctrl.chd_info_text().map(str::to_string),
                 editor: ctrl.table_editor().map(|v| (v, ctrl.table_write_target())),
-                expand: self
-                    .windows
-                    .expand_open
-                    .get()
-                    .then(|| ctrl.expand_image_preview(self.windows.expand_mib.get())),
                 export: export::ExportShown::read(&mut ctrl),
             },
             remote: RemoteBar {

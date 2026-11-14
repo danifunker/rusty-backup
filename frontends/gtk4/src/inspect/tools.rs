@@ -15,8 +15,6 @@ pub struct ToolState {
     pub can_edit_table: bool,
     pub can_add_partition: bool,
     pub add_hint: String,
-    pub can_expand_image: bool,
-    pub expand_hint: &'static str,
     pub can_make_bootable: bool,
     /// Resize Image applies, and its wizard is not mid-write.
     pub can_resize_image: bool,
@@ -36,7 +34,6 @@ pub struct ToolBar {
     expand: gtk::Button,
     bootable: gtk::Button,
     resize: gtk::Button,
-    resize_image: gtk::Button,
     convert: gtk::Button,
     chd: gtk::Button,
     close: gtk::Button,
@@ -62,10 +59,10 @@ fn view(label: &str, id: &str, run: Rc<dyn Fn()>) -> gtk::Button {
 }
 
 impl ToolBar {
-    /// `expand_image` and `resize` open the view's own windows; `convert` hands over to Convert.
+    /// `resize` and `resize_image` (behind Expand Image) open the view's own windows; `convert`
+    /// hands over to Convert.
     pub fn build(
         send: &ActionFn,
-        expand_image: Rc<dyn Fn()>,
         resize: Rc<dyn Fn()>,
         resize_image: Rc<dyn Fn()>,
         convert: Rc<dyn Fn()>,
@@ -84,14 +81,13 @@ impl ToolBar {
         let add = live("Add Partition...", ids::ADD_PARTITION, send, || {
             InspectAction::AddPartition
         });
-        let expand = view("Expand Image...", ids::EXPAND_IMAGE, expand_image);
+        let expand = view("Expand Image...", ids::EXPAND_IMAGE, resize_image);
         let bootable = live("Make Bootable...", ids::MAKE_BOOTABLE, send, || {
             InspectAction::MakeBootable
         });
         bootable.set_tooltip_text(Some(hints::MAKE_BOOTABLE));
         let resize = view("Resize Partitions...", ids::RESIZE, resize);
-        let resize_image = view("Resize Image...", ids::RESIZE_IMAGE, resize_image);
-        resize_image.set_tooltip_text(Some(
+        expand.set_tooltip_text(Some(
             "Give the image a new size and resize its partitions with their filesystems, \
              checking the volumes before and after.",
         ));
@@ -100,17 +96,7 @@ impl ToolBar {
 
         let root = flow();
         for b in [
-            &reinspect,
-            &export,
-            &convert,
-            &edit,
-            &add,
-            &resize_image,
-            &expand,
-            &bootable,
-            &resize,
-            &chd,
-            &close,
+            &reinspect, &export, &convert, &edit, &add, &expand, &bootable, &resize, &chd, &close,
         ] {
             root.append(b);
         }
@@ -123,7 +109,6 @@ impl ToolBar {
             expand,
             bootable,
             resize,
-            resize_image,
             convert,
             chd,
             close,
@@ -140,10 +125,8 @@ impl ToolBar {
         self.edit.set_sensitive(state.can_edit_table);
         self.add.set_sensitive(state.can_add_partition);
         self.add.set_tooltip_text(Some(&state.add_hint));
-        self.expand.set_sensitive(state.can_expand_image);
-        self.expand.set_tooltip_text(Some(state.expand_hint));
         self.bootable.set_sensitive(state.can_make_bootable);
-        self.resize_image.set_sensitive(state.can_resize_image);
+        self.expand.set_sensitive(state.can_resize_image);
         self.resize
             .set_sensitive(state.can_edit_table && !state.resizing);
         flow_show(&self.convert, state.can_convert);
