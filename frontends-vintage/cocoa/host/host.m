@@ -4,9 +4,22 @@
 #import <Cocoa/Cocoa.h>
 #include <string.h>
 
+#include <objc/objc-runtime.h>
+
+// 10.4's SDK predates NSInteger, NSUInteger and CGFloat.
 #ifndef NSINTEGER_DEFINED
-typedef int NSInteger;  // 10.4's SDK predates NSInteger
+typedef int NSInteger;
+typedef unsigned int NSUInteger;
 #endif
+#ifndef CGFLOAT_DEFINED
+typedef float CGFloat;
+#endif
+
+// A selector newer than the SDK in use, sent with one BOOL: the caller checks it responds.
+static void rb_send_bool(id target, SEL sel, BOOL on)
+{
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(target, sel, on);
+}
 
 extern void rb_event(uint32_t s, uint32_t c, uint32_t kind);
 extern void rb_window_event(uint32_t s, uint32_t kind);
@@ -1136,7 +1149,7 @@ static NSImage *rb_row_icon(int code)
             return nil;
         [img setSize:NSMakeSize(16, 16)];
         if ([img respondsToSelector:@selector(setTemplate:)])
-            [img setTemplate:YES];
+            rb_send_bool(img, @selector(setTemplate:), YES);
         [cache setObject:img forKey:k];
     }
     return img;
@@ -1759,7 +1772,7 @@ int rb_host_hit(uint32_t s, uint32_t c, double x, double y)
     if (img != nil) {
         [img setSize:NSMakeSize(24, 24)];
         if ([img respondsToSelector:@selector(setTemplate:)])
-            [img setTemplate:YES];
+            rb_send_bool(img, @selector(setTemplate:), YES);
         [item setImage:img];
     }
     [item setTarget:self];

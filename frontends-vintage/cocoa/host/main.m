@@ -2,6 +2,11 @@
 // The app's lifecycle and its Quit; the windows and the rest of the menu bar are Rust's.
 
 #import <Cocoa/Cocoa.h>
+#include <objc/objc-runtime.h>
+
+#ifndef NSINTEGER_DEFINED
+typedef int NSInteger;  // 10.4's SDK predates NSInteger
+#endif
 
 extern void rb_start(void);
 extern void rb_open_files(const char *paths);
@@ -42,11 +47,18 @@ static void rb_install_menu(void)
     [NSApp setMainMenu:bar];
 }
 
+// On PowerPC, Rust owns `main` (ppc_main.rs) and calls this.
+#ifdef RB_RUST_MAIN
+int rb_objc_main(int argc, const char **argv)
+#else
 int main(int argc, const char **argv)
+#endif
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // 10.6 and later: a regular app. Earlier systems take a bundled app as one already.
+    if ([NSApp respondsToSelector:@selector(setActivationPolicy:)])
+        ((BOOL (*)(id, SEL, NSInteger))objc_msgSend)(NSApp, @selector(setActivationPolicy:), 0);
     rb_install_menu();
     RBAppDelegate *delegate = [[RBAppDelegate alloc] init];
     [NSApp setDelegate:(id)delegate];  // 10.4's SDK has no formal NSApplicationDelegate protocol
