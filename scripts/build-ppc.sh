@@ -91,6 +91,8 @@ PPC_CC_WRAPPER="$RB_DIR/scripts/ppc-cc-remote.py"
 PPC_AR_WRAPPER="$RB_DIR/scripts/ppc-ar-remote.py"
 # mrustc picks its C compiler from CC_<triple with - replaced by _>.
 export CC_powerpc_apple_darwin="$PPC_CC_WRAPPER"
+# Host build scripts and proc-macros on a Mac go through -O0 (see the script for why).
+[ "$(uname -s)" = Darwin ] && [ -z "${CC:-}" ] && export CC="$RB_DIR/scripts/host-cc-darwin.sh"
 # cc-rs uses the same convention, so the -sys crates pick the wrapper up free.
 # Archives must also be built on the Mac (Mach-O __.SYMDEF): see the doc's
 # "The remote archiver".

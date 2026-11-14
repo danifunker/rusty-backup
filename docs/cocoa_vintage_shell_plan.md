@@ -88,14 +88,19 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
 
 ### PowerPC, 10.4 and 10.5
 
-- Engine and `mac-screens`: the existing `rb-cli-ppc` pipeline (mrustc to C on the Linux box,
-  compiled by gcc 10 on the G5, `PPC_CPU=750`), with a staticlib target added.
-- Objective-C host: Apple gcc 4.0 from the G5's Xcode against the 10.4u SDK, `-mcpu=750`.
-- Link with gcc 10's driver (it owns libatomic and the runtime the engine needs) plus
-  `-framework Cocoa`.
-- Tiger: `panic=abort` (no `_Unwind_GetIPInfo` in `libgcc_s.10.4`), and the GUI keeps away from
-  `posix_spawn` and `fcopyfile` until the shim covers them.
-- No CI: built and packaged on the G5 like `rb-cli-ppc`.
+`scripts/build-ppc-cocoa.sh` (with `PPC_HOST` set) builds it in three steps:
+
+- `host`: Apple gcc 4.0 on the G5 compiles `host.m` and `main.m` against the 10.4u SDK with
+  `-DRB_RUST_MAIN` into `librbcocoahost.a`, which comes back to `rb-cli-ppc/cocoa-host/`.
+- `app`: `scripts/build-ppc.sh ppc` builds rb-cli-ppc's second bin, `rusty-backup-cocoa`
+  (`rust/src/ppc_main.rs`). mrustc links binaries, not staticlibs, so Rust owns `main` and calls
+  the host's `rb_objc_main`; `#[link]` attributes name the archive, Cocoa and libobjc, and the
+  archive's directory is added to `PPC_LDFLAGS`. gcc 10's driver does the link.
+- `bundle`: the .app (10.4 floor in Info.plist) and its HFS+ DMG are made on the G5, into
+  `dist/Rusty-Backup-Cocoa-macos-ppc-<cpu>-<version>.dmg`.
+
+Tiger needs `panic=abort` (no `_Unwind_GetIPInfo` in `libgcc_s.10.4`). No CI: built and packaged
+on the G5 like `rb-cli-ppc`.
 
 ## 4. Testing
 
@@ -190,5 +195,6 @@ Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main wind
   (`--cocoa`), save those that need CHD, optical media, CD audio or Convert.
 - **CI.** `build-macos-vintage` builds the app with `build.sh`, checks its 10.7 floor and symbols,
   and ships `Rusty-Backup-Cocoa-macos-vintage-x64-<ver>.dmg` (HFS+, readable on 10.7).
-- **Next:** the cocoa flows here under Rosetta and on the Lion Mac (its Accessibility setting is
-  off), then Phase 5 (PowerPC).
+- **Flows.** All cocoa flows pass here under Rosetta, the floppy conversions on the Convert tab
+  included. The Lion Mac waits on its Accessibility setting.
+- **PowerPC** (Phase 5): see § 3; the host compiles clean on the G5 against the 10.4u SDK.

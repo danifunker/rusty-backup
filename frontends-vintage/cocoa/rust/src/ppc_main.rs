@@ -4,6 +4,10 @@
 
 include!("app.rs");
 
+// librbcocoahost.a is host.o + main.o, built on the PowerPC Mac (scripts/build-ppc-cocoa.sh).
+#[link(name = "rbcocoahost", kind = "static")]
+#[link(name = "Cocoa", kind = "framework")]
+#[link(name = "objc")]
 extern "C" {
     fn rb_objc_main(argc: i32, argv: *const *const c_char) -> i32;
 }

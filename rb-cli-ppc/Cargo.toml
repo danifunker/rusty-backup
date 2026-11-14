@@ -93,6 +93,12 @@ path = "../src/lib.rs"
 name = "rb-cli"
 path = "../src/bin/rb_cli.rs"
 
+# The vintage Cocoa app (docs/cocoa_vintage_shell_plan.md): the shared screens over the
+# Objective-C host, linked against its librbcocoahost.a. Built by scripts/build-ppc-cocoa.sh.
+[[bin]]
+name = "rusty-backup-cocoa"
+path = "../frontends-vintage/cocoa/rust/src/ppc_main.rs"
+
 [features]
 default = []
 native-zstd = ["dep:zstd", "dsk-clonezilla/native-zstd", "fs-squashfs/native-zstd", "fs-tar/native-zstd"]

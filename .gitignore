@@ -115,3 +115,6 @@ docker/sol9-cross/sysroot.tar.gz.tmp
 /license.jpg
 /20240724-emerge_unprovisioned/
 /20240724-emerge_unprovisioned.tgz
+
+# The PowerPC Cocoa host archive, built on the Mac by scripts/build-ppc-cocoa.sh.
+rb-cli-ppc/cocoa-host/
