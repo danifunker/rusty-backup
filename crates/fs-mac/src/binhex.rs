@@ -280,7 +280,7 @@ fn parse_decoded(raw: &[u8]) -> Result<BinHexFile> {
         bail!("BinHex: truncated header");
     }
 
-    let name = crate::hfs::decode_mac_filename(&raw[1..1 + name_len]);
+    let name = crate::mac_roman::decode_mac_filename(&raw[1..1 + name_len]);
     let mut p = 1 + name_len + 1; // skip version byte
     let type_code: [u8; 4] = raw[p..p + 4].try_into().unwrap();
     p += 4;

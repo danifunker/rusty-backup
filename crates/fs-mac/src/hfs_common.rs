@@ -355,6 +355,7 @@ pub use disk_core::display::decode_ostype;
 // ---------------------------------------------------------------------------
 
 /// The catalog-name orderings live in the GPL `fs-mac-unicode` crate (derived tables).
+#[cfg(feature = "collate")]
 pub use fs_mac_unicode::collate::{compare_hfs_keys, compare_hfsplus_keys};
 
 /// Classic HFS extents-overflow key order: file ID, then fork type, then start

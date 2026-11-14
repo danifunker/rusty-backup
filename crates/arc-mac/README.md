@@ -8,6 +8,6 @@ Classic Macintosh archive formats, read back into Mac files with their data fork
 - the ShrinkWrap 3 "SIT2" codec (`shrinkwrap`), which Disk Copy 6 / NDIF images use for chunk type `0xF0`
 - writing: StuffIt archives and mar
 
-Builds on Rust 1.73 and later. Depends on `fs-mac` for Mac Roman names and resource forks. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
+Builds on Rust 1.73 and later. Depends on `fs-mac` for Mac Roman names and resource forks, with only its `codecs` feature, so the GPL-2.0-only `fs-mac-unicode` is not in this crate's tree (since 0.2.1): with every feature, it is usable from MIT, LGPL or AGPL code. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 
 Licensed **MIT AND LGPL-2.1-or-later**, file by file: the decompressors and the StuffIt 5 / Compact Pro parsers are ported from XADMaster (LGPL-2.1-or-later); the rest is MIT. Each file starts with an SPDX line, and `THIRD_PARTY_NOTICES.md` lists them.

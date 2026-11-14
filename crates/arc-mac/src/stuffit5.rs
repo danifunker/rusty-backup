@@ -229,7 +229,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
 
         let datastart = cur.pos as u64;
 
-        let name = fs_mac::hfs::decode_mac_filename(&namedata);
+        let name = fs_mac::mac_roman::decode_mac_filename(&namedata);
         let parent = dirs.get(&diroffs).cloned().unwrap_or_default();
         let mut path = parent.clone();
         path.push(name.clone());

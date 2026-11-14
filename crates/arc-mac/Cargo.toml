@@ -1,6 +1,6 @@
 [package]
 name = "arc-mac"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT AND LGPL-2.1-or-later"
@@ -17,8 +17,9 @@ rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac/rust173-polyfill", "ds
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.2", default-features = false }
-# Mac Roman names, BinHex and resource forks.
-fs-mac = { path = "../fs-mac", version = "0.1", default-features = false, features = ["hfs", "forks"] }
+# Mac Roman names, BinHex and resource forks: `codecs` only, so the GPL-2.0-only
+# `fs-mac-unicode` (HFS name ordering) stays out of this crate's tree.
+fs-mac = { path = "../fs-mac", version = "0.1.10", default-features = false, features = ["codecs"] }
 # Detecting DiskCopy 4.2 images, which are often what an archive holds.
 dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"] }
 anyhow = "1"

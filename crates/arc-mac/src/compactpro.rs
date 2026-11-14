@@ -21,7 +21,7 @@ use byteorder::{BigEndian, ByteOrder};
 use std::sync::OnceLock;
 
 use super::stuffit::{ForkCodec, ForkInfo, StuffItArchive, StuffItEntry};
-use fs_mac::hfs::decode_mac_filename;
+use fs_mac::mac_roman::decode_mac_filename;
 
 /// Bytes of file metadata that follow a file entry's name (volume, offset,
 /// type/creator, two dates, finder flags, crc, flags, four lengths).

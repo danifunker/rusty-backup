@@ -98,6 +98,7 @@ The format data tables (Arsenic randomization table, method-13 tables, LZAH dist
     - `adfs` → its own crate, GPL-2.0-only.
     - `hpfs` → its own crate, GPL-2.0-only, since the derived dnode editing and the read side share one file.
     - `hfs_unicode` → a sub-crate, GPL-2.0-only (e.g. `fs-mac-unicode`).
+      - **2026-11-13:** `fs-mac` 0.1.10 makes it optional (feature `collate`, which `hfs` and `hfsplus` turn on) and adds `codecs` (Mac Roman names, BinHex, resource forks, without HFS). `arc-mac` 0.2.1 uses only `codecs`, so its tree has no GPL-2.0-only crate and AGPL projects (legcon) can depend on it. `fs-unix`'s `ofs` uses `fs-mac` with no features, so it drops the GPL crate too.
     - `HFS_CHARORDER` → GPL-2.0-or-later. Settle the exact split when `fs-mac` moves: move the table into a sub-crate, or license the classic-HFS part accordingly.
     - XFS is already planned as `fs-xfs` (GPL-2.0).
     - The GPL-2.0-only vs AGPL-3.0 question for the app is unchanged by this. It needs separate legal advice.
