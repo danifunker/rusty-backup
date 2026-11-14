@@ -85,7 +85,7 @@ jobs:
   #   4. .github/ci-targets on the branch (one comma list; # comments allowed)
   #   5. all
   # Targets: windows macos appimage linux-packages mister extra-arch windows-arm64
-  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32.
+  # riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32 appkit.
   # Groups: desktop (everything the old "desktop" switch covered), linux
   # (appimage + linux-packages), vintage (macos-vintage + windows-vintage), all, none.
   plan:
@@ -109,6 +109,7 @@ jobs:
       crates-msrv: ${{ steps.p.outputs.crates-msrv }}
       gtk4: ${{ steps.p.outputs.gtk4 }}
       win32: ${{ steps.p.outputs.win32 }}
+      appkit: ${{ steps.p.outputs.appkit }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -124,7 +125,7 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32"
+          ALL="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 appliance sol9 cbdos macos-vintage windows-vintage musl crates-msrv gtk4 win32 appkit"
           DESKTOP="windows macos appimage linux-packages mister extra-arch windows-arm64 riscv64 macos-vintage windows-vintage musl"
           if [ "$EVENT" = workflow_dispatch ]; then
             spec="${INPUT_TARGETS:-all}"; why="manual run"
@@ -2074,6 +2075,127 @@ jobs:
           name: Rusty-Backup-Win32-preview-x64-${{ needs.generate-version.outputs.version }}
           path: frontends/win32/target/release/rusty-backup-win32.exe
 
+  # The AppKit shell (docs/appkit_shell_plan.md), a preview: its own signed DMG per arch, published
+  # beside egui's. Its tier 8 flows run over AX where the runner grants it (Gate 0, probed below).
+  build-appkit:
+    name: Build AppKit shell (${{ matrix.arch }})
+    needs: [generate-version, plan]
+    if: needs.plan.outputs.appkit == 'true'
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          # Cross-built on the arm64 runner, like the egui x64 DMG; its flows run under Rosetta.
+          - arch: x64
+            target: x86_64-apple-darwin
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      APPKIT_BIN: frontends/appkit/target/${{ matrix.target }}/release/rusty-backup-appkit
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - name: Clippy
+        if: matrix.arch == 'arm64'
+        working-directory: frontends/appkit
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Layout tests
+        if: matrix.arch == 'arm64'
+        working-directory: frontends/appkit
+        run: cargo test --locked
+      - name: Build
+        working-directory: frontends/appkit
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Rosetta for the x64 flows
+        if: matrix.arch == 'x64'
+        run: |
+          arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
+      - name: Gate 0 - does this runner grant AX?
+        id: ax
+        shell: bash
+        run: |
+          printf 'import ApplicationServices\nprint(AXIsProcessTrusted())\n' > "$RUNNER_TEMP/ax.swift"
+          swiftc -o "$RUNNER_TEMP/ax" "$RUNNER_TEMP/ax.swift"
+          trusted=$("$RUNNER_TEMP/ax")
+          echo "AXIsProcessTrusted: $trusted"
+          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
+      - name: Build rb-cli and rb-regress
+        if: steps.ax.outputs.trusted == 'true'
+        run: |
+          cargo build --locked --release --bin rb-cli
+          cargo build --locked --release --manifest-path regression-tests/runner/Cargo.toml
+      - name: Tier 8 flows over AX
+        if: steps.ax.outputs.trusted == 'true'
+        working-directory: regression-tests
+        run: ./runner/target/release/rb-regress run --tiers 8 --shell appkit --appkit "../$APPKIT_BIN" --no-prompt
+      - name: Upload the flow reports
+        if: failure() && steps.ax.outputs.trusted == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: appkit-flow-reports-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            regression-tests/runs/
+            regression-tests/scratch/**/appkit-app.log
+      - name: No AX on this runner
+        if: steps.ax.outputs.trusted != 'true'
+        run: echo "::notice::This runner does not grant AX; the appkit flows run on a self-hosted Mac (Gate 0)."
+      # Slice 9: its own .app and DMG, named as the in-app updater expects (src/update.rs).
+      - name: Import signing certificate
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+      - name: Package the app and DMG
+        env:
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          if [ "$HAS_SIGNING_CERT" = "true" ] && [ -n "$MACOS_TEAM_ID" ]; then
+            SIGN_IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            export SIGN_IDENTITY
+          fi
+          scripts/package-appkit.sh "$APPKIT_BIN" \
+            "${{ needs.generate-version.outputs.version }}" ${{ matrix.arch }} .
+      - name: Notarize the DMG
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          DMG_FILE="Rusty-Backup-AppKit-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+            --password "$MACOS_NOTARIZE_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG_FILE"
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-AppKit-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-AppKit-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
   # The GTK4 shell: not shipped yet, but it must keep compiling, because its exhaustive
   # Action / Effect matches are how a new feature reaches it. See frontends/gtk4/.
   build-gtk4:
@@ -2971,6 +3093,8 @@ jobs:
       - build-rb-cli-musl
       # Solaris 9 SPARC; skips when the sysroot secret is absent.
       - build-sol9-sparc
+      # The AppKit shell's own DMGs (arm64, x64): waited on, never blocking.
+      - build-appkit
       # The GTK4 shell (packages, riscv64, AppImage): waited on, never blocking.
       - build-gtk4
       - build-gtk4-riscv64
@@ -3023,6 +3147,7 @@ jobs:
             "Rusty-Backup-Win32-Setup-windows-x86-${VER}.exe" "Rusty-Backup-Win32-windows-x86-${VER}.zip" \
             "Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe" "Rusty-Backup-Win32-windows-arm64-${VER}.zip" \
             "Rusty-Backup-macos-arm64-${VER}.dmg" "Rusty-Backup-macos-x64-${VER}.dmg" \
+            "Rusty-Backup-AppKit-macos-arm64-${VER}.dmg" "Rusty-Backup-AppKit-macos-x64-${VER}.dmg" \
             "Rusty-Backup-linux-x64-${VER}.AppImage" "Rusty-Backup-linux-x64-${VER}.deb" \
             "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
             "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
@@ -3070,6 +3195,8 @@ jobs:
           | **Windows 11**, native Win32 preview | ARM64 (AArch64) | [Installer](${BASE}/Rusty-Backup-Win32-Setup-windows-arm64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-Win32-windows-arm64-${VER}.zip) | _(as above)_ |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
+          | **macOS 10.13+**, native AppKit preview | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-AppKit-macos-arm64-${VER}.dmg) | _(as above)_ |
+          | **macOS 10.13+**, native AppKit preview | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-AppKit-macos-x64-${VER}.dmg) | _(as above)_ |
           | **Linux** (Ubuntu 20.04+ / Debian 11+) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
           | **Linux** (Ubuntu 24.04+ / Debian 13+) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
           | **Linux** (Ubuntu 24.04+ / Debian 13+) | RISC-V 64-bit (\`riscv64gc\`) | [deb](${BASE}/Rusty-Backup-linux-riscv64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-riscv64-${VER}.rpm) · [tar.gz](${BASE}/Rusty-Backup-linux-riscv64-${VER}.tar.gz) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |

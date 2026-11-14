@@ -16,7 +16,7 @@ pub use shell::{
     elevation_button_label, elevation_confirm, elevation_gate, host_known_older_than,
     install_appimage_entry, no_devices_hint, physical_devices_available, picker_start_folder,
     progress_text, running_elevated, unelevated_device_note, AppTab, DiskDevice, DropRoute,
-    DropTargets, ElevationGate, ShareStep, PHYSICAL_DEVICES_DISABLED,
+    DropTargets, ElevationGate, ShareStep, MENU_SHORTCUTS, PHYSICAL_DEVICES_DISABLED,
 };
 #[cfg(any(feature = "gui", feature = "tui-update"))]
 pub use update::{InstallState, UpdateInfo};
@@ -57,6 +57,10 @@ pub mod ids {
     pub const ABOUT: &str = "app.about";
     pub const UPDATE_VIEW: &str = "app.update.view";
     pub const UPDATE_DISMISS: &str = "app.update.dismiss";
+    pub const UPDATE_INSTALL: &str = "app.update.install";
+    pub const UPDATE_RESTART: &str = "app.update.restart";
+    pub const UPDATE_RETRY: &str = "app.update.retry";
+    pub const UPDATE_CHECK: &str = "app.update.check";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +82,10 @@ pub enum AppAction {
     InstallUpdate,
     /// After a failed install, offer it again.
     RetryUpdate,
-    /// Run the installed update (Windows; exits this process).
+    /// Run the installed update (Windows, macOS; exits this process).
     RestartApp,
+    /// Check the release feed now and say what it found (the menu's Check for Updates...).
+    CheckForUpdates,
 }
 
 pub struct AppController {
@@ -190,10 +196,21 @@ impl Controller for AppController {
                 self.retry_update();
                 Vec::new()
             }
+            AppAction::CheckForUpdates => {
+                #[cfg(any(feature = "gui", feature = "tui-update"))]
+                self.check_updates_now();
+                Vec::new()
+            }
             AppAction::RestartApp => {
-                #[cfg(windows)]
+                #[cfg(any(
+                    windows,
+                    all(target_os = "macos", any(feature = "gui", feature = "tui-update"))
+                ))]
                 crate::update::restart_app();
-                #[cfg(not(windows))]
+                #[cfg(not(any(
+                    windows,
+                    all(target_os = "macos", any(feature = "gui", feature = "tui-update"))
+                )))]
                 Vec::new()
             }
         }
@@ -203,7 +220,8 @@ impl Controller for AppController {
         self.log.extend_from_capture(capture::drain());
         self.poll_shell();
         #[cfg(any(feature = "gui", feature = "tui-update"))]
-        self.poll_update();
+        return self.poll_update();
+        #[cfg(not(any(feature = "gui", feature = "tui-update")))]
         Vec::new()
     }
 }

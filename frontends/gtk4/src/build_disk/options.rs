@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use rusty_backup::controller::build_disk::{
-    cpm_presets, geometries, hints, ids, parse_size_field, BuildDiskAction, FormatTarget, FsKind,
+    cpm_presets, geometries, ids, parse_size_field, BuildDiskAction, FormatTarget, FsKind,
     FsOption, OptionEdit, AFFS_VARIANTS, NTFS_VERSIONS, SECTOR_SIZES,
 };
 
@@ -100,15 +100,6 @@ fn field(
             t.opts.cluster_bytes.map(u64::from)
         }),
         FsOption::BigEndian => toggle("Big-endian", OptionEdit::BigEndian, |t| t.opts.big_endian),
-        FsOption::Fat32 => {
-            let f = toggle("FAT32 whatever the size", OptionEdit::Fat32, |t| {
-                t.opts.fat32
-            });
-            if let Field::Switch(row, _) = &f {
-                row.set_tooltip_text(Some(hints::FAT32));
-            }
-            f
-        }
         FsOption::CaseSensitive => {
             toggle("Case-sensitive (HFSX)", OptionEdit::CaseSensitive, |t| {
                 t.opts.case_sensitive

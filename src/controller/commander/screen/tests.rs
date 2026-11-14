@@ -707,10 +707,45 @@ fn the_export_default_follows_the_filesystem_family() {
         ("UFS", F::TarGz),
         ("Alto BFS", F::LooseFiles),
         ("ProDOS", F::LooseFiles),
+        ("ISO 9660", F::Zip),
+        ("UDF", F::Zip),
     ];
     for (fs, want) in cases {
         assert_eq!(default_export_format(fs), want, "{fs}");
     }
+}
+
+#[test]
+fn a_volume_exports_to_one_archive_starting_from_its_filesystems_format() {
+    use ExportFormat as F;
+    assert_eq!(default_volume_export("ext4"), F::TarGz);
+    assert_eq!(default_volume_export("ISO 9660"), F::Zip);
+    assert_eq!(default_volume_export("ProDOS"), F::Zip);
+    assert_eq!(default_volume_export("HFS+"), F::MacArchive);
+    assert!(volume_export_formats("FAT16")
+        .iter()
+        .all(|f| f.is_single_file()));
+    assert!(!volume_export_formats("FAT16").contains(&F::StuffIt));
+    assert!(volume_export_formats("HFS").contains(&F::StuffIt));
+}
+
+#[test]
+fn an_export_format_is_named_or_read_off_the_output_name() {
+    use std::path::Path;
+    use ExportFormat as F;
+    assert_eq!(export_format_named("TGZ"), Some(F::TarGz));
+    assert_eq!(export_format_named(".zip"), Some(F::Zip));
+    assert_eq!(export_format_named("rar"), None);
+    assert_eq!(
+        export_format_of_path(Path::new("a/b.TAR.ZST")),
+        Some(F::TarZstd)
+    );
+    assert_eq!(
+        export_format_of_path(Path::new("disc.sit.hqx")),
+        Some(F::StuffItHqx)
+    );
+    assert_eq!(export_format_of_path(Path::new("plain.tar")), Some(F::Tar));
+    assert_eq!(export_format_of_path(Path::new("noext")), None);
 }
 
 #[test]
@@ -987,4 +1022,78 @@ fn a_drop_opens_in_an_empty_pane_copies_into_a_volume_and_asks_only_for_an_image
         Some(DropPlan::Do(_))
     ));
     assert!(ctl.drop_plan(Side::Left, &[]).is_none());
+}
+
+#[test]
+fn the_export_bar_exports_the_marked_rows_else_the_volume_in_its_one_format() {
+    let img = tempfile::tempdir().unwrap();
+    let mut ctl = CommanderController::headless();
+    open_image(&mut ctl, Side::Left, img.path());
+    let bar = ctl.export_bar(Side::Left);
+    assert_eq!(bar.button, "Export Volume...");
+    // Loose files in each fork form first, then the archives a FAT volume can fill.
+    let labels: Vec<&str> = bar.choices.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels[0].starts_with("Files, "), "{labels:?}");
+    assert!(!labels.contains(&"StuffIt (.sit)"), "{labels:?}");
+    assert_eq!(bar.choices[bar.pick].format, ExportFormat::Zip);
+    let tar = bar
+        .choices
+        .iter()
+        .position(|c| c.format == ExportFormat::Tar);
+    let choice = tar.unwrap();
+    ctl.apply(A::PickExport {
+        from: Side::Left,
+        choice,
+    });
+    assert_eq!(ctl.export_bar(Side::Left).pick, choice);
+    // Nothing marked: the whole volume, named after it.
+    match ctl.apply(A::ExportFromBar(Side::Left)).as_slice() {
+        [Effect::PickFile(spec)] => assert!(spec.file_name.ends_with(".tar"), "{spec:?}"),
+        other => panic!("expected a save picker, got {other:?}"),
+    }
+    ctl.apply(A::Picked {
+        purpose: purpose::EXPORT,
+        path: None,
+    });
+    let name = files(&ctl, Side::Left)[0].clone();
+    select(&mut ctl, Side::Left, &name);
+    assert_eq!(ctl.export_bar(Side::Left).button, "Export 1 Selected...");
+}
+
+#[test]
+fn the_preview_shows_a_large_files_head_and_an_empty_data_forks_resource_fork() {
+    let detail = |size: u64, data: Vec<u8>, rsrc: Option<Vec<u8>>| FileDetail {
+        side: Side::Left,
+        entry: FileEntry::new_file("F".into(), "/F".into(), size, 0),
+        editable: false,
+        fs_type: "HFS".into(),
+        loading: false,
+        preview: Some(data),
+        rsrc_preview: rsrc,
+        xattrs: Vec::new(),
+        id_names: IdNameMap::default(),
+        size_plan: None,
+        result: None,
+        serial: 0,
+    };
+    let big = detail(
+        3 * MAX_PREVIEW_SIZE as u64,
+        vec![b'a'; MAX_PREVIEW_SIZE],
+        None,
+    );
+    match big.panel_preview() {
+        PanelPreview::Text(t) => {
+            assert!(t.starts_with("(The first 1.0 MiB of 3.0 MiB.)"), "{t:.60}")
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+    let app = detail(0, Vec::new(), Some(vec![0, 0, 1, 0]));
+    match app.panel_preview() {
+        PanelPreview::Hex(h) => assert!(h.starts_with("(The data fork is empty;"), "{h}"),
+        other => panic!("expected hex, got {other:?}"),
+    }
+    assert_eq!(
+        detail(0, Vec::new(), None).panel_preview(),
+        PanelPreview::Note("Empty file.".into())
+    );
 }

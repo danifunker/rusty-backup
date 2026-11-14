@@ -206,7 +206,7 @@ pub fn parse(bytes: &[u8]) -> Result<MacBinaryFile> {
     if name_len == 0 || name_len > 63 {
         bail!("MacBinary: bad filename length {name_len}");
     }
-    let filename = fs_mac::hfs::decode_mac_filename(&bytes[2..2 + name_len]);
+    let filename = fs_mac::mac_roman::decode_mac_filename(&bytes[2..2 + name_len]);
 
     let version = version_of(bytes);
 

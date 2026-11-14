@@ -339,6 +339,41 @@ fn cached_font(dpi: u32, mono: bool) -> HFONT {
     })
 }
 
+/// The Windows 10 / 11 icon font at `px` pixels, or `None` where it is not installed (Windows 7 / 8).
+pub fn icon_font(px: i32) -> Option<HFONT> {
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetTextFaceW, ReleaseDC, SelectObject, FW_NORMAL, LOGFONTW,
+    };
+    ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
+        .iter()
+        .find_map(|name| {
+            let face = wide(name);
+            let mut lf = LOGFONTW {
+                lfHeight: -px,
+                lfWeight: FW_NORMAL.0 as i32,
+                ..Default::default()
+            };
+            lf.lfFaceName[..face.len()].copy_from_slice(&face);
+            // SAFETY: a font is created, then selected into the screen DC only to read back its face.
+            unsafe {
+                let font = CreateFontIndirectW(&lf);
+                let dc = GetDC(None);
+                let old = SelectObject(dc, HGDIOBJ(font.0));
+                let mut got = [0u16; 32];
+                let n = GetTextFaceW(dc, Some(&mut got)) as usize;
+                SelectObject(dc, old);
+                ReleaseDC(None, dc);
+                let matched = n > 1 && got[..n - 1] == face[..face.len() - 1];
+                if matched {
+                    Some(font)
+                } else {
+                    let _ = DeleteObject(HGDIOBJ(font.0));
+                    None
+                }
+            }
+        })
+}
+
 pub fn set_font(hwnd: HWND, font: HFONT) {
     // SAFETY: WM_SETFONT takes the font handle; the font outlives the control.
     unsafe {

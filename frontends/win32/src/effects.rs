@@ -39,13 +39,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
     IsDialogMessageW, IsWindow, PostMessageW, RegisterClassW, SendMessageW, SetWindowPos,
     TranslateMessage, BN_CLICKED, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, ES_PASSWORD, HMENU,
-    IDCANCEL, IDOK, MSG, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WNDCLASSW, WS_CAPTION, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    IDCANCEL, IDOK, MSG, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WNDCLASSW, WS_CAPTION, WS_EX_CLIENTEDGE,
+    WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
 };
 
 use crate::layout::{self, Node, Rect, Size};
 use crate::ui;
+use rusty_backup::controller::remote_pick::asks_for_a_daemon;
 
 /// An answer, routed by the screen that asked to its controller's matching `Action`.
 // The screens of slices 1 to 8 read every field; until then only the app's Confirm is routed.
@@ -533,6 +534,7 @@ impl Prompt {
         secret: bool,
         spec: Option<TextSpec>,
     ) -> Option<String> {
+        let network = spec.as_ref().is_some_and(|s| asks_for_a_daemon(s.purpose));
         // SAFETY: plain window creation and a modal loop over the owner, which is disabled meanwhile.
         unsafe {
             let inst = GetModuleHandleW(None).ok()?;
@@ -576,20 +578,42 @@ impl Prompt {
             let okb = ui::button(window, ok, "prompt.ok");
             let cancel = ui::button(window, "Cancel", "prompt.cancel");
             let dpi = GetDpiForWindow(window).max(96);
-            let tree = Node::inset(
-                Node::column(vec![
-                    Node::leaf(label, Size::Stretch(1), Size::Fixed(layout::ROW - 8)),
-                    Node::field(edit),
-                    Node::leaf(error, Size::Stretch(1), Size::Fixed(layout::ROW - 8)),
-                    Node::row(vec![
-                        Node::Space(Size::Stretch(1)),
-                        Node::button(okb, 75),
-                        Node::button(cancel, 75),
-                    ]),
+            let form = Node::column(vec![
+                Node::leaf(label, Size::Stretch(1), Size::Fixed(layout::ROW - 8)),
+                Node::field(edit),
+                Node::leaf(error, Size::Stretch(1), Size::Fixed(layout::ROW - 8)),
+                Node::row(vec![
+                    Node::Space(Size::Stretch(1)),
+                    Node::button(okb, 75),
+                    Node::button(cancel, 75),
                 ]),
-                layout::MARGIN,
-            );
-            let (cw, ch) = (layout::scale(360, dpi), layout::scale(140, dpi));
+            ]);
+            // A daemon's address: two opposing arrows ("Switch") from the system icon font.
+            let icon_font = network
+                .then(|| ui::icon_font(layout::scale(32, dpi)))
+                .flatten();
+            let icon = icon_font.map(|font| {
+                let style = WINDOW_STYLE(0x1); // SS_CENTER
+                let h = ui::child(
+                    window,
+                    w!("STATIC"),
+                    "\u{E8AB}",
+                    style,
+                    WINDOW_EX_STYLE(0),
+                    "prompt.icon",
+                );
+                ui::set_font(h, font);
+                h
+            });
+            let tree = match icon {
+                Some(h) => Node::inset(
+                    Node::row(vec![Node::leaf(h, Size::Fixed(44), Size::Fixed(44)), form]),
+                    layout::MARGIN,
+                ),
+                None => Node::inset(form, layout::MARGIN),
+            };
+            let width = if icon.is_some() { 410 } else { 360 };
+            let (cw, ch) = (layout::scale(width, dpi), layout::scale(140, dpi));
             let mut r = Default::default();
             let _ = GetWindowRect(owner, &mut r);
             let x = r.left + ((r.right - r.left) - cw) / 2;
@@ -643,6 +667,11 @@ impl Prompt {
                 .and_then(|p| p.answer);
             if IsWindow(Some(window)).as_bool() {
                 let _ = DestroyWindow(window);
+            }
+            if let Some(font) = icon_font {
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                    windows::Win32::Graphics::Gdi::HGDIOBJ(font.0),
+                );
             }
             let _ = SetFocus(Some(owner));
             answer

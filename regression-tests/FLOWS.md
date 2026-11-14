@@ -130,6 +130,7 @@ Each op sets exactly one action.
 | `wait_gone = "text or id"` | wait until it is no longer shown (a staged count clearing) | polls the screen | likewise |
 | `wait_file = "path"` | wait until the file exists and its size holds for half a second | the runner, the same for every shell | likewise |
 | `expect` / `expect_not` | the screen shows / does not show it now | after a short settle | likewise |
+| `shot = "name"` | AppKit only (tier 9 tours): clear the log, then save each of the app's own windows as `name.png`, `name-2.png`... | skipped | skipped |
 
 Prefer `wait_file` for a job's end: it is the output itself, the same on every
 shell, and GTK's log panel is not in its accessibility tree, so a log line is
@@ -164,7 +165,7 @@ sign the two shells don't offer the same thing.
 |---|---|---|---|
 | `tui` | `runner/src/tui.rs`: `rb-cli tui` in a pseudo-terminal at 120x40, `RB_TUI_ASCII=1`, a scratch `HOME` with the update check off; a small screen model reads what ratatui draws | nothing | Linux, macOS, and Windows 10 1809+ over ConPTY (`RUSTY_BACKUP_CONFIG_DIR` keeps its config in the scratch home there). About 4 s a flow on Linux, 5 s on Windows |
 | `gtk` | `drivers/gtk_driver.py` over AT-SPI, run by `runner/src/gtk.rs` under `dbus-run-session -- xvfb-run` (1600x2300, scratch `HOME`, `RUSTY_BACKUP_TEST_PICKS`, ALSA into a null sink so playback is silent) | `xvfb-run`, `dbus-run-session`, `xdotool`, python3 with the Atspi typelib, a built `frontends/gtk4` (`--gtk <path>`) | Linux. About 15 s a flow |
-| `appkit` | `drivers/ax_driver.py`: PyObjC over AX, controls found by `AXIdentifier` (the controller id), so no `labels.toml` section | the AX (TCC) permission | planned: [docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md) |
+| `appkit` | `drivers/ax_driver.swift`: Swift over AX, controls found by `AXIdentifier` (the controller id); its `labels.toml` section holds only Win32's behaviour drift and the Commander toolbar item, which has no AX identifier | `swiftc` and the AX (TCC) permission for the process running it | `runner/src/ax.rs` builds the driver into `runner/target/` and runs it (`--appkit <binary>`, default `frontends/appkit/target/release/rusty-backup-appkit`); macOS, CI target `appkit` where the runner grants AX ([docs/appkit_shell_plan.md](../docs/appkit_shell_plan.md)) |
 | `win32` | `drivers/uia_driver.py` over UI Automation, run by `runner/src/uia.rs` (`--win32 <exe>`, default `frontends/win32/target/release/rusty-backup-win32.exe`): controls found by `AutomationId`, the controller id, else by name; scratch config and picks file as for the other shells | Python with `comtypes` | Windows, CI target `win32`. The flows that list `win32` run on it as the screens land; its `labels.toml` section holds only behaviour drift (a copy into a host folder needs no Apply) ([docs/win32_shell_plan.md](../docs/win32_shell_plan.md)) |
 
 A case whose shell has no driver, or whose driver's tools are missing, resolves
@@ -255,17 +256,34 @@ printf '%s\n' '{"op":"tab","arg":"Backup"}' '{"op":"text"}' |
 
 | File | Flows | Shells | Checks |
 |---|---|---|---|
-| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32 | restore + byte-compare; the .vhd read back |
-| `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (gtk, win32) | tui, gtk, win32 | byte-compare |
-| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32 | inspect + byte-compare; the TUI can join |
-| `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32 | byte-compare |
-| `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32 | byte-compare + fsck |
-| `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk | size, byte-compare, fsck |
-| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32) | tui, gtk, win32 | byte-compare out of the ISO; table + label |
-| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32) | tui, gtk, win32 | restore + byte-compare |
-| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32 | against `rb-cli optical extract` |
-| `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry) | gtk, win32 | the reopened form |
-| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32 | a file out of the CHD against the same file out of the ISO |
-| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32 | against `rb-cli archive extract` |
-| `audio.toml` | play a CD-DA track | gtk, win32 (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
-| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it | gtk, win32 | the TUI can join once its extract-to-folder step is checked |
+| `backup.toml` | a FAT image to zstd from the Backup screen; to one whole-disk VHD through the VHD options window (gtk, win32) | tui, gtk, win32, appkit | restore + byte-compare; the .vhd read back |
+| `restore.toml` | a backup folder to a new image file; the folder shared with Inspect and closed on both (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare |
+| `disk-write.toml` | Write Image File through the disk writer window, with a synthesized MBR | gtk, win32, appkit | inspect + byte-compare; the TUI can join |
+| `commander.toml` | a file out of a zip in a host folder into an image; opening a zip directly (R-090, fixed) | tui, gtk, win32, appkit | byte-compare |
+| `files.toml` | inject and extract on 18 filesystems through Commander | tui, gtk, win32, appkit | byte-compare + fsck |
+| `inspect-hfs.toml` | Expand HFS Volume growing 1.4 MB to 8 MiB and shrinking 32 MiB to 8 MiB | tui, gtk, win32, appkit | size, byte-compare, fsck |
+| `inspect-tools.toml` | Expand Image grows a built MBR image by 16 MiB, Resize Partitions previews it, and the table editor adds a partition in the free space; Export Disk Image writes a floppy as a VHD | appkit (the ids and labels are shared; the others can join) | the new partition's start LBA; the file read back from the VHD |
+| `build-cd.toml` | an IRIX EFS CD from a host folder on Build Disk; an MBR disk with a labelled FAT partition through the Partitions and Options steps (gtk, win32, appkit) | tui, gtk, win32, appkit | byte-compare out of the ISO; table + label |
+| `network.toml` | an `rb-cli serve` image opened in Inspect and backed up locally; Backup's Remote Drive window connecting to a daemon, a restore into an image file on one, and Optical's Add remote daemon (gtk, win32, appkit) | tui, gtk, win32, appkit | restore + byte-compare |
+| `optical.toml` | browse an ISO and a CD CHD, extract a file through the UI | tui, gtk, win32, appkit | against `rb-cli optical extract` |
+| `settings.toml` | the update URL saved in Settings and found again in a fresh window (the association box is left alone: Save would touch the registry; AppKit has none) | gtk, win32, appkit | the reopened form |
+| `convert.toml` | the ISO fixture to a CD CHD on the Convert tab | gtk, win32, appkit | a file out of the CHD against the same file out of the ISO |
+| `archives.toml` | open the StuffIt archive off the ISO fixture on Archives, extract all as raw forks | gtk, win32, appkit | against `rb-cli archive extract` |
+| `audio.toml` | play a CD-DA track | gtk, win32, appkit (no TUI player by design; under WSL the GTK run fails, see above) | the position advances |
+| `browse.toml` | Inspect's Browse opens the volume, Extract All writes it to a host folder, Close returns to Inspect; Edit Mode stages a new folder through the name prompt and Apply writes it; Edit as text replaces a file's text and Apply writes it; Export Volume writes a zip (appkit) | gtk, win32, appkit | the TUI can join once its extract-to-folder step is checked |
+
+## The AppKit screenshot tour (tier 9)
+
+The flows prove behaviour through the accessibility tree; nothing in them looks at the screen.
+`cases/tier9/appkit-tour.toml` does: each case walks screens and dialogs with real content and
+`shot`s them, and `scripts/appkit-tour.sh [binary] [out-dir] [baseline-dir]` runs it in light
+and dark (`RUSTY_BACKUP_APPEARANCE`) and writes `index.html`, each shot's two looks side by side.
+
+- Only the app's own windows are captured (`screencapture -l` by window id), never the screen,
+  so the process running it needs the Screen Recording permission besides Accessibility.
+- Given an earlier, approved out-dir as `baseline-dir`, a shot whose pixels moved by more than
+  0.05% (`scripts/shotdiff.swift`) is marked changed with its share. That asks for a look; it
+  never fails the run, since macOS versions draw a little differently. The log is cleared before
+  each shot, as its timestamps change every run; the playing CD player's position still moves.
+- Tier 9 is not in CI's `--tiers 8` run and is not a test: a tour case fails only when it cannot
+  reach the state it shoots.

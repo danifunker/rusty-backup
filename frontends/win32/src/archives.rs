@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use rusty_backup::controller::app::{busy_elsewhere_notice, Notify, RecentHandle, RecentMode};
 use rusty_backup::controller::archives::{
-    hints, human_size, ids, mount_label, ArchiveEntryRow, ArchivesAction, ArchivesController,
-    ExtractOutcome, ForkFormat, HostRequest,
+    hints, human_size, ids, mount_label, row_label, ArchiveEntryRow, ArchivesAction,
+    ArchivesController, ExtractOutcome, ForkFormat, HostRequest,
 };
 use rusty_backup::controller::commander::Tone;
 use rusty_backup::controller::{Controller, Effect};
@@ -49,14 +49,9 @@ const COLUMNS: [(&str, i32); 4] = [
 
 fn cells(r: &ArchiveEntryRow) -> [String; 4] {
     match r.is_dir {
-        true => [
-            format!("[ {} ]", r.path),
-            String::new(),
-            String::new(),
-            String::new(),
-        ],
+        true => [row_label(r), String::new(), String::new(), String::new()],
         false => [
-            r.path.clone(),
+            row_label(r),
             format!("{} / {}", r.type_code, r.creator),
             human_size(r.size),
             r.method.to_string(),
@@ -440,10 +435,7 @@ impl ArchivesScreen {
         );
 
         let loaded = ctrl.is_loaded();
-        ui::set_text(
-            self.count,
-            &format!("{} files in archive", ctrl.file_count()),
-        );
+        ui::set_text(self.count, &ctrl.summary());
         for h in [
             self.count,
             self.list,

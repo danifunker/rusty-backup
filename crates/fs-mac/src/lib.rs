@@ -6,15 +6,18 @@
 //! | `mfs` | [`mfs`] | Macintosh File System (the 400K-floppy filesystem): read, edit, create |
 //! | `hfsplus` | [`hfsplus`], [`hfsplus_fsck`], [`hfsplus_journal`], [`hfsplus_clone`], [`hfsplus_defrag`], [`hfsplus_wrapper_clone`] | HFS+ / HFSX: read, edit, create, check, journal replay, defragmenting clone (flat or HFS-wrapped) |
 //! | `lisa` | [`lisa`] | Lisa File System, read-only, from DiskCopy 4.2 images with tags |
-//! | `forks` | [`resource_fork`], [`binhex`], [`fork_export`] | resource forks, BinHex 4.0, fork-aware export |
+//! | `codecs` | [`resource_fork`], [`binhex`] | resource forks, MacBinary / AppleDouble, BinHex 4.0, without HFS |
+//! | `forks` | `codecs` + [`fork_export`] | fork-aware export from a filesystem (implies `hfs`) |
+//! | `collate` | `hfs_common::compare_hfs_keys` / `compare_hfsplus_keys` | catalog name order, from the GPL-2.0-only `fs-mac-unicode`; `hfs` and `hfsplus` turn it on |
 //!
-//! [`hfs_common`] (B-trees, dates, type/creator codes) is always built. Name ordering comes
-//! from the GPL `fs-mac-unicode` crate. All fields are big-endian.
+//! [`hfs_common`] (B-trees, dates, type/creator codes) and [`mac_roman`] (Mac Roman names) are
+//! always built. Without `collate` (`default-features = false`, with `codecs`) the crate's tree is
+//! MIT only. All fields are big-endian.
 
 // `is_multiple_of` & co. come from disk-core's rust173 polyfill on 1.73; the real floor check is a 1.73 build.
 #![allow(clippy::incompatible_msrv)]
 
-#[cfg(feature = "forks")]
+#[cfg(feature = "codecs")]
 pub mod binhex;
 #[cfg(feature = "forks")]
 pub mod fork_export;
@@ -45,7 +48,8 @@ pub mod hfv;
 pub mod lisa;
 #[cfg(feature = "hfs")]
 pub mod mac_alias;
+pub mod mac_roman;
 #[cfg(feature = "mfs")]
 pub mod mfs;
-#[cfg(feature = "forks")]
+#[cfg(feature = "codecs")]
 pub mod resource_fork;

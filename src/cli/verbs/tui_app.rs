@@ -61,6 +61,7 @@ mod inspect;
 #[cfg(feature = "optical")]
 mod optical;
 mod resize;
+mod resize_image;
 mod restore;
 mod settings;
 mod shell;
@@ -4829,19 +4830,27 @@ mod tests {
         let img = crate::controller::commander::blank_fat_image(dir.path());
         let before = std::fs::metadata(&img).unwrap().len();
         let mut app = inspect_on(&img);
+        // Expand Image opens Resize Image: the bare volume grows with its disk, as a copy.
         ikey(&mut app, KeyCode::Char('x'));
-        ikeys(&mut app, "3");
+        wizard_settle(&mut app);
         let text = backup_screen(&app);
-        assert!(
-            text.contains("Expand Image") && text.contains("New size"),
-            "{text}"
-        );
-        ikey(&mut app, KeyCode::Enter);
-        inspect_settle(&mut app);
-        assert_eq!(
-            std::fs::metadata(&img).unwrap().len(),
-            before + 3 * 1024 * 1024
-        );
+        assert!(text.contains("Resize Image"), "{text}");
+        for _ in 0..4 {
+            ikey(&mut app, KeyCode::Backspace);
+        }
+        ikeys(&mut app, "5M");
+        for _ in 0..3 {
+            ikey(&mut app, KeyCode::Char('n'));
+            wizard_settle(&mut app);
+        }
+        ikey(&mut app, KeyCode::Char('n'));
+        wizard_settle(&mut app);
+        let w = &app.inspect.as_ref().unwrap().wizard;
+        assert_eq!(w.outcome(), Some(&Ok(())), "{:?}", w.steps());
+        let copy = w.output().expect("a copy");
+        assert_eq!(std::fs::metadata(&copy).unwrap().len(), 5 * 1024 * 1024);
+        assert_eq!(std::fs::metadata(&img).unwrap().len(), before);
+        ikey(&mut app, KeyCode::Esc);
         for k in ['B', 'w', 'i', 'u'] {
             ikey(&mut app, KeyCode::Char(k));
             assert!(inspect_note(&app).contains("does not apply"), "{k}");
@@ -5174,6 +5183,75 @@ mod tests {
         ikey(&mut app, KeyCode::Esc);
         assert!(!app.inspect.as_ref().unwrap().dialog_open());
         assert_eq!(app.key_context().0, "Inspect - partitions");
+    }
+
+    /// Wait out the wizard's own jobs (probe, checks, plan, write).
+    fn wizard_settle(app: &mut App) {
+        let start = std::time::Instant::now();
+        loop {
+            app.tick();
+            let w = &app.inspect.as_ref().unwrap().wizard;
+            if !(w.probing() || w.checking() || w.planning() || w.is_running()) {
+                app.tick();
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the wizard never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Expand Image (`x`) opens Resize Image; by keys: a bigger disk, partition 2 filling it, a copy.
+    #[test]
+    fn the_resize_image_wizard_grows_a_copy_by_keys() {
+        use crate::controller::resize_image::{Page, PartMode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = crate::controller::test_fixtures::fat_disk(
+            dir.path(),
+            crate::controller::test_fixtures::TableKind::Mbr,
+            64,
+            &[16, 16],
+        );
+        let mut app = inspect_on(&img);
+        ikey(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.key_context().0, "Inspect - resize image");
+        wizard_settle(&mut app);
+        for _ in 0..3 {
+            ikey(&mut app, KeyCode::Backspace);
+        }
+        ikeys(&mut app, "96M");
+        assert_eq!(app.inspect.as_ref().unwrap().wizard.disk_text(), "96M");
+        ikey(&mut app, KeyCode::Char('n'));
+        wizard_settle(&mut app);
+        assert_eq!(app.inspect.as_ref().unwrap().wizard.page(), Page::Check);
+        ikey(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            app.inspect.as_ref().unwrap().wizard.page(),
+            Page::Partitions
+        );
+        while app.inspect.as_ref().unwrap().iwin.sel != resize_image::WRow::Mode(1) {
+            ikey(&mut app, KeyCode::Down);
+        }
+        while app.inspect.as_ref().unwrap().wizard.rows()[1].mode != PartMode::Fill {
+            ikey(&mut app, KeyCode::Right);
+        }
+        let text = backup_screen(&app);
+        assert!(text.contains("Resize Image"), "{text}");
+        ikey(&mut app, KeyCode::Char('n'));
+        wizard_settle(&mut app);
+        let w = &app.inspect.as_ref().unwrap().wizard;
+        assert_eq!(w.page(), Page::Review, "{:?}", w.plan_error());
+        ikey(&mut app, KeyCode::Char('n'));
+        wizard_settle(&mut app);
+        let w = &app.inspect.as_ref().unwrap().wizard;
+        assert_eq!(w.page(), Page::Done);
+        assert_eq!(w.outcome(), Some(&Ok(())));
+        let out = dir.path().join("disk-resized.img");
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 96 * 1024 * 1024);
+        ikey(&mut app, KeyCode::Esc);
+        assert!(!app.inspect.as_ref().unwrap().dialog_open());
     }
 
     /// Resize Partitions shrinks an EFS partition: Custom size typed, Preview, Apply, and the grid

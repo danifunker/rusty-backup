@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli resize-image</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>resize-image</span></nav>
+<h1><code>rb-cli resize-image</code></h1>
+<p>Give a disk image a new size and resize its partitions with their filesystems, checking the volumes before and after (the GUI's Resize Image). Writes a copy unless `--in-place`</p>
+<h2>Usage</h2>
+<pre><code>Usage: resize-image [OPTIONS] --size &lt;SIZE&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>The disk image to resize (raw `.img` / `.hda` / `.vhd`)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>The disk's new size (e.g. `512M`, `2G`)</dd>
+<dt><code>--part</code></dt>
+<dd>A partition's new size, by its `idx` from `rb-cli inspect`: `2=300M`, `2=fill` (the space the others leave), `2=min` (its smallest) or `2=keep`. Repeat per partition</dd>
+<dt><code>--out</code></dt>
+<dd>Write the resized image here (default: `NAME-resized.EXT` beside the image)</dd>
+<dt><code>--in-place</code></dt>
+<dd>Change the image itself instead of writing a copy</dd>
+<dt><code>--no-check</code></dt>
+<dd>Skip the volume checks before and after</dd>
+<dt><code>--force</code></dt>
+<dd>Resize even when the check before finds problems</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

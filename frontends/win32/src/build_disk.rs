@@ -92,6 +92,7 @@ struct DiskStep {
     size: HWND,
     size_hint: HWND,
     align_caption: HWND,
+    align_pick: Combo,
     align: HWND,
     heads_caption: HWND,
     heads: HWND,
@@ -140,6 +141,7 @@ impl DiskStep {
             size: ui::edit(page, ids::SIZE),
             size_hint: ui::cell_label(page, ""),
             align_caption: ui::cell_label(page, "Alignment:"),
+            align_pick: Combo::build(page, ids::ALIGN_PICK, &[]),
             align: ui::edit(page, ids::ALIGN),
             heads_caption: ui::cell_label(page, "Heads:"),
             heads: number(page, ids::HEADS),
@@ -465,9 +467,13 @@ impl BuildScreen {
         d.table.select(at.unwrap_or(0));
         *d.kinds.borrow_mut() = view.kinds.to_vec();
         ui::set_enabled(d.table.h, !view.fixed);
-        for h in [d.align_caption, d.align] {
+        for h in [d.align_caption, d.align_pick.h] {
             ui::set_visible(h, part);
         }
+        d.align_pick.set_items(&view.align_choices);
+        d.align_pick.select(view.align_pick);
+        ui::set_enabled(d.align_pick.h, !view.fixed);
+        ui::set_visible(d.align, part && view.align_custom);
         set_field(d.align, &view.align_text);
         let geo = part && view.geometry.is_some();
         for h in [d.heads_caption, d.heads, d.sectors_caption, d.sectors] {
@@ -656,6 +662,7 @@ impl BuildScreen {
             d.volume.h,
             d.size,
             d.size_hint,
+            d.align_pick.h,
             d.align,
             d.heads,
             d.preset.h,
@@ -779,8 +786,11 @@ impl BuildScreen {
                 stretch(d.size_hint),
             ]));
         }
-        if shown(d.align) {
-            let mut row = vec![fixed(d.align_caption, cap), fixed(d.align, 120)];
+        if shown(d.align_pick.h) {
+            let mut row = vec![fixed(d.align_caption, cap), fixed(d.align_pick.h, 330)];
+            if shown(d.align) {
+                row.push(fixed(d.align, 120));
+            }
             if shown(d.heads) {
                 row.extend([
                     fixed(d.heads_caption, 60),
@@ -897,6 +907,9 @@ impl BuildScreen {
             };
             let device = self.devices.borrow().get(row).cloned()?;
             return Some(BuildDiskAction::SelectDevice { row, device });
+        }
+        if from == d.align_pick.h {
+            return Some(BuildDiskAction::Table(BuildAction::PickAlign(d.align_pick.picked()?)));
         }
         if from == d.table.h {
             let kind = *d.kinds.borrow().get(d.table.picked()?)?;

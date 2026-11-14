@@ -42,7 +42,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use fs_mac::hfs::{decode_mac_filename, utf8_to_mac_roman};
+use fs_mac::mac_roman::{decode_mac_filename, utf8_to_mac_roman};
 
 use super::stuffit::{
     crc16_arc, ForkCodec, ForkInfo, StuffItArchive, StuffItEntry, StuffItInputNode,

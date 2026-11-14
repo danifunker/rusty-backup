@@ -1,6 +1,6 @@
 [package]
 name = "fs-mac"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -14,20 +14,26 @@ categories = ["filesystem", "emulators"]
 [features]
 default = ["forks", "hfs", "hfsplus", "lisa", "mfs"]
 # One feature per filesystem; `hfs_common` (B-trees, dates, type/creator codes) is always built.
-hfs = []
-hfsplus = []
+hfs = ["collate"]
+hfsplus = ["collate"]
+# The HFS / HFS+ catalog-name orderings from the GPL-2.0-only `fs-mac-unicode` (`hfs_common`'s
+# `compare_hfs_keys` / `compare_hfsplus_keys`). Off, this crate's tree is MIT only.
+collate = ["dep:fs-mac-unicode"]
 mfs = ["hfs"]
 # Lisa Office System; its images come as DiskCopy 4.2 with tags, hence dsk-apple.
 lisa = ["dep:dsk-apple"]
-# Resource forks, BinHex 4.0 and AppleDouble / MacBinary fork export.
-forks = ["hfs"]
+# Mac Roman names, BinHex 4.0 and the resource-fork / MacBinary / AppleDouble codecs, without
+# HFS: the MIT-only set an archive reader needs (`arc-mac` uses just this).
+codecs = []
+# `codecs` plus fork-aware export from a filesystem.
+forks = ["codecs", "hfs"]
 # Only for a Rust 1.73 toolchain; see disk-core.
-rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode/rust173-polyfill", "dsk-apple?/rust173-polyfill"]
+rust173-polyfill = ["disk-core/rust173-polyfill", "fs-mac-unicode?/rust173-polyfill", "dsk-apple?/rust173-polyfill"]
 
 [dependencies]
 disk-core = { path = "../disk-core", version = "0.2", features = ["fs"] }
 # GPL-2.0-only: the HFS / HFS+ name-ordering tables (see that crate's README).
-fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1" }
+fs-mac-unicode = { path = "../fs-mac-unicode", version = "0.1", optional = true }
 dsk-apple = { path = "../dsk-apple", version = "0.1", default-features = false, features = ["dc42"], optional = true }
 anyhow = "1"
 byteorder = "1"

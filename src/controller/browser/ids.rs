@@ -22,6 +22,8 @@ pub const EXTRACT: &str = "browse.extract";
 pub const EXTRACT_ALL: &str = "browse.extract_all";
 pub const EXPORT_ENTRY: &str = "browse.export_entry";
 pub const EXPORT_VOLUME: &str = "browse.export_volume";
+/// The archive format Export Volume writes (`commander::volume_export_formats`).
+pub const EXPORT_VOLUME_FORMAT: &str = "browse.export_volume_format";
 pub const EXPORT_MARKED: &str = "browse.export_marked";
 pub const EXPORT_FORMAT: &str = "browse.export_format";
 pub const CLEAR_MARKS: &str = "browse.clear_marks";

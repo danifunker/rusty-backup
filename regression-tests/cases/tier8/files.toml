@@ -12,7 +12,7 @@ level = "smoke"
 smoke_fs = ["fat", "hfs"]
 area = ["commander", "files"]
 fs = ["fat", "hfs", "hfsplus", "ntfs", "hpfs", "ext", "ext3", "ext4", "affs", "pfs3", "sfs", "prodos", "efs", "efs-v1", "minix2", "minix3", "ufs", "ofs"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["commander.host-folder", "commander.copy", "commander.apply"]
 timeout_ms = 180000
 
@@ -52,7 +52,7 @@ level = "smoke"
 smoke_fs = ["fat", "hfs"]
 area = ["commander", "files"]
 fs = ["fat", "hfs", "hfsplus", "ntfs", "hpfs", "ext", "ext3", "ext4", "affs", "pfs3", "sfs", "prodos", "efs", "efs-v1", "minix2", "minix3", "ufs", "ofs"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["commander.host-folder", "commander.copy", "commander.apply"]
 timeout_ms = 180000
 

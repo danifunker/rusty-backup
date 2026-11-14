@@ -58,8 +58,8 @@ mod modes;
 pub use drop::DropPlan;
 mod panel;
 pub use panel::{
-    CopyColumn, EditBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SideBars, SidePanel,
-    VolumeLine,
+    CopyColumn, EditBar, ExportBar, HeaderTools, MarkBar, PanelActions, PanelPreview, SideBars,
+    SidePanel, VolumeLine,
 };
 mod windows;
 pub use windows::{
@@ -167,6 +167,13 @@ pub enum CommanderAction {
         from: Side,
         format: Option<ExportFormat>,
     },
+    /// The export bar's button: the marked rows, else the whole volume, in the screen's format.
+    ExportFromBar(Side),
+    /// The export bar's list: an index into [`CommanderController::export_bar`]'s choices.
+    PickExport {
+        from: Side,
+        choice: usize,
+    },
     /// Export the entry at `path` (`/`: the whole volume) instead of the selection.
     ExportEntry {
         from: Side,
@@ -265,7 +272,17 @@ pub fn default_export_format(fs_type: &str) -> ExportFormat {
     if t == "mfs" || t.starts_with("hfs") {
         return ExportFormat::MacArchive;
     }
-    if t.starts_with("fat") || t.starts_with("vfat") || has(&["exfat", "ntfs", "hpfs", "msdos"]) {
+    let pc = [
+        "exfat",
+        "ntfs",
+        "hpfs",
+        "msdos",
+        "iso 9660",
+        "udf",
+        "high sierra",
+        "joliet",
+    ];
+    if t.starts_with("fat") || t.starts_with("vfat") || has(&pc) {
         return ExportFormat::Zip;
     }
     let unix = [
@@ -277,6 +294,59 @@ pub fn default_export_format(fs_type: &str) -> ExportFormat {
         return ExportFormat::TarGz;
     }
     ExportFormat::LooseFiles
+}
+
+/// The single-file formats a whole volume exports to: zip and tar, plus Mac archives on a Mac volume.
+pub fn volume_export_formats(fs_type: &str) -> Vec<ExportFormat> {
+    use ExportFormat as F;
+    let mut v = vec![F::Zip, F::TarGz, F::TarZstd, F::Tar];
+    if default_export_format(fs_type) == F::MacArchive {
+        v.extend([F::MacArchive, F::StuffIt, F::StuffItHqx]);
+    }
+    v
+}
+
+/// Where a volume's export starts: its filesystem's own archive format, else zip.
+pub fn default_volume_export(fs_type: &str) -> ExportFormat {
+    let f = default_export_format(fs_type);
+    match volume_export_formats(fs_type).contains(&f) {
+        true => f,
+        false => ExportFormat::Zip,
+    }
+}
+
+/// A volume-export format by its short name (`zip`, `tar`, `tar.gz` / `tgz`, `tar.zst`, `mar`,
+/// `sit`, `sit.hqx`), as `rb-cli export --format` takes it.
+pub fn export_format_named(name: &str) -> Option<ExportFormat> {
+    use ExportFormat as F;
+    Some(
+        match name
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "zip" => F::Zip,
+            "tar" => F::Tar,
+            "tar.gz" | "tgz" | "targz" => F::TarGz,
+            "tar.zst" | "tzst" | "tarzst" => F::TarZstd,
+            "mar" => F::MacArchive,
+            "sit" => F::StuffIt,
+            "sit.hqx" | "hqx" => F::StuffItHqx,
+            _ => return None,
+        },
+    )
+}
+
+/// The volume-export format an output file name asks for, by its extension.
+pub fn export_format_of_path(path: &std::path::Path) -> Option<ExportFormat> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let ext = [
+        "tar.gz", "tar.zst", "sit.hqx", "tgz", "tzst", "tar", "zip", "mar", "sit",
+    ];
+    ext.iter()
+        .find(|e| name.ends_with(&format!(".{e}")))
+        .and_then(|e| export_format_named(e))
 }
 
 /// The "Export as" menu for a view without an always-visible format chooser.
@@ -304,6 +374,22 @@ pub fn export_choices() -> Vec<ExportChoice> {
             fork: None,
         }))
         .collect()
+}
+
+/// The browse view's one export list for a volume of `fs_type`: loose files in each fork form,
+/// then the archives the volume can fill (Mac archives only on a Mac volume).
+pub fn export_bar_choices(fs_type: &str) -> Vec<ExportChoice> {
+    let loose = export_choices()
+        .into_iter()
+        .filter(|c| c.format == ExportFormat::LooseFiles);
+    let archives = volume_export_formats(fs_type)
+        .into_iter()
+        .map(|f| ExportChoice {
+            label: f.label().to_string(),
+            format: f,
+            fork: None,
+        });
+    loose.chain(archives).collect()
 }
 
 /// The entries a run skipped after the user was asked about them, shown when it ends.
@@ -609,6 +695,21 @@ impl CommanderController {
                 self.forward(self.active, BrowserPaneAction::Delete)
             }
             A::Export { from, format } => self.request_export(from, format),
+            A::ExportFromBar(from) => match self.mark_bar(from).count {
+                0 => self.request_export_entry(from, "/", None),
+                _ => self.request_export(from, None),
+            },
+            A::PickExport { from, choice } => {
+                let fs = self.pane(from).volume().fs_type.clone();
+                if let Some(c) = export_bar_choices(&fs).get(choice) {
+                    let key = self.volume_key(from);
+                    self.export_pick[from.idx()] = Some((c.format, key));
+                    if let Some(fork) = c.fork {
+                        self.export_fork_mode = fork;
+                    }
+                }
+                Vec::new()
+            }
             A::Checksums(from) => {
                 self.status = self.start_checksums(from);
                 Vec::new()
@@ -1334,6 +1435,7 @@ impl CommanderController {
             | Command::ViewMenu
             | Command::Transforms
             | Command::Extract
+            | Command::ExportVolume
             | Command::EditMode => None,
         };
         if let Some(action) = pane_action {
@@ -1371,7 +1473,8 @@ impl CommanderController {
             | Command::Delete
             | Command::Transforms
             | Command::Edit
-            | Command::Extract => {}
+            | Command::Extract
+            | Command::ExportVolume => {}
             Command::CursorUp
             | Command::CursorDown
             | Command::PageUp

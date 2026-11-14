@@ -26,6 +26,7 @@ use ratatui::Frame;
 use super::ask::Ask;
 use super::dialogs::{DRow, DialogKey, DialogWindow, HINTS_ALTO_RESIZE, HINTS_EXPAND_HFS};
 use super::resize::{ResizeKey, ResizeWindow, HINTS_RESIZE};
+use super::resize_image::{WizardKey, WizardWindow, HINTS_RESIZE_IMAGE};
 use super::table_edit::{TableKey, TableWindow, HINTS_TABLE_EDIT};
 use super::writer::{WriterKey, WriterWindow, HINTS_WRITER};
 use super::{centered_rect, hint, App, FilePicker, KeyHint, PartRow, PickKind, PickResult};
@@ -39,14 +40,14 @@ use crate::controller::app::{DiskDevice, RecentHandle, RecentMode};
 use crate::controller::disk_write::{DiskWriteAction, DiskWriteController, DiskWriteServices};
 use crate::controller::expand_hfs::{ExpandHfsAction, ExpandHfsController};
 use crate::controller::inspect::{
-    expand_image_bytes, format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile,
-    ExportFormat, HostRequest, InspectAction, InspectController, InspectServices, InspectSource,
-    JobRegistry, LayoutSegment, MinCell, NoNotify, SegmentKind, SizeMode, CHD_REFUSAL,
-    EXPAND_IMAGE_MIB_MAX,
+    format_size, per_partition_refusal, BrowseOpen, ChdOptions, ChdProfile, ExportFormat,
+    HostRequest, InspectAction, InspectController, InspectServices, InspectSource, JobRegistry,
+    LayoutSegment, MinCell, NoNotify, SegmentKind, SizeMode, CHD_REFUSAL,
 };
 #[cfg(feature = "remote")]
 use crate::controller::remote_pick::{RemotePickAction, RemotePickController};
 use crate::controller::resize::{ResizeAction, ResizeController};
+use crate::controller::resize_image::{ResizeImageAction, ResizeImageController};
 use crate::controller::{Controller as _, Effect, PickSpec};
 
 /// Which controller asked a question.
@@ -59,6 +60,7 @@ pub(super) enum Who {
     Resize,
     Alto,
     Hfs,
+    Wizard,
 }
 
 /// A window of the screen's own, drawn over the grid.
@@ -66,7 +68,6 @@ pub(super) enum Who {
 #[cfg_attr(not(feature = "remote"), allow(dead_code))]
 pub(super) enum Win {
     Export,
-    Expand,
     Remote,
 }
 
@@ -101,7 +102,10 @@ pub(super) const HINTS_INSPECT_SOURCE: &[KeyHint] = &[
     hint("d", "Defragment a Human68k partition"),
     hint("r", "Re-inspect the source"),
     hint("e", "Export the disk image (and Physical Disk Export)"),
-    hint("x", "Expand Image: grow the image file with zeros"),
+    hint(
+        "x",
+        "Expand Image: the Resize Image wizard (size, partitions, filesystems)",
+    ),
     hint("B", "Make Bootable (classic Mac disks)"),
     hint("w", "Swap the 16-bit word order into a new image"),
     hint("i", "CHD Info"),
@@ -153,6 +157,9 @@ pub(super) struct InspectState {
     /// The Inspect dialogs' controllers and their windows' cursors.
     pub(super) resize: ResizeController,
     pub(super) rwin: ResizeWindow,
+    /// Resize Image, and its cursor.
+    pub(super) wizard: ResizeImageController,
+    pub(super) iwin: WizardWindow,
     pub(super) twin: TableWindow,
     pub(super) alto: AltoResizeController,
     pub(super) hfs: ExpandHfsController,
@@ -169,9 +176,6 @@ pub(super) struct InspectState {
     pub(super) esel: ERow,
     #[cfg(feature = "chd")]
     chd: ChdOptionsControl,
-    pub(super) expand_mib: u32,
-    /// Expand Image's (current, after) sizes for `expand_mib`.
-    expand_preview: (u64, u64),
     /// The layout line's segments, refreshed each tick (the controller caches the disk size).
     layout: Vec<LayoutSegment>,
     scroll: usize,
@@ -216,6 +220,8 @@ impl InspectState {
             remote_sel: 0,
             resize: ResizeController::new(Arc::new(NoNotify)),
             rwin: ResizeWindow::default(),
+            wizard: ResizeImageController::new(Arc::new(NoNotify)),
+            iwin: WizardWindow::default(),
             twin: TableWindow::default(),
             alto: AltoResizeController::new(Arc::new(NoNotify)),
             hfs: ExpandHfsController::new(Arc::new(NoNotify)),
@@ -229,8 +235,6 @@ impl InspectState {
             esel: ERow::Format,
             #[cfg(feature = "chd")]
             chd: ChdOptionsControl::new(ChdProfile::Hd),
-            expand_mib: 0,
-            expand_preview: (0, 0),
             layout: Vec::new(),
             scroll: 0,
             ask: None,
@@ -278,6 +282,7 @@ impl InspectState {
             || self.writer.opening().is_some()
             || self.ctl.summarizing_hfs()
             || self.resize.is_running()
+            || self.wizard.is_running()
             || self.alto.opening().is_some()
             || self.alto.is_writing()
             || self.hfs.is_running()
@@ -308,6 +313,13 @@ impl InspectState {
         let fx = self.resize.apply(action);
         self.absorb(Who::Resize, fx);
         self.after();
+    }
+
+    pub(super) fn iact(&mut self, action: ResizeImageAction) {
+        let fx = self.wizard.apply(action);
+        self.absorb(Who::Wizard, fx);
+        self.after();
+        self.iwin.settle(&self.wizard);
     }
 
     pub(super) fn aact(&mut self, action: AltoResizeAction) {
@@ -412,8 +424,19 @@ impl InspectState {
                 self.absorb(Who::Inspect, fx);
             }
         }
+        if let Some(path) = self.wizard.take_open_request() {
+            let fx = self.wizard.apply(ResizeImageAction::Close);
+            self.absorb(Who::Wizard, fx);
+            self.disk = None;
+            self.plain = None;
+            self.sel = 0;
+            let fx = self
+                .ctl
+                .apply(InspectAction::Open(InspectSource::ImageFile(path)));
+            self.absorb(Who::Inspect, fx);
+        }
         // A resize rewrote the table under the grid: read it again.
-        if self.resize.take_disk_changed() {
+        if self.resize.take_disk_changed() | self.wizard.take_disk_changed() {
             let fx = self.ctl.apply(InspectAction::DiskChanged);
             self.absorb(Who::Inspect, fx);
         }
@@ -423,6 +446,7 @@ impl InspectState {
             .into_iter()
             .chain(self.writer.take_log())
             .chain(self.resize.take_log())
+            .chain(self.wizard.take_log())
             .chain(self.alto.take_log())
             .chain(self.hfs.take_log())
             .map(|(_, msg)| msg)
@@ -477,6 +501,9 @@ impl InspectState {
             Pick::Of(Who::Alto, purpose) => self.aact(AltoResizeAction::Picked { purpose, path }),
             Pick::Of(Who::Hfs, purpose) => self.hact(ExpandHfsAction::Picked { purpose, path }),
             Pick::Of(Who::Writer, purpose) => self.wact(DiskWriteAction::Picked { purpose, path }),
+            Pick::Of(Who::Wizard, purpose) => {
+                self.iact(ResizeImageAction::Picked { purpose, path })
+            }
             // The remote picker and Resize ask for no file.
             Pick::Of(Who::Remote, _) | Pick::Of(Who::Resize, _) => {}
             Pick::WriterImage => {
@@ -522,6 +549,10 @@ impl InspectState {
                 text,
             }),
             Ask::Confirm(Who::Resize, spec) => self.zact(ResizeAction::Confirmed {
+                purpose: spec.purpose,
+                yes,
+            }),
+            Ask::Confirm(Who::Wizard, spec) => self.iact(ResizeImageAction::Confirmed {
                 purpose: spec.purpose,
                 yes,
             }),
@@ -740,29 +771,6 @@ impl InspectState {
 
     // --- the other windows --------------------------------------------------------------
 
-    fn expand_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => self.window = None,
-            KeyCode::Enter if self.expand_mib > 0 => {
-                self.window = None;
-                let bytes = expand_image_bytes(self.expand_mib);
-                self.act(InspectAction::ExpandImage(bytes));
-            }
-            KeyCode::Backspace => self.expand_mib /= 10,
-            KeyCode::Char(c) => {
-                if let Some(d) = c.to_digit(10) {
-                    self.expand_mib = self
-                        .expand_mib
-                        .saturating_mul(10)
-                        .saturating_add(d)
-                        .min(EXPAND_IMAGE_MIB_MAX);
-                }
-            }
-            _ => {}
-        }
-        self.expand_preview = self.ctl.expand_image_preview(self.expand_mib);
-    }
-
     fn check_key(&mut self, code: KeyCode) {
         let (repairable, has_debug, debug) = match self.ctl.fsck_view() {
             Some(v) => (
@@ -875,6 +883,25 @@ impl InspectState {
         }
     }
 
+    fn wizard_key(&mut self, code: KeyCode) {
+        match self.iwin.key(&self.wizard, code) {
+            WizardKey::Done => {}
+            WizardKey::Act(a) => self.iact(a),
+        }
+        self.iwin.settle(&self.wizard);
+    }
+
+    fn open_resize_image(&mut self) {
+        match self.ctl.resize_image_source() {
+            Ok(source) => {
+                self.iact(ResizeImageAction::Open(Box::new(source)));
+                self.iwin = WizardWindow::default();
+                self.iwin.settle(&self.wizard);
+            }
+            Err(e) => self.note = Some(e),
+        }
+    }
+
     fn resize_key(&mut self, code: KeyCode) {
         match self.rwin.key(&self.resize, code) {
             ResizeKey::Done => {}
@@ -905,7 +932,11 @@ impl InspectState {
 
     /// A dialog of the screen's own is up over the grid.
     pub(super) fn dialog_open(&self) -> bool {
-        self.ctl.editor_open() || self.resize.is_open() || self.alto.is_open() || self.hfs.is_open()
+        self.ctl.editor_open()
+            || self.resize.is_open()
+            || self.wizard.is_open()
+            || self.alto.is_open()
+            || self.hfs.is_open()
     }
 
     fn open_table_editor(&mut self, add: bool) {
@@ -979,10 +1010,8 @@ impl InspectState {
                 self.window = Some(Win::Export);
                 self.esel = ERow::Format;
             }
-            KeyCode::Char('x') if self.ctl.can_expand_image() => {
-                self.expand_mib = 0;
-                self.expand_preview = self.ctl.expand_image_preview(0);
-                self.window = Some(Win::Expand);
+            KeyCode::Char('x') if self.ctl.can_resize_image() && !self.wizard.is_running() => {
+                self.open_resize_image()
             }
             KeyCode::Char('B') if self.ctl.can_make_bootable() => {
                 self.act(InspectAction::MakeBootable)
@@ -1076,6 +1105,9 @@ impl App {
         }
         if s.resize.is_open() {
             return Some(("Inspect - resize", HINTS_RESIZE));
+        }
+        if s.wizard.is_open() {
+            return Some(("Inspect - resize image", HINTS_RESIZE_IMAGE));
         }
         if s.hfs.is_open() {
             return Some(("Inspect - expand HFS", HINTS_EXPAND_HFS));
@@ -1303,10 +1335,6 @@ impl App {
                 s.export_key(code);
                 return true;
             }
-            Some(Win::Expand) => {
-                s.expand_key(code);
-                return true;
-            }
             None => {}
         }
         if s.ctl.fsck_view().is_some() {
@@ -1324,6 +1352,11 @@ impl App {
         }
         if s.resize.is_open() {
             s.resize_key(code);
+            self.after_inspect();
+            return true;
+        }
+        if s.wizard.is_open() {
+            s.wizard_key(code);
             self.after_inspect();
             return true;
         }
@@ -1367,6 +1400,9 @@ impl App {
         }
         let fx = s.resize.tick();
         s.absorb(Who::Resize, fx);
+        let fx = s.wizard.tick();
+        s.absorb(Who::Wizard, fx);
+        s.iwin.settle(&s.wizard);
         let fx = s.alto.tick();
         s.absorb(Who::Alto, fx);
         let fx = s.hfs.tick();
@@ -1530,7 +1566,6 @@ impl App {
     pub(super) fn draw_inspect_windows(&self, frame: &mut Frame, area: Rect, s: &InspectState) {
         match s.window {
             Some(Win::Export) => self.draw_inspect_export(frame, area, s),
-            Some(Win::Expand) => self.draw_inspect_expand(frame, area, s),
             Some(Win::Remote) => self.draw_inspect_remote(frame, area, s),
             None => {}
         }
@@ -1561,6 +1596,9 @@ impl App {
         }
         if s.resize.is_open() {
             self.draw_resize(frame, area, &s.resize, &s.rwin);
+        }
+        if s.wizard.is_open() {
+            self.draw_resize_image(frame, area, &s.wizard, &s.iwin);
         }
         if s.alto.is_open() {
             self.draw_alto_resize(frame, area, &s.alto, &s.dwin);
@@ -2113,28 +2151,6 @@ impl App {
     #[cfg(not(feature = "chd"))]
     fn inspect_chd_row(&self, _s: &InspectState, _row: ERow) -> String {
         String::new()
-    }
-
-    fn draw_inspect_expand(&self, frame: &mut Frame, area: Rect, s: &InspectState) {
-        let pal = self.palette;
-        let (current, after) = s.expand_preview;
-        let lines = vec![
-            Line::raw(format!("  Current size: {}", format_size(current))),
-            Line::styled(
-                format!("  Add free space: {}_ MiB", s.expand_mib),
-                pal.accent().add_modifier(Modifier::REVERSED),
-            ),
-            Line::raw(format!("  New size: {}", format_size(after))),
-            Line::raw(""),
-            Line::styled(
-                "  After expansion, re-inspect (r) to refresh the partition list, then add or \
-                 extend a partition into the new space.",
-                pal.dim(),
-            ),
-            Line::raw(""),
-            Line::styled("  0-9 type MiB   Enter expand   Esc cancel", pal.dim()),
-        ];
-        self.draw_inspect_popup(frame, area, "Expand Image", lines, 1);
     }
 
     fn draw_inspect_check(&self, frame: &mut Frame, area: Rect, s: &InspectState) {

@@ -8,6 +8,7 @@
 //! seven verdicts in [`report::Verdict`].
 
 mod assertion;
+mod ax;
 mod consolidate;
 mod envelope;
 mod exec;
@@ -43,6 +44,7 @@ struct Args {
     rb_cli: PathBuf,
     gtk: PathBuf,
     win32: PathBuf,
+    appkit: PathBuf,
     identify: bool,
     detect: bool,
     set_oracle: Option<String>,
@@ -149,6 +151,9 @@ fn parse_args() -> Result<Args, String> {
         win32: base
             .join("..")
             .join("frontends/win32/target/release/rusty-backup-win32.exe"),
+        appkit: base
+            .join("..")
+            .join("frontends/appkit/target/release/rusty-backup-appkit"),
         identify: false,
         detect: false,
         set_oracle: None,
@@ -242,6 +247,10 @@ fn parse_args() -> Result<Args, String> {
                         args.win32 = PathBuf::from(value()?);
                         i += 1;
                     }
+                    "--appkit" => {
+                        args.appkit = PathBuf::from(value()?);
+                        i += 1;
+                    }
                     "--rb-cli" => {
                         args.rb_cli = PathBuf::from(value()?);
                         i += 1;
@@ -323,6 +332,7 @@ fn parse_args() -> Result<Args, String> {
     args.rb_cli = exec::absolutise(&args.rb_cli);
     args.gtk = exec::absolutise(&args.gtk);
     args.win32 = exec::absolutise(&args.win32);
+    args.appkit = exec::absolutise(&args.appkit);
     args.scratch_root = exec::absolutise(&args.scratch_root);
     args.artifacts_root = exec::absolutise(&args.artifacts_root);
     args.verifications_root = exec::absolutise(&args.verifications_root);
@@ -396,6 +406,8 @@ OPTIONS:
                            is older than the sources in the tree.
     --gtk <PATH>           GTK shell the gtk flows drive
                            [default: <repo>/frontends/gtk4/target/release/rusty-backup-gtk]
+    --appkit <PATH>        AppKit shell the appkit flows drive
+                           [default: <repo>/frontends/appkit/target/release/rusty-backup-appkit]
     --fixture-root <DIR>   Fixture corpus root      [or RB_FIXTURE_ROOT, or local.toml]
     --sync                 (fixtures) copy the corpus from local.toml's
                            `corpus_source` into the fixture root first. Runs
@@ -1586,6 +1598,7 @@ fn run_case(
         &args.rb_cli,
         &args.gtk,
         &args.win32,
+        &args.appkit,
         &scratch,
         controls,
     );

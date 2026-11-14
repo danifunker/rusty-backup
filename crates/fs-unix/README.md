@@ -15,7 +15,7 @@ Unix-family filesystems, one Cargo feature each:
 | `bfs` | BeOS / Haiku BFS | read, edit, create, check |
 | `ofs` | the old BeOS fs (BeBox prototypes, DR8 and earlier) | read, edit, check |
 
-`ofs` is off by default. Early BeOS used Mac-style type / creator codes, so it depends on `fs-mac`, which in turn depends on the GPL-2.0-only `fs-mac-unicode`; a build with `ofs` on is therefore GPL as a whole. Every other feature is MIT.
+`ofs` is off by default. Early BeOS used Mac-style type / creator codes, so it depends on `fs-mac` (with no features, so `fs-mac` 0.1.10's GPL-2.0-only `fs-mac-unicode` stays out). Every feature is MIT.
 
 Each implements the `disk-core` filesystem traits. Builds on Rust 1.73 and later. Part of [rusty-backup](https://github.com/danifunker/rusty-backup).
 

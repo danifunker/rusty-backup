@@ -1,0 +1,4 @@
+# The .app's floor, the same as the egui one (docs/appkit_shell_plan.md). The repository's own
+# .cargo/config.toml (four jobs) still applies: cargo reads every config up the tree.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "10.13"

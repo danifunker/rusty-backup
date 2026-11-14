@@ -161,6 +161,7 @@ struct GithubAsset {
 
 /// Asset-name arch tag used in the Windows release ZIPs
 /// (`Rusty-Backup-windows-<tag>-<version>.zip`). `x86` = i686, `x64` = x86_64.
+#[cfg(not(target_os = "macos"))]
 fn windows_arch_tag() -> &'static str {
     if cfg!(target_arch = "x86") {
         "x86"
@@ -397,27 +398,14 @@ pub fn check_for_updates(
 
     let is_outdated = release_is_newer(&latest_version, current);
 
-    // Match this GUI's ZIP + CLI asset for this arch so the GUI can offer an
+    // Match this GUI's package + CLI asset for this arch so the GUI can offer an
     // in-app update. Naming is set by .github/workflows/release.yml:
     //   Rusty-Backup-windows-<arch>-<version>.zip        (egui)
     //   Rusty-Backup-Win32-windows-<arch>-<version>.zip  (the Win32 shell)
     //   Rusty-Backup-CLI-windows-<arch>-<version>.exe
-    let arch_pat = format!("windows-{}-", windows_arch_tag());
-    let zip = format!(
-        "{}-{}-",
-        crate::os::windows_gui::WindowsGui::current().zip_prefix(),
-        windows_arch_tag()
-    );
-    let asset_url = release
-        .assets
-        .iter()
-        .find(|a| a.name.starts_with(&zip) && a.name.to_ascii_lowercase().ends_with(".zip"))
-        .map(|a| a.browser_download_url.clone());
-    let cli_asset_url = release
-        .assets
-        .iter()
-        .find(|a| a.name.starts_with("Rusty-Backup-CLI-windows") && a.name.contains(&arch_pat))
-        .map(|a| a.browser_download_url.clone());
+    //   Rusty-Backup-macos-<arch>-<version>.dmg          (egui; the AppKit shell's own prefix)
+    //   rb-cli-macos-<arch>-<version>.zip
+    let (asset_url, cli_asset_url) = match_assets(&release.assets, &asset_patterns());
 
     Ok(UpdateInfo {
         current_version: current.to_string(),
@@ -427,6 +415,49 @@ pub fn check_for_updates(
         asset_url,
         cli_asset_url,
     })
+}
+
+/// The GUI package and the CLI asset among `assets` for the `patterns` of [`asset_patterns`].
+#[cfg(any(feature = "gui", feature = "tui-update"))]
+fn match_assets(
+    assets: &[GithubAsset],
+    patterns: &(String, &'static str, &'static str, String),
+) -> (Option<String>, Option<String>) {
+    let (gui_prefix, gui_ext, cli_prefix, cli_arch) = patterns;
+    let gui = assets
+        .iter()
+        .find(|a| a.name.starts_with(gui_prefix) && a.name.to_ascii_lowercase().ends_with(gui_ext))
+        .map(|a| a.browser_download_url.clone());
+    let cli = assets
+        .iter()
+        .find(|a| a.name.starts_with(cli_prefix) && a.name.contains(cli_arch.as_str()))
+        .map(|a| a.browser_download_url.clone());
+    (gui, cli)
+}
+
+/// This platform's GUI asset prefix and extension, then its CLI asset prefix and arch part.
+#[cfg(any(feature = "gui", feature = "tui-update"))]
+fn asset_patterns() -> (String, &'static str, &'static str, String) {
+    #[cfg(target_os = "macos")]
+    {
+        let arch = mac::arch_tag();
+        (
+            format!("{}-macos-{}-", mac::dmg_prefix(), arch),
+            ".dmg",
+            "rb-cli-macos-",
+            format!("macos-{}-", arch),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let zip = format!(
+            "{}-{}-",
+            crate::os::windows_gui::WindowsGui::current().zip_prefix(),
+            windows_arch_tag()
+        );
+        let arch = format!("windows-{}-", windows_arch_tag());
+        (zip, ".zip", "Rusty-Backup-CLI-windows", arch)
+    }
 }
 
 /// Download a release asset into memory, reporting progress as
@@ -460,6 +491,7 @@ fn download_bytes(
 }
 
 /// Extract every file in a ZIP (flattened to basenames) into `dest`.
+#[cfg(not(target_os = "macos"))]
 fn extract_zip_flat(
     bytes: &[u8],
     dest: &std::path::Path,
@@ -482,13 +514,12 @@ fn extract_zip_flat(
     Ok(())
 }
 
-/// Download the matched release ZIP, extract it, and replace the running
-/// executable in place. On success the caller should prompt the user and then
-/// call [`restart_app`] to relaunch into the new version.
+/// Download the matched release package and replace the running app with it. On success the
+/// caller should prompt the user and then call [`restart_app`] to relaunch into the new version.
 ///
-/// Windows-only: the in-place running-exe replacement uses `self_replace`.
-/// On other platforms this returns an error (macOS/Linux update via DMG /
-/// AppImage instead).
+/// Windows: the ZIP's exe replaces the running one (`self_replace`). macOS: the signed DMG's
+/// bundle replaces the running one ([`mac::install`]); a [`ManualInstall`] error means the DMG
+/// was opened for the user instead. Linux updates through its AppImage.
 #[cfg(any(feature = "gui", feature = "tui-update"))]
 pub fn download_and_apply_update(
     info: &UpdateInfo,
@@ -498,7 +529,23 @@ pub fn download_and_apply_update(
         .asset_url
         .as_ref()
         .ok_or("No downloadable update asset for this platform/arch")?;
+    #[cfg(target_os = "macos")]
+    {
+        mac::install(asset_url, progress)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        apply_zip_update(info, asset_url, progress)
+    }
+}
 
+/// The Windows path: the GUI's ZIP, its exe swapped for the running one, rb-cli beside it.
+#[cfg(all(not(target_os = "macos"), any(feature = "gui", feature = "tui-update")))]
+fn apply_zip_update(
+    info: &UpdateInfo,
+    asset_url: &str,
+    progress: &dyn Fn(u64, Option<u64>),
+) -> Result<(), Box<dyn std::error::Error>> {
     let zip_bytes = download_bytes(asset_url, progress)?;
     let staging = tempfile::Builder::new().prefix("rb-update-").tempdir()?;
     extract_zip_flat(&zip_bytes, staging.path())?;
@@ -659,7 +706,7 @@ fn replace_running_exe(new_exe: &std::path::Path) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn replace_running_exe(_new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     Err("in-app self-update is only supported on Windows".into())
 }
@@ -685,7 +732,11 @@ fn update_sidecar_cli(cli_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(windows, any(feature = "gui", feature = "tui-update"))))]
+#[cfg(all(
+    not(windows),
+    not(target_os = "macos"),
+    any(feature = "gui", feature = "tui-update")
+))]
 fn update_sidecar_cli(_cli_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
@@ -700,9 +751,241 @@ pub fn restart_app() -> ! {
     std::process::exit(0);
 }
 
+/// The update could not replace the app in place, so it opened the DMG for the user instead.
+#[derive(Debug)]
+pub struct ManualInstall(pub String);
+
+impl std::fmt::Display for ManualInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ManualInstall {}
+
+/// Relaunch the updated bundle and exit; a bare binary (a dev run) just exits.
+#[cfg(all(target_os = "macos", any(feature = "gui", feature = "tui-update")))]
+pub fn restart_app() -> ! {
+    if let Some(bundle) = mac::running_bundle() {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg("-n")
+            .arg(&bundle)
+            .spawn();
+    }
+    std::process::exit(0);
+}
+
+/// The macOS in-app update: the signed DMG's bundle replaces the running one (docs/appkit_shell_plan.md).
+#[cfg(all(target_os = "macos", any(feature = "gui", feature = "tui-update")))]
+pub(crate) mod mac {
+    use super::ManualInstall;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+    /// The DMG name prefix of the running GUI: the AppKit shell or egui.
+    pub fn dmg_prefix() -> &'static str {
+        let exe = std::env::current_exe().ok();
+        let name = exe
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name == "rusty-backup-appkit" {
+            "Rusty-Backup-AppKit"
+        } else {
+            "Rusty-Backup"
+        }
+    }
+
+    pub fn arch_tag() -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        }
+    }
+
+    /// The `.app` this process runs from (`X.app/Contents/MacOS/exe`), if any.
+    pub fn running_bundle() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+        let bundle = exe.parent()?.parent()?.parent()?.to_path_buf();
+        let is_app = bundle.extension().is_some_and(|e| e == "app");
+        is_app.then_some(bundle)
+    }
+
+    /// Where the replaced bundle goes for the swap: `.X.app.old` beside it.
+    fn old_path(bundle: &Path) -> Option<PathBuf> {
+        let name = bundle.file_name()?.to_str()?;
+        Some(bundle.with_file_name(format!(".{name}.old")))
+    }
+
+    fn run(cmd: &mut Command) -> Res<std::process::Output> {
+        let out = cmd.output()?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("{:?} failed: {}", cmd.get_program(), err).into());
+        }
+        Ok(out)
+    }
+
+    /// The bundle's signing Team ID, if it is signed by a developer.
+    fn team_id(app: &Path) -> Option<String> {
+        let out = Command::new("/usr/bin/codesign")
+            .args(["-dv", "--verbose=2"])
+            .arg(app)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned();
+        text.lines()
+            .find_map(|l| l.strip_prefix("TeamIdentifier="))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty() && t != "not set")
+    }
+
+    /// A mounted DMG, detached when dropped.
+    struct Mount(PathBuf);
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-quiet", "-force"])
+                .arg(&self.0)
+                .output();
+        }
+    }
+
+    /// Open the downloaded DMG in Finder and say why the user installs it.
+    fn hand_over(dmg: &Path, keep: tempfile::TempDir, why: &str) -> Res<()> {
+        // The DMG must outlive this call: Finder mounts it after we return.
+        std::mem::forget(keep);
+        run(Command::new("/usr/bin/open").arg(dmg))?;
+        Err(Box::new(ManualInstall(format!(
+            "{why}; the new version's disk image is open: drag the app into Applications"
+        ))))
+    }
+
+    pub fn install(url: &str, progress: &dyn Fn(u64, Option<u64>)) -> Res<()> {
+        let bundle = running_bundle().ok_or("this copy is not running from an app bundle")?;
+        let work = tempfile::Builder::new().prefix("rb-update-").tempdir()?;
+        let dmg = work.path().join("update.dmg");
+        std::fs::write(&dmg, super::download_bytes(url, progress)?)?;
+        let Some(team) = team_id(&bundle) else {
+            return hand_over(
+                &dmg,
+                work,
+                "this build is not signed, so it cannot check the update",
+            );
+        };
+        let parent = bundle.parent().ok_or("the app has no parent folder")?;
+        let probe = parent.join(format!(".rb-update-probe-{}", std::process::id()));
+        if std::fs::write(&probe, b"").is_err() {
+            return hand_over(
+                &dmg,
+                work,
+                "the app's folder is not writable by this account",
+            );
+        }
+        let _ = std::fs::remove_file(&probe);
+
+        let mnt = work.path().join("mnt");
+        std::fs::create_dir(&mnt)?;
+        run(Command::new("/usr/bin/hdiutil")
+            .args([
+                "attach",
+                "-nobrowse",
+                "-readonly",
+                "-noautoopen",
+                "-mountpoint",
+            ])
+            .arg(&mnt)
+            .arg(&dmg))?;
+        let mount = Mount(mnt);
+        let name = bundle.file_name().ok_or("the app has no name")?;
+        let mut found = mount.0.join(name);
+        if !found.exists() {
+            let apps: Vec<PathBuf> = std::fs::read_dir(&mount.0)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "app"))
+                .collect();
+            if apps.len() != 1 {
+                return Err("the disk image does not hold exactly one app".into());
+            }
+            found = apps[0].clone();
+        }
+        run(Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(&found))
+        .map_err(|e| format!("the downloaded app's signature does not check out: {e}"))?;
+        if team_id(&found).as_deref() != Some(team.as_str()) {
+            return Err("the downloaded app is not signed by this app's developer".into());
+        }
+
+        let fresh = bundle.with_file_name(format!(".{}.new", name.to_string_lossy()));
+        let old = old_path(&bundle).ok_or("the app has no name")?;
+        let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&old);
+        run(Command::new("/usr/bin/ditto").arg(&found).arg(&fresh))?;
+        drop(mount);
+        std::fs::rename(&bundle, &old)?;
+        if let Err(e) = std::fs::rename(&fresh, &bundle) {
+            let _ = std::fs::rename(&old, &bundle);
+            let _ = std::fs::remove_dir_all(&fresh);
+            return Err(e.into());
+        }
+        // The running process keeps its open files; the bundle's path now names the new one.
+        let _ = std::fs::remove_dir_all(&old);
+        Ok(())
+    }
+}
+
 /// Tests for the Unix CLI self-replace extraction (the `--apply` core). Gated
 /// to the same cfg as the code under test so `cargo test` (default features
 /// include `gui`) compiles and runs them.
+#[cfg(all(
+    test,
+    target_os = "macos",
+    any(feature = "tui-update", feature = "gui")
+))]
+mod mac_update_tests {
+    use super::{asset_patterns, match_assets, GithubAsset};
+
+    fn asset(name: &str) -> GithubAsset {
+        GithubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+        }
+    }
+
+    #[test]
+    fn egui_takes_its_own_dmg_and_the_mac_cli() {
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let other = if arch == "arm64" { "x64" } else { "arm64" };
+        let assets = vec![
+            asset("Rusty-Backup-windows-x64-1.zip"),
+            asset(&format!("Rusty-Backup-AppKit-macos-{arch}-1.dmg")),
+            asset(&format!("Rusty-Backup-macos-{other}-1.dmg")),
+            asset(&format!("Rusty-Backup-macos-{arch}-1.dmg")),
+            asset(&format!("rb-cli-macos-{arch}-1.zip")),
+        ];
+        // A test binary is not rusty-backup-appkit, so it counts as egui.
+        let (gui, cli) = match_assets(&assets, &asset_patterns());
+        assert_eq!(
+            gui.as_deref(),
+            Some(format!("https://example.invalid/Rusty-Backup-macos-{arch}-1.dmg").as_str())
+        );
+        assert_eq!(
+            cli.as_deref(),
+            Some(format!("https://example.invalid/rb-cli-macos-{arch}-1.zip").as_str())
+        );
+    }
+}
+
 #[cfg(all(test, unix, any(feature = "tui-update", feature = "gui")))]
 mod cli_update_tests {
     use super::{extract_cli_binary, looks_like_unix_executable};

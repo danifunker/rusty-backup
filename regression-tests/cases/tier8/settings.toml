@@ -13,7 +13,7 @@ id = "flow.settings.save-and-reopen"
 description = "Set the update repository URL in Settings, save, close, reopen and find it there (config.json round trip)"
 level = "smoke"
 area = ["settings"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["settings.update-check"]
 timeout_ms = 60000
 

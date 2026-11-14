@@ -84,7 +84,6 @@ pub enum FsOption {
     BtreeSizes,
     CaseSensitive,
     MinCatalog,
-    Fat32,
     AffsVariant,
     CpmPreset,
     /// A fixed geometry from [`geometries`] (CBM drive, DFS / RS-DOS / DragonDOS tracks).
@@ -314,7 +313,6 @@ impl FsKind {
                 ..c(400 * KIB, fs_mac::hfv::HFV_MAX_BYTES, true, 27)
             },
             FsKind::Fat => FsCaps {
-                options: &[Fat32],
                 floppy: true,
                 ..c(64 * KIB, 2 * TIB, true, 11)
             },

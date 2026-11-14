@@ -47,12 +47,12 @@ use crate::disk_write::DiskWriteWindow;
 use crate::editor::EditorWindow;
 use crate::effects::{EffectHost, Reply, ReplyFn};
 use crate::expand_hfs::ExpandHfsWindow;
-use crate::expand_image::{self, ExpandImageWindow};
 use crate::export::{self, ExportWindow};
 use crate::layout::{self, Node, Size};
 use crate::panel::{self, Handler};
 use crate::report::{self, ReportWindow};
 use crate::resize::ResizeWindow;
+use crate::resize_image::ResizeImageWindow;
 use crate::sync::SyncGuard;
 use crate::ui;
 
@@ -154,7 +154,8 @@ struct Shown {
     selected: Option<usize>,
     can_reinspect: bool,
     can_bootable: bool,
-    can_expand_image: bool,
+    /// Expand Image opens Resize Image: an image file with a table.
+    can_resize_image: bool,
     can_edit_table: bool,
     can_export: bool,
     exporting: bool,
@@ -216,6 +217,7 @@ pub struct InspectScreen {
     cancel_export: HWND,
     export_window: RefCell<Option<Rc<ExportWindow>>>,
     resize: RefCell<Option<Rc<ResizeWindow>>>,
+    resize_image: RefCell<Option<Rc<ResizeImageWindow>>>,
     writer: RefCell<Option<Rc<DiskWriteWindow>>>,
     close: HWND,
     details: HWND,
@@ -237,7 +239,6 @@ pub struct InspectScreen {
     browse: Rc<BrowseView>,
     browse_page: HWND,
     hfs: RefCell<Option<Rc<ExpandHfsWindow>>>,
-    expand_window: RefCell<Option<Rc<ExpandImageWindow>>>,
     check_window: RefCell<Option<Rc<ReportWindow>>>,
     chd_window: RefCell<Option<Rc<ReportWindow>>>,
 }
@@ -399,6 +400,7 @@ impl InspectScreen {
             cancel_export,
             export_window: RefCell::default(),
             resize: RefCell::default(),
+            resize_image: RefCell::default(),
             writer: RefCell::default(),
             close,
             details,
@@ -418,7 +420,6 @@ impl InspectScreen {
             browse,
             browse_page,
             hfs: RefCell::default(),
-            expand_window: RefCell::default(),
             check_window: RefCell::default(),
             chd_window: RefCell::default(),
         });
@@ -541,6 +542,20 @@ impl InspectScreen {
                 self.hfs.replace(None);
             }
         }
+        let wizard = self.resize_image.borrow().clone();
+        if let Some(d) = wizard {
+            d.tick();
+            if d.take_disk_changed() {
+                self.apply(InspectAction::DiskChanged);
+            }
+            if let Some(path) = d.take_open_request() {
+                d.apply(rusty_backup::controller::resize_image::ResizeImageAction::Close);
+                self.apply(InspectAction::Open(InspectSource::ImageFile(path)));
+            }
+            if !d.is_open() {
+                self.resize_image.replace(None);
+            }
+        }
         let resize = self.resize.borrow().clone();
         if let Some(d) = resize {
             d.tick();
@@ -637,6 +652,30 @@ impl InspectScreen {
     }
 
     /// Resize Partitions: a dialog with its own controller, on the table read here.
+    fn open_resize_image(&self) {
+        if self
+            .resize_image
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.is_open())
+        {
+            return;
+        }
+        let source = self.ctrl.borrow_mut().resize_image_source();
+        match source {
+            Ok(source) => {
+                let d = ResizeImageWindow::open(
+                    self.owner,
+                    self.notify.clone(),
+                    self.host.clone(),
+                    source,
+                );
+                *self.resize_image.borrow_mut() = Some(d);
+            }
+            Err(e) => crate::app::append_log(vec![(LogLevel::Error, e)]),
+        }
+    }
+
     fn open_resize(&self) {
         let busy = self.resize.borrow().as_ref().is_some_and(|d| d.is_open());
         let plan = self.ctrl.borrow().resize_plan();
@@ -840,7 +879,12 @@ impl InspectScreen {
             selected: c.selected_partition(),
             can_reinspect: c.can_reinspect(),
             can_bootable: c.can_make_bootable(),
-            can_expand_image: c.can_expand_image(),
+            can_resize_image: c.can_resize_image()
+                && !self
+                    .resize_image
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|d| d.is_running()),
             can_edit_table: c.can_edit_table(),
             can_export: c.can_export(),
             exporting: c.export_job().is_some(),
@@ -886,7 +930,7 @@ impl InspectScreen {
         self.show_job(s.jobs.first());
         ui::set_enabled(self.reinspect, s.can_reinspect);
         ui::set_enabled(self.bootable, s.can_bootable);
-        ui::set_enabled(self.expand_image, s.can_expand_image);
+        ui::set_enabled(self.expand_image, s.can_resize_image);
         ui::set_enabled(self.export_btn, s.can_export);
         ui::set_visible(self.cancel_export, s.exporting);
         self.show_export(s.export);
@@ -1295,40 +1339,6 @@ impl InspectScreen {
         }
     }
 
-    /// Expand Image's window: the view's own, previewing sizes through the controller.
-    fn open_expand_image(&self) {
-        if self.expand_window.borrow().is_some() {
-            return;
-        }
-        let me = self.me.clone();
-        let w = ExpandImageWindow::open(
-            self.owner,
-            Box::new(move |event| {
-                let Some(s) = me.upgrade() else { return };
-                match event {
-                    expand_image::Event::Preview(mib) => s.preview_expand(mib),
-                    expand_image::Event::Expand(bytes) => {
-                        s.expand_window.replace(None);
-                        s.apply(InspectAction::ExpandImage(bytes));
-                    }
-                    expand_image::Event::Close => {
-                        s.expand_window.replace(None);
-                    }
-                }
-            }),
-        );
-        *self.expand_window.borrow_mut() = Some(w);
-        self.preview_expand(0);
-    }
-
-    fn preview_expand(&self, mib: u32) {
-        let (current, new) = self.ctrl.borrow_mut().expand_image_preview(mib);
-        if let Some(w) = self.expand_window.borrow().as_ref() {
-            debug_assert_eq!(w.added(), mib);
-            w.show(current, new);
-        }
-    }
-
     fn row_index(&self) -> Option<usize> {
         self.rows.borrow().get(self.cursor.get()).map(|r| r.index)
     }
@@ -1370,7 +1380,7 @@ impl Handler for InspectScreen {
         } else if from == self.chd {
             InspectAction::ChdInfo
         } else if from == self.expand_image {
-            self.open_expand_image();
+            self.open_resize_image();
             return;
         } else if from == self.resize_btn {
             self.open_resize();

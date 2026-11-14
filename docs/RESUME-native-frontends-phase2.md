@@ -26,7 +26,7 @@ no other branches, no worktrees, no PR or merge into `main` unless the user asks
   `rb-regress run --require-clean --scratch-root /run/media/dani/BigDisk/rb-build/regress-scratch`.
 - **Published 2026-11-04:** part-tables 0.1.1, arc-mac 0.1.3, dsk-dmg 0.1.1, fs-mac 0.1.3,
   rb-fsexporter 0.1.3, fs-pc 0.1.2, opticaldiscs 0.16.2, libchdman-rs 0.289.4 (its release workflow now has a
-  `skip_macos` input for GitHub macOS runner outages; test on `dani@dani-dev.local` first).
+  `skip_macos` input for GitHub macOS runner outages; test on a self-hosted Mac from `local.toml` first).
 - **Issues #98-#104** closed (silently). Fixtures for them and the NT4 TSE disk (R-079) are
   in `/run/media/dani/BigDisk/rb-fixtures` and on the NAS (`smb://daninas.local/software`,
   mount it from the file manager; it needs the saved password).

@@ -145,3 +145,27 @@ fn table_rows_offer_their_modes_delete_and_type_note() {
     assert_eq!(type_note(TableKind::Mbr, "zz"), Some("custom"));
     assert_eq!(type_note(TableKind::Mbr, " "), None);
 }
+
+#[test]
+fn alignment_is_picked_by_name_and_typed_only_for_custom() {
+    let mut b = DiskBuilder::new(TableKind::Mbr, 64 * MIB);
+    let v = build_view(&b);
+    assert_eq!((v.align_pick, v.align_custom), (0, false));
+    assert_eq!(v.align_choices[0], "Table default (1.0 MiB)");
+    let custom = v.align_choices.len() - 1;
+    // The DOS track preset sets the text the layout reads.
+    apply_build(&mut b, BuildAction::PickAlign(2));
+    assert_eq!((b.align_text.as_str(), b.align_bytes()), ("63s", 63 * 512));
+    assert_eq!(build_view(&b).align_pick, 2);
+    // Custom keeps what was there and opens the field; typed text no preset names stays custom.
+    apply_build(&mut b, BuildAction::PickAlign(custom));
+    assert!(build_view(&b).align_custom);
+    apply_build(&mut b, BuildAction::SetAlign("4K".into()));
+    assert_eq!((build_view(&b).align_pick, b.align_bytes()), (custom, 4096));
+    apply_build(&mut b, BuildAction::PickAlign(0));
+    let v = build_view(&b);
+    assert_eq!(
+        (v.align_pick, v.align_custom, b.align_text.as_str()),
+        (0, false, "")
+    );
+}

@@ -49,6 +49,7 @@ pub(super) enum Row {
     /// Start from a blank table or a donor disk's layout.
     Donor,
     Size,
+    AlignPick,
     Align,
     Heads,
     Sectors,
@@ -242,7 +243,10 @@ impl BuildDiskState {
                         if !c.output_is_device() {
                             r.push(Row::Size);
                         }
-                        r.push(Row::Align);
+                        r.push(Row::AlignPick);
+                        if c.table_view().align_custom {
+                            r.push(Row::Align);
+                        }
                         if c.table_view().geometry.is_some() {
                             r.extend([Row::Heads, Row::Sectors]);
                         }
@@ -446,6 +450,12 @@ impl BuildDiskState {
                 let k: TableKind = cycle(v.kinds, v.kind, forward);
                 self.act(BuildDiskAction::Table(BuildAction::SetKind(k)));
             }
+            Row::AlignPick => {
+                let v = c.table_view();
+                let all: Vec<usize> = (0..v.align_choices.len()).collect();
+                let at = cycle(all.as_slice(), v.align_pick, forward);
+                self.act(BuildDiskAction::Table(BuildAction::PickAlign(at)));
+            }
             Row::VolumeFs => {
                 let k = cycle(FsChoice::all().as_slice(), c.volume_fs_choice(), forward);
                 self.act(BuildDiskAction::SetVolumeFs(k));
@@ -537,7 +547,6 @@ impl BuildDiskState {
                 };
                 match opt {
                     FsOption::BigEndian => o.big_endian = !o.big_endian,
-                    FsOption::Fat32 => o.fat32 = !o.fat32,
                     FsOption::CaseSensitive => o.case_sensitive = !o.case_sensitive,
                     FsOption::AffsVariant => {
                         let all = AFFS_VARIANTS.map(|v| v.0);
@@ -917,8 +926,18 @@ impl App {
                         c.disk_size().map(format_size).unwrap_or_else(|e| e)
                     ),
                 ),
-                Row::Align => (
+                Row::AlignPick => (
                     "Alignment".into(),
+                    format!(
+                        "< {} >",
+                        v.align_choices
+                            .get(v.align_pick)
+                            .cloned()
+                            .unwrap_or_default()
+                    ),
+                ),
+                Row::Align => (
+                    "  Custom".into(),
                     if v.align_text.is_empty() {
                         format!("(default {})", v.align_hint)
                     } else {
@@ -1080,7 +1099,6 @@ impl App {
                             ("  Block size".into(), auto(x.block_size.map(u64::from)))
                         }
                         FsOption::BigEndian => ("  Big-endian".into(), tick(x.big_endian)),
-                        FsOption::Fat32 => ("  FAT32 always".into(), tick(x.fat32)),
                         FsOption::CaseSensitive => {
                             ("  Case-sensitive".into(), tick(x.case_sensitive))
                         }
@@ -1295,7 +1313,7 @@ mod tests {
             app.build_disk.as_ref().unwrap().ctl.row_fs(0),
             Some(FsKind::Fat)
         );
-        assert!(screen(&app).contains("FAT12 / FAT16 / FAT32"));
+        assert!(screen(&app).contains("FAT (12, 16 or 32 by size)"));
         for _ in 0..3 {
             key(&mut app, KeyCode::Char('n'));
         }

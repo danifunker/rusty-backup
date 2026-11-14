@@ -238,10 +238,11 @@ impl RowFormat {
 }
 
 /// The partition type a row formatted with `fs` should carry on a `kind` table, when the table
-/// has one for it. `size` picks FAT's type byte.
-pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64) -> Option<String> {
+/// has one for it. `size` picks FAT's type byte, unless `fat32` forces FAT32.
+pub fn suggested_type(kind: TableKind, fs: FsKind, size: u64, fat32: bool) -> Option<String> {
     use FsKind as F;
     let t = match (kind, fs) {
+        (TableKind::Mbr, F::Fat) if fat32 => "0C",
         (TableKind::Mbr, F::Fat) => {
             let fat = fs_pc::fat::compute_fat_blank_layout(size.max(64 * 1024)).ok()?;
             match fat.fat_type {
@@ -307,6 +308,8 @@ pub struct DiskBuilder {
     /// Alignment for partition starts; the same grammar as `--align`
     /// (`"1M"`, `"63s"`).
     pub align_text: String,
+    /// The user chose to type an alignment rather than pick a named one.
+    pub align_custom: bool,
     /// Only consulted for SGI, whose partitions are cylinder-aligned.
     pub geometry: Geometry,
     pub rows: Vec<BuilderRow>,
@@ -322,6 +325,7 @@ impl Default for DiskBuilder {
             disk_size: 0,
             // Blank means "the table's own default" — 1 MiB, or a cylinder on SGI.
             align_text: String::new(),
+            align_custom: false,
             geometry: Geometry::default(),
             rows: Vec::new(),
             errors: Vec::new(),

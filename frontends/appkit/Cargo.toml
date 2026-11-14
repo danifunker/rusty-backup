@@ -1,0 +1,30 @@
+# The AppKit shell (docs/native_frontends_plan.md Phase 3, docs/appkit_shell_plan.md).
+# Its own workspace root and lockfile, like frontends/win32: stable Rust, not the engine's 1.73 floor.
+[package]
+name = "rusty-backup-appkit"
+version = "0.1.0"
+description = "Rusty Backup, the AppKit front end: back up, restore and inspect vintage disk images"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+[[bin]]
+name = "rusty-backup-appkit"
+path = "src/main.rs"
+
+[dependencies]
+rusty-backup = { path = "../..", default-features = false, features = [
+    "chd", "optical", "native-zlib", "native-zstd", "seekable-zstd",
+    "remote", "tui-update", "crypto", "yaml", "audio",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+dispatch2 = "0.3"
+
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"

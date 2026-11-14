@@ -471,7 +471,7 @@ fn parse_apple_entries(data: &[u8], magic: u32) -> Option<AppleEntries> {
         match entry_id {
             1 => out.data_fork = Some(body.to_vec()),
             2 => out.rsrc = Some(body.to_vec()),
-            3 if !body.is_empty() => out.name = Some(crate::hfs::decode_mac_filename(body)),
+            3 if !body.is_empty() => out.name = Some(crate::mac_roman::decode_mac_filename(body)),
             9 if length >= 8 => {
                 let tc: [u8; 4] = body[0..4].try_into().ok()?;
                 let cc: [u8; 4] = body[4..8].try_into().ok()?;
@@ -645,7 +645,7 @@ pub fn parse_macbinary(data: &[u8]) -> Option<ImportedResourceFork> {
             None
         },
         name: {
-            let n = crate::hfs::decode_mac_filename(&data[2..2 + name_len]);
+            let n = crate::mac_roman::decode_mac_filename(&data[2..2 + name_len]);
             (!n.is_empty()).then_some(n)
         },
         // MacBinary II splits fdFlags: the high byte at 73, the low byte at 101.
@@ -702,8 +702,8 @@ pub fn mac_name_bytes(name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len());
     for ch in name.chars() {
         let mut one = [0u8; 4];
-        let bytes =
-            crate::hfs::utf8_to_mac_roman(ch.encode_utf8(&mut one)).unwrap_or_else(|_| vec![b'?']);
+        let bytes = crate::mac_roman::utf8_to_mac_roman(ch.encode_utf8(&mut one))
+            .unwrap_or_else(|_| vec![b'?']);
         if out.len() + bytes.len() > 63 {
             break;
         }

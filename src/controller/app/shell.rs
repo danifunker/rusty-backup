@@ -49,6 +49,19 @@ impl AppTab {
         }
     }
 
+    /// The screen's menu-bar shortcut (macOS View menu): its place in [`AppTab::ALL`].
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            AppTab::Backup => "Primary+1",
+            AppTab::Restore => "Primary+2",
+            AppTab::Build => "Primary+3",
+            AppTab::Inspect => "Primary+4",
+            AppTab::Convert => "Primary+5",
+            AppTab::Optical => "Primary+6",
+            AppTab::Archives => "Primary+7",
+        }
+    }
+
     /// The screen's toolbar icon, a file stem in `assets/icons/toolbar/` (D9).
     pub fn icon(self) -> &'static str {
         match self {
@@ -62,6 +75,27 @@ impl AppTab {
         }
     }
 }
+
+/// The menu bar's shortcuts by controller id, for a shell with a menu bar (docs/appkit_shell_plan.md).
+pub const MENU_SHORTCUTS: &[(&str, &str)] = &[
+    (super::ids::SETTINGS, "Primary+,"),
+    (super::ids::COMMANDER, "Primary+8"),
+    (crate::controller::inspect::ids::OPEN_FILE, "Primary+O"),
+    // `optical::ids::BROWSE_IMAGE`, spelled out: the optical module is not in every build.
+    ("optical.browse_image", "Primary+Alt+O"),
+    (
+        crate::controller::inspect::ids::OPEN_BACKUP,
+        "Primary+Shift+O",
+    ),
+    (
+        crate::controller::inspect::ids::CONNECT_REMOTE,
+        "Primary+Shift+K",
+    ),
+    (crate::controller::inspect::ids::CLOSE, "Primary+W"),
+    (crate::controller::inspect::ids::REINSPECT, "Primary+R"),
+    (crate::controller::inspect::ids::EXPORT, "Primary+E"),
+    (crate::controller::inspect::ids::ROW_BROWSE, "Primary+B"),
+];
 
 /// What the tabs a drop may go to are doing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -472,6 +506,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn menu_shortcuts_parse_and_never_repeat() {
+        use crate::controller::keys::Chord;
+        let mut seen = Vec::new();
+        let tabs = AppTab::ALL.iter().map(|t| ("tab", t.shortcut()));
+        for (id, chord) in MENU_SHORTCUTS.iter().copied().chain(tabs) {
+            let parsed = Chord::parse(chord).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(!seen.contains(&parsed), "{chord} is bound twice");
+            seen.push(parsed);
+        }
+        #[cfg(feature = "optical")]
+        assert!(MENU_SHORTCUTS
+            .iter()
+            .any(|(id, _)| *id == crate::controller::optical::ids::BROWSE_IMAGE));
+    }
 
     #[test]
     fn drops_follow_the_active_tab() {

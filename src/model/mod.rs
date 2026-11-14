@@ -63,6 +63,7 @@ pub mod wrapper_tree;
 #[cfg(feature = "remote")]
 pub mod remote_browser;
 pub mod repack_runner;
+pub mod resize_image;
 #[cfg(feature = "remote")]
 pub mod resize_remote;
 pub mod restore_plan;

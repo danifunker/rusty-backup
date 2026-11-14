@@ -22,7 +22,7 @@
 
 use anyhow::{bail, Context, Result};
 use byteorder::{BigEndian, ByteOrder};
-use fs_mac::hfs::decode_mac_filename;
+use fs_mac::mac_roman::decode_mac_filename;
 
 /// `kc\0\x01` at offset 0.
 pub const TOME_MAGIC: [u8; 4] = [0x6b, 0x63, 0x00, 0x01];

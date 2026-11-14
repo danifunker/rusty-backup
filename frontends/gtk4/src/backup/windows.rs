@@ -178,6 +178,7 @@ impl RemoteWindow {
     fn build(send: &ActionFn) -> (RemoteWindow, adw::Dialog) {
         let body = page();
         let form = group("");
+        form.set_description(Some(hints::REMOTE_DRIVE_INTRO));
         let address = adw::EntryRow::builder().title("Host").build();
         address.set_widget_name(ids::REMOTE_ADDRESS);
         address.set_tooltip_text(Some(hints::REMOTE_ADDRESS));

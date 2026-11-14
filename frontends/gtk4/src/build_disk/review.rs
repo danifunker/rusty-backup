@@ -7,7 +7,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use rusty_backup::controller::app::Snapshot;
-use rusty_backup::controller::build_disk::{ids, labels, BuildDiskAction, BuildDiskController, DiskKind};
+use rusty_backup::controller::build_disk::{
+    ids, labels, BuildDiskAction, BuildDiskController, DiskKind,
+};
 
 use super::ActionFn;
 use crate::form::{button, group, line, set_entry, set_line, Notes, Tone};

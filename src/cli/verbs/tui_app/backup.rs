@@ -1335,6 +1335,11 @@ impl App {
 
     fn draw_backup_remote(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
         let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::styled(
+            format!("  {}", crate::controller::backup::hints::REMOTE_DRIVE_INTRO),
+            self.palette.dim(),
+        ));
+        lines.push(Line::raw(""));
         let addr = b.ctl.remote_address().to_string();
         let host_focus = !b.remote_list;
         let field_style = if host_focus {
@@ -1402,7 +1407,9 @@ impl App {
         let popup = centered_rect(76.min(area.width), h, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block("Remote Drive", true)),
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .block(self.pane_block("Remote Drive", true)),
             popup,
         );
     }

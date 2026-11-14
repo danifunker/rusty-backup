@@ -95,8 +95,6 @@ pub mod ids {
     pub const EDIT_TABLE: &str = "inspect.edit_table";
     pub const ADD_PARTITION: &str = "inspect.add_partition";
     pub const EXPAND_IMAGE: &str = "inspect.expand_image";
-    pub const EXPAND_IMAGE_ADD: &str = "inspect.expand_image.add_mib";
-    pub const EXPAND_IMAGE_START: &str = "inspect.expand_image.start";
     pub const CHECK_REPAIR: &str = "inspect.check.repair";
     pub const CHECK_DEBUG: &str = "inspect.check.debug";
     pub const MAKE_BOOTABLE: &str = "inspect.make_bootable";
@@ -964,6 +962,30 @@ impl InspectController {
             }
         }
         segments
+    }
+
+    /// Partition `index` as the layout bar shows it: its number, label, filesystem and colour.
+    pub fn partition_place(
+        &mut self,
+        index: usize,
+    ) -> Option<crate::model::hfs_expand_runner::PartitionPlace> {
+        // The grid's numbering: the list position, the `@N` the CLI takes.
+        let parts = self.partitions();
+        let (of, pos) = (parts.len(), parts.iter().position(|p| p.index == index)?);
+        let seg = self
+            .layout()
+            .into_iter()
+            .find(|s| s.partition == Some(index))?;
+        let SegmentKind::Partition { color_index } = seg.kind else {
+            return None;
+        };
+        Some(crate::model::hfs_expand_runner::PartitionPlace {
+            number: pos + 1,
+            of,
+            label: seg.label,
+            kind: seg.fs,
+            color_index,
+        })
     }
 
     /// Unreadable sectors a flux image decoded as zeros.

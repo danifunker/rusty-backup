@@ -37,6 +37,20 @@ pub struct ExpandSource {
     pub file_count: u64,
     pub dir_count: u64,
     pub volume_name: String,
+    /// Which partition of its disk the volume is, when it came from a partitioned disk.
+    pub place: Option<PartitionPlace>,
+}
+
+/// Where a volume sits on its disk, so a dialog can name it as the disk view does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionPlace {
+    /// The partition's number in its table (1-based), and how many the table holds.
+    pub number: usize,
+    pub of: usize,
+    pub label: String,
+    pub kind: String,
+    /// The colour the disk's layout bar gives it.
+    pub color_index: usize,
 }
 
 /// Quickly summarise a source HFS volume.
@@ -60,6 +74,7 @@ pub fn summarize_source(
         file_count: summary.file_count as u64,
         dir_count: summary.folder_count as u64,
         volume_name: summary.volume_name,
+        place: None,
     })
 }
 

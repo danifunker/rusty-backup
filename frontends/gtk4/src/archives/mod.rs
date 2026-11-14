@@ -60,7 +60,7 @@ struct Shown {
     jobs: Vec<(Snapshot, bool)>,
     load_error: Option<(String, String)>,
     loaded: bool,
-    file_count: usize,
+    summary: String,
     selected: usize,
     format: ForkFormat,
     mountable: Option<MountableImageKind>,
@@ -321,7 +321,7 @@ impl ArchivesScreen {
                 .load_error()
                 .map(|e| (e.message.clone(), e.detail.clone())),
             loaded: ctrl.is_loaded(),
-            file_count: ctrl.file_count(),
+            summary: ctrl.summary(),
             selected: ctrl.selected_file_count(),
             format: ctrl.format(),
             mountable: ctrl.mountable(),
@@ -369,7 +369,7 @@ impl ArchivesScreen {
         );
 
         self.count.set_visible(s.loaded);
-        set_text(&self.count, &format!("{} files in archive", s.file_count));
+        set_text(&self.count, &s.summary);
         self.list.root().set_visible(s.loaded);
         self.controls.set_visible(s.loaded);
         let at = ForkFormat::ALL.iter().position(|f| *f == s.format);

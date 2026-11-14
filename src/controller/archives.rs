@@ -187,6 +187,24 @@ impl ArchivesController {
         self.loaded.as_ref().map_or(0, |l| l.file_count)
     }
 
+    /// "1 file, no folders" or "12 files in 3 folders", so a flat archive says it is flat.
+    pub fn summary(&self) -> String {
+        let files = self.file_count();
+        let folders = self.rows().iter().filter(|r| r.is_dir).count();
+        let noun = |n: usize, one: &str, many: &str| match n {
+            1 => format!("1 {one}"),
+            n => format!("{n} {many}"),
+        };
+        match folders {
+            0 => format!("{}, no folders", noun(files, "file", "files")),
+            n => format!(
+                "{} in {}",
+                noun(files, "file", "files"),
+                noun(n, "folder", "folders")
+            ),
+        }
+    }
+
     /// Whether entry `i` is ticked for Extract Selected.
     pub fn is_selected(&self, i: usize) -> bool {
         self.selected.get(i).copied().unwrap_or(true)
@@ -418,6 +436,14 @@ impl ArchivesController {
     }
 }
 
+/// A row's name as a list shows it: indented under its folder, a folder ending in `/`.
+pub fn row_label(r: &ArchiveEntryRow) -> String {
+    let depth = r.path.matches('/').count();
+    let name = r.path.rsplit('/').next().unwrap_or(&r.path);
+    let slash = if r.is_dir { "/" } else { "" };
+    format!("{}{name}{slash}", "    ".repeat(depth))
+}
+
 fn folder_picker(purpose: &'static str, title: &str) -> Vec<Effect> {
     vec![Effect::PickFolder(PickSpec {
         purpose,
@@ -534,6 +560,7 @@ mod tests {
         ));
         c.wait_idle();
         assert_eq!(c.file_count(), 2);
+        assert_eq!(c.summary(), "2 files, no folders");
         assert_eq!(c.rows()[0].type_code, "TEXT");
         assert!(c.mountable().is_none());
         c.apply(ArchivesAction::SetSelected(0, false));
@@ -566,5 +593,22 @@ mod tests {
         c.wait_idle();
         assert!(!c.is_loaded());
         assert!(!c.load_error().unwrap().message.is_empty());
+    }
+
+    #[test]
+    fn a_row_is_indented_under_its_folder() {
+        let row = |path: &str, is_dir| ArchiveEntryRow {
+            is_dir,
+            path: path.to_string(),
+            type_code: String::new(),
+            creator: String::new(),
+            size: 0,
+            method: "None",
+            data_len: None,
+            rsrc_len: None,
+        };
+        assert_eq!(row_label(&row("Docs", true)), "Docs/");
+        assert_eq!(row_label(&row("Docs/Read Me", false)), "    Read Me");
+        assert_eq!(row_label(&row("Top", false)), "Top");
     }
 }

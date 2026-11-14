@@ -1,0 +1,435 @@
+# Tier 9: the AppKit screenshot tour (FLOWS.md). Not a test of behaviour: each case walks screens
+# and dialogs with real content and shoots the app's own windows (`shot`), for
+# scripts/appkit-tour.sh to lay out side by side in light and dark. A shot named `a-b` is screen
+# `a`, state `b`; a second window open at the same time is saved as `a-b-2`.
+
+[meta]
+tier = 9
+group = "tour.appkit"
+description = "Shoot every AppKit screen and dialog for a visual review."
+
+[[case]]
+id = "tour.appkit.screens"
+description = "Every screen with nothing open, Commander, Settings and the remote windows"
+level = "smoke"
+area = ["shell"]
+shells = ["appkit"]
+capabilities = []
+timeout_ms = 180000
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { shot = "backup-empty" },
+  { tab = "Restore" },
+  { shot = "restore-empty" },
+  { tab = "Build Disk" },
+  { shot = "build-kind" },
+  { tab = "Inspect" },
+  { shot = "inspect-empty" },
+  { tab = "Convert" },
+  { shot = "convert-empty" },
+  { tab = "Optical" },
+  { shot = "optical-empty" },
+  { activate = "optical.source_drive" },
+  { shot = "optical-drive" },
+  { activate = "optical.add_remote" },
+  { wait = "Daemon address" },
+  { shot = "optical-add-remote" },
+  { activate = "optical.remote_cancel" },
+  { wait_gone = "Daemon address" },
+  { tab = "Archives" },
+  { shot = "archives-empty" },
+  { tab = "Backup" },
+  { activate = "backup.remote_open" },
+  { wait = "Remote Drive" },
+  { shot = "backup-remote-drive" },
+  { activate = "backup.remote_close" },
+  { activate = "app.settings" },
+  { wait = "Update Check" },
+  { shot = "settings" },
+  { activate = "settings.cancel" },
+  { wait_gone = "Update Check" },
+  { tab = "Inspect" },
+  { activate = "inspect.source.connect_remote" },
+  { wait = "Connect to remote" },
+  { shot = "inspect-connect-prompt" },
+  { activate = "prompt.cancel" },
+  { activate = "app.commander" },
+  { wait = "Commander" },
+  { shot = "commander-empty" },
+]
+
+[[case]]
+id = "tour.appkit.inspect"
+description = "Inspect on a built MBR image: the table, Check, the browse view in Edit Mode, and the image and table dialogs"
+level = "smoke"
+area = ["inspect"]
+shells = ["appkit"]
+capabilities = []
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "FAT (12, 16" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.open_inspect", timeout_ms = 240000 },
+]
+
+# Something to browse and preview: a folder and two text files.
+[[case.step]]
+args = ["mkdir", "{scratch}/mbr.img@1", "/DOCS"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/mbr.img@1", "{cases}/tier8/data/hello.txt", "/README.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/mbr.img@1", "{cases}/tier8/data/edited.txt", "/DOCS/NOTES.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Re-inspect" },
+  { shot = "inspect-loaded" },
+  { activate = "inspect.row.check" },
+  { wait = "Close", timeout_ms = 60000 },
+  { shot = "inspect-check" },
+  { activate = "inspect.check.close" },
+  # Expand Image opens the Resize Image wizard: 16 MiB more, left free, in place.
+  { activate = "inspect.expand_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "48M" },
+  { wait = "Grows by 16.0 MiB" },
+  { shot = "inspect-expand-image" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { wait = "Free space left at the end of the disk: 16.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { activate = "resize_image.in_place" },
+  { activate = "resize_image.next" },
+  { activate = "Resize in Place" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+  { activate = "resize_image.cancel" },
+  { wait = "48.0 MiB" },
+  { activate = "inspect.resize" },
+  { wait = "Partition Sizes:" },
+  { shot = "inspect-resize" },
+  { activate = "resize.close" },
+  { activate = "inspect.add_partition" },
+  { wait = "Will be added as partition" },
+  { shot = "inspect-table-editor" },
+  { activate = "partition_edit.cancel" },
+  { activate = "inspect.export" },
+  { wait = "Partition Sizes:" },
+  { shot = "inspect-export" },
+  { activate = "inspect.export.close" },
+  { activate = "inspect.row.browse" },
+  { wait = "README.TXT" },
+  { focus = "browse.list" },
+  { key = "Down" },
+  { wait = "Hello from" },
+  { shot = "browse-readonly" },
+  { key = "Space" },
+  { wait = "Export 1 Selected..." },
+  { shot = "browse-marked" },
+  { key = "Space" },
+  { activate = "browse.edit_mode" },
+  { wait = "Edit Mode ON" },
+  { shot = "browse-edit-mode" },
+]
+
+[[case]]
+id = "tour.appkit.hfs"
+description = "Expand HFS Volume on a Mac II's APM disk: the dialog names the partition and shows its space"
+level = "smoke"
+area = ["inspect"]
+shells = ["appkit"]
+capabilities = []
+fixture = "fs.hfs.populated-macii.hd"
+timeout_ms = 120000
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{fixture}" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Partition Table: APM" },
+  { activate = "inspect.row.expand_hfs" },
+  { wait = "Expand HFS Volume" },
+  { shot = "inspect-expand-hfs" },
+]
+
+[[case]]
+id = "tour.appkit.backup-restore"
+description = "Backup with an image loaded and its VHD window; Restore with a backup folder, Write Image File and the disk writer"
+level = "smoke"
+area = ["backup", "restore"]
+shells = ["appkit"]
+capabilities = []
+timeout_ms = 240000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+args = ["backup", "{scratch}/src.img", "{scratch}/bk", "--name", "job", "--format", "zstd"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Backup" },
+  { pick = "{scratch}/src.img" },
+  { activate = "backup.open_image" },
+  { wait = "FAT" },
+  { focus = "backup.destination" },
+  { fill = "{scratch}" },
+  { focus = "backup.name" },
+  { fill = "tour" },
+  { shot = "backup-loaded" },
+  { focus = "backup.format" },
+  { choose = "VHD" },
+  { activate = "backup.start" },
+  { wait = "VHD Backup Options" },
+  { shot = "backup-vhd" },
+  { activate = "backup.vhd_cancel" },
+  { tab = "Restore" },
+  { pick = "{scratch}/bk/job" },
+  { activate = "restore.backup_folder" },
+  { wait = "1 partition" },
+  { shot = "restore-loaded" },
+  { focus = "restore.target_kind" },
+  { choose = "Save as image file" },
+  { shot = "restore-to-image" },
+  { focus = "restore.mode" },
+  { choose = "Write Image File" },
+  { pick = "{scratch}/src.img" },
+  { activate = "restore.write_image" },
+  { wait = "Decoded size" },
+  { shot = "restore-write-image" },
+  { activate = "restore.write_target" },
+  { wait = "Physical Disk Export" },
+  { shot = "disk-writer" },
+]
+
+[[case]]
+id = "tour.appkit.build"
+description = "Build Disk: every step of an MBR disk, and a CD-ROM image's Disk step"
+level = "smoke"
+area = ["build-disk"]
+shells = ["appkit"]
+capabilities = []
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { shot = "build-output" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { shot = "build-disk" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "FAT (12, 16" },
+  { shot = "build-partitions" },
+  { activate = "build_disk.next" },
+  { shot = "build-options" },
+  { activate = "build_disk.next" },
+  { shot = "build-review" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.build_another", timeout_ms = 240000 },
+  { shot = "build-done" },
+  { activate = "build_disk.build_another" },
+  { focus = "build_disk.kind" },
+  { choose = "CD-ROM image" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/cd.iso" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { shot = "build-cd" },
+]
+
+[[case]]
+id = "tour.appkit.commander"
+description = "Commander with a host folder on the left, a zip open inside it, and an image on the right"
+level = "smoke"
+area = ["commander"]
+shells = ["appkit"]
+capabilities = []
+timeout_ms = 120000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/dst.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { activate = "app.commander" },
+  { pick = "{scratch}/dst.img" },
+  { activate = "commander.right.open_file" },
+  { wait = "(0 item(s))" },
+  { pick = "{cases}/tier8/data/zipdir" },
+  { activate = "commander.left.open_folder" },
+  { wait = "in.zip" },
+  { shot = "commander-folder" },
+  { focus = "in.zip" },
+  { key = "Enter" },
+  { wait = "HELLO.TXT" },
+  { focus = "HELLO.TXT" },
+  { activate = "commander.copy_ltr" },
+  { shot = "commander-staged" },
+]
+
+[[case]]
+id = "tour.appkit.optical"
+description = "Optical on the ISO fixture: the disc, its browser, Convert on it, and Archives on the StuffIt file it holds"
+level = "smoke"
+area = ["optical", "archives", "convert"]
+shells = ["appkit"]
+fixture = "optical.iso9660.joliet.cd"
+capabilities = []
+timeout_ms = 300000
+
+[[case.step]]
+args = ["optical", "extract", "{fixture}", "--to", "{scratch}/iso"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { pick = "{fixture}" },
+  { activate = "optical.browse_image" },
+  { wait = "ISO 9660", timeout_ms = 20000 },
+  { shot = "optical-disc" },
+  { activate = "optical.browse_contents" },
+  { wait = "CIV_II_GOLD_111_UPDATE.SIT" },
+  { focus = "browse.list" },
+  { key = "Home" },
+  { wait = "StuffIt (c)" },
+  { shot = "optical-browser" },
+  { tab = "Archives" },
+  { pick = "{scratch}/iso/CIV_II_GOLD_111_UPDATE.SIT" },
+  { activate = "archives.browse" },
+  { wait = "no folders", timeout_ms = 60000 },
+  { shot = "archives-loaded" },
+  { tab = "Convert" },
+  { pick = "{fixture}" },
+  { activate = "convert.source_file" },
+  { wait = "will be converted", timeout_ms = 60000 },
+  { focus = "convert.disc.format" },
+  { choose = "CD CHD" },
+  { shot = "convert-loaded" },
+]
+
+[[case]]
+id = "tour.appkit.audio"
+description = "The CD-DA player on the mixed-mode fixture, playing"
+level = "smoke"
+area = ["optical", "audio"]
+shells = ["appkit"]
+fixture = "optical.cdda.mixedmode.cd"
+capabilities = []
+timeout_ms = 120000
+
+[[case.step]]
+ui = [
+  { tab = "Optical" },
+  { pick = "{fixture}" },
+  { activate = "optical.browse_image" },
+  { wait = "Audio Tracks (1)", timeout_ms = 20000 },
+  { activate = "optical.audio.open" },
+  { activate = "optical.audio.play.2" },
+  { wait = "Playing track 2" },
+  { shot = "optical-player" },
+]
+
+[[case]]
+id = "tour.appkit.resize-image"
+description = "The Resize Image wizard on a two-partition FAT disk, page by page, then on the Mac II disk past HFS's block limit"
+level = "smoke"
+area = ["inspect"]
+shells = ["appkit"]
+capabilities = []
+fixture = "fs.hfs.populated-macii.hd"
+timeout_ms = 300000
+
+[[case.step]]
+args = ["new", "volume", "fat", "{scratch}/v.img", "--size", "16M"]
+expect_exit = 0
+
+[[case.step]]
+args = ["new", "hd", "mbr", "{scratch}/disk.img", "--size", "64M",
+        "--partition", "16M:0b", "--partition", "16M:0b",
+        "--fill", "1={scratch}/v.img", "--fill", "2={scratch}/v.img"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/disk.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Re-inspect" },
+  { activate = "inspect.expand_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "96M" },
+  { wait = "Grows by 32.0 MiB" },
+  { shot = "resize-image-size" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { shot = "resize-image-check" },
+  { activate = "resize_image.next" },
+  { wait = "Step 3 of 6" },
+  { focus = "resize_image.row_size.1" },
+  { fill = "40" },
+  { wait = "Free space left at the end of the disk: 39.0 MiB" },
+  { shot = "resize-image-partitions" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { shot = "resize-image-review" },
+  { activate = "resize_image.next" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+  { shot = "resize-image-done" },
+  { activate = "resize_image.cancel" },
+  { pick = "{fixture}" },
+  { activate = "inspect.source.open_file" },
+  { wait = "Partition Table: APM" },
+  { activate = "inspect.expand_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "40M" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { focus = "resize_image.row_mode.0" },
+  { choose = "Fill free space" },
+  { wait = "rebuilt with 4 KiB blocks" },
+  { shot = "resize-image-hfs-rebuild" },
+]

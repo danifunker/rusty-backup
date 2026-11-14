@@ -1,0 +1,108 @@
+# Tier 8: Inspect's image and table tools, end to end (FLOWS.md).
+
+[meta]
+tier = 8
+group = "flow.inspect.tools"
+description = "Inspect's image tools (Expand Image, Resize, the table editor, Export), then prove the result with rb-cli."
+
+[[case]]
+id = "flow.inspect.tools.expand-add"
+description = "Build a 32 MiB MBR image, grow it by 16 MiB with Expand Image, preview Resize Partitions (no change), then add a partition in the free space with the table editor and check its start with rb-cli"
+level = "full"
+area = ["inspect"]
+# The ids and labels are shared; the other shells can join once they are checked.
+shells = ["appkit"]
+capabilities = ["inspect.expand-image", "inspect.resize", "inspect.edit-table"]
+timeout_ms = 300000
+
+[[case.step]]
+ui = [
+  { tab = "Build Disk" },
+  { activate = "build_disk.next" },
+  { pick = "{scratch}/mbr.img" },
+  { activate = "build_disk.pick_image" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.size" },
+  { fill = "32M" },
+  { activate = "build_disk.next" },
+  { focus = "build_disk.row_content.0" },
+  { choose = "FAT (12, 16" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.next" },
+  { activate = "build_disk.create" },
+  { wait = "build_disk.open_inspect", timeout_ms = 240000 },
+  { activate = "build_disk.open_inspect" },
+  { wait = "Re-inspect" },
+  # Expand Image opens the Resize Image wizard: 16 MiB more, left free, in place.
+  { activate = "inspect.expand_image" },
+  { wait = "Step 1 of 6" },
+  { focus = "resize_image.disk_size" },
+  { fill = "48M" },
+  { wait = "Grows by 16.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Clean", timeout_ms = 60000 },
+  { activate = "resize_image.next" },
+  { wait = "Free space left at the end of the disk: 16.0 MiB" },
+  { activate = "resize_image.next" },
+  { wait = "Step 4 of 6", timeout_ms = 60000 },
+  { activate = "resize_image.in_place" },
+  { activate = "resize_image.next" },
+  { activate = "Resize in Place" },
+  { wait = "Done. The resized image", timeout_ms = 120000 },
+  { activate = "resize_image.cancel" },
+  { wait = "48.0 MiB" },
+  { activate = "inspect.resize" },
+  { wait = "Partition Sizes:" },
+  { activate = "resize.preview" },
+  { wait = "No size changes" },
+  { activate = "resize.close" },
+  { activate = "inspect.add_partition" },
+  { wait = "Will be added as partition" },
+  # By label: the 1 MiB gap ahead of the first partition comes first.
+  { activate = "16.0 MiB at LBA 65536" },
+  { activate = "partition_edit.add" },
+  { activate = "partition_edit.apply" },
+  # The controller's question; its button is labelled, not named by the purpose.
+  { activate = "Write Table" },
+  { wait = "Re-inspect" },
+]
+
+[[case.step]]
+args = ["inspect", "{scratch}/mbr.img"]
+expect_exit = 0
+stdout_contains = ["65536"]
+
+[[case]]
+id = "flow.inspect.tools.export-vhd"
+description = "Export a FAT floppy image from Inspect's Export Disk Image window as a whole-disk VHD, then read its file back with rb-cli"
+level = "smoke"
+area = ["inspect"]
+shells = ["appkit"]
+capabilities = ["inspect.export"]
+timeout_ms = 180000
+
+[[case.step]]
+args = ["new", "floppy", "fat", "--size", "1440K", "{scratch}/src.img"]
+expect_exit = 0
+
+[[case.step]]
+args = ["put", "{scratch}/src.img", "{cases}/tier8/data/hello.txt", "/HELLO.TXT"]
+expect_exit = 0
+
+[[case.step]]
+ui = [
+  { tab = "Inspect" },
+  { pick = "{scratch}/src.img" },
+  { activate = "inspect.source.open_file" },
+  { wait = "FAT" },
+  { activate = "inspect.export" },
+  { wait = "Partition Sizes:" },
+  { pick = "{scratch}/out.vhd" },
+  { activate = "inspect.export.start" },
+  { wait = "Export completed successfully", timeout_ms = 120000 },
+]
+
+[[case.step]]
+args = ["get", "{scratch}/out.vhd", "/HELLO.TXT", "{scratch}/back.txt"]
+expect_exit = 0
+files_identical = [["{cases}/tier8/data/hello.txt", "{scratch}/back.txt"]]

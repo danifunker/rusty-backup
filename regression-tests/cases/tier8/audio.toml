@@ -8,10 +8,10 @@ description = "Play a CD audio track from a disc image and watch it advance."
 
 [[case]]
 id = "flow.audio.cdda-play"
-description = "Open a mixed-mode BIN/CUE on the Optical screen, open the CD-DA player, play the audio track and see its position advance (into a null ALSA sink on GTK, the default device on Win32)"
+description = "Open a mixed-mode BIN/CUE on the Optical screen, open the CD-DA player, play the audio track and see its position advance (into a null ALSA sink on GTK, the default device on Win32 and macOS)"
 level = "smoke"
 area = ["optical", "audio"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 fixture = "optical.cdda.mixedmode.cd"
 capabilities = ["optical.cdda-play"]
 timeout_ms = 120000
@@ -24,9 +24,11 @@ ui = [
   { wait = "Audio Tracks (1)", timeout_ms = 20000 },
   { activate = "Audio Tracks (1)", only = "gtk" },
   { activate = "Play", only = "gtk" },
-  # Win32 opens the player from the screen's button and gives each track's Play its own id.
+  # Win32 and AppKit open the player from the screen's button and give each track's Play its own id.
   { activate = "optical.audio.open", only = "win32" },
   { activate = "optical.audio.play.2", only = "win32" },
+  { activate = "optical.audio.open", only = "appkit" },
+  { activate = "optical.audio.play.2", only = "appkit" },
   { wait = "Playing track 2" },
   # The position moves, so the track is really being decoded and timed.
   { wait = "3s / 211s", timeout_ms = 15000 },

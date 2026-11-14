@@ -1,6 +1,6 @@
 # Native front-ends plan
 
-Status: **Phase 4 (GTK4) shipped as a preview beside egui (merged 2026-11-08), and front-end flows (tier 8) drive the TUI and GTK from one flow file (2026-11-09). Next: Phase 5 (Win32, [win32_shell_plan.md](win32_shell_plan.md)) with Phase 2b's shared work, then Phase 3 (AppKit, [appkit_shell_plan.md](appkit_shell_plan.md)); D7. Resume on the Windows box: [RESUME-win32-shell.md](RESUME-win32-shell.md).** Phases 0 and 1 done (2026-11-01). Phase 2 done (2026-11-04) apart from the macOS / Windows GUI smoke, which the tier 8 flows now cover once those shells have drivers: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
+Status: **Phase 4 (GTK4) and Phase 5 (Win32) ship as previews beside egui (GTK4 merged 2026-11-08, Win32 2026-11-11); tier 8 flows drive the TUI, GTK and Win32 from one flow file. Phase 3 (AppKit, [appkit_shell_plan.md](appkit_shell_plan.md)) slice 0 is under way (2026-11-11). Phase 7 for Windows and Linux waits on the parity gaps the user is reviewing.** Phases 0 and 1 done (2026-11-01). Phase 2 done (2026-11-04) apart from the macOS / Windows GUI smoke, which the tier 8 flows now cover once those shells have drivers: every egui screen and dialog and the whole TUI run on `src/controller/` (slices 1-29), both shells are enforced at 0 engine references, the TUI has the GUI's feature set (except the CD-DA player and Build Disk, `build_disk_plan.md`), and the full fixture suite passed 461/461 at 4e0ee6a6. Progress and decisions: [phase2_commander_plan.md](phase2_commander_plan.md). Drafted 2026-10-29.
 
 This plan moves rusty-backup from one egui GUI to a native front-end on every platform. Every feature is written once in shared Rust, and each front-end only renders it.
 
@@ -243,7 +243,7 @@ TUI and GTK; `capabilities.md` lists every flow.
 
 Second, after Win32 (D7). Plan: [appkit_shell_plan.md](appkit_shell_plan.md). `frontends/appkit/` on `objc2-app-kit` 0.3,
 macOS 10.13+, a second `.app` beside egui until parity. Controller ids become `AXIdentifier`, so
-its flow driver (`drivers/ax_driver.py`, PyObjC over AX) finds controls by id. Slices follow the
+its flow driver (`drivers/ax_driver.swift`, Swift over AX) finds controls by id. Slices follow the
 GTK shell's; each is done when its tier 8 flows pass on `appkit`.
 
 **Exit:** every tier 8 flow passes on `appkit`, and its `capabilities.md` column has no
@@ -425,10 +425,10 @@ If the prototype fails, fall back to keeping the egui AppImage only for old dist
 
 1. Linux (§9): does gtk3-rs build on 1.73; the oldest distro to test the GTK3 AppImage on; the Flatpak images-only edition.
 7. ~~Phase 2b's drift questions~~: decided 2026-11-09 (D8): staged copy into a host folder; disc conversion in the Convert tab.
-8. AppKit: PyObjC or a Swift helper for the AX driver, and whether GitHub's macOS runners grant AX (its plan's Gate 0).
+8. ~~AppKit: PyObjC or a Swift helper; whether GitHub's macOS runners grant AX~~: Swift (2026-11-11); the runners grant it (2026-11-12).
 9. Win32: Dynamic Annotation for `AutomationId` or a numeric id table (its plan's Gate 0).
 2. macOS 10.7 bindings: which ObjC crate builds on 1.73, or ObjC shell + C ABI.
 3. C ABI over JSON versus an engine process over the extended daemon protocol, for PPC and Sol9 (§8).
 4. Whether the Buildroot appliance gains the `tui` feature or keeps `menu.rs`.
-5. Naming and distribution of the side-by-side native preview apps.
+5. Naming and distribution of the side-by-side native preview apps (AppKit: bundle id `io.github.danifunker.rusty-backup`, 2026-11-11).
 6. Whether `/fanout` becomes a project skill, or the CLAUDE.md section alone is enough.
