@@ -40,10 +40,10 @@ CFLAGS="-arch $ARCH -mmacosx-version-min=$MIN -fno-objc-arc -O2 -Wall -Werror -W
 APP="$OUT/Rusty Backup.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$OUT/obj"
-clang $CFLAGS -c "$HERE/host/main.m" -o "$OUT/obj/main.o"
+for m in main host; do clang $CFLAGS -c "$HERE/host/$m.m" -o "$OUT/obj/$m.o"; done
 # The frameworks the engine's device layer and std need (rustc --print native-static-libs).
 clang -arch $ARCH -mmacosx-version-min=$MIN -o "$APP/Contents/MacOS/Rusty Backup" \
-    "$OUT/obj/main.o" "$LIB" \
+    "$OUT/obj/main.o" "$OUT/obj/host.o" "$LIB" \
     -framework Cocoa -framework IOKit -framework DiskArbitration -framework CoreFoundation \
     -framework Security -liconv -Wl,-dead_strip
 

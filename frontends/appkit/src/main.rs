@@ -31,7 +31,10 @@ mod export;
 mod form;
 #[cfg(target_os = "macos")]
 mod inspect;
-mod layout;
+// Shared with the vintage Cocoa shell (docs/cocoa_vintage_shell_plan.md); `crate::layout` stays its path.
+#[path = "../../mac-screens/src/mod.rs"]
+mod screens;
+use screens::layout;
 #[cfg(target_os = "macos")]
 mod menu;
 #[cfg(target_os = "macos")]

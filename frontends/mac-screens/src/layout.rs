@@ -1,4 +1,4 @@
-//! Rows, columns and label-and-field pairs for the AppKit shell, ported from the Win32 shell's.
+//! Rows, columns and label-and-field pairs for the Mac shells, ported from the Win32 shell's.
 //!
 //! The shell places every view by hand in a flipped container (y grows down). A screen describes
 //! its controls once as a tree of [`Node`]s, and [`layout`] turns the tree into one rectangle per

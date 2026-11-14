@@ -1,6 +1,6 @@
 # The vintage Cocoa shell: Mac OS X 10.4 to 10.12
 
-**Status: Gate 0 under way (2026-11-14).** See § 7 for what the gates have shown so far. This is Phase 6's macOS
+**Status: Phase 1 under way (2026-11-14).** § 7 has what the gates showed, § 8 where Phase 1 stands. This is Phase 6's macOS
 item in [native_frontends_plan.md](native_frontends_plan.md), with §8's C ABI, for the Macs the
 AppKit shell ([appkit_shell_plan.md](appkit_shell_plan.md), 10.13 and later) cannot reach.
 
@@ -10,7 +10,7 @@ AppKit shell ([appkit_shell_plan.md](appkit_shell_plan.md), 10.13 and later) can
 |---|---|
 | V1 | Three Mac builds: the AppKit shell (10.13+), this shell on x86_64 (10.7 to 10.12), and this shell on PowerPC (10.4 and 10.5, G3 floor). |
 | V2 | Intel Macs that stop at 10.4 to 10.6 run the PowerPC build under Rosetta. No i386 slice, no mrustc Intel target: only a handful of Intel models top out below 10.7. |
-| V3 | 10.7 first. It builds on Rust 1.73 here in minutes and has a real test Mac. PowerPC follows once the shell works. (Rosetta 2 is not installed on the dev Mac since macOS 27.2; an arm64 build of the same code stands in for local runs, § 7.) |
+| V3 | 10.7 first. It builds on Rust 1.73 here in minutes and has a real test Mac. PowerPC follows once the shell works. (macOS 27 is the last release with full Rosetta 2; after it, an arm64 build of the same code stands in for local runs, § 7.) |
 | V4 | The floor is 10.4, not 10.3. 10.3 means Xcode 1.5, no Objective-C 2.0 runtime and a smaller AppKit, for little gain. |
 | V5 | The shell is Objective-C 1.0 with manual retain/release. objc2 creates classes through the Objective-C 2.0 runtime (10.5+) and mrustc cannot transpile it, so a Rust shell cannot reach PowerPC. One Objective-C code base serves both builds. |
 
@@ -99,8 +99,8 @@ Objective-C shell builds each screen itself). Less change to the AppKit shell, b
 
 ## 4. Testing
 
-- **Every day:** the arm64 build of the same code on this Mac (`build.sh release arm64`), driven by
-  the tier 8 flows; the x86_64 build under Rosetta 2 wherever it is installed.
+- **Every day:** the x86_64 10.7 build on this Mac under Rosetta 2, driven by the tier 8 flows.
+  Once Rosetta goes (macOS 28), the arm64 build of the same code (`build.sh release arm64`).
 - **Driver:** the Swift AX driver needs 10.9+, so it is ported to Objective-C. One driver then
   runs everywhere from 10.7 up, and could replace the Swift one. To check in Gate 0: whether 10.7
   reports `AXIdentifier` for an id set from code.
@@ -146,8 +146,8 @@ The AX probe is `regression-tests/drivers/ax_probe.m`, Objective-C 1.0 and built
 | Gate | Result |
 |---|---|
 | Rust 1.73 staticlib in a 10.7 Objective-C app | **Pass.** x86_64, `LC_VERSION_MIN_MACOSX` 10.7, no known post-10.7 symbols, 436 KB. It launches on the Lion Mac (10.7.5) through `open` with no dyld error. Its window still has to be seen there (below). |
-| Same app on this Mac | **Pass**, as the arm64 build: the window shows the version and summary from Rust. |
-| AX identifiers set from code | **Pass on this Mac:** `setIdentifier:` (10.7 API) is read back as `AXIdentifier` for all three labels. **10.7 not yet checked:** Accessibility is off on the Lion Mac. |
+| Same app on this Mac | **Pass**, both the x86_64 build under Rosetta 2 and the arm64 build: the window shows the version and summary from Rust. |
+| AX identifiers set from code | **Pass on this Mac** (x86_64 and arm64): `setIdentifier:` (10.7 API) is read back as `AXIdentifier` for all three labels. **10.7 not yet checked:** Accessibility is off on the Lion Mac. |
 | `hostc` transpiles a stub `mac-screens` | Not started. |
 
 Lion test-rig findings:
@@ -159,3 +159,21 @@ Lion test-rig findings:
   `admin` user, so the window id for `screencapture -l` has no route back yet.
 - `scp` fails against Lion's sshd; pipe through `ssh ... 'cat > file'` instead.
 - The Mac drops off the network for minutes at a time ("Host is down").
+
+## 8. Phase 1 progress
+
+- `frontends/mac-screens/src/` is shared source, not a crate. The two shells link different engine
+  packages under the one crate name `rusty_backup`, so each mounts it with
+  `#[path = ".../mac-screens/src/mod.rs"] mod screens;`: the AppKit shell from `main.rs`, the
+  vintage shell from `frontends-vintage/cocoa/rust/src/lib.rs`. The vintage build is its 1.73 check.
+- In it now: `layout.rs` (moved, history kept), `host.rs` (the `Host` trait: surfaces and controls
+  as integers, reports as `Ev::{Act, Edited, ValueSet}`), and `form.rs` (the `Form` every screen is
+  written on, generic over the host, with the order rules for accessibility-set values and picks).
+- AppKit implements `Host` in `frontends/appkit/src/form.rs` (objc2), plus its own `Form::new`,
+  `add`, `v` and `place_page`. No screen changed. All 68 tier 8 appkit flows pass on it.
+- The vintage shell implements `Host` over the C ABI: `rust/src/host.rs` (Rust, `extern "C"`) and
+  `host/host.m` (Objective-C 1.0, 10.4 APIs only, `NSInteger` shimmed for the 10.4 SDK). The Gate 0
+  window is now a `Form` screen. Under Rosetta, through `ax_probe`: an AX value set on the field
+  echoes into a label, a press on the check box re-tones it, Close quits.
+- Next: windows and the rest of the host surface into `Host` (window, present, close, area,
+  resize), then Inspect, the first real screen, into `mac-screens` (Phase 2).

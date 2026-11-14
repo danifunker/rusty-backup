@@ -3,6 +3,7 @@
 //
 //   ax_probe <pid>            -> one "role<TAB>identifier<TAB>value" line per element with an identifier
 //   ax_probe --window <pid>   -> the CGWindowID of the app's front window, for `screencapture -l`
+//   ax_probe <pid> press <id> | set <id> <value> | texts   -> act on a control, or list all text
 
 #import <Foundation/Foundation.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -20,6 +21,38 @@ static NSString *ax_str(AXUIElementRef e, CFStringRef name)
     NSString *s = [[(id)v description] retain];
     CFRelease(v);
     return [s autorelease];
+}
+
+// The first element in `e`'s tree whose AXIdentifier is `want`; the caller releases it.
+static AXUIElementRef find(AXUIElementRef e, NSString *want, int depth)
+{
+    if ([ax_str(e, CFSTR("AXIdentifier")) isEqualToString:want]) {
+        CFRetain(e);
+        return e;
+    }
+    if (depth > 60) return NULL;
+    CFTypeRef kids = ax_attr(e, kAXChildrenAttribute);
+    if (kids == NULL) return NULL;
+    AXUIElementRef hit = NULL;
+    CFIndex i, n = CFArrayGetCount((CFArrayRef)kids);
+    for (i = 0; i < n && hit == NULL; i++)
+        hit = find((AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)kids, i), want, depth + 1);
+    CFRelease(kids);
+    return hit;
+}
+
+// Every static text's value, in tree order.
+static void texts(AXUIElementRef e, int depth)
+{
+    if ([ax_str(e, kAXRoleAttribute) isEqualToString:(NSString *)kAXStaticTextRole])
+        printf("%s\n", [ax_str(e, kAXValueAttribute) UTF8String]);
+    if (depth > 60) return;
+    CFTypeRef kids = ax_attr(e, kAXChildrenAttribute);
+    if (kids == NULL) return;
+    CFIndex i, n = CFArrayGetCount((CFArrayRef)kids);
+    for (i = 0; i < n; i++)
+        texts((AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)kids, i), depth + 1);
+    CFRelease(kids);
 }
 
 static int walk(AXUIElementRef e, int depth)
@@ -65,8 +98,8 @@ int main(int argc, const char **argv)
         [pool release];
         return wid >= 0 ? 0 : 1;
     }
-    if (argc != 2) {
-        fprintf(stderr, "usage: ax_probe [--window] <pid>\n");
+    if (argc < 2) {
+        fprintf(stderr, "usage: ax_probe [--window] <pid> [press <id> | set <id> <value> | texts]\n");
         return 2;
     }
     if (!AXAPIEnabled() && !AXIsProcessTrusted()) {
@@ -74,6 +107,32 @@ int main(int argc, const char **argv)
         return 3;
     }
     AXUIElementRef app = AXUIElementCreateApplication((pid_t)atoi(argv[1]));
+    if (argc >= 3) {
+        NSString *op = [NSString stringWithUTF8String:argv[2]];
+        CFTypeRef wins = ax_attr(app, kAXWindowsAttribute);
+        AXUIElementRef win = (wins && CFArrayGetCount((CFArrayRef)wins) > 0)
+            ? (AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)wins, 0) : NULL;
+        int rc = 1;
+        if (win != NULL && [op isEqualToString:@"texts"]) {
+            texts(win, 0);
+            rc = 0;
+        } else if (win != NULL && argc >= 4) {
+            AXUIElementRef el = find(win, [NSString stringWithUTF8String:argv[3]], 0);
+            if (el == NULL) {
+                fprintf(stderr, "ax_probe: no element %s\n", argv[3]);
+            } else if ([op isEqualToString:@"press"]) {
+                rc = AXUIElementPerformAction(el, kAXPressAction) == kAXErrorSuccess ? 0 : 1;
+            } else if ([op isEqualToString:@"set"] && argc >= 5) {
+                NSString *v = [NSString stringWithUTF8String:argv[4]];
+                rc = AXUIElementSetAttributeValue(el, kAXValueAttribute, (CFTypeRef)v) == kAXErrorSuccess ? 0 : 1;
+            }
+            if (el != NULL) CFRelease(el);
+        }
+        if (wins) CFRelease(wins);
+        CFRelease(app);
+        [pool release];
+        return rc;
+    }
     CFTypeRef windows = ax_attr(app, kAXWindowsAttribute);
     int found = 0;
     if (windows != NULL) {

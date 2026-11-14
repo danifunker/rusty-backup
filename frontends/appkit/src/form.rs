@@ -1,8 +1,11 @@
-//! A screen's controls keyed by its own enum: built once, each tagged with its place, its actions
-//! and text changes handed to the screen as that key. The screens of slices 4 and on are written
-//! on it, so each is its controller's reading and its layout, not AppKit plumbing.
+//! The AppKit [`Host`] for the shared screens' [`Form`] (frontends/mac-screens): each control an
+//! objc2 view on a surface's body, its tag its control number, its action the surface's target.
+//!
+//! What stays here is AppKit's own: a field's cell that reports a value set through accessibility
+//! (typing reports through the delegate), and a guard so reading a field, which commits an edit in
+//! progress, reports nothing. `Form::new`, `add`, `v` and `place_page` are this shell's extras.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
@@ -11,14 +14,18 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
-    NSLineBreakMode, NSPopUpButton, NSProgressIndicator, NSSecureTextField, NSTextField,
-    NSTextFieldCell, NSView,
+    NSLineBreakMode, NSMenuItem, NSPopUpButton, NSSecureTextField, NSTextField, NSTextFieldCell,
+    NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use rusty_backup::controller::commander::Tone;
 
 use crate::layout::{self, Node};
+use crate::screens::host::{Ctl, Ev, Host, PullItem, Surface};
 use crate::ui::{self, ns, Callback, TextChange};
+
+/// A screen's controls on the AppKit host.
+pub type Form<K> = crate::screens::form::Form<K, AppKitHost>;
 
 /// A control's colour for a controller's tone.
 pub fn tone_color(t: Option<Tone>) -> Retained<NSColor> {
@@ -43,7 +50,7 @@ define_class!(
     impl FieldCell {
         #[unsafe(method(setObjectValue:))]
         fn set_object_value(&self, value: Option<&AnyObject>) {
-            // SAFETY: the cell's own setter; the screen hears of it after (its sync guard drops its own sets).
+            // SAFETY: the cell's own setter; the form hears of it after (its sync guard drops its own sets).
             unsafe {
                 let _: () = msg_send![super(self), setObjectValue: value];
             }
@@ -57,242 +64,245 @@ define_class!(
 
 thread_local! {
     /// A field's text is being read: the commit that reading makes reports nothing.
-    static READING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READING: Cell<bool> = const { Cell::new(false) };
+    static HOST: RefCell<Option<Rc<AppKitHost>>> = const { RefCell::new(None) };
 }
 
-type Fields<K> = Rc<RefCell<Vec<(K, Retained<NSTextField>, String)>>>;
-type Pops<K> = Rc<RefCell<Vec<(K, Retained<NSPopUpButton>, isize)>>>;
+/// Where a surface's controls report; set by `bind`, shared with its target and delegates.
+type Slot = Rc<RefCell<Option<Rc<dyn Fn(Ctl, Ev)>>>>;
 
-/// The next field whose text changed since it was last reported, now marked as reported.
-fn next_edit<K: Copy + PartialEq>(fields: &Fields<K>) -> Option<K> {
-    // No borrow while reading: reading a field being edited commits it, and its cell reports here.
-    let list: Vec<(K, Retained<NSTextField>)> = fields
-        .borrow()
-        .iter()
-        .map(|(k, f, _)| (*k, f.clone()))
-        .collect();
-    for (k, f) in list {
-        let was = READING.with(|r| r.replace(true));
-        let now = f.stringValue().to_string();
-        READING.with(|r| r.set(was));
-        let mut all = fields.borrow_mut();
-        if let Some(entry) = all.iter_mut().find(|(x, _, _)| *x == k) {
-            if now != entry.2 {
-                entry.2 = now;
-                return Some(k);
-            }
-        }
+fn fire(slot: &Slot, c: Ctl, ev: Ev) {
+    // The handler is taken out of the borrow first: it calls back into the host.
+    let on = slot.borrow().clone();
+    if let Some(on) = on {
+        on(c, ev);
     }
-    None
 }
 
-/// The next pop-up whose pick changed without its action (an accessibility pick), now marked.
-fn next_pick<K: Copy>(pops: &Pops<K>) -> Option<K> {
-    for (k, p, last) in pops.borrow_mut().iter_mut() {
-        let now = p.indexOfSelectedItem();
-        if now != *last {
-            *last = now;
-            return Some(*k);
-        }
-    }
-    None
-}
-
-pub struct Form<K: Copy + PartialEq + 'static> {
-    mtm: MainThreadMarker,
+struct Rec {
     body: Retained<NSView>,
-    views: RefCell<Vec<(K, Retained<NSView>)>>,
-    target: Retained<Callback>,
-    delegates: RefCell<Vec<Retained<TextChange>>>,
-    keys: Rc<RefCell<Vec<K>>>,
+    views: Vec<(Ctl, Retained<NSView>)>,
     /// Each radio group's layer over the body.
-    layers: RefCell<Vec<(usize, Retained<NSView>)>>,
-    /// Each field and the text last reported to the screen or set from the controller.
-    fields: Fields<K>,
-    pops: Pops<K>,
-    on: Rc<dyn Fn(K)>,
+    layers: Vec<(usize, Retained<NSView>)>,
+    target: Retained<Callback>,
+    delegates: Vec<(Ctl, Retained<TextChange>)>,
+    slot: Slot,
 }
 
-impl<K: Copy + PartialEq + 'static> Form<K> {
-    /// A form on `body`; `on` hears each control's key when it acts or its text changes.
-    pub fn new(mtm: MainThreadMarker, body: Retained<NSView>, on: Rc<dyn Fn(K)>) -> Form<K> {
-        let keys: Rc<RefCell<Vec<K>>> = Rc::default();
-        let fields: Fields<K> = Rc::default();
-        let pops: Pops<K> = Rc::default();
-        let (held, call, edited, picks) = (keys.clone(), on.clone(), fields.clone(), pops.clone());
+pub struct AppKitHost {
+    mtm: MainThreadMarker,
+    /// Each surface by its number; `None` once released (numbers are not reused).
+    surfaces: RefCell<Vec<Option<Rec>>>,
+}
+
+impl AppKitHost {
+    /// The app's one host.
+    pub fn get(mtm: MainThreadMarker) -> Rc<AppKitHost> {
+        HOST.with(|h| {
+            h.borrow_mut()
+                .get_or_insert_with(|| {
+                    Rc::new(AppKitHost {
+                        mtm,
+                        surfaces: RefCell::new(Vec::new()),
+                    })
+                })
+                .clone()
+        })
+    }
+
+    /// A new surface on `body`.
+    pub fn adopt(&self, body: Retained<NSView>) -> Surface {
+        let slot: Slot = Rc::new(RefCell::new(None));
+        let fired = slot.clone();
         let target = ui::callback(
-            mtm,
+            self.mtm,
             Box::new(move |sender: &AnyObject| {
                 let tag = sender
                     .downcast_ref::<NSControl>()
                     .map(|c| c.tag())
-                    .or_else(|| {
-                        sender
-                            .downcast_ref::<objc2_app_kit::NSMenuItem>()
-                            .map(|m| m.tag())
-                    });
-                let key = tag.and_then(|t| held.borrow().get(t as usize).copied());
-                if let Some(k) = key {
-                    // The sender's own pick or tick, which the refreshes below could reset.
-                    let pick = sender
-                        .downcast_ref::<NSPopUpButton>()
-                        .map(|p| p.indexOfSelectedItem());
-                    let tick = sender.downcast_ref::<NSButton>().map(|b| b.state());
-                    // The sender reports itself below; the others' unreported changes go first.
-                    if let Some(i) = pick {
-                        for (pk, _, last) in picks.borrow_mut().iter_mut() {
-                            if *pk == k {
-                                *last = i;
-                            }
-                        }
-                    }
-                    // A value or pick set through accessibility is reported before the action,
-                    // one at a time: each report refreshes the form, which must not undo the next.
-                    while let Some(f) = next_edit(&edited).or_else(|| next_pick(&picks)) {
-                        call(f);
-                    }
-                    if let (Some(p), Some(i)) = (sender.downcast_ref::<NSPopUpButton>(), pick) {
-                        p.selectItemAtIndex(i);
-                    } else if let (Some(b), Some(st)) = (sender.downcast_ref::<NSButton>(), tick) {
-                        b.setState(st);
-                    }
-                    call(k);
+                    .or_else(|| sender.downcast_ref::<NSMenuItem>().map(|m| m.tag()));
+                if let Some(t) = tag.filter(|t| *t >= 0) {
+                    fire(&fired, t as Ctl, Ev::Act);
                 }
             }),
         );
-        Form {
-            mtm,
+        let mut all = self.surfaces.borrow_mut();
+        all.push(Some(Rec {
             body,
-            views: RefCell::default(),
+            views: Vec::new(),
+            layers: Vec::new(),
             target,
-            delegates: RefCell::default(),
-            keys,
-            layers: RefCell::default(),
-            fields,
-            pops,
-            on,
-        }
+            delegates: Vec::new(),
+            slot,
+        }));
+        (all.len() - 1) as Surface
     }
 
-    fn tag_of(&self, k: K) -> isize {
-        let mut keys = self.keys.borrow_mut();
-        match keys.iter().position(|x| *x == k) {
-            Some(i) => i as isize,
-            None => {
-                keys.push(k);
-                keys.len() as isize - 1
-            }
-        }
+    fn with<R>(&self, s: Surface, f: impl FnOnce(&mut Rec) -> R) -> R {
+        let mut all = self.surfaces.borrow_mut();
+        let rec = all
+            .get_mut(s as usize)
+            .and_then(|r| r.as_mut())
+            .expect("a live surface");
+        f(rec)
     }
 
-    /// Add `view` as `k`; a control gets its tag and, unless it is a plain label, the action.
-    pub fn add(&self, k: K, view: &NSView) {
-        if let Some(c) = view.downcast_ref::<NSControl>() {
-            c.setTag(self.tag_of(k));
-            let label = c
+    pub fn body(&self, s: Surface) -> Retained<NSView> {
+        self.with(s, |r| r.body.clone())
+    }
+
+    /// The view of control `c`.
+    pub fn view(&self, s: Surface, c: Ctl) -> Retained<NSView> {
+        self.with(s, |r| {
+            r.views
+                .iter()
+                .find(|(x, _)| *x == c)
+                .map(|(_, v)| v.clone())
+                .expect("every control is built")
+        })
+    }
+
+    /// Put `view` on surface `s` as control `c`; a control gets its tag and, unless a label, the action.
+    pub fn adopt_view(&self, s: Surface, c: Ctl, view: &NSView) {
+        let (body, target) = self.with(s, |r| (r.body.clone(), r.target.clone()));
+        if let Some(ctl) = view.downcast_ref::<NSControl>() {
+            ctl.setTag(c as isize);
+            let label = ctl
                 .downcast_ref::<NSTextField>()
                 .is_some_and(|t| !t.isEditable());
             if !label {
-                ui::hook(c, &self.target);
+                ui::hook(ctl, &target);
             }
         }
-        self.body.addSubview(view);
-        self.views.borrow_mut().push((k, view.retain()));
+        body.addSubview(view);
+        self.with(s, |r| {
+            r.views.retain(|(x, _)| *x != c);
+            r.views.push((c, view.retain()));
+        });
     }
 
-    pub fn button(&self, k: K, title: &str, id: &str) -> Retained<NSButton> {
-        let b = ui::button(self.mtm, title, id);
-        self.add(k, &b);
-        b
+    fn button_of(&self, s: Surface, c: Ctl) -> Retained<NSButton> {
+        self.view(s, c).downcast::<NSButton>().expect("a button")
     }
 
-    pub fn check(&self, k: K, title: &str, id: &str) -> Retained<NSButton> {
-        let b = ui::checkbox(self.mtm, title, id);
-        self.add(k, &b);
-        b
+    fn popup_of(&self, s: Surface, c: Ctl) -> Retained<NSPopUpButton> {
+        self.view(s, c)
+            .downcast::<NSPopUpButton>()
+            .expect("a pop-up")
     }
 
-    /// A radio button; AppKit groups the ones sharing an action, and the screen sets each state.
-    /// A radio button in group `group`: only radios of one group exclude each other.
-    pub fn radio(&self, k: K, group: usize, title: &str, id: &str) -> Retained<NSButton> {
-        // SAFETY: no target yet; it is pointed at the form's own below.
+    fn text_of(&self, s: Surface, c: Ctl) -> Retained<NSTextField> {
+        self.view(s, c)
+            .downcast::<NSTextField>()
+            .expect("a text field")
+    }
+}
+
+impl Host for AppKitHost {
+    fn bind(&self, s: Surface, on: Rc<dyn Fn(Ctl, Ev)>) {
+        let slot = self.with(s, |r| r.slot.clone());
+        *slot.borrow_mut() = Some(on);
+    }
+
+    fn release(&self, s: Surface) {
+        let gone = self
+            .surfaces
+            .borrow_mut()
+            .get_mut(s as usize)
+            .and_then(|r| r.take());
+        // Dropped outside the borrow: a view's teardown can reach the host.
+        if let Some(rec) = gone {
+            *rec.slot.borrow_mut() = None;
+            drop(rec);
+        }
+    }
+
+    fn button(&self, s: Surface, c: Ctl, title: &str, id: &str) {
+        self.adopt_view(s, c, &ui::button(self.mtm, title, id));
+    }
+
+    fn check(&self, s: Surface, c: Ctl, title: &str, id: &str) {
+        self.adopt_view(s, c, &ui::checkbox(self.mtm, title, id));
+    }
+
+    fn radio(&self, s: Surface, c: Ctl, group: usize, title: &str, id: &str) {
+        // SAFETY: no target yet; it is pointed at the surface's own below.
         let b = unsafe {
             NSButton::radioButtonWithTitle_target_action(&ns(title), None, None, self.mtm)
         };
         if !id.is_empty() {
             ui::set_id(&b, id);
         }
-        b.setTag(self.tag_of(k));
-        ui::hook(&b, &self.target);
-        let layer = {
-            let mut layers = self.layers.borrow_mut();
-            match layers.iter().find(|(g, _)| *g == group) {
-                Some((_, l)) => l.clone(),
-                None => {
-                    let l = ui::radio_layer(self.mtm, &self.body);
-                    layers.push((group, l.clone()));
-                    l
-                }
+        b.setTag(c as isize);
+        let (body, target, layer) = self.with(s, |r| {
+            (
+                r.body.clone(),
+                r.target.clone(),
+                r.layers
+                    .iter()
+                    .find(|(g, _)| *g == group)
+                    .map(|(_, l)| l.clone()),
+            )
+        });
+        ui::hook(&b, &target);
+        let layer = match layer {
+            Some(l) => l,
+            None => {
+                let l = ui::radio_layer(self.mtm, &body);
+                self.with(s, |r| r.layers.push((group, l.clone())));
+                l
             }
         };
         layer.addSubview(&b);
-        self.views
-            .borrow_mut()
-            .push((k, b.retain().into_super().into_super()));
-        b
+        self.with(s, |r| {
+            r.views.push((c, b.retain().into_super().into_super()))
+        });
     }
 
-    pub fn label(&self, k: K, text: &str) -> Retained<NSTextField> {
-        let l = ui::label(self.mtm, text);
-        self.add(k, &l);
-        l
+    fn label(&self, s: Surface, c: Ctl, text: &str) {
+        self.adopt_view(s, c, &ui::label(self.mtm, text));
     }
 
-    /// A label that wraps onto as many lines as its frame gives it.
-    pub fn wrap(&self, k: K, text: &str) -> Retained<NSTextField> {
-        let l = NSTextField::wrappingLabelWithString(&ns(&ui::plain(text)), self.mtm);
+    fn wrap(&self, s: Surface, c: Ctl, text: &str) {
+        let l = NSTextField::wrappingLabelWithString(&ns(text), self.mtm);
         l.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
-        self.add(k, &l);
-        l
+        self.adopt_view(s, c, &l);
     }
 
-    pub fn popup(&self, k: K, items: &[String], id: &str) -> Retained<NSPopUpButton> {
+    fn popup(&self, s: Surface, c: Ctl, items: &[String], id: &str) {
         let p = NSPopUpButton::initWithFrame_pullsDown(self.mtm.alloc(), NSRect::ZERO, false);
         for i in items {
-            p.addItemWithTitle(&ns(&ui::plain(i)));
+            p.addItemWithTitle(&ns(i));
         }
         if !id.is_empty() {
             ui::set_id(&p, id);
         }
-        self.add(k, &p);
-        self.pops
-            .borrow_mut()
-            .push((k, p.clone(), p.indexOfSelectedItem()));
-        p
+        self.adopt_view(s, c, &p);
     }
 
-    /// A pull-down whose first item is its title and whose items each act as `item_key(i)`.
-    pub fn pulldown(&self, k: K, id: &str) -> Retained<NSPopUpButton> {
+    fn pulldown(&self, s: Surface, c: Ctl, id: &str) {
         let p = NSPopUpButton::initWithFrame_pullsDown(self.mtm.alloc(), NSRect::ZERO, true);
         ui::set_id(&p, id);
-        self.add(k, &p);
-        p
+        self.adopt_view(s, c, &p);
     }
 
-    /// Fill pull-down `k`: its title, then `(label, key, on)` items; a `None` key is a caption.
-    pub fn set_pulldown(&self, k: K, title: &str, items: &[(String, Option<K>, bool)]) {
-        let p = self.popup_of(k);
+    fn set_pulldown(&self, s: Surface, c: Ctl, title: &str, items: &[PullItem]) {
+        let p = self.popup_of(s, c);
+        let target = self.with(s, |r| r.target.clone());
         p.removeAllItems();
-        p.addItemWithTitle(&ns(&ui::plain(title)));
+        p.addItemWithTitle(&ns(title));
         for (label, key, on) in items {
-            p.addItemWithTitle(&ns(&ui::plain(label)));
-            let Some(item) = p.lastItem() else { continue };
+            p.addItemWithTitle(&ns(label));
+            let item = match p.lastItem() {
+                Some(item) => item,
+                None => continue,
+            };
             match key {
                 Some(key) => {
-                    item.setTag(self.tag_of(*key));
-                    // SAFETY: the target is the form's, kept as long as its controls.
+                    item.setTag(*key as isize);
+                    // SAFETY: the target is the surface's, kept as long as its controls.
                     unsafe {
-                        item.setTarget(Some(&self.target));
+                        item.setTarget(Some(&target));
                         item.setAction(Some(objc2::sel!(fire:)));
                     }
                 }
@@ -304,21 +314,15 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         }
     }
 
-    /// An editable field; every change reaches the screen as `k`.
-    pub fn field(&self, k: K, id: &str, caption: &str, secret: bool) -> Retained<NSTextField> {
+    fn field(&self, s: Surface, c: Ctl, id: &str, caption: &str, secret: bool) {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 22.0));
+        let slot = self.with(s, |r| r.slot.clone());
         let f: Retained<NSTextField> = if secret {
             Retained::into_super(NSSecureTextField::initWithFrame(self.mtm.alloc(), frame))
         } else {
             let f = NSTextField::initWithFrame(self.mtm.alloc(), frame);
-            let edited = self.fields.clone();
-            let on = self.on.clone();
-            let report: Rc<dyn Fn()> = Rc::new(move || {
-                // Only a change the screen has not heard yet: typing reports through the delegate.
-                if next_edit(&edited).is_some() {
-                    on(k);
-                }
-            });
+            let set = slot.clone();
+            let report: Rc<dyn Fn()> = Rc::new(move || fire(&set, c, Ev::ValueSet));
             let this = self.mtm.alloc::<FieldCell>().set_ivars(RefCell::new(None));
             // SAFETY: NSTextFieldCell's text initialiser.
             let cell: Retained<FieldCell> =
@@ -334,93 +338,57 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
             ui::set_id(&f, id);
         }
         f.setAccessibilityLabel(Some(&ns(caption)));
-        let on = self.on.clone();
-        let edited = self.fields.clone();
-        let d = ui::on_change(
-            self.mtm,
-            Box::new(move || {
-                while next_edit(&edited).is_some() {}
-                on(k);
-            }),
-        );
-        // SAFETY: the delegate is kept by the form as long as the field.
+        let d = ui::on_change(self.mtm, Box::new(move || fire(&slot, c, Ev::Edited)));
+        // SAFETY: the delegate is kept by the surface as long as the field.
         unsafe { f.setDelegate(Some(ProtocolObject::from_ref(&*d))) };
-        self.delegates.borrow_mut().push(d);
-        f.setTag(self.tag_of(k));
-        self.fields.borrow_mut().push((k, f.clone(), String::new()));
-        self.body.addSubview(&f);
-        self.views
-            .borrow_mut()
-            .push((k, Retained::into_super(Retained::into_super(f.clone()))));
-        f
-    }
-
-    pub fn progress(&self, k: K) -> Retained<NSProgressIndicator> {
-        let p = ui::progress(self.mtm);
-        self.add(k, &p);
-        p
-    }
-
-    /// Drop every view whose key `gone` names (rows built again for a new source).
-    pub fn remove(&self, gone: impl Fn(&K) -> bool) {
-        self.fields.borrow_mut().retain(|(k, _, _)| !gone(k));
-        self.pops.borrow_mut().retain(|(k, _, _)| !gone(k));
-        self.views.borrow_mut().retain(|(k, v)| {
-            let drop = gone(k);
-            if drop {
-                v.removeFromSuperview();
-            }
-            !drop
+        f.setTag(c as isize);
+        let body = self.body(s);
+        body.addSubview(&f);
+        self.with(s, |r| {
+            r.delegates.push((c, d));
+            r.views.retain(|(x, _)| *x != c);
+            r.views
+                .push((c, Retained::into_super(Retained::into_super(f.clone()))));
         });
     }
 
-    pub fn has(&self, k: K) -> bool {
-        self.views.borrow().iter().any(|(x, _)| *x == k)
+    fn progress(&self, s: Surface, c: Ctl) {
+        self.adopt_view(s, c, &ui::progress(self.mtm));
     }
 
-    pub fn v(&self, k: K) -> Retained<NSView> {
-        self.views
-            .borrow()
-            .iter()
-            .find(|(x, _)| *x == k)
-            .map(|(_, v)| v.clone())
-            .expect("every control is built")
+    fn remove(&self, s: Surface, c: Ctl) {
+        let gone = self.with(s, |r| {
+            r.delegates.retain(|(x, _)| *x != c);
+            let at = r.views.iter().position(|(x, _)| *x == c);
+            at.map(|i| r.views.remove(i).1)
+        });
+        if let Some(v) = gone {
+            v.removeFromSuperview();
+        }
     }
 
-    fn popup_of(&self, k: K) -> Retained<NSPopUpButton> {
-        self.v(k).downcast::<NSPopUpButton>().expect("a pop-up")
+    fn shown(&self, s: Surface, c: Ctl) -> bool {
+        ui::shown(&self.view(s, c))
     }
 
-    fn button_of(&self, k: K) -> Retained<NSButton> {
-        self.v(k).downcast::<NSButton>().expect("a button")
+    fn show(&self, s: Surface, c: Ctl, on: bool) {
+        ui::set_visible(&self.view(s, c), on);
     }
 
-    fn text_of(&self, k: K) -> Retained<NSTextField> {
-        self.v(k).downcast::<NSTextField>().expect("a text field")
-    }
-
-    pub fn shown(&self, k: K) -> bool {
-        self.has(k) && ui::shown(&self.v(k))
-    }
-
-    pub fn show(&self, k: K, on: bool) {
-        ui::set_visible(&self.v(k), on);
-    }
-
-    pub fn enable(&self, k: K, on: bool) {
-        if let Some(c) = self.v(k).downcast_ref::<NSControl>() {
-            if c.isEnabled() != on {
-                c.setEnabled(on);
+    fn enable(&self, s: Surface, c: Ctl, on: bool) {
+        if let Some(ctl) = self.view(s, c).downcast_ref::<NSControl>() {
+            if ctl.isEnabled() != on {
+                ctl.setEnabled(on);
             }
         }
     }
 
-    pub fn checked(&self, k: K) -> bool {
-        self.button_of(k).state() == NSControlStateValueOn
+    fn checked(&self, s: Surface, c: Ctl) -> bool {
+        self.button_of(s, c).state() == NSControlStateValueOn
     }
 
-    pub fn set_check(&self, k: K, on: bool) {
-        let b = self.button_of(k);
+    fn set_check(&self, s: Surface, c: Ctl, on: bool) {
+        let b = self.button_of(s, c);
         let want = if on {
             NSControlStateValueOn
         } else {
@@ -431,113 +399,84 @@ impl<K: Copy + PartialEq + 'static> Form<K> {
         }
     }
 
-    pub fn set_title(&self, k: K, t: &str) {
-        let b = self.button_of(k);
-        if b.title().to_string() != t {
-            b.setTitle(&ns(t));
+    fn set_title(&self, s: Surface, c: Ctl, title: &str) {
+        let b = self.button_of(s, c);
+        if b.title().to_string() != title {
+            b.setTitle(&ns(title));
         }
     }
 
-    /// A label's text, or a field's: a field keeps text the screen has not heard yet.
-    pub fn set_text(&self, k: K, t: &str) {
-        let f = self.text_of(k);
-        if !f.isEditable() {
-            ui::set_text(&f, t);
-            return;
-        }
-        if self.typing(k) {
-            return;
-        }
-        {
-            let mut fields = self.fields.borrow_mut();
-            let Some(entry) = fields.iter_mut().find(|(x, _, _)| *x == k) else {
-                return;
-            };
-            let now = f.stringValue().to_string();
-            if now != entry.2 && now != t {
-                return;
-            }
-            entry.2 = ui::plain(t);
-        }
-        // The borrow ends first: the cell reports the set, and its report reads the fields.
-        ui::set_text(&f, t);
+    fn set_text(&self, s: Surface, c: Ctl, text: &str) {
+        ui::set_text(&self.text_of(s, c), text);
     }
 
-    /// Set a line's text and tone; hidden when there is none.
-    pub fn line(&self, k: K, text: Option<&str>, tone: Option<Tone>) {
-        self.set_text(k, text.unwrap_or(""));
-        self.show(k, text.is_some());
-        self.set_tone(k, tone);
+    fn set_tone(&self, s: Surface, c: Ctl, tone: Option<Tone>) {
+        self.text_of(s, c).setTextColor(Some(&tone_color(tone)));
     }
 
-    pub fn set_tone(&self, k: K, tone: Option<Tone>) {
-        self.text_of(k).setTextColor(Some(&tone_color(tone)));
+    fn text(&self, s: Surface, c: Ctl) -> String {
+        let f = self.text_of(s, c);
+        let was = READING.with(|r| r.replace(true));
+        let now = f.stringValue().to_string();
+        READING.with(|r| r.set(was));
+        now
     }
 
-    pub fn text(&self, k: K) -> String {
-        self.text_of(k).stringValue().to_string()
+    fn typing(&self, s: Surface, c: Ctl) -> bool {
+        self.text_of(s, c).currentEditor().is_some()
     }
 
-    /// The field has the keyboard: what is typed there wins over the controller's copy.
-    pub fn typing(&self, k: K) -> bool {
-        self.text_of(k).currentEditor().is_some()
+    fn picked(&self, s: Surface, c: Ctl) -> Option<usize> {
+        usize::try_from(self.popup_of(s, c).indexOfSelectedItem()).ok()
     }
 
-    pub fn picked(&self, k: K) -> Option<usize> {
-        usize::try_from(self.popup_of(k).indexOfSelectedItem()).ok()
+    fn select(&self, s: Surface, c: Ctl, i: usize) {
+        self.popup_of(s, c).selectItemAtIndex(i as isize);
     }
 
-    pub fn select(&self, k: K, i: usize) {
-        let p = self.popup_of(k);
-        if p.indexOfSelectedItem() != i as isize {
-            p.selectItemAtIndex(i as isize);
-        }
-        self.mark_pick(k);
+    fn items(&self, s: Surface, c: Ctl) -> Vec<String> {
+        let p = self.popup_of(s, c);
+        let titles = p.itemTitles();
+        titles.iter().map(|t| t.to_string()).collect()
     }
 
-    /// The pop-up's pick now is the screen's own, not one to report.
-    fn mark_pick(&self, k: K) {
-        for (pk, p, last) in self.pops.borrow_mut().iter_mut() {
-            if *pk == k {
-                *last = p.indexOfSelectedItem();
-            }
+    fn set_items(&self, s: Surface, c: Ctl, items: &[String]) {
+        let p = self.popup_of(s, c);
+        p.removeAllItems();
+        for i in items {
+            p.addItemWithTitle(&ns(i));
         }
     }
 
-    /// Replace a pop-up's items, only when they changed.
-    pub fn set_items(&self, k: K, items: &[String]) {
-        let p = self.popup_of(k);
-        let now: Vec<String> = p.itemTitles().iter().map(|t| t.to_string()).collect();
-        let want: Vec<String> = items.iter().map(|i| ui::plain(i)).collect();
-        if now != want {
-            p.removeAllItems();
-            for i in &want {
-                p.addItemWithTitle(&ns(i));
-            }
-        }
-        self.mark_pick(k);
+    fn move_to(&self, s: Surface, c: Ctl, r: layout::Rect) {
+        ui::move_to(&self.view(s, c), r);
+    }
+}
+
+impl<K: Copy + PartialEq + 'static> crate::screens::form::Form<K, AppKitHost> {
+    /// A form on `body`; `on` hears each control's key when it acts or its text changes.
+    pub fn new(mtm: MainThreadMarker, body: Retained<NSView>, on: Rc<dyn Fn(K)>) -> Form<K> {
+        let host = AppKitHost::get(mtm);
+        let s = host.adopt(body);
+        Self::with_host(host, s, on)
     }
 
-    /// Lay `tree` out in `area` and move each view to its place.
-    pub fn place(&self, tree: &Node<K>, area: layout::Rect) {
-        for (k, r) in layout::layout(tree, area, 96) {
-            ui::move_to(&self.v(k), r);
-        }
+    /// Add a view the screen built (a list, a bar) as `k`.
+    pub fn add(&self, k: K, view: &NSView) {
+        let c = self.custom(k);
+        self.host().adopt_view(self.surface(), c, view);
     }
 
-    /// Prune `tree` of hidden views, then place it in `area`.
-    pub fn place_shown(&self, tree: Node<K>, area: layout::Rect) {
-        let keep = |k: &K| self.shown(*k);
-        if let Some(tree) = tree.prune(&keep) {
-            self.place(&tree, area);
-        }
+    pub fn v(&self, k: K) -> Retained<NSView> {
+        self.host().view(self.surface(), self.ctl(k))
     }
 
     /// Prune `tree` of hidden views and lay it out in the page the form is on, which scrolls.
     pub fn place_page(&self, tree: Node<K>) {
         let keep = |k: &K| self.shown(*k);
         if let Some(tree) = tree.prune(&keep) {
-            crate::app::place_page(&self.body, &tree, &|k, r| ui::move_to(&self.v(k), r));
+            let body = self.host().body(self.surface());
+            crate::app::place_page(&body, &tree, &|k, r| ui::move_to(&self.v(k), r));
         }
     }
 }

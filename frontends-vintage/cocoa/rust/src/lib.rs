@@ -1,29 +1,32 @@
-//! The C ABI the Objective-C host calls (docs/cocoa_vintage_shell_plan.md § 2).
+//! The vintage Cocoa shell's Rust half (docs/cocoa_vintage_shell_plan.md § 2): the shared Mac
+//! screens over [`host::VintageHost`], and the C ABI the Objective-C host calls into.
 //!
-//! Strings Rust hands out are NUL-terminated UTF-8 owned by Rust; `'static` ones need no free.
+//! The host calls [`rb_start`] once the app has launched, then [`host::rb_event`] for every report.
+
+// The same source the AppKit shell mounts; see its mod.rs for why it is not a crate.
+#[path = "../../../../frontends/mac-screens/src/mod.rs"]
+mod screens;
+
+mod gate;
+mod host;
 
 use std::os::raw::c_char;
 
-use rusty_backup::controller::app::{about, app_version};
-
-/// Leaked once per process: a `'static` C string built from a `'static` Rust one.
-fn c_static(s: &'static str) -> *const c_char {
-    let mut v = Vec::with_capacity(s.len() + 1);
-    v.extend_from_slice(s.as_bytes());
-    v.push(0);
-    Box::leak(v.into_boxed_slice()).as_ptr() as *const c_char
-}
+use rusty_backup::controller::app::app_version;
 
 /// This build's version, e.g. `0.1.0-dev`. Valid for the life of the process.
 #[no_mangle]
 pub extern "C" fn rb_version() -> *const c_char {
     static ONCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| c_static(app_version()) as usize) as *const c_char
+    *ONCE.get_or_init(|| {
+        let mut v = app_version().as_bytes().to_vec();
+        v.push(0);
+        Box::leak(v.into_boxed_slice()).as_ptr() as usize
+    }) as *const c_char
 }
 
-/// The one-line summary the About box shows. Valid for the life of the process.
+/// The app has launched: open the first window.
 #[no_mangle]
-pub extern "C" fn rb_summary() -> *const c_char {
-    static ONCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| c_static(about::SUMMARY) as usize) as *const c_char
+pub extern "C" fn rb_start() {
+    gate::open();
 }
