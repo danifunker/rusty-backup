@@ -156,18 +156,21 @@ fn dropped_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A drop view that hands `f` the dropped paths and the point, in window coordinates.
-pub fn drop_view(
-    mtm: MainThreadMarker,
-    f: Rc<dyn Fn(Vec<PathBuf>, NSPoint)>,
-) -> Retained<DropView> {
-    let this = mtm.alloc::<DropView>().set_ivars(RefCell::new(Some(f)));
+/// A window's content: flipped, taking file drops once `accept_drops` gives it a handler.
+pub fn drop_view(mtm: MainThreadMarker) -> Retained<DropView> {
+    let this = mtm.alloc::<DropView>().set_ivars(RefCell::new(None));
     // SAFETY: NSView's designated initialiser.
-    let v: Retained<DropView> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
-    // SAFETY: the system's own pasteboard type constant.
-    let kind = unsafe { NSPasteboardTypeFileURL };
-    v.registerForDraggedTypes(&NSArray::from_slice(&[kind]));
-    v
+    unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] }
+}
+
+impl DropView {
+    /// Hand `f` the dropped paths and the point, in window coordinates.
+    pub fn accept_drops(&self, f: Rc<dyn Fn(Vec<PathBuf>, NSPoint)>) {
+        *self.ivars().borrow_mut() = Some(f);
+        // SAFETY: the system's own pasteboard type constant.
+        let kind = unsafe { NSPasteboardTypeFileURL };
+        self.registerForDraggedTypes(&NSArray::from_slice(&[kind]));
+    }
 }
 
 define_class!(
@@ -305,8 +308,10 @@ pub fn window(
     h: f64,
     on_close: Box<dyn Fn()>,
 ) -> (Retained<NSWindow>, Retained<CloseDelegate>) {
-    let style =
-        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
     // SAFETY: the designated initialiser; the caller keeps the window.
     let window = unsafe {
@@ -321,7 +326,7 @@ pub fn window(
     // SAFETY: the caller owns the window, so AppKit must not release it on close.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&ns(title));
-    window.setContentView(Some(&flipped(mtm)));
+    window.setContentView(Some(&drop_view(mtm)));
     let delegate: Retained<CloseDelegate> = {
         let this = mtm
             .alloc::<CloseDelegate>()

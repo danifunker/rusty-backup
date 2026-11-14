@@ -14,6 +14,8 @@ extern void rb_later(void);
 extern void rb_tick(void);
 extern void rb_timed(void);
 extern void rb_canvas_draw(uint32_t s, uint32_t c, double w, double h, int dark);
+extern void rb_dropped(uint32_t s, const char *paths, double x, double y);
+extern void rb_command(const char *id);
 extern void rb_rows_event(uint32_t s, uint32_t c, uint32_t kind, uint32_t a, uint32_t b, uint32_t mods, double x, double y);
 
 enum { RB_ACT = 0, RB_EDITED = 1, RB_VALUE_SET = 2, RB_SELECTED = 3, RB_ACTIVATED = 4, RB_TOGGLED = 5 };
@@ -27,6 +29,34 @@ static BOOL rb_reading = NO;
 @implementation RBFlipped
 - (BOOL)isFlipped
 {
+    return YES;
+}
+@end
+
+// A window's content: flipped, and taking file drops once the window's surface asks for them.
+@interface RBDropView : RBFlipped
+{
+@public
+    uint32_t sid;
+    BOOL drops;
+}
+@end
+
+@implementation RBDropView
+- (NSDragOperation)draggingEntered:(id)info
+{
+    NSArray *files = [[info draggingPasteboard] propertyListForType:NSFilenamesPboardType];
+    return (drops && [files count] > 0) ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id)info
+{
+    NSArray *files = [[info draggingPasteboard] propertyListForType:NSFilenamesPboardType];
+    if (!drops || [files count] == 0)
+        return NO;
+    NSPoint at = [info draggingLocation];
+    NSString *joined = [files componentsJoinedByString:@"\n"];
+    rb_dropped(sid, [joined UTF8String], at.x, at.y);
     return YES;
 }
 @end
@@ -393,7 +423,9 @@ uint32_t rb_host_window(const char *title, int32_t w, int32_t h)
                                                 defer:NO];
     [x->window setReleasedWhenClosed:NO];
     [x->window setTitle:str(title)];
-    x->body = [[RBFlipped alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+    RBDropView *content = [[RBDropView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+    content->sid = s;
+    x->body = content;
     [x->body setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [x->window setContentView:x->body];
     x->views = [[NSMutableDictionary alloc] init];
@@ -1625,4 +1657,233 @@ void rb_host_resize_window(uint32_t s, int32_t w, int32_t h)
     NSWindow *win = surf(s)->window;
     [win setContentSize:NSMakeSize(w, h)];
     [win center];
+}
+
+// A surface on `body`, with no window of its own: a page or a pane.
+static uint32_t new_surface(NSView *body)
+{
+    uint32_t s = (uint32_t)[rb_surfaces count];
+    RBSurface *x = [[[RBSurface alloc] init] autorelease];
+    x->body = [body retain];
+    x->views = [[NSMutableDictionary alloc] init];
+    x->lists = [[NSMutableDictionary alloc] init];
+    x->texts = [[NSMutableDictionary alloc] init];
+    x->rowsv = [[NSMutableDictionary alloc] init];
+    x->target = [[RBTarget alloc] initWithSurface:s];
+    [rb_surfaces addObject:x];
+    return s;
+}
+
+void rb_host_set_min_size(uint32_t s, int32_t w, int32_t h)
+{
+    [surf(s)->window setContentMinSize:NSMakeSize(w, h)];
+}
+
+uint32_t rb_host_page(uint32_t s, uint32_t c)
+{
+    NSScrollView *scroll = [[[NSScrollView alloc] initWithFrame:NSZeroRect] autorelease];
+    [scroll setHasVerticalScroller:YES];
+    [scroll setAutohidesScrollers:YES];
+    [scroll setDrawsBackground:NO];
+    RBFlipped *body = [[[RBFlipped alloc] initWithFrame:NSZeroRect] autorelease];
+    [scroll setDocumentView:body];
+    adopt(s, c, scroll, NO);
+    return new_surface(body);
+}
+
+uint32_t rb_host_pane(uint32_t s, uint32_t c)
+{
+    RBFlipped *body = [[[RBFlipped alloc] initWithFrame:NSZeroRect] autorelease];
+    adopt(s, c, body, NO);
+    return new_surface(body);
+}
+
+void rb_host_accept_drops(uint32_t s)
+{
+    NSView *v = surf(s)->body;
+    if ([v isKindOfClass:[RBDropView class]]) {
+        ((RBDropView *)v)->drops = YES;
+        [v registerForDraggedTypes:[NSArray arrayWithObject:NSFilenamesPboardType]];
+    }
+}
+
+// `(x, y)` is a window point, as a drop reports it.
+int rb_host_hit(uint32_t s, uint32_t c, double x, double y)
+{
+    NSView *v = view(s, c);
+    NSPoint p = [v convertPoint:NSMakePoint(x, y) fromView:nil];
+    NSRect b = [v bounds];
+    return (p.x >= 0 && p.y >= 0 && p.x <= b.size.width && p.y <= b.size.height) ? 1 : 0;
+}
+
+// ---- The toolbar: the screens as selectable items, Commander at the end.
+
+@interface RBToolbar : NSObject
+{
+@public
+    NSArray *ids;
+    NSArray *labels;
+    NSArray *icons;
+    NSString *extra;
+}
+@end
+
+@implementation RBToolbar
+- (void)dealloc
+{
+    [ids release];
+    [labels release];
+    [icons release];
+    [extra release];
+    [super dealloc];
+}
+
+- (void)tool:(id)sender
+{
+    rb_command([[sender itemIdentifier] UTF8String]);
+}
+
+- (NSToolbarItem *)toolbar:(NSToolbar *)toolbar itemForItemIdentifier:(NSString *)ident willBeInsertedIntoToolbar:(BOOL)insert
+{
+    NSUInteger i = [ids indexOfObject:ident];
+    NSString *label = i != NSNotFound ? [labels objectAtIndex:i] : @"Commander";
+    NSString *icon = i != NSNotFound ? [icons objectAtIndex:i] : @"commander";
+    if (i == NSNotFound && ![ident isEqualToString:extra])
+        return nil;
+    NSToolbarItem *item = [[[NSToolbarItem alloc] initWithItemIdentifier:ident] autorelease];
+    [item setLabel:label];
+    [item setPaletteLabel:label];
+    [item setToolTip:label];
+    NSString *path = [[NSBundle mainBundle] pathForResource:[icon stringByAppendingString:@"-48"] ofType:@"png"];
+    NSImage *img = path ? [[[NSImage alloc] initWithContentsOfFile:path] autorelease] : nil;
+    if (img != nil) {
+        [img setSize:NSMakeSize(24, 24)];
+        if ([img respondsToSelector:@selector(setTemplate:)])
+            [img setTemplate:YES];
+        [item setImage:img];
+    }
+    [item setTarget:self];
+    [item setAction:@selector(tool:)];
+    return item;
+}
+
+- (NSArray *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar
+{
+    NSMutableArray *all = [NSMutableArray arrayWithArray:ids];
+    [all addObject:NSToolbarFlexibleSpaceItemIdentifier];
+    [all addObject:extra];
+    return all;
+}
+
+- (NSArray *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar
+{
+    return [self toolbarDefaultItemIdentifiers:toolbar];
+}
+
+- (NSArray *)toolbarSelectableItemIdentifiers:(NSToolbar *)toolbar
+{
+    return ids;
+}
+@end
+
+static RBToolbar *rb_toolbar = nil;
+
+void rb_host_toolbar(uint32_t s, const char *const *ids, const char *const *labels, const char *const *icons,
+                     uint32_t n, const char *extra)
+{
+    NSMutableArray *a = [NSMutableArray array], *b = [NSMutableArray array], *c = [NSMutableArray array];
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        [a addObject:str(ids[i])];
+        [b addObject:str(labels[i])];
+        [c addObject:str(icons[i])];
+    }
+    rb_toolbar = [[RBToolbar alloc] init];
+    rb_toolbar->ids = [a retain];
+    rb_toolbar->labels = [b retain];
+    rb_toolbar->icons = [c retain];
+    rb_toolbar->extra = [str(extra) retain];
+    NSToolbar *t = [[[NSToolbar alloc] initWithIdentifier:@"app.screens"] autorelease];
+    [t setDelegate:(id)rb_toolbar];
+    [t setDisplayMode:NSToolbarDisplayModeIconAndLabel];
+    [t setAllowsUserCustomization:NO];
+    [surf(s)->window setToolbar:t];
+}
+
+void rb_host_select_tool(uint32_t s, const char *ident)
+{
+    NSToolbar *t = [surf(s)->window toolbar];
+    NSString *i = str(ident);
+    if (![[t selectedItemIdentifier] isEqualToString:i])
+        [t setSelectedItemIdentifier:i];
+}
+
+void rb_host_show_toolbar(uint32_t s, int on)
+{
+    [[surf(s)->window toolbar] setVisible:(on ? YES : NO)];
+}
+
+// ---- The menu bar Rust describes: each item sends its controller id.
+
+@interface RBCommand : NSObject
+@end
+
+@implementation RBCommand
+- (void)run:(id)sender
+{
+    rb_command([[sender representedObject] UTF8String]);
+}
+@end
+
+static RBCommand *rb_commands = nil;
+
+void rb_host_menu_add(const char *menu, const char *label, const char *ident, const char *keyeq)
+{
+    if (rb_commands == nil)
+        rb_commands = [[RBCommand alloc] init];
+    NSMenu *bar = [NSApp mainMenu];
+    NSString *title = str(menu);
+    NSMenu *into = nil;
+    // The app menu is the first; the others are found or made by title.
+    if ([title isEqualToString:@"Rusty Backup"]) {
+        into = [[bar itemAtIndex:0] submenu];
+    } else {
+        NSInteger i;
+        for (i = 1; i < [bar numberOfItems]; i++)
+            if ([[[bar itemAtIndex:i] title] isEqualToString:title])
+                into = [[bar itemAtIndex:i] submenu];
+        if (into == nil) {
+            into = [[[NSMenu alloc] initWithTitle:title] autorelease];
+            [into setAutoenablesItems:NO];
+            NSMenuItem *holder = [[[NSMenuItem alloc] initWithTitle:title action:NULL keyEquivalent:@""] autorelease];
+            [holder setSubmenu:into];
+            [bar addItem:holder];
+        }
+    }
+    [into setAutoenablesItems:NO];
+    NSMenuItem *it = [[[NSMenuItem alloc] initWithTitle:str(label) action:@selector(run:) keyEquivalent:str(keyeq)] autorelease];
+    [it setTarget:rb_commands];
+    [it setRepresentedObject:str(ident)];
+    // The app menu ends with Quit; its own items go before it.
+    if (into == [[bar itemAtIndex:0] submenu] && [into numberOfItems] > 0)
+        [into insertItem:it atIndex:[into numberOfItems] - 1];
+    else
+        [into addItem:it];
+}
+
+static void rb_enable_in(NSMenu *menu, NSString *ident, BOOL on)
+{
+    NSInteger i;
+    for (i = 0; i < [menu numberOfItems]; i++) {
+        NSMenuItem *it = [menu itemAtIndex:i];
+        if ([[it representedObject] isEqual:ident])
+            [it setEnabled:on];
+        if ([it submenu] != nil)
+            rb_enable_in([it submenu], ident, on);
+    }
+}
+
+void rb_host_menu_enable(const char *ident, int on)
+{
+    rb_enable_in([NSApp mainMenu], str(ident), on ? YES : NO);
 }

@@ -13,14 +13,7 @@ use rusty_backup::controller::app::{ids, AppTab};
 
 use crate::ui::{ns, target};
 
-/// The toolbar item id of a screen; `app::command` maps it back.
-pub fn screen_id(tab: AppTab) -> String {
-    format!("app.screen.{}", tab.icon())
-}
-
-pub fn tab_of(id: &str) -> Option<AppTab> {
-    AppTab::ALL.iter().copied().find(|t| screen_id(*t) == id)
-}
+use crate::screens::main_window::{screen_id, tab_of};
 
 /// The 48-pixel icon, shown at 24 points so it is sharp on a Retina screen.
 fn icon_png(name: &str) -> Option<&'static [u8]> {

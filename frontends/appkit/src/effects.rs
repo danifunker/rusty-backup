@@ -22,8 +22,6 @@ use rusty_backup::controller::{ChoiceSpec, ConfirmSpec, PasswordSpec, PickSpec, 
 
 use crate::ui::{self, ns};
 
-pub use crate::screens::effects::{EffectHost, Reply, ReplyFn};
-
 /// Put `text` on the general pasteboard.
 pub fn copy_text(text: &str) {
     let pb = NSPasteboard::generalPasteboard();

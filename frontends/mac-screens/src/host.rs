@@ -149,6 +149,15 @@ pub enum MenuEntry {
     },
 }
 
+/// One toolbar item: the controller id it sends, its label, and its icon's name
+/// (`assets/icons/toolbar`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolItem {
+    pub id: String,
+    pub label: String,
+    pub icon: String,
+}
+
 /// Draws a canvas `w` by `h` points; `dark` is the view's appearance.
 pub type Painter = Rc<dyn Fn(&dyn Pen, f64, f64, bool)>;
 
@@ -239,6 +248,25 @@ pub trait Host {
     fn set_window_frame(&self, s: Surface, frame: (f64, f64, f64, f64));
     /// Size a window's content and centre it on screen.
     fn resize_window(&self, s: Surface, w: i32, h: i32);
+    /// The smallest a window's content may be made.
+    fn set_min_size(&self, s: Surface, w: i32, h: i32);
+    /// A scroll view as control `c` of `s`, its document the surface returned: a screen's page.
+    fn page(&self, s: Surface, c: Ctl) -> Surface;
+    /// A plain view as control `c` of `s`, as the surface returned: a page that stands in another's place.
+    fn pane(&self, s: Surface, c: Ctl) -> Surface;
+    /// The window's toolbar: the screens as selectable items, then `extra` (Commander) at the end.
+    /// A pick reaches the app's command handler by the item's id, as a menu item does.
+    fn toolbar(&self, s: Surface, items: &[ToolItem], extra: &str);
+    fn select_tool(&self, s: Surface, id: &str);
+    fn show_toolbar(&self, s: Surface, on: bool);
+    /// Enable the menu bar's items by id: `on` says, or `None` leaves an item to its control.
+    fn sync_menu(&self, on: &dyn Fn(&str) -> Option<bool>);
+    /// Files dropped on window `s`, at `(x, y)` in its content.
+    fn on_drop(&self, s: Surface, f: Rc<dyn Fn(Vec<PathBuf>, f64, f64)>);
+    /// Whether `(x, y)` in window `s`'s content falls on control `c` of surface `on`.
+    fn hit(&self, on: Surface, c: Ctl, x: f64, y: f64) -> bool;
+    /// Where `Effect::Message` text goes: label `c` of `s`.
+    fn status_to(&self, s: Surface, c: Ctl);
     /// The visible size of the scroll view a page's surface sits in, if it is in one.
     fn page_viewport(&self, s: Surface) -> Option<(i32, i32)>;
     /// Size a page's surface; taller than its viewport, it scrolls.
@@ -287,6 +315,8 @@ pub trait Host {
     /// An open panel that takes several files; none when cancelled.
     fn pick_files(&self, title: &str) -> Vec<PathBuf>;
     fn confirm(&self, spec: &ConfirmSpec) -> bool;
+    /// A one-button note (About).
+    fn note(&self, title: &str, text: &str);
     /// A question the shell itself asks: the button picked, or `None` for the Cancel it adds.
     fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize>;
     /// The choice picked; Esc gives `spec.dismiss`.

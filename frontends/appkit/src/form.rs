@@ -29,6 +29,7 @@ use crate::layout;
 use crate::rows::Rows;
 use crate::screens::host::{
     Column, Ctl, Ev, Host, MenuEntry, Painter, PullItem, RowLine, RowsEvent, RowsSpec, Surface,
+    ToolItem,
 };
 use crate::table::Table;
 use crate::ui::{self, ns, Callback, CloseDelegate, TextChange};
@@ -128,6 +129,13 @@ pub struct AppKitHost {
     surfaces: RefCell<Vec<Option<Rec>>>,
     /// The status line under the screens, once the app window has one.
     status: RefCell<Option<Retained<NSTextField>>>,
+    /// The main window's toolbar and its delegate, which the toolbar holds weakly.
+    toolbar: RefCell<
+        Option<(
+            Retained<objc2_app_kit::NSToolbar>,
+            Retained<crate::toolbar::Delegate>,
+        )>,
+    >,
 }
 
 impl AppKitHost {
@@ -140,21 +148,11 @@ impl AppKitHost {
                         mtm,
                         surfaces: RefCell::new(Vec::new()),
                         status: RefCell::new(None),
+                        toolbar: RefCell::new(None),
                     })
                 })
                 .clone()
         })
-    }
-
-    /// The app's one host, once `get` has made it.
-    pub fn current() -> Rc<AppKitHost> {
-        HOST.with(|h| h.borrow().clone())
-            .expect("the host is made at launch")
-    }
-
-    /// Where `Effect::Message` text goes.
-    pub fn set_status_view(&self, field: Retained<NSTextField>) {
-        *self.status.borrow_mut() = Some(field);
     }
 
     /// The window of surface `s`, when it is one.
@@ -722,6 +720,77 @@ impl Host for AppKitHost {
         }
     }
 
+    fn set_min_size(&self, s: Surface, w: i32, h: i32) {
+        if let Some(win) = self.ns_window(s) {
+            win.setContentMinSize(NSSize::new(f64::from(w), f64::from(h)));
+        }
+    }
+
+    fn page(&self, s: Surface, c: Ctl) -> Surface {
+        let scroll = NSScrollView::initWithFrame(self.mtm.alloc(), NSRect::ZERO);
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+        let body = ui::flipped(self.mtm);
+        scroll.setDocumentView(Some(&body));
+        self.adopt_view(s, c, &scroll);
+        self.adopt(body)
+    }
+
+    fn pane(&self, s: Surface, c: Ctl) -> Surface {
+        let body = ui::flipped(self.mtm);
+        self.adopt_view(s, c, &body);
+        self.adopt(body)
+    }
+
+    fn toolbar(&self, s: Surface, _items: &[ToolItem], _extra: &str) {
+        let Some(win) = self.ns_window(s) else {
+            return;
+        };
+        let (toolbar, delegate) = crate::toolbar::build(self.mtm);
+        // macOS 11's tall toolbar shows icons with labels; 10.13 to 10.15 lack the call.
+        if win.respondsToSelector(objc2::sel!(setToolbarStyle:)) {
+            win.setToolbarStyle(objc2_app_kit::NSWindowToolbarStyle::Expanded);
+        }
+        win.setToolbar(Some(&toolbar));
+        *self.toolbar.borrow_mut() = Some((toolbar, delegate));
+    }
+
+    fn select_tool(&self, _s: Surface, id: &str) {
+        let toolbar = self.toolbar.borrow().as_ref().map(|t| t.0.clone());
+        if let (Some(t), Some(tab)) = (toolbar, crate::screens::main_window::tab_of(id)) {
+            crate::toolbar::select(&t, tab);
+        }
+    }
+
+    fn show_toolbar(&self, _s: Surface, on: bool) {
+        if let Some((t, _)) = &*self.toolbar.borrow() {
+            t.setVisible(on);
+        }
+    }
+
+    fn sync_menu(&self, on: &dyn Fn(&str) -> Option<bool>) {
+        crate::menu::sync(on);
+    }
+
+    fn on_drop(&self, s: Surface, f: Rc<dyn Fn(Vec<PathBuf>, f64, f64)>) {
+        if let Some(d) = self.body(s).downcast_ref::<ui::DropView>() {
+            d.accept_drops(Rc::new(move |paths, at| f(paths, at.x, at.y)));
+        }
+    }
+
+    fn hit(&self, on: Surface, c: Ctl, x: f64, y: f64) -> bool {
+        let v = self.view(on, c);
+        let p = v.convertPoint_fromView(NSPoint::new(x, y), None);
+        let b = v.bounds();
+        p.x >= 0.0 && p.y >= 0.0 && p.x <= b.size.width && p.y <= b.size.height
+    }
+
+    fn status_to(&self, s: Surface, c: Ctl) {
+        let field = self.view(s, c).downcast::<NSTextField>().ok();
+        *self.status.borrow_mut() = field;
+    }
+
     fn page_viewport(&self, s: Surface) -> Option<(i32, i32)> {
         let scroll = self.body(s).enclosingScrollView()?;
         let visible = scroll.contentSize();
@@ -937,6 +1006,10 @@ impl Host for AppKitHost {
 
     fn confirm(&self, spec: &ConfirmSpec) -> bool {
         crate::effects::confirm(self.mtm, spec)
+    }
+
+    fn note(&self, title: &str, text: &str) {
+        crate::effects::note(title.to_string(), text.to_string());
     }
 
     fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize> {

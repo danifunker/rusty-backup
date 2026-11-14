@@ -36,6 +36,7 @@ pub mod host;
 pub mod inspect;
 pub mod jobs;
 pub mod layout;
+pub mod main_window;
 pub mod model_window;
 #[cfg(feature = "optical")]
 pub mod optical;

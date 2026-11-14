@@ -20,7 +20,7 @@ use rusty_backup::controller::keys::{Key, Mods};
 
 use crate::screens::host::{
     Align, Column, Ctl, Ev, Host, Ink, MenuEntry, Painter, Pen, PullItem, RowIcon, RowLine,
-    RowsEvent, RowsSpec, Surface,
+    RowsEvent, RowsSpec, Surface, ToolItem,
 };
 use crate::screens::layout::Rect;
 use crate::screens::prompt;
@@ -101,6 +101,21 @@ extern "C" {
     fn rb_host_set_window_frame(s: u32, x: f64, y: f64, w: f64, h: f64);
     fn rb_host_pick_files(title: *const c_char) -> *mut c_char;
     fn rb_host_text_area(s: u32, c: u32, id: *const c_char, caption: *const c_char);
+    fn rb_host_set_min_size(s: u32, w: i32, h: i32);
+    fn rb_host_page(s: u32, c: u32) -> u32;
+    fn rb_host_pane(s: u32, c: u32) -> u32;
+    fn rb_host_toolbar(
+        s: u32,
+        ids: *const *const c_char,
+        labels: *const *const c_char,
+        icons: *const *const c_char,
+        n: u32,
+        extra: *const c_char,
+    );
+    fn rb_host_select_tool(s: u32, id: *const c_char);
+    fn rb_host_show_toolbar(s: u32, on: c_int);
+    fn rb_host_accept_drops(s: u32);
+    fn rb_host_hit(s: u32, c: u32, x: f64, y: f64) -> c_int;
     fn rb_host_text_view_text(s: u32, c: u32) -> *mut c_char;
     fn rb_host_resize_window(s: u32, w: i32, h: i32);
     fn rb_host_redraw(s: u32, c: u32);
@@ -230,8 +245,9 @@ thread_local! {
     static TIMED: RefCell<Vec<(std::time::Instant, Box<dyn FnOnce()>)>> = RefCell::new(Vec::new());
     static PAINTERS: RefCell<Vec<((Surface, Ctl), Painter)>> = RefCell::new(Vec::new());
     static ROWS: RefCell<Vec<((Surface, Ctl), Rc<dyn Fn(RowsEvent)>)>> = RefCell::new(Vec::new());
+    static DROPS: RefCell<Vec<(Surface, Rc<dyn Fn(Vec<PathBuf>, f64, f64)>)>> = RefCell::new(Vec::new());
     static HOST: Rc<VintageHost> = Rc::new(VintageHost {
-        status: RefCell::new(String::new()),
+        status: RefCell::new(None),
         log: RefCell::new(Vec::new()),
     });
 }
@@ -340,6 +356,27 @@ pub extern "C" fn rb_rows_event(
     f(e);
 }
 
+/// Files dropped on window `s` at `(x, y)` in window coordinates, one path per line.
+#[no_mangle]
+pub extern "C" fn rb_dropped(s: u32, paths: *const c_char, x: f64, y: f64) {
+    if paths.is_null() {
+        return;
+    }
+    // SAFETY: the host passes a NUL-terminated string it keeps for the call.
+    let all = unsafe { CStr::from_ptr(paths) }
+        .to_string_lossy()
+        .into_owned();
+    let list: Vec<PathBuf> = all
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let f = DROPS.with(|d| d.borrow().iter().find(|e| e.0 == s).map(|e| e.1.clone()));
+    if let Some(f) = f {
+        f(list, x, y);
+    }
+}
+
 /// A canvas's `drawRect:`: run its painter with a pen over the current graphics context.
 #[no_mangle]
 pub extern "C" fn rb_canvas_draw(s: u32, c: u32, w: f64, h: f64, dark: c_int) {
@@ -441,8 +478,8 @@ pub extern "C" fn rb_event(s: u32, c: u32, kind: u32) {
 }
 
 pub struct VintageHost {
-    /// The last transient message, for the status line the main window will show.
-    status: RefCell<String>,
+    /// Where a transient message goes: the main window's status line, once it has one.
+    status: RefCell<Option<(Surface, Ctl)>>,
     /// Log lines kept until the main window's log panel takes them.
     log: RefCell<Vec<(LogLevel, String)>>,
 }
@@ -939,6 +976,76 @@ impl Host for VintageHost {
         unsafe { rb_host_resize_window(s, w, h) }
     }
 
+    fn set_min_size(&self, s: Surface, w: i32, h: i32) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_set_min_size(s, w, h) }
+    }
+
+    fn page(&self, s: Surface, c: Ctl) -> Surface {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_page(s, c) }
+    }
+
+    fn pane(&self, s: Surface, c: Ctl) -> Surface {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_pane(s, c) }
+    }
+
+    fn toolbar(&self, s: Surface, items: &[ToolItem], extra: &str) {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
+        let icons: Vec<String> = items.iter().map(|i| i.icon.clone()).collect();
+        let (_a, ip) = list(&ids);
+        let (_b, lp) = list(&labels);
+        let (_c, cp) = list(&icons);
+        let e = cs(extra);
+        // SAFETY: three arrays of `n` strings, alive for the call; the host copies them.
+        unsafe {
+            rb_host_toolbar(
+                s,
+                ip.as_ptr(),
+                lp.as_ptr(),
+                cp.as_ptr(),
+                ids.len() as u32,
+                e.as_ptr(),
+            )
+        }
+    }
+
+    fn select_tool(&self, s: Surface, id: &str) {
+        let i = cs(id);
+        // SAFETY: the host copies the id.
+        unsafe { rb_host_select_tool(s, i.as_ptr()) }
+    }
+
+    fn show_toolbar(&self, s: Surface, on: bool) {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_show_toolbar(s, flag(on)) }
+    }
+
+    fn sync_menu(&self, on: &dyn Fn(&str) -> Option<bool>) {
+        crate::menu::sync(on);
+    }
+
+    fn on_drop(&self, s: Surface, f: Rc<dyn Fn(Vec<PathBuf>, f64, f64)>) {
+        DROPS.with(|d| {
+            let mut d = d.borrow_mut();
+            d.retain(|e| e.0 != s);
+            d.push((s, f));
+        });
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_accept_drops(s) }
+    }
+
+    fn hit(&self, on: Surface, c: Ctl, x: f64, y: f64) -> bool {
+        // SAFETY: a plain call on the main thread.
+        unsafe { rb_host_hit(on, c, x, y) != 0 }
+    }
+
+    fn status_to(&self, s: Surface, c: Ctl) {
+        *self.status.borrow_mut() = Some((s, c));
+    }
+
     fn canvas(&self, s: Surface, c: Ctl, id: &str, painter: Painter) {
         PAINTERS.with(|p| {
             let mut p = p.borrow_mut();
@@ -1097,14 +1204,19 @@ impl Host for VintageHost {
     }
 
     fn log(&self, lines: Vec<(LogLevel, String)>) {
-        for (_, line) in &lines {
-            eprintln!("{}", line);
+        let mut all = std::mem::take(&mut *self.log.borrow_mut());
+        all.extend(lines);
+        // Lines from before the main window opened wait for it.
+        if let Some(back) = crate::append_log(all) {
+            *self.log.borrow_mut() = back;
         }
-        self.log.borrow_mut().extend(lines);
     }
 
     fn status(&self, text: &str) {
-        *self.status.borrow_mut() = text.to_string();
+        let at = *self.status.borrow();
+        if let Some((s, c)) = at {
+            self.set_text(s, c, text);
+        }
     }
 
     fn menu_sources(&self, _recent: &[String], _devices: &[String]) {}
@@ -1182,6 +1294,10 @@ impl Host for VintageHost {
             spec.destructive,
             Some(1),
         ) == Some(0)
+    }
+
+    fn note(&self, title: &str, text: &str) {
+        let _ = self.alert(title, text, &["OK".to_string()], false, None);
     }
 
     fn ask(&self, title: &str, message: &str, buttons: &[String]) -> Option<usize> {

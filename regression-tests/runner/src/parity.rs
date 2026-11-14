@@ -95,9 +95,7 @@ fn masked(ranges: &[VolatileRange], offset: u64) -> bool {
 
 /// The declared range covering `offset`, if any.
 fn expected_at(ranges: &[ExpectedRange], offset: u64) -> Option<&ExpectedRange> {
-    ranges
-        .iter()
-        .find(|r| offset >= r.start && offset < r.end)
+    ranges.iter().find(|r| offset >= r.start && offset < r.end)
 }
 
 /// True when `offset` sits within [`ADJACENCY`] of any range without being in

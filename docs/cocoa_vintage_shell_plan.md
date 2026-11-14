@@ -1,6 +1,6 @@
 # The vintage Cocoa shell: Mac OS X 10.4 to 10.12
 
-**Status: Phase 1 under way (2026-11-14).** § 7 has what the gates showed, § 8 where Phase 1 stands. This is Phase 6's macOS
+**Status: Phases 1 to 4 done for x86_64 (2026-11-14).** § 7 has what the gates showed, § 8 where it stands. This is Phase 6's macOS
 item in [native_frontends_plan.md](native_frontends_plan.md), with §8's C ABI, for the Macs the
 AppKit shell ([appkit_shell_plan.md](appkit_shell_plan.md), 10.13 and later) cannot reach.
 
@@ -160,20 +160,35 @@ Lion test-rig findings:
 - `scp` fails against Lion's sshd; pipe through `ssh ... 'cat > file'` instead.
 - The Mac drops off the network for minutes at a time ("Host is down").
 
-## 8. Phase 1 progress
+## 8. Where it stands (2026-11-14)
 
-- `frontends/mac-screens/src/` is shared source, not a crate. The two shells link different engine
-  packages under the one crate name `rusty_backup`, so each mounts it with
-  `#[path = ".../mac-screens/src/mod.rs"] mod screens;`: the AppKit shell from `main.rs`, the
-  vintage shell from `frontends-vintage/cocoa/rust/src/lib.rs`. The vintage build is its 1.73 check.
-- In it now: `layout.rs` (moved, history kept), `host.rs` (the `Host` trait: surfaces and controls
-  as integers, reports as `Ev::{Act, Edited, ValueSet}`), and `form.rs` (the `Form` every screen is
-  written on, generic over the host, with the order rules for accessibility-set values and picks).
-- AppKit implements `Host` in `frontends/appkit/src/form.rs` (objc2), plus its own `Form::new`,
-  `add`, `v` and `place_page`. No screen changed. All 68 tier 8 appkit flows pass on it.
-- The vintage shell implements `Host` over the C ABI: `rust/src/host.rs` (Rust, `extern "C"`) and
-  `host/host.m` (Objective-C 1.0, 10.4 APIs only, `NSInteger` shimmed for the 10.4 SDK). The Gate 0
-  window is now a `Form` screen. Under Rosetta, through `ax_probe`: an AX value set on the field
-  echoes into a label, a press on the check box re-tones it, Close quits.
-- Next: windows and the rest of the host surface into `Host` (window, present, close, area,
-  resize), then Inspect, the first real screen, into `mac-screens` (Phase 2).
+Phases 1 to 3 are done for x86_64: every AppKit screen, dialog and the main window live in
+`frontends/mac-screens/src/`, and both shells run them.
+
+- **Layout.** `frontends/mac-screens/src/` is shared source, not a crate: the two shells link
+  different engine packages under the one crate name `rusty_backup`, so each mounts it with
+  `#[path = ".../mac-screens/src/mod.rs"] mod screens;`. The vintage build compiling it on 1.73 is
+  its version check. Let-else is fine (mrustc already takes the engine's 684).
+- **The `Host` trait** (`host.rs`): windows, the `Form` controls, lists, pane lists (rows with
+  indent, icon and tick box), a canvas with a `Pen` (the partition bar draws through it), text
+  views and areas, menus at a point, the main window's pages, panes, toolbar, menu bar, drops,
+  the panels and alerts the shared `EffectHost` asks for, and the main queue (`later`, `after`).
+- **Feature gates.** The mounting crate's features decide: `chd` (a stand-in `chd` module with
+  the same calls and no controls keeps the screens free of cfg lines), `optical` (Optical, its
+  remote window, the disc browser) and `update` (the banner). AppKit turns all three on; the
+  vintage build has none of them (its engine has no CHD, optical or network stack).
+- **AppKit** (`frontends/appkit/src/`) is now its host only: `form.rs` (the `Host`), `rows.rs`,
+  `canvas.rs`, `table.rs`, `effects.rs` (panels), `popup.rs`, `toolbar.rs`, `menu.rs`, `ui.rs`,
+  and `app.rs` (the application object and its delegate). All 68 tier 8 appkit flows pass.
+- **Vintage** (`frontends-vintage/cocoa/`): `rust/src/host.rs` implements the `Host` over the C
+  ABI that `host/host.m` (Objective-C 1.0, 10.4 APIs, `NSInteger` shimmed) fulfils; `menu.rs` is
+  its menu bar; `lib.rs` opens the shared main window. Cell-based lists (10.4 has no other), an
+  indented, iconned name cell, the Tabler toolbar and row icons in the bundle, NSMenu pop-ups with
+  a pre-10.6 fallback, `performSelectorOnMainThread:` for wakes and `later`.
+- **The flow driver** (`regression-tests/drivers/ax_driver.m`) is `ax_driver.swift` in
+  Objective-C, built for 10.7. The runner's `cocoa` shell runs each AppKit flow on the vintage app
+  (`--cocoa`), save those that need CHD, optical media, CD audio or Convert.
+- **CI.** `build-macos-vintage` builds the app with `build.sh`, checks its 10.7 floor and symbols,
+  and ships `Rusty-Backup-Cocoa-macos-vintage-x64-<ver>.dmg` (HFS+, readable on 10.7).
+- **Next:** the cocoa flows here under Rosetta and on the Lion Mac (its Accessibility setting is
+  off), then Phase 5 (PowerPC).

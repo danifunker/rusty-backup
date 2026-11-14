@@ -47,11 +47,13 @@ clang -arch $ARCH -mmacosx-version-min=$MIN -o "$APP/Contents/MacOS/Rusty Backup
     -framework Cocoa -framework IOKit -framework DiskArbitration -framework CoreFoundation \
     -framework Security -liconv -Wl,-dead_strip
 
-VERSION="$(strings "$APP/Contents/MacOS/Rusty Backup" | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$' || echo 0.1.0)"
+# The version the engine bakes in (build.rs): RELEASE_VERSION in CI, else the vintage manifest's.
+VERSION="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/rb-cli-vintage/Cargo.toml" | head -1)}"
 sed "s/@VERSION@/$VERSION/g" "$HERE/host/Info.plist" > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ROOT/assets/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
-# The listing's row icons (Tabler), which the pane lists draw.
+# The toolbar's screen icons and the listing's row icons (Tabler).
+cp "$ROOT"/assets/icons/toolbar/png/*-48.png "$APP/Contents/Resources/"
 for i in file file-plus file-minus folder folder-plus folder-minus folder-open; do
     cp "$ROOT/assets/icons/rows/png/$i-32.png" "$APP/Contents/Resources/"
 done

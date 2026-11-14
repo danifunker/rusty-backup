@@ -137,8 +137,12 @@ impl Bundle {
             ..clone_result(r)
         };
         let r = &mut r;
-        let line = serde_json::to_string(r)
-            .unwrap_or_else(|e| format!("{{\"case_id\":\"{}\",\"serialize_error\":\"{}\"}}", r.case_id, e));
+        let line = serde_json::to_string(r).unwrap_or_else(|e| {
+            format!(
+                "{{\"case_id\":\"{}\",\"serialize_error\":\"{}\"}}",
+                r.case_id, e
+            )
+        });
         writeln!(self.results, "{}", line)?;
         self.results.flush()?;
         self.results_seen
@@ -205,8 +209,12 @@ impl Bundle {
             dir.join("exit.txt"),
             format!(
                 "observed: {}\nexpected: {}\n",
-                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "killed".into()),
-                expected_exit.map(|c| c.to_string()).unwrap_or_else(|| "(unasserted)".into()),
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "killed".into()),
+                expected_exit
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "(unasserted)".into()),
             ),
         )?;
         fs::write(dir.join("stdout.txt"), stdout)?;
@@ -262,7 +270,11 @@ impl Bundle {
             s.push_str("Every external oracle a case asked for was available.\n");
         } else {
             for (tool, cases) in &self.tool_skips {
-                s.push_str(&format!("## `{}` — {} case(s) skipped\n\n", tool, cases.len()));
+                s.push_str(&format!(
+                    "## `{}` — {} case(s) skipped\n\n",
+                    tool,
+                    cases.len()
+                ));
                 for c in cases {
                     s.push_str(&format!("- {}\n", c));
                 }
@@ -286,7 +298,9 @@ impl Bundle {
             "- platform: `{}`\n- host: `{}`\n- rb-cli: `{}`\n- wall clock: {:.1}s\n- cases: {}\n\n",
             env.get("platform").and_then(|v| v.as_str()).unwrap_or("?"),
             env.get("host").and_then(|v| v.as_str()).unwrap_or("?"),
-            env.get("rb_cli_version").and_then(|v| v.as_str()).unwrap_or("?"),
+            env.get("rb_cli_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?"),
             wall_ms as f64 / 1000.0,
             self.results_seen.len(),
         ));
@@ -303,7 +317,10 @@ impl Bundle {
         let mut by_group: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, group, _, v) in &self.results_seen {
             if *v == Verdict::Fail || *v == Verdict::Error {
-                by_group.entry(group.as_str()).or_default().push(id.as_str());
+                by_group
+                    .entry(group.as_str())
+                    .or_default()
+                    .push(id.as_str());
             }
         }
 

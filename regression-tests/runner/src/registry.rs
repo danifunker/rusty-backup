@@ -228,18 +228,21 @@ impl Registry {
         // --- formats -------------------------------------------------------
         let p = data.join("formats.toml");
         let text = fs::read_to_string(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
-        let ff: FormatsFile = toml::from_str(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
+        let ff: FormatsFile =
+            toml::from_str(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
         r.formats = ff.formats;
 
         let known: BTreeSet<String> = r.formats.iter().map(|f| f.id.clone()).collect();
         if known.len() != r.formats.len() {
-            r.warnings.push("duplicate format ids in formats.toml".to_string());
+            r.warnings
+                .push("duplicate format ids in formats.toml".to_string());
         }
 
         // --- oracles -------------------------------------------------------
         let p = data.join("oracles.toml");
         let text = fs::read_to_string(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
-        let of: OraclesFile = toml::from_str(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
+        let of: OraclesFile =
+            toml::from_str(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
         for o in of.oracles {
             for a in &o.availability {
                 r.availability.push(Availability {
@@ -302,9 +305,7 @@ impl Registry {
                         r.availability.push(a);
                     }
                 }
-                Err(e) => r
-                    .warnings
-                    .push(format!("{}: {}", local.display(), e)),
+                Err(e) => r.warnings.push(format!("{}: {}", local.display(), e)),
             }
         }
 
@@ -416,7 +417,12 @@ impl Registry {
         self.formats
             .iter()
             .filter(|f| f.we_read)
-            .filter(|f| !self.fixtures.iter().any(|x| x.formats.iter().any(|c| c == &f.id)))
+            .filter(|f| {
+                !self
+                    .fixtures
+                    .iter()
+                    .any(|x| x.formats.iter().any(|c| c == &f.id))
+            })
             .collect()
     }
 
@@ -434,8 +440,11 @@ impl Registry {
                 if !matches!(a.status.as_str(), "verified" | "expected" | "install") {
                     continue;
                 }
-                let vs: Vec<&Verification> =
-                    self.verifications.iter().filter(|v| v.oracle == a.oracle).collect();
+                let vs: Vec<&Verification> = self
+                    .verifications
+                    .iter()
+                    .filter(|v| v.oracle == a.oracle)
+                    .collect();
                 out.push((h, a, vs));
             }
         }

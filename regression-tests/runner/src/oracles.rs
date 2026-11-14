@@ -159,7 +159,11 @@ fn find_under_roots(program: &str, roots: &[PathBuf]) -> Option<String> {
 /// guessed at: an emulator or a MiSTer core is not something `which` can find,
 /// and claiming "absent" for them would read as a missing install rather than
 /// a different kind of oracle.
-pub fn detect(reg: &Registry, path_hints: &BTreeMap<String, String>, platform: &str) -> Vec<Detected> {
+pub fn detect(
+    reg: &Registry,
+    path_hints: &BTreeMap<String, String>,
+    platform: &str,
+) -> Vec<Detected> {
     let mut out = Vec::new();
     for o in &reg.oracles {
         // A `mount` oracle is the kernel's opinion, so it only means anything
@@ -428,7 +432,11 @@ platform = \"windows\"
         )
         .expect("path exists");
         assert!(out.contains("\"keepme\""), "other rows must survive");
-        assert_eq!(out.matches("oracle = \"fs-uae\"").count(), 1, "no duplicate row");
+        assert_eq!(
+            out.matches("oracle = \"fs-uae\"").count(),
+            1,
+            "no duplicate row"
+        );
         assert!(out.contains("status = \"installed\""));
     }
 
@@ -436,7 +444,14 @@ platform = \"windows\"
     fn setting_a_hint_to_nothing_is_refused() {
         // A hint pointing at nothing is discovered three weeks later, as a
         // quiet skip. Fail at the point the mistake is made.
-        let e = set_hint("", "fs-uae", "/definitely/not/here", "windows", "2026-08-10", "installed");
+        let e = set_hint(
+            "",
+            "fs-uae",
+            "/definitely/not/here",
+            "windows",
+            "2026-08-10",
+            "installed",
+        );
         assert!(e.is_err());
     }
 
@@ -549,7 +564,10 @@ mod prompt_tests {
         }];
         let mut input = std::io::Cursor::new(b"\n".to_vec());
         let mut out = Vec::new();
-        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        assert_eq!(
+            prompt_for_missing(&mut found, &reg, &mut input, &mut out),
+            0
+        );
         assert_eq!(found[0].status, "manual");
     }
 
@@ -564,7 +582,10 @@ mod prompt_tests {
         let here = std::env::current_exe().unwrap();
         let mut input = std::io::Cursor::new(format!("{}\n", here.display()).into_bytes());
         let mut out = Vec::new();
-        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 1);
+        assert_eq!(
+            prompt_for_missing(&mut found, &reg, &mut input, &mut out),
+            1
+        );
         assert_eq!(found[0].status, "installed");
     }
 
@@ -579,7 +600,10 @@ mod prompt_tests {
         // Wrong once, then blank. The wrong one must not be written.
         let mut input = std::io::Cursor::new(b"/nope/nowhere\n\n".to_vec());
         let mut out = Vec::new();
-        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        assert_eq!(
+            prompt_for_missing(&mut found, &reg, &mut input, &mut out),
+            0
+        );
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("no such file"), "must say why it was refused");
         assert_eq!(found[0].status, "manual");
@@ -597,7 +621,10 @@ mod prompt_tests {
         }];
         let mut input = std::io::Cursor::new(b"".to_vec());
         let mut out = Vec::new();
-        assert_eq!(prompt_for_missing(&mut found, &reg, &mut input, &mut out), 0);
+        assert_eq!(
+            prompt_for_missing(&mut found, &reg, &mut input, &mut out),
+            0
+        );
         assert!(out.is_empty(), "no prompt should have been printed");
     }
 }
@@ -675,7 +702,10 @@ mod mister_tests {
 
     fn reg() -> Registry {
         let mut r = Registry::default();
-        for (id, core) in [("mister-core-amiga", "Minimig"), ("mister-core-ti99", "Ti994a")] {
+        for (id, core) in [
+            ("mister-core-amiga", "Minimig"),
+            ("mister-core-ti99", "Ti994a"),
+        ] {
             r.oracles.push(Oracle {
                 id: id.into(),
                 tool: "core".into(),

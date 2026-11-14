@@ -17,8 +17,7 @@ use rusty_backup::controller::keys::{Chord, Key};
 use crate::ui::{ns, target};
 
 /// The Help menu's items that open the project's pages.
-pub const WEBSITE: &str = "app.website";
-pub const ISSUES: &str = "app.issues";
+use crate::screens::main_window::{ISSUES, WEBSITE};
 
 /// Items that are always on: they switch to their screen first.
 const ALWAYS: [&str; 7] = [
@@ -199,7 +198,7 @@ pub fn build(mtm: MainThreadMarker) {
             ours_with(
                 mtm,
                 t.label(),
-                &crate::toolbar::screen_id(*t),
+                &crate::screens::main_window::screen_id(*t),
                 Some(t.shortcut()),
             )
         })
