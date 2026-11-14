@@ -23,6 +23,12 @@ pub mod purpose {
     pub const CONNECT: &str = "remote_pick.connect";
 }
 
+/// The question asks for an `rb-cli serve` daemon's address, so a view can show a network icon.
+pub fn asks_for_a_daemon(purpose: &str) -> bool {
+    use crate::controller::browser::pane::source::purpose as pane;
+    purpose == self::purpose::CONNECT || purpose == pane::CONNECT
+}
+
 /// Stable widget ids, shared by every shell's accessibility identifiers.
 pub mod ids {
     pub const DISCONNECT: &str = "remote_pick.disconnect";

@@ -52,6 +52,8 @@ pub(super) struct ToolState {
     pending_repack: Option<(u64, String)>,
     swab: Option<Job<()>>,
     hfs_summary: Option<Job<Result<crate::model::hfs_expand_runner::ExpandSource, String>>>,
+    /// The partition Expand HFS reads, named for its dialog.
+    hfs_place: Option<crate::model::hfs_expand_runner::PartitionPlace>,
     chd_info: Option<Job<Result<String, String>>>,
     chd_info_text: Option<String>,
 }
@@ -203,6 +205,14 @@ impl InspectController {
 
     pub fn can_expand_image(&self) -> bool {
         self.is_image_file() && !self.export_running() && self.tools.expand.is_none()
+    }
+
+    /// Resize Image applies: a plain image file with a partition table, read as it is on disk.
+    pub fn can_resize_image(&self) -> bool {
+        self.can_expand_image()
+            && (self.found.chd_path.is_none() || cfg!(feature = "chd"))
+            && !matches!(&self.source, Some(Source::Image { _temp: Some(_), .. }))
+            && self.found.table.is_some()
     }
 
     pub fn expanding(&self) -> bool {
@@ -789,6 +799,33 @@ impl InspectController {
         })
     }
 
+    /// What Resize Image starts from, or why this source cannot be resized as an image file.
+    pub fn resize_image_source(
+        &mut self,
+    ) -> Result<crate::controller::resize_image::ResizeImageSource, String> {
+        if !self.is_image_file() {
+            return Err("Resize Image works on a disk image file.".to_string());
+        }
+        if self.found.chd_path.is_some() && !cfg!(feature = "chd") {
+            return Err("This build has no CHD support.".to_string());
+        }
+        if matches!(&self.source, Some(Source::Image { _temp: Some(_), .. })) {
+            return Err(
+                "This image is unpacked from a container; convert it to a raw image first."
+                    .to_string(),
+            );
+        }
+        let plan = self
+            .resize_plan()
+            .ok_or_else(|| "This image has no partition table to resize.".to_string())?;
+        let places = plan
+            .partitions
+            .iter()
+            .filter_map(|p| self.partition_place(p.index).map(|pl| (p.index, pl)))
+            .collect();
+        Ok(crate::controller::resize_image::ResizeImageSource { plan, places })
+    }
+
     /// The device size the shell knows for the open device.
     pub fn device_size(&self) -> Option<u64> {
         match &self.source {
@@ -989,6 +1026,7 @@ impl InspectController {
         if self.tools.hfs_summary.is_some() {
             return;
         }
+        self.tools.hfs_place = self.partition_place(index);
         self.tools.hfs_summary = Some(self.spawn("Reading the HFS volume...", move |_| {
             Ok(
                 crate::model::hfs_expand_runner::summarize_source(path.as_path(), offset, size)
@@ -1051,7 +1089,10 @@ impl InspectController {
         if let Some(done) = self.tools.hfs_summary.as_ref().and_then(finished) {
             self.tools.hfs_summary = None;
             match done.and_then(|r| r) {
-                Ok(source) => self.requests.push(HostRequest::ExpandHfs(Box::new(source))),
+                Ok(mut source) => {
+                    source.place = self.tools.hfs_place.take();
+                    self.requests.push(HostRequest::ExpandHfs(Box::new(source)));
+                }
                 Err(e) => self.error(format!("Cannot read source HFS volume: {e}")),
             }
         }

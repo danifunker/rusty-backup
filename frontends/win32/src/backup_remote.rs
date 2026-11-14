@@ -40,6 +40,7 @@ pub struct RemoteWindow {
     send: Rc<dyn Fn(BackupAction)>,
     sync: SyncGuard,
     me: Weak<RemoteWindow>,
+    intro: HWND,
     caption: HWND,
     address: HWND,
     connect: HWND,
@@ -92,6 +93,7 @@ impl RemoteWindow {
             send,
             sync: SyncGuard::default(),
             me: me.clone(),
+            intro: ui::label(window, hints::REMOTE_DRIVE_INTRO),
             caption: ui::cell_label(window, "Host:"),
             address: ui::edit(window, ids::REMOTE_ADDRESS),
             connect: ui::button(window, "Connect", ids::REMOTE_CONNECT),
@@ -180,6 +182,7 @@ impl RemoteWindow {
         let row_h = Size::Fixed(layout::ROW);
         let line = |h: HWND| Node::leaf(h, Size::Stretch(1), Size::Fixed((layout::ROW - 8) * 2));
         let mut col = vec![
+            line(self.intro),
             Node::row(vec![
                 Node::leaf(self.caption, Size::Fixed(50), row_h),
                 Node::field(self.address),

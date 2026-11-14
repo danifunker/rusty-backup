@@ -530,15 +530,31 @@ impl BuildDiskTab {
                 self.size_row(ui, None);
                 ui.horizontal(|ui| {
                     ui.label("Alignment:");
-                    let mut align = view.align_text.clone();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut align)
-                            .desired_width(80.0)
-                            .hint_text(view.align_hint.as_str()),
-                    )
-                    .on_hover_text(hints::ALIGN);
-                    if align != view.align_text {
-                        self.act(BuildDiskAction::Table(BuildAction::SetAlign(align)));
+                    let mut pick = view.align_pick;
+                    let shown = view.align_choices.get(pick).cloned().unwrap_or_default();
+                    egui::ComboBox::from_id_salt("build_disk_align")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in view.align_choices.iter().enumerate() {
+                                ui.selectable_value(&mut pick, i, label.as_str());
+                            }
+                        })
+                        .response
+                        .on_hover_text(hints::ALIGN);
+                    if pick != view.align_pick {
+                        self.act(BuildDiskAction::Table(BuildAction::PickAlign(pick)));
+                    }
+                    if view.align_custom {
+                        let mut align = view.align_text.clone();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut align)
+                                .desired_width(80.0)
+                                .hint_text(view.align_hint.as_str()),
+                        )
+                        .on_hover_text(hints::ALIGN_CUSTOM);
+                        if align != view.align_text {
+                            self.act(BuildDiskAction::Table(BuildAction::SetAlign(align)));
+                        }
                     }
                     if let Some((heads, sectors)) = view.geometry {
                         ui.label("Heads:");
@@ -971,11 +987,6 @@ fn options_form(ui: &mut egui::Ui, t: &FormatTarget) -> Option<FormatOptions> {
                 FsOption::BigEndian => {
                     ui.label("Byte order:");
                     ui.checkbox(&mut o.big_endian, "Big-endian");
-                }
-                FsOption::Fat32 => {
-                    ui.label("FAT type:");
-                    ui.checkbox(&mut o.fat32, "FAT32 whatever the size")
-                        .on_hover_text(hints::FAT32);
                 }
                 FsOption::CaseSensitive => {
                     ui.label("Case:");

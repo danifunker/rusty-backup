@@ -2,8 +2,8 @@
 
 Phase 3 of [native_frontends_plan.md](native_frontends_plan.md). Drafted 2026-11-09 from what the
 GTK4 shell ([gtk4_shell_plan.md](gtk4_shell_plan.md)) and the tier 8 flows
-([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Not started: second, after
-the Win32 shell (main plan D7), which settles Phase 2b and the driver pattern first.
+([regression-tests/FLOWS.md](../regression-tests/FLOWS.md)) taught. Second, after the Win32 shell
+(main plan D7). **Slice 0 under way (2026-11-11)**; see "Progress" below.
 
 The shell is `frontends/appkit/`: AppKit through `objc2` / `objc2-app-kit` 0.3 (the versions the
 engine already links for IOKit and DiskArbitration), a pure view over `rusty_backup::controller`,
@@ -80,12 +80,29 @@ The GTK plan's rules are the starting point; most are about retained-mode toolki
   slice 1 needs them.
 - **Keys.** `Primary` in `controller::keys` is Cmd; Commander's F-keys need fn on a laptop, so every
   command also has its menu item (the menu bar is where Mac users look).
-- **Menus.** The menu bar carries the commands the GTK shell puts in its header menu, plus Edit's
-  standard items so text fields get copy and paste.
+- **Menus (agreed 2026-11-12, draft: [mockups/appkit-draft.html](mockups/appkit-draft.html)).**
+  The window keeps Win32's controls (D8) and the menu bar carries the same commands, each running
+  its button's action and greyed out with it: Rusty Backup (About, Check for Updates..., Settings...),
+  File (Open File for Inspect..., Open CD-ROM Image..., Open Backup Folder..., Open Recent, Open
+  Device, Connect to Remote..., Refresh Devices, Close Backup, Close), Edit's standard items, View
+  (the screens on Cmd 1 to 8, the log), Disk and Partition (Inspect's disk and row tools), Window
+  and Help. Shortcuts go into the controller's key map, not the shell.
+- **In-app update (built 2026-11-12, `update::mac`).** As egui does on Windows:
+  the banner's Install downloads the release's signed, notarized DMG for this app and arch,
+  attaches it read-only (`hdiutil attach -nobrowse -readonly`), checks the bundle inside with
+  `codesign --verify --deep --strict` and that its Team ID matches the running app's, copies it
+  beside the running bundle with `ditto`, swaps the two by rename and removes the old one (the
+  running process keeps its open files), detaches, and on Restart Now relaunches with `open -n`.
+  The menu's Check for Updates... (`AppAction::CheckForUpdates`) checks at once and says when the
+  build is up to date. A folder the user cannot write
+  (a standard account's /Applications) or an unsigned build falls back to opening the DMG. The
+  logic is the engine's (`src/update.rs`) and the app controller's `InstallUpdate`, so egui on
+  macOS gets it too; the AppKit preview takes its own DMG, as Win32 takes its own ZIP.
 - **Drag and drop.** Drop routing goes through `AppController::route_drop` as in GTK. A drag *out*
   to Finder is a file promise (`NSFilePromiseProvider`); GTK never built its drag out.
-- **Packaging.** A second `.app` in the same DMG job, signed and notarized with the egui one; the
-  bundle id differs so both can be installed.
+- **Packaging.** Its own `.app` and DMG from the build-appkit job, signed and notarized like the
+  egui one (the updater expects the AppKit shell in a DMG of its own); the bundle id differs so
+  both can be installed.
 
 ## Slices
 
@@ -106,14 +123,14 @@ The GTK slices, in the same order; each is done when its tier 8 flows pass on `a
 | 8 | Drop routing, file open (`application:openURLs:`), hand-offs, About, icon | manual: drops cannot be driven yet |
 | 9 | The AX driver in rb-regress, the DMG beside egui | every tier 8 flow with `shells` gaining `appkit` |
 
-## The flow driver: `drivers/ax_driver.py`
+## The flow driver: `drivers/ax_driver.swift`
 
 Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` back), run by a
 `runner/src/ax.rs` client, so every flow file only gains `"appkit"` in its `shells`.
 
-- **Language.** Python with PyObjC (`ApplicationServices` for `AXUIElement`), mirroring
-  `gtk_driver.py`. If PyObjC is a problem on the runners, a small Swift helper speaking the same
-  protocol is the fallback.
+- **Language.** Swift (decided 2026-11-11): one file over `ApplicationServices` (`AXUIElement`),
+  compiled by `swiftc` from the Xcode command-line tools, which every macOS runner has. No Python
+  package to install, and the same protocol as `gtk_driver.py`.
 - **Finding controls.** By `AXIdentifier`, which is the controller id. No `labels.toml` section;
   `[all]` messages still apply.
 - **Acting.** `AXPress` for buttons, menu items and pop-up items; `AXValue` set for text fields,
@@ -131,7 +148,182 @@ Same protocol as the GTK driver (one JSON op per line on stdin, `{"ok": ...}` ba
 **Gate 0, before slice 9 depends on it:** the process driving AX needs the Accessibility (TCC)
 permission. Locally that is one grant to the terminal or Python. On GitHub's macOS runners, check
 whether it is already granted (UI-testing images often are); if not, the AX flows run on a
-self-hosted Mac (`dani-dev.local`) and CI keeps the build plus `--shell tui`.
+self-hosted Mac (named in the gitignored `local.toml`, never in the repo) and CI keeps the build
+plus `--shell tui`.
+
+## Progress
+
+- **Slice 0 (2026-11-11), built, not yet seen under the driver.** `frontends/appkit/`: its own
+  workspace and lockfile, `MACOSX_DEPLOYMENT_TARGET` 10.13 in its `.cargo/config.toml`. The window
+  with the D9 screen toolbar (`toolbar.rs`, an `NSToolbar` of selectable items, the shared PNGs
+  as template images, Commander at the right end and off until slice 3), the top bar, update
+  banner, a page per screen (a scroll view over a flipped body, holding a placeholder until its
+  slice), the status line and the log (`app.rs`); the menu bar (`menu.rs`); the effect host
+  (`effects.rs`: open and save panels after the scripted pick, alerts for Confirm and Choose, a
+  prompt with the controller's validator run as the user types, the pasteboard, URLs), with every
+  question opened from a main-queue block of its own; `MacWake` queues one tick on the main queue.
+  `layout.rs` is the Win32 shell's tree (prune, then measure), so hidden views take no room;
+  every control's action goes to one target that reads the sender's controller id.
+  `scripts/check-boundaries.sh` enforces `frontends/appkit/src` from the start, and CI target
+  `appkit` runs clippy, the layout tests, the build and the Gate 0 probe.
+- **The driver**: `drivers/ax_driver.swift` (the UIA driver's protocol and ops) and
+  `runner/src/ax.rs`, which builds it with `swiftc` into `runner/target/` and passes it
+  `--appkit <binary>`.
+- **Gate 0 on a desk Mac: passed (2026-11-11, macOS 27).** The driver found every control by
+  `AXIdentifier`, switched screens through the toolbar items, pressed a button by id and answered
+  an alert. The grant goes to the process macOS holds responsible: run from the Claude desktop
+  app, that is the Claude Code binary (`claude.app` under `~/Library/Application Support/Claude`),
+  not Claude.app, and it took a new process to see it.
+- **Gate 0 on GitHub: passed (2026-11-12).** The `macos-26` runner reports `AXIsProcessTrusted`
+  true, and `flow.shell.appkit-start` passes in the `appkit` job, so the AX flows run in CI.
+
+- **Slice 1 (2026-11-12), Inspect, first pass.** `inspect.rs` over `InspectController`, as the
+  Win32 screen: the source pull-down (recent files and devices), Open File, Open Backup Folder,
+  the facts, the job line with its bar, the two rows of tools, the partition bar
+  (`partition_bar.rs`, a custom `NSView` with Win32's palette and legend), the partition list
+  (`table.rs`, a view-based `NSTableView`), the row tools, and the Check and CHD Info windows
+  (`report.rs`). Tools whose windows later slices build (Export, the table editor, Resize, Expand
+  Image, Expand HFS, Alto, Browse, Convert, remote) show, stay off and say which slice brings
+  them. The menu bar has the agreed File, View, Disk and Partition menus; each item follows the
+  control with its id (`ui::usable`), and the shortcuts come from
+  `controller::app::MENU_SHORTCUTS` and `AppTab::shortcut`. Checked under the AX driver: an
+  AHDI disk and an HFS floppy open, Check runs and its window closes. Learned:
+  `NSPopUpButton::itemAtIndex` raises on an empty menu, and a raised Objective-C exception
+  inside a delegate callback silently ends it, so the window never appeared; ask the count first.
+
+- **Slice 2 (2026-11-12), the browse view.** `browse.rs` over the single-pane
+  `CommanderController`, as the Win32 view: the volume line and header tools, the edit bar, the
+  job line with Cancel, notices, the folder tree and listing (`pane_view.rs`: an `NSTableView`
+  subclass that hands unused keys to the controller's key map and reports right-clicks, with
+  tick boxes, the row icons from `assets/icons/rows` and the indent of a row inside a folder),
+  the side panel over its text or hex preview, the status line and mark bar, the View and row
+  menus (`popup.rs`), and every window the controller describes (`model_window.rs`, Win32's
+  `window.rs` in AppKit). A window's actions reach the view from a main-queue block of their
+  own (`app::later`), since the owner may rebuild the window that sent them. Inspect's Browse
+  opens it in the page's place. `flow.browse.inspect-extract-all`, `-new-folder` and
+  `-edit-text` pass on `appkit`.
+
+- **Slice 3 (2026-11-12), Commander.** `commander.rs` on one `CommanderController`, as the
+  Win32 screen: two sides (source pull-down with recent sources, File / Folder / Backup / Remote,
+  Close, partitions, New Folder, Apply / Discard / Edits, title and free space, the path as link
+  crumbs, the unlock row, the job line) over the shared `PaneView`, the copy column between them,
+  quick view, the log and every window the controller describes. It covers the window (the
+  toolbar and the screens hide) until the controller closes it; closing the window with staged
+  edits asks the controller first. A click-marking pane shows its marks as the selection and
+  reports the list taking focus, as Win32 does, so an AX row selection marks and activates its
+  side. `drivers/labels.toml` gains an `[appkit]` section with Win32's two behaviour entries and
+  the Commander toolbar item's label (an `NSToolbarItem` carries no AX identifier). Not done:
+  dragging rows between panes, and drops from Finder (slice 8).
+
+- **Slice 4, Backup (2026-11-12).** `backup.rs` and its VHD options window
+  (`backup_vhd.rs`) over `BackupController`, with the shared CHD control (`chd.rs`), all on
+  `form.rs`: a screen's controls keyed by its own enum, their actions and text changes handed
+  to it by key. A value or pick set through accessibility sends AppKit no change notification
+  (it goes through the field's cell, and a pop-up's action waits for its menu to close), so the
+  form keeps each field's and pop-up's last reported value: a field's cell reports an outside
+  set at once, any other unreported change goes before the next action, and a refresh never
+  undoes an edit the screen has not heard. `flow.backup.image-zstd` and `-image-vhd` pass. The
+  Remote Drive window comes with slice 7b.
+
+- **Slice 4, Restore (2026-11-12).** `restore.rs` over `RestoreController` on `form.rs`: the
+  backup folder and its Recent list, the target (a device, an image file or a new disk), the
+  expand and size rows with the before and after partition bars, alignment, notes and the
+  caveats. Restore and Inspect share one backup folder through `AppController::share_backup`,
+  and the top bar's Close Backup closes it on both. Writing to a target image as its own action
+  waits for the disk writer (slice 7a). `flow.restore.folder-to-image` and
+  `-share-with-inspect` pass; all 46 appkit flows pass.
+
+- **Slice 5, Build Disk (2026-11-12).** `build_disk.rs` over `BuildDiskController`, the wizard's
+  steps on one form with Back / Next / Create, and `build_rows.rs` for the Partitions and
+  Options steps, whose rows and option groups are built again only when the plan's shape
+  changes. A row's Pick... is a pull-down of the table's type catalog, so accessibility can
+  reach every entry. Open in Inspect switches to Inspect with the built image. The three
+  `flow.build` flows pass; all 49 appkit flows pass.
+
+- **Slice 6, Optical and Archives (2026-11-12).** `optical.rs` over `OpticalController`: the
+  source (a drive, or an image with a pull-down of recent ones), the disc and its tools, the
+  rip form with the shared CHD control, and the CD-DA player in its own window, with a 250 ms
+  timer while a track plays because nothing else wakes the shell then. The disc browser is
+  `BrowseView` in disc mode, standing in the Optical page's place while it is open. CHD Info
+  reuses the report window. `archives.rs` over `ArchivesController`, its entries in a `Table`
+  that gained a tick-box column. Inspect now hands discs and archives to these screens. Add
+  remote daemon waits for slice 7b and Convert... for 7c. The optical, audio and archives
+  flows pass; all 53 appkit flows pass.
+
+- **Slice 7a, volume dialogs (2026-11-12).** The disk writer (`disk_write.rs`, from Restore's
+  Write Image File), Expand HFS (`expand_hfs.rs`), Resize Partitions (`resize.rs`), Resize Alto
+  Disk (`alto.rs`), Expand Image (`expand_image.rs`) and the partition table editor
+  (`editor.rs`), each a window on `form.rs` over its controller. A field read while it is being
+  edited commits the edit, and its cell reports back: the form now reads without holding its
+  borrow and ignores that report. A new flow, `flow.inspect.table.expand-add`, covers Expand
+  Image, Resize's preview and the table editor; the disk-write and Expand HFS flows pass too, and
+  all 57 appkit flows pass. Inspect's Export window (which also opens the disk writer) comes with
+  slice 7b. The Alto dialog has no flow yet (no Alto fixture in tier 8).
+
+- **Slice 7b, Settings (2026-11-12).** `settings.rs`: the update check and Clear Recent Files.
+  File associations are left out, as a Mac app declares its document types in Info.plist.
+  Every window now opens through `ui::present`, which leaves no field focused: a new window
+  focused its first field, and the form keeps the controller's text out of a field being
+  typed in, so a reopened Settings showed an empty URL. `flow.settings.save-and-reopen` passes;
+  all 58 appkit flows pass.
+
+- **Slice 7b, Export and the remote windows (2026-11-12).** `export.rs` (Export Disk Image,
+  whose Physical Disk Export opens Inspect's own disk writer), `remote_pick.rs` (the daemon's
+  listing, standing in Inspect's page while active, with Pick Another / Back Up Image / Close
+  Remote on Inspect), `backup_remote.rs` (Backup's Remote Drive), Restore's remote target rows
+  (in `restore.rs`), and `optical_remote.rs` (Add remote daemon). `Table` gained an activate
+  hook (Return or a double-click), and a prompt's field now presses the default button on
+  Return. A new flow, `flow.inspect.tools.export-vhd`, covers Export; the four network flows
+  pass, and all 63 appkit flows pass. The metadata editor is the browse view's and already
+  ships with slice 2; Convert (7c) is next.
+
+- **Slice 7c, Convert (2026-11-12).** `convert.rs` over `ConvertController`: the source, the
+  output, a format and extension per image kind, the three CHD profiles' options, the size and
+  floppy choices, and the file list with its tick boxes. Inspect's and Optical's Convert...
+  hand their image over. Every screen is now built, so the placeholder pages are gone (the
+  `app.start` stand-in flow now checks Archives and Convert). Every tier 8 flow lists appkit,
+  and all 64 pass locally. Left: drops and file open (8) and packaging (9).
+
+- **Slice 8, drops and file open (2026-11-12).** The window's content is a drop view taking
+  file URLs from Finder. Commander takes a drop by the pane under it (or asks which), and
+  plays the controller's drop plan; otherwise Inspect's browse view in Edit Mode stages it, or
+  `AppController::route_drop` picks the screen. Finder's open (`application:openURLs:`) and a
+  path on the command line open in Inspect, as on Windows; files asked for while launching
+  wait for the app to be built. No driver can drag yet, so drops have no tier 8 flow (none of
+  the shells has one); the command-line open was checked through the AX driver.
+
+- **Slice 9, packaging (2026-11-12).** `scripts/package-appkit.sh` builds "Rusty Backup
+  AppKit.app" (bundle id `io.github.danifunker.rusty-backup`, so it installs beside egui) and
+  `Rusty-Backup-AppKit-macos-<arch>-<version>.dmg`, the name the in-app updater looks for. Its
+  document types are `DISK_IMAGE_EXTS` at the Alternate rank: Finder's Open With lists it, and
+  it never takes a file type over. CI's build-appkit job signs, notarizes and uploads the DMG
+  as an artifact; like the Win32 preview, it is not attached to releases yet.
+
+- **CI (2026-11-12, b5fdd8c2).** The build-appkit job is green on GitHub's macos-26 runner:
+  59 tier 8 flows pass over AX and 5 skip for a fixture the runner lacks (the optical ISO and
+  CD-DA images; all 64 pass locally), and the DMG is signed, notarized and uploaded. Two fixes
+  came from the slower runner: the AX driver's `choose` waits for a pop-up to show its pick,
+  and the remote-Inspect flow sets AppKit's modal prompt over AX, since posted keys never
+  reach it there.
+
+- **Releases (2026-11-12).** The build-appkit job is a matrix: arm64, and x64 cross-built on the
+  same runner with its tier 8 flows run under Rosetta. Each leg signs and notarizes its own
+  `Rusty-Backup-AppKit-macos-<arch>-<version>.dmg`, and the release job publishes both beside
+  egui's DMGs as "native AppKit preview" rows, so the in-app updater finds them. A failed leg
+  never holds a release back.
+
+- **Screenshot tour (2026-11-12).** The flows never look at the screen, so tier 9
+  (`cases/tier9/appkit-tour.toml`, `scripts/appkit-tour.sh`; FLOWS.md) shoots the app's own
+  windows across every screen and dialog in light and dark, 55 shots each, onto a contact sheet,
+  with a pixel comparison against an approved run. Its first review found and fixed:
+  - captions sat above the controls beside them: a row now centres each control vertically;
+  - AppKit links every radio sharing a superview and an action, so Export's layout and format
+    radios (and Optical's, and each table-editor row's) unchecked each other: each group now
+    lives on its own see-through layer;
+  - Inspect left Export, the table tools, Resize and Expand Image enabled with nothing open;
+  - Commander's bars overflowed a half-window pane: they now take four short rows;
+  - the browse view's notice row showed an empty notice and a stray OK from the start;
+  - the Check report's stats and the disk writer's source path were cut off.
 
 ## Exit criteria
 
@@ -142,7 +334,9 @@ self-hosted Mac (`dani-dev.local`) and CI keeps the build plus `--shell tui`.
 
 ## Open questions
 
-1. PyObjC or a Swift helper for the driver; and whether GitHub's macOS runners grant AX (Gate 0).
-2. App name and bundle id of the preview app beside egui (main plan § 11, item 5).
+1. ~~PyObjC or a Swift helper for the driver~~: Swift (2026-11-11). ~~Whether GitHub's macOS
+   runners grant AX~~: they do (2026-11-12).
+2. ~~App name and bundle id~~: bundle id `io.github.danifunker.rusty-backup` (2026-11-11), distinct
+   from egui's `io.github.dani.rusty-backup`, so both install side by side.
 3. How the 10.7 vintage shell (Phase 6) shares slices with this one: forked like the Win32 pair,
    or this package built against older bindings.

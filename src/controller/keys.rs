@@ -122,6 +122,8 @@ pub enum Command {
     Transforms,
     /// Extract the cursor entry to a host folder (the view asks for the fork mode first).
     Extract,
+    /// Archive the whole volume in a format the view offers (`commander::volume_export_formats`).
+    ExportVolume,
     /// List the whole volume as a text tree.
     Tree,
     /// Enter or leave Edit Mode on a source edited through a copy (a CHD or compressed backup).
@@ -167,7 +169,7 @@ impl Command {
         Command::Collapse,
     ];
 
-    pub const ALL: [Command; 43] = [
+    pub const ALL: [Command; 44] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -209,12 +211,13 @@ impl Command {
         Command::Metadata,
         Command::Transforms,
         Command::Extract,
+        Command::ExportVolume,
         Command::Tree,
         Command::EditMode,
     ];
 
     /// The commands the one-pane Explorer binds.
-    pub const EXPLORER: [Command; 37] = [
+    pub const EXPLORER: [Command; 38] = [
         Command::Help,
         Command::Rename,
         Command::Info,
@@ -250,6 +253,7 @@ impl Command {
         Command::Metadata,
         Command::Transforms,
         Command::Extract,
+        Command::ExportVolume,
         Command::Tree,
         Command::EditMode,
     ];
@@ -298,6 +302,7 @@ impl Command {
             Command::Metadata => "metadata",
             Command::Transforms => "transforms",
             Command::Extract => "extract",
+            Command::ExportVolume => "export-volume",
             Command::Tree => "tree",
             Command::EditMode => "edit-mode",
         }
@@ -351,6 +356,7 @@ impl Command {
             Command::Metadata => "Edit metadata",
             Command::Transforms => "Transform image",
             Command::Extract => "Extract to a folder",
+            Command::ExportVolume => "Export the volume",
             Command::Tree => "List the tree",
             Command::EditMode => "Edit Mode",
         }
@@ -396,7 +402,10 @@ const DEFAULTS: &[(Command, &[&str])] = &[
 ];
 
 /// Extra chords a terminal needs: most cannot tell Ctrl+Shift+K from Ctrl+K.
-const TERMINAL_EXTRA: &[(Command, &[&str])] = &[(Command::Connect, &["Alt+K"])];
+const TERMINAL_EXTRA: &[(Command, &[&str])] = &[
+    (Command::Connect, &["Alt+K"]),
+    (Command::ExportVolume, &["Alt+E"]),
+];
 
 /// The Explorer's chords beyond the file-manager ones it keeps (no sources, no second pane).
 const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
@@ -407,6 +416,7 @@ const EXPLORER_EXTRA: &[(Command, &[&str])] = &[
     (Command::Metadata, &["Primary+A"]),
     (Command::Transforms, &["Primary+T"]),
     (Command::Extract, &["Primary+X"]),
+    (Command::ExportVolume, &["Primary+Shift+E"]),
     (Command::Tree, &["Primary+D"]),
     (Command::EditMode, &["Primary+W"]),
 ];

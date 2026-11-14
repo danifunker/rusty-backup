@@ -15,6 +15,7 @@ use rusty_backup::controller::commander::{
     PRODOS_UNKNOWN_TYPE_NOTE,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen};
+use rusty_backup::controller::keys::Command;
 use rusty_backup::controller::{Controller as _, Effect};
 
 use super::commander::pane::PaneView;
@@ -580,20 +581,33 @@ impl BrowseView {
                     }
                 }
 
-                // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
-                // .tar). Preserves case-sensitive names + real symlinks (data
-                // fork only) so a case-insensitive host won't clobber files that
-                // differ only in case. Runs on a worker thread.
+                // The one export bar: the marked rows, else the whole volume, in its format.
                 if !self.ctl.edit_mode() && self.ctl.copy_job().is_none() {
-                    let btn = ui.button("Export to .tar.gz...");
-                    if btn.hovered() {
-                        btn.clone().on_hover_text(
-                            "Archive the whole volume to .tar.gz / .tar.zst / .tar \
-                         (preserves case + symlinks; choose the extension in the save dialog)",
+                    let bar = self.ctl.export_bar(Side::Left);
+                    let btn = ui
+                        .add_enabled(bar.enabled, egui::Button::new(bar.button.as_str()))
+                        .on_hover_text(
+                            "Export the marked rows, or else the whole volume, in the format \
+                             beside this button",
                         );
+                    let mut pick = bar.pick;
+                    let shown = bar.choices.get(pick).map(|c| c.label.clone());
+                    egui::ComboBox::from_id_salt("browse_export_bar_format")
+                        .selected_text(shown.unwrap_or_default())
+                        .show_ui(ui, |ui| {
+                            for (i, c) in bar.choices.iter().enumerate() {
+                                ui.selectable_value(&mut pick, i, c.label.as_str());
+                            }
+                        });
+                    if pick != bar.pick {
+                        let act = CommanderAction::PickExport {
+                            from: Side::Left,
+                            choice: pick,
+                        };
+                        self.ctl.apply(act);
                     }
                     if btn.clicked() {
-                        self.export_entry(ui.ctx(), &FileEntry::root(), ExportFormat::TarGz);
+                        self.export_bar(ui.ctx());
                     }
                 }
 
@@ -1007,11 +1021,23 @@ impl BrowseView {
         }
         ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
         for (key, mods) in keys {
+            if self.ctl.command_for(key, mods) == Some(Command::ExportVolume) {
+                self.export_volume_key(ctx);
+                continue;
+            }
             self.dispatch(ctx, CommanderAction::Key(key, mods));
         }
         self.cursor_armed = true;
         self.scroll_cursor = true;
         ctx.request_repaint();
+    }
+
+    /// The Export Volume key: the whole volume in the export bar's format.
+    fn export_volume_key(&mut self, ctx: &egui::Context) {
+        if self.ctl.edit_mode() || self.ctl.copy_job().is_some() {
+            return;
+        }
+        self.export_entry(ctx, &FileEntry::root(), None);
     }
 
     /// Point the content panel at the cursor row once it moved (a click or a key).
@@ -1173,65 +1199,47 @@ impl BrowseView {
         }
     }
 
-    /// Compact bar shown above the tree when entries are checkbox-marked: the
-    /// count, an "Export selected as..." format menu (the shared `export_selection`
-    /// engine, so `.mar` and the other formats come for free), and Clear.
+    /// The bar shown above the tree while entries are marked: the count and Clear; the header's
+    /// export bar exports them.
     fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
         let count = self.ctl.pane(Side::Left).selected_entries().len();
         if count == 0 {
             return;
         }
-        let picked = self.ctl.export_format();
-        let mut fmt = picked;
-        let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{count} selected"));
-            ui.label("Export as:");
-            egui::ComboBox::from_id_salt("browse_export_fmt")
-                .selected_text(fmt.label())
-                .show_ui(ui, |ui| {
-                    for f in ExportFormat::ALL {
-                        ui.selectable_value(&mut fmt, f, f.label());
-                    }
-                });
-            if ui.button("Export...").clicked() {
-                do_export = true;
-            }
             if ui.button("Clear").clicked() {
                 clear = true;
             }
         });
         ui.separator();
-        if fmt != picked {
-            self.ctl.apply(CommanderAction::SetExportFormat(fmt));
-        }
         if clear {
             let act = CommanderAction::Pane(Side::Left, BrowserPaneAction::ClearSelection);
             self.ctl.apply(act);
         }
-        if do_export {
-            self.export_marked(&ui.ctx().clone(), fmt);
-        }
     }
 
-    /// Export the marked rows as one `format` output through the screen's export (picker, job).
-    fn export_marked(&mut self, ctx: &egui::Context, format: ExportFormat) {
+    /// The export bar's button: the marked rows, else the whole volume, through the screen.
+    fn export_bar(&mut self, ctx: &egui::Context) {
         if self.ctl.copy_job().is_some() {
             return;
         }
         let fork = CommanderAction::SetForkMode(self.resource_fork_mode);
         self.ctl.apply(fork);
-        let export = CommanderAction::Export {
-            from: Side::Left,
-            format: Some(format),
-        };
         self.exporting = true;
-        self.dispatch(ctx, export);
+        let ctx = ctx.clone();
+        self.dispatch(&ctx, CommanderAction::ExportFromBar(Side::Left));
     }
 
-    /// Export one entry (the root: the whole volume) as `format` through the screen's export.
-    fn export_entry(&mut self, ctx: &egui::Context, entry: &FileEntry, format: ExportFormat) {
+    /// Export one entry (the root: the whole volume) through the screen's export; `None` is
+    /// the export bar's format.
+    fn export_entry(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &FileEntry,
+        format: Option<ExportFormat>,
+    ) {
         if self.ctl.copy_job().is_some() {
             return;
         }
@@ -1240,7 +1248,7 @@ impl BrowseView {
         let act = CommanderAction::ExportEntry {
             from: Side::Left,
             path: entry.path.clone(),
-            format: Some(format),
+            format,
         };
         self.exporting = true;
         let ctx = ctx.clone();
@@ -1394,9 +1402,9 @@ impl BrowseView {
                 // of laying it out on the host — preserves case +
                 // symlinks (handy for case-sensitive volumes).
                 let tgz_label = if entry.is_directory() {
-                    "Export Folder to .tgz..."
+                    "Export Folder..."
                 } else {
-                    "Export File to .tgz..."
+                    "Export File..."
                 };
                 if extras
                     && ui
@@ -1405,13 +1413,11 @@ impl BrowseView {
                         egui::Button::new(tgz_label),
                     )
                     .on_hover_text(
-                        "Save the selection as a single .tar.gz / .tar.zst / .tar \
-                         (preserves exact case + symlinks; pick the extension in \
-                         the save dialog)",
+                        "Export this entry in the format the export bar above shows",
                     )
                     .clicked()
                 {
-                    self.export_entry(ui.ctx(), &entry, ExportFormat::TarGz);
+                    self.export_entry(ui.ctx(), &entry, None);
                 }
 
                 if extras
@@ -1489,7 +1495,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_entry(ui.ctx(), &entry, ExportFormat::BinHex);
+                        self.export_entry(ui.ctx(), &entry, Some(ExportFormat::BinHex));
                     }
                     if ui
                         .button("StuffIt (.sit)")
@@ -1500,7 +1506,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffIt);
+                        self.export_entry(ui.ctx(), &entry, Some(ExportFormat::StuffIt));
                     }
                     if ui
                         .button("StuffIt-over-BinHex (.sit.hqx)")
@@ -1510,7 +1516,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_entry(ui.ctx(), &entry, ExportFormat::StuffItHqx);
+                        self.export_entry(ui.ctx(), &entry, Some(ExportFormat::StuffItHqx));
                     }
                     if ui
                         .button("MAR (.mar)")
@@ -1521,7 +1527,7 @@ impl BrowseView {
                         )
                         .clicked()
                     {
-                        self.export_entry(ui.ctx(), &entry, ExportFormat::MacArchive);
+                        self.export_entry(ui.ctx(), &entry, Some(ExportFormat::MacArchive));
                     }
                 });
             }

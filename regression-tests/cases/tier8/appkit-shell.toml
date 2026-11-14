@@ -1,0 +1,27 @@
+# Tier 8: the AppKit shell's skeleton (slice 0) starts under the AX driver (FLOWS.md).
+#
+# A stand-in until the first screen's flows gain "appkit": it proves the driver can start the
+# shell, find controls by AXIdentifier and switch screens. Remove it then.
+
+[meta]
+tier = 8
+group = "flow.shell"
+description = "The AppKit shell starts under the AX driver and switches screens."
+
+[[case]]
+id = "flow.shell.appkit-start"
+description = "Start the AppKit shell, switch between two screens, and clear the log by its controller id"
+level = "smoke"
+area = ["shell"]
+shells = ["appkit"]
+capabilities = ["app.start"]
+
+[[case.step]]
+ui = [
+  { tab = "Archives" },
+  { wait = "No archive selected" },
+  { tab = "Convert" },
+  { wait = "Choose Folder..." },
+  { activate = "log.clear" },
+  { expect = "Copy Log" },
+]

@@ -651,6 +651,8 @@ impl BackupTab {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
+                ui.set_max_width(420.0);
+                ui.label(hints::REMOTE_DRIVE_INTRO);
                 ui.horizontal(|ui| {
                     ui.label("Host:");
                     let mut addr = self.ctl.remote_address().to_string();

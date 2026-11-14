@@ -40,6 +40,7 @@ pub mod picks;
 #[cfg(feature = "remote")]
 pub mod remote_pick;
 pub mod resize;
+pub mod resize_image;
 pub mod restore;
 #[cfg(any(feature = "gui", feature = "tui-update", feature = "tui"))]
 pub mod settings;

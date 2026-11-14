@@ -133,6 +133,9 @@ pub mod hints {
     pub const WAITING_FOR_MINIMUMS: &str = "Waiting for minimum-size calculations to finish";
     pub const NO_REMOTE_DRIVES: &str =
         "No physical drives reported. The daemon may need to run as root.";
+    pub const REMOTE_DRIVE_INTRO: &str = "Back up a disk attached to another computer. Run \
+        rb-cli serve there, then connect to its address (port 7341 unless you give one) and \
+        pick one of its drives.";
     pub const REMOTE_ADDRESS: &str = "192.168.1.50:7341";
 }
 

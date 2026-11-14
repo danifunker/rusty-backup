@@ -44,7 +44,6 @@ mod effects;
 #[cfg(windows)]
 mod expand_hfs;
 #[cfg(windows)]
-mod expand_image;
 #[cfg(windows)]
 mod export;
 #[cfg(windows)]
@@ -68,6 +67,7 @@ mod remote_pick;
 mod report;
 #[cfg(windows)]
 mod resize;
+mod resize_image;
 #[cfg(windows)]
 mod restore;
 #[cfg(windows)]

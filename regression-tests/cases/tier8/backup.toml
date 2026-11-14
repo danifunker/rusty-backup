@@ -10,7 +10,7 @@ id = "flow.backup.image-zstd"
 description = "Open a FAT floppy image on the Backup screen, back it up to zstd, restore it with rb-cli and read the file back"
 level = "smoke"
 area = ["backup"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["backup.source-image", "backup.format", "backup.run"]
 timeout_ms = 180000
 
@@ -52,7 +52,7 @@ id = "flow.backup.image-vhd"
 description = "Back a FAT floppy image up to one whole-disk VHD through the VHD options window and read the file back out of the .vhd"
 level = "smoke"
 area = ["backup"]
-shells = ["gtk", "win32"]
+shells = ["gtk", "win32", "appkit"]
 capabilities = ["backup.source-image", "backup.format", "backup.run"]
 timeout_ms = 180000
 

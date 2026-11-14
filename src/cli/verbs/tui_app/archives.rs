@@ -21,7 +21,8 @@ use super::{
 };
 use crate::controller::app::{format_size, RecentHandle};
 use crate::controller::archives::{
-    ArchiveEntryRow, ArchivesAction, ArchivesController, ForkFormat, HostRequest, NoNotify,
+    row_label, ArchiveEntryRow, ArchivesAction, ArchivesController, ForkFormat, HostRequest,
+    NoNotify,
 };
 use crate::controller::{Controller as _, Effect};
 
@@ -260,7 +261,7 @@ impl ArchiveState {
 fn archive_row_line(ticked: bool, e: &ArchiveEntryRow) -> String {
     let tick = if ticked { "[x]" } else { "[ ]" };
     if e.is_dir {
-        return format!("{tick} DIR   {}/", e.path);
+        return format!("{tick} {}", row_label(e));
     }
     let data = e
         .data_len
@@ -271,8 +272,12 @@ fn archive_row_line(ticked: bool, e: &ArchiveEntryRow) -> String {
         .map(|n| format!("rsrc {}", format_size(n)))
         .unwrap_or_default();
     format!(
-        "{tick} FILE  {:<34} {:>4} {:>4}  {}  {}",
-        e.path, e.type_code, e.creator, data, rsrc
+        "{tick} {:<40} {:>4} {:>4}  {}  {}",
+        row_label(e),
+        e.type_code,
+        e.creator,
+        data,
+        rsrc
     )
 }
 
@@ -428,8 +433,9 @@ impl App {
 
         let rows = a.ctl.rows();
         let title = format!(
-            "Archives  {}  [{} of {} files ticked]  fork: {}",
+            "Archives  {}  {}  [{} of {} files ticked]  fork: {}",
             basename(a.archive_path.as_str()),
+            a.ctl.summary(),
             a.ctl.selected_file_count(),
             a.ctl.file_count(),
             ARCHIVE_FORK_FORMATS[a.fork_fmt_sel].0

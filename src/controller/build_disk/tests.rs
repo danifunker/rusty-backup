@@ -610,3 +610,34 @@ fn cd_options_are_all_listed_and_refuse_with_a_reason() {
     );
     assert_eq!(c.cd_sidecars(), CdSidecars::ResourceFork);
 }
+
+/// FAT32 at a size that would be FAT16 is its own filesystem entry, and the type byte follows.
+#[test]
+fn the_fat32_entry_forces_fat32_and_its_type_byte() {
+    let mut c = ctl();
+    act(&mut c, BuildDiskAction::SetSize("64M".into()));
+    let fat32 = FsChoice::all()
+        .into_iter()
+        .find(|f| f.fat32)
+        .expect("FAT32 is its own entry");
+    assert_eq!(fat32.label(), "FAT32 (at any size)");
+    act(
+        &mut c,
+        BuildDiskAction::SetRowFs {
+            row: 0,
+            fs: Some(fat32),
+        },
+    );
+    assert_eq!(c.row_fs_choice(0), Some(fat32));
+    assert_eq!(c.table_view().rows[0].type_text, "0C");
+    let by_size = Some(FsKind::Fat.into());
+    act(
+        &mut c,
+        BuildDiskAction::SetRowFs {
+            row: 0,
+            fs: by_size,
+        },
+    );
+    assert!(!c.format_targets()[0].opts.fat32);
+    assert_ne!(c.table_view().rows[0].type_text, "0C");
+}

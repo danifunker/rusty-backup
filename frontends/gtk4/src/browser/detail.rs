@@ -156,7 +156,7 @@ impl Detail {
         ));
 
         let extract = action_button("Extract...", ids::EXTRACT);
-        let export = action_button("Export to .tgz...", ids::EXPORT_ENTRY);
+        let export = action_button("Export File...", ids::EXPORT_ENTRY);
         export.set_tooltip_text(Some(
             "Save the selection as a single .tar.gz / .tar.zst / .tar (preserves exact case + \
              symlinks; pick the extension in the save dialog)",
@@ -320,7 +320,17 @@ impl Detail {
                 ]
             })
         };
-        on_path(&self.export, export(ExportFormat::TarGz));
+        let bar_format: OnPath = Box::new(|d, path| {
+            vec![
+                A::SetForkMode(d.fork_mode()),
+                A::ExportEntry {
+                    from: Side::Left,
+                    path,
+                    format: None,
+                },
+            ]
+        });
+        on_path(&self.export, bar_format);
         on_path(&self.binhex, export(ExportFormat::BinHex));
         on_path(stuffit, export(ExportFormat::StuffIt));
         on_path(sit_hqx, export(ExportFormat::StuffItHqx));
@@ -453,8 +463,8 @@ impl Detail {
         flow_show(&self.prodos_row, a.prodos);
         flow_show(&self.rs_to_lf, a.qnx);
         let (extract, export) = match a.folder {
-            true => ("Extract Folder...", "Export Folder to .tgz..."),
-            false => ("Extract File...", "Export File to .tgz..."),
+            true => ("Extract Folder...", "Export Folder..."),
+            false => ("Extract File...", "Export File..."),
         };
         self.extract.set_label(extract);
         self.export.set_label(export);

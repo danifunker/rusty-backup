@@ -26,6 +26,12 @@ Rusty Backup ships as a single self-contained binary per platform.
      existing portable-ZIP users can run `Setup.exe` once to gain the
      Start-Menu / ARP integration without re-downloading later updates.
    - **macOS** — open the DMG and drag `Rusty Backup.app` into `/Applications`.
+     Later updates install from the update banner (**Download & Install Update**):
+     the app checks the new DMG's signature before it replaces itself, and
+     opens the DMG for you instead when it cannot write to its own folder.
+     A native AppKit preview ships beside it as `Rusty-Backup-AppKit-macos-*.dmg`
+     (`Rusty Backup AppKit.app`, its own bundle id, so both can be installed);
+     it updates itself the same way.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
    Linux, an authorisation prompt on macOS). Working with image files on disk
@@ -405,7 +411,11 @@ The app has seven tabs:
     whole selection into a single archive — Mac Archive (`.mar`), StuffIt
     (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
     Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
-    run the same `export_selection` engine.
+    run the same `export_selection` engine. **Export Volume** archives the
+    whole volume the same way, in the format picked beside it: tar.gz for a
+    Unix filesystem (it keeps permissions and symlinks), Mac Archive for HFS
+    and MFS, Zip for the rest; Zip and every tar flavour are always offered (Cmd/Ctrl+Shift+E in the
+    browse view, Alt+E in the `rb-cli tui`, `rb-cli export` from a script).
     The browse view is the same file browser as Commander's panes: its
     **View** menu switches between one expandable tree (the default), a flat
     folder list and a folder tree beside the list, archives and disk images
@@ -431,10 +441,17 @@ The app has seven tabs:
     file itself, so a partition can be grown past the end of the current
     container without dropping to `rb-cli grow` first (a physical device's
     size is fixed, and a compressed container can't be extended in place).
+  - **Expand Image…** opens the **Resize Image** wizard: a new disk size, each
+    partition kept, filled, shrunk to its minimum or typed, with its
+    filesystem resized and free space left where you want it; the
+    volumes are checked before and after, and a copy is written unless
+    you choose in place. A classic HFS volume past its block-size limit
+    is rebuilt with larger blocks; a CHD is unpacked, resized and packed
+    again (the free space it needs is shown first). A bare volume (no
+    partition table, an `.hfv`) grows or shrinks with its disk. Also
+    `rb-cli resize-image`.
   - **Add Partition…** as a streamlined entry into the editor when
     trailing free space exists, pre-filled per partition-table type.
-  - **Expand Image…** to grow a raw, VHD, or CHD image with trailing
-    zero-padding so you have room for new partitions.
   - **Export Disk Image…** to write VHD (fixed or dynamic), QCOW2,
     VMDK, Raw, 2MG, WOZ, MOOF, DC42, HFV, or CHD (whole-disk or
     per-partition) — see `docs/vhd-export.md`.
@@ -582,15 +599,17 @@ works for ext, NTFS, FAT, HFS+, exFAT, btrfs, etc.
 
 **Open an existing image and add trailing free space:**
 
-1. Open the image in the **Inspect** tab. Any backup, raw disk image,
-   VHD, or CHD works.
-2. Click **Expand Image…** in the toolbar. Enter how much MiB to add and
-   click Expand. Raw/VHD images grow instantly via `set_len`; CHD images
-   re-encode in a background worker (the CHD hunk layout is fixed at
-   creation, so there's no in-place grow).
-3. Click **Re-inspect** to refresh the partition list. The new trailing
-   region appears as a gray "Free" segment in the **Disk layout** bar.
-4. Either:
+1. Open the image in the **Inspect** tab. A raw disk image, VHD, or
+   CHD works.
+2. Click **Expand Image…** in the toolbar. In the Resize Image wizard,
+   type the new disk size, then on the Partitions page either give a
+   partition the new space (**Fill free space**, with its filesystem
+   grown too) or keep the sizes and leave it free. A CHD is unpacked,
+   resized and packed again (the free space that needs is shown first).
+3. The partition list is read again when the wizard writes in place (or
+   open the copy with **Open in Inspect**). Free space appears as a gray
+   "Free" segment in the **Disk layout** bar.
+4. To use space you left free, either:
    - Click **Add Partition…** to allocate the free space as a new
      partition (defaults are pre-filled per partition-table type — XFS
      for SGI, `0x83` for MBR, Linux Filesystem GUID for GPT,

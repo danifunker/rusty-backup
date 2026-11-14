@@ -10,7 +10,7 @@ id = "flow.commander.zip-to-image"
 description = "Open a host folder holding a zip in one Commander pane and a FAT image in the other, copy a file out of the zip into the image, apply, and read it back with rb-cli"
 level = "smoke"
 area = ["commander"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["commander.host-folder", "commander.archive-browse", "commander.copy", "commander.apply"]
 timeout_ms = 180000
 
@@ -47,7 +47,7 @@ id = "flow.commander.open-zip"
 description = "Open a zip straight from Commander's Open, as its help says it can, and list the file inside (R-090)"
 level = "full"
 area = ["commander"]
-shells = ["tui", "gtk", "win32"]
+shells = ["tui", "gtk", "win32", "appkit"]
 capabilities = ["commander.archive-browse"]
 timeout_ms = 120000
 

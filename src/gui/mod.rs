@@ -307,6 +307,10 @@ impl RustyBackupApp {
                         actions.push(AppAction::RestartApp);
                     }
                 }
+                Some(InstallState::Manual(why)) => {
+                    ui.label(format!("Update: {why}"));
+                    view_release = ui.button("View Release").clicked();
+                }
                 Some(InstallState::Failed(e)) => {
                     ui.label(
                         egui::RichText::new(format!("Update failed: {e}"))

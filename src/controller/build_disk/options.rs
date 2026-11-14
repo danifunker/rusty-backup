@@ -20,18 +20,24 @@ pub const NTFS_VERSIONS: [(NtfsVersion, &str); 2] = [
     (NtfsVersion::V1_2, "1.2 (Windows NT 3.5 to 4.0)"),
 ];
 
-/// One entry of a filesystem list: NTFS is listed once per version, since the version decides
-/// which Windows mounts the volume, and picking it is picking the filesystem.
+/// One entry of a filesystem list: NTFS once per version and FAT twice (its type by size, or
+/// FAT32 at any size), since that choice decides which systems mount the volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsChoice {
     pub kind: FsKind,
     /// The NTFS version, `None` for every other filesystem (and for NTFS's default).
     pub ntfs: Option<NtfsVersion>,
+    /// FAT32 whatever the size; false for every other filesystem.
+    pub fat32: bool,
 }
 
 impl From<FsKind> for FsChoice {
     fn from(kind: FsKind) -> Self {
-        FsChoice { kind, ntfs: None }
+        FsChoice {
+            kind,
+            ntfs: None,
+            fat32: false,
+        }
     }
 }
 
@@ -44,7 +50,14 @@ impl FsChoice {
                 v.extend(NTFS_VERSIONS.iter().map(|(n, _)| FsChoice {
                     kind,
                     ntfs: Some(*n),
+                    fat32: false,
                 }));
+            } else if kind == FsKind::Fat {
+                v.push(kind.into());
+                v.push(FsChoice {
+                    fat32: true,
+                    ..kind.into()
+                });
             } else {
                 v.push(kind.into());
             }
@@ -59,6 +72,8 @@ impl FsChoice {
                 let readers = NTFS_VERSIONS.iter().find(|(v, _)| *v == n).map(|(_, l)| *l);
                 format!("NTFS {}", readers.unwrap_or(n.label()))
             }
+            _ if self.kind == FsKind::Fat && self.fat32 => "FAT32 (at any size)".to_string(),
+            _ if self.kind == FsKind::Fat => "FAT (12, 16 or 32 by size)".to_string(),
             _ => self.kind.display_name().to_string(),
         }
     }
@@ -68,6 +83,7 @@ impl FsChoice {
         FsChoice {
             kind,
             ntfs: (kind == FsKind::Ntfs).then(|| opts.ntfs_version.unwrap_or_default()),
+            fat32: kind == FsKind::Fat && opts.fat32,
         }
     }
 
@@ -77,16 +93,20 @@ impl FsChoice {
             self.kind,
             &FormatOptions {
                 ntfs_version: self.ntfs,
+                fat32: self.fat32,
                 ..FormatOptions::default()
             },
         );
         all.iter().position(|c| *c == me)
     }
 
-    /// Set a freshly chosen target's options to this choice (an NTFS version).
+    /// Set a freshly chosen target's options to this choice (an NTFS version, FAT32).
     pub(crate) fn apply_to(self, f: &mut crate::model::disk_builder::RowFormat) {
         if let (FsKind::Ntfs, Some(n)) = (self.kind, self.ntfs) {
             OptionEdit::NtfsVersion(n).apply(&mut f.opts);
+        }
+        if self.kind == FsKind::Fat {
+            OptionEdit::Fat32(self.fat32).apply(&mut f.opts);
         }
     }
 }

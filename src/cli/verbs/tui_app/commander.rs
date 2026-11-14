@@ -20,9 +20,10 @@ use ratatui::Frame;
 
 use super::{bytes_to_lines, centered_rect, App, FilePicker, PickKind, PickResult};
 use crate::controller::commander::{
-    export_choices, format_size, purpose, BrowserPaneAction, BrowserPaneController,
-    CommanderAction, CommanderController, DetailField, DetailMetadata, DisplayRow, FileDetail,
-    HashAlgo, OnConflict, RowKind, Side, ViewItemKind, MAX_CONSECUTIVE_FAILURES,
+    default_volume_export, export_choices, format_size, purpose, volume_export_formats,
+    BrowserPaneAction, BrowserPaneController, CommanderAction, CommanderController, DetailField,
+    DetailMetadata, DisplayRow, ExportFormat, FileDetail, HashAlgo, OnConflict, RowKind, Side,
+    ViewItemKind, MAX_CONSECUTIVE_FAILURES,
 };
 use crate::controller::keys::{Command, Key, KeyMap, Mods};
 use crate::controller::{ChoiceSpec, ConfirmSpec, Controller, Effect, PasswordSpec, TextSpec};
@@ -84,6 +85,8 @@ pub(super) struct CommanderView {
     muted: Option<super::MutedStderr>,
     /// The "Export as" menu's row, while it is up.
     export_sel: Option<usize>,
+    /// The "Export volume as" menu: its formats and row, while it is up.
+    volume_export: Option<(Side, Vec<ExportFormat>, usize)>,
     /// File Info shows the resource fork instead of the data fork.
     show_rsrc: bool,
     /// The View popup's row.
@@ -116,6 +119,7 @@ impl CommanderView {
             quit: false,
             muted: None,
             export_sel: None,
+            volume_export: None,
             show_rsrc: false,
             view_sel: 0,
             ex: None,
@@ -263,6 +267,10 @@ impl CommanderView {
             self.export_key(key.code);
             return true;
         }
+        if self.volume_export.is_some() {
+            self.volume_export_key(key.code);
+            return true;
+        }
         self.sync_scroll();
         if let Some(done) = self.window_key(key) {
             return done;
@@ -292,6 +300,16 @@ impl CommanderView {
                 self.open_extract();
                 return true;
             }
+            Some(Command::ExportVolume) if !self.ctl.modal_open() => {
+                // It starts on the filesystem's own format, as the GUIs' list does.
+                let side = self.ctl.active();
+                let fs = self.ctl.pane(side).volume().fs_type.clone();
+                let formats = volume_export_formats(&fs);
+                let first = default_volume_export(&fs);
+                let at = formats.iter().position(|f| *f == first).unwrap_or(0);
+                self.volume_export = Some((side, formats, at));
+                return true;
+            }
             _ => {}
         }
         let page = page_rows();
@@ -299,6 +317,27 @@ impl CommanderView {
         self.ctl.apply(A::SetPageRows(Side::Right, page));
         self.send(A::Key(k, m));
         true
+    }
+
+    fn volume_export_key(&mut self, code: KeyCode) {
+        let Some((side, formats, sel)) = self.volume_export.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.volume_export = None,
+            KeyCode::Up => *sel = sel.saturating_sub(1),
+            KeyCode::Down => *sel = (*sel + 1).min(formats.len().saturating_sub(1)),
+            KeyCode::Enter => {
+                let (from, format) = (*side, formats.get(*sel).copied());
+                self.volume_export = None;
+                self.send(A::ExportEntry {
+                    from,
+                    path: "/".to_string(),
+                    format,
+                });
+            }
+            _ => {}
+        }
     }
 
     fn export_key(&mut self, code: KeyCode) {
@@ -846,6 +885,20 @@ impl App {
             }
             lines.push(Line::styled(" Enter choose   Esc cancel", pal.dim()));
             self.draw_cmd_box_auto(frame, area, 56, "Export as", lines);
+        }
+        if let Some((_, formats, sel)) = &v.volume_export {
+            let pal = self.palette;
+            let mut lines = Vec::new();
+            for (i, f) in formats.iter().enumerate() {
+                let style = if i == *sel {
+                    pal.accent().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(format!(" {}", f.label()), style));
+            }
+            lines.push(Line::styled(" Enter choose   Esc cancel", pal.dim()));
+            self.draw_cmd_box_auto(frame, area, 56, "Export volume as", lines);
         }
         self.draw_cmd_modal(frame, area, v);
     }
@@ -1846,6 +1899,26 @@ mod tests {
         app.on_key(key(KeyCode::F(10)));
         settle(app);
         assert_eq!(staged(app, Side::Right), 0, "{}", status(app));
+    }
+
+    #[test]
+    fn alt_e_exports_the_active_volume_in_the_format_chosen() {
+        let (_h, img, mut app) = host_and_image(&["VOL.TXT"]);
+        copy_and_apply(&mut app, &["VOL.TXT"]);
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
+        let (side, formats, at) = view(&app).volume_export.clone().expect("the chooser");
+        assert_eq!((side, formats[at]), (Side::Right, ExportFormat::Zip));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        let out = img.path().join("vol.tgz");
+        match &mut app.commander.as_mut().unwrap().modal {
+            Some(Modal::Pick { picker, .. }) => picker.input = out.display().to_string(),
+            _ => panic!("no save picker: {}", status(&app)),
+        }
+        app.on_key(key(KeyCode::Enter));
+        settle(&mut app);
+        let head = std::fs::read(&out).unwrap_or_default();
+        assert!(head.starts_with(&[0x1f, 0x8b]), "{}", status(&app));
     }
 
     #[test]

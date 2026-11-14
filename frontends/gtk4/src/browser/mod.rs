@@ -21,8 +21,8 @@ use gtk::glib;
 use rusty_backup::controller::app::{CommanderRecent, Notify, Snapshot, UserConfig};
 use rusty_backup::controller::browser::ids;
 use rusty_backup::controller::commander::{
-    BrowserPaneAction as P, CommanderAction as A, CommanderController, DisplayRow, ExportFormat,
-    JobRegistry, ModeAction, PaneProfile, PaneServices, RowLabel, RowMenuEntry, Side, FOLLOW_DELAY,
+    BrowserPaneAction as P, CommanderAction as A, CommanderController, DisplayRow, JobRegistry,
+    ModeAction, PaneProfile, PaneServices, RowLabel, RowMenuEntry, Side, FOLLOW_DELAY,
 };
 use rusty_backup::controller::inspect::{BrowseEdit, BrowseOpen, InspectAction, InspectSource};
 use rusty_backup::controller::keys::{Command, Key, KeyMap, Mods};
@@ -175,7 +175,13 @@ impl BrowseView {
                     view.extract("/".to_string());
                 }
             });
-            let header = Header::build(&send, items.clone(), extract_all);
+            let target = me.clone();
+            let export = Rc::new(move || {
+                if let Some(view) = target.upgrade() {
+                    view.export_bar();
+                }
+            });
+            let header = Header::build(&send, items.clone(), extract_all, export);
             let disc_header = DiscHeader::build(&send, items);
             header.root().set_visible(!disc);
             disc_header.root().set_visible(disc);
@@ -187,13 +193,7 @@ impl BrowseView {
                 }
             });
             let edit = EditBar::build(&send, add_files);
-            let target = me.clone();
-            let export = Rc::new(move |format: ExportFormat| {
-                if let Some(view) = target.upgrade() {
-                    view.export_marked(format);
-                }
-            });
-            let marks = MarkBar::build(&send, export);
+            let marks = MarkBar::build(&send);
 
             let banner = adw::Banner::new("");
             banner.set_use_markup(false);
@@ -532,13 +532,11 @@ impl BrowseView {
         });
     }
 
-    fn export_marked(&self, format: ExportFormat) {
+    /// The export bar's button: the marked rows, else the whole volume, in its format.
+    fn export_bar(&self) {
         let options = self.detail.extract_options();
         self.apply(A::SetForkMode(options.fork_mode));
-        self.apply(A::Export {
-            from: Side::Left,
-            format: Some(format),
-        });
+        self.apply(A::ExportFromBar(Side::Left));
     }
 
     fn cancel_job(&self) {
@@ -571,6 +569,11 @@ impl BrowseView {
                     self.extract(path);
                 }
             }
+            Some(Command::ExportVolume) => self.apply(A::ExportEntry {
+                from: Side::Left,
+                path: "/".to_string(),
+                format: None,
+            }),
             Some(Command::PageUp | Command::PageDown) => {
                 self.apply(A::SetPageRows(Side::Left, self.pane.page_rows()));
                 self.apply(A::Key(key, mods));

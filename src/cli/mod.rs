@@ -123,6 +123,10 @@ pub enum Command {
     /// files that differ only in case.
     Tar(verbs::tar::TarArgs),
 
+    /// Archive a whole volume to one file: zip, tar (plain / gzip / zstd), or on a Mac volume
+    /// Mac Archive / StuffIt. The format is `--format`, OUT's extension, or the filesystem's own.
+    Export(verbs::export::ExportArgs),
+
     /// Import a `.tar.gz` / `.tar.bz2` / `.tar.zst` / `.tar` archive's contents INTO a
     /// filesystem in an image (the inverse of `tar`). Recreates the tree,
     /// streams files in, and recreates symlinks where the target FS
@@ -238,6 +242,10 @@ pub enum Command {
     /// Grow a disk image by `--add SIZE` of trailing zero-padding so a
     /// subsequent `partmap` edit can place a new partition.
     Grow(verbs::grow::GrowArgs),
+
+    /// Give a disk image a new size and resize its partitions with their filesystems, checking
+    /// the volumes before and after (the GUI's Resize Image). Writes a copy unless `--in-place`.
+    ResizeImage(verbs::resize_image::ResizeImageArgs),
 
     /// Whole-disk aggregate read-only view (partition table + per-partition
     /// summary + CHD metadata when applicable). The `idx` column is the
@@ -498,6 +506,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Get(args) => verbs::get::run(args),
         Command::Edit(args) => verbs::edit::run(args),
         Command::Tar(args) => verbs::tar::run(args),
+        Command::Export(args) => verbs::export::run(args),
         Command::Untar(args) => verbs::untar::run(args),
         Command::Import(args) => verbs::import::run(args),
         Command::Cp(args) => verbs::cp::run(args),
@@ -522,6 +531,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Repack(args) => verbs::repack::run(args),
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
+        Command::ResizeImage(args) => verbs::resize_image::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
         #[cfg(feature = "remote")]
         Command::Serve(args) => verbs::serve::run(args),

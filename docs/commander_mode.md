@@ -194,6 +194,9 @@ every shell shares, and `src/gui/commander/` only draws:
   descending, then the next column), +G checksums, +E export, +U staged edits,
   +L session log, F9 the View menu. Copy, Delete, Checksums and Export act on the
   cursor row when nothing is selected; that implicit selection is dropped by the next key.
+- Export Volume (`Command::ExportVolume`) archives the whole volume: Cmd/Ctrl+Shift+E in the
+  browse views presses the Export Volume button with the format its list shows; the TUI's
+  Alt+E opens an "Export volume as" menu (`volume_export_formats`) for the active pane.
 - **View menu** (egui: "View" in the top bar, and a window on F9; TUI: a popup on F9).
   Its entries come from `CommanderController::view_menu()`, so both views list the
   same things: the active pane's listing style (radio), Quick view (with its chord),

@@ -11,6 +11,8 @@ use disk_core::display::format_size;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildAction {
     SetKind(TableKind),
+    /// An entry of [`BuildView::align_choices`]; the last one opens the typed field.
+    PickAlign(usize),
     SetAlign(String),
     SetHeads(u16),
     SetSectorsPerTrack(u16),
@@ -66,6 +68,11 @@ pub struct BuildView {
     pub align_text: String,
     /// The alignment a blank field means.
     pub align_hint: String,
+    /// The named alignments, the table's default first and "Custom..." last.
+    pub align_choices: Vec<String>,
+    pub align_pick: usize,
+    /// The typed alignment field is shown (the pick is "Custom...").
+    pub align_custom: bool,
     /// Heads / sectors per track are recorded in this table.
     pub geometry: Option<(u16, u16)>,
     /// The Name column is shown.
@@ -86,6 +93,43 @@ pub struct BuildView {
     pub fixed: bool,
 }
 
+/// The named alignments after the table's default: the `--align` text and what it suits.
+pub const ALIGN_PRESETS: [(&str, &str); 3] = [
+    ("1M", "1 MiB (Windows Vista and later, Linux, flash cards)"),
+    ("63s", "63 sectors, one track (DOS, Windows 9x)"),
+    ("1s", "None (any sector)"),
+];
+
+/// The alignment list: the table's default, the presets, then "Custom...".
+fn align_choices(builder: &DiskBuilder) -> Vec<String> {
+    let bytes = provision::default_align(builder.kind, builder.geometry);
+    let default = match provision::uses_cylinder_geometry(builder.kind) {
+        true => format!("Table default (one cylinder, {})", format_size(bytes)),
+        false => format!("Table default ({})", format_size(bytes)),
+    };
+    let presets = ALIGN_PRESETS.iter().map(|(_, label)| label.to_string());
+    std::iter::once(default)
+        .chain(presets)
+        .chain(std::iter::once("Custom...".to_string()))
+        .collect()
+}
+
+/// Where the plan's alignment sits in [`align_choices`]: typed text no preset names is custom.
+fn align_pick(builder: &DiskBuilder) -> usize {
+    let custom = ALIGN_PRESETS.len() + 1;
+    let text = builder.align_text.trim();
+    if builder.align_custom {
+        return custom;
+    }
+    if text.is_empty() {
+        return 0;
+    }
+    let preset = ALIGN_PRESETS
+        .iter()
+        .position(|(t, _)| t.eq_ignore_ascii_case(text));
+    preset.map_or(custom, |i| i + 1)
+}
+
 /// Carry out one intent on the plan; `PickRowSource` is the host's (it needs a picker and a job).
 pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
     // A label donor keeps its table and slots; only sizes, bootable flags and content change.
@@ -99,6 +143,7 @@ pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
                 | BuildAction::RemoveRow(_)
                 | BuildAction::AddRow
                 | BuildAction::SetAlign(_)
+                | BuildAction::PickAlign(_)
                 | BuildAction::SetHeads(_)
                 | BuildAction::SetSectorsPerTrack(_)
         )
@@ -108,6 +153,14 @@ pub fn apply_build(builder: &mut DiskBuilder, action: BuildAction) {
     match action {
         BuildAction::SetKind(kind) => builder.set_kind(kind),
         BuildAction::SetAlign(t) => builder.align_text = t,
+        BuildAction::PickAlign(i) => match i {
+            0 => (builder.align_text, builder.align_custom) = (String::new(), false),
+            i if i <= ALIGN_PRESETS.len() => {
+                builder.align_text = ALIGN_PRESETS[i - 1].0.to_string();
+                builder.align_custom = false;
+            }
+            _ => builder.align_custom = true,
+        },
         BuildAction::SetHeads(h) => builder.geometry.heads = h.clamp(1, 255),
         BuildAction::SetSectorsPerTrack(s) => builder.geometry.sectors_per_track = s.clamp(1, 1024),
         BuildAction::SetRowSize { row, text } => {
@@ -224,6 +277,9 @@ pub(crate) fn build_view(builder: &DiskBuilder) -> BuildView {
         disk_size: builder.disk_size,
         align_text: builder.align_text.clone(),
         align_hint: format_size(builder.align_bytes()),
+        align_choices: align_choices(builder),
+        align_pick: align_pick(builder),
+        align_custom: align_pick(builder) == ALIGN_PRESETS.len() + 1,
         geometry: provision::records_geometry(builder.kind)
             .then_some((builder.geometry.heads, builder.geometry.sectors_per_track)),
         names: provision::carries_entry_name(builder.kind),

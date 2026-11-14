@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AppKit UI Draft</title>
+<style>
+:root {
+  --desk: #1b1b1d; --win: #2a2a2c; --bar: #323234; --line: #48484a; --text: #e8e8ea;
+  --dim: #9a9a9e; --btn: #4a4a4d; --btnline: #5b5b5f; --sel: #2f6fd6; --field: #1f1f21;
+  --menu: rgba(40,40,42,.97); --accent: #0a84ff; --seg1: #4f7fd8; --seg2: #8a6fd0; --seg3: #4fae7c;
+  --free: #3a3a3d; --note: #e0b44a;
+}
+:root[data-theme="light"] {
+  --desk: #d9dbe0; --win: #ececec; --bar: #e3e3e3; --line: #c9c9cb; --text: #1d1d1f;
+  --dim: #6e6e73; --btn: #ffffff; --btnline: #c6c6c8; --sel: #0a64d8; --field: #ffffff;
+  --menu: rgba(246,246,246,.97); --free: #d6d6d8;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--desk); color: var(--text);
+  font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 4px 0 2px; }
+h2 { font-size: 15px; margin: 26px 0 8px; }
+p.lead { color: var(--dim); margin: 0 0 14px; max-width: 900px; }
+.toggle { float: right; }
+.toggle button { background: var(--btn); color: var(--text); border: 1px solid var(--btnline);
+  border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; }
+
+/* menu bar */
+.menubar { display: flex; gap: 2px; align-items: center; height: 26px; padding: 0 10px;
+  background: var(--menu); border-radius: 8px 8px 0 0; border: 1px solid var(--line); border-bottom: 0;
+  overflow-x: auto; white-space: nowrap; }
+.menubar span { padding: 2px 8px; border-radius: 4px; }
+.menubar span.app { font-weight: 700; }
+.menubar span.open { background: var(--accent); color: #fff; }
+
+/* window */
+.window { background: var(--win); border: 1px solid var(--line); border-radius: 0 0 10px 10px;
+  overflow: hidden; box-shadow: 0 18px 50px rgba(0,0,0,.35); }
+.titlebar { background: var(--bar); border-bottom: 1px solid var(--line); }
+.title { display: flex; align-items: center; height: 28px; padding: 0 10px; position: relative; }
+.dots { display: flex; gap: 8px; }
+.dots i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+.dots i:nth-child(1) { background: #ff5f57; } .dots i:nth-child(2) { background: #febc2e; }
+.dots i:nth-child(3) { background: #28c840; }
+.title b { position: absolute; left: 0; right: 0; text-align: center; font-weight: 600; color: var(--dim); }
+.toolbar { display: flex; align-items: flex-end; gap: 2px; padding: 2px 10px 6px; overflow-x: auto; }
+.tool { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 64px;
+  padding: 4px 6px; border-radius: 7px; color: var(--dim); font-size: 11px; }
+.tool svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round; }
+.tool.on { background: rgba(127,127,127,.22); color: var(--text); }
+.tool.off { opacity: .45; }
+.spacer { flex: 1; }
+
+.content { padding: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.btn { background: var(--btn); border: 1px solid var(--btnline); border-radius: 6px; padding: 3px 11px;
+  white-space: nowrap; box-shadow: 0 1px 0 rgba(0,0,0,.15); }
+.btn.dis { opacity: .45; }
+.btn.pop::after { content: ""; display: inline-block; margin-left: 8px; border: 4px solid transparent;
+  border-top-color: currentColor; transform: translateY(2px); }
+.cap { color: var(--dim); }
+.grow { flex: 1; }
+.field { flex: 1; min-width: 220px; background: var(--field); border: 1px solid var(--btnline); border-radius: 6px;
+  padding: 3px 8px; }
+.facts { color: var(--dim); margin: 2px 0 10px; }
+.facts b { color: var(--text); font-weight: 600; }
+
+.pbar { display: flex; height: 34px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0 8px; }
+.pbar div { display: flex; align-items: center; justify-content: center; font-size: 11px; color: #fff;
+  border-right: 1px solid rgba(0,0,0,.25); overflow: hidden; white-space: nowrap; }
+.pbar .s1 { background: var(--seg1); } .pbar .s2 { background: var(--seg2); }
+.pbar .s3 { background: var(--seg3); outline: 2px solid #fff; outline-offset: -3px; }
+.pbar .free { background: var(--free); color: var(--dim); }
+
+.tablewrap { border: 1px solid var(--line); border-radius: 4px; overflow-x: auto; background: var(--field); }
+table { border-collapse: collapse; width: 100%; min-width: 720px; }
+th { text-align: left; font-weight: 600; color: var(--dim); padding: 4px 8px; border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line); background: var(--bar); }
+td { padding: 3px 8px; }
+td.r, th.r { text-align: right; }
+tr:nth-child(even) td { background: rgba(127,127,127,.07); }
+tr.sel td { background: var(--sel); color: #fff; }
+
+.status { color: var(--dim); margin: 8px 0 6px; }
+.log { background: var(--field); border: 1px solid var(--line); border-radius: 4px; height: 92px; padding: 6px 8px;
+  font: 11px/1.45 ui-monospace, Menlo, monospace; overflow: hidden; }
+
+/* menus */
+.menus { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.menu { background: var(--menu); border: 1px solid var(--line); border-radius: 8px; padding: 5px 0;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+.menu h3 { margin: 0; padding: 2px 12px 6px; font-size: 12px; color: var(--accent); }
+.mi { display: flex; justify-content: space-between; gap: 12px; padding: 2px 12px; }
+.mi kbd { font: inherit; color: var(--dim); }
+.mi.dis { color: var(--dim); }
+.mi.sub::after { content: ">"; color: var(--dim); }
+.mi.new { box-shadow: inset 3px 0 0 var(--note); }
+.sep { height: 1px; background: var(--line); margin: 5px 0; }
+.legend { color: var(--dim); font-size: 12px; margin-top: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; background: var(--note); margin-right: 6px; vertical-align: -1px; }
+
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.card { background: var(--win); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card h4 { margin: 0 0 6px; font-size: 13px; }
+.card ul { margin: 0; padding-left: 18px; color: var(--dim); }
+.card li { margin: 3px 0; }
+@media (max-width: 700px) { .wrap { padding: 10px; } .tool { min-width: 52px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toggle"><button id="theme" type="button">Light / Dark</button></div>
+  <h1>Rusty Backup on macOS: AppKit draft</h1>
+  <p class="lead">The Inspect screen with an APM disk open, laid out like the Win32 shell (D8: same controls, same
+  labels, same order), with macOS's own widgets. The second half proposes a menu bar that carries the same
+  commands, since that is where Mac users look and Commander's F-keys need fn on a laptop. Nothing here is built yet
+  beyond slice 0's window, toolbar and log.</p>
+
+  <div class="menubar" aria-label="Menu bar">
+    <span class="app">Rusty Backup</span><span>File</span><span>Edit</span><span>View</span>
+    <span class="open">Disk</span><span>Partition</span><span>Window</span><span>Help</span>
+  </div>
+  <div class="window">
+    <div class="titlebar">
+      <div class="title"><div class="dots"><i></i><i></i><i></i></div><b>Rusty Backup (AppKit preview)</b></div>
+      <div class="toolbar" aria-label="Screens">
+        <div class="tool"><svg viewBox="0 0 24 24"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/></svg>Backup</div>
+        <div class="tool"><svg viewBox="0 0 24 24"><path d="M12 15V4m-5 5 5-5 5 5M5 20h14"/></svg>Restore</div>
+        <div class="tool"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 4v5h6V4M8 15h8"/></svg>Build Disk</div>
+        <div class="tool on"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></svg>Inspect</div>
+        <div class="tool"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M9 6h7a2 2 0 0 1 2 2v7M15 18H8a2 2 0 0 1-2-2V9"/></svg>Convert</div>
+        <div class="tool"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/></svg>Optical</div>
+        <div class="tool"><svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M12 5v2m0 2v2m0 2v2"/></svg>Archives</div>
+        <div class="spacer"></div>
+        <div class="tool"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="8" height="14" rx="1"/><rect x="13" y="5" width="8" height="14" rx="1"/></svg>Commander</div>
+      </div>
+    </div>
+    <div class="content">
+      <div class="row">
+        <span class="cap">Source:</span>
+        <span class="field btn pop">MacOS8.hda</span>
+        <span class="btn">Open File...</span><span class="btn">Open Backup Folder...</span><span class="btn">Connect to Remote...</span>
+      </div>
+      <div class="facts"><b>Apple Partition Map</b> - 2.00 GiB (4,194,304 sectors of 512 bytes) - 4 partitions - alignment: Custom</div>
+      <div class="row">
+        <span class="btn">Re-inspect</span><span class="btn">Export Disk Image...</span><span class="btn">Convert...</span>
+        <span class="btn dis">CHD Info</span><span class="grow"></span><span class="btn">Close</span>
+      </div>
+      <div class="row">
+        <span class="btn">Edit Partition Table...</span><span class="btn">Add Partition...</span>
+        <span class="btn">Resize Partitions...</span><span class="btn">Expand Image...</span><span class="btn">Make Bootable...</span>
+      </div>
+      <div class="pbar" aria-label="Partition bar">
+        <div class="s1" style="flex:1">Map</div>
+        <div class="s2" style="flex:2">Driver</div>
+        <div class="s3" style="flex:62">Macintosh HD (HFS, 1.60 GiB)</div>
+        <div class="free" style="flex:15">Free 400 MiB</div>
+      </div>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>#</th><th>Type</th><th>Volume</th><th class="r">Start LBA</th><th class="r">Size</th><th class="r">Min Size</th><th class="r">Block</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Apple_partition_map</td><td></td><td class="r">1</td><td class="r">31.5 KiB</td><td class="r"></td><td class="r"></td></tr>
+            <tr><td>2</td><td>Apple_Driver43</td><td></td><td class="r">64</td><td class="r">28.0 KiB</td><td class="r"></td><td class="r"></td></tr>
+            <tr class="sel"><td>3</td><td>Apple_HFS (HFS)</td><td>Macintosh HD</td><td class="r">96</td><td class="r">1.60 GiB</td><td class="r">412.7 MiB</td><td class="r">32 KiB</td></tr>
+            <tr><td>4</td><td>Apple_Free</td><td></td><td class="r">3,355,744</td><td class="r">400.0 MiB</td><td class="r"></td><td class="r"></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span class="btn">Browse</span><span class="btn">Calc min</span><span class="btn">Check</span>
+        <span class="btn">Expand/Export...</span><span class="btn dis">Defragment...</span><span class="btn dis">Resize...</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="grow"></span><span class="btn">Refresh Devices</span><span class="btn">Settings...</span><span class="btn">About Rusty Backup</span>
+      </div>
+      <div class="status">Opened MacOS8.hda</div>
+      <div class="row"><span class="btn">Copy Log</span><span class="btn">Clear Log</span><span>[x] Auto-scroll</span></div>
+      <div class="log">22:43:05 [INFO] Found 6 device(s)<br>22:43:12 [INFO] Opened MacOS8.hda: Apple Partition Map, 4 partitions<br>22:43:12 [INFO] Partition 3: HFS "Macintosh HD", 1.60 GiB</div>
+    </div>
+  </div>
+
+  <h2>Proposed menu bar</h2>
+  <div class="menus">
+    <div class="menu"><h3>Rusty Backup</h3>
+      <div class="mi">About Rusty Backup</div>
+      <div class="mi new">Check for Updates...</div><div class="sep"></div>
+      <div class="mi">Settings... <kbd>Cmd ,</kbd></div><div class="sep"></div>
+      <div class="mi">Hide Rusty Backup <kbd>Cmd H</kbd></div><div class="mi">Hide Others <kbd>Opt Cmd H</kbd></div>
+      <div class="mi">Show All</div><div class="sep"></div><div class="mi">Quit Rusty Backup <kbd>Cmd Q</kbd></div>
+    </div>
+    <div class="menu"><h3>File</h3>
+      <div class="mi new">Open File for Inspect... <kbd>Cmd O</kbd></div>
+      <div class="mi new">Open CD-ROM Image... <kbd>Opt Cmd O</kbd></div>
+      <div class="mi new">Open Backup Folder... <kbd>Shift Cmd O</kbd></div>
+      <div class="mi new sub">Open Recent</div>
+      <div class="mi new sub">Open Device</div>
+      <div class="mi new">Connect to Remote... <kbd>Shift Cmd K</kbd></div><div class="sep"></div>
+      <div class="mi new">Refresh Devices</div><div class="sep"></div>
+      <div class="mi new dis">Close Backup</div>
+      <div class="mi new">Close <kbd>Cmd W</kbd></div>
+    </div>
+    <div class="menu"><h3>Edit</h3>
+      <div class="mi">Undo <kbd>Cmd Z</kbd></div><div class="mi">Redo <kbd>Shift Cmd Z</kbd></div><div class="sep"></div>
+      <div class="mi">Cut <kbd>Cmd X</kbd></div><div class="mi">Copy <kbd>Cmd C</kbd></div>
+      <div class="mi">Paste <kbd>Cmd V</kbd></div><div class="mi">Select All <kbd>Cmd A</kbd></div>
+    </div>
+    <div class="menu"><h3>View</h3>
+      <div class="mi new">Backup <kbd>Cmd 1</kbd></div><div class="mi new">Restore <kbd>Cmd 2</kbd></div>
+      <div class="mi new">Build Disk <kbd>Cmd 3</kbd></div><div class="mi new">Inspect <kbd>Cmd 4</kbd></div>
+      <div class="mi new">Convert <kbd>Cmd 5</kbd></div><div class="mi new">Optical <kbd>Cmd 6</kbd></div>
+      <div class="mi new">Archives <kbd>Cmd 7</kbd></div><div class="mi new dis">Commander <kbd>Cmd 8</kbd></div><div class="sep"></div>
+      <div class="mi new">Copy Log</div><div class="mi new">Clear Log</div><div class="mi new">Auto-scroll Log</div>
+    </div>
+    <div class="menu"><h3>Disk (Inspect)</h3>
+      <div class="mi new">Re-inspect <kbd>Cmd R</kbd></div><div class="sep"></div>
+      <div class="mi new">Edit Partition Table...</div><div class="mi new">Add Partition...</div>
+      <div class="mi new">Resize Partitions...</div><div class="mi new">Expand Image...</div>
+      <div class="mi new">Make Bootable...</div><div class="sep"></div>
+      <div class="mi new">Export Disk Image... <kbd>Cmd E</kbd></div><div class="mi new">Convert...</div>
+      <div class="mi new dis">CHD Info</div>
+    </div>
+    <div class="menu"><h3>Partition (selected row)</h3>
+      <div class="mi new">Browse <kbd>Cmd B</kbd></div><div class="mi new">Calc min</div>
+      <div class="mi new">Check</div><div class="mi new">Expand/Export...</div>
+      <div class="mi new dis">Defragment...</div><div class="mi new dis">Resize...</div>
+    </div>
+    <div class="menu"><h3>Window</h3>
+      <div class="mi">Minimize <kbd>Cmd M</kbd></div><div class="mi">Zoom</div>
+    </div>
+    <div class="menu"><h3>Help</h3>
+      <div class="mi">Rusty Backup Website</div><div class="mi new">Report an Issue</div>
+    </div>
+  </div>
+  <div class="legend"><i></i>New in this draft. Every item runs the same controller action as its button, and
+  greys out when the button does. The shortcuts are proposals: they go into the controller's key map, not the shell.</div>
+
+  <h2>Decisions for you</h2>
+  <div class="notes">
+    <div class="card"><h4>1. Keep the top bar, or move it to the menus?</h4><ul>
+      <li>Win32 has Refresh Devices, Settings... and About Rusty Backup as buttons; drawn here at the bottom right.</li>
+      <li>On a Mac, Settings and About live in the app menu. Option A keeps the buttons too (D8 parity); option B
+      drops them from the window and relies on the menus.</li></ul></div>
+    <div class="card"><h4>2. Disk and Partition menus</h4><ul>
+      <li>They change with the screen: on Backup they would hold Backup's commands, and they hide on screens with
+      no disk.</li>
+      <li>Alternative: one "Inspect" menu that is always there and greys out off the Inspect screen.</li></ul></div>
+    <div class="card"><h4>3. Shortcuts</h4><ul>
+      <li>Cmd 1 to 8 for the screens, Cmd O / Shift Cmd O to open, Cmd R re-inspect, Cmd E export, Cmd B browse.</li>
+      <li>Commander keeps its F-key map; its menu (slice 3) lists each with its F-key.</li></ul></div>
+    <div class="card"><h4>4. Look</h4><ul>
+      <li>Standard Mac push buttons, a source-list style table with zebra rows, a custom-drawn partition bar with the
+      selected partition outlined, follows Light and Dark (use the button at the top).</li></ul></div>
+  </div>
+</div>
+<script>
+(function () {
+  var root = document.documentElement, key = "appkit-draft-theme";
+  try { var t = localStorage.getItem(key); if (t) root.setAttribute("data-theme", t); } catch (e) {}
+  document.getElementById("theme").addEventListener("click", function () {
+    var next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>
